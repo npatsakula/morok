@@ -26,7 +26,9 @@ ioctl_readwrite!(kfd_destroy_event, KFD_IOCTL_BASE, 0x09, kfd::kfd_ioctl_destroy
 ioctl_readwrite!(kfd_set_event, KFD_IOCTL_BASE, 0x0A, kfd::kfd_ioctl_set_event_args);
 ioctl_readwrite!(kfd_reset_event, KFD_IOCTL_BASE, 0x0B, kfd::kfd_ioctl_reset_event_args);
 ioctl_readwrite!(kfd_wait_events, KFD_IOCTL_BASE, 0x0C, kfd::kfd_ioctl_wait_events_args);
+ioctl_readwrite!(kfd_set_scratch_backing_va, KFD_IOCTL_BASE, 0x11, kfd::kfd_ioctl_set_scratch_backing_va_args);
 ioctl_readwrite!(kfd_acquire_vm, KFD_IOCTL_BASE, 0x15, kfd::kfd_ioctl_acquire_vm_args);
+ioctl_readwrite!(kfd_set_xnack_mode, KFD_IOCTL_BASE, 0x21, kfd::kfd_ioctl_set_xnack_mode_args);
 ioctl_readwrite!(kfd_alloc_memory_of_gpu, KFD_IOCTL_BASE, 0x16, kfd::kfd_ioctl_alloc_memory_of_gpu_args);
 ioctl_readwrite!(kfd_free_memory_of_gpu, KFD_IOCTL_BASE, 0x17, kfd::kfd_ioctl_free_memory_of_gpu_args);
 ioctl_readwrite!(kfd_map_memory_to_gpu, KFD_IOCTL_BASE, 0x18, kfd::kfd_ioctl_map_memory_to_gpu_args);

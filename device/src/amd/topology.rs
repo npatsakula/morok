@@ -49,6 +49,20 @@ pub struct AmdNode {
     /// to `simd_per_cu * max_waves_per_simd` (matches RDNA scratch slot
     /// budgeting) when absent.
     pub max_slots_scratch_cu: u32,
+    /// `cpu_cores_count` from the node's KFD properties. Nonzero only on an APU
+    /// (integrated GPU), where the CPU and GPU share one topology node — exactly
+    /// libhsakmt's discrete-GPU test (`!NumCPUCores && NumFComputeCores`). See
+    /// [`AmdNode::is_apu`].
+    pub cpu_cores_count: u32,
+}
+
+impl AmdNode {
+    /// True iff this is an APU (integrated GPU with unified system memory): the
+    /// node carries CPU cores alongside its compute units. APUs have no
+    /// dedicated VRAM, so the allocator routes device buffers to GTT.
+    pub fn is_apu(&self) -> bool {
+        self.cpu_cores_count > 0
+    }
 }
 
 /// Sysfs root for KFD topology. Public so tests can override via env.
@@ -122,6 +136,7 @@ pub fn enumerate() -> Vec<AmdNode> {
                 .copied()
                 .map(|v| v as u32)
                 .unwrap_or_else(|| simd_per_cu.max(1) * max_waves_per_simd.max(1)),
+            cpu_cores_count: map.get("cpu_cores_count").copied().unwrap_or(0) as u32,
         });
     }
     nodes.sort_by_key(|n| n.node_id);

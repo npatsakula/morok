@@ -48,6 +48,9 @@ pub const AQL_PACKET_BYTES: usize = 64;
 const INVALID_AQL_HEADER: u32 = hsa_packet_type_t_HSA_PACKET_TYPE_INVALID << hsa_packet_header_t_HSA_PACKET_HEADER_TYPE;
 /// 16 MiB ring — the compute-ring default size.
 pub const COMPUTE_RING_BYTES: usize = 16 * 1024 * 1024;
+/// RDNA2 compute ring — ROCr never creates user queues above 1 MiB on gfx10.3
+/// (HW-confirmed: the 16 MiB ring's GART wptr poll faults the CPF mid-run).
+pub const COMPUTE_RING_BYTES_RDNA2: usize = 1024 * 1024;
 /// SDMA ring is smaller; 1 MiB is plenty for short copy bursts.
 pub const COPY_RING_BYTES: usize = 1024 * 1024;
 
@@ -60,7 +63,9 @@ const MAX_DISPATCH_DWORDS: usize = 1024;
 /// Chosen so the combined ring footprint stays at half the ring even in the
 /// worst case (`* MAX_DISPATCH_DWORDS`), leaving generous margin while still
 /// letting the host run thousands of dispatches ahead of the GPU.
-const RING_MAX_INFLIGHT: u64 = (COMPUTE_RING_BYTES / 4 / MAX_DISPATCH_DWORDS / 2) as u64;
+const fn ring_max_inflight(ring_bytes: usize) -> u64 {
+    (ring_bytes / 4 / MAX_DISPATCH_DWORDS / 2) as u64
+}
 
 /// Build an AQL `hsa_barrier_and_packet_t` (64 bytes) with no dependencies and
 /// the given `completion_signal` handle. Used as a graph batch's terminator:
@@ -407,6 +412,7 @@ impl QueueInner {
         // ring packet / kernarg stores are still buffered (stale read → wedge).
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let doorbell_value = if is_pm4 { self.write_idx } else { self.write_idx - 1 };
+        tracing::debug!(write_idx = self.write_idx, doorbell_value, ring_size = self.ring_size, "ring_doorbell");
         // SAFETY: doorbell is mmapped MMIO; aligned 64-bit store.
         unsafe { std::ptr::write_volatile(self.doorbell.as_ptr(), doorbell_value) };
     }
@@ -425,7 +431,10 @@ impl AmdComputeQueue {
     /// path is unsupported anyway. Same logic as `create`'s `is_pm4` decision.
     pub fn will_use_pm4(core: &AmdDeviceCore) -> bool {
         let force_aql = std::env::var("SVOD_AMD_AQL").ok().map(|s| s != "0").unwrap_or(false);
-        !force_aql && core.node.num_xcc.max(1) == 1
+        // RDNA2 (gfx10.3) runs AQL like ROCr: PM4 user compute queues have zero
+        // production users on this generation, and the HWS preempt path is only
+        // validated against an AQL `amd_queue_t`.
+        !force_aql && !core.arch.is_rdna2() && core.node.num_xcc.max(1) == 1
     }
 
     pub fn create(allocator: &AmdAllocator) -> Result<Box<Self>> {
@@ -434,7 +443,8 @@ impl AmdComputeQueue {
         // bisecting PM4 vs AQL bring-up issues.
         let is_pm4 = Self::will_use_pm4(core);
         let queue_type = if is_pm4 { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE } else { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE_AQL };
-        let inner = create_queue(allocator, queue_type, COMPUTE_RING_BYTES, !is_pm4, /*needs_cwsr=*/ true)?;
+        let ring_bytes = if core.arch.is_rdna2() { COMPUTE_RING_BYTES_RDNA2 } else { COMPUTE_RING_BYTES };
+        let inner = create_queue(allocator, queue_type, ring_bytes, !is_pm4, /*needs_cwsr=*/ true)?;
         debug!(gpu_id = core.node.gpu_id, num_xcc = core.node.num_xcc, is_pm4 = is_pm4, "AmdComputeQueue created");
         Ok(Box::new(Self { inner: Mutex::new(inner), core: Arc::clone(core), is_pm4 }))
     }
@@ -457,9 +467,10 @@ impl AmdComputeQueue {
     /// The dispatches we wait on were submitted (doorbell rung) in prior calls,
     /// so the GPU will signal them; the wait always makes progress.
     fn wait_dispatch_headroom(&self, pool: &PoolQueue) -> Result<()> {
+        let max_inflight = ring_max_inflight(self.inner.lock().ring_size);
         let last_reserved = pool.pm4_value().saturating_sub(1);
-        if last_reserved > RING_MAX_INFLIGHT {
-            let target = last_reserved - RING_MAX_INFLIGHT;
+        if last_reserved > max_inflight {
+            let target = last_reserved - max_inflight;
             pool.pm4_signal().wait_signal_value(target, 30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
         }
         Ok(())
@@ -509,21 +520,27 @@ impl AmdComputeQueue {
         // async (`wait=false`) burst can't lap the ring. Outside the inner lock.
         self.wait_dispatch_headroom(pool)?;
         let counter_addr = pool.pm4_signal().value_addr();
-        let scratch_addr = pool.scratch_gpu_va();
-        let tmpring_size = pool.tmpring_size();
-        // Assemble the full USER_DATA prefix here, under the lock, so the scratch
-        // SGPR descriptor (words 0-3) is derived from the SAME `scratch_addr` as
-        // the `COMPUTE_DISPATCH_SCRATCH_BASE` register below. Building it in
-        // `AmdProgram::execute` (outside the lock) let a concurrent scratch
-        // realloc slip in between the two reads, so the descriptor and the
-        // register could point at different buffers. The scratch base address
-        // is read exactly once and reused for the descriptor and the register.
+        // One snapshot under one lock window, so the scratch SGPR descriptor
+        // (words 0-3), the tmpring, and the `COMPUTE_DISPATCH_SCRATCH_BASE`
+        // register below all describe the SAME buffer even when a concurrent
+        // grow swaps the scratch state mid-dispatch.
+        let scratch = pool.scratch_snapshot();
+        let scratch_addr = scratch.gpu_va;
+        let tmpring_size = scratch.tmpring_size;
         let mut full_user_data: Vec<u32> = Vec::with_capacity(user_data.len() + 4);
         if enable_private_segment_sgpr {
             full_user_data.push(scratch_addr as u32);
             full_user_data.push((scratch_addr >> 32) as u32 | (1u32 << 31));
-            full_user_data.push(0xFFFF_FFFF);
-            full_user_data.push(0x20c1_4000);
+            if scratch.aql_desc.resource_descriptor[3] != 0 {
+                // Arch-built SRD (gfx9 on CDNA, gfx10 on RDNA2): NUM_RECORDS =
+                // per-XCC scratch size, WORD3 per `AqlScratchDesc::gfx9/gfx10`.
+                full_user_data.push(scratch.aql_desc.resource_descriptor[2]);
+                full_user_data.push(scratch.aql_desc.resource_descriptor[3]);
+            } else {
+                // gfx11+ literals (tinygrad's working RDNA3 values).
+                full_user_data.push(0xFFFF_FFFF);
+                full_user_data.push(0x20c1_4000);
+            }
         }
         full_user_data.extend_from_slice(user_data);
         let mut g = self.inner.lock();
@@ -808,7 +825,8 @@ fn dwords_as_bytes(p: &[u32; 16]) -> &[u8] {
 /// appending into `q` (minus SQTT/PMC/dispatch_ptr).
 /// The shader entry point is pre-shifted right by 8 (COMPUTE_PGM_LO/HI hold the
 /// upper bits of a 256-byte-aligned address). `wave32` comes from
-/// `kd.kernel_code_properties & 0x400`; `cs_w32_en` is gfx11/12-only.
+/// `kd.kernel_code_properties & 0x400`; `cs_w32_en` applies to gfx10+ (every
+/// non-CDNA arch — RDNA2/3/4), gfx9 (CDNA, wave64) ignores it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_exec_pm4(
     q: &mut Vec<u32>,
@@ -844,7 +862,12 @@ pub(crate) fn build_exec_pm4(
     q.extend(pm4::set_sh_reg(rsrc3_reg, &[rsrc3]));
 
     // 4. Scratch / tmpring (valid base required for wave init on RDNA3+ even
-    //    when SCRATCH_EN=0).
+    //    when SCRATCH_EN=0). COMPUTE_DISPATCH_SCRATCH_BASE is written on ALL
+    //    arches incl. gfx10.3 (RDNA2): RDNA2 uses "architected flat scratch" —
+    //    LLVM emits scratch accesses relative to FLAT_SCRATCH, which HW
+    //    initialises from this register, so it MUST be set. tinygrad ops_amd
+    //    writes it unconditionally; the old `has_scratch_base_registers` gate
+    //    (gfx11+/CDNA only) was wrong for gfx10.3 and left FLAT_SCRATCH unset.
     q.extend(pm4::set_sh_reg(pm4::COMPUTE_TMPRING_SIZE, &[tmpring_size]));
     let scratch_shr = scratch_addr >> 8;
     q.extend(pm4::set_sh_reg(pm4::COMPUTE_DISPATCH_SCRATCH_BASE_LO, &[scratch_shr as u32, (scratch_shr >> 32) as u32]));
@@ -994,6 +1017,15 @@ impl AmdCopyQueue {
         // no extra cache bookkeeping is needed here.
         self.timeline.drain(COPY_TIMEOUT_MS)
     }
+
+    /// Fence all in-flight SDMA work on this queue's timeline. `copy_fenced`
+    /// already drains per call, but the async graph-replay path submits without
+    /// an immediate wait, and `AmdDeviceCore::synchronize_all` (the fence before
+    /// every host read / buffer free) must quiesce the SDMA queue too — ROCr
+    /// quiesces a queue before any buffer it touched is freed. Idle-fast.
+    pub fn drain(&self) -> Result<()> {
+        self.timeline.drain(COPY_TIMEOUT_MS)
+    }
 }
 
 /// Append SDMA dwords into the byte-indexed copy ring, padding with NOPs
@@ -1035,9 +1067,9 @@ fn create_queue(
     needs_cwsr: bool,
 ) -> Result<QueueInner> {
     let dev = allocator.dev.core();
-    // Ring + GART are both VRAM with COHERENT | UNCACHED | PUBLIC flags
-    // (uncached + cpu-accessible). Using plain VRAM (no UNCACHED) makes
-    // KFD reject the create_queue ioctl with EINVAL.
+    // The ring is GTT, host-visible, uncached (COHERENT | UNCACHED | PUBLIC):
+    // plain VRAM (no UNCACHED) makes KFD reject the create_queue ioctl with
+    // EINVAL. The descriptor page below uses tighter ROCr flags (no COHERENT).
     let ring_buf = allocator.alloc_uncached(ring_size)?;
     let (ring_gpu, ring_host) = match &ring_buf {
         crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
@@ -1058,10 +1090,10 @@ fn create_queue(
         }
     }
     // GART page holds the AQL queue descriptor (`amd_queue_t`, 256 bytes).
-    // rptr/wptr live at fixed offsets inside it; KFD reads the descriptor
-    // when wiring up the queue. The GART page is a 0x100-byte uncached,
-    // cpu-accessible allocation.
-    let gart_buf = allocator.alloc_uncached(0x100)?;
+    // rptr/wptr live at fixed offsets inside it; the CP reads them to drive the
+    // queue. ROCr allocates this page cached-coherent (no UNCACHED bit) — the
+    // only working gfx10.3 reference, so match it exactly.
+    let gart_buf = allocator.alloc_coherent(0x100)?;
     let (gart_gpu, gart_host) = match &gart_buf {
         crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
         _ => return Err(Error::AmdAllocFailed { reason: "GART page requires host-visible buffer".into() }),
@@ -1090,13 +1122,28 @@ fn create_queue(
                 crate::amd::sys::hsa::amd_signal_kind_t_AMD_SIGNAL_KIND_USER as i64,
             );
         }
-        // Initialize the GART descriptor.
+        // Initialize the GART descriptor with the FULL ROCr field set
+        // (amd_aql_queue.cpp ctor). The CWSR trap path walks the struct at
+        // preemption: hsa_queue.base_address/size and the aperture base_hi
+        // words must be valid (ROCr asserts them non-zero) — publishing a
+        // partial struct corrupts the context save and the resumed CPF fetch
+        // faults on the queue's control pages.
         // max_cu_id is total CUs across all XCCs - 1 (cu_cnt*xccs-1).
         let cu_cnt = dev.node.simd_count.max(1) / dev.node.simd_per_cu.max(1);
         let waves_per_cu = dev.node.max_waves_per_simd * dev.node.simd_per_cu;
+        let (group_hi, private_hi) = dev.iface().aperture_base_hi();
         // `queue_properties` is the u32 storage field; the generated property
         // constants are `amd_queue_properties_t` (c_int), narrowed here.
         let desc = crate::amd::sys::hsa::amd_queue_t {
+            hsa_queue: crate::amd::sys::hsa::hsa_queue_t {
+                type_: 0,    // HSA_QUEUE_TYPE_MULTI
+                features: 1, // HSA_QUEUE_FEATURE_KERNEL_DISPATCH
+                base_address: ring_gpu as *mut _,
+                size: (ring_size / AQL_PACKET_BYTES) as u32,
+                ..Default::default()
+            },
+            group_segment_aperture_base_hi: group_hi,
+            private_segment_aperture_base_hi: private_hi,
             queue_properties: (crate::amd::sys::hsa::amd_queue_properties_t_AMD_QUEUE_PROPERTIES_IS_PTR64
                 | crate::amd::sys::hsa::amd_queue_properties_t_AMD_QUEUE_PROPERTIES_ENABLE_PROFILING)
                 as u32,
@@ -1135,9 +1182,8 @@ fn create_queue(
     // KFD writes debug-trap state. Undersizing causes corruption when CWSR
     // fires; oversizing is harmless.
     //
-    // EOP and ctx-save are *plain VRAM* (no PUBLIC/COHERENT/UNCACHED flags):
-    // they're written by the GPU during preemption and never read from the
-    // CPU, so the default allocation flags suffice.
+    // EOP is plain VRAM (GPU-only, ROCr device-local); ctx-save is coherent
+    // GTT (host writes the CWSR header, ROCr's CWSR heap).
     // SDMA queues take no EOP/ctx-save buffers (CWSR is a compute-shader
     // preemption mechanism) — both are zero for SDMA. Compute queues
     // size them per the CWSR contract below.
@@ -1153,9 +1199,11 @@ fn create_queue(
         // save/restore (MES preempts a busy queue as routine runlist scheduling).
         // Without the header, a restore reads garbage `DebugOffset`/`DebugSize`
         // and the queue silently strands (rptr frozen, no fault) — the exact
-        // multi-XCC wedge. Mirrors libhsakmt `fill_cwsr_header`.
-        let ctx_spec = BufferSpec { cpu_access: true, nolru: true, ..Default::default() };
-        let ctx_buf = allocator.alloc(cwsr_buffer_size, &ctx_spec, /*zero=*/ true)?;
+        // multi-XCC wedge. Mirrors libhsakmt `fill_cwsr_header`. Backing is
+        // cached-coherent GTT, ROCr's CWSR fallback heap (`queues.c`
+        // `allocate_exec_aligned_memory` nonPaged=false DeviceLocal=false) —
+        // never VRAM.
+        let ctx_buf = allocator.alloc_coherent(cwsr_buffer_size)?;
         let eop_gpu = match &eop_buf {
             crate::allocator::RawBuffer::AmdDevice { gpu_addr, .. } => *gpu_addr,
             _ => 0,
@@ -1235,9 +1283,11 @@ fn compute_ctx_sizes(dev: &AmdDeviceCore) -> (usize, usize, usize) {
     let is_cdna4 = dev.arch == svod_dtype::AmdArch::Gfx950;
     let lds_per_cu: usize = if is_cdna4 { (dev.node.lds_size_in_kb as usize) << 10 } else { 0x10000 };
 
-    // VGPR-per-CU branches on a small whitelist of gfx-target
-    // tuples: CDNA (gfx9.x) uses 0x80000, the listed
-    // RDNA3/RDNA4 tuples use 0x60000, Gfx1102 alone uses 0x40000.
+    // VGPR-per-CU, mirroring ROCr's `hsakmt_get_vgpr_size_per_cu` (libhsakmt
+    // queues.c): CDNA (gfx9.x) uses 0x80000, the listed RDNA3/RDNA4 tuples use
+    // 0x60000, and everything below gfx1100 — all RDNA2 (gfx10.3) — plus Gfx1102
+    // use the 0x40000 default. The kernel rejects CREATE_QUEUE with EINVAL if the
+    // CWSR buffer derived from this is short, so it must match the runtime.
     let vgpr_per_cu: usize = match dev.arch {
         svod_dtype::AmdArch::Gfx942 | svod_dtype::AmdArch::Gfx950 => 0x80000,
         svod_dtype::AmdArch::Gfx1100
@@ -1245,7 +1295,14 @@ fn compute_ctx_sizes(dev: &AmdDeviceCore) -> (usize, usize, usize) {
         | svod_dtype::AmdArch::Gfx1151
         | svod_dtype::AmdArch::Gfx1200
         | svod_dtype::AmdArch::Gfx1201 => 0x60000,
-        svod_dtype::AmdArch::Gfx1102 => 0x40000,
+        svod_dtype::AmdArch::Gfx1030
+        | svod_dtype::AmdArch::Gfx1031
+        | svod_dtype::AmdArch::Gfx1032
+        | svod_dtype::AmdArch::Gfx1033
+        | svod_dtype::AmdArch::Gfx1034
+        | svod_dtype::AmdArch::Gfx1035
+        | svod_dtype::AmdArch::Gfx1036
+        | svod_dtype::AmdArch::Gfx1102 => 0x40000,
     };
 
     let xccs = dev.node.num_xcc.max(1) as usize;
@@ -1267,7 +1324,14 @@ fn compute_ctx_sizes(dev: &AmdDeviceCore) -> (usize, usize, usize) {
     let wg_data_size = wg_data_size.next_multiple_of(PAGE);
 
     let waves_factor = if dev.arch.is_cdna() { 8 } else { 12 };
-    let ctl_stack_size = (waves_factor * wave_cnt + 8 + 40).next_multiple_of(PAGE);
+    let mut ctl_stack_size = (waves_factor * wave_cnt + 8 + 40).next_multiple_of(PAGE);
+    // gfx10 (RDNA2) HW design caps the control stack at 0x7000 (sufficient for
+    // AQL, limited by SPI events). ROCr clamps it for `(gfxv & 0x3f0000) ==
+    // 0xA0000` (queues.c), tinygrad for `target[0] == 10`; an unclamped larger
+    // value risks CREATE_QUEUE rejection on gfx10.
+    if dev.arch.is_rdna2() {
+        ctl_stack_size = ctl_stack_size.min(0x7000);
+    }
     // `debug_memory_size = round_up(wave_cnt * 32, 64)`.
     let debug_memory_size = (wave_cnt * 32).next_multiple_of(64);
 

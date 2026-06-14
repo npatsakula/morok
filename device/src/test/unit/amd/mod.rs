@@ -17,6 +17,8 @@ mod am;
 #[cfg(unix)]
 mod device;
 #[cfg(unix)]
+mod iface;
+#[cfg(unix)]
 mod kernarg;
 #[cfg(unix)]
 mod program;

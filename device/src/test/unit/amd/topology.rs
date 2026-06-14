@@ -61,6 +61,39 @@ fn enumerate_skips_cpu_nodes_and_parses_gpu() {
     assert_eq!(nodes[0].simd_arrays_per_engine, 2);
 }
 
+#[test]
+fn is_apu_keys_off_cpu_cores_count() {
+    // libhsakmt's discrete-GPU test is `!NumCPUCores && NumFComputeCores`, so a
+    // GPU node with cpu_cores_count > 0 is an APU. Pure check on constructed
+    // nodes — no SVOD_KFD_TOPOLOGY env mutation, so it's race-free under the
+    // parallel test runner (the enumerate()-based tests own that global).
+    let discrete = gpu_node(/*cpu_cores_count=*/ 0); // e.g. gfx1030 (RX 6900 XT)
+    let apu = gpu_node(/*cpu_cores_count=*/ 32); // e.g. gfx1036 (7950X3D iGPU)
+    assert!(!discrete.is_apu());
+    assert!(apu.is_apu());
+}
+
+/// Minimal GPU `AmdNode` for pure (non-enumerate) logic tests.
+fn gpu_node(cpu_cores_count: u32) -> AmdNode {
+    AmdNode {
+        node_id: 1,
+        gpu_id: 5711,
+        drm_render_minor: 128,
+        gfx_target_version: 100_306,
+        simd_count: 4,
+        array_count: 2,
+        simd_arrays_per_engine: 1,
+        simd_per_cu: 2,
+        max_waves_per_simd: 16,
+        lds_size_in_kb: 64,
+        wave_front_size: 32,
+        num_xcc: 1,
+        num_cp_queues: 8,
+        max_slots_scratch_cu: 32,
+        cpu_cores_count,
+    }
+}
+
 fn tempfile_dir() -> PathBuf {
     // Build a fresh per-test tempdir so concurrent tests don't collide on
     // `SVOD_KFD_TOPOLOGY`. We don't pull `tempfile` for one test path.

@@ -183,7 +183,7 @@ pub const COMPUTE_PGM_RSRC3_GFX9: u32 = 0x22d;
 pub const COMPUTE_USER_DATA_0: u32 = 0x240;
 
 // ── COMPUTE_DISPATCH_INITIATOR field bits ─────────────────────────────────
-// The `cs_w32_en` bit is only defined on gfx11/12; gfx9 (CDNA) ignores it.
+// The `cs_w32_en` bit is defined on gfx10+ (RDNA2/3/4); gfx9 (CDNA) ignores it.
 
 pub const DISPATCH_INITIATOR_COMPUTE_SHADER_EN: u32 = 1 << 0;
 pub const DISPATCH_INITIATOR_FORCE_START_AT_000: u32 = 1 << 2;

@@ -120,6 +120,7 @@ impl PoolQueue {
                 tmpring_size,
                 handle: scratch_handle,
                 size: scratch_size,
+                aql_desc,
             }),
             pm4_counter,
             dispatch_lock: Mutex::new(()),
@@ -192,6 +193,13 @@ impl PoolQueue {
     /// Packed `COMPUTE_TMPRING_SIZE` for the current scratch buffer.
     pub fn tmpring_size(&self) -> u32 {
         self.scratch_state.lock().tmpring_size
+    }
+
+    /// Atomic snapshot of the scratch state — one lock window, so the PM4
+    /// dispatch's VA, tmpring, and SRD words all describe the same buffer
+    /// even when a concurrent grow swaps it.
+    pub(crate) fn scratch_snapshot(&self) -> crate::amd::device::ScratchState {
+        *self.scratch_state.lock()
     }
 
     /// Drain ALL submitted GPU work on this queue (every owner's). Blocks until
@@ -334,7 +342,14 @@ impl PoolQueue {
             let mut state = self.scratch_state.lock();
             if rounded > state.size_per_thread {
                 let old = (state.gpu_va, state.size, state.handle);
-                *state = ScratchState { gpu_va: va, size_per_thread: rounded, tmpring_size: tmpring, handle, size };
+                *state = ScratchState {
+                    gpu_va: va,
+                    size_per_thread: rounded,
+                    tmpring_size: tmpring,
+                    handle,
+                    size,
+                    aql_desc,
+                };
                 Some(old)
             } else {
                 None

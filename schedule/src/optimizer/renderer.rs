@@ -250,6 +250,29 @@ impl Renderer {
         self.device.is_apple_amx()
     }
 
+    /// Create an AMD RDNA2 GPU renderer (RX 6000 series; gfx1030 = RX 6900 XT).
+    ///
+    /// Identical to RDNA3 except `tensor_cores` is empty: RDNA2 has no WMMA, so
+    /// the optimizer must never emit a WMMA UOp. The empty list makes
+    /// [`try_tensor_cores`](super::heuristics) bail and matmul lower to the
+    /// scalar/vector FMA path. This is the load-bearing line for RDNA2 support —
+    /// see the `renderer_internal` regression test that asserts it stays empty.
+    pub fn amd_rdna2() -> Self {
+        Self {
+            device: RendererDevice::AmdRdna2,
+            has_local: true,
+            has_shared: true,
+            has_threads: false,
+            shared_max: 65536, // 64KB/CU, same as RDNA3
+            global_max: Some(vec![2147483647, 65535, 65535]),
+            local_max: Some(1024),
+            upcast_max: 8,
+            buffer_max: None,
+            tensor_cores: vec![], // no matrix cores on gfx10
+            supports_float4: true,
+        }
+    }
+
     /// Create an AMD RDNA3 GPU renderer (RX 7000 series).
     pub fn amd_rdna3() -> Self {
         Self {
@@ -326,7 +349,8 @@ impl Renderer {
     /// ≤ 1024 but z > 64 is still invalid and must be bounded at gpudims time.
     pub fn local_max_axes(&self) -> Option<[usize; 3]> {
         match self.device {
-            RendererDevice::AmdRdna3
+            RendererDevice::AmdRdna2
+            | RendererDevice::AmdRdna3
             | RendererDevice::AmdRdna4
             | RendererDevice::AmdCdna3
             | RendererDevice::AmdCdna4 => Some([1024, 1024, 64]),
@@ -335,11 +359,14 @@ impl Renderer {
     }
 
     /// Select the AMD optimizer profile matching a gfx arch. CDNA gfx942 maps
-    /// to CDNA3 and gfx950 to CDNA4; RDNA3/RDNA4 families map to their profiles.
+    /// to CDNA3 and gfx950 to CDNA4; RDNA2/RDNA3/RDNA4 families map to their
+    /// profiles. RDNA2 MUST be routed explicitly before the catch-all — it has
+    /// no tensor cores, and falling through to RDNA3 would wrongly emit WMMA.
     pub fn for_amd_arch(arch: AmdArch) -> Self {
         match arch {
             AmdArch::Gfx942 => Self::amd_cdna3(),
             AmdArch::Gfx950 => Self::amd_cdna4(),
+            _ if arch.is_rdna2() => Self::amd_rdna2(),
             _ if arch.is_rdna4() => Self::amd_rdna4(),
             _ => Self::amd_rdna3(),
         }

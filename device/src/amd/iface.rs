@@ -65,17 +65,30 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// `Ok(Some(Error::Runtime{..}))` on a fault, `Ok(None)` on a normal
     /// wake-up/timeout, `Err` if the WAIT_EVENTS ioctl itself failed.
     fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
+    /// `(group/LDS, private/scratch)` aperture base hi32 from
+    /// GET_PROCESS_APERTURES — written into the AQL `amd_queue_t` (the CWSR
+    /// trap path walks the struct and ROCr asserts these non-zero).
+    fn aperture_base_hi(&self) -> (u32, u32) {
+        (0, 0)
+    }
 }
 
 /// Allocation flavor — selects the KFD flag set built in [`AmdIface::alloc_raw`].
 #[derive(Clone, Copy, Debug)]
 pub enum AllocKind {
-    /// Device VRAM. `executable` adds the EXECUTABLE bit (set for general
-    /// buffers, cleared for scratch). PUBLIC is derived from `cpu_access`.
-    DeviceVram { executable: bool },
-    /// GTT-pinned, host-visible, uncached system memory (rings, GART, signal
-    /// slots, the event page).
+    /// Device VRAM (GTT on APUs). WRITABLE | EXECUTABLE | NO_SUBSTITUTE, plus
+    /// PUBLIC when `cpu_access` — the tinygrad/ROCr base flag set for every
+    /// data/code/scratch buffer.
+    DeviceVram,
+    /// GTT-pinned, host-visible, uncached system memory (rings, signal slots,
+    /// the event page). Carries fine-grained `COHERENT`, which the completion
+    /// signal handshake relies on.
     UncachedGtt,
+    /// GTT-pinned, host-visible, *cached* coherent memory — ROCr's flag set for
+    /// the queue rptr/wptr control page and CWSR ctx-save (`queues.c`
+    /// `allocate_exec_aligned_memory_gpu`, Uncached=0). Same as `UncachedGtt`
+    /// minus the UNCACHED bit.
+    CoherentGtt,
 }
 
 /// Result of [`AmdIface::alloc_raw`]: everything `RawBuffer::AmdDevice` needs
@@ -161,6 +174,9 @@ pub struct KfdIface {
     /// even though `wait_events(0)` may re-observe the (non-auto-reset) fault
     /// event on subsequent poll-fault calls.
     fault_logged: AtomicBool,
+    /// `(group/LDS, private/scratch)` aperture base hi32 from
+    /// GET_PROCESS_APERTURES, captured at open for the AQL queue descriptor.
+    aperture_base_hi: (u32, u32),
 }
 
 impl KfdIface {
@@ -190,10 +206,70 @@ impl KfdIface {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_ACQUIRE_VM", errno: e as i32 });
         }
 
+        // SET_MEMORY_POLICY — ROCr issues this once per GPU right after
+        // ACQUIRE_VM (fmm_init_process_apertures): default NONCOHERENT cache
+        // policy, COHERENT alternate. We carve no alternate aperture (per-alloc
+        // COHERENT flags select fine-grain instead), so base/size stay 0.
+        let mut policy = kfd::kfd_ioctl_set_memory_policy_args {
+            gpu_id: node.gpu_id,
+            default_policy: kfd::KFD_IOC_CACHE_POLICY_NONCOHERENT,
+            alternate_policy: kfd::KFD_IOC_CACHE_POLICY_COHERENT,
+            ..Default::default()
+        };
+        if let Err(e) = unsafe { ioctl::kfd_set_memory_policy(kfd_fd.as_raw_fd(), &mut policy as *mut _) } {
+            return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_SET_MEMORY_POLICY", errno: e as i32 });
+        }
+
+        // SCRATCH_BACKING_VA — ROCr programs the per-VMID scratch aperture base
+        // (SH_HIDDEN_PRIVATE_BASE) before any queue exists; KFD reports the
+        // process scratch aperture in GET_PROCESS_APERTURES. Without it, gfx10
+        // dispatches that spill resolve scratch against an unprogrammed base.
+        let mut apertures = kfd::kfd_ioctl_get_process_apertures_args::default();
+        if let Err(e) = unsafe { ioctl::kfd_get_process_apertures(kfd_fd.as_raw_fd(), &mut apertures as *mut _) } {
+            return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_GET_PROCESS_APERTURES", errno: e as i32 });
+        }
+        let node_apertures = apertures.process_apertures[..apertures.num_of_nodes.min(7) as usize]
+            .iter()
+            .find(|a| a.gpu_id == node.gpu_id);
+        let scratch_base = node_apertures.map(|a| a.scratch_base).unwrap_or(0);
+        let lds_base = node_apertures.map(|a| a.lds_base).unwrap_or(0);
+        if scratch_base != 0 {
+            let mut sb =
+                kfd::kfd_ioctl_set_scratch_backing_va_args { va_addr: scratch_base, gpu_id: node.gpu_id, pad: 0 };
+            if let Err(e) = unsafe { ioctl::kfd_set_scratch_backing_va(kfd_fd.as_raw_fd(), &mut sb as *mut _) } {
+                return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_SET_SCRATCH_BACKING_VA", errno: e as i32 });
+            }
+        }
+
+        // XNACK off — explicit, matching ROCr's init on non-XNACK parts. Old
+        // kernels reject the ioctl (ENOTTY); best-effort.
+        let mut xnack = kfd::kfd_ioctl_set_xnack_mode_args { xnack_enabled: 0 };
+        if let Err(e) = unsafe { ioctl::kfd_set_xnack_mode(kfd_fd.as_raw_fd(), &mut xnack as *mut _) } {
+            tracing::warn!(?e, "SET_XNACK_MODE(0) rejected; continuing with kernel default");
+        }
+
         // RUNTIME_ENABLE — only on KFD >= 1.14; older kernels reject the
-        // ioctl with ENOTTY.
-        if kfd_version >= (1, 14) {
-            let mut rt = kfd::kfd_ioctl_runtime_enable_args { mode_mask: 0, ..Default::default() };
+        // ioctl with ENOTTY. KFD selects enable-vs-disable by
+        // `mode_mask & KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK` (bit 0), so a zero
+        // mask invokes runtime *disable* — the opposite of intent. ROCr always
+        // enables at init (libhsakmt `hsaKmtRuntimeEnable`, debug.c). The enabled
+        // runtime state is what registers the process for KFD eviction→restore +
+        // queue-resume, which a memory-pressured APU (iGPU driving display +
+        // compute) depends on; without it, an evicted-but-live BO is never
+        // restored and the CP faults NotPresent on it. No TTMP (no CWSR
+        // trap-debug); r_debug = 0 (no debugger attached).
+        // Bisect gate: KFD couples runtime-enable to per-process debug state;
+        // we pass r_debug=0 (ROCr passes a real pointer). Skip the ioctl to
+        // isolate whether the enabled-debug-runtime state perturbs queue/BO
+        // restore on gfx10.3 iGPUs.
+        if std::env::var_os("SVOD_AMD_NO_RUNTIME_ENABLE").is_some() {
+            tracing::warn!("SVOD_AMD_NO_RUNTIME_ENABLE set; skipping RUNTIME_ENABLE");
+        } else if kfd_version >= (1, 14) {
+            const KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK: u32 = 1;
+            let mut rt = kfd::kfd_ioctl_runtime_enable_args {
+                mode_mask: KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK,
+                ..Default::default()
+            };
             if let Err(e) = unsafe { ioctl::kfd_runtime_enable(kfd_fd.as_raw_fd(), &mut rt as *mut _) } {
                 return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_RUNTIME_ENABLE", errno: e as i32 });
             }
@@ -254,6 +330,7 @@ impl KfdIface {
             hw_fault_event_id: hw_event.event_id,
             va: VaRegistry::default(),
             fault_logged: AtomicBool::new(false),
+            aperture_base_hi: ((lds_base >> 32) as u32, (scratch_base >> 32) as u32),
         })
     }
 }
@@ -269,7 +346,7 @@ impl AmdIface for KfdIface {
     ) -> Result<AllocResult> {
         // KFD VA reservation + map are page-granular; a 0-byte mmap is EINVAL.
         let size = size.max(1).next_multiple_of(0x1000);
-        let flags = compose_flags(kind, cpu_accessible);
+        let flags = compose_flags(kind, cpu_accessible, self.node.is_apu());
         let va = reserve_va(size)?;
         let mut args = kfd::kfd_ioctl_alloc_memory_of_gpu_args {
             va_addr: va as u64,
@@ -351,7 +428,7 @@ impl AmdIface for KfdIface {
         }
 
         self.va.insert(va as u64, size, mem_handle, tag);
-        debug!(size, gpu_addr = va as u64, handle = mem_handle, tag = ?tag, "AmdAllocator alloc done");
+        debug!(size, gpu_addr = va as u64, handle = mem_handle, tag = ?tag, cpu_accessible, "AmdAllocator alloc done");
 
         Ok(AllocResult { gpu_va: va as u64, host_ptr, handle: mem_handle, size })
     }
@@ -371,16 +448,42 @@ impl AmdIface for KfdIface {
             n_success: 0,
         };
         // SAFETY: fd is alive; handle is from a successful alloc.
-        let _ = unsafe { ioctl::kfd_unmap_memory_from_gpu(self.kfd_fd.as_raw_fd(), &mut unmap_args as *mut _) };
-        // 2. Drop host mapping (PROT_READ|PROT_WRITE for host-visible, or the
-        //    PROT_NONE reservation for device-only). Both cases munmap the
-        //    same VA region.
-        // SAFETY: gpu_va is the VA returned by our own mmap.
-        unsafe { munmap(gpu_va as *mut _, size) };
-        // 3. Free the KFD allocation.
+        let unmap_rc = unsafe { ioctl::kfd_unmap_memory_from_gpu(self.kfd_fd.as_raw_fd(), &mut unmap_args as *mut _) };
+        // A failed/partial unmap leaves the GPU PTEs for `gpu_va` intact while we
+        // go on to free the handle and (below) release the VA. If the VA is then
+        // recycled by a later alloc, those stale PTEs surface as a live-but-
+        // `NotPresent` fault. KFD's unmap is synchronous (PTE clear + TLB flush
+        // in-kernel), so a non-error return means the mapping is gone — surface
+        // any failure loudly instead of silently recycling a half-mapped VA.
+        match unmap_rc {
+            Err(e) => {
+                tracing::warn!(?e, gpu_va, handle, "free_raw: UNMAP_MEMORY_FROM_GPU failed — VA recycle may fault")
+            }
+            Ok(_) if unmap_args.n_success != 1 => {
+                tracing::warn!(n_success = unmap_args.n_success, gpu_va, handle, "free_raw: UNMAP partial")
+            }
+            Ok(_) => {}
+        }
+        // 2. Free the KFD allocation BEFORE releasing the VA (ROCr `__fmm_release`
+        //    order, fmm.c: free the BO — which finalizes PTE teardown — then let
+        //    the VA become reusable). Releasing the VA first would let a
+        //    concurrent alloc map a fresh BO over a VA whose old BO isn't freed.
         let mut free_args = kfd::kfd_ioctl_free_memory_of_gpu_args { handle };
-        // SAFETY: same as above.
+        // SAFETY: fd alive; handle from a successful alloc.
         let _ = unsafe { ioctl::kfd_free_memory_of_gpu(self.kfd_fd.as_raw_fd(), &mut free_args as *mut _) };
+        // 3. Quarantine the VA instead of releasing it (ROCr `reserved_aperture_release`,
+        //    fmm.c): re-mmap PROT_NONE drops the host pages but keeps the range
+        //    reserved, so neither the OS nor a later alloc can recycle a VA the GPU
+        //    might still reference through a stale PTE or in-flight packet. The
+        //    cost is bounded by total bytes ever freed in 47-bit address space;
+        //    only on ENOMEM fall back to a real munmap.
+        // SAFETY: gpu_va is the VA returned by our own mmap.
+        let p = unsafe {
+            mmap(gpu_va as *mut _, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0)
+        };
+        if p == libc::MAP_FAILED {
+            unsafe { munmap(gpu_va as *mut _, size) };
+        }
     }
 
     fn setup_ring(&self, desc: &RingDesc) -> Result<QueueHandle> {
@@ -414,6 +517,10 @@ impl AmdIface for KfdIface {
         let (doorbell_base, doorbell) = self.doorbell_mmap(args.doorbell_offset)?;
         debug!(queue_id = args.queue_id, doorbell_offset = args.doorbell_offset, "AMD queue created");
         Ok(QueueHandle { queue_id: args.queue_id, doorbell_base, doorbell })
+    }
+
+    fn aperture_base_hi(&self) -> (u32, u32) {
+        self.aperture_base_hi
     }
 
     fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) {
@@ -550,15 +657,22 @@ impl KfdIface {
 /// Compose the KFD `KFD_IOC_ALLOC_MEM_FLAGS_*` set for an allocation. This is
 /// the ONLY place the flags are built; it reproduces the four pre-refactor flag
 /// sets bit-for-bit (see the module doc / call sites).
-fn compose_flags(kind: AllocKind, cpu_access: bool) -> u32 {
+///
+/// `is_apu` selects the device-memory backing: discrete GPUs use dedicated VRAM,
+/// but APUs (integrated, unified memory) have none, so `DeviceVram` is allocated
+/// from GTT (system memory the GPU reaches via the GART). The modifier bits are
+/// otherwise identical, so the coherence contract the copy paths rely on (the
+/// GPU's L2-acquire dispatch prologue) is unchanged — GTT just replaces VRAM as
+/// the heap. The control-structure (`UncachedGtt`) set is already GTT and
+/// arch-independent.
+pub(crate) fn compose_flags(kind: AllocKind, cpu_access: bool, is_apu: bool) -> u32 {
     match kind {
-        AllocKind::DeviceVram { executable } => {
-            let mut flags = kfd::KFD_IOC_ALLOC_MEM_FLAGS_VRAM
+        AllocKind::DeviceVram => {
+            let heap = if is_apu { kfd::KFD_IOC_ALLOC_MEM_FLAGS_GTT } else { kfd::KFD_IOC_ALLOC_MEM_FLAGS_VRAM };
+            let mut flags = heap
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
-            if executable {
-                flags |= kfd::KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE;
-            }
             if cpu_access {
                 flags |= kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC;
             }
@@ -573,11 +687,46 @@ fn compose_flags(kind: AllocKind, cpu_access: bool) -> u32 {
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_COHERENT
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED
         }
+        AllocKind::CoherentGtt => {
+            kfd::KFD_IOC_ALLOC_MEM_FLAGS_GTT
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_COHERENT
+        }
     }
 }
 
 /// Reserve `size` bytes of host VA so KFD can bind VRAM into it.
-fn reserve_va(size: usize) -> Result<*mut libc::c_void> {
+///
+/// Bisect gate (SVOD_AMD_LOW_VA): place reservations under 2^40 via a bump
+/// cursor + MAP_FIXED_NOREPLACE. ROCr clamps every GPU VA to
+/// `SVM_RESERVATION_LIMIT = (1<<40)-1` (fmm.c); kernel-chosen `mmap(NULL)`
+/// VAs land at ~2^47, which RDNA2's UTCL2 may not translate for CP fetches.
+pub(crate) fn reserve_va(size: usize) -> Result<*mut libc::c_void> {
+    if std::env::var_os("SVOD_AMD_LOW_VA").is_some() {
+        static CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x80_0000_0000);
+        // Bump-allocate; on collision (EEXIST) keep bumping. 64 KiB-align.
+        for _ in 0..1024 {
+            let len = size.next_multiple_of(0x10000);
+            let base = CURSOR.fetch_add(len as u64 + 0x10000, Ordering::Relaxed);
+            let p = unsafe {
+                mmap(
+                    base as *mut _,
+                    size,
+                    PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | libc::MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            if p != libc::MAP_FAILED {
+                return Ok(p);
+            }
+        }
+        return Err(Error::AmdAllocFailed { reason: "SVOD_AMD_LOW_VA: no low VA found after 1024 probes".into() });
+    }
     // SAFETY: standard libc::mmap signature; no aliasing concerns at this point.
     let p = unsafe { mmap(std::ptr::null_mut(), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
     if p == libc::MAP_FAILED {

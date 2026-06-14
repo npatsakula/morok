@@ -76,6 +76,10 @@ pub(crate) struct ScratchState {
     /// old buffer when scratch grows.
     pub handle: u64,
     pub size: usize,
+    /// Arch-specific scratch SRD + queue fields. Published into the AQL
+    /// `amd_queue_t` on AQL queues; on PM4 the SRD words feed the user-SGPR
+    /// scratch descriptor prepend.
+    pub aql_desc: AqlScratchDesc,
 }
 
 /// The private-segment (scratch) fields the AQL packet processor reads from the
@@ -101,11 +105,14 @@ pub(crate) struct AqlScratchDesc {
 /// ADD_TID_ENABLE=1, TYPE=SQ_RSRC_BUF(0).
 const SCRATCH_RSRC_WORD3_GFX9: u32 = 0x00EA_4FAC;
 
+/// gfx10 SQ_BUF_RSRC WORD3 for a scratch buffer (ROCr `FillBufRsrcWord3_Gfx10`):
+/// DST_SEL=XYZW (4,5,6,7), FORMAT=BUF_FORMAT_32_UINT(0x14)<<12, INDEX_STRIDE=0
+/// (filled in by CP), ADD_TID_ENABLE=1<<23, RESOURCE_LEVEL=1<<24,
+/// OOB_SELECT=2<<28 (no bounds check in swizzle mode), TYPE=SQ_RSRC_BUF(0).
+const SCRATCH_RSRC_WORD3_GFX10: u32 = 0x2181_4EAC;
+
 impl AqlScratchDesc {
-    /// Build the gfx9 scratch descriptor. `size_per_xcc` goes in NUM_RECORDS
-    /// (WORD2) — the per-XCC slice of the shared backing buffer — and the
-    /// SWIZZLE_ENABLE bit (WORD1 bit 31) enables the per-thread scratch swizzle.
-    pub(crate) fn gfx9(scratch_va: u64, size_per_xcc: usize, tmpring_size: u32, private_segment_size: u32) -> Self {
+    fn build(scratch_va: u64, size_per_xcc: usize, tmpring_size: u32, word3: u32, lane_bytes: u32) -> Self {
         Self {
             backing_va: scratch_va,
             tmpring_size,
@@ -113,10 +120,25 @@ impl AqlScratchDesc {
                 scratch_va as u32,
                 ((scratch_va >> 32) as u32 & 0xFFFF) | 0x8000_0000,
                 size_per_xcc as u32,
-                SCRATCH_RSRC_WORD3_GFX9,
+                word3,
             ],
-            wave64_lane_byte_size: private_segment_size,
+            wave64_lane_byte_size: lane_bytes,
         }
+    }
+
+    /// Build the gfx9 scratch descriptor. `size_per_xcc` goes in NUM_RECORDS
+    /// (WORD2) — the per-XCC slice of the shared backing buffer — and the
+    /// SWIZZLE_ENABLE bit (WORD1 bit 31) enables the per-thread scratch swizzle.
+    pub(crate) fn gfx9(scratch_va: u64, size_per_xcc: usize, tmpring_size: u32, private_segment_size: u32) -> Self {
+        Self::build(scratch_va, size_per_xcc, tmpring_size, SCRATCH_RSRC_WORD3_GFX9, private_segment_size)
+    }
+
+    /// Build the gfx10 (RDNA2 wave32) scratch descriptor. WORD0..2 match gfx9;
+    /// WORD3 uses the gfx10 SRD layout. `lane_bytes` is
+    /// `scratch_wave64_lane_byte_size` = `size_per_thread * lanes_per_wave / 64`
+    /// (ROCr halves the effective per-lane size for wave32 backing).
+    pub(crate) fn gfx10(scratch_va: u64, size_per_xcc: usize, tmpring_size: u32, lane_bytes: u32) -> Self {
+        Self::build(scratch_va, size_per_xcc, tmpring_size, SCRATCH_RSRC_WORD3_GFX10, lane_bytes)
     }
 }
 
@@ -245,7 +267,8 @@ impl AmdDevice {
         let arch = AmdArch::from_gfx_target_version(node.gfx_target_version).ok_or_else(|| Error::AmdAllocFailed {
             reason: format!(
                 "unsupported gfx target {} (decoded major.minor.step = {}.{}.{}); supported families: \
-                 CDNA gfx942/950, RDNA3 gfx1100/1101/1102/1151, RDNA4 gfx1200/1201",
+                 CDNA gfx942/950, RDNA2 gfx1030/1031/1032/1034, RDNA3 gfx1100/1101/1102/1151, \
+                 RDNA4 gfx1200/1201",
                 node.gfx_target_version,
                 node.gfx_target_version / 10_000,
                 (node.gfx_target_version / 100) % 100,
@@ -336,6 +359,17 @@ impl AmdDeviceCore {
                 }
             }
         }
+        // The SDMA copy queue is NOT in the connector registry, but it has its
+        // own timeline of in-flight DMA. Quiesce it too, or an async graph-replay
+        // copy can still be touching a buffer the caller is about to free/read.
+        if let Some(copy) = self.copy_queue()
+            && let Err(e) = copy.drain()
+        {
+            tracing::warn!(?e, "synchronize_all: SDMA copy-queue drain failed; continuing");
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
         // Opportunistic GC of dropped queue entries. The registry is touched
         // here on every host read/free, so dead Weaks don't accumulate.
         self.connectors.lock().retain(|w| w.strong_count() > 0);
@@ -423,6 +457,20 @@ impl AmdDeviceCore {
     /// runtime factory; subsequent calls are a no-op.
     pub fn install_signal_pool(&self, pool: Arc<crate::amd::signal::SignalPool>) {
         let _ = self.signal_pool.set(pool);
+    }
+
+    /// Seed the queue pool with its first compute queue. gfx10.3 (RDNA2) HWS
+    /// faults reading an SDMA queue's GART descriptor when the process run-list
+    /// holds no compute queue, so the factory calls this BEFORE creating the
+    /// SDMA copy queue on RDNA2. Pool queues live for the device lifetime, so
+    /// the compute-first run-list invariant holds permanently; the seeded queue
+    /// is a normal pool member that `assign_owner` hands out as usual.
+    pub fn seed_compute_queue(self: &Arc<Self>, allocator: &crate::amd::AmdAllocator) -> Result<()> {
+        let mut queues = self.queue_pool.lock();
+        if queues.is_empty() {
+            queues.push(crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(self), allocator)?);
+        }
+        Ok(())
     }
 }
 
@@ -549,16 +597,11 @@ pub(crate) fn ensure_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNo
 /// Returns `(va, size, kfd_handle)`. The handle goes into the
 /// `event_page_offset` field of the bind `AMDKFD_IOC_CREATE_EVENT` call.
 fn alloc_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Result<(u64, usize, u64)> {
-    use libc::{
-        MAP_ANONYMOUS, MAP_FIXED, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE, mmap,
-        munmap,
-    };
+    use libc::{MAP_FIXED, MAP_SHARED, PROT_READ, PROT_WRITE, mmap, munmap};
     let size: usize = 0x8000;
-    // SAFETY: standard libc::mmap; PROT_NONE reservation.
-    let va = unsafe { mmap(std::ptr::null_mut(), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
-    if va == libc::MAP_FAILED {
-        return Err(Error::AmdAllocFailed { reason: "event-page VA reservation failed".into() });
-    }
+    // Shared VA reservation path so the SVOD_AMD_LOW_VA bisect gate covers the
+    // event page too.
+    let va = crate::amd::iface::reserve_va(size)?;
     let mut args = kfd::kfd_ioctl_alloc_memory_of_gpu_args {
         va_addr: va as u64,
         size: size as u64,
@@ -630,10 +673,16 @@ pub(crate) fn alloc_scratch(
     arch: &AmdArch,
     private_segment_size: u32,
 ) -> Result<(u64, usize, u32, u32, u64, AqlScratchDesc)> {
-    const LANES_PER_WAVE: u32 = 64;
     const PAGE: usize = 0x1000;
-    // gfx9 (CDNA) scratch is 1024-byte aligned; gfx11/12 (RDNA) use 256.
-    let mem_alignment_size: u32 = if arch.is_cdna() { 1024 } else { 256 };
+    // ROCr sizes scratch from the arch's native wave width (wave32 on RDNA2):
+    // size_per_thread aligns to mem_alignment/lanes, the per-XCC slice is
+    // lanes*slots, and tmpring WAVESIZE = lanes*size_per_thread/alignment.
+    let lanes_per_wave: u32 = arch.wave_size();
+    // gfx9 (CDNA) AND gfx10 (RDNA2) scratch is 1024-byte aligned; only gfx11+
+    // (RDNA3/4) use 256. Authority: ROCr amd_aql_queue.cpp `mem_alignment_size =
+    // (major >= 11) ? 256 : 1024`. (new tinygrad's `256 if target[0]!=9` is wrong
+    // for gfx10 — verified against the vendored production driver.)
+    let mem_alignment_size: u32 = if arch.is_cdna() || arch.is_rdna2() { 1024 } else { 256 };
 
     let xccs = node.num_xcc.max(1);
     let simd_per_cu = node.simd_per_cu.max(1);
@@ -650,17 +699,16 @@ pub(crate) fn alloc_scratch(
     let cu_slots = cu_cnt.next_multiple_of(se_cnt);
 
     // Round up to the per-lane alignment stride.
-    let size_per_thread = private_segment_size.max(1).next_multiple_of(mem_alignment_size / LANES_PER_WAVE);
+    let size_per_thread = private_segment_size.max(1).next_multiple_of(mem_alignment_size / lanes_per_wave);
     let size_per_xcc =
-        (size_per_thread as usize) * (LANES_PER_WAVE as usize) * (max_slots as usize) * (cu_slots as usize);
+        (size_per_thread as usize) * (lanes_per_wave as usize) * (max_slots as usize) * (cu_slots as usize);
     let total = (size_per_xcc * xccs as usize).next_multiple_of(PAGE);
 
-    // KFD alloc as plain VRAM (GPU-only; no host access needed — the GPU writes
-    // register spills here and reads them back). Plain VRAM = no EXECUTABLE, no
-    // PUBLIC (`cpu_access=false` keeps PUBLIC off); see `AllocKind::DeviceVram`.
+    // KFD alloc as plain VRAM (GPU-only; `cpu_access=false` keeps PUBLIC off);
+    // see `AllocKind::DeviceVram`.
     let r = iface.alloc_raw(
         total,
-        crate::amd::iface::AllocKind::DeviceVram { executable: false },
+        crate::amd::iface::AllocKind::DeviceVram,
         crate::amd::va_registry::AllocTag::Scratch,
         /*cpu_access=*/ false,
         /*zero=*/ false,
@@ -669,10 +717,14 @@ pub(crate) fn alloc_scratch(
     let total = r.size;
     let handle = r.handle;
 
-    // gfx9 divides scratch evenly across SEs (1); gfx11/12 divide by se_cnt.
-    let wave_scratch = (LANES_PER_WAVE * size_per_thread).div_ceil(mem_alignment_size);
+    // gfx9 (CDNA) AND gfx10 (RDNA2) compute total waves (no per-SE division);
+    // only gfx11+ divides by se_cnt. Authority: ROCr amd_aql_queue.cpp — the base
+    // FillComputeTmpRingSize (gfx9/gfx10) does NOT divide by NumShaderBanks,
+    // whereas FillComputeTmpRingSize_Gfx11 adds `num_waves /= NumShaderBanks`
+    // ("for GFX11 we specify number of waves per engine instead of total").
+    let wave_scratch = (lanes_per_wave * size_per_thread).div_ceil(mem_alignment_size);
     let max_scratch_waves = cu_slots * max_slots * xccs;
-    let se_div = if arch.is_cdna() { 1 } else { se_cnt };
+    let se_div = if arch.is_cdna() || arch.is_rdna2() { 1 } else { se_cnt };
     let num_waves = ((size_per_xcc as u32) / (wave_scratch * mem_alignment_size)) / se_div;
     // COMPUTE_TMPRING_SIZE.WAVES must be a multiple of the per-XCC shader-engine
     // count (amd_aql_queue.cpp asserts `WAVES % (banks/xcc) == 0`); round down to
@@ -680,10 +732,14 @@ pub(crate) fn alloc_scratch(
     let waves = (num_waves.min(max_scratch_waves) / se_cnt).max(1) * se_cnt;
     let tmpring_size = pack_tmpring(waves, wave_scratch, arch);
 
-    // The AQL descriptor is only consumed on multi-XCC CDNA; non-CDNA arches
-    // dispatch via PM4 and never read it, so leave it zero there.
+    // CDNA consumes the descriptor through the AQL amd_queue_t; RDNA2 consumes
+    // the same words through the PM4 user-SGPR prepend (and the GART descriptor
+    // when AQL is forced). RDNA3/4 don't run this scratch path yet — zero.
     let aql_desc = if arch.is_cdna() {
         AqlScratchDesc::gfx9(va, size_per_xcc, tmpring_size, private_segment_size)
+    } else if arch.is_rdna2() {
+        let lane_bytes = size_per_thread * lanes_per_wave / 64;
+        AqlScratchDesc::gfx10(va, size_per_xcc, tmpring_size, lane_bytes)
     } else {
         AqlScratchDesc::default()
     };
@@ -692,9 +748,11 @@ pub(crate) fn alloc_scratch(
 }
 
 /// Pack `COMPUTE_TMPRING_SIZE`: WAVES in bits 0..12, WAVESIZE at bit 12 with an
-/// arch-specific field width — gfx9 13b, gfx11 15b, gfx12 18b.
+/// arch-specific field width — gfx9/gfx10 13b, gfx11 15b, gfx12 18b (per the
+/// `COMPUTE_TMPRING_SIZE__WAVESIZE_MASK` asic_reg headers: gc_9_x/gc_10_3 =
+/// 0x01FFF000, gc_11_0 = 0x07FFF000, gc_12_0 = 0x3FFFF000).
 pub(crate) fn pack_tmpring(waves: u32, wave_scratch: u32, arch: &AmdArch) -> u32 {
-    let wavesize_mask: u32 = if arch.is_cdna() {
+    let wavesize_mask: u32 = if arch.is_cdna() || arch.is_rdna2() {
         0x1FFF
     } else if arch.is_rdna4() {
         0x3FFFF
