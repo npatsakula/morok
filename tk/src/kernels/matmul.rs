@@ -110,6 +110,13 @@ pub const M1_CFG: MatmulCfg =
 pub const SMALL_CFG: MatmulCfg =
     MatmulCfg { block: 64, wave_rows: 1, wave_cols: 1, n_accum: 1, l2_swizzle: false, vec_load: false, k_step: K_STEP };
 
+/// Mid-N (gfx942): 128×128 block, 2×2 waves (4 waves / 256 threads), one 64×64
+/// accumulator/wave, L2 swizzle + 128-bit vec fills. 32 KB LDS (vs M1's 64 KB) so
+/// two workgroups fit per CU, and the grid is `(n/128)²` — 4× M1's tile count at a
+/// given N. Fills the saturation gap between SMALL (64×64) and M1 (256×256).
+pub const MID_CFG: MatmulCfg =
+    MatmulCfg { block: 128, wave_rows: 2, wave_cols: 2, n_accum: 1, l2_swizzle: true, vec_load: true, k_step: K_STEP };
+
 /// gfx1151 (RDNA3.5, wave32) config: 64×64 block, 2×2
 /// waves (4 waves / 128 threads), ONE
 /// 32×32 accumulator/wave, 128-bit vec fills, no L2 swizzle (single-XCD APU), and
@@ -123,11 +130,24 @@ pub const SMALL_CFG: MatmulCfg =
 pub const GFX1151_CFG: MatmulCfg =
     MatmulCfg { block: 64, wave_rows: 2, wave_cols: 2, n_accum: 1, l2_swizzle: false, vec_load: true, k_step: 32 };
 
-/// Size-adaptive config selection: small N (where the 256×256/8-wave grid
-/// starves the machine) uses [`SMALL_CFG`]; everything else keeps [`M1_CFG`].
-/// Small N uses an occupancy-tuned config; the threshold follows size-adaptive tuning.
+/// Size-adaptive config for gfx942 (CDNA wave64). [`MID_CFG`] (128×128) is the
+/// tuned block for all but small N: its 32 KB LDS admits two workgroups per CU and
+/// its `(n/128)²` grid keeps the machine fed, beating the 256×256 [`M1_CFG`] by
+/// 6–8× across 1024–8192 (M1's 64 KB LDS pins one single-buffered workgroup per CU,
+/// so it starves the GPU — it is no longer auto-selected). [`SMALL_CFG`] (64×64)
+/// keeps the grid fed for small N, where 128-blocks leave too few tiles. The block
+/// must divide N, so the chain also degrades gracefully (128 → 64) for sizes that
+/// aren't a multiple of 128.
 pub fn cfg_for_n(n: usize) -> MatmulCfg {
-    if n <= 768 && n.is_multiple_of(SMALL_CFG.block) { SMALL_CFG } else { M1_CFG }
+    if n <= 768 && n.is_multiple_of(SMALL_CFG.block) {
+        SMALL_CFG
+    } else if n.is_multiple_of(MID_CFG.block) {
+        MID_CFG
+    } else if n.is_multiple_of(SMALL_CFG.block) {
+        SMALL_CFG
+    } else {
+        M1_CFG
+    }
 }
 
 /// Per-arch config: gfx1151 (RDNA3.5 wave32) uses the occupancy-tuned
