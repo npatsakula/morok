@@ -112,6 +112,17 @@
         };
 
         cargoArtifacts = crane'.buildDepsOnly (commonArgs // { });
+
+        # Vendor-floor benchmark shims + dev shells (svod-tk `vendor` bench).
+        bench = import ./nix/bench.nix {
+          inherit
+            pkgs
+            stdenv
+            mkShell
+            commonArgs
+            nativeBuildInputs
+            ;
+        };
       in
       {
         checks = {
@@ -139,36 +150,41 @@
           # treefmt = treefmt.config.build.check self;
         };
 
-        devShells = rec {
-          stable = mkShell (
-            commonArgs
-            // {
-              packages =
-                (with pkgs; [
-                  rust_stable
-                  cargo-outdated
-                  git
-                ])
-                ++ nativeBuildInputs;
-            }
-          );
+        devShells = (
+          rec {
+            stable = mkShell (
+              commonArgs
+              // {
+                packages =
+                  (with pkgs; [
+                    rust_stable
+                    cargo-outdated
+                    git
+                  ])
+                  ++ nativeBuildInputs;
+              }
+            );
 
-          nightly = mkShell (
-            commonArgs
-            // {
-              packages =
-                (with pkgs; [
-                  rust_stable
-                  cargo-outdated
-                  git
-                ])
-                ++ nativeBuildInputs
-                ++ [ pkgs.cargo-udeps ];
-            }
-          );
+            nightly = mkShell (
+              commonArgs
+              // {
+                packages =
+                  (with pkgs; [
+                    rust_stable
+                    cargo-outdated
+                    git
+                  ])
+                  ++ nativeBuildInputs
+                  ++ [ pkgs.cargo-udeps ];
+              }
+            );
 
-          default = stable;
-        };
+            default = stable;
+          }
+          // bench.shells
+        );
+
+        packages = bench.packages;
 
         formatter = treefmt.config.build.wrapper;
       }

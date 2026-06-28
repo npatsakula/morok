@@ -25,6 +25,7 @@ proptest = "1.9"
 test-case = "3.3.1"
 criterion = { version = "0.8", features = ["html_reports"] }
 ndarray.workspace = true # native CPU baseline for the knn bench
+libloading = "0.8" # dlopen the optional Nix-built vendor shims (benches/vendor.rs)
 
 # GPU device-time benches (criterion), one binary per kernel sharing `benches/common.rs`.
 # Self-skip when no AMD GPU; run one with e.g. `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench knn`.
@@ -42,4 +43,11 @@ harness = false
 
 [[bench]]
 name = "matmul"
+harness = false
+
+# Vendor-floor comparison (hipBLASLt GEMM via the Nix-built shim). Standalone and
+# svod-free — HIP can't share a process with svod's KFD backend; run it on its own
+# with the shim on LD_LIBRARY_PATH (the flake `bench` dev shell).
+[[bench]]
+name = "vendor"
 harness = false
