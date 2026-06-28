@@ -245,19 +245,34 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> crate::LaunchResult<Option<Tensor>> {
             // bf16, so the ABI's bf16 globals bind directly. Output stays f32 (accumulator).
             let a_bf = a.cast(DType::BFloat16).context(crate::launch::OperandSnafu)?;
             let b_bf = b.cast(DType::BFloat16).context(crate::launch::OperandSnafu)?;
-            let out = Tensor::empty(&[n, n], DType::Float32);
-            crate::graph_launch(
-                "matmul",
-                cfg.grid_dims(n),
-                cfg.threads(caps.wave_size),
-                out,
-                &[&a_bf, &b_bf],
-                caps,
-                move |ker| {
+            let threads = cfg.threads(caps.wave_size);
+            let k_splits = split_k_for(n, cfg);
+            if k_splits > 1 {
+                // Split-K: a `[(n/block)², k_splits]` grid keeps a small problem's grid
+                // wide enough to fill the machine. Each workgroup writes a partial tile
+                // to `scratch[k_slice]`; the graph reduce sums them into the result.
+                let g = (n / cfg.block) as i64;
+                let scratch = Tensor::empty(&[k_splits, n, n], DType::Float32);
+                let partial = crate::graph_launch(
+                    "matmul_splitk",
+                    [g * g, k_splits as i64, 1],
+                    threads,
+                    scratch,
+                    &[&a_bf, &b_bf],
+                    caps,
+                    move |ker| {
+                        build_matmul_splitk(ker, n, cfg, k_splits);
+                        ker.finish(cfg.n_accum)
+                    },
+                )?;
+                Ok(partial.sum(0).expect("split-K: reduce scratch over k_slice"))
+            } else {
+                let out = Tensor::empty(&[n, n], DType::Float32);
+                crate::graph_launch("matmul", cfg.grid_dims(n), threads, out, &[&a_bf, &b_bf], caps, move |ker| {
                     build_matmul_cfg(ker, n, cfg);
                     ker.finish(cfg.n_accum)
-                },
-            )
+                })
+            }
         },
     )
 }
@@ -406,4 +421,140 @@ pub fn gemm_core(
         let mrow = row.mul(&cidx(bps)).add(&acc_row(&warp_row, a, &cfg));
         c_t = g.store(c_t, c, MoveIdx::block((0, 0, mrow.clone(), nidx.clone()), 2));
     }
+}
+
+/// Split-K [`gemm_core`]: partitions the K reduction across `k_splits` workgroups
+/// per C tile so a small `(n/block)²` grid still fills the machine. Workgroup
+/// `(tile, k_slice)` (the latter on `block_idx[1]`, so this requires `l2_swizzle`
+/// — which frees `block_idx[1]`) computes the `block×block` tile's *partial* sum
+/// over K-strips `[k_slice·spk, (k_slice+1)·spk)` and writes it to
+/// `scratch[k_slice]`. The caller sums `scratch` over `k_slice` (a graph reduce).
+/// Single-buffered, same per-tile inner loop as [`gemm_core`].
+#[allow(clippy::too_many_arguments)]
+fn gemm_core_splitk(
+    ker: &Kernel,
+    n: usize,
+    cfg: MatmulCfg,
+    k_step: usize,
+    k_splits: usize,
+    c_gl: GL,
+    a_gl: GL,
+    b_gl: GL,
+) {
+    assert_eq!(n % cfg.block, 0, "split-K N={n} must be a multiple of block {}", cfg.block);
+    assert_eq!(k_step % 16, 0, "k_step={k_step} must be a multiple of 16");
+    assert!(cfg.l2_swizzle, "split-K needs l2_swizzle (block_idx[1] carries k_slice)");
+    let strips = n / k_step;
+    assert_eq!(strips % k_splits, 0, "split-K: strips {strips} must divide k_splits {k_splits}");
+    let spk = (strips / k_splits) as i64; // K-strips per slice
+    let reg = cfg.reg();
+    let g = ker.group_2d(cfg.wave_rows, cfg.wave_cols);
+    let bf16 = DType::BFloat16;
+
+    let a_smem = ker.shared_sw((cfg.block, k_step), bf16.clone(), TileLayout::Row);
+    let b_smem = ker.shared_sw((k_step, cfg.block), bf16.clone(), TileLayout::Row);
+
+    let (row, col) = block_coords(ker, n, n, &cfg);
+    let warp_row = g.warp_row();
+    let warp_col = g.warp_col();
+    let k_slice = ker.block_idx[1].clone(); // 0..k_splits
+    let k_origin = k_slice.mul(&cidx(spk)); // first global K-strip of this slice
+
+    let accs: Vec<RT> = (0..cfg.n_accum).map(|_| g.zero(ker.acc((reg, reg), TileLayout::Col))).collect();
+
+    let lp = ker.loop_static(spk);
+    let strip = k_origin.add(lp.index()); // global K-strip = k_slice*spk + t
+
+    let (a_smem, b_smem) = if cfg.vec_load {
+        (
+            g.fill_local_vec(a_smem, a_gl, &[Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(&strip)], 2),
+            g.fill_local_vec(b_smem, b_gl, &[Idx::Const(0), Idx::Const(0), Idx::from(&strip), Idx::from(&col)], 2),
+        )
+    } else {
+        (
+            g.load(a_smem, a_gl, MoveIdx::block((0, 0, row.clone(), strip.clone()), 2)),
+            g.load(b_smem, b_gl, MoveIdx::block((0, 0, strip.clone(), col.clone()), 2)),
+        )
+    };
+
+    let bb = g.load(
+        ker.operand((k_step, reg), bf16.clone(), TileLayout::Col),
+        b_smem.subtile((k_step, reg), (0, warp_col.clone())),
+        MoveIdx::default(),
+    );
+    let a_subs: Vec<RT> = (0..cfg.n_accum)
+        .map(|a| {
+            g.load(
+                ker.operand((reg, k_step), bf16.clone(), TileLayout::Row),
+                a_smem.subtile((reg, k_step), (acc_row(&warp_row, a, &cfg), 0)),
+                MoveIdx::default(),
+            )
+        })
+        .collect();
+
+    let mut bar_deps: smallvec::SmallVec<[Arc<UOp>; 4]> = smallvec![bb.uop().clone()];
+    bar_deps.extend(a_subs.iter().skip(1).map(|t| t.uop().clone()));
+    let sync = a_subs[0].uop().barrier(bar_deps);
+    let bb = bb.after(smallvec![sync.clone()]);
+    let a_subs: Vec<RT> = a_subs.into_iter().map(|t| t.after(smallvec![sync.clone()])).collect();
+
+    let mut prev_out: Option<Arc<UOp>> = None;
+    for (a, a_sub) in a_subs.iter().enumerate() {
+        let a_sub = match &prev_out {
+            Some(p) => a_sub.after(smallvec![p.clone()]),
+            None => a_sub.clone(),
+        };
+        prev_out = Some(g.mma_ab(accs[a].clone(), &a_sub, &bb).uop().clone());
+    }
+    let ended = lp.close();
+    let final_accs: Vec<RT> = accs.iter().map(|c| c.after(smallvec![ended.clone()])).collect();
+
+    // Epilogue: store the partial tile into `scratch[k_slice]` (leading dim = k_slice).
+    let bps = cfg.blocks_per_side() as i64;
+    let nidx = col.mul(&cidx(bps)).add(&warp_col);
+    let mut c_t = c_gl;
+    for (a, c) in final_accs.into_iter().enumerate() {
+        let mrow = row.mul(&cidx(bps)).add(&acc_row(&warp_row, a, &cfg));
+        c_t = g.store(c_t, c, MoveIdx::block((k_slice.clone(), 0, mrow.clone(), nidx.clone()), 2));
+    }
+}
+
+/// Bind the split-K ABI — output `scratch[k_splits, 1, n, n]` (f32 partials), inputs
+/// `a`/`b` `[1,1,n,n]` bf16 — and run [`gemm_core_splitk`]. The caller launches with
+/// grid `[(n/block)², k_splits, 1]` and reduces `scratch` over axis 0.
+pub fn build_matmul_splitk(ker: &Kernel, n: usize, cfg: MatmulCfg, k_splits: usize) {
+    let bf16 = DType::BFloat16;
+    let (outs, ins) = ker.bind_abi(
+        &[GlSpec::new(&[k_splits, 1, n, n], DType::Float32)],
+        &[GlSpec::new(&[1, 1, n, n], bf16.clone()), GlSpec::new(&[1, 1, n, n], bf16)],
+    );
+    gemm_core_splitk(ker, n, cfg, cfg.k_step(), k_splits, outs[0].clone(), ins[0].clone(), ins[1].clone());
+}
+
+/// Reference gfx942 CU count (MI300X) for the split-K grid target. A smaller SKU
+/// just over-splits slightly (more reduce traffic), so an exact count isn't needed.
+const SPLITK_CU_TARGET: usize = 304;
+
+/// Choose `k_splits` so the `n_tiles · k_splits` grid covers ~2× the CUs when the
+/// plain `(n/block)²` grid is too small to fill the machine. Returns 1 (no split)
+/// when the grid is already large enough or K can't be divided usefully. Picks the
+/// largest divisor of `strips` not exceeding the saturation target, bounding the
+/// reduce overhead.
+fn split_k_for(n: usize, cfg: MatmulCfg) -> usize {
+    if !cfg.l2_swizzle {
+        return 1; // split-K needs block_idx[1] free
+    }
+    let strips = n / cfg.k_step();
+    let n_tiles = (n / cfg.block).pow(2);
+    // Only split when the plain grid is *well* under the machine — otherwise the
+    // scratch round-trip of the reduce outweighs the added parallelism (at n_tiles ≈
+    // CU the grid already fills the GPU).
+    if n_tiles >= SPLITK_CU_TARGET / 2 || strips <= 1 {
+        return 1;
+    }
+    // Target ~1·CU total workgroups: past that the scratch round-trip of the reduce
+    // costs more than the extra parallelism buys (measured: k=4 beats k=8 at N=1024).
+    let target = SPLITK_CU_TARGET.div_ceil(n_tiles).max(1);
+    // Largest divisor of `strips` that is ≤ target (and ≥ 1).
+    (1..=strips).rev().find(|d| strips.is_multiple_of(*d) && *d <= target).unwrap_or(1)
 }
