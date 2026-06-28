@@ -127,14 +127,21 @@ fn run_count(uop: &Arc<UOp>) -> u64 {
     #[allow(clippy::mutable_key_type)]
     let in_scope = InScopeRangesProperty::get(uop);
 
+    // Saturating: a range with an unbounded/symbolic `vmax` (e.g. a data-dependent
+    // dynamic-loop bound with no sound range) reports `i64::MAX`; nested inside
+    // another loop its trip product overflows `u64`. `run_count` is only a "place
+    // deepest in loops" sort key, so saturating to `u64::MAX` is correct (the
+    // faithful equivalent of tinygrad's big-int product). For every kernel whose
+    // trips fit in `u64` this is identical to the old `.product()`, and it also
+    // fixes the prior release-mode wrap (debug panicked; release silently mis-ordered).
     in_scope
         .iter()
         .map(|key| match key.0.vmax() {
-            ConstValue::Int(v) => (v + 1) as u64,
-            ConstValue::UInt(v) => v + 1,
+            ConstValue::Int(v) if *v >= 0 => (*v as u64).saturating_add(1),
+            ConstValue::UInt(v) => (*v).saturating_add(1),
             _ => 1,
         })
-        .product()
+        .fold(1u64, |acc, n| acc.saturating_mul(n))
 }
 
 /// Priority assignment matching tinygrad's linearizer.py:24-32.
