@@ -1,4 +1,5 @@
 mod arch;
+mod bitonic;
 mod elementwise;
 mod fa;
 mod golden;

@@ -23,6 +23,7 @@ use crate::index::{Idx, cidx, flat_offset};
 use crate::kernel::Kernel;
 use crate::tile::{GL, RT, RegTile, ST};
 
+mod bitonic;
 mod elementwise;
 mod mma;
 mod movement;
@@ -365,6 +366,17 @@ impl<'k> Group<'k> {
 
     pub(super) fn finalize_reg(&self, t: RT<'k>, ended: Arc<UOp>) -> RT<'k> {
         self.finalize_tile(t, ended)
+    }
+    /// Record ONE grouped two-output terminal store (`END(GROUP(STORE, STORE))`)
+    /// and rewrap BOTH register tiles after it — the [`RT`] analog of the
+    /// arg-reduce `finalize_pair`. One END closes the shared loops exactly once; a
+    /// per-store `.end()` would double-`END` a range. Used by the paired
+    /// value/index ops (`arg_compare_exchange` and the bitonic helpers).
+    pub(super) fn finalize_reg_pair(&self, a: RT<'k>, b: RT<'k>, ended: Arc<UOp>) -> (RT<'k>, RT<'k>) {
+        self.ker.push_store(ended.clone(), a.uop().clone());
+        let a = a.rewrap(a.uop().after(smallvec![ended.clone()]));
+        let b = b.rewrap(b.uop().after(smallvec![ended]));
+        (a, b)
     }
     /// Record `ended` as a terminal store and rewrap the register tile so later
     /// reads order after it (tinygrad `dst.after(dst_store)`).

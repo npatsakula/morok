@@ -278,6 +278,24 @@ pub struct RT<'k> {
 
 impl<'k> RT<'k> {
     tile_accessors_ker!();
+    /// A fresh register tile with the SAME logical shape, layout, base fragment,
+    /// and dtype, but a **distinct** backing buffer (a new `DefineReg`). The
+    /// sorting-network stages need a clean destination each pass (a
+    /// compare-exchange reads its source across lanes while writing the
+    /// destination, so an in-place rewrite would race), and the bitonic helpers
+    /// allocate the per-stage scratch through this.
+    pub fn alloc_like(&self) -> RT<'k> {
+        let flat: usize = self.shape.iter().product();
+        let buf = self.ker.alloc_reg(flat, self.elem.clone());
+        RT {
+            buf,
+            shape: self.shape.clone(),
+            layout: self.layout,
+            base: self.base,
+            elem: self.elem.clone(),
+            ker: self.ker,
+        }
+    }
     pub fn rewrap(&self, new_uop: Arc<UOp>) -> Self {
         RT {
             buf: new_uop,

@@ -10,23 +10,26 @@
 //! in (an augmentation that smuggled it through a bf16 WMMA operand would lose its
 //! precision), replicated along the query axis so every `(m, n)` reads `c_sq[m]`.
 //!
-//! **Stage 2** ([`build_knn_topk`]) streams the corpus in [`TM`]-tall tiles and
-//! keeps, per query, the running unsorted top-K nearest corpus rows via a
-//! flashlib-style **argmin-insert**: no score recompute, no in-kernel sort. The
-//! final K-ordering is offloaded to the generic graph in Stage 3.
+//! **Stage 2** ([`build_knn_topk`]) streams the corpus in [`TM`]`= 16`-wide tiles
+//! and keeps, per query, a running top-K **sorted ascending** by a counted
+//! **bitonic sorting network** (no `loop_dynamic`, no GPU-hang risk): each tile's
+//! candidate scores are bitonic-argsorted once and merged into the running top-K
+//! ([`crate::group`]'s `bitonic_argsort` / `bitonic_merge_topk`), replacing the old
+//! serialized k-step argmin-insert. The final exact re-sort/distances still run in
+//! the generic graph (Stage 3).
 //!
-//! Orientation (mirrors [`crate::kernels::fa::fa_qk`]'s `QKᵀ`): the **corpus `m`
-//! is the reduced / row axis** and the query `n` the column, so Stage 2's running
-//! top-K over the corpus folds the score tile's row — the inner-carrying axis on
-//! both the gfx942 normal accumulator (matrix-col reduce) and the gfx1151 wave32
-//! even/odd interleave accumulator (matrix-row reduce); the caller arranges the
-//! tile, exactly as FA does. The cross MMA is `mma_atb(score, cᵀ, xᵀ)` (both
-//! operands the corpus/query tiles transposed to `[d, *]` Col fragments), giving
-//! `score[m, n] = Σ_d c[m,d]·x[n,d] = ⟨c[m], x[n]⟩` in the f32 accumulator.
+//! Stage 2 computes the score **query-major** (`score[n, m]`, query the row, corpus
+//! the **column**): the corpus axis then lands on the 16-wide lane axis
+//! (`laneid % 16`) of ONE WMMA fragment, exactly the axis a cross-lane butterfly
+//! sorts, so the bitonic network folds it with no LDS relayout. The cross MMA is
+//! `mma_atb(score, xᵀ, cᵀ)` (the swapped-operand transpose of Stage 1), and the
+//! running top-K's `[query, K-slot]` orientation makes the `[query, k]` output a
+//! direct (masked) store — no output transpose.
 //!
-//! The `c_sq` global is loaded into a tile declared with the SAME accumulator
-//! fragment as the cross MMA output, so it aligns lane-for-lane (both index the
-//! accumulator frag's `lane_rc`); the combine `score = c_sq − 2·cross` is then a
+//! Stage 1 ([`build_knn_score`]) keeps the original corpus-major `score[m, n]`
+//! orientation; [`score_tile`]'s `query_major` flag selects between the two. The
+//! `c_sq` global is loaded into the SAME accumulator fragment as the cross MMA
+//! output, so it aligns lane-for-lane; the combine `score = c_sq − 2·cross` is a
 //! pair of per-lane f32 elementwise ops. Arch-portable (gfx942 wave64 / gfx1151
 //! wave32) via the role-based fragment shortcuts — no hardcoded fragment.
 
@@ -36,33 +39,29 @@ use svod_dtype::DType;
 use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
 
-use crate::ArgDir;
 use crate::Group;
 use crate::arch::FragRole;
 use crate::group::MoveIdx;
-use crate::index::{Idx, cidx, load_at};
+use crate::index::{Idx, cidx};
 use crate::kernel::Kernel;
 use crate::scaffold::GlSpec;
-use crate::tile::{GL, RT, RV, RegTile};
-use crate::tiles::{TileLayout, VecLayout};
+use crate::tile::{GL, RT, RegTile};
+use crate::tiles::TileLayout;
 
 /// The WMMA tile edge (K=16); the cross MMA operates on 16×16 fragments, so the
 /// corpus / query / D dims must each be a multiple of it. Also the query width and
 /// the top-K slot padding (`K_pad`). The corpus stream tile height is [`TM`].
 const BLK: usize = 16;
 
-/// The corpus stream-tile height for Stage 2 ([`build_knn_topk`]) — a multiple of
-/// [`BLK`] (16). The corpus is streamed in `M/TM` tiles, so the running top-K runs
-/// `M/TM × k` insert passes instead of `M/16 × k`: a taller `TM` trades fewer insert
-/// passes for a proportionally heavier per-step reduce. Each `[TM, query]` score
-/// sub-tile is `TM/16` stacked 16-row WMMA fragments; `row_arg_reduce` folds across
-/// those stacked frags INTERNALLY, returning one logical-`TM`-row argmin per query
-/// (the in-primitive cross-frag fold). MUST be a multiple of 16; independent of the
-/// query width and `K_pad`
-/// (both stay [`BLK`]). `32` is the measured gfx1151 optimum (≈9–22% faster than the
-/// `BLK`-tall stream, the win growing with `M`); `64` over-grows the per-step cost
-/// and regresses, so the sweet spot is `2·BLK`, not maximal.
-const TM: usize = 32;
+/// The corpus stream-tile width for Stage 2 ([`build_knn_topk`]). The corpus is
+/// streamed in `M/TM` tiles, and per tile the [`TM`]-wide candidate scores are sorted
+/// by a cross-lane bitonic network and merged into the sorted running top-K. The
+/// bitonic sort folds the corpus along the 16-wide lane axis (`laneid % 16`) of ONE
+/// WMMA fragment, so `TM` is pinned to [`BLK`] (16): a wider tile would span multiple
+/// corpus fragments, which the single-fragment butterfly cannot reach across without
+/// an extra inter-fragment merge. (Tunable only by extending the network — see the
+/// merge helpers in [`crate::group`].)
+const TM: usize = BLK;
 
 /// The GPU arch(es) this kernel is built for: gfx942 (CDNA3 MFMA, wave64) and
 /// gfx1151 (RDNA3.5 WMMA, wave32). Both resolve the accumulator/operand fragments
@@ -71,7 +70,6 @@ const TM: usize = 32;
 pub const KNN_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151];
 
 const POS_INF: f64 = f64::INFINITY;
-const NEG_INF: f64 = f64::NEG_INFINITY;
 
 fn fconst(dt: &DType, v: f64) -> Arc<UOp> {
     UOp::const_(dt.clone(), ConstValue::Float(v))
@@ -115,6 +113,7 @@ fn score_tile<'k>(
     c_sq_gl: &GL,
     m_blk: &Idx,
     masked: bool,
+    query_major: bool,
 ) -> RT<'k> {
     let bf16 = DType::BFloat16;
     let (row, col) = (TileLayout::Row, TileLayout::Col);
@@ -129,21 +128,34 @@ fn score_tile<'k>(
     let c_reg = warp.load(c_reg, c_smem, MoveIdx::default());
     let c_reg_t = warp.transpose(c_reg_t, &c_reg);
 
-    // score[m, n] = Σ_d c[m,d]·x[n,d] = ⟨c[m], x[n]⟩ (corpus = row, query = col).
+    // The score `‖c[m]‖² − 2·⟨x[n],c[m]⟩` in one of two orientations:
+    // - `query_major = false` (Stage 1 [`build_knn_score`]): `score[m, n]` — corpus
+    //   the row, query the col (`mma_atb(cross, cᵀ, xᵀ)`); `c_sq` rides axis 2.
+    // - `query_major = true` (Stage 2 [`build_knn_topk`]): `score[n, m]` — query the
+    //   row, **corpus the col** (`mma_atb(cross, xᵀ, cᵀ)`), so the corpus axis lands
+    //   on `laneid % 16` and the running-top-K's cross-lane bitonic sort folds it;
+    //   `c_sq[m]` rides axis 3 (replicated along the query rows).
     // The MMA accumulator must be RE-ZEROED each corpus iteration: when `m_blk` is the
     // rolled corpus-loop index, anchor the zero-fill on it (`cross.after([loop_range])`,
     // exactly `fa_qk`'s `warp.zero(lp.reinit(att))`) or the constant fill hoists out of
     // the loop (`run_count = 1`) and the MMA accumulates the cross term across ALL tiles.
     // A `Const` `m_blk` (the single-tile Stage-1 path) adds no dependency.
-    let cross = warp.zero(reinit_on(ker.acc((m_rows, query), col), m_blk));
-    let cross = warp.mma_atb(cross, &c_reg_t, x_reg_t);
+    let acc_dims = if query_major { (query, m_rows) } else { (m_rows, query) };
+    let cross = warp.zero(reinit_on(ker.acc(acc_dims, col), m_blk));
+    let cross =
+        if query_major { warp.mma_atb(cross, x_reg_t, &c_reg_t) } else { warp.mma_atb(cross, &c_reg_t, x_reg_t) };
 
     // Load c_sq_rep[m_blk] into the SAME accumulator fragment + layout as the cross
     // MMA output, so the two align lane-for-lane (both index the accumulator frag's
-    // `lane_rc`; orientation-robust per the reductions/masked tests).
-    let cs_mi = MoveIdx::block((0, 0, m_blk.clone(), 0), 2);
+    // `lane_rc`; orientation-robust per the reductions/masked tests). The corpus-tile
+    // offset rides the corpus axis: axis 2 when corpus is the row, axis 3 when col.
+    let cs_mi = if query_major {
+        MoveIdx::block((0, 0, 0, m_blk.clone()), 2)
+    } else {
+        MoveIdx::block((0, 0, m_blk.clone(), 0), 2)
+    };
     let cs_mi = if masked { cs_mi.masked() } else { cs_mi };
-    let c_sq = warp.load(ker.acc((m_rows, query), col), c_sq_gl.clone(), cs_mi);
+    let c_sq = warp.load(ker.acc(acc_dims, col), c_sq_gl.clone(), cs_mi);
 
     // score = c_sq − 2·cross, all f32.
     let cross = warp.mul_scalar(cross, -2.0);
@@ -188,7 +200,7 @@ pub fn build_knn_score(ker: &Kernel, corpus: usize, query: usize, d: usize) {
     let x_reg_t = load_query_t(ker, &warp, query, d, &x_gl, &Idx::Const(0));
 
     // The whole corpus in one `(corpus, query)` tile (the Stage-1 single-store shape).
-    let score = score_tile(ker, &warp, corpus, query, d, &x_reg_t, &c_gl, &c_sq_gl, &Idx::Const(0), false);
+    let score = score_tile(ker, &warp, corpus, query, d, &x_reg_t, &c_gl, &c_sq_gl, &Idx::Const(0), false, false);
     let _ = warp.store(score_gl, score, MoveIdx::block((0, 0, 0, 0), 2));
 }
 
@@ -210,10 +222,12 @@ fn load_query_t<'k>(ker: &'k Kernel, warp: &Group<'k>, query: usize, d: usize, x
     warp.transpose(x_reg_t, &x_reg)
 }
 
-/// Per-query running top-K state: two Col-layout `[K_pad=BLK, query]` register
-/// tiles — `val` (f32, K-slot = row, seeded `+∞`) and `idx` (Int32, seeded `−1`).
-/// `row_arg_reduce` folds the K-slot (row) axis on both archs, so a `Max` reduce
-/// yields the per-query running-worst slot to evict.
+/// Per-query running top-K state: two `Col`-layout `[query, K_pad=BLK]` register
+/// tiles — `val` (f32) and `idx` (Int32) — kept **sorted ascending** along the
+/// K-slot (column = `laneid % 16`) axis. Slots `[0, k)` hold the running `k` smallest
+/// (ascending); slots `[k, 16)` are `+∞` padding (idx `−1`). Each corpus tile's
+/// candidates are bitonic-argsorted and merged in via [`Group::bitonic_merge_topk`],
+/// which keeps the 16 smallest of the two ascending runs.
 struct TopK<'k> {
     val: RT<'k>,
     idx: RT<'k>,
@@ -222,37 +236,44 @@ struct TopK<'k> {
 /// Build the x²-free KNN running-top-K kernel into the bound ABI.
 ///
 /// ABI (outputs then inputs):
-/// - `idx` (`[1, 1, query, k]`, Int32) — the **unsorted** K nearest corpus indices
-///   per query (final K-ordering offloaded to the generic graph in Stage 3).
-/// - `val` (`[1, 1, query, k]`, f32) — their x²-free scores.
+/// - `idx` (`[1, 1, query, k]`, Int32) — the K nearest corpus indices per query,
+///   sorted ascending by score (the final exact re-sort still runs in Stage 3).
+/// - `val` (`[1, 1, query, k]`, f32) — their x²-free scores (ascending).
 /// - `x` (`[1, 1, query, d]`, bf16) — the query rows.
 /// - `c` (`[1, 1, corpus, d]`, bf16) — the corpus rows.
-/// - `c_sq_rep` (`[1, 1, corpus, query]`, f32) — `‖c[m]‖²` replicated along query.
+/// - `c_sq_rep` (`[1, 1, query, corpus]`, f32) — `‖c[m]‖²` replicated along query
+///   (the query-major orientation: corpus is the last axis).
 ///
 /// Single-warp, correctness-first, arch-portable via role fragments. The corpus is
-/// streamed in [`TM`]-tall tiles through a [`crate::loop_scope::Loop`]; per tile
-/// the running top-K is updated by up to `k` argmin-insert steps. Built **rolled**
-/// (`arg_reduce` panics under unroll).
+/// streamed in [`TM`]`= 16`-wide tiles through a [`crate::loop_scope::Loop`]; per
+/// tile the candidate scores are **bitonic-argsorted** once and merged into the
+/// sorted running top-K ([`TopK`]) — replacing the serialized k-step argmin-insert
+/// with a counted sorting network. Built **rolled**.
+///
+/// The score is computed **query-major** (`score[n, m]`, corpus the column), so the
+/// corpus axis lands on the 16-wide lane axis (`laneid % 16`) of one WMMA fragment
+/// and the cross-lane bitonic network folds it directly. The running top-K then
+/// already has query rows / K-slot columns, so the `[query, k]` output is a direct
+/// (masked) store with no transpose.
 ///
 /// **Query-block grid tiling:** each workgroup processes ONE `query`(= [`BLK`]) block,
 /// selected by `block_idx[0]` — the grid is `[ceil(Npad/16), 1, 1]`, so it covers a
 /// wide `[Npad, *]` query input. The block index offsets ONLY the query (x) load and
 /// the output store (query-independent steps — the corpus stream, score, `c_sq` load,
-/// argmin-insert — are block-relative); a `[1,1,1]` grid ⇒ block 0 ⇒ the single-block
+/// sort/merge — are block-relative); a `[1,1,1]` grid ⇒ block 0 ⇒ the single-block
 /// path. The `[1,1,query,*]` x/output globals address the wider real buffers because
 /// the offset rides the (identical) row stride, not the declared extent.
 ///
 /// # Panics
 /// Panics unless `query`/`d` are multiples of [`BLK`], `corpus > 0`, `1 ≤ k ≤ BLK`,
-/// and `query ≤ BLK` (the v1 single-query-fragment constraint: a wider query would
-/// fold distinct queries together in the per-query `row_arg_reduce`).
+/// and `query ≤ BLK` (the single-query-fragment constraint).
 pub fn build_knn_topk(ker: &Kernel, corpus: usize, query: usize, d: usize, k: usize) {
     Kernel::assert_divisible(query, BLK, "KNN topk query");
     Kernel::assert_divisible(d, BLK, "KNN topk D");
     Kernel::assert_divisible(TM, BLK, "KNN topk TM");
     assert!(corpus > 0, "KNN topk corpus must be > 0");
     assert!((1..=BLK).contains(&k), "KNN topk k must be in 1..=16");
-    assert!(query <= BLK, "KNN topk query must be <= 16 (single query fragment) for v1");
+    assert!(query <= BLK, "KNN topk query must be <= 16 (single query fragment)");
 
     let bf16 = DType::BFloat16;
     let f32 = DType::Float32;
@@ -261,248 +282,118 @@ pub fn build_knn_topk(ker: &Kernel, corpus: usize, query: usize, d: usize, k: us
     let warp = ker.warp();
     let acc_frag = ker.caps.frag(FragRole::Accumulator);
 
-    // ABI: outputs (idx i32, val f32) then inputs (x, c — bf16; c_sq_rep — f32).
+    // ABI: outputs (idx i32, val f32) then inputs (x, c — bf16; c_sq_rep — f32). The
+    // c_sq is query-major (`[1,1,query,corpus]`): `‖c[m]‖²` replicated along query.
     let (outs, ins) = ker.bind_abi(
         &[GlSpec::new(&[1, 1, query, k], i32.clone()), GlSpec::new(&[1, 1, query, k], f32.clone())],
         &[
             GlSpec::new(&[1, 1, query, d], bf16.clone()),
             GlSpec::new(&[1, 1, corpus, d], bf16.clone()),
-            GlSpec::new(&[1, 1, corpus, query], f32.clone()),
+            GlSpec::new(&[1, 1, query, corpus], f32.clone()),
         ],
     );
     let (idx_gl, val_gl, x_gl, c_gl, c_sq_gl): (GL, GL, GL, GL, GL) =
         (outs[0].clone(), outs[1].clone(), ins[0].clone(), ins[1].clone(), ins[2].clone());
 
-    // Query-block grid tiling: each workgroup owns one 16-query block, selected by
-    // `block_idx[0]`. The grid is `[ceil(Npad/16), 1, 1]`, so the offset rides ONLY the
-    // query (x) load and the output store — the corpus stream, score, c_sq load (all
-    // query-independent), and the per-query argmin-insert are block-relative and
-    // unchanged. A `[1,1,1]` grid ⇒ block 0 ⇒ the single-query-block path.
     let q_blk = Idx::Uop(ker.block_idx[0].clone());
     let x_reg_t = load_query_t(ker, &warp, query, d, &x_gl, &q_blk);
 
-    // Running top-K state (Col `[K_pad=BLK, query]`). The fragment is 16-wide but only
-    // the first `k` K-slots are live; seed slots `[0, k)` to `+∞` (empty, fillable) and
-    // the padding `[k, 16)` to `−∞` so the `row_arg_reduce(Max)` worst-slot search NEVER
-    // evicts into a padding slot (a `−∞` always loses the Max to a real `+∞`/finite
-    // slot). Without this the worst is forever the `+∞` of an unused slot and inserts
-    // leak past the stored first-`k` columns. `idx` seeds to `−1` everywhere.
-    let val0 = seed_topk_val(ker, &warp, query, k);
-    let idx0 = warp.map(ker.rt((BLK, query), i32.clone(), col, acc_frag), |_, _| iconst32(-1));
+    // Running top-K state (Col `[query, K_pad=BLK]`, K-slot = column = `laneid % 16`),
+    // sorted ascending. All 16 slots seed to `+∞` (idx `−1`): the bitonic merge keeps
+    // the 16 smallest, so real candidates always beat the `+∞` padding and settle into
+    // the leading `k` slots. No `−∞` padding trick is needed (that was the Max-evict's).
+    let val0 = warp.map(ker.acc((query, BLK), col), |x, _| fconst(&x.dtype(), POS_INF));
+    let idx0 = warp.map(ker.rt((query, BLK), i32.clone(), col, acc_frag), |_, _| iconst32(-1));
     let topk = TopK { val: val0, idx: idx0 };
 
-    // Stream the corpus in TM-tall tiles via the FA running-state Loop carry.
+    // Stream the corpus in TM-wide tiles via the FA running-state Loop carry.
     let tiles = corpus.div_ceil(TM);
     let masked = !corpus.is_multiple_of(TM);
     let lp = ker.loop_static(tiles as i64);
     let m_tile = lp.index().clone();
     let topk = TopK { val: lp.reinit(topk.val), idx: lp.reinit(topk.idx) };
 
-    let topk = topk_insert(ker, &warp, corpus, query, d, k, &x_reg_t, &c_gl, &c_sq_gl, &m_tile, masked, topk);
+    let topk = topk_merge(ker, &warp, corpus, query, d, &x_reg_t, &c_gl, &c_sq_gl, &m_tile, masked, topk);
 
-    // Close the loop once: `topk_insert` chained the idx-evict store (the last
-    // terminal) to depend on the val-evict store and the score updates, so the single
-    // loop-closing END scopes the whole insert body (the matmul multi-accumulator
-    // idiom). Both carried tiles then read their post-loop value via `.after([end])`.
+    // Close the loop once: `bitonic_merge_topk`'s final `arg_compare_exchange` is the
+    // body's terminal grouped (val, idx) store; the single loop-closing END scopes the
+    // whole sort/merge body. Both carried tiles read their post-loop value via `.after`.
     let ended = lp.close();
     let idx_after = topk.idx.after(&ended);
     let val_after = topk.val.after(&ended);
 
-    store_topk(ker, &warp, query, k, &idx_gl, &val_gl, &idx_after, &val_after, &q_blk);
+    store_topk(&warp, k, &idx_gl, &val_gl, &idx_after, &val_after, &q_blk);
 }
 
-/// One corpus tile's argmin-insert: compute the score sub-tile, mask ragged rows
-/// to `+∞`, then run up to `k` steps of (find the per-query tile-min over corpus,
-/// compare to the running worst slot, conditionally evict, remove the consumed
-/// element). Returns the updated running top-K.
+/// One corpus tile's sort-and-merge: compute the query-major score sub-tile
+/// (`[query, TM]`, corpus = column = `laneid % 16`), mask ragged corpus columns to
+/// `+∞`, tag each candidate with its global corpus index, bitonic-argsort the
+/// candidates ascending, then merge them into the sorted running top-K (keep the 16
+/// smallest). Returns the updated running top-K.
 #[allow(clippy::too_many_arguments)]
-fn topk_insert<'k>(
+fn topk_merge<'k>(
     ker: &'k Kernel,
     warp: &Group<'k>,
     corpus: usize,
     query: usize,
     d: usize,
-    k: usize,
     x_reg_t: &RT<'k>,
     c_gl: &GL,
     c_sq_gl: &GL,
     m_tile: &Arc<UOp>,
     masked: bool,
-    mut topk: TopK<'k>,
+    topk: TopK<'k>,
 ) -> TopK<'k> {
-    // score[m, n] for this corpus tile — `TM`-tall (`TM/16` stacked 16-row frags),
-    // corpus = row, query = col.
-    let mut score = score_tile(ker, warp, TM, query, d, x_reg_t, c_gl, c_sq_gl, &Idx::Uop(m_tile.clone()), masked);
+    let i32 = DType::Int32;
+    let col = TileLayout::Col;
+    let acc_frag = ker.caps.frag(FragRole::Accumulator);
+
+    // score[query, corpus] for this corpus tile (query-major, corpus = column).
+    let mut score =
+        score_tile(ker, warp, TM, query, d, x_reg_t, c_gl, c_sq_gl, &Idx::Uop(m_tile.clone()), masked, true);
     if masked {
-        score = mask_ragged_rows(warp, score, m_tile, corpus);
+        score = mask_ragged_cols(warp, score, m_tile, corpus);
     }
 
-    // Each step's stores are CHAINED so a single loop-closing END (in the caller)
-    // scopes the whole insert body inside the rolled corpus loop (the matmul
-    // multi-accumulator idiom): idx-evict ← val-evict, score-remove ← idx-evict, and
-    // the next step's reduces read the chained `score`/`topk.val`. The idx-evict of
-    // the LAST step is the loop's terminal store, so its `remove_used` (dead — no next
-    // argmin) is skipped, leaving idx-evict last on the store stack for `lp.close()`.
-    for step in 0..k {
-        // a. per-query tile-min over the TM corpus rows. `row_arg_reduce` folds the
-        //    `[TM, query]` Col score's `TM/16` stacked height-frags INTERNALLY (the
-        //    in-primitive cross-frag fold), returning one `(row_min, row_arg)` per
-        //    query directly — `row_arg` is the in-tile corpus row `0..TM` (global
-        //    over the stacked frags). `global_m = m_tile·TM + row_arg`.
-        let (row_min, row_arg) =
-            warp.row_arg_reduce(seed_val(ker, warp, BLK, POS_INF), seed_idx(ker, warp, BLK), &score, ArgDir::Min);
-        // `global_m = m_tile·TM + row_arg` in a FRESH RV — `warp.map` rewrites its
-        // tile in place, so mapping `row_arg` directly would clobber the in-tile index
-        // that `remove_used` still needs to mask the consumed element (the `k > 1`
-        // per-step argmin-skip). Read `row_arg` (anchored) into the new buffer instead.
-        let mbase = m_tile.mul(&cidx(TM as i64)).cast(DType::Int32);
-        let (ra_buf, ra_shape) = (warp.anchor(row_arg.uop()), row_arg.shape().to_vec());
-        let global_m = warp.map(seed_idx(ker, warp, BLK), move |_, idx| {
-            load_at(&ra_buf, &ra_shape, idx).try_add(&mbase).expect("global_m")
-        });
+    // Each candidate's global corpus index `m_tile·TM + col` (the in-tile column is the
+    // arch-correct `lane_col`, lifted by the corpus-tile block via `map_position`).
+    let cand_idx = warp.map_position(
+        ker.rt((query, TM), i32, col, acc_frag),
+        Idx::Const(0),
+        Idx::Uop(m_tile.clone()),
+        |_, _, _, corpus_col| corpus_col.cast(DType::Int32),
+    );
 
-        // b. per-query running-worst value + its K-slot index. The running top-K is
-        //    `[K_pad=BLK, query]` (one frag), so this reduce needs no fold.
-        let (worst, evict) =
-            warp.row_arg_reduce(seed_val(ker, warp, BLK, NEG_INF), seed_idx(ker, warp, BLK), &topk.val, ArgDir::Max);
-
-        // d. Evict (conditional rewrite by K-slot): write row_min/global_m into the
-        //    `evict[query]` K-slot where `row_min[query] < worst[query]` (do_insert).
-        //    Chain idx-evict after val-evict so both carried writes share one END.
-        topk.val = evict_slot(warp, topk.val, &evict, &row_min, &worst, &row_min);
-        topk.idx = evict_slot(warp, topk.idx.after(&topk.val), &evict, &row_min, &worst, &global_m);
-
-        // e. Remove the consumed corpus element so the next step's argmin skips it
-        //    (chained after idx-evict). Skipped on the last step (no next argmin), so
-        //    idx-evict stays the loop's terminal store.
-        if step + 1 < k {
-            score = remove_used(warp, score.after(&topk.idx), &row_arg, &row_min, &worst);
-        }
-    }
-    topk
+    // Sort the candidates ascending, then merge into the running top-K (smallest 16).
+    let (sorted_v, sorted_i) = warp.bitonic_argsort(score, cand_idx);
+    // The merge yields FRESH buffers; copy them back into the loop-carried `topk`
+    // tiles (the rolled-loop carry needs the SAME buffer read-then-written each trip,
+    // so the next iteration sees this tile's result rather than the `+∞` seed). The
+    // idx copy chains after the val copy so one loop-closing END scopes both.
+    let (merged_v, merged_i) = warp.bitonic_merge_topk(&topk.val, &topk.idx, &sorted_v, &sorted_i);
+    let val = warp.copy(topk.val, &merged_v);
+    let idx = warp.copy(topk.idx.after(&val), &merged_i);
+    TopK { val, idx }
 }
 
-/// A length-`length` f32 RV seeded to `init` (the `row_arg_reduce` value
-/// accumulator; it actually overwrites the seed with `dir.init()`, but a same-dtype
-/// seed keeps the alloc explicit). `length` is always `BLK` (one output slot per
-/// lane): `row_arg_reduce` collapses the whole reduced axis — including the score
-/// tile's `TM/16` stacked frags, folded internally — into that single slot.
-fn seed_val<'k>(ker: &'k Kernel, warp: &Group<'k>, length: usize, init: f64) -> RV<'k> {
-    let frag = ker.caps.frag(FragRole::Accumulator);
-    warp.clear_rv(ker.rv(length, DType::Float32, VecLayout::Ortho, frag), init)
-}
-/// A length-`length` Int32 index RV seeded to `−1` (the `row_arg_reduce` index acc).
-fn seed_idx<'k>(ker: &'k Kernel, warp: &Group<'k>, length: usize) -> RV<'k> {
-    let frag = ker.caps.frag(FragRole::Accumulator);
-    warp.clear_rv(ker.rv(length, DType::Int32, VecLayout::Ortho, frag), -1.0)
-}
-
-/// Seed the running-top-K value tile (Col `[K_pad=BLK, query]`): K-slots `[0, k)`
-/// to `+∞` (empty, fillable), the padding slots `[k, 16)` to `−∞` so the worst-slot
-/// `row_arg_reduce(Max)` never evicts into a padding slot. The per-element K-slot
-/// is its global row position, computed arch-correctly via [`Group::map_position`].
-/// Both branches are constant (`x` is only used for its dtype), so this uses the
-/// seed form directly instead of [`Group::mask_where`].
-fn seed_topk_val<'k>(ker: &'k Kernel, warp: &Group<'k>, query: usize, k: usize) -> RT<'k> {
-    let tile = ker.acc((BLK, query), TileLayout::Col);
-    let k_c = cidx(k as i64);
-    warp.map_position(tile, Idx::Const(0), Idx::Const(0), move |x, _idx, k_pos, _q_pos| {
-        UOp::try_where(k_pos.lt(&k_c), fconst(&x.dtype(), POS_INF), fconst(&x.dtype(), NEG_INF))
-            .expect("topk val seed where")
-    })
-}
-
-/// Read a per-query RV scalar inside a `map` over a Col `[*, query]` tile: the
-/// query is the tile's column / width axis, so it selects RV slot `idx[1]` exactly
-/// as [`crate::math`]'s `combine_rv` does for a Col tile. The RV buffer is anchored
-/// so a constant-address read of a carried (loop) RV is not hoisted out of the
-/// corpus loop. Returns `(anchored_buf, shape)` to capture into the `map` closure.
-fn rv_query_src<'k>(warp: &Group<'k>, rv: &RV<'k>) -> (Arc<UOp>, Vec<usize>) {
-    (warp.anchor(rv.uop()), rv.shape().to_vec())
-}
-
-/// Mask ragged corpus rows (`global_m ≥ corpus`) of a Col `[TM, query]` score
-/// tile to `+∞` via [`Group::mask_where`], so the per-query argmin never selects
-/// the padding the masked score load zeroed. The per-element corpus row
-/// (`global_m = m_tile·TM + idx[0]·16 + m_if`) is computed arch-correctly inside
-/// `mask_where` — the `m_tile` block offset threads the stream stride.
-fn mask_ragged_rows<'k>(warp: &Group<'k>, score: RT<'k>, m_tile: &Arc<UOp>, corpus: usize) -> RT<'k> {
+/// Mask ragged corpus columns (`global_m ≥ corpus`) of a query-major Col
+/// `[query, TM]` score tile to `+∞` via [`Group::mask_where`], so the bitonic sort
+/// never ranks the padding the masked score load zeroed. The per-element corpus
+/// column (`global_m = m_tile·TM + lane_col`) is computed arch-correctly inside
+/// `mask_where`; the corpus-tile block offset rides the column (`col_blk`).
+fn mask_ragged_cols<'k>(warp: &Group<'k>, score: RT<'k>, m_tile: &Arc<UOp>, corpus: usize) -> RT<'k> {
     let bound = cidx(corpus as i64);
-    warp.mask_where(score, Idx::Uop(m_tile.clone()), Idx::Const(0), POS_INF, move |global_m, _| global_m.ge(&bound))
+    warp.mask_where(score, Idx::Const(0), Idx::Uop(m_tile.clone()), POS_INF, move |_, global_m| global_m.ge(&bound))
 }
 
-/// Evict step (used for BOTH the f32 value tile and its Int32 index partner): in
-/// the Col `[BLK, query]` tile, overwrite the element at the per-query worst K-slot
-/// `evict[query]` with `repl[query]` when `do_insert = row_min[query] <
-/// worst[query]`, leaving every other slot. Selecting both outputs (value tile and
-/// index tile) by the SAME predicate keeps the kept value paired with its index.
-/// The K-slot of an element is its global row position (computed via
-/// [`Group::map_position`]); the per-query RVs are read by the col-tile index
-/// (`idx[1]`), the multi-RV generalization of `combine_rv`.
-#[allow(clippy::too_many_arguments)]
-fn evict_slot<'k>(
-    warp: &Group<'k>,
-    tile: RT<'k>,
-    evict: &RV<'k>,
-    row_min: &RV<'k>,
-    worst: &RV<'k>,
-    repl: &RV<'k>,
-) -> RT<'k> {
-    let (e_buf, e_shape) = rv_query_src(warp, evict);
-    let (rmin_buf, rmin_shape) = rv_query_src(warp, row_min);
-    let (worst_buf, worst_shape) = rv_query_src(warp, worst);
-    let (repl_buf, repl_shape) = rv_query_src(warp, repl);
-    warp.map_position(tile, Idx::Const(0), Idx::Const(0), move |x, idx, k_pos, _col| {
-        let k_pos = k_pos.cast(DType::Int32);
-        let q = idx[1].clone();
-        let e = load_at(&e_buf, &e_shape, &[q.clone(), Idx::Const(0)]);
-        let rmin = load_at(&rmin_buf, &rmin_shape, &[q.clone(), Idx::Const(0)]);
-        let wst = load_at(&worst_buf, &worst_shape, &[q.clone(), Idx::Const(0)]);
-        let mut rpl = load_at(&repl_buf, &repl_shape, &[q, Idx::Const(0)]);
-        if rpl.dtype() != x.dtype() {
-            rpl = rpl.cast(x.dtype());
-        }
-        let do_insert = rmin.lt(&wst);
-        let hit = k_pos.eq(&e).and_(&do_insert);
-        UOp::try_where(hit, rpl, x.clone()).expect("evict where")
-    })
-}
-
-/// Remove the consumed corpus element from a Col `[TM, query]` score tile: set
-/// `score[m == row_arg[query], query] = +∞` where `row_min[query] < worst[query]`
-/// (i.e. the element actually inserted this step), so the next step's argmin skips
-/// it. `row_arg` is the in-tile corpus row (0..TM) `row_arg_reduce` folded across
-/// the stacked frags, compared against the element's global row position (computed
-/// via [`Group::map_position`]). Exactly one tile position matches (the frag
-/// decomposition `0..TM ↔ (idx[0], in-frag row)` is a bijection), so no
-/// double-removal.
-fn remove_used<'k>(warp: &Group<'k>, score: RT<'k>, row_arg: &RV<'k>, row_min: &RV<'k>, worst: &RV<'k>) -> RT<'k> {
-    let (ra_buf, ra_shape) = rv_query_src(warp, row_arg);
-    let (rmin_buf, rmin_shape) = rv_query_src(warp, row_min);
-    let (worst_buf, worst_shape) = rv_query_src(warp, worst);
-    warp.map_position(score, Idx::Const(0), Idx::Const(0), move |x, idx, m_local, _col| {
-        let m_local = m_local.cast(DType::Int32);
-        let q = idx[1].clone();
-        let ra = load_at(&ra_buf, &ra_shape, &[q.clone(), Idx::Const(0)]);
-        let rmin = load_at(&rmin_buf, &rmin_shape, &[q.clone(), Idx::Const(0)]);
-        let wst = load_at(&worst_buf, &worst_shape, &[q, Idx::Const(0)]);
-        let do_insert = rmin.lt(&wst);
-        let hit = m_local.eq(&ra).and_(&do_insert);
-        UOp::try_where(hit, fconst(&x.dtype(), POS_INF), x.clone()).expect("remove-used where")
-    })
-}
-
-/// Store the unsorted running top-K to the `[1, 1, query, k]` outputs. The running
-/// tiles are Col `[K_slot=BLK, query]`; the output wants `[query, K_slot]`, the
-/// transpose. So each tile is `transpose`d into a Row `[query, BLK]`
-/// AccumulatorT-fragment tile (the FA output-store relayout) and stored with the
-/// boundary mask, which drops the columns `≥ k` (the K-slots past the requested
-/// `k`). `k == BLK` needs no mask; a partial `k` gates the trailing columns.
-#[allow(clippy::too_many_arguments)]
+/// Store the sorted running top-K to the `[1, 1, query, k]` outputs. The running
+/// tiles are already Col `[query, K_slot=BLK]` (query the row, K-slot the column), so
+/// the `[query, k]` output is a DIRECT store of the leading `k` columns — no
+/// transpose (the query-major orientation's payoff). `k == BLK` needs no mask; a
+/// partial `k` gates the trailing columns via the boundary mask. The query-row block
+/// is offset by `q_blk` (the store-side mirror of `load_query_t`).
 fn store_topk<'k>(
-    ker: &'k Kernel,
     warp: &Group<'k>,
-    query: usize,
     k: usize,
     idx_gl: &GL,
     val_gl: &GL,
@@ -510,28 +401,15 @@ fn store_topk<'k>(
     val_after: &RT<'k>,
     q_blk: &Idx,
 ) {
-    let row = TileLayout::Row;
-    let i32 = DType::Int32;
-    let acc_t = ker.caps.frag(FragRole::AccumulatorT);
-    // Offset the output store's query-row block by `q_blk` (this workgroup's query
-    // block, in query-tile-height units), the store-side mirror of `load_query_t`'s
-    // load offset, so each workgroup writes its own 16-query rows of the `[Npad, k]`
-    // output. `Idx::Const(0)` ⇒ the single-block (`N ≤ 16`) path.
     let mi = if k.is_multiple_of(BLK) {
         MoveIdx::block((0, 0, q_blk.clone(), 0), 2)
     } else {
         MoveIdx::block((0, 0, q_blk.clone(), 0), 2).masked()
     };
-
-    // Transpose Col [BLK, query] → Row [query, BLK] (AccumulatorT), then masked-store
-    // its first `k` columns to the [query, k] output. Both transposes (which push
-    // intermediate REG stores) come BEFORE both global stores, so the kernel's final
-    // two terminal stores — popped by `finish(2)` as the SINK sources — are exactly
-    // the two output writes.
-    let val_t = warp.transpose(ker.acc_t((query, BLK), row), val_after);
-    let idx_t = warp.transpose(ker.rt((query, BLK), i32.clone(), row, acc_t), idx_after);
-    let _ = warp.store(val_gl.clone(), val_t, mi.clone());
-    let _ = warp.store(idx_gl.clone(), idx_t, mi);
+    // Both global stores come last on the store stack, so `finish(2)` pops exactly
+    // these two output writes as the SINK sources.
+    let _ = warp.store(val_gl.clone(), val_after.clone(), mi.clone());
+    let _ = warp.store(idx_gl.clone(), idx_after.clone(), mi);
 }
 
 /// Round `x` up to the next multiple of [`BLK`] (16) — the WMMA tile edge the
@@ -666,10 +544,11 @@ fn pad_operand(t: &Tensor, rows: usize, d: usize, rows_pad: usize, d_pad: usize)
     padded.try_reshape([1isize, 1, rows_pad as isize, d_pad as isize]).context(crate::launch::OperandSnafu)
 }
 
-/// `c_sq[m] = Σ_d c_f32[m,d]²` in f32, replicated to the kernel's `[1, 1, M, BLK]`
-/// `c_sq_rep` operand (each `(m, n)` reads `c_sq[m]`). `c_sq` is query-independent, so
-/// one query-block width (`BLK = 16`) suffices regardless of `N` — every query block
-/// reads the same slice.
+/// `c_sq[m] = Σ_d c_f32[m,d]²` in f32, replicated to the kernel's **query-major**
+/// `[1, 1, BLK, M]` `c_sq_rep` operand (each `(n, m)` reads `c_sq[m]` — corpus the
+/// last axis, broadcast along the `BLK = 16` query rows). `c_sq` is query-independent,
+/// so one query-block height suffices regardless of `N` — every query block reads the
+/// same slice. The query-major layout matches [`build_knn_topk`]'s `score[n, m]` tile.
 fn c_sq_replicated(c_f32: &Tensor, m: usize) -> crate::LaunchResult<Tensor> {
     use snafu::ResultExt;
     let c_sq = c_f32
@@ -680,9 +559,9 @@ fn c_sq_replicated(c_f32: &Tensor, m: usize) -> crate::LaunchResult<Tensor> {
         .keepdim(true)
         .call()
         .context(crate::launch::OperandSnafu)?; // [M, 1]
-    c_sq.try_reshape([1isize, 1, m as isize, 1])
+    c_sq.try_reshape([1isize, 1, 1, m as isize])
         .context(crate::launch::OperandSnafu)?
-        .try_expand([1isize, 1, m as isize, BLK as isize])
+        .try_expand([1isize, 1, BLK as isize, m as isize])
         .context(crate::launch::OperandSnafu)
 }
 

@@ -165,11 +165,11 @@ fn topk_sink(corpus: usize, query: usize, d: usize, k: usize, caps: ArchCaps) ->
     ker.finish(2)
 }
 
-/// The topk kernel's graph carries the full argmin-insert machinery on BOTH archs:
-/// the score WMMA, the index-carrying `row_arg_reduce` `ds_bpermute` `Op::Custom`
-/// gathers (two reduces per insert step — a corpus-min and a K-slot-max — each
-/// riding the arch's `reduce_tree`), the `Op::Ternary` evict/mask `where`s, and the
-/// two `[query, k]` output stores. Built rolled (the corpus loop).
+/// The topk kernel's graph carries the bitonic sort/merge machinery on BOTH archs:
+/// the score WMMA, the `arg_compare_exchange` `ds_bpermute` `Op::Custom` butterflies
+/// (value + index each ride their own gather, across the argsort's 10 stages and the
+/// merge's reverse + 4 stages), the `Op::Ternary` keep-selects, the `Lt`/`Eq`
+/// total-order compares, and the two `[query, k]` output stores. Built rolled.
 #[test]
 fn test_knn_topk_graph_shape() {
     for caps in [ArchCaps::GFX942, ArchCaps::for_arch(AmdArch::Gfx1151)] {
@@ -179,23 +179,23 @@ fn test_knn_topk_graph_shape() {
 
         assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "{arch:?}: score WMMA");
 
-        // The arg-reduce cross-lane gathers (value + index each ride a ds_bpermute):
-        // many across the k insert steps × 2 reduces × reduce_tree length.
+        // The bitonic butterflies' cross-lane gathers (value + index each ride a
+        // ds_bpermute): many across the argsort (10) + merge (reverse + 4) stages.
         let customs = topo.iter().filter(|u| matches!(u.op(), Op::Custom { .. })).count();
-        assert!(customs >= 4 * caps.reduce_tree().len(), "{arch:?}: arg_reduce ds_bpermute Op::Customs, got {customs}");
+        assert!(customs >= 16, "{arch:?}: bitonic ds_bpermute Op::Customs, got {customs}");
 
-        // The evict/mask conditional rewrites are `where` (Ternary) selects.
+        // The keep-selects are `where` (Ternary).
         let ternaries = topo.iter().filter(|u| matches!(u.op(), Op::Ternary(..))).count();
-        assert!(ternaries >= k, "{arch:?}: evict/remove Ternary wheres, got {ternaries}");
+        assert!(ternaries >= k, "{arch:?}: keep-select Ternary wheres, got {ternaries}");
 
-        // The do_insert/tie predicates: Lt and Eq compares.
+        // The (value, index) total-order predicates: Lt and Eq compares.
         assert!(
             topo.iter().any(|u| matches!(u.op(), Op::Binary(svod_ir::BinaryOp::Lt, ..))),
-            "{arch:?}: do_insert Lt compare"
+            "{arch:?}: total-order Lt compare"
         );
         assert!(
             topo.iter().any(|u| matches!(u.op(), Op::Binary(svod_ir::BinaryOp::Eq, ..))),
-            "{arch:?}: K-slot Eq compare"
+            "{arch:?}: total-order Eq compare"
         );
 
         // Two outputs: a Store into the i32 idx Param (slot 0) and the f32 val (slot 1).
@@ -212,14 +212,16 @@ fn test_knn_topk_graph_shape() {
 
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib knn::test_knn_topk_amd -- --ignored --nocapture`.
 ///
-/// Random `x[query, d]`, `c[corpus, d]` (bf16); `c_sq[m] = Σ_d c[m,d]²` in f32
-/// replicated along query. The kernel emits the UNSORTED K nearest corpus indices
-/// per query; the reference is the x²-free score `c_sq[m] − 2·⟨c[m],x[n]⟩` (as in
+/// Random `x[query, d]`, `c[corpus, d]` (bf16); `c_sq[m] = Σ_d c[m,d]²` in f32,
+/// query-major. The kernel bitonic-sorts each corpus tile and merges into a sorted
+/// running top-K, emitting the K nearest corpus indices per query (ascending by
+/// score); the reference is the x²-free score `c_sq[m] − 2·⟨c[m],x[n]⟩` (as in
 /// [`test_knn_score_amd`]), permuted to `[query, corpus]` and `topk(k, largest =
-/// false)`. Both index lists are sorted per query and compared as sets (the kernel
-/// is unsorted; ties → smaller corpus index, which both honor). Values compared at
-/// √D-scaled tolerance. Covers a forced symmetric tie, a ragged corpus, `k = 1`,
-/// and `k` near 16.
+/// false)`. Both index lists are sorted per query and compared as sets (ties →
+/// smaller corpus index, which both honor). Values compared at √D-scaled tolerance.
+/// Covers a forced symmetric tie, a ragged corpus, `k = 1`, `k` near 16, and
+/// multi-tile corpora (TM = 16) so the cross-tile merge / running-top-K eviction is
+/// exercised with the true top-K landing in late tiles.
 #[test]
 #[ignore]
 fn test_knn_topk_amd() {
@@ -236,15 +238,19 @@ fn test_knn_topk_amd() {
 
     // (corpus, query, d, k, tie): a square/ragged sweep over k. `tie` forces two
     // corpus rows equidistant to query 0 (a duplicated corpus row) so the smaller
-    // corpus index must be kept.
+    // corpus index must be kept. With TM = 16, corpus > 16 spans multiple tiles, so
+    // the larger corpora stress the cross-tile bitonic merge (late winners).
     let cases: &[(usize, usize, usize, usize, bool)] = &[
         (32, 16, 16, 1, false),
         (32, 16, 16, 4, false),
         (32, 16, 32, 8, false),
         (48, 16, 16, 16, false),
-        (40, 16, 16, 5, false), // ragged: 40 % 16 != 0
-        (32, 16, 16, 1, true),  // forced tie on query 0 (k=1: the tied pair {0,1} competes
-                                // for the single slot → the smaller index 0 must win)
+        (40, 16, 16, 5, false),  // ragged: 40 % 16 != 0
+        (80, 16, 16, 4, false),  // 5 tiles: late-tile winners exercise the merge
+        (96, 16, 32, 16, false), // 6 tiles, full k = 16
+        (50, 16, 16, 3, false),  // ragged + multi-tile (50 % 16 != 0)
+        (32, 16, 16, 1, true),   // forced tie on query 0 (k=1: the tied pair {0,1} competes
+                                 // for the single slot → the smaller index 0 must win)
     ];
 
     for &(corpus, query, d, k, tie) in cases {
@@ -269,18 +275,15 @@ fn test_knn_topk_amd() {
             x.realize().expect("realize tie x");
         }
 
-        // c_sq[m] = Σ_d c[m,d]² in f32, replicated to [corpus, query].
+        // c_sq[m] = Σ_d c[m,d]² in f32, query-major [query, corpus] (c_sq[m] broadcast
+        // along the query rows) — matching build_knn_topk's score[n, m] orientation.
         let cf = c.cast(DType::Float32).expect("c→f32");
-        let mut c_sq_rep = cf
-            .try_mul(&cf)
-            .expect("c²")
-            .sum_with()
-            .axes(1isize)
-            .keepdim(true)
-            .call()
-            .expect("Σ_d c²")
-            .try_expand([corpus, query])
-            .expect("replicate along query");
+        let csq = cf.try_mul(&cf).expect("c²").sum_with().axes(1isize).keepdim(true).call().expect("Σ_d c²"); // [M,1]
+        let mut c_sq_rep = csq
+            .try_reshape([1isize, corpus as isize])
+            .expect("→[1,M]")
+            .try_expand([query, corpus])
+            .expect("replicate along query rows");
         c_sq_rep.realize().expect("realize c_sq_rep");
 
         let mut idx_out = Tensor::empty(&[1, 1, query, k], DType::Int32);
@@ -293,19 +296,20 @@ fn test_knn_topk_amd() {
         let got_idx = idx_out.as_vec::<i32>().expect("read idx");
         let got_val = val_out.as_vec::<f32>().expect("read val");
 
-        // Reference: x²-free score [corpus, query] → [query, corpus] → topk smallest.
+        // Reference: x²-free score [query, corpus] (query-major, matching the kernel),
+        // then topk smallest over the corpus axis. cross_qc[n,m] = ⟨x[n],c[m]⟩;
+        // c_sq_rep is c_sq[m] broadcast along query rows.
         let xf = x.cast(DType::Float32).expect("x→f32");
-        let cross = cf.matmul(&xf.try_permute(&[1, 0]).expect("xᵀ")).expect("c @ xᵀ");
+        let cross_qc = xf.matmul(&cf.try_permute(&[1, 0]).expect("cᵀ")).expect("x @ cᵀ"); // [query, corpus]
         let two = Tensor::from_slice([2.0f32]);
-        let score = c_sq_rep.try_sub(&cross.try_mul(&two).expect("2·cross")).expect("score [corpus, query]");
-        let score_qc = score.try_permute(&[1, 0]).expect("→[query, corpus]");
+        let score_qc = c_sq_rep.try_sub(&cross_qc.try_mul(&two).expect("2·cross")).expect("score [query, corpus]");
         let (mut ref_val, mut ref_idx) = score_qc.topk(k, -1, false).expect("ref topk");
         ref_val.realize().expect("realize ref_val");
         ref_idx.realize().expect("realize ref_idx");
         let exp_idx = ref_idx.as_vec::<i32>().expect("read ref idx");
         let exp_val = ref_val.as_vec::<f32>().expect("read ref val");
 
-        // Compare per query as SETS (the kernel is unsorted): sort both index lists.
+        // Compare per query as SETS (order-agnostic): sort both index lists.
         let atol = 0.02 * (d as f32).sqrt();
         let mut ok = true;
         for q in 0..query {
