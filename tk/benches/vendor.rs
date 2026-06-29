@@ -30,6 +30,10 @@ type HblDestroy = unsafe extern "C" fn(*mut c_void);
 type KnnCreate = unsafe extern "C" fn(i64, i64, i64, u64) -> *mut c_void;
 type KnnRunNs = unsafe extern "C" fn(*mut c_void, c_int, c_int) -> f64;
 type KnnDestroy = unsafe extern "C" fn(*mut c_void);
+// Complete kmeans-assign floor: hipBLASLt GEMM + rocPRIM segmented arg-min (N, K, D, max_ws).
+type KmeansCreate = unsafe extern "C" fn(i64, i64, i64, u64) -> *mut c_void;
+type KmeansRunNs = unsafe extern "C" fn(*mut c_void, c_int, c_int) -> f64;
+type KmeansDestroy = unsafe extern "C" fn(*mut c_void);
 
 struct HblShim {
     _lib: Library,
@@ -40,6 +44,9 @@ struct HblShim {
     knn_create: KnnCreate,
     knn_run_ns: KnnRunNs,
     knn_destroy: KnnDestroy,
+    kmeans_create: KmeansCreate,
+    kmeans_run_ns: KmeansRunNs,
+    kmeans_destroy: KmeansDestroy,
 }
 
 fn load_hbl() -> Option<HblShim> {
@@ -55,7 +62,22 @@ fn load_hbl() -> Option<HblShim> {
         let knn_create = *lib.get::<KnnCreate>(b"knn_create\0").ok()?;
         let knn_run_ns = *lib.get::<KnnRunNs>(b"knn_run_ns\0").ok()?;
         let knn_destroy = *lib.get::<KnnDestroy>(b"knn_destroy\0").ok()?;
-        Some(HblShim { _lib: lib, device_ok, create, run_ns, destroy, knn_create, knn_run_ns, knn_destroy })
+        let kmeans_create = *lib.get::<KmeansCreate>(b"kmeans_create\0").ok()?;
+        let kmeans_run_ns = *lib.get::<KmeansRunNs>(b"kmeans_run_ns\0").ok()?;
+        let kmeans_destroy = *lib.get::<KmeansDestroy>(b"kmeans_destroy\0").ok()?;
+        Some(HblShim {
+            _lib: lib,
+            device_ok,
+            create,
+            run_ns,
+            destroy,
+            knn_create,
+            knn_run_ns,
+            knn_destroy,
+            kmeans_create,
+            kmeans_run_ns,
+            kmeans_destroy,
+        })
     }
 }
 
@@ -139,6 +161,28 @@ fn bench_knn_full(group: &mut BenchmarkGroup<'_, WallTime>, shim: &HblShim, n: i
     unsafe { (shim.knn_destroy)(plan) };
 }
 
+/// Bench the COMPLETE vendor kmeans-assign for `[N,D]` points vs `[K,D]`
+/// centroids: hipBLASLt GEMM (x·cᵀ -> [N,K] cross) + rocPRIM segmented arg-min
+/// over K (the nearest-centroid assignment). Row id `vendor`. The shim
+/// column-tiles the GEMM internally for large K.
+fn bench_kmeans_full(group: &mut BenchmarkGroup<'_, WallTime>, shim: &HblShim, n: i64, k: i64, d: i64) {
+    // SAFETY: the shim self-allocates; null on unsupported config / OOM.
+    let plan = unsafe { (shim.kmeans_create)(n, k, d, MAX_WS) };
+    if plan.is_null() {
+        eprintln!("svod-tk vendor kmeans: hipBLASLt+rocPRIM kmeans-assign unavailable for N={n} K={k}; skipping");
+        return;
+    }
+    group.bench_with_input(BenchmarkId::new("vendor", k as usize), &k, |b, _| {
+        b.iter_custom(|iters| {
+            // SAFETY: `plan` valid for the bench's duration.
+            let ns = unsafe { (shim.kmeans_run_ns)(plan, WARMUP, iters_to_c(iters)) };
+            Duration::from_nanos((ns * iters as f64) as u64)
+        });
+    });
+    // SAFETY: from kmeans_create, destroyed once.
+    unsafe { (shim.kmeans_destroy)(plan) };
+}
+
 /// Square `C[n,n] = A·B` — the hipBLASLt floor for `svod_tk::matmul`.
 fn bench_matmul(c: &mut Criterion) {
     let Some(shim) = gemm_ready() else {
@@ -154,8 +198,10 @@ fn bench_matmul(c: &mut Criterion) {
     group.finish();
 }
 
-/// Cross GEMM `x·cᵀ = [N,D]×[D,K] = [N,K]` — the GEMM floor for the kmeans-assign
-/// score (the ‖c‖² + argmin fusion is tk's free extra work; this is the dominant cost).
+/// kmeans-assign floor: `vendor` = complete hipBLASLt GEMM (`x·cᵀ -> [N,K] cross`)
+/// then rocPRIM segmented arg-min over K — apples-to-apples vs `svod_tk::kmeans_assign`,
+/// which fuses GEMM with the nearest-centroid argmin. `vendor_gemm` = the cross GEMM
+/// only, so the GEMM-vs-argmin split is visible on the vendor side too.
 fn bench_kmeans(c: &mut Criterion) {
     let Some(shim) = gemm_ready() else {
         eprintln!("svod-tk vendor kmeans: skipped (no hipBLASLt shim / GPU)");
@@ -165,12 +211,15 @@ fn bench_kmeans(c: &mut Criterion) {
     let mut group = c.benchmark_group("kmeans");
     for &k in &[64usize, 256, 1024, 4096] {
         group.throughput(Throughput::Elements((2.0 * (n * k * d) as f64) as u64));
+        // Complete vendor kmeans-assign: hipBLASLt GEMM + rocPRIM segmented arg-min.
+        bench_kmeans_full(&mut group, shim, n as i64, k as i64, d as i64);
+        // Cross GEMM score floor only (no argmin), for reference / the split.
         bench_gemm(
             &mut group,
             shim,
             k,
             GemmShape { m: n as i64, n: k as i64, k: d as i64, trans_a: 0, trans_b: 1 },
-            "vendor",
+            "vendor_gemm",
         );
     }
     group.finish();
