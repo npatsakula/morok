@@ -395,7 +395,7 @@ fn test_matmul_graph_amd() {
 }
 
 /// The size-adaptive matmul is correct at every N, picking [`SMALL_CFG`] for
-/// small N (where the 256×256 block under-occupies the machine) and [`M1_CFG`]
+/// small N (where a larger block under-occupies the machine) and [`MID_CFG`]
 /// otherwise.
 ///
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_adaptive_amd -- --ignored --nocapture`.
