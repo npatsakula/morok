@@ -132,3 +132,18 @@ impl ArchCaps {
         self.arch.is_cdna()
     }
 }
+
+/// What a launcher resolves from the **physical device**: the arch-derived
+/// [`ArchCaps`] plus topology scalars that vary across SKUs and virtualized
+/// partitions of the *same* arch (a partition exposes fewer CUs than the full
+/// device). Kept distinct from [`ArchCaps`] so the latter stays a pure function of
+/// the arch; these fields are not arch-derivable and come from the KFD probe in
+/// [`crate::target::resolve_supported_profile`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceProfile {
+    /// Arch-derived capabilities (wave size, fragment shapes).
+    pub caps: ArchCaps,
+    /// Whole-device compute-unit count (`simd_count / simd_per_cu` from KFD) — the
+    /// grid-saturation target for the split-K / corpus-split / FA-tile heuristics.
+    pub cu_count: usize,
+}

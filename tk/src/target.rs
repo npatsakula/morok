@@ -51,6 +51,27 @@ pub fn resolve_supported_arch(spec: &DeviceSpec, supported: &'static [AmdArch]) 
     Ok(arch)
 }
 
+/// Like [`resolve_supported_arch`], but returns the full [`crate::DeviceProfile`] —
+/// the arch-derived [`crate::ArchCaps`] **plus the topology-derived CU count** (a
+/// single KFD probe), so grid-saturation heuristics size against the real device's
+/// CU count instead of a hard-coded constant. This is the resolution entry the kernel
+/// launchers use; the CU count is deliberately *not* an [`crate::ArchCaps`] field (it
+/// is not arch-derived — it varies by SKU and virtualized partition).
+pub fn resolve_supported_profile(spec: &DeviceSpec, supported: &'static [AmdArch]) -> Result<crate::DeviceProfile> {
+    let DeviceSpec::Amd { device_id } = spec else {
+        return UnsupportedArchSnafu { supported, spec: spec.clone(), resolved: None }.fail();
+    };
+    let (arch, cu_count) =
+        svod_device::registry::resolve_amd_arch_and_cu(*device_id).map(|(a, cu)| (Some(a), cu)).unwrap_or((None, 0));
+    let Some(arch) = arch.filter(|a| supported.contains(a)) else {
+        return UnsupportedArchSnafu { supported, spec: spec.clone(), resolved: arch }.fail();
+    };
+    if !svod_runtime::amd::has_amdgpu_target() {
+        return ToolchainUnavailableSnafu.fail();
+    }
+    Ok(crate::DeviceProfile { caps: crate::ArchCaps::for_arch(arch), cu_count })
+}
+
 /// [`resolve_supported_arch`] discarding the arch — the gate-only wrapper for
 /// launchers that don't need the resolved arch (the SDPA-fallback eligibility
 /// check folds this into [`resolve_supported_arch`] directly instead).

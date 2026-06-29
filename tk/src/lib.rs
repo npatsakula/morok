@@ -73,7 +73,7 @@ pub use kernels::matmul::matmul;
 pub use launch::{Error as LaunchError, Result as LaunchResult};
 
 // ── Author your own kernel (the tile DSL) ───────────────────────────────────
-pub use arch::ArchCaps;
+pub use arch::{ArchCaps, DeviceProfile};
 pub use group::{ArgDir, Group, LoadInto, MoveIdx, StoreInto, SwapDir};
 pub use index::IntoIdxs;
 pub use kernel::Kernel;
@@ -84,7 +84,7 @@ pub use swizzle::Swizzle;
 pub use tile::{AfterDep, AfterDeps, GL, RT, RV, RegTile, ST};
 pub use tiles::{
     BaseShape, RT_16X16, RT_16X32, RT_32X16, RT_32X32, RTBaseShape, ST_16X16, ST_16X16_SWIZZLED, ST_16X32, ST_32X16,
-    ST_32X32, STBaseShape, TileLayout, VecLayout,
+    ST_32X32, STBaseShape, TileLayout, VecLayout, WMMA_EDGE,
 };
 
 // ── Debug your kernel (direct dispatch against concrete buffers) ─────────────

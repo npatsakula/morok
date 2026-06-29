@@ -51,7 +51,7 @@ use crate::tiles::TileLayout;
 /// The WMMA tile edge (K=16); the cross MMA operates on 16×16 fragments, so the
 /// corpus / query / D dims must each be a multiple of it. Also the query width and
 /// the top-K slot padding (`K_pad`). The corpus stream tile height is [`TM`].
-const BLK: usize = 16;
+const BLK: usize = crate::tiles::WMMA_EDGE;
 
 /// The corpus stream-tile width for Stage 2 ([`build_knn_topk`]): the corpus is
 /// streamed in `M/TM` tiles, each sorted by a cross-lane bitonic network and merged
@@ -258,13 +258,25 @@ struct TopK<'k> {
 /// # Panics
 /// Panics unless `query`/`d` are multiples of [`BLK`], `corpus > 0`, `1 ≤ k ≤ BLK`,
 /// and `query ≤ BLK` (the single-query-fragment constraint).
-pub fn build_knn_topk(ker: &Kernel, corpus: usize, query: usize, d: usize, k: usize) {
+pub fn build_knn_topk(
+    ker: &Kernel,
+    corpus: usize,
+    query: usize,
+    d: usize,
+    k: usize,
+    c_splits: usize,
+    query_blocks: usize,
+) {
     Kernel::assert_divisible(query, BLK, "KNN topk query");
     Kernel::assert_divisible(d, BLK, "KNN topk D");
     Kernel::assert_divisible(TM, BLK, "KNN topk TM");
     assert!(corpus > 0, "KNN topk corpus must be > 0");
     assert!((1..=BLK).contains(&k), "KNN topk k must be in 1..=16");
     assert!(query <= BLK, "KNN topk query must be <= 16 (single query fragment)");
+    assert!(
+        c_splits >= 1 && corpus.div_ceil(TM).is_multiple_of(c_splits),
+        "KNN topk: c_splits must divide the corpus tiles"
+    );
 
     let bf16 = DType::BFloat16;
     let f32 = DType::Float32;
@@ -297,11 +309,19 @@ pub fn build_knn_topk(ker: &Kernel, corpus: usize, query: usize, d: usize, k: us
     let idx0 = warp.map(ker.rt((query, BLK), i32.clone(), col, acc_frag), |_, _| iconst32(-1));
     let topk = TopK { val: val0, idx: idx0 };
 
-    // Stream the corpus in TM-wide tiles via the FA running-state Loop carry.
+    // Corpus-split: this workgroup owns corpus slice `block_idx[1]` (0..c_splits),
+    // streaming only its `tiles/c_splits` TM-wide tiles. With `c_splits == 1` the grid's
+    // y-dim is 1 ⇒ `block_idx[1] == 0` ⇒ identical to the un-split path. Splitting the
+    // corpus across workgroups fills the machine (the query-only grid is `n/16`
+    // single-wave WGs, which under-fills a large device) and shortens the latency-bound
+    // bitonic chain; the
+    // `c_splits` partial top-Ks are merged in the graph tail.
     let tiles = corpus.div_ceil(TM);
     let masked = !corpus.is_multiple_of(TM);
-    let lp = ker.loop_static(tiles as i64);
-    let m_tile = lp.index().clone();
+    let tiles_per_split = tiles / c_splits;
+    let slice_off = ker.block_idx[1].mul(&cidx(tiles_per_split as i64)); // global tile base of this slice
+    let lp = ker.loop_static(tiles_per_split as i64);
+    let m_tile = slice_off.add(lp.index()); // global corpus-tile index = slice·tiles_per_split + local
     let topk = TopK { val: lp.reinit(topk.val), idx: lp.reinit(topk.idx) };
 
     let topk = topk_merge(ker, &warp, corpus, query, d, &x_reg_t, &c_gl, &c_sq_gl, &m_tile, masked, topk);
@@ -313,7 +333,12 @@ pub fn build_knn_topk(ker: &Kernel, corpus: usize, query: usize, d: usize, k: us
     let idx_after = topk.idx.after(&ended);
     let val_after = topk.val.after(&ended);
 
-    store_topk(&warp, k, &idx_gl, &val_gl, &idx_after, &val_after, &q_blk);
+    // Write the slice's partial top-K to its own query-block band: row block
+    // `c_slice·query_blocks + q_blk`, so the output stacks the `c_splits` partials as
+    // `[c_splits·Npad, k]` (the tail merges over the slice axis). `c_splits == 1`
+    // collapses to `q_blk`.
+    let q_blk_out = Idx::Uop(ker.block_idx[1].mul(&cidx(query_blocks as i64)).add(&ker.block_idx[0]));
+    store_topk(&warp, k, &idx_gl, &val_gl, &idx_after, &val_after, &q_blk_out);
 }
 
 /// One corpus tile's sort-and-merge: compute the query-major score sub-tile
@@ -474,11 +499,10 @@ pub fn knn(x: &Tensor, c: &Tensor, k: usize) -> crate::LaunchResult<Option<(Tens
     // The three-way policy (cf. `launch_custom`), inlined because the build yields a
     // tuple (`launch_custom` is single-Tensor): `None` for the wrong arch/toolchain
     // (caller's fallback), `Err` for a malformed request (handled above), `Some` when run.
-    let Some(arch) = crate::target::resolve_supported_arch(&x.device(), KNN_SUPPORTED_ARCHS).ok() else {
+    let Some(profile) = crate::target::resolve_supported_profile(&x.device(), KNN_SUPPORTED_ARCHS).ok() else {
         return Ok(None);
     };
-
-    let caps = crate::ArchCaps::for_arch(arch);
+    let caps = profile.caps;
     let (f32, bf16) = (DType::Float32, DType::BFloat16);
     let d_pad = pad16(dx);
     let n_pad = pad16(n);
@@ -498,14 +522,20 @@ pub fn knn(x: &Tensor, c: &Tensor, k: usize) -> crate::LaunchResult<Option<(Tens
     // [1,1,M,BLK] (one query-block width — every query block reads the same slice).
     let c_sq_rep = c_sq_replicated(&c_f32, m)?;
 
-    let idx_t = Tensor::empty(&[1, 1, n_pad, k], DType::Int32);
-    let val_t = Tensor::empty(&[1, 1, n_pad, k], f32.clone());
-    let grid = [(n_pad / BLK) as i64, 1, 1];
+    // Corpus-split: partition the corpus stream across `c_splits` workgroups (grid y)
+    // so a small query grid still fills the machine. Each (q_blk, c_slice)
+    // workgroup writes a partial top-K; the `c_splits` partials stack as
+    // `[1,1,c_splits·Npad,k]` and the graph merges them.
+    let query_blocks = n_pad / BLK;
+    let c_splits = choose_knn_split(query_blocks, m.div_ceil(TM), profile.cu_count);
+    let idx_t = Tensor::empty(&[1, 1, c_splits * n_pad, k], DType::Int32);
+    let val_t = Tensor::empty(&[1, 1, c_splits * n_pad, k], f32.clone());
+    let grid = [query_blocks as i64, c_splits as i64, 1];
     let block = caps.wave_size as i64;
 
     // The kernel processes ONE 16-query block per workgroup (`query = BLK`);
     // `block_idx[0]` selects the block, so its declared `[1,1,BLK,*]` x/output globals
-    // address the wider real `[1,1,Npad,*]` buffers (identical row stride).
+    // address the wider real `[1,1,c_splits·Npad,*]` buffers (identical row stride).
     let outs = crate::graph_launch_multi(
         "knn_topk",
         grid,
@@ -514,13 +544,71 @@ pub fn knn(x: &Tensor, c: &Tensor, k: usize) -> crate::LaunchResult<Option<(Tens
         &[&x_bf, &c_bf, &c_sq_rep],
         caps,
         move |ker| {
-            build_knn_topk(ker, m, BLK, d_pad, k);
+            build_knn_topk(ker, m, BLK, d_pad, k, c_splits, query_blocks);
             ker.finish(2)
         },
     )?;
     let (idx_raw, val_raw) = (outs[0].clone(), outs[1].clone());
 
-    knn_tail(&idx_raw, &val_raw, &x_f32, &c_f32, n, dx, k).map(Some)
+    // Merge the `c_splits` partial top-Ks per query into one (graph topk over the
+    // `c_splits·k` candidates), or pass through when un-split.
+    let (idx_m, val_m) =
+        if c_splits > 1 { knn_merge_partials(&idx_raw, &val_raw, c_splits, n_pad, k)? } else { (idx_raw, val_raw) };
+
+    knn_tail(&idx_m, &val_m, &x_f32, &c_f32, n, dx, k).map(Some)
+}
+
+/// Minimum corpus tiles before the corpus-split pays off. Splitting trades a shorter
+/// per-workgroup bitonic chain for a graph merge of the partials (a `topk` + scratch
+/// round-trip); on a bandwidth-limited part that merge only wins once the per-workgroup
+/// chain is long enough to dominate it. Measured: split helps at `tiles = 1024` (1.4×)
+/// but *regresses* at `tiles ≤ 128`, so gate well above that.
+const KNN_SPLIT_MIN_TILES: usize = 512;
+
+/// Choose `c_splits`. Only split when the per-workgroup corpus chain is long
+/// (`tiles ≥ KNN_SPLIT_MIN_TILES`) — otherwise the merge overhead outweighs the
+/// shorter chain. When splitting, target ~2·CU total workgroups (`cu_target` is the
+/// topology-derived device CU count via [`crate::DeviceProfile::cu_count`]; the topk
+/// workgroups are single-wave, so oversubscribe to hide the chain latency); pick the
+/// largest divisor of `tiles` not exceeding that, so each slice keeps whole tiles.
+fn choose_knn_split(query_blocks: usize, tiles: usize, cu_target: usize) -> usize {
+    if tiles < KNN_SPLIT_MIN_TILES {
+        return 1;
+    }
+    let target = (2 * cu_target).div_ceil(query_blocks.max(1)).max(1);
+    (1..=tiles).rev().find(|d| tiles.is_multiple_of(*d) && *d <= target).unwrap_or(1)
+}
+
+/// Merge the `c_splits` stacked partial top-Ks (`[1,1,c_splits·Npad,k]`, each query
+/// block sorted ascending) into one `[1,1,Npad,k]` top-K per query: reshape to
+/// `[c_splits, Npad, k]`, bring the `c_splits` candidates together per query
+/// (`[Npad, c_splits·k]`), take the `k` smallest, and gather their corpus indices.
+fn knn_merge_partials(
+    idx_raw: &Tensor,
+    val_raw: &Tensor,
+    c_splits: usize,
+    n_pad: usize,
+    k: usize,
+) -> crate::LaunchResult<(Tensor, Tensor)> {
+    use snafu::ResultExt;
+    let op = crate::launch::OperandSnafu;
+    let cand = (c_splits * k) as isize;
+    let cat = |t: &Tensor| -> crate::LaunchResult<Tensor> {
+        t.try_reshape([c_splits as isize, n_pad as isize, k as isize])
+            .context(op)?
+            .try_permute(&[1, 0, 2])
+            .context(op)?
+            .try_reshape([n_pad as isize, cand])
+            .context(op)
+    };
+    let (val_cat, idx_cat) = (cat(val_raw)?, cat(idx_raw)?);
+    // k smallest scores per query + their positions into the c_splits·k candidates.
+    let (val_m, perm) = val_cat.topk(k, 1, false).context(op)?;
+    let idx_m = idx_cat.gather(1, &perm).context(op)?;
+    Ok((
+        idx_m.try_reshape([1, 1, n_pad as isize, k as isize]).context(op)?,
+        val_m.try_reshape([1, 1, n_pad as isize, k as isize]).context(op)?,
+    ))
 }
 
 /// Zero-pad a `[rows, d]` tensor's last (`D`) axis to `d_pad` and its leading (row)

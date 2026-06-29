@@ -234,9 +234,9 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> crate::LaunchResult<Option<Tensor>> {
             Ok(())
         },
         true, // no runtime-applicability fallback — a bad size is an error, not `None`.
-        move |arch| {
-            let caps = crate::ArchCaps::for_arch(arch);
-            let cfg = cfg_for_arch(arch, n);
+        move |profile| {
+            let caps = profile.caps;
+            let cfg = cfg_for_arch(caps.arch, n);
             ensure!(
                 n % cfg.block == 0,
                 crate::launch::DimMultipleSnafu { kernel: "matmul", dim: "n", value: n, multiple: cfg.block }
@@ -246,7 +246,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> crate::LaunchResult<Option<Tensor>> {
             let a_bf = a.cast(DType::BFloat16).context(crate::launch::OperandSnafu)?;
             let b_bf = b.cast(DType::BFloat16).context(crate::launch::OperandSnafu)?;
             let threads = cfg.threads(caps.wave_size);
-            let k_splits = split_k_for(n, cfg);
+            let k_splits = split_k_for(n, cfg, profile.cu_count);
             if k_splits > 1 {
                 // Split-K: a `[(n/block)², k_splits]` grid keeps a small problem's grid
                 // wide enough to fill the machine. Each workgroup writes a partial tile
@@ -531,16 +531,14 @@ pub fn build_matmul_splitk(ker: &Kernel, n: usize, cfg: MatmulCfg, k_splits: usi
     gemm_core_splitk(ker, n, cfg, cfg.k_step(), k_splits, outs[0].clone(), ins[0].clone(), ins[1].clone());
 }
 
-/// Reference gfx942 CU count (MI300X) for the split-K grid target. A smaller SKU
-/// just over-splits slightly (more reduce traffic), so an exact count isn't needed.
-const SPLITK_CU_TARGET: usize = 304;
-
 /// Choose `k_splits` so the `n_tiles · k_splits` grid covers ~2× the CUs when the
-/// plain `(n/block)²` grid is too small to fill the machine. Returns 1 (no split)
-/// when the grid is already large enough or K can't be divided usefully. Picks the
-/// largest divisor of `strips` not exceeding the saturation target, bounding the
-/// reduce overhead.
-fn split_k_for(n: usize, cfg: MatmulCfg) -> usize {
+/// plain `(n/block)²` grid is too small to fill the machine. `cu_target` is the
+/// device CU count (topology-derived via [`crate::DeviceProfile::cu_count`]); a smaller
+/// SKU just over-splits slightly (more reduce traffic), so an exact count isn't
+/// needed. Returns 1 (no split) when the grid is already large enough or K can't be
+/// divided usefully. Picks the largest divisor of `strips` not exceeding the
+/// saturation target, bounding the reduce overhead.
+fn split_k_for(n: usize, cfg: MatmulCfg, cu_target: usize) -> usize {
     if !cfg.l2_swizzle {
         return 1; // split-K needs block_idx[1] free
     }
@@ -549,12 +547,12 @@ fn split_k_for(n: usize, cfg: MatmulCfg) -> usize {
     // Only split when the plain grid is *well* under the machine — otherwise the
     // scratch round-trip of the reduce outweighs the added parallelism (at n_tiles ≈
     // CU the grid already fills the GPU).
-    if n_tiles >= SPLITK_CU_TARGET / 2 || strips <= 1 {
+    if n_tiles >= cu_target / 2 || strips <= 1 {
         return 1;
     }
     // Target ~1·CU total workgroups: past that the scratch round-trip of the reduce
     // costs more than the extra parallelism buys (measured: k=4 beats k=8 at N=1024).
-    let target = SPLITK_CU_TARGET.div_ceil(n_tiles).max(1);
+    let target = cu_target.div_ceil(n_tiles).max(1);
     // Largest divisor of `strips` that is ≤ target (and ≥ 1).
     (1..=strips).rev().find(|d| strips.is_multiple_of(*d) && *d <= target).unwrap_or(1)
 }

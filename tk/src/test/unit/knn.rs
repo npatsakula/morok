@@ -161,7 +161,7 @@ fn topk_bufs(corpus: usize, query: usize, d: usize, k: usize) -> Vec<Arc<UOp>> {
 /// Build the KNN topk SINK for `(corpus, query, d, k)` on `caps` (GPU-free).
 fn topk_sink(corpus: usize, query: usize, d: usize, k: usize, caps: ArchCaps) -> Arc<UOp> {
     let ker = Kernel::new("knn_topk", [1, 1, 1], caps.wave_size as i64, topk_bufs(corpus, query, d, k), caps);
-    build_knn_topk(&ker, corpus, query, d, k);
+    build_knn_topk(&ker, corpus, query, d, k, 1, 1);
     ker.finish(2)
 }
 
@@ -289,7 +289,7 @@ fn test_knn_topk_amd() {
         let mut idx_out = Tensor::empty(&[1, 1, query, k], DType::Int32);
         let mut val_out = Tensor::empty(&[1, 1, query, k], DType::Float32);
         crate::run_kernel("knn_topk", [1, 1, 1], w, &mut [&mut idx_out, &mut val_out], &[&x, &c, &c_sq_rep], |ker| {
-            build_knn_topk(ker, corpus, query, d, k);
+            build_knn_topk(ker, corpus, query, d, k, 1, 1);
             ker.finish(2)
         })
         .expect("knn_topk launch");

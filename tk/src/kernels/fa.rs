@@ -27,7 +27,7 @@ use crate::tiles::TileLayout;
 /// The WMMA tile edge (gfx942 K=16). The QKᵀ / A·V WMMAs always operate on
 /// 16×16 fragments; Q/KV per-warp *tiles* are grids of `BLK`-edged fragments
 /// ([`Q_BLK`]/[`KV_BLK`]).
-const BLK: usize = 16;
+const BLK: usize = crate::tiles::WMMA_EDGE;
 
 /// Multi-wave warps per workgroup (the multi-wave occupancy lift, 8 waves/block):
 /// 8 wave64 warps = `8 * 64 = 512` threads per block. Each warp owns a distinct
@@ -71,8 +71,8 @@ pub const FA_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gf
 const FA_DIRECT_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942];
 
 /// Validate a direct-launch wrapper's device against [`FA_DIRECT_SUPPORTED_ARCHS`].
-fn fa_check_target(t: &Tensor) -> crate::LaunchResult<()> {
-    crate::target::check_target(&t.device(), FA_DIRECT_SUPPORTED_ARCHS)
+fn fa_check_target(t: &Tensor) -> crate::LaunchResult<crate::DeviceProfile> {
+    crate::target::resolve_supported_profile(&t.device(), FA_DIRECT_SUPPORTED_ARCHS)
 }
 
 /// Tuning knobs for [`build_fa_mw_rdb`] — the structured replacement for its former
@@ -483,14 +483,14 @@ pub(crate) fn build_fa_mw_rdb(
 }
 
 /// Per-warp tile for [`build_fa_mw_rdb`]: the bigger `{32,32}` (which amortizes the
-/// softmax over more MFMA) once its grid `b·h·n/(32·NUM_WARPS)` covers the ~304-CU
-/// machine and `N` divides `32·NUM_WARPS`; otherwise the baseline `{16,16}` (the
-/// bigger tile halves the grid, so it loses at low occupancy). The 304 crossover is
-/// a first cut from the gfx942 bench.
-fn adaptive_fa_tile(b: usize, n: usize, h: usize) -> (usize, usize) {
-    const NUM_CU: usize = 304;
+/// softmax over more MFMA) once its grid `b·h·n/(32·NUM_WARPS)` covers the machine
+/// (`cu_target`, the topology-derived device CU count via [`crate::DeviceProfile::cu_count`])
+/// and `N` divides `32·NUM_WARPS`; otherwise the baseline `{16,16}` (the bigger tile
+/// halves the grid, so it loses at low occupancy). The crossover is a first cut from
+/// benchmarking.
+fn adaptive_fa_tile(b: usize, n: usize, h: usize, cu_target: usize) -> (usize, usize) {
     const BIG: usize = 32;
-    if n.is_multiple_of(BIG * NUM_WARPS) && b * h * (n / (BIG * NUM_WARPS)) >= NUM_CU {
+    if n.is_multiple_of(BIG * NUM_WARPS) && b * h * (n / (BIG * NUM_WARPS)) >= cu_target {
         (BIG, BIG)
     } else {
         (Q_BLK, KV_BLK)
@@ -515,12 +515,12 @@ fn adaptive_fa_tile(b: usize, n: usize, h: usize) -> (usize, usize) {
 /// satisfy the builder's divisibility asserts (`D % 16`, `Q_BLK % 16`,
 /// `KV_BLK % 16`, `H % H_kv`, `N % (Q_BLK·NUM_WARPS)`).
 pub fn flash_attention_forward_mw_rdb(o: &mut Tensor, q: &Tensor, k: &Tensor, v: &Tensor) -> crate::LaunchResult<()> {
-    fa_check_target(q)?;
+    let profile = fa_check_target(q)?;
     let qd = crate::launch::concrete_dims(q, "flash-attention", "q", 4)?;
     let kd = crate::launch::concrete_dims(k, "flash-attention", "k", 4)?;
     let (b, n, h, d) = (qd[0], qd[1], qd[2], qd[3]);
     let h_kv = kd[2];
-    let (q_blk, kv_blk) = adaptive_fa_tile(b, n, h);
+    let (q_blk, kv_blk) = adaptive_fa_tile(b, n, h, profile.cu_count);
     let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
 
     let in_dtype = q.uop().dtype();
@@ -601,7 +601,13 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
     let kd = crate::launch::concrete_dims(k, "flash-attention", "k", 4)?;
     let (b, n, h, d) = (qd[0], qd[1], qd[2], qd[3]);
     let h_kv = kd[2];
-    let (q_blk, kv_blk) = adaptive_fa_tile(b, n, h);
+    // Resolve the profile up front for the CU-count-aware tile heuristic (the
+    // `applies` precheck below needs `q_blk` before `launch_custom` resolves). An
+    // unsupported arch yields `None` here, exactly as `launch_custom` would.
+    let Some(profile) = crate::target::resolve_supported_profile(&q.device(), FA_SUPPORTED_ARCHS).ok() else {
+        return Ok(None);
+    };
+    let (q_blk, kv_blk) = adaptive_fa_tile(b, n, h, profile.cu_count);
     let dtype = q.uop().dtype();
     let dtype_ok = dtype == DType::BFloat16 || dtype == DType::Float16;
     let err_dtype = dtype.clone();
@@ -641,8 +647,8 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
         // legitimately not tile, so the caller falls back per-clip instead of padding.
         n % (q_blk * NUM_WARPS) == 0,
         // Build for the resolved arch — caps track the real wave width.
-        move |arch| {
-            let caps = crate::ArchCaps::for_arch(arch);
+        move |profile| {
+            let caps = profile.caps;
             let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
             let out = Tensor::empty(&[b, n, h, d], dtype.clone());
             let masked = opts.key_lens.is_some();

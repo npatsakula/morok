@@ -100,6 +100,11 @@ pub const ST_16X32: STBaseShape =
 pub const ST_32X16: STBaseShape =
     STBaseShape { base: BaseShape { rows: 32, cols: 16, ept: 8 }, swizzle: Swizzle::Sw32x16 };
 
+/// The WMMA matrix-core tile edge (16): the fragment dimension every supported arch
+/// shares (gfx942 MFMA and gfx1151 WMMA are both 16×16). The single source the
+/// kernels' structural `BLK` tiles derive from, rather than re-declaring `16`.
+pub const WMMA_EDGE: usize = RT_16X16.base.rows;
+
 // Predefined register-tile base shapes.
 pub const RT_16X16: RTBaseShape =
     RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 4 }, stride: 4, interleave: false, interleave_t: false };

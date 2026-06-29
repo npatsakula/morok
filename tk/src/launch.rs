@@ -543,20 +543,22 @@ pub fn launch_custom(
     archs: &'static [AmdArch],
     validate: impl FnOnce(AmdArch) -> Result<()>,
     applies: bool,
-    build: impl FnOnce(AmdArch) -> Result<Tensor>,
+    build: impl FnOnce(crate::DeviceProfile) -> Result<Tensor>,
 ) -> Result<Option<Tensor>> {
     // "Can this device run the kernel at all?" — wrong arch / missing toolchain is
-    // environmental, so `None` (the caller's fallback), never an error.
-    let Some(arch) = crate::target::resolve_supported_arch(device, archs).ok() else {
+    // environmental, so `None` (the caller's fallback), never an error. Resolves the
+    // full profile (arch caps + topology CU count) in one probe so `build` sizes its
+    // grid heuristics against the real device.
+    let Some(profile) = crate::target::resolve_supported_profile(device, archs).ok() else {
         return Ok(None);
     };
     // "Is the request structurally valid?" — a fixed-property violation is a caller bug.
-    validate(arch)?;
+    validate(profile.caps.arch)?;
     // "Does this runtime instance fit?" — if not, a fallback trigger, not an error.
     if !applies {
         return Ok(None);
     }
-    build(arch).map(Some)
+    build(profile).map(Some)
 }
 
 /// Realize `ins`, allocate/realize `outs`, build a hand-written kernel against

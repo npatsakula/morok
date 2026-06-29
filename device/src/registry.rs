@@ -183,19 +183,29 @@ pub fn cpu() -> Result<Arc<dyn Allocator>> {
     registry().get(&DeviceSpec::Cpu)
 }
 
-/// Read the gfx arch of AMD device `device_id` from KFD topology. Used by
-/// `DeviceSpec::parse("AMD:N")` so the resulting spec encodes the real arch
-/// (not a hard-coded default that would break the kernel cache).
-pub fn resolve_amd_arch_from_topology(device_id: usize) -> Result<svod_dtype::AmdArch> {
+/// Read the gfx arch **and CU count** of AMD device `device_id` from KFD topology
+/// in a single probe. The CU count is `simd_count / simd_per_cu` (the whole-device
+/// total, which varies by SKU and virtualized partition) — the real number kernels
+/// size their grid-saturation heuristics against instead of a hard-coded constant.
+pub fn resolve_amd_arch_and_cu(device_id: usize) -> Result<(svod_dtype::AmdArch, usize)> {
     let nodes = crate::amd::topology::enumerate();
     let node = nodes.get(device_id).ok_or_else(|| crate::error::Error::NoAmdGpu {
         reason: format!("device_id {device_id} out of range; {} GPU node(s) present", nodes.len()),
     })?;
-    svod_dtype::AmdArch::from_gfx_target_version(node.gfx_target_version).ok_or_else(|| {
+    let arch = svod_dtype::AmdArch::from_gfx_target_version(node.gfx_target_version).ok_or_else(|| {
         crate::error::Error::DeviceUnavailable {
             reason: format!("unsupported gfx_target_version {} on AMD device {device_id}", node.gfx_target_version),
         }
-    })
+    })?;
+    let cu_count = (node.simd_count / node.simd_per_cu.max(1)).max(1) as usize;
+    Ok((arch, cu_count))
+}
+
+/// Read the gfx arch of AMD device `device_id` from KFD topology. Used by
+/// `DeviceSpec::parse("AMD:N")` so the resulting spec encodes the real arch
+/// (not a hard-coded default that would break the kernel cache).
+pub fn resolve_amd_arch_from_topology(device_id: usize) -> Result<svod_dtype::AmdArch> {
+    resolve_amd_arch_and_cu(device_id).map(|(arch, _)| arch)
 }
 
 /// Convenience function to get CUDA allocator.

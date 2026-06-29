@@ -51,7 +51,7 @@ use crate::tiles::{TileLayout, VecLayout};
 /// The WMMA tile edge (K=16); the cross MMA operates on 16×16 fragments, so the
 /// point / centroid / D dims must each be a multiple of it. Also the per-workgroup
 /// point-block width (each wave owns [`BLK`] points, selected by `block_idx[0]`).
-const BLK: usize = 16;
+const BLK: usize = crate::tiles::WMMA_EDGE;
 
 /// The centroid stream-tile height — a multiple of [`BLK`] (16). Centroids are
 /// streamed in `K/TM` tiles through the assignment loop. `16` (= BLK) keeps the
@@ -421,11 +421,10 @@ pub fn kmeans_assign(x: &Tensor, c: &Tensor) -> crate::LaunchResult<Option<(Tens
     ensure!(dx == dc, crate::launch::OperandDimMismatchSnafu { kernel: "kmeans_assign", dim: "D", a: dx, b: dc });
 
     // Three-way policy (inlined — multi-output; `launch_custom` is single-Tensor).
-    let Some(arch) = crate::target::resolve_supported_arch(&x.device(), KMEANS_SUPPORTED_ARCHS).ok() else {
+    let Some(profile) = crate::target::resolve_supported_profile(&x.device(), KMEANS_SUPPORTED_ARCHS).ok() else {
         return Ok(None);
     };
-
-    let caps = crate::ArchCaps::for_arch(arch);
+    let caps = profile.caps;
     let (f32, bf16) = (DType::Float32, DType::BFloat16);
     let d_pad = pad16(dx);
     let n_pad = pad16(n);
