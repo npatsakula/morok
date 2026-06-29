@@ -422,34 +422,43 @@ impl<'k> Group<'k> {
         let sn = st.shape().len();
         let (st_h, st_w) = (st.shape()[sn - 4] as i64, st.shape()[sn - 3] as i64);
         assert!(rt_h <= st_h && rt_w <= st_w, "load LOCAL→REG: RT {rt_h}×{rt_w} exceeds ST {st_h}×{st_w}");
+        let transpose = rt.layout != st.layout;
+
+        // A lane's `ept` fragment elements are a swizzle-safe column-contiguous run —
+        // readable in ONE `ds_read_b64` instead of `ept` scalar `ds_read_u16` — when the
+        // fragment is a non-transposed, non-interleaved CDNA-MFMA bf16 input: `lane_rc`
+        // then maps the element index to consecutive columns, and `ept == 4` is exactly
+        // one swizzle group (the `sw`-wide run the vec-fill commits in). `vw` is the read
+        // width — the whole run when contiguous, else one element (the proven scalar
+        // gather, which also carries the cast / transpose / RDNA-interleave cases).
+        let contiguous =
+            !transpose && !rt.base.interleave && !rt.base.interleave_t && st.elem() == rt.elem() && ept == 4;
+        let vw = if contiguous { ept } else { 1 };
+
         let height = self.ker.raw_range(rt_h, AxisType::Loop);
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
-        let inner = self.ker.raw_range(ept, AxisType::Loop);
+        let inner = self.ker.raw_range(ept / vw, AxisType::Loop); // groups of `vw` elements
+        let elem = imul(&inner, vw); // base element index of this group
 
-        let (row, col) = lane_rc(
-            rt.layout != st.layout,
-            rt.base.interleave,
-            rt.base.interleave_t,
-            &laneid,
-            base_rows,
-            base_cols,
-            stride,
-            &inner,
-        );
+        let (row, col) =
+            lane_rc(transpose, rt.base.interleave, rt.base.interleave_t, &laneid, base_rows, base_cols, stride, &elem);
         let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
 
         // Wave sub-tile fragment offset (SI-1): the caller passes the wave's
         // `(row_block, col_block)` via `idxs` (already including warp_row/col);
-        // empty ⇒ no offset (single-warp).
+        // empty ⇒ no offset (single-warp). `off` honors the double-buffer parity base.
         let h_idx = wave_offset(idxs.first(), rt_h, &height);
         let w_idx = wave_offset(idxs.get(1), rt_w, &width);
-        let src_idx = [h_idx, w_idx, Idx::Uop(srow), Idx::Uop(scol)];
-        let mut load = st_load(st, &src_idx);
+        let mut off = flat_offset(st.shape(), &[h_idx, w_idx, Idx::Uop(srow), Idx::Uop(scol)]);
+        if let Some(bo) = st.base_offset() {
+            off = off.try_add(bo).expect("load LOCAL→REG: parity base offset");
+        }
+        let mut load = if vw > 1 { load_vec(st.uop(), off, vw as usize) } else { load_off(st.uop(), off) };
         if st.elem() != rt.elem() {
             load = load.cast(rt.elem().clone());
         }
         let mut didx: Vec<Idx> = dst_idxs.to_vec();
-        didx.extend([Idx::from(&height), Idx::from(&width), Idx::from(&inner)]);
+        didx.extend([Idx::from(&height), Idx::from(&width), Idx::from(&elem)]);
         let ended = flat_index(rt.uop(), rt.shape(), &didx).store(load).end(smallvec![height, width, inner]);
         self.finalize_reg(rt, ended)
     }
@@ -693,9 +702,4 @@ fn st_index(st: &ST, idxs: &[Idx]) -> Arc<UOp> {
         off = off.try_add(bo).expect("st_index: parity base offset add");
     }
     index_off(st.uop(), off)
-}
-/// ST flat LOAD honoring [`ST::base_offset`] — the [`crate::index::load_at`] analog.
-fn st_load(st: &ST, idxs: &[Idx]) -> Arc<UOp> {
-    let idx = st_index(st, idxs);
-    UOp::load().buffer(st.uop().clone()).index(idx).call()
 }
