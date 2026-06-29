@@ -128,12 +128,11 @@ fn run_count(uop: &Arc<UOp>) -> u64 {
     let in_scope = InScopeRangesProperty::get(uop);
 
     // Saturating: a range with an unbounded/symbolic `vmax` (e.g. a data-dependent
-    // dynamic-loop bound with no sound range) reports `i64::MAX`; nested inside
-    // another loop its trip product overflows `u64`. `run_count` is only a "place
-    // deepest in loops" sort key, so saturating to `u64::MAX` is correct (the
-    // faithful equivalent of tinygrad's big-int product). For every kernel whose
-    // trips fit in `u64` this is identical to the old `.product()`, and it also
-    // fixes the prior release-mode wrap (debug panicked; release silently mis-ordered).
+    // dynamic-loop bound with no sound range) reports `i64::MAX`, whose trip product
+    // overflows `u64` when nested. `run_count` is only a "place deepest in loops" sort
+    // key, so saturating to `u64::MAX` is correct; for every kernel whose trips fit in
+    // `u64` it is identical to the old `.product()`, and it fixes the prior wrap (debug
+    // panicked; release silently mis-ordered).
     in_scope
         .iter()
         .map(|key| match key.0.vmax() {

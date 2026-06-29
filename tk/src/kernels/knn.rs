@@ -53,14 +53,11 @@ use crate::tiles::TileLayout;
 /// the top-K slot padding (`K_pad`). The corpus stream tile height is [`TM`].
 const BLK: usize = 16;
 
-/// The corpus stream-tile width for Stage 2 ([`build_knn_topk`]). The corpus is
-/// streamed in `M/TM` tiles, and per tile the [`TM`]-wide candidate scores are sorted
-/// by a cross-lane bitonic network and merged into the sorted running top-K. The
-/// bitonic sort folds the corpus along the 16-wide lane axis (`laneid % 16`) of ONE
-/// WMMA fragment, so `TM` is pinned to [`BLK`] (16): a wider tile would span multiple
-/// corpus fragments, which the single-fragment butterfly cannot reach across without
-/// an extra inter-fragment merge. (Tunable only by extending the network — see the
-/// merge helpers in [`crate::group`].)
+/// The corpus stream-tile width for Stage 2 ([`build_knn_topk`]): the corpus is
+/// streamed in `M/TM` tiles, each sorted by a cross-lane bitonic network and merged
+/// into the running top-K. The sort folds the corpus along the 16-wide lane axis
+/// (`laneid % 16`) of ONE WMMA fragment, so `TM` is pinned to [`BLK`] (16) — a wider
+/// tile would span corpus fragments the single-fragment butterfly cannot cross.
 const TM: usize = BLK;
 
 /// The GPU arch(es) this kernel is built for: gfx942 (CDNA3 MFMA, wave64) and
@@ -90,17 +87,16 @@ fn reinit_on<'k>(t: RT<'k>, m_blk: &Idx) -> RT<'k> {
     }
 }
 
-/// The cross-term + `c_sq` combine yielding one `[m_rows, query]` Col f32 score tile
-/// `score[m, n] = ‖c[m]‖² − 2·⟨x[n], c[m]⟩` for corpus rows `[m_blk·m_rows, +m_rows)`
-/// — the Stage-1 machinery, factored so Stage 2 calls it per [`TM`]-tall corpus tile
-/// (and [`build_knn_score`] still uses it for the whole corpus in one tile).
-/// `m_rows` is the corpus-tile height (the full `corpus` for Stage 1, [`BLK`] per
-/// stream tile for Stage 2). `x_reg_t` is the loop-invariant query operand `[d,
-/// query]` (the caller loads it once); `m_blk` is the corpus tile index (its
-/// row-block offset, in units of `m_rows`). `masked` gates the GLOBAL→LDS/REG hops
-/// against the true corpus extent so a ragged final tile reads `0.0` instead of
-/// touching out-of-bounds memory (the caller then masks those rows to `+∞` for the
-/// argmin).
+/// The cross-term + `c_sq` combine yielding one f32 score tile for corpus rows
+/// `[m_blk·m_rows, +m_rows)`, factored so Stage 2 calls it per [`TM`]-wide corpus
+/// tile and [`build_knn_score`] uses it for the whole corpus at once. `query_major`
+/// selects the orientation: `false` → `[m_rows, query]` Col `score[m, n]` (Stage 1);
+/// `true` → `[query, m_rows]` `score[n, m]`, corpus on the lane axis for the bitonic
+/// sort (Stage 2). `m_rows` is the corpus-tile extent (full `corpus` for Stage 1,
+/// [`BLK`] per stream tile). `x_reg_t` is the loop-invariant `[d, query]` query
+/// operand; `m_blk` the corpus-tile index. `masked` gates the GLOBAL→LDS/REG hops
+/// against the true corpus extent so a ragged final tile reads `0.0` instead of OOB
+/// memory (the caller then masks those entries to `+∞` for the sort).
 #[allow(clippy::too_many_arguments)]
 fn score_tile<'k>(
     ker: &'k Kernel,
@@ -135,11 +131,8 @@ fn score_tile<'k>(
     //   row, **corpus the col** (`mma_atb(cross, xᵀ, cᵀ)`), so the corpus axis lands
     //   on `laneid % 16` and the running-top-K's cross-lane bitonic sort folds it;
     //   `c_sq[m]` rides axis 3 (replicated along the query rows).
-    // The MMA accumulator must be RE-ZEROED each corpus iteration: when `m_blk` is the
-    // rolled corpus-loop index, anchor the zero-fill on it (`cross.after([loop_range])`,
-    // exactly `fa_qk`'s `warp.zero(lp.reinit(att))`) or the constant fill hoists out of
-    // the loop (`run_count = 1`) and the MMA accumulates the cross term across ALL tiles.
-    // A `Const` `m_blk` (the single-tile Stage-1 path) adds no dependency.
+    // Re-zero the accumulator each corpus iteration, anchored on `m_blk` (see
+    // `reinit_on`); a `Const` `m_blk` (single-tile Stage 1) adds no dependency.
     let acc_dims = if query_major { (query, m_rows) } else { (m_rows, query) };
     let cross = warp.zero(reinit_on(ker.acc(acc_dims, col), m_blk));
     let cross =
@@ -147,8 +140,8 @@ fn score_tile<'k>(
 
     // Load c_sq_rep[m_blk] into the SAME accumulator fragment + layout as the cross
     // MMA output, so the two align lane-for-lane (both index the accumulator frag's
-    // `lane_rc`; orientation-robust per the reductions/masked tests). The corpus-tile
-    // offset rides the corpus axis: axis 2 when corpus is the row, axis 3 when col.
+    // `lane_rc`). The corpus-tile offset rides the corpus axis: axis 2 when corpus is
+    // the row, axis 3 when col.
     let cs_mi = if query_major {
         MoveIdx::block((0, 0, 0, m_blk.clone()), 2)
     } else {
@@ -250,11 +243,9 @@ struct TopK<'k> {
 /// sorted running top-K ([`TopK`]) — replacing the serialized k-step argmin-insert
 /// with a counted sorting network. Built **rolled**.
 ///
-/// The score is computed **query-major** (`score[n, m]`, corpus the column), so the
-/// corpus axis lands on the 16-wide lane axis (`laneid % 16`) of one WMMA fragment
-/// and the cross-lane bitonic network folds it directly. The running top-K then
-/// already has query rows / K-slot columns, so the `[query, k]` output is a direct
-/// (masked) store with no transpose.
+/// The score is computed query-major so the corpus axis lands on the bitonic sort's
+/// lane axis, and the top-K's `[query, K-slot]` layout makes the output a direct
+/// store (the module header has the full layout rationale).
 ///
 /// **Query-block grid tiling:** each workgroup processes ONE `query`(= [`BLK`]) block,
 /// selected by `block_idx[0]` — the grid is `[ceil(Npad/16), 1, 1]`, so it covers a
@@ -565,11 +556,11 @@ fn c_sq_replicated(c_f32: &Tensor, m: usize) -> crate::LaunchResult<Tensor> {
         .context(crate::launch::OperandSnafu)
 }
 
-/// The generic-graph tail over the kernel's UNSORTED top-K (`idx_raw`/`val_raw`,
-/// `[1,1,Npad,k]`): slice off the padded query rows, sort the `k` per query ascending
-/// by the x²-free score (its order equals the true-distance order — `‖x‖²` is constant
-/// per query), gather the sorted corpus rows, and recompute the EXACT f32 squared-L2.
-/// Returns `(dists [N,k] f32, idx_sorted [N,k] i32)`.
+/// The generic-graph tail over the kernel's per-query top-K (`idx_raw`/`val_raw`,
+/// `[1,1,Npad,k]`, already ascending by score): slice off the padded query rows,
+/// order the `k` ascending by the x²-free score (its order equals the true-distance
+/// order — `‖x‖²` is constant per query), gather the corpus rows, and recompute the
+/// EXACT f32 squared-L2. Returns `(dists [N,k] f32, idx_sorted [N,k] i32)`.
 fn knn_tail(
     idx_raw: &Tensor,
     val_raw: &Tensor,
