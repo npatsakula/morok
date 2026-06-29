@@ -21,7 +21,7 @@ fn bench_matmul(c: &mut Criterion) {
         return;
     }
     let mut group = c.benchmark_group("matmul");
-    for &n in &[1024usize, 2048] {
+    for &n in &[1024usize, 2048, 4096, 8192] {
         group.throughput(Throughput::Elements((2.0 * (n as f64).powi(3)) as u64)); // 2·M·N·K
         let a = randn_bf16(&[n, n]);
         let b = randn_bf16(&[n, n]);
@@ -31,7 +31,10 @@ fn bench_matmul(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("tk", n), &n, |bencher, _| bench_plan(bencher, &plan));
 
         // Reference: svod's generic bf16→f32 GEMM (the matmul a user would write).
-        let mut reft = a.matmul_with().other(&b).dtype(DType::Float32).call().expect("ref matmul");
+        // `matmul` now follows the HK contract `C = A·Bᵀ` (B in [N,K]), so the generic
+        // reference transposes B too — same op, apples-to-apples throughput.
+        let bt = b.try_permute(&[1, 0]).expect("bᵀ");
+        let mut reft = a.matmul_with().other(&bt).dtype(DType::Float32).call().expect("ref matmul");
         let ref_plan = reft.prepare().expect("prepare ref");
         group.bench_with_input(BenchmarkId::new("generic", n), &n, |bencher, _| bench_plan(bencher, &ref_plan));
     }

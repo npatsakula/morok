@@ -183,17 +183,20 @@ fn bench_kmeans_full(group: &mut BenchmarkGroup<'_, WallTime>, shim: &HblShim, n
     unsafe { (shim.kmeans_destroy)(plan) };
 }
 
-/// Square `C[n,n] = A·B` — the hipBLASLt floor for `svod_tk::matmul`.
+/// Square `C[n,n] = A·Bᵀ` (B in `[N,K]`, the HK contract) — the hipBLASLt floor for
+/// `svod_tk::matmul`. `trans_b: 1` makes the vendor compute the identical `A·Bᵀ`.
 fn bench_matmul(c: &mut Criterion) {
     let Some(shim) = gemm_ready() else {
         eprintln!("svod-tk vendor matmul: skipped (no hipBLASLt shim / GPU)");
         return;
     };
     let mut group = c.benchmark_group("matmul");
+    // hipBLASLt shim SIGSEGVs (Tensile host init) past 2048 on this VF — keep the
+    // vendor floor at the runnable sizes; the tk `--bench matmul` covers 4096/8192.
     for &n in &[1024usize, 2048] {
         group.throughput(Throughput::Elements((2.0 * (n as f64).powi(3)) as u64)); // 2·M·N·K
         let i = n as i64;
-        bench_gemm(&mut group, shim, n, GemmShape { m: i, n: i, k: i, trans_a: 0, trans_b: 0 }, "vendor");
+        bench_gemm(&mut group, shim, n, GemmShape { m: i, n: i, k: i, trans_a: 0, trans_b: 1 }, "vendor");
     }
     group.finish();
 }

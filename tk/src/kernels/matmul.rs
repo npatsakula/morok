@@ -1,6 +1,8 @@
 //! The bf16→f32 tile matmul: a single arch-generic, single-buffered builder
 //! ([`build_matmul_cfg`] / [`build_matmul_cfg_k`]) driven by a per-arch
-//! [`MatmulCfg`]. One `cfg.block × cfg.block` C tile per workgroup, `cfg.n_accum`
+//! [`MatmulCfg`]. Computes `C = A·Bᵀ` with **B in `[N,K]` layout** (the HK contract):
+//! both operands then have K contiguous, so both gather from LDS as one `ds_read_b64`
+//! per fragment (`mma_abt`). One `cfg.block × cfg.block` C tile per workgroup, `cfg.n_accum`
 //! `reg × reg` accumulators/wave reduced over a tracked K-loop in `cfg.k_step()`-wide
 //! strips out of XOR-swizzled LDS. The tile shortcuts ([`Kernel::acc`] /
 //! [`Kernel::operand`] / [`Kernel::shared_sw`]) resolve the right WMMA fragment per
@@ -192,11 +194,12 @@ pub const MATMUL_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch
 /// Composes into a model graph and realizes / benchmarks through the normal
 /// `prepare()` → `execute_profiled` path like any other tensor op.
 ///
-/// `a`/`b` are square `[n, n]` of **any float dtype**: they are cast to bf16
-/// internally (the kernel is a bf16-input matrix-engine GEMM), and the result is
-/// the f32 WMMA/MFMA accumulator. So a caller needs no kernel knowledge — pass
-/// plain tensors, get a tensor back. The per-arch occupancy config is picked by
-/// [`cfg_for_arch`].
+/// Computes `C = A·Bᵀ`: **`b` is the `[N, K]` operand** (the HK contract — B stored
+/// N-major so both operands gather K-contiguous; see the module docs). `a`/`b` are
+/// square `[n, n]` of **any float dtype**: they are cast to bf16 internally (the
+/// kernel is a bf16-input matrix-engine GEMM), and the result is the f32 WMMA/MFMA
+/// accumulator. So a caller needs no kernel knowledge — pass plain tensors, get a
+/// tensor back. The per-arch occupancy config is picked by [`cfg_for_arch`].
 ///
 /// Like [`crate::flash_attention_with`], the outcome is three-way (via
 /// [`crate::launch_custom`]): `Ok(None)` when the device can't run the kernel,
@@ -207,7 +210,7 @@ pub const MATMUL_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch
 /// ```no_run
 /// use svod_tensor::Tensor;
 /// let a = Tensor::randn(&[256, 256]).unwrap();
-/// let b = Tensor::randn(&[256, 256]).unwrap();
+/// let b = Tensor::randn(&[256, 256]).unwrap(); // B is [N, K]: result is A·Bᵀ
 /// if let Some(mut c) = svod_tk::matmul(&a, &b).unwrap() { // lazy bf16→f32 GEMM node
 ///     c.prepare().unwrap();                                // realize through the scheduler
 /// }
@@ -309,8 +312,8 @@ pub fn build_matmul_cfg_k(ker: &Kernel, n: usize, cfg: MatmulCfg, k_step: usize)
     gemm_core(ker, n, n, n, cfg, k_step, outs[0].clone(), ins[0].clone(), ins[1].clone());
 }
 
-/// The parametrized `C[m,n] = A[m,k] · B[k,n]` (`mma_ab`) GEMM core for the square
-/// matmul, into the already-bound `c_gl`. One `cfg.block × cfg.block` C tile per
+/// The parametrized `C[m,n] = A[m,k] · B[n,k]` (`mma_abt`, B in `[N,K]` layout) GEMM
+/// core for the square matmul, into the already-bound `c_gl`. One `cfg.block × cfg.block` C tile per
 /// workgroup, `cfg.n_accum` col-major `reg × reg` accumulators/wave reduced over a
 /// tracked `k_step`-strip K-loop out of XOR-swizzled LDS; a single `END` closes the
 /// loop around the last accumulator's store, the rest scoped inside by chaining their
@@ -341,10 +344,10 @@ pub fn gemm_core(
     let g = ker.group_2d(cfg.wave_rows, cfg.wave_cols);
     let bf16 = DType::BFloat16;
 
-    // A strip [block×k_step] = [M-block, K-strip]; B strip [k_step×block] = [K-strip,
-    // N-block]; both XOR-swizzled, single-buffered.
+    // A strip [block×k_step] = [M-block, K-strip]; B strip [block×k_step] = [N-block,
+    // K-strip] (B is [N,K]); both XOR-swizzled, K contiguous, single-buffered.
     let a_smem = ker.shared_sw((cfg.block, k_step), bf16.clone(), TileLayout::Row);
-    let b_smem = ker.shared_sw((k_step, cfg.block), bf16.clone(), TileLayout::Row);
+    let b_smem = ker.shared_sw((cfg.block, k_step), bf16.clone(), TileLayout::Row);
 
     let (row, col) = block_coords(ker, m, n, &cfg); // (pid_m, pid_n) in block units
     let warp_row = g.warp_row();
@@ -357,26 +360,26 @@ pub fn gemm_core(
     let tile = lp.index().clone();
 
     // Collaborative GLOBAL→LDS fill over all threads (each ends in a barrier);
-    // Uses 128-bit vectorized loads for the large-N strips. B is indexed as
-    // [K-strip, N-block] at (tile, col).
+    // Uses 128-bit vectorized loads for the large-N strips. B is in [N,K] layout
+    // (the HK contract), indexed as [N-block, K-strip] at (col, tile).
     let (a_smem, b_smem) = if cfg.vec_load {
         (
             g.fill_local_vec(a_smem, a_gl, &[Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(&tile)], 2),
-            g.fill_local_vec(b_smem, b_gl, &[Idx::Const(0), Idx::Const(0), Idx::from(&tile), Idx::from(&col)], 2),
+            g.fill_local_vec(b_smem, b_gl, &[Idx::Const(0), Idx::Const(0), Idx::from(&col), Idx::from(&tile)], 2),
         )
     } else {
         (
             g.load(a_smem, a_gl, MoveIdx::block((0, 0, row.clone(), tile.clone()), 2)),
-            g.load(b_smem, b_gl, MoveIdx::block((0, 0, tile.clone(), col.clone()), 2)),
+            g.load(b_smem, b_gl, MoveIdx::block((0, 0, col.clone(), tile.clone()), 2)),
         )
     };
 
-    // Shared B sub-tile (N col-block {warp_col}, same for every accumulator) read as a
-    // [k_step, reg] Col fragment, and per-accumulator A sub-tiles (M row-block
-    // {warp_row + a*wave_rows}).
+    // Shared B sub-tile (N row-block {warp_col}, same for every accumulator) read as a
+    // [reg, k_step] Row fragment (K contiguous → `ds_read_b64`), and per-accumulator A
+    // sub-tiles (M row-block {warp_row + a*wave_rows}). `mma_abt` consumes B as B[N,k].
     let bb = g.load(
-        ker.operand((k_step, reg), bf16.clone(), TileLayout::Col),
-        b_smem.subtile((k_step, reg), (0, warp_col.clone())),
+        ker.operand((reg, k_step), bf16.clone(), TileLayout::Row),
+        b_smem.subtile((reg, k_step), (warp_col.clone(), 0)),
         MoveIdx::default(),
     );
     let a_subs: Vec<RT> = (0..cfg.n_accum)
@@ -406,7 +409,7 @@ pub fn gemm_core(
             Some(p) => a_sub.after(smallvec![p.clone()]),
             None => a_sub.clone(),
         };
-        prev_out = Some(g.mma_ab(accs[a].clone(), &a_sub, &bb).uop().clone());
+        prev_out = Some(g.mma_abt(accs[a].clone(), &a_sub, &bb).uop().clone());
     }
     let ended = lp.close();
     // Each accumulator reads its fully-reduced register value *outside* the loop.
@@ -452,7 +455,7 @@ fn gemm_core_splitk(
     let bf16 = DType::BFloat16;
 
     let a_smem = ker.shared_sw((cfg.block, k_step), bf16.clone(), TileLayout::Row);
-    let b_smem = ker.shared_sw((k_step, cfg.block), bf16.clone(), TileLayout::Row);
+    let b_smem = ker.shared_sw((cfg.block, k_step), bf16.clone(), TileLayout::Row);
 
     let (row, col) = block_coords(ker, n, n, &cfg);
     let warp_row = g.warp_row();
@@ -468,18 +471,18 @@ fn gemm_core_splitk(
     let (a_smem, b_smem) = if cfg.vec_load {
         (
             g.fill_local_vec(a_smem, a_gl, &[Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(&strip)], 2),
-            g.fill_local_vec(b_smem, b_gl, &[Idx::Const(0), Idx::Const(0), Idx::from(&strip), Idx::from(&col)], 2),
+            g.fill_local_vec(b_smem, b_gl, &[Idx::Const(0), Idx::Const(0), Idx::from(&col), Idx::from(&strip)], 2),
         )
     } else {
         (
             g.load(a_smem, a_gl, MoveIdx::block((0, 0, row.clone(), strip.clone()), 2)),
-            g.load(b_smem, b_gl, MoveIdx::block((0, 0, strip.clone(), col.clone()), 2)),
+            g.load(b_smem, b_gl, MoveIdx::block((0, 0, col.clone(), strip.clone()), 2)),
         )
     };
 
     let bb = g.load(
-        ker.operand((k_step, reg), bf16.clone(), TileLayout::Col),
-        b_smem.subtile((k_step, reg), (0, warp_col.clone())),
+        ker.operand((reg, k_step), bf16.clone(), TileLayout::Row),
+        b_smem.subtile((reg, k_step), (warp_col.clone(), 0)),
         MoveIdx::default(),
     );
     let a_subs: Vec<RT> = (0..cfg.n_accum)
@@ -504,7 +507,7 @@ fn gemm_core_splitk(
             Some(p) => a_sub.after(smallvec![p.clone()]),
             None => a_sub.clone(),
         };
-        prev_out = Some(g.mma_ab(accs[a].clone(), &a_sub, &bb).uop().clone());
+        prev_out = Some(g.mma_abt(accs[a].clone(), &a_sub, &bb).uop().clone());
     }
     let ended = lp.close();
     let final_accs: Vec<RT> = accs.iter().map(|c| c.after(smallvec![ended.clone()])).collect();

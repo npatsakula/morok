@@ -10,7 +10,7 @@
 //! ```no_run
 //! use svod_tensor::Tensor;
 //! let a = Tensor::randn(&[256, 256]).unwrap();
-//! let b = Tensor::randn(&[256, 256]).unwrap();
+//! let b = Tensor::randn(&[256, 256]).unwrap(); // B is [N, K]: `matmul` computes C = A·Bᵀ
 //! if let Some(mut c) = svod_tk::matmul(&a, &b).unwrap() { // `None` if the device can't run it
 //!     c.prepare().unwrap();
 //! }

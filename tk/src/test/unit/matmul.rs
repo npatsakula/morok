@@ -260,10 +260,10 @@ fn matmul_inputs(n: usize) -> (svod_tensor::Tensor, svod_tensor::Tensor) {
     (a, b)
 }
 
-/// f32 ground-truth `a·b` over the bf16-rounded operands.
+/// f32 ground-truth `a·bᵀ` (B in `[N,K]`, the HK contract) over the bf16-rounded operands.
 fn matmul_reference(a: &svod_tensor::Tensor, b: &svod_tensor::Tensor) -> Vec<f32> {
-    let mut reference =
-        a.cast(DType::Float32).expect("a→f32").matmul(&b.cast(DType::Float32).expect("b→f32")).expect("ref matmul");
+    let bt = b.cast(DType::Float32).expect("b→f32").try_permute(&[1, 0]).expect("bᵀ");
+    let mut reference = a.cast(DType::Float32).expect("a→f32").matmul(&bt).expect("ref matmul");
     reference.realize().expect("realize reference");
     reference.as_vec::<f32>().expect("read reference")
 }
@@ -273,10 +273,11 @@ fn max_abs_err(got: &[f32], expected: &[f32]) -> f32 {
     got.iter().zip(expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max)
 }
 
-/// The wave32 (gfx1151) matmul computes exactly `A·B` — not a transposed or
-/// operand-swapped variant. Compares `got` against every transpose/permutation
-/// candidate and asserts `A·B` is the unique match (the rest are garbage-scale).
-/// A layout regression in the wave32 fragment map would flip which candidate wins.
+/// The wave32 (gfx1151) matmul computes exactly `A·Bᵀ` (B in `[N,K]`, the HK
+/// contract) — not a non-transposed or operand-swapped variant. Compares `got`
+/// against every transpose/permutation candidate and asserts `A·Bᵀ` is the unique
+/// match (the rest are garbage-scale). A layout regression in the wave32 fragment
+/// map would flip which candidate wins.
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_rdna_computes_ab -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -295,28 +296,29 @@ fn test_matmul_rdna_computes_ab() {
         x.as_vec::<f32>().expect("read")
     };
 
-    let ab_err = max_abs_err(&got, &vec(mm(&af, &bf)));
+    let abt_err = max_abs_err(&got, &vec(mm(&af, &tr(&bf))));
     // bf16 accumulation over K=64 ⇒ a few thousandths; transposes/swaps are O(1).
-    assert!(ab_err < 1e-1, "wave32 matmul should equal A·B, got max abs err {ab_err:e}");
+    assert!(abt_err < 1e-1, "wave32 matmul should equal A·Bᵀ, got max abs err {abt_err:e}");
 
     let wrong: Vec<(&str, Tensor)> = vec![
-        ("(A·B)^T", tr(&mm(&af, &bf))),
+        ("A·B", mm(&af, &bf)),
+        ("(A·Bᵀ)^T", tr(&mm(&af, &tr(&bf)))),
         ("A^T·B", mm(&tr(&af), &bf)),
-        ("A·B^T", mm(&af, &tr(&bf))),
         ("A^T·B^T", mm(&tr(&af), &tr(&bf))),
         ("B·A", mm(&bf, &af)),
         ("(B·A)^T", tr(&mm(&bf, &af))),
     ];
     for (name, cand) in wrong {
         let err = max_abs_err(&got, &vec(cand));
-        assert!(err > 1.0, "wave32 matmul matches {name} (err {err:e}) — layout is not plain A·B");
+        assert!(err > 1.0, "wave32 matmul matches {name} (err {err:e}) — layout is not plain A·Bᵀ");
     }
 }
 
 /// Element-level check of the wave32 fragment lane→(m,n) map: `A = I`,
-/// `B[k][j] = (k%16)*16 + (j%16)` ⇒ `C = B`, so the first 16×16 output fragment must
-/// read `got[i][j] = i*16 + j`. Any within-fragment permutation lands a source
-/// element at the wrong `(i,j)` and trips the assert (printing the offending row).
+/// `B[k][j] = (k%16)*16 + (j%16)` ⇒ `C = I·Bᵀ = Bᵀ`, so the first 16×16 output
+/// fragment must read `got[i][j] = B[j][i] = j*16 + i`. Any within-fragment
+/// permutation lands a source element at the wrong `(i,j)` and trips the assert
+/// (printing the offending row).
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_rdna_grid -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -337,7 +339,7 @@ fn test_matmul_rdna_grid() {
 
     for i in 0..16 {
         let row: Vec<i32> = (0..16).map(|j| got[i * n + j].round() as i32).collect();
-        let expected: Vec<i32> = (0..16).map(|j| (i * 16 + j) as i32).collect();
+        let expected: Vec<i32> = (0..16).map(|j| (j * 16 + i) as i32).collect();
         assert_eq!(row, expected, "fragment(0,0) row i={i} permuted: {row:?} (expected {expected:?})");
     }
 }
