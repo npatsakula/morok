@@ -72,29 +72,78 @@ impl Swizzle {
         }
     }
 
-    /// Map `(row, col)` within a base tile of `cols` columns to swizzled
-    /// `(row, col)`. `scalar` is the element type (the XOR variants depend on
-    /// `itemsize`). The mapping is a bijection on `[0,rows)×[0,cols)`, so a write
-    /// and a later read at the same logical `(row, col)` hit the same slot.
+    /// The subtile column width (`swizzle_bytes / itemsize`) of the whole-tile
+    /// layout — the contiguous column block, and (×`base_rows`) the element stride
+    /// between adjacent fragment-rows. Because the XOR delta depends only on
+    /// `row % 16` (invariant under a +16 row step) and the swizzled column part is
+    /// always `< subtile_cols`, `tile_offset(row+16, col) == tile_offset(row, col)
+    /// + 16*subtile_cols` exactly — a lane-uniform constant the gather lifts into
+    /// the `ds_read offset:` immediate. `None` for [`Swizzle::Identity`].
+    pub(crate) fn subtile_cols(&self, cols: usize, scalar: ScalarDType) -> Option<i64> {
+        let is = scalar.bytes() as i64;
+        match self {
+            Swizzle::Identity => None,
+            _ => Some(swizzle_bytes(cols, is) / is),
+        }
+    }
+
+    /// Map a WHOLE-TILE in-tile `(row, col)` (`0 ≤ row < rows`, `0 ≤ col < cols`,
+    /// the full ST tile dims) to the flat element offset within the LDS tile,
+    /// applying HipKittens' subtile-structured XOR bank swizzle (`st.cuh:88-104`).
+    ///
+    /// The tile is laid out as `subtile_cols`-wide column subtiles, each stored
+    /// `rows × subtile_cols` contiguous; the element's byte address inside that
+    /// layout is XORed with `((addr % repeat) >> 7) << 3`. Computing the swizzle
+    /// over the *whole-tile* `subtile_cols`-wide address (not a 16-col base
+    /// fragment) is what spreads the gfx942 LDS banks: every row gets a distinct
+    /// XOR delta, so the per-warp MFMA gather hits 32 distinct banks instead of
+    /// collapsing rows `r, r+4, …` onto the same bank.
+    ///
+    /// A bijection on `[0,rows)×[0,cols)`, applied identically on every LDS store
+    /// and load, so it never changes the numeric result — it only re-lays-out the
+    /// banks. [`Swizzle::Identity`] is handled by the caller (plain fragment-major
+    /// layout) and is not a valid receiver here.
     ///
     /// # Panics
-    /// For a non-[`Swizzle::Identity`] variant, panics if the scalar itemsize is
-    /// not 1, 2, or 4 bytes (only bf16/f16/f32 LDS tiles are swizzled).
-    pub fn swizzle_rc(&self, row: Arc<UOp>, col: Arc<UOp>, cols: usize, scalar: ScalarDType) -> (Arc<UOp>, Arc<UOp>) {
-        match self {
-            Swizzle::Identity => (row, col),
-            Swizzle::Sw16x16 | Swizzle::Sw32x32 | Swizzle::Sw16x32 | Swizzle::Sw32x16 => {
-                let cols_i = cols as i64;
-                let itemsize = scalar.bytes() as i64;
-                let repeat = swizzle_bytes(cols, itemsize) << 4; // st.cuh:87
-                // Row-major element offset within the fragment, then its byte
-                // address; XOR the byte address per st.cuh:96-97 and divide back.
-                let e = row.mul(&cidx(cols_i)).add(&col);
-                let byte = e.mul(&cidx(itemsize));
-                let sw_bytes = byte.mod_(&cidx(repeat)).shr(&cidx(7)).shl(&cidx(3));
-                let e2 = e.xor(&sw_bytes.idiv(&cidx(itemsize)));
-                (e2.idiv(&cidx(cols_i)), e2.mod_(&cidx(cols_i)))
-            }
+    /// Panics on [`Swizzle::Identity`], or if the scalar itemsize is not 1/2/4
+    /// bytes (only bf16/f16/f32 LDS tiles are swizzled).
+    pub fn tile_offset(&self, row: Arc<UOp>, col: Arc<UOp>, rows: usize, cols: usize, scalar: ScalarDType) -> Arc<UOp> {
+        assert!(!matches!(self, Swizzle::Identity), "tile_offset: Identity uses the caller's plain layout");
+        let itemsize = scalar.bytes() as i64;
+        let sb = swizzle_bytes(cols, itemsize);
+        let subtile = sb / itemsize; // subtile_cols (st.cuh:104)
+        let repeat = sb << 4; // swizzle_repeat (st.cuh:87)
+        debug_assert_eq!(cols as i64 % subtile, 0, "tile_offset: cols {cols} not a multiple of subtile {subtile}");
+        // Subtile-major element address: `addr = (col/subtile)*rows*subtile +
+        // row*subtile + col%subtile` (st.cuh:101). When the tile is exactly one
+        // subtile wide (`cols == subtile`, the common K_STEP=64 gemm operand) the
+        // outer index is statically 0 and `col%subtile == col`, so we drop that
+        // whole sub-expression — keeping the per-`ds_read` address arithmetic in
+        // the unrolled MFMA cluster cheap (the compiler can't prove `col < subtile`
+        // at runtime, so it would otherwise emit the divide/mul/mask).
+        let subtile_u = cidx(subtile);
+        if cols as i64 == subtile {
+            // Single-subtile-wide tile (the K_STEP=64 gemm operand): `outer == 0`,
+            // `col < subtile`, and `row*subtile` is a `subtile` multiple, so the
+            // byte address `row*sb + col*itemsize` has `col*itemsize < sb`. The
+            // swizzle's `>>7` therefore sees ONLY the `row` term — the XOR delta
+            // `(((row%16)*sb >> 7) << 3)/itemsize` depends on `row` alone and is
+            // `< subtile`, so `addr = row*subtile + (col ^ delta)` (no carry into
+            // the row bits). Folding the XOR into `col` keeps `delta` loop-invariant
+            // (it hoists out of the unrolled MFMA cluster) and collapses the live
+            // range, avoiding the per-`ds_read` address recompute + register spills.
+            let r16 = row.mod_(&cidx(16));
+            let dbytes = r16.mul(&cidx(subtile * itemsize)).mod_(&cidx(repeat)).shr(&cidx(7)).shl(&cidx(3));
+            let delta = dbytes.idiv(&cidx(itemsize));
+            return row.mul(&subtile_u).add(&col.xor(&delta));
         }
+        // General (multi-subtile) layout: `addr = (col/subtile)*rows*subtile +
+        // row*subtile + col%subtile` (st.cuh:101). XOR its byte address per
+        // st.cuh:103 and divide back to elements (the delta is a multiple of
+        // `itemsize`, so the element-space XOR equals the byte-space one).
+        let outer = col.idiv(&subtile_u);
+        let addr = outer.mul(&cidx(rows as i64 * subtile)).add(&row.mul(&subtile_u)).add(&col.mod_(&subtile_u));
+        let sw_bytes = addr.mul(&cidx(itemsize)).mod_(&cidx(repeat)).shr(&cidx(7)).shl(&cidx(3));
+        addr.xor(&sw_bytes.idiv(&cidx(itemsize)))
     }
 }

@@ -344,6 +344,113 @@ fn test_matmul_rdna_grid() {
     }
 }
 
+/// Numerics of the inline-`asm` HK-pipeline reference kernel ([`build_matmul_hk`]) —
+/// the flat single-LDS-buffer microkernel that exercises tk's full asm GEMM
+/// infrastructure (asm MFMA + asm `ds_read_b64` gather + asm register-staged
+/// `global_load_dwordx4`/`ds_write_b64` prefetch). Must equal `A·Bᵀ` (B in `[N,K]`)
+/// within bf16 tolerance; the chunk/pre-gather schedule reorders the K reduction but the
+/// result is the same sum. Dump the ISA with `SVOD_DUMP_AMD_IR=<dir>` to inspect the held
+/// `L … P M(32) P … W` asm pipeline.
+///
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_hk_amd -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_matmul_hk_amd() {
+    for n in [256usize, 512, 1024, 2048] {
+        let (a, b) = matmul_inputs(n);
+        let got = launch_matmul("matmul_hk", n, M1_CFG, |ker| build_matmul_hk(ker, n), &a, &b);
+        let expected = matmul_reference(&a, &b);
+        let max_abs = max_abs_err(&got, &expected);
+        println!("matmul_hk N={n}: max abs error = {max_abs:e}");
+        assert!(max_abs < 5e-2, "hk N={n}: max abs err {max_abs} exceeds bf16 tolerance 5e-2");
+    }
+}
+
+/// Route A bisect: the HK-pipeline reference ([`build_matmul_hk_phase`]) with the
+/// wave-phase ping-pong toggled. Order matters — (1) the skeleton with the offset OFF (eq
+/// never-matching → no conditional barrier fires, no phase shift) must be numerically
+/// correct first, isolating the pipelined-skeleton restructure from the offset; (2) the
+/// offset ON (`if(warp_row==1)` prologue / `if(warp_row==0)` epilogue) must also be correct.
+/// Run under a wall-clock timeout to double as the HANG test (balanced counts → no deadlock).
+///
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_hk_route_a -- --ignored --nocapture`
+fn route_a_numerics(offset: bool, sizes: &[usize]) {
+    for &n in sizes {
+        let (a, b) = matmul_inputs(n);
+        let got = launch_matmul("matmul_hk", n, M1_CFG, |ker| build_matmul_hk_phase(ker, n, offset), &a, &b);
+        let expected = matmul_reference(&a, &b);
+        let max_abs = max_abs_err(&got, &expected);
+        println!("matmul_hk offset={offset} N={n}: max abs error = {max_abs:e}");
+        assert!(max_abs < 5e-2, "hk offset={offset} N={n}: max abs err {max_abs} exceeds 5e-2");
+    }
+}
+
+/// Bisect step 1 — the pipelined skeleton with the offset OFF (eq never-matching → no
+/// conditional barrier fires). Must be numerically correct, isolating the restructure.
+#[test]
+#[ignore]
+fn test_matmul_hk_route_a_off() {
+    route_a_numerics(false, &[256, 512, 1024, 2048]);
+}
+
+/// Bisect step 2 — the offset ON (HK's `if(warp_row==1)`/`if(warp_row==0)` ping-pong).
+/// Run under a wall-clock timeout to double as the HANG test (balanced counts → no
+/// deadlock); then numerics ≤5e-2.
+#[test]
+#[ignore]
+fn test_matmul_hk_route_a_on() {
+    route_a_numerics(true, &[256, 512, 1024, 2048]);
+}
+
+/// Route A device-time throughput (median TFLOP/s, ≥3 samples) of the HK-pipeline reference
+/// at large N — measured through the graph-node path so the runtime profiler stamps real
+/// per-kernel device time. Prints; no hard assert (the comparison vs MID/HK is the result).
+///
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_hk_route_a_tf -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn test_matmul_hk_route_a_tf() {
+    use svod_runtime::{PmcSelection, ProfileOptions};
+    use svod_tensor::Tensor;
+    let caps = crate::ArchCaps::GFX942;
+    let opts = ProfileOptions { iters: 1, static_analysis: false, counters: PmcSelection::None };
+    for offset in [false, true] {
+        for &n in &[1024usize, 2048, 4096, 8192] {
+            let (a, b) = matmul_inputs(n);
+            let out = Tensor::empty(&[n, n], DType::Float32);
+            let mut c = crate::launch::graph_launch(
+                "matmul_hk",
+                M1_CFG.grid_dims(n),
+                M1_CFG.threads(caps.wave_size),
+                out,
+                &[&a, &b],
+                caps,
+                move |ker| {
+                    build_matmul_hk_phase(ker, n, offset);
+                    ker.finish(M1_CFG.n_accum)
+                },
+            )
+            .expect("graph_launch hk");
+            let plan = c.prepare().expect("prepare hk");
+            let flop = 2.0 * (n as f64).powi(3);
+            let mut tfs: Vec<f64> = (0..5)
+                .map(|_| {
+                    let report = plan.profile(&opts).expect("profile hk");
+                    let ns: u64 = report
+                        .stages
+                        .iter()
+                        .flat_map(|s| &s.kernels)
+                        .filter_map(|k| Some(k.gpu_end_ns? - k.gpu_start_ns?))
+                        .sum();
+                    flop / ns as f64 / 1e3 // TFLOP/s
+                })
+                .collect();
+            tfs.sort_by(|x, y| x.partial_cmp(y).expect("nan"));
+            println!("matmul_hk offset={offset} N={n}: median {:.1} TF  (samples {:?})", tfs[tfs.len() / 2], tfs);
+        }
+    }
+}
+
 /// Build + dispatch a matmul `cfg` over `(a, b)` once, returning the f32 C.
 fn launch_matmul<F>(
     name: &str,

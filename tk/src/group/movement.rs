@@ -13,6 +13,7 @@ use super::{Group, MoveIdx, iadd, idiv, idx_mul, imod, imul, lane_rc, wave_offse
 use crate::index::{
     Idx, cidx, flat_index, flat_offset, index_off, index_off_gated, load_at, load_off, load_off_gated, load_vec,
 };
+use crate::swizzle::Swizzle;
 use crate::tile::{GL, RT, ST};
 use crate::tiles::TileLayout;
 
@@ -136,14 +137,172 @@ impl<'k> Group<'k> {
         let outer = self.ker.raw_range(geom.total_calls, AxisType::Loop);
         let inner = self.ker.raw_range(geom.ept, AxisType::Upcast);
         let (height, width, row, col) = self.fill_lane_rc(&geom, &outer, &inner);
-        let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
 
         let stage_shape = [geom.total_calls as usize, geom.ept as usize];
         let load = load_at(stage, &stage_shape, &[Idx::from(&outer), Idx::from(&inner)]);
-        let stored = st_index(&st, &[Idx::Uop(height), Idx::Uop(width), Idx::Uop(srow), Idx::Uop(scol)])
-            .store(load)
-            .end(smallvec![outer, inner]);
+        let off = swizzled_st_offset(&st, &Idx::Uop(height), &Idx::Uop(width), &row, &col);
+        let stored = index_off(st.uop(), off).store(load).end(smallvec![outer, inner]);
         let stored = if barrier { stored.barrier(SmallVec::new()) } else { stored };
+        self.finalize_st(st, stored)
+    }
+
+    /// The shared 128-bit (`vw = 8` bf16) coalesced addressing of the vectorized
+    /// prefetch: for the lane's pass `outer`, the source-row `row0`, the within-tile
+    /// `col0`, and the `(height, width, row)` fragment coordinate — identical to
+    /// [`Self::load_global_to_local_vec`]. Returns `(total_calls, vw, sw, row0, col0,
+    /// height, width, row, outer)` for the stage (which adds the global base) and the
+    /// commit (which swizzles) to reuse.
+    #[allow(clippy::type_complexity)]
+    fn prefetch_vec_geom(
+        &self,
+        st: &ST,
+    ) -> (i64, i64, i64, Arc<UOp>, Arc<UOp>, Arc<UOp>, Arc<UOp>, Arc<UOp>, Arc<UOp>) {
+        let itemsize = st.elem().base().bytes() as i64;
+        assert_eq!(itemsize, 2, "asm prefetch: bf16-only (128-bit = vec8)");
+        let vw = 16 / itemsize; // 8 bf16 — the global_load_dwordx4 width
+        let sw = 8 / itemsize; // 4 bf16 — the swizzle-order-safe ds_write_b64 width
+        let base_rows = st.base.base.rows as i64;
+        let base_cols = st.base.base.cols as i64;
+        let st_cols = st.cols as i64;
+        let num_elements = st.base.base.num_elements() as i64;
+        let n = st.shape().len();
+        let total_elems = st.shape()[n - 4] as i64 * st.shape()[n - 3] as i64 * num_elements;
+        let memcpy_per_row = st_cols / vw;
+        let slots = self.group_threads() as i64 * vw;
+        let total_calls = (total_elems + slots - 1) / slots;
+        let num_valid = total_elems / vw;
+        let clamp = total_calls * slots != total_elems;
+
+        let outer = self.ker.raw_range(total_calls, AxisType::Loop);
+        let mut load_idx = iadd(&imul(&outer, self.group_threads() as i64), &self.laneid());
+        if clamp {
+            let cond = load_idx.try_cmplt(&cidx(num_valid)).expect("load_idx < num_valid");
+            load_idx = UOp::try_where(cond, load_idx.clone(), cidx(num_valid - 1)).expect("clamp load_idx");
+        }
+        let row0 = idiv(&load_idx, memcpy_per_row);
+        let col0 = imod(&imul(&load_idx, vw), st_cols);
+        let height = idiv(&row0, base_rows);
+        let row = imod(&row0, base_rows);
+        let width = idiv(&col0, base_cols);
+        (total_calls, vw, sw, row0, col0, height, width, row, outer)
+    }
+
+    /// **Inline-`asm` vectorized** GLOBAL→VGPR stage (M3 prefetch, half 1): one
+    /// `global_load_dwordx4` per lane-pass into a flat `[total_calls, vw]` DEFINE_REG,
+    /// as an opaque `asm sideeffect` so the load issues at the loop top and its
+    /// ~300-cycle latency overlaps the MFMA clusters (the machine scheduler can't sink
+    /// it). Same 128-bit coalesced addressing as [`Self::load_global_to_local_vec`].
+    /// Commit with [`Self::commit_reg_to_local_vec_asm`] (same `st`/`idxs`/`axis`).
+    pub fn stage_global_to_reg_vec_asm(
+        &self,
+        st: &ST,
+        src: &GL,
+        idxs: &[Idx],
+        axis: usize,
+        anchor: Option<&Arc<UOp>>,
+    ) -> Arc<UOp> {
+        assert_eq!(src.elem(), st.elem(), "asm prefetch: cast unsupported (bf16→bf16 only)");
+        let (total_calls, vw, _sw, row0, col0, _height, _width, _row, outer) = self.prefetch_vec_geom(st);
+        let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
+        let idxs_t: Vec<Idx> = idxs
+            .iter()
+            .enumerate()
+            .map(|(i, idx)| {
+                let mut e = idx.clone();
+                if i == axis {
+                    e = idx_mul(&e, st.rows as i64);
+                }
+                if i == 3 {
+                    e = idx_mul(&e, st.cols as i64);
+                }
+                e
+            })
+            .collect();
+        let src_i_base = flat_offset(src.shape(), &idxs_t);
+        let off = iadd(&src_i_base, &iadd(&imul(&row0, row_stride), &col0));
+
+        // COMPILER-TRACKED 128-bit global load (`global_load_dwordx4`): a plain
+        // vectorized LLVM load, NOT opaque asm. Because the backend tracks the
+        // outstanding VMEM, the commit's `ds_write` (which reads this staged
+        // register as an input operand) gets a PRECISE auto-inserted `s_waitcnt
+        // vmcnt(N)` — instead of the conservative full `vmcnt(0) lgkmcnt(0)` drain
+        // the opaque-asm load forced (8 per K-iteration). The enclosing per-cluster
+        // `s_barrier`s pin the load to its issue cluster so its ~300-cycle latency
+        // still overlaps the MFMA clusters.
+        let mut loaded = load_vec(src.uop(), off, vw as usize);
+        // Anchor the tracked load to its issue cluster: ordering it AFTER `anchor`
+        // (e.g. cluster-3's barrier for the B-prefetch) stops the linearizer's
+        // toposort from floating the minimally-dependent load to the loop top
+        // bunched with the A-prefetch — it lands mid-loop so its latency overlaps
+        // the intervening MFMA clusters (HK's interleaved `BLOAD` placement).
+        if let Some(a) = anchor {
+            loaded = loaded.after(smallvec![a.clone()]);
+        }
+
+        let stage = self.ker.alloc_reg((total_calls * vw) as usize, st.elem().clone());
+        let stage_shape = [total_calls as usize, vw as usize];
+        let stored =
+            flat_index(&stage, &stage_shape, &[Idx::from(&outer), Idx::Const(0)]).store(loaded).end(smallvec![outer]);
+        self.ker.push_store(stored.clone(), stage.clone());
+        // PIN the tracked load at this stage cluster: a `sched.barrier(0)` after the
+        // staging store forbids the machine scheduler from sinking the load down to
+        // (or bunching it with) the commit. Without it the loads hoist/bunch at the
+        // loop top adjacent to the commit and their latency is no longer overlapped
+        // by the intervening MFMA clusters (the partial M3 re-batch).
+        let pinned = crate::asm::sched_barrier(0, stored);
+        stage.after(smallvec![pinned])
+    }
+
+    /// **Inline-`asm` vectorized** VGPR→LDS commit (M3 prefetch, half 2): reads the
+    /// staged vec8 and writes it to the XOR-swizzled LDS half as `vw/sw` opaque
+    /// `ds_write_b64`s, recomputing the identical addressing as
+    /// [`Self::stage_global_to_reg_vec_asm`]. Opaque `asm sideeffect` so the writes stay
+    /// *after* the MFMA clusters (the caller threads `st.after([last_mfma])`) instead of
+    /// being hoisted. No barrier — the caller fences once at the loop tail.
+    pub fn commit_reg_to_local_vec_asm(&self, st: ST, stage: &Arc<UOp>) -> ST {
+        let (_total_calls, vw, sw, _row0, col0, height, width, row, outer) = self.prefetch_vec_geom(&st);
+        let base_cols = st.base.base.cols as i64;
+
+        // The `vw/sw` swizzle-safe `ds_write_b64`s, chained (each carries the prior as an
+        // ordering dep — void asm side-effects can't sit in a GROUP, so they thread into a
+        // single terminal the loop `END` scopes).
+        let mut prev: Option<Arc<UOp>> = None;
+        for j in 0..vw / sw {
+            let col = imod(&iadd(&col0, &cidx(j * sw)), base_cols);
+            // The sw-wide run staged at reg offset `outer*vw + j*sw`.
+            let roff = iadd(&imul(&outer, vw), &cidx(j * sw));
+            let val =
+                load_vec(stage, roff, sw as usize).bitcast(svod_dtype::DType::Int16.vec(sw as usize).expect("i16 vec"));
+            // Swizzled LDS address (generic `ptr`) → addrspace(3) → asm ds_write_b64.
+            let dst = index_off(
+                st.uop(),
+                swizzled_st_offset(&st, &Idx::Uop(height.clone()), &Idx::Uop(width.clone()), &row, &col),
+            );
+            let as3 = UOp::custom(
+                smallvec![dst],
+                "addrspacecast ptr {0} to ptr addrspace(3)".to_string(),
+                svod_dtype::DType::Int32,
+            );
+            let mut deps: SmallVec<[Arc<UOp>; 4]> = smallvec![as3, val];
+            // No manual `s_waitcnt`: the staged load is now COMPILER-TRACKED, so the
+            // backend auto-inserts the PRECISE `vmcnt` here (the `<4 x i16> {1}`
+            // staged-register input creates the data dependency it waits on); the
+            // WAR `lgkmcnt(0)` (prior-gather drain before overwriting the single LDS
+            // tile) is already supplied by the cluster-5 barrier's `cbar` drain that
+            // precedes this commit. This drops the conservative full `vmcnt(0)
+            // lgkmcnt(0)` the opaque-asm load used to force, matching HK.
+            if let Some(p) = prev.take() {
+                deps.push(p); // ordering only (not referenced in the template)
+            }
+            prev = Some(UOp::custom(
+                deps,
+                "call void asm sideeffect \"ds_write_b64 $0, $1 offset:0\", \"v,v\"\
+                 (ptr addrspace(3) {0}, <4 x i16> {1})"
+                    .to_string(),
+                svod_dtype::DType::Void,
+            ));
+        }
+        let stored = prev.expect("ds_write: at least one sw group").end(smallvec![outer]);
         self.finalize_st(st, stored)
     }
 
@@ -289,7 +448,6 @@ impl<'k> Group<'k> {
         let width = idiv(&col0, base_cols);
         let row = imod(&row0, base_rows);
         let col = imod(&col0, base_cols);
-        let (srow, scol) = st.base.swizzle.swizzle_rc(row.clone(), col.clone(), st.base.base.cols, st.elem().base());
 
         let off = iadd(
             &src_i_base,
@@ -302,7 +460,7 @@ impl<'k> Group<'k> {
         if src.elem() != st.elem() {
             load = load.cast(st.elem().clone());
         }
-        let dst_idx = st_index(&st, &[Idx::Uop(height), Idx::Uop(width), Idx::Uop(srow), Idx::Uop(scol)]);
+        let dst_idx = index_off(st.uop(), swizzled_st_offset(&st, &Idx::Uop(height), &Idx::Uop(width), &row, &col));
         let stored = dst_idx.store(load).end(smallvec![outer, inner]);
         let ended = if barrier { stored.barrier(SmallVec::new()) } else { stored };
         self.finalize_st(st, ended)
@@ -327,6 +485,15 @@ impl<'k> Group<'k> {
         self.load_global_to_local_vec(dst, &src, idxs, axis, true)
     }
 
+    /// [`Self::fill_local_vec`] **without** the trailing workgroup barrier — the
+    /// vectorized counterpart of [`Self::fill_local_nobar`], for the double-buffered
+    /// matmul prefetch (issue strip k+1's 128-bit global loads at the loop top so the
+    /// memory latency overlaps strip k's MFMAs; the caller fences once *after* the
+    /// MFMAs so the load and the compute run concurrently).
+    pub fn fill_local_vec_nobar(&self, dst: ST, src: GL, idxs: &[Idx], axis: usize) -> ST {
+        self.load_global_to_local_vec(dst, &src, idxs, axis, false)
+    }
+
     fn load_global_to_local_vec(&self, st: ST, src: &GL, idxs: &[Idx], axis: usize, barrier: bool) -> ST {
         let itemsize = st.elem().base().bytes() as i64;
         assert_eq!(itemsize, 2, "vec fill: bf16-only (128-bit = vec8)");
@@ -339,7 +506,7 @@ impl<'k> Group<'k> {
         let st_cols = st.cols as i64;
         // Alignment invariants: the swizzle period and the
         // tile/fragment widths must admit `vw`-aligned 16-byte groups.
-        if let Some(period) = st.base.swizzle.period_bytes(st.base.base.cols, itemsize) {
+        if let Some(period) = st.base.swizzle.period_bytes(st.cols, itemsize) {
             assert_eq!(period % 16, 0, "vec fill: swizzle period {period}B not 16B-aligned");
         }
         assert_eq!(base_cols % vw, 0, "vec fill: base cols {base_cols} not a multiple of vec width {vw}");
@@ -396,10 +563,9 @@ impl<'k> Group<'k> {
         let stores: Vec<Arc<UOp>> = (0..vw / sw)
             .map(|j| {
                 let col = imod(&iadd(&col0, &cidx(j * sw)), base_cols);
-                let (srow, scol) = st.base.swizzle.swizzle_rc(row.clone(), col, st.base.base.cols, st.elem().base());
                 let val = loaded.gep(((j * sw) as usize..(j * sw + sw) as usize).collect());
-                let didx = [Idx::Uop(height.clone()), Idx::Uop(width.clone()), Idx::Uop(srow), Idx::Uop(scol)];
-                st_index(&st, &didx).store(val)
+                let off = swizzled_st_offset(&st, &Idx::Uop(height.clone()), &Idx::Uop(width.clone()), &row, &col);
+                index_off(st.uop(), off).store(val)
             })
             .collect();
         let grouped = if stores.len() == 1 { stores.into_iter().next().unwrap() } else { UOp::group(stores) };
@@ -435,6 +601,25 @@ impl<'k> Group<'k> {
             !transpose && !rt.base.interleave && !rt.base.interleave_t && st.elem() == rt.elem() && ept == 4;
         let vw = if contiguous { ept } else { 1 };
 
+        // Unrolled inline-`asm` `ds_read_b64` gather of a swizzled tile: emit one
+        // `ds_read` per fragment-ROW sharing ONE base-address VGPR (the lane address
+        // at `height == 0`) and a per-row `offset:` IMMEDIATE. The bank swizzle is
+        // non-linear, so the per-row addresses are not a linear stride the backend
+        // could fold — BUT the XOR delta depends only on `row % 16` (invariant under
+        // the +`base_rows` row step) and the swizzled column part is `< subtile_cols`,
+        // so `tile_offset(row+base_rows, col) == tile_offset(row, col) +
+        // base_rows*subtile_cols` exactly: a lane-UNIFORM constant we bake straight
+        // into the `offset:` field. This collapses the per-read permuted-address
+        // VGPRs (which otherwise spill across the 128-MFMA cluster) to a single base.
+        // gemm is the only `asm_gather` kernel — `rt_w == 1`, one `vw`-wide run — and
+        // the column direction's stride is NOT lane-uniform (the XOR), so we restrict
+        // the unroll to that shape and fall back to the rolled path otherwise.
+        if self.ker.asm_gather() && vw > 1 && rt_w == 1 && ept / vw == 1 {
+            // `asm_gather` (gemm only) always reads a swizzled operand tile.
+            let subtile = st.base.swizzle.subtile_cols(st.cols, st.elem().base()).expect("asm_gather tile swizzled");
+            return self.gather_asm_unrolled(rt, st, dst_idxs, idxs, transpose, vw, subtile);
+        }
+
         let height = self.ker.raw_range(rt_h, AxisType::Loop);
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
         let inner = self.ker.raw_range(ept / vw, AxisType::Loop); // groups of `vw` elements
@@ -442,18 +627,45 @@ impl<'k> Group<'k> {
 
         let (row, col) =
             lane_rc(transpose, rt.base.interleave, rt.base.interleave_t, &laneid, base_rows, base_cols, stride, &elem);
-        let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
 
         // Wave sub-tile fragment offset (SI-1): the caller passes the wave's
         // `(row_block, col_block)` via `idxs` (already including warp_row/col);
         // empty ⇒ no offset (single-warp). `off` honors the double-buffer parity base.
         let h_idx = wave_offset(idxs.first(), rt_h, &height);
         let w_idx = wave_offset(idxs.get(1), rt_w, &width);
-        let mut off = flat_offset(st.shape(), &[h_idx, w_idx, Idx::Uop(srow), Idx::Uop(scol)]);
-        if let Some(bo) = st.base_offset() {
-            off = off.try_add(bo).expect("load LOCAL→REG: parity base offset");
-        }
-        let mut load = if vw > 1 { load_vec(st.uop(), off, vw as usize) } else { load_off(st.uop(), off) };
+        let off = swizzled_st_offset(st, &h_idx, &w_idx, &row, &col);
+        let mut load = if vw > 1 {
+            if self.ker.asm_gather() {
+                // Inline-`asm` `ds_read_b64`: the `Op::Index` GEP renders the LDS
+                // element pointer (a generic `ptr` — svod `addrspacecast`s its
+                // addrspace(3) locals to generic on entry), which we cast back to
+                // addrspace(3) so the AMDGPU backend lowers it to the i32 LDS-offset
+                // VGPR fed as the `$1` "v" operand (the entry/exit casts fold away).
+                // The read is an opaque `asm sideeffect` so the machine scheduler can't
+                // reorder it across the asm MFMAs — holding the `R M R M` interleave.
+                // Output `<4 x i16>` (the proven gfx942 form), then bitcast to the bf16
+                // fragment, matching the plain `load_vec` value type. The intermediate
+                // cast's svod dtype is cosmetic — its rendered RHS carries the LLVM type.
+                let idx = index_off(st.uop(), off);
+                let as3 = UOp::custom(
+                    smallvec![idx],
+                    "addrspacecast ptr {0} to ptr addrspace(3)".to_string(),
+                    svod_dtype::DType::Int32,
+                );
+                let read = UOp::custom(
+                    smallvec![as3],
+                    "call <4 x i16> asm sideeffect \"ds_read_b64 $0, $1 offset:0\", \"=v,v\"\
+                     (ptr addrspace(3) {0})"
+                        .to_string(),
+                    svod_dtype::DType::Int16.vec(vw as usize).expect("ds_read_b64: i16 vec"),
+                );
+                read.bitcast(st.elem().vec(vw as usize).expect("ds_read_b64: bf16 vec"))
+            } else {
+                load_vec(st.uop(), off, vw as usize)
+            }
+        } else {
+            load_off(st.uop(), off)
+        };
         if st.elem() != rt.elem() {
             load = load.cast(rt.elem().clone());
         }
@@ -461,6 +673,88 @@ impl<'k> Group<'k> {
         didx.extend([Idx::from(&height), Idx::from(&width), Idx::from(&elem)]);
         let ended = flat_index(rt.uop(), rt.shape(), &didx).store(load).end(smallvec![height, width, inner]);
         self.finalize_reg(rt, ended)
+    }
+
+    /// Rust-unrolled inline-`asm` `ds_read_b64` gather (the gemm `asm_gather`
+    /// shape: `rt_w == 1`, one `vw`-wide column run). Computes ONE base LDS address
+    /// (the lane's `height == 0` slot) and emits one `ds_read_b64 ... offset:N` per
+    /// fragment-row, `N = h * base_rows * subtile_cols * itemsize` bytes — a
+    /// lane-uniform constant (see [`Swizzle::subtile_cols`]). Sharing the base VGPR
+    /// across the unrolled MFMA cluster is what keeps VGPR pressure low (no
+    /// per-read permuted-address spills); the asm reads are `sideeffect` and chain
+    /// through their RT stores so the last store scopes them under one loop `END`.
+    #[allow(clippy::too_many_arguments)]
+    fn gather_asm_unrolled(
+        &self,
+        rt: RT<'k>,
+        st: &ST,
+        dst_idxs: &[Idx],
+        idxs: &[Idx],
+        transpose: bool,
+        vw: i64,
+        subtile: i64,
+    ) -> RT<'k> {
+        let laneid = self.ker.laneid();
+        let base_rows = rt.base.base.rows as i64;
+        let base_cols = rt.base.base.cols as i64;
+        let stride = rt.base.stride as i64;
+        let n = rt.shape().len();
+        let rt_h = rt.shape()[n - 3] as i64;
+        let itemsize = st.elem().base().bytes() as i64;
+        let row_stride_bytes = base_rows * subtile * itemsize; // fragment-row `offset:` step
+
+        // Shared base address: the lane's slot at fragment-row 0 (`elem == 0`), with
+        // the wave/parity offset folded in. One `addrspacecast` ⇒ one `$1` VGPR.
+        let (row, col) = lane_rc(
+            transpose,
+            rt.base.interleave,
+            rt.base.interleave_t,
+            &laneid,
+            base_rows,
+            base_cols,
+            stride,
+            &cidx(0),
+        );
+        let h0 = wave_offset(idxs.first(), rt_h, &cidx(0));
+        let w0 = wave_offset(idxs.get(1), 1, &cidx(0));
+        let base_off = swizzled_st_offset(st, &h0, &w0, &row, &col);
+        let base_as3 = UOp::custom(
+            smallvec![index_off(st.uop(), base_off)],
+            "addrspacecast ptr {0} to ptr addrspace(3)".to_string(),
+            svod_dtype::DType::Int32,
+        );
+
+        let i16v = svod_dtype::DType::Int16.vec(vw as usize).expect("ds_read_b64: i16 vec");
+        let bf16v = st.elem().vec(vw as usize).expect("ds_read_b64: bf16 vec");
+        let mut prev: Option<Arc<UOp>> = None;
+        for h in 0..rt_h {
+            let nbytes = h * row_stride_bytes;
+            assert!(nbytes <= 65535, "ds_read offset {nbytes}B exceeds the 16-bit immediate");
+            // `asm sideeffect` so the read can't hoist across the asm MFMAs; the prior
+            // fragment's store is carried as an ordering-only operand (not in the
+            // template) so the reads stay in program order under one `END`.
+            let mut deps: SmallVec<[Arc<UOp>; 4]> = smallvec![base_as3.clone()];
+            if let Some(p) = prev.take() {
+                deps.push(p);
+            }
+            let read = UOp::custom(
+                deps,
+                format!(
+                    "call <4 x i16> asm sideeffect \"ds_read_b64 $0, $1 offset:{nbytes}\", \"=v,v\"\
+                     (ptr addrspace(3) {{0}})"
+                ),
+                i16v.clone(),
+            );
+            let mut val = read.bitcast(bf16v.clone());
+            if st.elem() != rt.elem() {
+                val = val.cast(rt.elem().clone());
+            }
+            let mut didx: Vec<Idx> = dst_idxs.to_vec();
+            didx.extend([Idx::Const(h), Idx::Const(0), Idx::Const(0)]);
+            prev = Some(flat_index(rt.uop(), rt.shape(), &didx).store(val));
+        }
+        let terminal = prev.expect("gather_asm_unrolled: at least one fragment-row");
+        self.finalize_reg(rt, terminal)
     }
 
     /// The boundary gate for a GLOBAL↔REG hop: `global_row < shape[axis] &
@@ -602,8 +896,6 @@ impl<'k> Group<'k> {
             stride,
             &inner,
         );
-        let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
-
         let mut sidx: Vec<Idx> = src_idxs.to_vec();
         sidx.extend([Idx::from(&height), Idx::from(&width), Idx::from(&inner)]);
         let mut load = load_at(rt.uop(), rt.shape(), &sidx);
@@ -613,8 +905,8 @@ impl<'k> Group<'k> {
         // Wave sub-tile fragment offset (SI-1), symmetric with `load_local_to_reg`.
         let h_idx = wave_offset(idxs.first(), rt_h, &height);
         let w_idx = wave_offset(idxs.get(1), rt_w, &width);
-        let didx = [h_idx, w_idx, Idx::Uop(srow), Idx::Uop(scol)];
-        let ended = st_index(&st, &didx).store(load).end(smallvec![height, width, inner]);
+        let off = swizzled_st_offset(&st, &h_idx, &w_idx, &row, &col);
+        let ended = index_off(st.uop(), off).store(load).end(smallvec![height, width, inner]);
         self.finalize_st(st, ended)
     }
 
@@ -696,10 +988,37 @@ impl<'k> Group<'k> {
 /// ST flat INDEX honoring the optional double-buffer parity [`ST::base_offset`].
 /// Identical to [`crate::index::flat_index`] for an ordinary (`base_offset:None`)
 /// tile; adds the parity offset for a [`Kernel::st_db`](crate::Kernel) half-view.
-fn st_index(st: &ST, idxs: &[Idx]) -> Arc<UOp> {
-    let mut off = flat_offset(st.shape(), idxs);
+/// Flat element offset of in-tile fragment position `(frag_h, frag_w, row, col)`
+/// in the (possibly swizzled) LDS tile, plus any double-buffer parity base.
+/// `frag_h`/`frag_w` are the fragment-grid indices (height/width, with the wave
+/// `block` already folded in for the gather/scatter hops); `row`/`col` are the
+/// per-lane position WITHIN the base fragment.
+///
+/// [`Swizzle::Identity`] keeps the plain fragment-major layout (shape
+/// `[H, W, base_rows, base_cols]`); the XOR variants reconstruct the whole-tile
+/// `(row, col)` and apply HipKittens' subtile-structured bank swizzle
+/// ([`Swizzle::tile_offset`]) over the full in-tile address — the same bijection
+/// on every store and load, so numerics are preserved while the gfx942 LDS banks
+/// are spread (the MFMA-gather bank-conflict fix).
+fn swizzled_st_offset(st: &ST, frag_h: &Idx, frag_w: &Idx, row: &Arc<UOp>, col: &Arc<UOp>) -> Arc<UOp> {
+    let mut off = match st.base.swizzle {
+        Swizzle::Identity => {
+            flat_offset(st.shape(), &[frag_h.clone(), frag_w.clone(), Idx::Uop(row.clone()), Idx::Uop(col.clone())])
+        }
+        sw => {
+            let mut full_row = iadd(&imul(&frag_h.to_uop(), st.base.base.rows as i64), row);
+            let mut full_col = iadd(&imul(&frag_w.to_uop(), st.base.base.cols as i64), col);
+            // A `subtile` view's absolute element origin enters the swizzle here,
+            // BEFORE the (non-linear) bank remap — see `ST::with_origin`.
+            if let Some((orow, ocol)) = st.origin() {
+                full_row = iadd(&full_row, orow);
+                full_col = iadd(&full_col, ocol);
+            }
+            sw.tile_offset(full_row, full_col, st.rows, st.cols, st.elem().base())
+        }
+    };
     if let Some(bo) = st.base_offset() {
-        off = off.try_add(bo).expect("st_index: parity base offset add");
+        off = off.try_add(bo).expect("swizzled_st_offset: parity base offset add");
     }
-    index_off(st.uop(), off)
+    off
 }

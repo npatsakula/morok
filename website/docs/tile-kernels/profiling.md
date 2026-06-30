@@ -217,6 +217,19 @@ Tier-1 device time.
 holds a fixed clock. On the default `auto` power state the profiler does *not* fail — it degrades:
 it reports timing only and prints a one-line note that counters need the `profile_standard` state.
 Put the GPU in that state first (e.g. `amd-smi set -l stable_std`), then re-run with `SVOD_PMC`.
+
+**Tier 4 is gfx11 (RDNA3.5) only, and external profilers can't see svod at all.** The PM4 counter
+programming in `device/src/amd/pmc.rs` is keyed to the `GC_11_5_0` register table and exposes just
+three selectors (`sqbusy`, `waves`, `valu`) — there is no MFMA-duty-cycle or LDS-bank-conflict
+counter, and nothing for CDNA3 (gfx942). Reaching for `rocprofv3` / `rocprof-compute` instead does
+**not** work either: svod submits AQL/PM4 to its *own* KFD compute queue (own ring + doorbell),
+bypassing ROCr/HSA, so the rocprofiler-sdk HSA interception captures **zero** dispatches from a svod
+process. To get gfx942 hardware counters (MFMA util, bank conflicts, stall breakdown) for a `tk`
+kernel today, take it out of svod's runtime: dump the kernel IR (`SVOD_DUMP_AMD_IR=<dir>`), compile
+it to a code object with svod's own flags
+(`clang -x ir -c -O2 --target=amdgcn-amd-amdhsa -mcpu=gfx942 -mcumode -nogpulib`, then link with
+`ld.lld -shared`), and `hipModuleLoad` it from a tiny HIP harness — that dispatch *is* ROCr-visible,
+so `rocprofv3 -i counters.txt` profiles the identical machine code.
 :::
 
 ---

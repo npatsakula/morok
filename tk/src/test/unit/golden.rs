@@ -68,8 +68,8 @@ fn fa_sink() -> Arc<UOp> {
 }
 
 // Committed structural golden digests. Update ONLY for an intentional graph change.
-const MATMUL_DIGEST: u128 = 0x5dcf_6d50_f798_3d8e_0000_0000_0000_0000;
-const MATMUL_NODES: usize = 483;
+const MATMUL_DIGEST: u128 = 0x2afd_2c07_4792_1bbd_0000_0000_0000_0000;
+const MATMUL_NODES: usize = 449;
 const FA_DIGEST: u128 = 0x8d4e_3262_dd79_2a58_0000_0000_0000_0000;
 const FA_NODES: usize = 879;
 // Non-causal and non-causal+key-masked build variants (pin the `causal:false` and

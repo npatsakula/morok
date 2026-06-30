@@ -81,7 +81,23 @@ pub fn render_wmma_amd(
         ", i1 false"
     };
 
-    kernel.push(format!("  {call_dst} = call {acc_wire} @{intrinsic}({a_op}, {b_op}, {c_op}{tail})"));
+    // Inline-`asm sideeffect` MFMA path (tk asm-microkernel only): emit the matrix
+    // op as opaque inline asm so the AMDGPU machine scheduler cannot re-batch the
+    // inner loop's `ds_read`/MFMA program order (the intrinsic form gets reordered
+    // into all-memory-then-all-compute). The `0` constraint ties the C accumulator
+    // operand to the result register (in==out → the K-reduction chains in place),
+    // exactly mirroring the proven gfx942 spike. Only valid for the f32-accumulating
+    // bf16 K=16 MFMA — the only shape the flag is ever set for; any other (e.g. the
+    // bf16→bf16 reinterpreted accumulator) falls through to the intrinsic.
+    let asm_mfma = metadata.asm && arch.is_cdna() && !acc_reinterpreted;
+    if asm_mfma {
+        kernel.push(format!(
+            "  {call_dst} = call {acc_wire} asm sideeffect \
+             \"v_mfma_f32_16x16x16_bf16 $0, $1, $2, $3\", \"=v,v,v,0\"({a_op}, {b_op}, {c_op})"
+        ));
+    } else {
+        kernel.push(format!("  {call_dst} = call {acc_wire} @{intrinsic}({a_op}, {b_op}, {c_op}{tail})"));
+    }
 
     if acc_reinterpreted {
         // bf16→bf16: the call returns `<N x i16>`; reinterpret it back to bf16.

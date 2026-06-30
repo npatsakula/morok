@@ -41,6 +41,7 @@ fn wmma_from_tc(tc: &TensorCore, device: RendererDevice) -> WmmaMetadata {
         },
         reduce_axes: vec![],
         tile_grid: tc.tile_grid,
+        asm: false,
     }
 }
 
@@ -135,7 +136,8 @@ impl<'k> Group<'k> {
         // per-lane operand widths come from the descriptor (gfx942 4/4/4; RDNA
         // 16/16/8), not a hardcoded 4.
         assert_eq!(a.base.base.cols, 16, "mma: only the 16-col WMMA base is supported");
-        let meta = wmma_desc(self.ker.caps.arch, a.elem());
+        let mut meta = wmma_desc(self.ker.caps.arch, a.elem());
+        meta.asm = self.ker.asm_mfma();
         let (a_w, b_w, c_w) =
             (upcast_count(&meta.upcast_axes.a), upcast_count(&meta.upcast_axes.b), upcast_count(&meta.upcast_axes.c));
 
@@ -209,7 +211,8 @@ impl<'k> Group<'k> {
     /// `kernels/matmul.rs:201`). Bit-identical accumulation order to [`Self::mma`].
     fn mma_u(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool) -> RT<'k> {
         assert_eq!(a.base.base.cols, 16, "mma_u: only the 16-col WMMA base is supported");
-        let meta = wmma_desc(self.ker.caps.arch, a.elem());
+        let mut meta = wmma_desc(self.ker.caps.arch, a.elem());
+        meta.asm = self.ker.asm_mfma();
         let (a_w, b_w, c_w) =
             (upcast_count(&meta.upcast_axes.a), upcast_count(&meta.upcast_axes.b), upcast_count(&meta.upcast_axes.c));
 

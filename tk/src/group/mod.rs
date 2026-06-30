@@ -411,17 +411,27 @@ impl ST {
     /// content hash.
     pub fn subtile<R: Into<Idx>, C: Into<Idx>>(&self, dims: (usize, usize), blk: (R, C)) -> ST {
         let blk = (blk.0.into(), blk.1.into());
-        let frag_h = (dims.0 / self.base.base.rows) as i64;
-        let frag_w = (dims.1 / self.base.base.cols) as i64;
-        let band = flat_offset(
-            self.shape(),
-            &[idx_mul(&blk.0, frag_h), idx_mul(&blk.1, frag_w), Idx::Const(0), Idx::Const(0)],
-        );
-        let off = match self.base_offset() {
-            Some(bo) => band.try_add(bo).expect("subtile band + base offset"),
-            None => band,
-        };
-        self.with_base_offset(off)
+        if self.base.swizzle == crate::swizzle::Swizzle::Identity {
+            // Identity's layout is linear in the fragment grid, so the band is a
+            // plain additive offset (folds with the parity `base_offset`).
+            let frag_h = (dims.0 / self.base.base.rows) as i64;
+            let frag_w = (dims.1 / self.base.base.cols) as i64;
+            let band = flat_offset(
+                self.shape(),
+                &[idx_mul(&blk.0, frag_h), idx_mul(&blk.1, frag_w), Idx::Const(0), Idx::Const(0)],
+            );
+            let off = match self.base_offset() {
+                Some(bo) => band.try_add(bo).expect("subtile band + base offset"),
+                None => band,
+            };
+            return self.with_base_offset(off);
+        }
+        // A swizzled tile's bank layout is non-linear in absolute position, so the
+        // band origin must enter the swizzle as absolute `(row, col)` coordinates
+        // (element units: `blk * dims`), not as a post-swizzle linear offset.
+        let orow = idx_mul(&blk.0, dims.0 as i64).to_uop();
+        let ocol = idx_mul(&blk.1, dims.1 as i64).to_uop();
+        self.with_origin(orow, ocol)
     }
 }
 

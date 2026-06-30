@@ -226,8 +226,16 @@ pub struct ST {
     /// software double-buffer parity select (`tile % 2 * half_elems`). `None`
     /// for an ordinary single-buffered tile (the common case). When `Some`, every
     /// LDS access adds it to the computed flat offset, selecting one half of a
-    /// `st_db` (2×-size) buffer at runtime.
+    /// `st_db` (2×-size) buffer at runtime. A whole-tile (`half_elems`-multiple)
+    /// shift, so it commutes with the swizzle and is applied AFTER it.
     base_offset: Option<Arc<UOp>>,
+    /// Optional absolute `(row, col)` element origin of a [`Group::subtile`] view
+    /// into a *swizzled* tile. Unlike `base_offset`, this is INTRA-tile, so it
+    /// must enter the bank swizzle as part of the absolute coordinates (a
+    /// post-swizzle linear band would land on the wrong banks); the swizzle is
+    /// non-linear in absolute position. `None` for a whole-tile view / Identity
+    /// (whose layout is linear, so it uses `base_offset` for the band instead).
+    origin: Option<(Arc<UOp>, Arc<UOp>)>,
 }
 
 impl ST {
@@ -242,6 +250,7 @@ impl ST {
             base: self.base,
             elem: self.elem.clone(),
             base_offset: self.base_offset.clone(),
+            origin: self.origin.clone(),
         }
     }
 
@@ -261,6 +270,23 @@ impl ST {
     /// The parity base offset, if this is a double-buffer half view.
     pub fn base_offset(&self) -> Option<&Arc<UOp>> {
         self.base_offset.as_ref()
+    }
+
+    /// This tile viewing a swizzled-subtile band at absolute element origin
+    /// `(orow, ocol)` — added to the in-tile coordinates BEFORE the bank swizzle.
+    /// Accumulates with any existing origin (nested subtiles). Clones the wrapper.
+    pub fn with_origin(&self, orow: Arc<UOp>, ocol: Arc<UOp>) -> ST {
+        let mut t = self.rewrap(self.buf.clone());
+        t.origin = Some(match &self.origin {
+            Some((r, c)) => (r.add(&orow), c.add(&ocol)),
+            None => (orow, ocol),
+        });
+        t
+    }
+
+    /// The absolute `(row, col)` element origin of a swizzled-subtile view.
+    pub fn origin(&self) -> Option<&(Arc<UOp>, Arc<UOp>)> {
+        self.origin.as_ref()
     }
 }
 
@@ -373,7 +399,7 @@ impl Kernel {
         let shape = vec![height, width, base.base.rows, base.base.cols];
         let flat = shape.iter().product();
         let buf = self.alloc_local(flat, dtype.clone());
-        ST { buf, shape, rows, cols, layout, base, elem: dtype, base_offset: None }
+        ST { buf, shape, rows, cols, layout, base, elem: dtype, base_offset: None, origin: None }
     }
 
     /// Allocate a **double-buffered** shared-memory [`ST`] tile: identical logical
@@ -396,7 +422,7 @@ impl Kernel {
         let shape = vec![height, width, base.base.rows, base.base.cols];
         let half: usize = shape.iter().product();
         let buf = self.alloc_local(2 * half, dtype.clone());
-        ST { buf, shape, rows, cols, layout, base, elem: dtype, base_offset: None }
+        ST { buf, shape, rows, cols, layout, base, elem: dtype, base_offset: None, origin: None }
     }
 
     /// Allocate a register [`RT`] tile (tinygrad `ker.rt`). `dims` is the

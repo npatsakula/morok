@@ -158,6 +158,7 @@ fn wmma_f16_f32_metadata() -> WmmaMetadata {
         upcast_axes: WmmaUpcastAxes { a: vec![(2, 16)], b: vec![(2, 16)], c: vec![(2, 8)] },
         reduce_axes: vec![],
         tile_grid: (1, 1),
+        asm: false,
     }
 }
 
@@ -212,6 +213,7 @@ fn cpu_amx_f32_metadata() -> WmmaMetadata {
         upcast_axes: WmmaUpcastAxes { a: vec![(2, 256)], b: vec![(2, 256)], c: vec![(2, 256)] },
         reduce_axes: vec![],
         tile_grid: (1, 1),
+        asm: false,
     }
 }
 
@@ -244,6 +246,7 @@ fn wmma_meta(dims: (usize, usize, usize), in_dt: DType, out_dt: DType, c_count: 
         upcast_axes: WmmaUpcastAxes { a: vec![(2, 16)], b: vec![(2, 16)], c: vec![(2, c_count)] },
         reduce_axes: vec![],
         tile_grid: (1, 1),
+        asm: false,
     }
 }
 

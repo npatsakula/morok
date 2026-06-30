@@ -16,6 +16,7 @@ fn make_metadata(dtype_in: DType, dtype_out: DType) -> WmmaMetadata {
         upcast_axes: WmmaUpcastAxes { a: vec![], b: vec![], c: vec![] },
         reduce_axes: vec![],
         tile_grid: (1, 1),
+        asm: false,
     }
 }
 

@@ -506,6 +506,7 @@ fn apply_axis_choice_impl(
             upcast_axes: WmmaUpcastAxes { a: a_axes.clone(), b: b_axes.clone(), c: c_axes.clone() },
             reduce_axes: tc_reduce_aids.clone(),
             tile_grid: tc.tile_grid,
+            asm: false,
         };
 
         // Tag the WMMA structure finalized (see `TAG_TC_FINAL`) so the expander

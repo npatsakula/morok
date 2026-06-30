@@ -95,6 +95,12 @@ impl Kernel {
     pub fn shared_sw(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> ST {
         self.st(dims, dt, layout, self.caps.shared_swizzled())
     }
+    /// A 2×-size double-buffered XOR-swizzled shared tile: [`Self::shared_sw`] in a
+    /// ping/pong ring (the software-pipelined matmul A/B strips). Select a half with
+    /// `with_base_offset(parity * half_elems())`.
+    pub fn shared_db_sw(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> ST {
+        self.st_db(dims, dt, layout, self.caps.shared_swizzled())
+    }
 
     /// Build-time divisibility check with a uniform message (emits no UOps, so it is
     /// invisible to the graph fingerprint).

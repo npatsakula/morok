@@ -913,7 +913,7 @@ impl core::fmt::Display for RendererDevice {
 }
 
 /// Metadata for WMMA (Warp Matrix Multiply-Accumulate) operations.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct WmmaMetadata {
     /// Operation name (e.g., "WMMA_INSTRUCTION").
@@ -937,6 +937,37 @@ pub struct WmmaMetadata {
     /// When > (1, 1), uses load-pair mode and emits multiple FMAs per K iteration
     /// to compute a 2×2 grid of output tiles. Default is (1, 1).
     pub tile_grid: (usize, usize),
+    /// Emit the matrix op as an inline-`asm sideeffect` MFMA (opaque to the AMDGPU
+    /// machine scheduler, so it holds program order) instead of the
+    /// `@llvm.amdgcn.mfma.*` intrinsic. Only the tk asm-microkernel sets this; every
+    /// other path leaves it `false` and keeps the intrinsic. `#[serde(default)]` keeps
+    /// pre-existing serialized metadata loadable, and the manual [`Hash`] below folds
+    /// this field in only when `true`, so the default `false` hashes byte-identically
+    /// to pre-existing WMMA metadata (the structural golden digests stay stable).
+    #[serde(default)]
+    pub asm: bool,
+}
+
+impl Hash for WmmaMetadata {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Hash every field EXCEPT `asm` in declaration order (the pre-`asm` layout),
+        // then fold `asm` in only when set — so a default (`asm == false`) descriptor
+        // produces exactly the hash it had before the field existed. `Eq` still
+        // compares `asm`, so the two values that differ only in `asm` are unequal; the
+        // hash need only agree for *equal* values, which it does.
+        self.name.hash(state);
+        self.dims.hash(state);
+        self.dtype_in.hash(state);
+        self.dtype_out.hash(state);
+        self.device.hash(state);
+        self.threads.hash(state);
+        self.upcast_axes.hash(state);
+        self.reduce_axes.hash(state);
+        self.tile_grid.hash(state);
+        if self.asm {
+            self.asm.hash(state);
+        }
+    }
 }
 
 /// Wrapper for ConstValue that implements Eq and Hash.

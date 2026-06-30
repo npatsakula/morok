@@ -46,6 +46,30 @@ pub struct Kernel {
     /// scheduling comb can weave. Off by default (the looped form keeps the matmul
     /// + rolled-FA IR compact); the cross-tile-pipeline FA builder opts in.
     unroll: Cell<bool>,
+
+    /// When set, [`crate::Group::mma`] tags each emitted [`svod_ir::Op::Wmma`] to
+    /// render as an inline-`asm sideeffect` MFMA (opaque to the AMDGPU machine
+    /// scheduler, so the inner-loop program order survives) instead of the
+    /// `@llvm.amdgcn.mfma.*` intrinsic. Off by default — only the tk asm-microkernel
+    /// matmul opts in; every shipping kernel keeps the intrinsic path.
+    asm_mfma: Cell<bool>,
+
+    /// When set, the contiguous LOCAL→REG fragment gather
+    /// ([`crate::Group::load_local_to_reg`]) emits its `b64` LDS read as an
+    /// inline-`asm sideeffect` `ds_read_b64` (opaque to the machine scheduler, so it
+    /// holds program order relative to the asm MFMAs) instead of an `addrspace(3)`
+    /// vector `load`. Off by default — only the tk asm-microkernel's interleaved core
+    /// opts in; FA and every shipping matmul keep the plain load.
+    asm_gather: Cell<bool>,
+
+    /// When set, the register-staged global prefetch emits its GLOBAL→VGPR load
+    /// ([`crate::Group::stage_global_to_reg`]) and VGPR→LDS commit
+    /// ([`crate::Group::commit_reg_to_local`]) as inline-`asm` `global_load_dwordx4` /
+    /// `ds_write_b128` (opaque to the machine scheduler, so the prefetch stays woven
+    /// among the asm MFMA clusters through `-O3`) instead of plain `addrspace(1)`/`(3)`
+    /// memory ops. Off by default — only the tk asm-microkernel double-buffered core
+    /// opts in; FA and every shipping matmul keep the plain staged path.
+    asm_prefetch: Cell<bool>,
 }
 
 impl Kernel {
@@ -89,6 +113,9 @@ impl Kernel {
             range_stack: RefCell::new(Vec::new()),
             store_stack: RefCell::new(Vec::new()),
             unroll: Cell::new(false),
+            asm_mfma: Cell::new(false),
+            asm_gather: Cell::new(false),
+            asm_prefetch: Cell::new(false),
         }
     }
 
@@ -102,6 +129,43 @@ impl Kernel {
     /// Whether the register compute primitives should emit fully-unrolled bodies.
     pub fn unrolled(&self) -> bool {
         self.unroll.get()
+    }
+
+    /// Opt into inline-`asm` MFMA emission for this kernel's matrix ops (see
+    /// [`Self::asm_mfma`]). Only the tk asm-microkernel matmul sets this.
+    pub fn set_asm_mfma(&self, on: bool) {
+        self.asm_mfma.set(on);
+    }
+
+    /// Whether [`crate::Group::mma`] should tag its `Op::Wmma` for inline-`asm`
+    /// MFMA rendering (opaque to the machine scheduler) instead of the intrinsic.
+    pub fn asm_mfma(&self) -> bool {
+        self.asm_mfma.get()
+    }
+
+    /// Opt into inline-`asm` `ds_read_b64` for the contiguous LOCAL→REG gather (see
+    /// [`Self::asm_gather`]). Only the tk asm-microkernel interleaved core sets this.
+    pub fn set_asm_gather(&self, on: bool) {
+        self.asm_gather.set(on);
+    }
+
+    /// Whether [`crate::Group::load_local_to_reg`] should emit its `b64` LDS read as
+    /// inline-`asm` `ds_read_b64` instead of an `addrspace(3)` vector load.
+    pub fn asm_gather(&self) -> bool {
+        self.asm_gather.get()
+    }
+
+    /// Opt into inline-`asm` `global_load_dwordx4` / `ds_write_b128` for the
+    /// register-staged global prefetch (see [`Self::asm_prefetch`]). Only the tk
+    /// asm-microkernel double-buffered core sets this.
+    pub fn set_asm_prefetch(&self, on: bool) {
+        self.asm_prefetch.set(on);
+    }
+
+    /// Whether the register-staged global prefetch should emit its GLOBAL→VGPR load and
+    /// VGPR→LDS commit as inline `asm` instead of plain memory ops.
+    pub fn asm_prefetch(&self) -> bool {
+        self.asm_prefetch.get()
     }
 
     // ── lane / warp helpers ────────────────────────────────────────────────
