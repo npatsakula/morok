@@ -446,7 +446,7 @@ pub(crate) fn build_fa_mw_rdb(
     // threaded through the in-loop K/V buffers so the marker precedes the first
     // prefetch load and stays loop-scoped (dep = `kv_idx`). The prologue keeps the
     // un-rewrapped `k`/`v`. The post-linearization scheduling pass brackets the MFMAs
-    // and (Stage 2) weaves the softmax under them (supersedes the prior `iglp_opt(0)`).
+    // and (Stage 2) weaves the softmax under them (supersedes an earlier `iglp.opt` pass).
     let pf_kidx = [Idx::from(&batch), Idx::from(&pf), Idx::from(&head_kv), Idx::Const(0)];
     let mark = crate::sched::pipeline(crate::sched::SchedKind::Attention, kv_idx.clone());
     let k_l = k.rewrap(k.uop().after(smallvec![mark.clone()]));

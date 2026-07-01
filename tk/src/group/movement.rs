@@ -249,7 +249,7 @@ impl<'k> Group<'k> {
         // (or bunching it with) the commit. Without it the loads hoist/bunch at the
         // loop top adjacent to the commit and their latency is no longer overlapped
         // by the intervening MFMA clusters (the partial M3 re-batch).
-        let pinned = crate::asm::sched_barrier(0, stored);
+        let pinned = crate::arch::gfx9::sched_barrier(0, stored);
         stage.after(smallvec![pinned])
     }
 
@@ -601,25 +601,6 @@ impl<'k> Group<'k> {
             !transpose && !rt.base.interleave && !rt.base.interleave_t && st.elem() == rt.elem() && ept == 4;
         let vw = if contiguous { ept } else { 1 };
 
-        // Unrolled inline-`asm` `ds_read_b64` gather of a swizzled tile: emit one
-        // `ds_read` per fragment-ROW sharing ONE base-address VGPR (the lane address
-        // at `height == 0`) and a per-row `offset:` IMMEDIATE. The bank swizzle is
-        // non-linear, so the per-row addresses are not a linear stride the backend
-        // could fold — BUT the XOR delta depends only on `row % 16` (invariant under
-        // the +`base_rows` row step) and the swizzled column part is `< subtile_cols`,
-        // so `tile_offset(row+base_rows, col) == tile_offset(row, col) +
-        // base_rows*subtile_cols` exactly: a lane-UNIFORM constant we bake straight
-        // into the `offset:` field. This collapses the per-read permuted-address
-        // VGPRs (which otherwise spill across the 128-MFMA cluster) to a single base.
-        // gemm is the only `asm_gather` kernel — `rt_w == 1`, one `vw`-wide run — and
-        // the column direction's stride is NOT lane-uniform (the XOR), so we restrict
-        // the unroll to that shape and fall back to the rolled path otherwise.
-        if self.ker.asm_gather() && vw > 1 && rt_w == 1 && ept / vw == 1 {
-            // `asm_gather` (gemm only) always reads a swizzled operand tile.
-            let subtile = st.base.swizzle.subtile_cols(st.cols, st.elem().base()).expect("asm_gather tile swizzled");
-            return self.gather_asm_unrolled(rt, st, dst_idxs, idxs, transpose, vw, subtile);
-        }
-
         let height = self.ker.raw_range(rt_h, AxisType::Loop);
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
         let inner = self.ker.raw_range(ept / vw, AxisType::Loop); // groups of `vw` elements
@@ -634,38 +615,9 @@ impl<'k> Group<'k> {
         let h_idx = wave_offset(idxs.first(), rt_h, &height);
         let w_idx = wave_offset(idxs.get(1), rt_w, &width);
         let off = swizzled_st_offset(st, &h_idx, &w_idx, &row, &col);
-        let mut load = if vw > 1 {
-            if self.ker.asm_gather() {
-                // Inline-`asm` `ds_read_b64`: the `Op::Index` GEP renders the LDS
-                // element pointer (a generic `ptr` — svod `addrspacecast`s its
-                // addrspace(3) locals to generic on entry), which we cast back to
-                // addrspace(3) so the AMDGPU backend lowers it to the i32 LDS-offset
-                // VGPR fed as the `$1` "v" operand (the entry/exit casts fold away).
-                // The read is an opaque `asm sideeffect` so the machine scheduler can't
-                // reorder it across the asm MFMAs — holding the `R M R M` interleave.
-                // Output `<4 x i16>` (the proven gfx942 form), then bitcast to the bf16
-                // fragment, matching the plain `load_vec` value type. The intermediate
-                // cast's svod dtype is cosmetic — its rendered RHS carries the LLVM type.
-                let idx = index_off(st.uop(), off);
-                let as3 = UOp::custom(
-                    smallvec![idx],
-                    "addrspacecast ptr {0} to ptr addrspace(3)".to_string(),
-                    svod_dtype::DType::Int32,
-                );
-                let read = UOp::custom(
-                    smallvec![as3],
-                    "call <4 x i16> asm sideeffect \"ds_read_b64 $0, $1 offset:0\", \"=v,v\"\
-                     (ptr addrspace(3) {0})"
-                        .to_string(),
-                    svod_dtype::DType::Int16.vec(vw as usize).expect("ds_read_b64: i16 vec"),
-                );
-                read.bitcast(st.elem().vec(vw as usize).expect("ds_read_b64: bf16 vec"))
-            } else {
-                load_vec(st.uop(), off, vw as usize)
-            }
-        } else {
-            load_off(st.uop(), off)
-        };
+        // Compiler-tracked vector / scalar `ds_read`; the inline-`asm` gather is the
+        // explicit [`Self::gather_local_asm`] (gfx942 microkernel), not a mode here.
+        let mut load = if vw > 1 { load_vec(st.uop(), off, vw as usize) } else { load_off(st.uop(), off) };
         if st.elem() != rt.elem() {
             load = load.cast(rt.elem().clone());
         }
@@ -675,7 +627,35 @@ impl<'k> Group<'k> {
         self.finalize_reg(rt, ended)
     }
 
-    /// Rust-unrolled inline-`asm` `ds_read_b64` gather (the gemm `asm_gather`
+    /// Explicit inline-`asm` `ds_read_b64` LOCAL→REG gather — the per-call
+    /// counterpart of the old kernel-global `asm_gather` mode (now removed): the
+    /// generic [`Self::load_local_to_reg`] always emits the compiler-tracked vector
+    /// `load`; the gfx942 asm microkernel ([`crate::kernels::matmul`] `gemm_core_hk`)
+    /// calls THIS for its operand gather. Emits one `ds_read` per fragment-row sharing
+    /// a single base-address VGPR + per-row `offset:` immediate (the lane-uniform XOR
+    /// delta, so no per-read permuted-address spill — see [`Self::gather_asm_unrolled`]).
+    /// `ix` carries the wave/frag offset, exactly as [`Self::load`](Group::load).
+    ///
+    /// # Panics
+    /// Panics unless the fragment is the contiguous single-column gemm operand shape
+    /// (`rt_w == 1`, `ept == 4`, non-transposed) on a swizzled tile.
+    pub fn gather_local_asm(&self, rt: RT<'k>, st: ST, ix: MoveIdx) -> RT<'k> {
+        let ept = rt.base.base.elements_per_thread() as i64;
+        let n = rt.shape().len();
+        let rt_w = rt.shape()[n - 2] as i64;
+        let transpose = rt.layout != st.layout;
+        let contiguous =
+            !transpose && !rt.base.interleave && !rt.base.interleave_t && st.elem() == rt.elem() && ept == 4;
+        let vw = if contiguous { ept } else { 1 };
+        assert!(
+            vw > 1 && rt_w == 1 && ept / vw == 1,
+            "gather_local_asm: gemm operand shape only (contiguous, rt_w==1)"
+        );
+        let subtile = st.base.swizzle.subtile_cols(st.cols, st.elem().base()).expect("gather_local_asm: tile swizzled");
+        self.gather_asm_unrolled(rt, &st, &ix.frag, &ix.block, transpose, vw, subtile)
+    }
+
+    /// Rust-unrolled inline-`asm` `ds_read_b64` gather (the gemm operand
     /// shape: `rt_w == 1`, one `vw`-wide column run). Computes ONE base LDS address
     /// (the lane's `height == 0` slot) and emits one `ds_read_b64 ... offset:N` per
     /// fragment-row, `N = h * base_rows * subtile_cols * itemsize` bytes — a

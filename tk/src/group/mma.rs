@@ -88,7 +88,7 @@ impl<'k> Group<'k> {
     /// tile's base is the 16-column WMMA base, and on an operand-rank mismatch
     /// (the index permutation reads the trailing fragment-grid axes).
     pub fn mma_ab(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
-        self.mma(c, a, b, false, false)
+        self.mma(c, a, b, false, false, false)
     }
 
     /// `C += A·Bᵀ` (tinygrad `mma_ABt`): B fragment is read transposed
@@ -98,7 +98,17 @@ impl<'k> Group<'k> {
     /// Panics on an unsupported operand dtype, unless the operand base is the
     /// 16-column WMMA base, and on an operand-rank mismatch (see [`Self::mma_ab`]).
     pub fn mma_abt(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
-        self.mma(c, a, b, false, true)
+        self.mma(c, a, b, false, true, false)
+    }
+
+    /// [`Self::mma_abt`] emitting the matrix op as an inline-`asm sideeffect` MFMA
+    /// (opaque to the AMDGPU machine scheduler, so the inner-loop program order
+    /// survives `-O3`) instead of the `@llvm.amdgcn.mfma.*` intrinsic. The explicit
+    /// per-call counterpart of the old kernel-global `asm_mfma` mode — only the
+    /// gfx942 asm microkernel ([`crate::kernels::matmul`] `gemm_core_hk`) calls it.
+    /// Valid only for the f32-accumulating bf16 K=16 MFMA (the shape it is used for).
+    pub fn mma_abt_asm(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
+        self.mma(c, a, b, false, true, true)
     }
 
     /// `C += Aᵀ·B` (tinygrad `mma_AtB`): A fragment is read transposed
@@ -108,7 +118,7 @@ impl<'k> Group<'k> {
     /// Panics on an unsupported operand dtype, unless the operand base is the
     /// 16-column WMMA base, and on an operand-rank mismatch (see [`Self::mma_ab`]).
     pub fn mma_atb(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
-        self.mma(c, a, b, true, false)
+        self.mma(c, a, b, true, false, false)
     }
 
     /// `C += Aᵀ·Bᵀ` (tinygrad `mma_AtBt`): both fragments read transposed.
@@ -117,7 +127,7 @@ impl<'k> Group<'k> {
     /// Panics on an unsupported operand dtype, unless the operand base is the
     /// 16-column WMMA base, and on an operand-rank mismatch (see [`Self::mma_ab`]).
     pub fn mma_atbt(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
-        self.mma(c, a, b, true, true)
+        self.mma(c, a, b, true, true, false)
     }
 
     /// The shared WMMA body. The four `mma_{AB,ABt,AtB,AtBt}` variants differ
@@ -125,11 +135,11 @@ impl<'k> Group<'k> {
     /// - `a_t` (Aᵀ): A is read `a[inner, height]` and the reduce axis is
     ///   `a.shape[-3]`; otherwise `a[height, inner]`, reduce axis `a.shape[-2]`.
     /// - `b_t` (Bᵀ): B is read `b[width, inner]`; otherwise `b[inner, width]`.
-    fn mma(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool) -> RT<'k> {
+    fn mma(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool, asm: bool) -> RT<'k> {
         // Flat (cross-tile-pipeline) FA opts into the fully-unrolled body so the
         // QKᵀ / A·V MFMAs render loop-free for the attention scheduling comb.
         if self.ker.unrolled() {
-            return self.mma_u(c, a, b, a_t, b_t);
+            return self.mma_u(c, a, b, a_t, b_t, asm);
         }
         // Wave-agnostic: each wave runs the WMMA on its own per-lane RT operands
         // (the wave sub-tile selection happens in the LDS→REG load, not here). The
@@ -137,7 +147,7 @@ impl<'k> Group<'k> {
         // 16/16/8), not a hardcoded 4.
         assert_eq!(a.base.base.cols, 16, "mma: only the 16-col WMMA base is supported");
         let mut meta = wmma_desc(self.ker.caps.arch, a.elem());
-        meta.asm = self.ker.asm_mfma();
+        meta.asm = asm;
         let (a_w, b_w, c_w) =
             (upcast_count(&meta.upcast_axes.a), upcast_count(&meta.upcast_axes.b), upcast_count(&meta.upcast_axes.c));
 
@@ -209,10 +219,10 @@ impl<'k> Group<'k> {
     /// k−1 store); fragments chain into one terminal store so the enclosing rolled
     /// KV loop's `END` scopes them all (cf. the matmul accumulator chain,
     /// `kernels/matmul.rs:201`). Bit-identical accumulation order to [`Self::mma`].
-    fn mma_u(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool) -> RT<'k> {
+    fn mma_u(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool, asm: bool) -> RT<'k> {
         assert_eq!(a.base.base.cols, 16, "mma_u: only the 16-col WMMA base is supported");
         let mut meta = wmma_desc(self.ker.caps.arch, a.elem());
-        meta.asm = self.ker.asm_mfma();
+        meta.asm = asm;
         let (a_w, b_w, c_w) =
             (upcast_count(&meta.upcast_axes.a), upcast_count(&meta.upcast_axes.b), upcast_count(&meta.upcast_axes.c));
 

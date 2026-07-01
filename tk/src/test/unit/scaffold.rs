@@ -1,7 +1,6 @@
 //! Unit tests for the kernel-scaffold shortcuts ([`crate::scaffold`]): the role
-//! tile builders resolve the arch fragment via `caps` (on BOTH arches — the
-//! gfx942-only golden tests don't cover gfx1151), and `bind_abi` binds outputs
-//! before inputs. The end-to-end graph-identity is covered by the golden digests.
+//! tile builders resolve the arch fragment via `caps` (on BOTH arches), and
+//! `bind_abi` binds outputs before inputs.
 
 use svod_dtype::{AmdArch, DType, DeviceSpec};
 use svod_ir::UOp;

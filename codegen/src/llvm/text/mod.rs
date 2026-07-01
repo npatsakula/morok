@@ -389,21 +389,34 @@ fn wmma_declaration_from_call(line: &str) -> Option<String> {
     } else {
         return None;
     };
-    // `  %vN = call <ret_ty> @llvm.amdgcn.wmma.<rest>(<args>)`
+    // `  %vN = call [fast-math flags] <ret_ty> @llvm.amdgcn.wmma.<rest>(<args>)`
     let call_start = line.find("call ")?;
-    let after_call = &line[call_start + "call ".len()..];
+    let mut after_call = &line[call_start + "call ".len()..];
+    // Skip the optional fast-math flags between `call` and the return type (the
+    // float-accumulating WMMA/MFMA carries `nsz arcp contract afn`) so the `declare`
+    // (which must NOT carry them) parses the real return type, not `nsz …`.
+    const FM_FLAGS: &[&str] = &["fast", "nnan", "ninf", "nsz", "arcp", "contract", "afn", "reassoc"];
+    while let Some(tok) = after_call.split_whitespace().next() {
+        if FM_FLAGS.contains(&tok) {
+            after_call = after_call[tok.len()..].trim_start();
+        } else {
+            break;
+        }
+    }
     let ret_end = after_call.find(" @")?;
     let ret_ty = &after_call[..ret_end];
-    let name_start = call_start + "call ".len() + ret_end + 2; // skip " @"
-    let paren = line[name_start..].find('(')?;
-    let intrinsic_name = &line[name_start..name_start + paren];
+    // Everything below is relative to `after_call` (the flag-stripped slice), not
+    // the raw line, so the leading fast-math flags don't offset the positions.
+    let name_start = ret_end + 2; // skip " @"
+    let paren = after_call[name_start..].find('(')?;
+    let intrinsic_name = &after_call[name_start..name_start + paren];
     if !intrinsic_name.starts_with(&needle[1..]) {
         return None;
     }
     // Extract the argument list (between the matching parens).
     let args_start = name_start + paren + 1;
-    let args_end = line[args_start..].rfind(')')?;
-    let args_chunk = &line[args_start..args_start + args_end];
+    let args_end = after_call[args_start..].rfind(')')?;
+    let args_chunk = &after_call[args_start..args_start + args_end];
     // Pull out types — entries are `<ty> %name` or `<ty> <const>`.
     let mut param_types: Vec<String> = Vec::new();
     let mut depth = 0;

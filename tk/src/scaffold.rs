@@ -5,8 +5,8 @@
 //! Each helper is a thin, **allocation-order-preserving** forwarder over the
 //! [`Kernel`]/[`crate::ArchCaps`] primitives, so a kernel migrated to the scaffold
 //! emits the *identical* UOp graph (same `Param`/`DefineReg`/`DefineLocal` slot ids
-//! → same content hash) — verified by the golden fingerprints
-//! ([`crate::kernel_fingerprint`]). The point is to make the load-bearing invariants
+//! → same content hash; [`crate::kernel_fingerprint`] diffs it if needed). The point
+//! is to make the load-bearing invariants
 //! safe by construction instead of by comment: the ABI slot order ([`Kernel::bind_abi`]
 //! binds outputs-then-inputs by parameter structure) and the role→fragment
 //! resolution (the tile shortcuts resolve [`crate::arch::FragRole`] via `caps`, so a

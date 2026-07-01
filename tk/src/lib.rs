@@ -39,7 +39,6 @@
 //! tensor scheduler.
 
 pub mod arch;
-pub mod asm;
 pub mod fingerprint;
 pub mod grid;
 pub mod group;

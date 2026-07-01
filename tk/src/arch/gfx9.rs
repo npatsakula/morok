@@ -1,4 +1,7 @@
-//! Raw gfx942 scheduling/synchronization primitives, injected as `Op::Custom`
+//! Raw **gfx9 (CDNA, wave64)** scheduling/synchronization primitives — the
+//! gfx942-calibrated MFMA-pipeline intrinsics, kept crate-internal (off the tk
+//! public API) since only the gfx942 asm microkernel and its asm gather use them.
+//! Injected as `Op::Custom`
 //! Void side-effects (K-loop pipeline). These carry no data — each takes a
 //! `dep` purely so the linearizer's toposort sequences it *after* the prior
 //! cluster and a consumer can `.after([..])` it to sequence the next cluster
@@ -38,6 +41,16 @@ pub fn s_waitcnt_lgkmcnt(n: i64, dep: Arc<UOp>) -> Arc<UOp> {
     UOp::custom(smallvec![dep], format!("call void asm sideeffect \"s_waitcnt lgkmcnt({n})\", \"\"()"), DType::Void)
 }
 
+/// A **bare** `s_barrier` (HK's `__builtin_amdgcn_s_barrier`) — the workgroup
+/// execution barrier with NO memory `fence`, emitted as opaque `asm sideeffect`.
+/// svod's [`UOp::barrier`] renders `fence release / s_barrier / fence acquire`; that
+/// acq/rel pair is itself a machine-scheduler barrier that throttles the intrinsic
+/// MFMAs' overlap. This bare form matches HK (which orders memory with targeted
+/// `s_waitcnt` instead of the fence). `deps` are ordering-only.
+pub fn s_barrier_bare(deps: smallvec::SmallVec<[Arc<UOp>; 4]>) -> Arc<UOp> {
+    UOp::custom(deps, "call void asm sideeffect \"s_barrier\", \"\"()".to_string(), DType::Void)
+}
+
 /// `@llvm.amdgcn.sched.barrier(mask)`: a hard instruction-scheduling fence.
 /// `mask = 0` forbids *any* instruction from moving across it, pinning each
 /// cluster's loads/MFMAs/`ds_write` into their program-order region so the
@@ -48,24 +61,6 @@ pub fn sched_barrier(mask: i64, dep: Arc<UOp>) -> Arc<UOp> {
         format!(
             "declare void @llvm.amdgcn.sched.barrier(i32)\n\
              call void @llvm.amdgcn.sched.barrier(i32 {mask})"
-        ),
-        DType::Void,
-    )
-}
-
-/// `@llvm.amdgcn.iglp.opt(mode)`: invoke the AMDGPU machine scheduler's canned
-/// "initiate-and-group-level-parallelism" pipeline over the loop region
-/// *following* this intrinsic. `mode = 0` is the MFMA/memory interleave (overlaps
-/// the next tile's global load under the current tile's MFMAs); `mode = 1/2` are
-/// attention variants. Place once at the K-loop top. It must NOT share a loop
-/// region with [`sched_barrier`] (the two scheduling mutators fight). `dep` orders
-/// it after the loop counter so it lands at the top of the loop body.
-pub fn iglp_opt(mode: i64, dep: Arc<UOp>) -> Arc<UOp> {
-    UOp::custom(
-        smallvec![dep],
-        format!(
-            "declare void @llvm.amdgcn.iglp.opt(i32)\n\
-             call void @llvm.amdgcn.iglp.opt(i32 {mode})"
         ),
         DType::Void,
     )

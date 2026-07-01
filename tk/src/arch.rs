@@ -32,6 +32,9 @@
 use smallvec::SmallVec;
 use svod_dtype::AmdArch;
 
+/// Raw gfx9 (CDNA/wave64) scheduling intrinsics for the asm MFMA microkernel.
+pub(crate) mod gfx9;
+
 use crate::tiles::{
     RT_16X16, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, RTBaseShape, ST_16X16, ST_16X16_SWIZZLED,
     ST_16X16_SWIZZLED_W32, STBaseShape,

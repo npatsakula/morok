@@ -2,7 +2,6 @@ mod arch;
 mod bitonic;
 mod elementwise;
 mod fa;
-mod golden;
 mod grid;
 mod guide;
 mod index;

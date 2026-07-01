@@ -96,7 +96,18 @@ pub fn render_wmma_amd(
              \"v_mfma_f32_16x16x16_bf16 $0, $1, $2, $3\", \"=v,v,v,0\"({a_op}, {b_op}, {c_op})"
         ));
     } else {
-        kernel.push(format!("  {call_dst} = call {acc_wire} @{intrinsic}({a_op}, {b_op}, {c_op}{tail})"));
+        // Carry svod's standard fp fast-math flags (`nsz arcp contract afn` — the
+        // same set applied to every `fadd`/`fmul`/… , matching tinygrad
+        // `llvmir.py`) on the matrix op, so the compiler may contract/fuse it with
+        // surrounding fp like any other float op and match hipcc's `contract` MFMA.
+        // Only for a **float**-accumulating WMMA: the bf16→bf16 reinterpreted form
+        // and integer accumulators return integer vectors, which reject fp flags.
+        let fm = if !acc_reinterpreted && matches!(acc_scalar, Some(ScalarDType::Float32 | ScalarDType::Float16)) {
+            "nsz arcp contract afn "
+        } else {
+            ""
+        };
+        kernel.push(format!("  {call_dst} = call {fm}{acc_wire} @{intrinsic}({a_op}, {b_op}, {c_op}{tail})"));
     }
 
     if acc_reinterpreted {

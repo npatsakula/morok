@@ -366,6 +366,68 @@ fn test_matmul_hk_amd() {
     }
 }
 
+/// Numerics of the **128²** HK-pipeline variant ([`build_matmul_hk128`]) — the small-N
+/// tile (HK switches to `BLOCK_SIZE=128` for N ≤ 2048). Same asm pipeline, `reg=32`.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_hk128_amd -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_matmul_hk128_amd() {
+    for n in [512usize, 1024, 2048] {
+        let (a, b) = matmul_inputs(n);
+        let got = launch_matmul("matmul_hk128", n, HK128_CFG, |ker| build_matmul_hk128(ker, n), &a, &b);
+        let expected = matmul_reference(&a, &b);
+        let max_abs = max_abs_err(&got, &expected);
+        println!("matmul_hk128 N={n}: max abs error = {max_abs:e}");
+        assert!(max_abs < 5e-2, "hk128 N={n}: max abs err {max_abs} exceeds bf16 tolerance 5e-2");
+    }
+}
+
+/// Device-time TF of the 128² HK variant vs the 256² [`build_matmul_hk`] and shipping MID
+/// at small N — does the HK pipeline at a grid-filling 128² tile beat MID (which runs the
+/// simpler `gemm_core` at 128²)?
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_hk128_tf -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_matmul_hk128_tf() {
+    use svod_runtime::{PmcSelection, ProfileOptions};
+    use svod_tensor::Tensor;
+    let caps = crate::ArchCaps::GFX942;
+    let opts = ProfileOptions { iters: 1, static_analysis: false, counters: PmcSelection::None };
+    for &n in &[1024usize, 2048, 4096] {
+        let (a, b) = matmul_inputs(n);
+        let out = Tensor::empty(&[n, n], DType::Float32);
+        let mut c = crate::launch::graph_launch(
+            "matmul_hk128",
+            HK128_CFG.grid_dims(n),
+            HK128_CFG.threads(caps.wave_size),
+            out,
+            &[&a, &b],
+            caps,
+            move |ker| {
+                build_matmul_hk128(ker, n);
+                ker.finish(HK128_CFG.n_accum)
+            },
+        )
+        .expect("graph_launch hk128");
+        let plan = c.prepare().expect("prepare hk128");
+        let flop = 2.0 * (n as f64).powi(3);
+        let mut tfs: Vec<f64> = (0..5)
+            .map(|_| {
+                let report = plan.profile(&opts).expect("profile hk128");
+                let ns: u64 = report
+                    .stages
+                    .iter()
+                    .flat_map(|s| &s.kernels)
+                    .filter_map(|k| Some(k.gpu_end_ns? - k.gpu_start_ns?))
+                    .sum();
+                flop / ns as f64 / 1e3
+            })
+            .collect();
+        tfs.sort_by(|x, y| x.partial_cmp(y).expect("nan"));
+        println!("matmul_hk128 N={n}: median {:.1} TF  (samples {:?})", tfs[tfs.len() / 2], tfs);
+    }
+}
+
 /// Route A bisect: the HK-pipeline reference ([`build_matmul_hk_phase`]) with the
 /// wave-phase ping-pong toggled. Order matters — (1) the skeleton with the offset OFF (eq
 /// never-matching → no conditional barrier fires, no phase shift) must be numerically
