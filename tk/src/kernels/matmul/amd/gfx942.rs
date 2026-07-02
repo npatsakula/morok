@@ -213,130 +213,183 @@ fn gemm_core_asm(ker: &Kernel, n: usize, c_gl: GL, a_gl: GL, b_gl: GL, cfg: Matm
         };
     }
 
-    // ── Cluster 0: stage A(k+1)→VGPR; pre-gather substep 0 (B0, A0a, A0b). ──
-    let s_a = g.stage_global_to_reg_vec_asm(
-        &a_smem,
-        &a_gl,
-        &[Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(&pf)],
-        2,
-        None,
-    );
-    let b0 = gb(&tile, 0);
-    let a0a = ga(&b0.uop().clone(), 0, 0);
-    let a0b = ga(&a0a.uop().clone(), 1, 0);
-    let bar0 = cbar(&a0b.uop().clone(), smallvec![b0.uop().clone(), a0a.uop().clone(), s_a.clone()]);
+    // ── One strip's cluster-for-cluster body, emitted twice: inside the steady loop with the
+    //    next strip's prefetch+commit threaded in (`pf = Some(tile+1)`), and flat in the drained
+    //    epilogue without (`pf = None`). The single `pf` toggle drives EVERY steady/epilogue
+    //    difference: the C0/C4 register-staged global prefetch (`stage_*`) and the C6 commit
+    //    (`commit_*`) exist only under `Some`; with a commit the four substeps' gathers front-load
+    //    onto clusters 0/2/4 (all resident before the C6 overwrite) and the register-only MMA
+    //    boundaries (C1/C3/C4) are bare `s_barrier`s (`lgkmcnt` already 0) — without a commit,
+    //    substep 2 instead gathers at C4 and every boundary drains (`cbar`), and C7's MMA opens
+    //    on the C5 barrier rather than the (absent) C6 commit barrier. Returns cluster 7's MMA
+    //    tail (the loop-close / final-barrier operand) and, under `Some`, the two commit chains
+    //    (the loop-close RAW deps). A `macro_rules!` (not a closure) — like [`mma_cluster!`], and
+    //    for the same reason: the hygienic `mma_cluster!` writes `accs[i] = …` to the `accs`
+    //    binding in *its* definition scope (this function's), so the body must expand IN this
+    //    scope to thread the loop-carried accumulators; a closure would instead capture that
+    //    outer `accs` mutably for its whole life and collide with the between-call re-threading.
+    macro_rules! compute_strip {
+        ($start:expr, $pf:expr) => {{
+            let start: &Arc<UOp> = $start;
+            let pf: Option<&Arc<UOp>> = $pf;
+            // ── Cluster 0: [stage A(k+1)→VGPR]; pre-gather substep 0 (B0, A0a, A0b). ──
+            let s_a = pf.map(|pf| {
+                g.stage_global_to_reg_vec_asm(
+                    &a_smem,
+                    &a_gl,
+                    &[Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(pf)],
+                    2,
+                    None,
+                )
+            });
+            let b0 = gb(start, 0);
+            let a0a = ga(&b0.uop().clone(), 0, 0);
+            let a0b = ga(&a0a.uop().clone(), 1, 0);
+            let mut c0: smallvec::SmallVec<[Arc<UOp>; 4]> = smallvec![b0.uop().clone(), a0a.uop().clone()];
+            if let Some(s_a) = &s_a {
+                c0.push(s_a.clone());
+            }
+            let bar0 = cbar(&a0b.uop().clone(), c0);
 
-    // ── Cluster 1: MMA substep 0. ──
-    mma_cluster!(m1, a0a, a0b, &b0, bar0);
-    // This cluster boundary carries NO drain (the MMA read no LDS → counter already 0); bare barrier.
-    let bar1 = crate::arch::gfx9::s_barrier_bare(smallvec![m1.clone()]);
+            // ── Cluster 1: MMA substep 0. Steady: bare boundary (the MMA read no LDS → counter
+            //    already 0). Epilogue: drained, like every epilogue boundary. ──
+            mma_cluster!(m1, a0a, a0b, &b0, bar0);
+            let bar1 = if pf.is_some() {
+                crate::arch::gfx9::s_barrier_bare(smallvec![m1.clone()])
+            } else {
+                cbar(&m1, smallvec![])
+            };
 
-    // ── Cluster 2: pre-gather substep 1 (B1,A1a,A1b) + part of substep 2 (B2,A2a). ──
-    let b1 = gb(&bar1, 1);
-    let a1a = ga(&b1.uop().clone(), 0, 1);
-    let a1b = ga(&a1a.uop().clone(), 1, 1);
-    let b2 = gb(&a1b.uop().clone(), 2);
-    let a2a = ga(&b2.uop().clone(), 0, 2);
-    // A2b gathered HERE (not at cluster 4) so all of cluster 5's operands are resident 2 clusters ahead.
-    let a2b = ga(&a2a.uop().clone(), 1, 2);
-    let bar2 = cbar(
-        &a2b.uop().clone(),
-        smallvec![b1.uop().clone(), a1a.uop().clone(), a1b.uop().clone(), b2.uop().clone(), a2a.uop().clone()],
-    );
+            // ── Cluster 2: pre-gather substep 1 (B1,A1a,A1b); steady also front-loads substep 2
+            //    (B2,A2a,A2b) HERE so all of cluster 5's operands are resident 2 clusters ahead of
+            //    the C6 commit; the epilogue (no commit) defers substep 2 to cluster 4. ──
+            let b1 = gb(&bar1, 1);
+            let a1a = ga(&b1.uop().clone(), 0, 1);
+            let a1b = ga(&a1a.uop().clone(), 1, 1);
+            let (b2, a2a, a2b, bar2) = if pf.is_some() {
+                let b2 = gb(&a1b.uop().clone(), 2);
+                let a2a = ga(&b2.uop().clone(), 0, 2);
+                let a2b = ga(&a2a.uop().clone(), 1, 2);
+                let bar = cbar(
+                    &a2b.uop().clone(),
+                    smallvec![
+                        b1.uop().clone(),
+                        a1a.uop().clone(),
+                        a1b.uop().clone(),
+                        b2.uop().clone(),
+                        a2a.uop().clone()
+                    ],
+                );
+                (Some(b2), Some(a2a), Some(a2b), bar)
+            } else {
+                (None, None, None, cbar(&a1b.uop().clone(), smallvec![b1.uop().clone(), a1a.uop().clone()]))
+            };
 
-    // ── Cluster 3: MMA substep 1. ──
-    mma_cluster!(m3, a1a, a1b, &b1, bar2);
-    // Bare barrier (cluster-3 boundary): counter already 0.
-    let bar3 = crate::arch::gfx9::s_barrier_bare(smallvec![m3.clone()]);
+            // ── Cluster 3: MMA substep 1. Boundary as cluster 1. ──
+            mma_cluster!(m3, a1a, a1b, &b1, bar2);
+            let bar3 = if pf.is_some() {
+                crate::arch::gfx9::s_barrier_bare(smallvec![m3.clone()])
+            } else {
+                cbar(&m3, smallvec![])
+            };
 
-    // ── Cluster 4: stage B(k+1)→VGPR; pre-gather rest (A2b, B3, A3a, A3b). ──
-    // Anchor B's prefetch load to `bar3` (cluster-3's barrier) so the toposort
-    // emits it HERE at cluster 4 — interleaved between the MFMA clusters — instead
-    // of floating it to the loop top bunched with A (latency then hides behind the
-    // cluster-5/7 MFMAs — the interleaved mid-loop global-load placement).
-    let s_b = g.stage_global_to_reg_vec_asm(
-        &b_smem,
-        &b_gl,
-        &[Idx::Const(0), Idx::Const(0), Idx::from(&col), Idx::from(&pf)],
-        2,
-        Some(&bar3),
-    );
-    // C4 gathers only substep 3 (A2b moved to C2); these are consumed at C7, drained at bar6.
-    let b3 = gb(&bar3, 3);
-    let a3a = ga(&b3.uop().clone(), 0, 3);
-    let a3b = ga(&a3a.uop().clone(), 1, 3);
-    // Bare barrier (cluster-4 boundary): cluster-5's operands all resident from cluster 2.
-    let bar4 = crate::arch::gfx9::s_barrier_bare(smallvec![
-        a3b.uop().clone(),
-        b3.uop().clone(),
-        a3a.uop().clone(),
-        s_b.clone()
-    ]);
+            // ── Cluster 4: [stage B(k+1)→VGPR, anchored to bar3 so the toposort emits it HERE —
+            //    interleaved between the MFMA clusters, latency hiding behind the C5/C7 MFMAs —
+            //    instead of floating it to the loop top]; gather substep 3, and (epilogue only) the
+            //    deferred substep 2 first. ──
+            let s_b = pf.map(|pf| {
+                g.stage_global_to_reg_vec_asm(
+                    &b_smem,
+                    &b_gl,
+                    &[Idx::Const(0), Idx::Const(0), Idx::from(&col), Idx::from(pf)],
+                    2,
+                    Some(&bar3),
+                )
+            });
+            let (b2, a2a, a2b) = match (b2, a2a, a2b) {
+                (Some(b2), Some(a2a), Some(a2b)) => (b2, a2a, a2b),
+                _ => {
+                    let b2 = gb(&bar3, 2);
+                    let a2a = ga(&b2.uop().clone(), 0, 2);
+                    let a2b = ga(&a2a.uop().clone(), 1, 2);
+                    (b2, a2a, a2b)
+                }
+            };
+            // Steady: substep 3 chains after bar3 (substep 2 already resident). Epilogue: after the
+            // just-gathered substep 2's tail. These are consumed at C7, drained at bar6 (steady).
+            let b3_dep = if pf.is_some() { bar3.clone() } else { a2b.uop().clone() };
+            let b3 = gb(&b3_dep, 3);
+            let a3a = ga(&b3.uop().clone(), 0, 3);
+            let a3b = ga(&a3a.uop().clone(), 1, 3);
+            let bar4 = if let Some(s_b) = &s_b {
+                // Bare (cluster-4 boundary): cluster-5's operands all resident from cluster 2.
+                crate::arch::gfx9::s_barrier_bare(smallvec![
+                    a3b.uop().clone(),
+                    b3.uop().clone(),
+                    a3a.uop().clone(),
+                    s_b.clone()
+                ])
+            } else {
+                cbar(
+                    &a3b.uop().clone(),
+                    smallvec![
+                        b2.uop().clone(),
+                        a2a.uop().clone(),
+                        a2b.uop().clone(),
+                        b3.uop().clone(),
+                        a3a.uop().clone()
+                    ],
+                )
+            };
 
-    // ── Cluster 5: MMA substep 2 (all current-strip reads now in registers). ──
-    mma_cluster!(m5, a2a, a2b, &b2, bar4);
-    let bar5 = cbar(&m5, smallvec![]);
+            // ── Cluster 5: MMA substep 2 (all current-strip reads now in registers). ──
+            mma_cluster!(m5, a2a, a2b, &b2, bar4);
+            let bar5 = cbar(&m5, smallvec![]);
 
-    // ── Cluster 6: commit strip k+1 into the SAME tile, ordered after the cluster-5
-    //    barrier (all waves past their reads). No WAR stall — every current-strip read is
-    //    already in registers; the commit's first `ds_write` bakes `s_waitcnt vmcnt(0)
-    //    lgkmcnt(0)` (global load arrived + gathers drained) so it can overwrite safely. ──
-    let a_after = a_smem.rewrap(a_smem.uop().after(smallvec![bar5.clone()]));
-    let b_after = b_smem.rewrap(b_smem.uop().after(smallvec![bar5]));
-    let commit_a = g.commit_reg_to_local_vec_asm(a_after, &s_a);
-    // Chain B's commit after A's so `cbar`'s single `lgkmcnt(0)` drain (on `commit_b`, the
-    // later one) covers BOTH tiles' asm `ds_write`s before `bar6` — the RAW edge the next
-    // strip's cross-warp-row gather depends on.
-    let b_after = b_after.rewrap(b_after.uop().after(smallvec![commit_a.uop().clone()]));
-    let commit_b = g.commit_reg_to_local_vec_asm(b_after, &s_b);
-    let bar6 = cbar(&commit_b.uop().clone(), smallvec![commit_a.uop().clone()]);
+            // ── Cluster 6 (steady only): commit strip k+1 into the SAME tile, ordered after the
+            //    cluster-5 barrier (all waves past their reads). No WAR stall — every current-strip
+            //    read is already in registers; the commit's first `ds_write` bakes `s_waitcnt
+            //    vmcnt(0) lgkmcnt(0)` (global load arrived + gathers drained) so it can overwrite
+            //    safely. C7's MMA opens on this commit barrier (steady) or directly on bar5
+            //    (epilogue, no commit cluster). ──
+            let (commits, bar_c7) = match (s_a, s_b) {
+                (Some(s_a), Some(s_b)) => {
+                    let a_after = a_smem.rewrap(a_smem.uop().after(smallvec![bar5.clone()]));
+                    let b_after = b_smem.rewrap(b_smem.uop().after(smallvec![bar5]));
+                    let commit_a = g.commit_reg_to_local_vec_asm(a_after, &s_a);
+                    // Chain B's commit after A's so `cbar`'s single `lgkmcnt(0)` drain (on `commit_b`,
+                    // the later one) covers BOTH tiles' asm `ds_write`s before `bar6` — the RAW edge
+                    // the next strip's cross-warp-row gather depends on.
+                    let b_after = b_after.rewrap(b_after.uop().after(smallvec![commit_a.uop().clone()]));
+                    let commit_b = g.commit_reg_to_local_vec_asm(b_after, &s_b);
+                    let bar6 = cbar(&commit_b.uop().clone(), smallvec![commit_a.uop().clone()]);
+                    (Some((commit_a.uop().clone(), commit_b.uop().clone())), bar6)
+                }
+                _ => (None, bar5),
+            };
 
-    // ── Cluster 7: MMA substep 3. ──
-    mma_cluster!(m7, a3a, a3b, &b3, bar6);
+            // ── Cluster 7: MMA substep 3. ──
+            mma_cluster!(m7, a3a, a3b, &b3, bar_c7);
+            (m7, commits)
+        }};
+    }
 
-    // Loop tail = cluster 7's workgroup barrier (the 8th per-iteration fence; RAW — the
-    // strip-(tile+1) commit is visible to the next trip's C0 gather / the epilogue's gather).
-    let ended = lp.close_barrier(smallvec![m7, commit_a.uop().clone(), commit_b.uop().clone()]);
+    // ── Steady strip (one per trip): the next strip's prefetch+commit threaded in. Loop tail
+    //    = cluster 7's workgroup barrier (the 8th per-iteration fence; RAW — the strip-(tile+1)
+    //    commit is visible to the next trip's C0 gather / the epilogue's gather).
+    let (m7, commits) = compute_strip!(&tile, Some(&pf));
+    let (commit_a, commit_b) = commits.expect("steady strip always prefetches+commits");
+    let ended = lp.close_barrier(smallvec![m7, commit_a, commit_b]);
     // Read the loop-carried accumulators' post-loop value, threaded IN PLACE on the same
     // `accs` binding — the `mma_cluster` macro's `accs[i] = …` writes resolve (by macro
     // hygiene) to this outer binding, so the epilogue MFMAs must continue ON it, not a shadow.
     accs = accs.iter().map(|c| c.after(smallvec![ended.clone()])).collect();
 
-    // ── Drained epilogue: the final strip (num_tiles-1) is already in LDS — gather every
-    //    substep and run the 4 MFMA clusters, with NO prefetch and NO commit. Seven cluster
-    //    barriers (clusters 0,1,2,3,4,5,7 — there is no cluster-6 commit), the count that
-    //    keeps the per-warp-row barrier total balanced.
-    let b0 = gb(&ended, 0);
-    let a0a = ga(&b0.uop().clone(), 0, 0);
-    let a0b = ga(&a0a.uop().clone(), 1, 0);
-    let eb0 = cbar(&a0b.uop().clone(), smallvec![b0.uop().clone(), a0a.uop().clone()]);
-
-    mma_cluster!(em1, a0a, a0b, &b0, eb0);
-    let eb1 = cbar(&em1, smallvec![]);
-
-    let b1 = gb(&eb1, 1);
-    let a1a = ga(&b1.uop().clone(), 0, 1);
-    let a1b = ga(&a1a.uop().clone(), 1, 1);
-    let eb2 = cbar(&a1b.uop().clone(), smallvec![b1.uop().clone(), a1a.uop().clone()]);
-
-    mma_cluster!(em3, a1a, a1b, &b1, eb2);
-    let eb3 = cbar(&em3, smallvec![]);
-
-    let b2 = gb(&eb3, 2);
-    let a2a = ga(&b2.uop().clone(), 0, 2);
-    let a2b = ga(&a2a.uop().clone(), 1, 2);
-    let b3 = gb(&a2b.uop().clone(), 3);
-    let a3a = ga(&b3.uop().clone(), 0, 3);
-    let a3b = ga(&a3a.uop().clone(), 1, 3);
-    let eb4 = cbar(
-        &a3b.uop().clone(),
-        smallvec![b2.uop().clone(), a2a.uop().clone(), a2b.uop().clone(), b3.uop().clone(), a3a.uop().clone()],
-    );
-
-    mma_cluster!(em5, a2a, a2b, &b2, eb4);
-    let eb5 = cbar(&em5, smallvec![]);
-
-    mma_cluster!(em7, a3a, a3b, &b3, eb5);
+    // ── Drained epilogue: the final strip (num_tiles-1) is already in LDS — the SAME body with
+    //    no prefetch/commit (`pf = None`): every substep gathered, 4 MFMA clusters, seven cluster
+    //    barriers (clusters 0,1,2,3,4,5,7 — no cluster-6 commit), the count that keeps the
+    //    per-warp-row barrier total balanced.
+    let (em7, _) = compute_strip!(&ended, None);
     let eb7 = cbar(&em7, smallvec![]);
     // Consume the 7th epilogue barrier in the accumulator value chain (so it is scheduled).
     accs = accs.iter().map(|c| c.after(smallvec![eb7.clone()])).collect();
