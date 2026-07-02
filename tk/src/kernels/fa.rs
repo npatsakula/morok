@@ -480,7 +480,12 @@ pub(crate) fn build_fa_mw_rdb(
     //   runtime as `s_waitcnt vmcnt(0)`). `close_barrier` folds the loop-tail fence into the END
     //   (commits as END deps); the explicit `lgkmcnt(0)` drain covers the asm `ds_write` (opaque
     //   to that fence) so the next iteration's collaborative gather sees the commit.
-    let (norm_vec, o_reg) = if causal || !ker.caps.arch.is_cdna() {
+    // The asm commit-late path needs >=4 MFMA clusters in the KV-loop body (one per 16-wide
+    // K-fragment, i.e. d/16) to order its schedule-opaque late `ds_write` before the next
+    // iteration's collaborative gather; below d=64 the body is too short and the gather can
+    // read a stale/partial LDS half. Small heads take the tracked commit-early path (correct
+    // at all d). Shipping shapes (d=64/128) keep the +11% asm path.
+    let (norm_vec, o_reg) = if causal || !ker.caps.arch.is_cdna() || d < 64 {
         let s_k = g.stage_global_to_reg(&k_smem, &k_l, &pf_kidx, 1);
         let s_v = g.stage_global_to_reg(&v_smem, &v_l, &pf_kidx, 1);
         let commit_k = g.commit_reg_to_local(k_nxt, &s_k, false);

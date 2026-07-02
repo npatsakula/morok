@@ -5,3 +5,6 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 7b8099b848653be093984dcff4f6abe297ac0f5b149d312b2b06bc9e3df15ffb # shrinks to seed = 0, bsz = 1, nblk = 1, h = 1, dblk = 1, causal = false, use_f16 = false, masked = true, frac0 = 0, frac1 = 0
+cc 5f5a27cc187f5ccfb219ede321818ba90a1f43a754eed80cb33999898851b7fa # shrinks to seed = 0, bsz = 1, nblk = 1, h = 1, dblk = 1, causal = false, use_f16 = false, masked = false, frac0 = 1, frac1 = 1
+cc 71d5df1624a6660179303f2f80e15dde95a3c245c89edb16cbf8f0d229ae2742 # shrinks to seed = 0, bsz = 2, nblk = 1, h = 1, dblk = 1, causal = false, use_f16 = true, masked = false, frac0 = 1, frac1 = 1
+cc 5aa14b89366db1d6bec024d041b74ce56e60a653c38c40a163c7db48947585c2 # shrinks to seed = 0, bsz = 1, nblk = 1, h = 2, dblk = 3, causal = true, use_f16 = true, masked = false, frac0 = 1, frac1 = 1
