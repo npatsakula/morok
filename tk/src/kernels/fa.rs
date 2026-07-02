@@ -461,30 +461,47 @@ pub(crate) fn build_fa_mw_rdb(
     let mark = crate::sched::pipeline(crate::sched::SchedKind::Attention, kv_idx.clone());
     let k_l = k.rewrap(k.uop().after(smallvec![mark.clone()]));
     let v_l = v.rewrap(v.uop().after(smallvec![mark]));
-    let s_k = g.stage_global_to_reg(&k_smem, &k_l, &pf_kidx, 1);
-    let s_v = g.stage_global_to_reg(&v_smem, &v_l, &pf_kidx, 1);
-
-    // Commit the staged registers into the *other* half (no per-commit barrier — the
-    // single in-loop WAR barrier below covers both RAW and WAR). Emitted before the
-    // slice so the slice's `o_reg` A·V store stays the last terminal store on the stack.
-    let commit_k = g.commit_reg_to_local(k_nxt, &s_k, false);
-    let commit_v = g.commit_reg_to_local(v_nxt, &s_v, false);
-
-    // Gather buf[cur] (counter-dependent ⇒ loop-scoped; reads the block committed
-    // last iteration, or the prologue for block 0) and run QKᵀ → causal mask →
-    // online softmax → A·V. The WAR barrier (consumed by the gathers, an in-loop
-    // anchor) folds in the prefetch commits via `extra_war`, so one barrier gates
-    // the cross-iteration RAW/WAR. The barrier-wrapped END (`endrange_barrier_to`)
-    // is NOT used here: it reorders the causal-mask WHERE past its consumer, leaving
-    // the renderer without its SSA value — plain `endrange` keeps the render order.
-    let extra_war = [commit_k.uop().clone(), commit_v.uop().clone()];
     let ctx = FaCtx { warp: &warp, lp: &lp, q_reg_t: &q_reg_t, q_blk: &q_blk, warpid: &warpid, causal, valid_len };
-    // The two pipeline stages: gather + QKᵀ + mask, then online-softmax + A·V.
     let FaScratch { k_reg, k_reg_t, v_reg, att, att_mma, max_vec_last, att_smem } = sc;
-    let (att, v_reg) = fa_qk(&ctx, k_reg, k_reg_t, v_reg, att, k_cur, v_cur, &kv_idx, true, &extra_war);
-    let FaAcc { norm_vec, o_reg, .. } = fa_softmax_pv(&ctx, acc, att_mma, att_smem, max_vec_last, att, &v_reg);
 
-    let o_reg = lp.close_carry(o_reg);
+    // Prefetch/commit placement differs by masking mode:
+    //
+    // * **Causal** — commit EARLY (tracked), gated by the in-slice `war_fence2` (folding the
+    //   commits via `extra_war`), closed with plain [`Loop::close_carry`]. `close_barrier`
+    //   can't be used (it reorders the causal-mask WHERE past its consumer, orphaning the
+    //   renderer's SSA — see the prologue note).
+    //
+    // * **Non-causal** — no mask WHERE, so adopt the matmul's asm-pinned commit-LATE pipeline:
+    //   a *tracked* vec8 global load (`stage_*_vec_asm`, `sched_barrier(0)`-pinned) left in
+    //   flight across QKᵀ+softmax+A·V, then an **asm** `ds_write` commit (schedule-opaque, so
+    //   the late order survives -O3 — a tracked commit gets re-bunched next to the load,
+    //   exposing ~24% of runtime as `s_waitcnt vmcnt(0)`). The load's precise `vmcnt` then
+    //   lands at the late commit. `close_barrier` folds the loop-tail workgroup fence into the
+    //   END (cycle-free — commits are END deps, not a commit-dep barrier spliced into the
+    //   carry); an explicit `lgkmcnt(0)` drain (the asm `ds_write` is opaque to that fence)
+    //   is threaded in as an END dep so the next iteration's collaborative gather sees it.
+    let (norm_vec, o_reg) = if causal {
+        let s_k = g.stage_global_to_reg(&k_smem, &k_l, &pf_kidx, 1);
+        let s_v = g.stage_global_to_reg(&v_smem, &v_l, &pf_kidx, 1);
+        let commit_k = g.commit_reg_to_local(k_nxt, &s_k, false);
+        let commit_v = g.commit_reg_to_local(v_nxt, &s_v, false);
+        let extra_war = [commit_k.uop().clone(), commit_v.uop().clone()];
+        let (att, v_reg) = fa_qk(&ctx, k_reg, k_reg_t, v_reg, att, k_cur, v_cur, &kv_idx, true, &extra_war);
+        let FaAcc { norm_vec, o_reg, .. } = fa_softmax_pv(&ctx, acc, att_mma, att_smem, max_vec_last, att, &v_reg);
+        (norm_vec, lp.close_carry(o_reg))
+    } else {
+        let s_k = g.stage_global_to_reg_vec_asm(&k_smem, &k_l, &pf_kidx, 1, None);
+        let s_v = g.stage_global_to_reg_vec_asm(&v_smem, &v_l, &pf_kidx, 1, None);
+        let (att, v_reg) = fa_qk(&ctx, k_reg, k_reg_t, v_reg, att, k_cur, v_cur, &kv_idx, false, &[]);
+        let FaAcc { norm_vec, o_reg, .. } = fa_softmax_pv(&ctx, acc, att_mma, att_smem, max_vec_last, att, &v_reg);
+        let commit_k =
+            g.commit_reg_to_local_vec_asm(k_nxt.rewrap(k_nxt.uop().after(smallvec![o_reg.uop().clone()])), &s_k);
+        let commit_v =
+            g.commit_reg_to_local_vec_asm(v_nxt.rewrap(v_nxt.uop().after(smallvec![commit_k.uop().clone()])), &s_v);
+        let drain = crate::arch::gfx9::s_waitcnt_lgkmcnt(0, commit_v.uop().clone());
+        let ended = lp.close_barrier(smallvec![o_reg.uop().clone(), drain, commit_v.uop().clone()]);
+        (norm_vec, o_reg.after(smallvec![ended]))
+    };
     let norm_vec = norm_vec.after(&o_reg);
 
     let o_reg = o_reg / &norm_vec;
