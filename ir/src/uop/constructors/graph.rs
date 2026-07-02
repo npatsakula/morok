@@ -119,6 +119,17 @@ impl UOp {
         if self.has_buffer_identity() {
             return self.clone();
         }
+        // An AFTER over a materialized buffer is already dense & contiguous: the producer
+        // (e.g. a hand `custom_kernel` / `graph_launch` that writes its output buffer in
+        // place) already filled that buffer, and `buf_uop()` resolves the AFTER back to it,
+        // so wrapping in CONTIGUOUS would only inject a redundant buffer→buffer copy kernel.
+        // Scoped to `contiguous()` — NOT `has_buffer_identity()` (which gates `realize()`'s
+        // dispatch short-circuit; an AFTER there must still schedule the producer).
+        if let Op::After { passthrough, .. } = self.op()
+            && passthrough.has_buffer_identity()
+        {
+            return self.clone();
+        }
         let dtype = self.dtype();
         Self::new(Op::Contiguous { src: self.clone(), opts: smallvec::SmallVec::new() }, dtype)
     }
