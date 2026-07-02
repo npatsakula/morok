@@ -89,6 +89,36 @@ fn gemm_ready() -> Option<&'static HblShim> {
     if unsafe { (shim.device_ok)() } != 0 { Some(shim) } else { None }
 }
 
+// ── CK ck_tile FMHA-forward vendor floor (separate .so: libsvod_ck_fmha_shim.so) ──
+// create(batch, nhead, nhead_kv, seqlen, hdim, causal) — self-allocates q/k/v/o; null when
+// CK has no instance for the shape (or no HIP device). run_ns(plan, warmup, iters) → median ns.
+type CkCreate = unsafe extern "C" fn(c_int, c_int, c_int, c_int, c_int, c_int) -> *mut c_void;
+type CkRunNs = unsafe extern "C" fn(*mut c_void, c_int, c_int) -> f64;
+type CkDestroy = unsafe extern "C" fn(*mut c_void);
+
+struct CkShim {
+    _lib: Library,
+    create: CkCreate,
+    run_ns: CkRunNs,
+    destroy: CkDestroy,
+}
+
+fn load_ck() -> Option<CkShim> {
+    // SAFETY: a trusted, flake-built lib whose `extern "C"` symbols match the signatures above.
+    unsafe {
+        let lib = Library::new("libsvod_ck_fmha_shim.so").ok()?;
+        let create = *lib.get::<CkCreate>(b"ck_fmha_create\0").ok()?;
+        let run_ns = *lib.get::<CkRunNs>(b"ck_fmha_run_ns\0").ok()?;
+        let destroy = *lib.get::<CkDestroy>(b"ck_fmha_destroy\0").ok()?;
+        Some(CkShim { _lib: lib, create, run_ns, destroy })
+    }
+}
+
+fn ck_ready() -> Option<&'static CkShim> {
+    static S: OnceLock<Option<CkShim>> = OnceLock::new();
+    S.get_or_init(load_ck).as_ref()
+}
+
 const MAX_WS: u64 = 256 * 1024 * 1024; // hipBLASLt heuristic workspace cap
 const WARMUP: c_int = 3;
 // Mirrors TILE in shims/hipblaslt_shim.cpp: the shim tiles output n into ≤2048
@@ -259,9 +289,48 @@ fn bench_knn(c: &mut Criterion) {
     group.finish();
 }
 
+/// Flash-attention vendor floor: CK ck_tile `fmha_fwd` (fused, bf16) at HK's shape —
+/// B=4, H=32, H_KV=8 (GQA 4:1), N=1024 — for the 4 configs (d ∈ {64,128} × causal). Row id
+/// `vendor`, group `fa_hk`. FLOPs = 4·B·H·N²·d (H = query heads; GQA shares KV but each query
+/// head does full N² attention), halved for causal. Compare to the svod `tk` fa rows measured
+/// at the same shape. Self-skips if the CK shim / a matching instance is absent.
+fn bench_fa(c: &mut Criterion) {
+    let Some(shim) = ck_ready() else {
+        eprintln!("svod-tk vendor fa: skipped (no libsvod_ck_fmha_shim.so — build the ckFmhaShim / bench-fa shell)");
+        return;
+    };
+    let (b, h, h_kv, n) = (4i64, 32i64, 8i64, 1024i64);
+    let mut group = c.benchmark_group("fa_hk");
+    for &d in &[64i64, 128] {
+        for &causal in &[0i32, 1] {
+            let f = 4.0 * (b * h * d) as f64 * (n as f64).powi(2) * if causal == 1 { 0.5 } else { 1.0 };
+            group.throughput(Throughput::Elements(f as u64));
+            // SAFETY: the shim self-allocates; null == no CK instance for this shape / no device.
+            let plan = unsafe {
+                (shim.create)(b as c_int, h as c_int, h_kv as c_int, n as c_int, d as c_int, causal)
+            };
+            if plan.is_null() {
+                eprintln!("svod-tk vendor fa (CK): no fmha instance for d={d} causal={causal}; skipping");
+                continue;
+            }
+            let id = format!("d{d}/{}", if causal == 1 { "causal" } else { "noncausal" });
+            group.bench_with_input(BenchmarkId::new("vendor", id), &d, |bch, _| {
+                bch.iter_custom(|iters| {
+                    // SAFETY: `plan` valid for the bench's duration; the shim's own device VAs.
+                    let ns = unsafe { (shim.run_ns)(plan, WARMUP, iters_to_c(iters)) };
+                    Duration::from_nanos((ns * iters as f64) as u64)
+                });
+            });
+            // SAFETY: from create, destroyed once.
+            unsafe { (shim.destroy)(plan) };
+        }
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_matmul, bench_kmeans, bench_knn
+    targets = bench_matmul, bench_kmeans, bench_knn, bench_fa
 }
 criterion_main!(benches);
