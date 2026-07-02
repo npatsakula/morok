@@ -31,6 +31,48 @@ struct LdsGeom {
     clamp: bool,
 }
 
+/// Shared 128-bit (`vw = 8` bf16) coalesced addressing of the vectorized prefetch —
+/// the fields the GLOBAL→VGPR stage (which adds the global base) and the VGPR→LDS
+/// commit (which swizzles) both recompute identically. Mirrors [`LdsGeom`].
+struct PrefetchVecGeom {
+    /// Lane-pass count.
+    total_calls: i64,
+    /// 128-bit global-load width (8 bf16).
+    vw: i64,
+    /// Swizzle-order-safe `ds_write_b64` width (4 bf16).
+    sw: i64,
+    /// Lane source row / within-tile col of the `vw`-run.
+    row0: Arc<UOp>,
+    col0: Arc<UOp>,
+    /// Fragment coordinate of the run (`height`, `width`, in-fragment `row`).
+    height: Arc<UOp>,
+    width: Arc<UOp>,
+    row: Arc<UOp>,
+    /// The lane-pass loop range.
+    outer: Arc<UOp>,
+}
+
+/// Scale a GLOBAL block-index vector for a tile hop: multiply the `axis` index by
+/// `row_scale` (the tile's global row span) and index 3 by `col_scale` (its col
+/// span), leaving the rest. Shared by the GLOBAL↔LDS fills (row/col span = the ST
+/// `rows`/`cols`) and the GLOBAL↔REG fragment gathers (span = the fragment grid
+/// `s3*base_rows` / `s2*base_cols`).
+fn scaled_idxs(idxs: &[Idx], axis: usize, row_scale: i64, col_scale: i64) -> Vec<Idx> {
+    idxs.iter()
+        .enumerate()
+        .map(|(i, idx)| {
+            let mut e = idx.clone();
+            if i == axis {
+                e = idx_mul(&e, row_scale);
+            }
+            if i == 3 {
+                e = idx_mul(&e, col_scale);
+            }
+            e
+        })
+        .collect()
+}
+
 impl<'k> Group<'k> {
     /// Move data into `dst` (tinygrad `Group.load`), with the legal (dst, src)
     /// address-space pair resolved at **compile time** via [`LoadInto`](super::LoadInto):
@@ -58,20 +100,6 @@ impl<'k> Group<'k> {
         src.load_into(self, dst, ix)
     }
 
-    /// Coalesced GLOBAL→LOCAL fill **without** the trailing workgroup barrier —
-    /// the software-pipeline primitive (stage ii). The caller is responsible
-    /// for inserting one barrier per buffer before the LDS→REG gather (so the
-    /// fill is visible) and before the next overwrite (the WAR edge); decoupling
-    /// the fill from its sync lets the next block's GLOBAL loads issue *ahead* of
-    /// the current block's compute, overlapping memory latency with the MFMA.
-    ///
-    /// # Panics
-    /// Panics if `axis` is out of range for the GLOBAL source's rank (the
-    /// row-stride is the product of the dims after `axis`).
-    pub fn fill_local_nobar(&self, dst: ST, src: GL, idxs: &[Idx], axis: usize) -> ST {
-        self.load_global_to_local(dst, &src, idxs, axis, false)
-    }
-
     /// Stage one tile of `src` (GLOBAL) into a fresh per-lane register buffer —
     /// the GLOBAL→VGPR half of the register prefetch. Uses the *same*
     /// coalesced per-lane addressing as [`Self::load_global_to_local`], but lands
@@ -85,20 +113,7 @@ impl<'k> Group<'k> {
     pub fn stage_global_to_reg(&self, st: &ST, src: &GL, idxs: &[Idx], axis: usize) -> Arc<UOp> {
         let geom = self.lds_fill_geom(st);
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
-        let idxs_t: Vec<Idx> = idxs
-            .iter()
-            .enumerate()
-            .map(|(i, idx)| {
-                let mut e = idx.clone();
-                if i == axis {
-                    e = idx_mul(&e, st.rows as i64);
-                }
-                if i == 3 {
-                    e = idx_mul(&e, st.cols as i64);
-                }
-                e
-            })
-            .collect();
+        let idxs_t = scaled_idxs(idxs, axis, st.rows as i64, st.cols as i64);
         let src_i_base = flat_offset(src.shape(), &idxs_t);
 
         let stage = self.ker.alloc_reg((geom.total_calls * geom.ept) as usize, st.elem().clone());
@@ -149,14 +164,9 @@ impl<'k> Group<'k> {
     /// The shared 128-bit (`vw = 8` bf16) coalesced addressing of the vectorized
     /// prefetch: for the lane's pass `outer`, the source-row `row0`, the within-tile
     /// `col0`, and the `(height, width, row)` fragment coordinate — identical to
-    /// [`Self::load_global_to_local_vec`]. Returns `(total_calls, vw, sw, row0, col0,
-    /// height, width, row, outer)` for the stage (which adds the global base) and the
-    /// commit (which swizzles) to reuse.
-    #[allow(clippy::type_complexity)]
-    fn prefetch_vec_geom(
-        &self,
-        st: &ST,
-    ) -> (i64, i64, i64, Arc<UOp>, Arc<UOp>, Arc<UOp>, Arc<UOp>, Arc<UOp>, Arc<UOp>) {
+    /// [`Self::load_global_to_local_vec`]. Returns a [`PrefetchVecGeom`] the stage
+    /// (which adds the global base) and the commit (which swizzles) reuse.
+    fn prefetch_vec_geom(&self, st: &ST) -> PrefetchVecGeom {
         let itemsize = st.elem().base().bytes() as i64;
         assert_eq!(itemsize, 2, "asm prefetch: bf16-only (128-bit = vec8)");
         let vw = 16 / itemsize; // 8 bf16 — the global_load_dwordx4 width
@@ -184,10 +194,10 @@ impl<'k> Group<'k> {
         let height = idiv(&row0, base_rows);
         let row = imod(&row0, base_rows);
         let width = idiv(&col0, base_cols);
-        (total_calls, vw, sw, row0, col0, height, width, row, outer)
+        PrefetchVecGeom { total_calls, vw, sw, row0, col0, height, width, row, outer }
     }
 
-    /// **Inline-`asm` vectorized** GLOBAL→VGPR stage (M3 prefetch, half 1): one
+    /// **Inline-`asm` vectorized** GLOBAL→VGPR stage (the register-staged prefetch, half 1): one
     /// `global_load_dwordx4` per lane-pass into a flat `[total_calls, vw]` DEFINE_REG,
     /// as an opaque `asm sideeffect` so the load issues at the loop top and its
     /// ~300-cycle latency overlaps the MFMA clusters (the machine scheduler can't sink
@@ -202,22 +212,9 @@ impl<'k> Group<'k> {
         anchor: Option<&Arc<UOp>>,
     ) -> Arc<UOp> {
         assert_eq!(src.elem(), st.elem(), "asm prefetch: cast unsupported (bf16→bf16 only)");
-        let (total_calls, vw, _sw, row0, col0, _height, _width, _row, outer) = self.prefetch_vec_geom(st);
+        let PrefetchVecGeom { total_calls, vw, row0, col0, outer, .. } = self.prefetch_vec_geom(st);
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
-        let idxs_t: Vec<Idx> = idxs
-            .iter()
-            .enumerate()
-            .map(|(i, idx)| {
-                let mut e = idx.clone();
-                if i == axis {
-                    e = idx_mul(&e, st.rows as i64);
-                }
-                if i == 3 {
-                    e = idx_mul(&e, st.cols as i64);
-                }
-                e
-            })
-            .collect();
+        let idxs_t = scaled_idxs(idxs, axis, st.rows as i64, st.cols as i64);
         let src_i_base = flat_offset(src.shape(), &idxs_t);
         let off = iadd(&src_i_base, &iadd(&imul(&row0, row_stride), &col0));
 
@@ -234,7 +231,7 @@ impl<'k> Group<'k> {
         // (e.g. cluster-3's barrier for the B-prefetch) stops the linearizer's
         // toposort from floating the minimally-dependent load to the loop top
         // bunched with the A-prefetch — it lands mid-loop so its latency overlaps
-        // the intervening MFMA clusters (HK's interleaved `BLOAD` placement).
+        // the intervening MFMA clusters (the interleaved mid-loop global-load placement).
         if let Some(a) = anchor {
             loaded = loaded.after(smallvec![a.clone()]);
         }
@@ -248,19 +245,19 @@ impl<'k> Group<'k> {
         // staging store forbids the machine scheduler from sinking the load down to
         // (or bunching it with) the commit. Without it the loads hoist/bunch at the
         // loop top adjacent to the commit and their latency is no longer overlapped
-        // by the intervening MFMA clusters (the partial M3 re-batch).
+        // by the intervening MFMA clusters.
         let pinned = crate::arch::gfx9::sched_barrier(0, stored);
         stage.after(smallvec![pinned])
     }
 
-    /// **Inline-`asm` vectorized** VGPR→LDS commit (M3 prefetch, half 2): reads the
+    /// **Inline-`asm` vectorized** VGPR→LDS commit (the register-staged prefetch, half 2): reads the
     /// staged vec8 and writes it to the XOR-swizzled LDS half as `vw/sw` opaque
     /// `ds_write_b64`s, recomputing the identical addressing as
     /// [`Self::stage_global_to_reg_vec_asm`]. Opaque `asm sideeffect` so the writes stay
     /// *after* the MFMA clusters (the caller threads `st.after([last_mfma])`) instead of
     /// being hoisted. No barrier — the caller fences once at the loop tail.
     pub fn commit_reg_to_local_vec_asm(&self, st: ST, stage: &Arc<UOp>) -> ST {
-        let (_total_calls, vw, sw, _row0, col0, height, width, row, outer) = self.prefetch_vec_geom(&st);
+        let PrefetchVecGeom { vw, sw, col0, height, width, row, outer, .. } = self.prefetch_vec_geom(&st);
         let base_cols = st.base.base.cols as i64;
 
         // The `vw/sw` swizzle-safe `ds_write_b64`s, chained (each carries the prior as an
@@ -290,7 +287,7 @@ impl<'k> Group<'k> {
             // WAR `lgkmcnt(0)` (prior-gather drain before overwriting the single LDS
             // tile) is already supplied by the cluster-5 barrier's `cbar` drain that
             // precedes this commit. This drops the conservative full `vmcnt(0)
-            // lgkmcnt(0)` the opaque-asm load used to force, matching HK.
+            // lgkmcnt(0)` the opaque-asm load used to force.
             if let Some(p) = prev.take() {
                 deps.push(p); // ordering only (not referenced in the template)
             }
@@ -390,24 +387,11 @@ impl<'k> Group<'k> {
     /// Coalesced GLOBAL→LOCAL fill: every group thread streams
     /// `elements_per_thread` contiguous global elements into the swizzled LDS
     /// tile. When `barrier`, it is closed with a workgroup barrier so the
-    /// subsequent gather sees it (the default); the software-pipeline path passes
-    /// `false` and inserts the barrier itself (see [`Self::fill_local_nobar`]).
+    /// subsequent gather sees it (the default); a caller wanting to decouple the
+    /// fill from its sync passes `false` and inserts the barrier itself.
     pub(super) fn load_global_to_local(&self, st: ST, src: &GL, idxs: &[Idx], axis: usize, barrier: bool) -> ST {
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
-        let idxs_t: Vec<Idx> = idxs
-            .iter()
-            .enumerate()
-            .map(|(i, idx)| {
-                let mut e = idx.clone();
-                if i == axis {
-                    e = idx_mul(&e, st.rows as i64);
-                }
-                if i == 3 {
-                    e = idx_mul(&e, st.cols as i64);
-                }
-                e
-            })
-            .collect();
+        let idxs_t = scaled_idxs(idxs, axis, st.rows as i64, st.cols as i64);
         let src_i_base = flat_offset(src.shape(), &idxs_t);
 
         let ept = st.base.base.elements_per_thread() as i64;
@@ -486,8 +470,8 @@ impl<'k> Group<'k> {
     }
 
     /// [`Self::fill_local_vec`] **without** the trailing workgroup barrier — the
-    /// vectorized counterpart of [`Self::fill_local_nobar`], for the double-buffered
-    /// matmul prefetch (issue strip k+1's 128-bit global loads at the loop top so the
+    /// software-pipeline primitive, for the register-staged matmul prefetch (issue
+    /// strip k+1's 128-bit global loads at the loop top so the
     /// memory latency overlaps strip k's MFMAs; the caller fences once *after* the
     /// MFMAs so the load and the compute run concurrently).
     pub fn fill_local_vec_nobar(&self, dst: ST, src: GL, idxs: &[Idx], axis: usize) -> ST {
@@ -515,20 +499,7 @@ impl<'k> Group<'k> {
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
         assert_eq!(row_stride % vw, 0, "vec fill: row stride {row_stride} not {vw}-aligned (need N % 8 == 0)");
 
-        let idxs_t: Vec<Idx> = idxs
-            .iter()
-            .enumerate()
-            .map(|(i, idx)| {
-                let mut e = idx.clone();
-                if i == axis {
-                    e = idx_mul(&e, st.rows as i64);
-                }
-                if i == 3 {
-                    e = idx_mul(&e, st.cols as i64);
-                }
-                e
-            })
-            .collect();
+        let idxs_t = scaled_idxs(idxs, axis, st.rows as i64, st.cols as i64);
         let src_i_base = flat_offset(src.shape(), &idxs_t);
 
         let num_elements = st.base.base.num_elements() as i64;
@@ -630,7 +601,7 @@ impl<'k> Group<'k> {
     /// Explicit inline-`asm` `ds_read_b64` LOCAL→REG gather — the per-call
     /// counterpart of the old kernel-global `asm_gather` mode (now removed): the
     /// generic [`Self::load_local_to_reg`] always emits the compiler-tracked vector
-    /// `load`; the gfx942 asm microkernel ([`crate::kernels::matmul`] `gemm_core_hk`)
+    /// `load`; the gfx942 asm microkernel ([`crate::kernels::matmul`] `gemm_core_asm`)
     /// calls THIS for its operand gather. Emits one `ds_read` per fragment-row sharing
     /// a single base-address VGPR + per-row `offset:` immediate (the lane-uniform XOR
     /// delta, so no per-read permuted-address spill — see [`Self::gather_asm_unrolled`]).
@@ -796,20 +767,7 @@ impl<'k> Group<'k> {
         let s3 = rt.shape()[n - 3] as i64;
         let s2 = rt.shape()[n - 2] as i64;
 
-        let idxs_t: Vec<Idx> = idxs
-            .iter()
-            .enumerate()
-            .map(|(i, idx)| {
-                let mut e = idx.clone();
-                if i == axis {
-                    e = idx_mul(&e, s3 * base_rows);
-                }
-                if i == 3 {
-                    e = idx_mul(&e, s2 * base_cols);
-                }
-                e
-            })
-            .collect();
+        let idxs_t = scaled_idxs(idxs, axis, s3 * base_rows, s2 * base_cols);
         let src_i_base = flat_offset(src.shape(), &idxs_t);
 
         let laneid = self.ker.laneid();
@@ -910,20 +868,7 @@ impl<'k> Group<'k> {
         let s3 = rt.shape()[n - 3] as i64;
         let s2 = rt.shape()[n - 2] as i64;
 
-        let idxs_t: Vec<Idx> = idxs
-            .iter()
-            .enumerate()
-            .map(|(i, idx)| {
-                let mut e = idx.clone();
-                if i == axis {
-                    e = idx_mul(&e, s3 * base_rows);
-                }
-                if i == 3 {
-                    e = idx_mul(&e, s2 * base_cols);
-                }
-                e
-            })
-            .collect();
+        let idxs_t = scaled_idxs(idxs, axis, s3 * base_rows, s2 * base_cols);
         let dst_i_base = flat_offset(dst.shape(), &idxs_t);
 
         let laneid = self.ker.laneid();
@@ -976,7 +921,7 @@ impl<'k> Group<'k> {
 ///
 /// [`Swizzle::Identity`] keeps the plain fragment-major layout (shape
 /// `[H, W, base_rows, base_cols]`); the XOR variants reconstruct the whole-tile
-/// `(row, col)` and apply HipKittens' subtile-structured bank swizzle
+/// `(row, col)` and apply a subtile-structured bank swizzle
 /// ([`Swizzle::tile_offset`]) over the full in-tile address — the same bijection
 /// on every store and load, so numerics are preserved while the gfx942 LDS banks
 /// are spread (the MFMA-gather bank-conflict fix).

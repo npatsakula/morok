@@ -105,7 +105,7 @@ impl<'k> Group<'k> {
     /// (opaque to the AMDGPU machine scheduler, so the inner-loop program order
     /// survives `-O3`) instead of the `@llvm.amdgcn.mfma.*` intrinsic. The explicit
     /// per-call counterpart of the old kernel-global `asm_mfma` mode — only the
-    /// gfx942 asm microkernel ([`crate::kernels::matmul`] `gemm_core_hk`) calls it.
+    /// gfx942 asm microkernel ([`crate::kernels::matmul`] `gemm_core_asm`) calls it.
     /// Valid only for the f32-accumulating bf16 K=16 MFMA (the shape it is used for).
     pub fn mma_abt_asm(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
         self.mma(c, a, b, false, true, true)
@@ -212,7 +212,7 @@ impl<'k> Group<'k> {
     /// attention scheduling comb can weave the online softmax through. tk's
     /// direct-launch path skips the optimizer's `pre_expand`, so the looped
     /// [`Self::mma`] stays rolled (three `loop_body_*` around the mfma); explicit
-    /// unroll is the only way to flatten it (route b — the cheap axis-flip is dead
+    /// unroll is the only way to flatten it (the cheap axis-flip is dead
     /// on the direct path).
     ///
     /// Each fragment's K-accumulation chains (`c[h,w]`'s k-step read observes the

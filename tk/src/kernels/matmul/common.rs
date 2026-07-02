@@ -1,7 +1,7 @@
 //! The arch-generic kernel machinery for the tile matmul: the single-buffered
 //! GEMM core ([`gemm_core`]) and its split-K sibling ([`gemm_core_splitk`]), the
-//! thin ABI-binding builders ([`build_matmul_cfg`] / [`build_matmul_cfg_k`] /
-//! [`build_matmul_splitk`]), the split-K size heuristic ([`split_k_for`]), and the
+//! thin ABI-binding builders ([`build_matmul_cfg`] / [`build_matmul_splitk`]),
+//! the split-K size heuristic ([`split_k_for`]), and the
 //! shared block/accumulator coordinate helpers ([`acc_row`] / [`block_coords`]).
 //! One builder serves every arch — the tile shortcuts ([`Kernel::acc`] /
 //! [`Kernel::operand`] / [`Kernel::shared_sw`]) resolve the right WMMA fragment per
@@ -16,12 +16,39 @@ use svod_ir::UOp;
 use super::MatmulCfg;
 use crate::index::{Idx, cidx};
 use crate::tiles::TileLayout;
-use crate::{GL, GlSpec, Kernel, MoveIdx, RT, RegTile};
+use crate::{GL, GlSpec, Group, Kernel, MoveIdx, RT, RegTile};
 
 /// The M-row C-block coordinate of accumulator `a` (`warp_row + a*wave_rows`,
-/// in `reg`-block units) — HK `GEMM:92-94` wave sub-tile row selection.
+/// in `reg`-block units) — the wave sub-tile row selection.
 pub(crate) fn acc_row(warp_row: &Arc<UOp>, a: usize, cfg: &MatmulCfg) -> Arc<UOp> {
     if a == 0 { warp_row.clone() } else { warp_row.add(&cidx((a * cfg.wave_rows) as i64)) }
+}
+
+/// Store each col-major accumulator to global C at its `reg`-block coordinate
+/// `{row*bps + warp_row + a*wave_rows, col*bps + warp_col}`. `lead` is the optional
+/// leading store index — `None` for the whole-C tile store, `Some(k_slice)` for the
+/// split-K partial-tile store into `scratch[k_slice]`. Shared by the generic core,
+/// the split-K core, and the gfx942 asm microkernel.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn store_accs<'k>(
+    g: &Group<'k>,
+    c_gl: GL,
+    final_accs: Vec<RT<'k>>,
+    row: &Arc<UOp>,
+    col: &Arc<UOp>,
+    warp_row: &Arc<UOp>,
+    warp_col: &Arc<UOp>,
+    cfg: &MatmulCfg,
+    lead: Option<Arc<UOp>>,
+) {
+    let bps = cfg.blocks_per_side() as i64;
+    let nidx = col.mul(&cidx(bps)).add(warp_col);
+    let lead = lead.unwrap_or_else(|| cidx(0));
+    let mut c_t = c_gl;
+    for (a, c) in final_accs.into_iter().enumerate() {
+        let mrow = row.mul(&cidx(bps)).add(&acc_row(warp_row, a, cfg));
+        c_t = g.store(c_t, c, MoveIdx::block((lead.clone(), 0, mrow.clone(), nidx.clone()), 2));
+    }
 }
 
 /// The `(pid_m, pid_n)` C-block coordinate (in `block` units) for this workgroup
@@ -49,16 +76,6 @@ pub(crate) fn block_coords(ker: &Kernel, m: usize, n: usize, cfg: &MatmulCfg) ->
 /// # Panics
 /// Panics on the same preconditions as [`gemm_core`].
 pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
-    build_matmul_cfg_k(ker, n, cfg, cfg.k_step());
-}
-
-/// [`build_matmul_cfg`] with an explicit `k_step` (the LDS strip depth / K-loop
-/// reduction step, replacing the hardcoded [`K_STEP`](super::K_STEP)). A thin wrapper that binds
-/// the square `n×n` bf16→f32 ABI and runs [`gemm_core`].
-///
-/// # Panics
-/// Panics on the same preconditions as [`gemm_core`].
-pub fn build_matmul_cfg_k(ker: &Kernel, n: usize, cfg: MatmulCfg, k_step: usize) {
     // ABI: output (c, f32) then inputs (a, b — bf16), fixed by construction. Tiles in
     // `gemm_core` are declared by ROLE via the scaffold shortcuts (`ker.acc`/`operand`/
     // `shared_sw`), which resolve the arch fragment through `caps.frag` (gfx942 CDNA
@@ -67,7 +84,7 @@ pub fn build_matmul_cfg_k(ker: &Kernel, n: usize, cfg: MatmulCfg, k_step: usize)
         &[GlSpec::new(&[1, 1, n, n], DType::Float32)],
         &[GlSpec::new(&[1, 1, n, n], DType::BFloat16), GlSpec::new(&[1, 1, n, n], DType::BFloat16)],
     );
-    gemm_core(ker, n, n, n, cfg, k_step, outs[0].clone(), ins[0].clone(), ins[1].clone());
+    gemm_core(ker, n, n, n, cfg, cfg.k_step(), outs[0].clone(), ins[0].clone(), ins[1].clone());
 }
 
 /// The parametrized `C[m,n] = A[m,k] · B[n,k]` (`mma_abt`, B in `[N,K]` layout) GEMM
@@ -119,7 +136,7 @@ pub fn gemm_core(
 
     // Collaborative GLOBAL→LDS fill over all threads (each ends in a barrier);
     // Uses 128-bit vectorized loads for the large-N strips. B is in [N,K] layout
-    // (the HK contract), indexed as [N-block, K-strip] at (col, tile).
+    // (the B[N,K] contract), indexed as [N-block, K-strip] at (col, tile).
     let (a_smem, b_smem) = if cfg.vec_load {
         (
             g.fill_local_vec(a_smem, a_gl, &[Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(&tile)], 2),
@@ -173,15 +190,8 @@ pub fn gemm_core(
     // Each accumulator reads its fully-reduced register value *outside* the loop.
     let final_accs: Vec<RT> = accs.iter().map(|c| c.after(smallvec![ended.clone()])).collect();
 
-    // Epilogue: store each col-major accumulator to global C at its reg-block coords
-    // {row*bps + warp_row + a*wave_rows, col*bps + warp_col}.
-    let bps = cfg.blocks_per_side() as i64;
-    let nidx = col.mul(&cidx(bps)).add(&warp_col);
-    let mut c_t = c_gl;
-    for (a, c) in final_accs.into_iter().enumerate() {
-        let mrow = row.mul(&cidx(bps)).add(&acc_row(&warp_row, a, &cfg));
-        c_t = g.store(c_t, c, MoveIdx::block((0, 0, mrow.clone(), nidx.clone()), 2));
-    }
+    // Epilogue: store each col-major accumulator to global C at its reg-block coords.
+    store_accs(&g, c_gl, final_accs, &row, &col, &warp_row, &warp_col, &cfg, None);
 }
 
 /// Split-K [`gemm_core`]: partitions the K reduction across `k_splits` workgroups
@@ -271,13 +281,7 @@ fn gemm_core_splitk(
     let final_accs: Vec<RT> = accs.iter().map(|c| c.after(smallvec![ended.clone()])).collect();
 
     // Epilogue: store the partial tile into `scratch[k_slice]` (leading dim = k_slice).
-    let bps = cfg.blocks_per_side() as i64;
-    let nidx = col.mul(&cidx(bps)).add(&warp_col);
-    let mut c_t = c_gl;
-    for (a, c) in final_accs.into_iter().enumerate() {
-        let mrow = row.mul(&cidx(bps)).add(&acc_row(&warp_row, a, &cfg));
-        c_t = g.store(c_t, c, MoveIdx::block((k_slice.clone(), 0, mrow.clone(), nidx.clone()), 2));
-    }
+    store_accs(&g, c_gl, final_accs, &row, &col, &warp_row, &warp_col, &cfg, Some(k_slice));
 }
 
 /// Bind the split-K ABI — output `scratch[k_splits, 1, n, n]` (f32 partials), inputs

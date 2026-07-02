@@ -75,8 +75,8 @@ fn test_mma_ab_wmma_graph_shape() {
 /// reduce steps) is 8 flat nodes — vs the looped form's single symbolic node, and
 /// renders to gfx942 with 8 distinct `mfma` instructions (no enclosing
 /// `loop_body`), which the looped form cannot (it renders one mfma inside loops).
-/// This is the P1 flatness de-risk: explicit Rust-`for` unroll *does* flatten the
-/// MFMAs on tk's optimizer-skipping direct-launch path (route b).
+/// The flatness de-risk: explicit Rust-`for` unroll *does* flatten the
+/// MFMAs on tk's optimizer-skipping direct-launch path.
 #[test]
 fn test_mma_unroll_flattens_mfma() {
     let build = |unroll: bool| {
@@ -224,7 +224,7 @@ fn test_simple_matmul_amd() {
 
 fn run_matmul_check(n: usize) {
     let (a, b) = matmul_inputs(n);
-    let got = launch_matmul("simple_matmul", n, M1_CFG, |ker| build_matmul_cfg(ker, n, M1_CFG), &a, &b);
+    let got = launch_matmul("simple_matmul", n, BLOCK256_CFG, |ker| build_matmul_cfg(ker, n, BLOCK256_CFG), &a, &b);
     let expected = matmul_reference(&a, &b);
     let max_abs = max_abs_err(&got, &expected);
     println!("matmul N={n}: max abs error = {max_abs:e}");
@@ -239,7 +239,7 @@ fn run_matmul_check(n: usize) {
 #[test]
 #[ignore]
 fn test_matmul_l2swizzle_amd() {
-    let cfg = MatmulCfg { vec_load: false, ..M1_CFG };
+    let cfg = MatmulCfg { vec_load: false, ..BLOCK256_CFG };
     for n in [2048usize, 4096] {
         let (a, b) = matmul_inputs(n);
         let got = launch_matmul("matmul_l2sw", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
@@ -253,14 +253,18 @@ fn test_matmul_l2swizzle_amd() {
 /// Realized bf16 `(a, b)` inputs so kernel + reference see identical rounding.
 fn matmul_inputs(n: usize) -> (svod_tensor::Tensor, svod_tensor::Tensor) {
     use svod_tensor::Tensor;
-    let mut a = Tensor::rand(&[n, n]).expect("rand a").cast(DType::BFloat16).expect("cast a→bf16");
-    let mut b = Tensor::rand(&[n, n]).expect("rand b").cast(DType::BFloat16).expect("cast b→bf16");
+    // Native bf16 (no f32 `rand` → `cast` round-trip): the matrix-engine operand dtype
+    // straight from the generator, so `matmul()` binds it with no cast.
+    let mut a =
+        Tensor::rand_with(&[n, n], DType::BFloat16, svod_dtype::default_device::default_device()).expect("rand a");
+    let mut b =
+        Tensor::rand_with(&[n, n], DType::BFloat16, svod_dtype::default_device::default_device()).expect("rand b");
     a.realize().expect("realize a");
     b.realize().expect("realize b");
     (a, b)
 }
 
-/// f32 ground-truth `a·bᵀ` (B in `[N,K]`, the HK contract) over the bf16-rounded operands.
+/// f32 ground-truth `a·bᵀ` (B in `[N,K]`, the B[N,K] contract) over the bf16-rounded operands.
 fn matmul_reference(a: &svod_tensor::Tensor, b: &svod_tensor::Tensor) -> Vec<f32> {
     let bt = b.cast(DType::Float32).expect("b→f32").try_permute(&[1, 0]).expect("bᵀ");
     let mut reference = a.cast(DType::Float32).expect("a→f32").matmul(&bt).expect("ref matmul");
@@ -273,7 +277,7 @@ fn max_abs_err(got: &[f32], expected: &[f32]) -> f32 {
     got.iter().zip(expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max)
 }
 
-/// The wave32 (gfx1151) matmul computes exactly `A·Bᵀ` (B in `[N,K]`, the HK
+/// The wave32 (gfx1151) matmul computes exactly `A·Bᵀ` (B in `[N,K]`, the B[N,K]
 /// contract) — not a non-transposed or operand-swapped variant. Compares `got`
 /// against every transpose/permutation candidate and asserts `A·Bᵀ` is the unique
 /// match (the rest are garbage-scale). A layout regression in the wave32 fragment
@@ -344,51 +348,65 @@ fn test_matmul_rdna_grid() {
     }
 }
 
-/// Numerics of the inline-`asm` HK-pipeline reference kernel ([`build_matmul_hk`]) —
-/// the flat single-LDS-buffer microkernel that exercises tk's full asm GEMM
-/// infrastructure (asm MFMA + asm `ds_read_b64` gather + asm register-staged
+/// Numerics of the software-pipelined inline-`asm` MFMA microkernel
+/// ([`build_matmul_asm_cfg`]) — the flat single-LDS-buffer microkernel that exercises tk's
+/// full asm GEMM infrastructure (asm MFMA + asm `ds_read_b64` gather + asm register-staged
 /// `global_load_dwordx4`/`ds_write_b64` prefetch). Must equal `A·Bᵀ` (B in `[N,K]`)
 /// within bf16 tolerance; the chunk/pre-gather schedule reorders the K reduction but the
 /// result is the same sum. Dump the ISA with `SVOD_DUMP_AMD_IR=<dir>` to inspect the held
 /// `L … P M(32) P … W` asm pipeline.
 ///
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_hk_amd -- --ignored --nocapture`.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_asm_amd -- --ignored --nocapture`.
 #[test]
 #[ignore]
-fn test_matmul_hk_amd() {
+fn test_matmul_asm_amd() {
     for n in [256usize, 512, 1024, 2048] {
         let (a, b) = matmul_inputs(n);
-        let got = launch_matmul("matmul_hk", n, M1_CFG, |ker| build_matmul_hk(ker, n), &a, &b);
+        let got = launch_matmul(
+            "matmul_asm",
+            n,
+            BLOCK256_CFG,
+            |ker| build_matmul_asm_cfg(ker, n, BLOCK256_CFG, true),
+            &a,
+            &b,
+        );
         let expected = matmul_reference(&a, &b);
         let max_abs = max_abs_err(&got, &expected);
-        println!("matmul_hk N={n}: max abs error = {max_abs:e}");
+        println!("matmul_asm N={n}: max abs error = {max_abs:e}");
         assert!(max_abs < 5e-2, "hk N={n}: max abs err {max_abs} exceeds bf16 tolerance 5e-2");
     }
 }
 
-/// Numerics of the **128²** HK-pipeline variant ([`build_matmul_hk128`]) — the small-N
-/// tile (HK switches to `BLOCK_SIZE=128` for N ≤ 2048). Same asm pipeline, `reg=32`.
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_hk128_amd -- --ignored --nocapture`.
+/// Numerics of the **128²** variant ([`build_matmul_asm_cfg`] at [`BLOCK128_CFG`]) — the
+/// small-N tile. Same asm pipeline, `reg=32`.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_asm128_amd -- --ignored --nocapture`.
 #[test]
 #[ignore]
-fn test_matmul_hk128_amd() {
+fn test_matmul_asm128_amd() {
     for n in [512usize, 1024, 2048] {
         let (a, b) = matmul_inputs(n);
-        let got = launch_matmul("matmul_hk128", n, HK128_CFG, |ker| build_matmul_hk128(ker, n), &a, &b);
+        let got = launch_matmul(
+            "matmul_asm128",
+            n,
+            BLOCK128_CFG,
+            |ker| build_matmul_asm_cfg(ker, n, BLOCK128_CFG, true),
+            &a,
+            &b,
+        );
         let expected = matmul_reference(&a, &b);
         let max_abs = max_abs_err(&got, &expected);
-        println!("matmul_hk128 N={n}: max abs error = {max_abs:e}");
+        println!("matmul_asm128 N={n}: max abs error = {max_abs:e}");
         assert!(max_abs < 5e-2, "hk128 N={n}: max abs err {max_abs} exceeds bf16 tolerance 5e-2");
     }
 }
 
-/// Device-time TF of the 128² HK variant vs the 256² [`build_matmul_hk`] and shipping MID
-/// at small N — does the HK pipeline at a grid-filling 128² tile beat MID (which runs the
-/// simpler `gemm_core` at 128²)?
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_hk128_tf -- --ignored --nocapture`.
+/// Device-time TF of the 128² asm variant vs the 256² asm kernel and the generic
+/// `gemm_core` at small N — does the software pipeline at a grid-filling 128² tile beat the
+/// generic `gemm_core` run at 128²?
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_asm128_tf -- --ignored --nocapture`.
 #[test]
 #[ignore]
-fn test_matmul_hk128_tf() {
+fn test_matmul_asm128_tf() {
     use svod_runtime::{PmcSelection, ProfileOptions};
     use svod_tensor::Tensor;
     let caps = crate::ArchCaps::GFX942;
@@ -397,15 +415,15 @@ fn test_matmul_hk128_tf() {
         let (a, b) = matmul_inputs(n);
         let out = Tensor::empty(&[n, n], DType::Float32);
         let mut c = crate::launch::graph_launch(
-            "matmul_hk128",
-            HK128_CFG.grid_dims(n),
-            HK128_CFG.threads(caps.wave_size),
+            "matmul_asm128",
+            BLOCK128_CFG.grid_dims(n),
+            BLOCK128_CFG.threads(caps.wave_size),
             out,
             &[&a, &b],
             caps,
             move |ker| {
-                build_matmul_hk128(ker, n);
-                ker.finish(HK128_CFG.n_accum)
+                build_matmul_asm_cfg(ker, n, BLOCK128_CFG, true);
+                ker.finish(BLOCK128_CFG.n_accum)
             },
         )
         .expect("graph_launch hk128");
@@ -424,25 +442,32 @@ fn test_matmul_hk128_tf() {
             })
             .collect();
         tfs.sort_by(|x, y| x.partial_cmp(y).expect("nan"));
-        println!("matmul_hk128 N={n}: median {:.1} TF  (samples {:?})", tfs[tfs.len() / 2], tfs);
+        println!("matmul_asm128 N={n}: median {:.1} TF  (samples {:?})", tfs[tfs.len() / 2], tfs);
     }
 }
 
-/// Route A bisect: the HK-pipeline reference ([`build_matmul_hk_phase`]) with the
-/// wave-phase ping-pong toggled. Order matters — (1) the skeleton with the offset OFF (eq
-/// never-matching → no conditional barrier fires, no phase shift) must be numerically
-/// correct first, isolating the pipelined-skeleton restructure from the offset; (2) the
-/// offset ON (`if(warp_row==1)` prologue / `if(warp_row==0)` epilogue) must also be correct.
-/// Run under a wall-clock timeout to double as the HANG test (balanced counts → no deadlock).
+/// Wave-phase ping-pong bisect: the asm microkernel ([`build_matmul_asm_cfg`]) with the
+/// ping-pong toggled. Order matters — (1) the skeleton with the offset OFF (no conditional
+/// barrier fires, no phase shift) must be numerically correct first, isolating the
+/// pipelined-skeleton restructure from the offset; (2) the offset ON (predicated barrier on
+/// warp-row 1 in the prologue / warp-row 0 in the epilogue) must also be correct. Run under
+/// a wall-clock timeout to double as the HANG test (balanced counts → no deadlock).
 ///
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_hk_route_a -- --ignored --nocapture`
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_asm_route -- --ignored --nocapture`
 fn route_a_numerics(offset: bool, sizes: &[usize]) {
     for &n in sizes {
         let (a, b) = matmul_inputs(n);
-        let got = launch_matmul("matmul_hk", n, M1_CFG, |ker| build_matmul_hk_phase(ker, n, offset), &a, &b);
+        let got = launch_matmul(
+            "matmul_asm",
+            n,
+            BLOCK256_CFG,
+            |ker| build_matmul_asm_cfg(ker, n, BLOCK256_CFG, offset),
+            &a,
+            &b,
+        );
         let expected = matmul_reference(&a, &b);
         let max_abs = max_abs_err(&got, &expected);
-        println!("matmul_hk offset={offset} N={n}: max abs error = {max_abs:e}");
+        println!("matmul_asm offset={offset} N={n}: max abs error = {max_abs:e}");
         assert!(max_abs < 5e-2, "hk offset={offset} N={n}: max abs err {max_abs} exceeds 5e-2");
     }
 }
@@ -451,27 +476,27 @@ fn route_a_numerics(offset: bool, sizes: &[usize]) {
 /// conditional barrier fires). Must be numerically correct, isolating the restructure.
 #[test]
 #[ignore]
-fn test_matmul_hk_route_a_off() {
+fn test_matmul_asm_route_off() {
     route_a_numerics(false, &[256, 512, 1024, 2048]);
 }
 
-/// Bisect step 2 — the offset ON (HK's `if(warp_row==1)`/`if(warp_row==0)` ping-pong).
-/// Run under a wall-clock timeout to double as the HANG test (balanced counts → no
-/// deadlock); then numerics ≤5e-2.
+/// Bisect step 2 — the offset ON (the predicated warp-row-1 prologue / warp-row-0 epilogue
+/// ping-pong). Run under a wall-clock timeout to double as the HANG test (balanced counts →
+/// no deadlock); then numerics ≤5e-2.
 #[test]
 #[ignore]
-fn test_matmul_hk_route_a_on() {
+fn test_matmul_asm_route_on() {
     route_a_numerics(true, &[256, 512, 1024, 2048]);
 }
 
-/// Route A device-time throughput (median TFLOP/s, ≥3 samples) of the HK-pipeline reference
-/// at large N — measured through the graph-node path so the runtime profiler stamps real
-/// per-kernel device time. Prints; no hard assert (the comparison vs MID/HK is the result).
+/// Device-time throughput (median TFLOP/s, ≥3 samples) of the asm microkernel at large N —
+/// measured through the graph-node path so the runtime profiler stamps real per-kernel
+/// device time. Prints; no hard assert (the comparison against the reference is the result).
 ///
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_hk_route_a_tf -- --ignored --nocapture`
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_asm_route_tf -- --ignored --nocapture`
 #[test]
 #[ignore]
-fn test_matmul_hk_route_a_tf() {
+fn test_matmul_asm_route_tf() {
     use svod_runtime::{PmcSelection, ProfileOptions};
     use svod_tensor::Tensor;
     let caps = crate::ArchCaps::GFX942;
@@ -481,15 +506,15 @@ fn test_matmul_hk_route_a_tf() {
             let (a, b) = matmul_inputs(n);
             let out = Tensor::empty(&[n, n], DType::Float32);
             let mut c = crate::launch::graph_launch(
-                "matmul_hk",
-                M1_CFG.grid_dims(n),
-                M1_CFG.threads(caps.wave_size),
+                "matmul_asm",
+                BLOCK256_CFG.grid_dims(n),
+                BLOCK256_CFG.threads(caps.wave_size),
                 out,
                 &[&a, &b],
                 caps,
                 move |ker| {
-                    build_matmul_hk_phase(ker, n, offset);
-                    ker.finish(M1_CFG.n_accum)
+                    build_matmul_asm_cfg(ker, n, BLOCK256_CFG, offset);
+                    ker.finish(BLOCK256_CFG.n_accum)
                 },
             )
             .expect("graph_launch hk");
@@ -508,7 +533,7 @@ fn test_matmul_hk_route_a_tf() {
                 })
                 .collect();
             tfs.sort_by(|x, y| x.partial_cmp(y).expect("nan"));
-            println!("matmul_hk offset={offset} N={n}: median {:.1} TF  (samples {:?})", tfs[tfs.len() / 2], tfs);
+            println!("matmul_asm offset={offset} N={n}: median {:.1} TF  (samples {:?})", tfs[tfs.len() / 2], tfs);
         }
     }
 }
@@ -538,6 +563,16 @@ where
     c.as_vec::<f32>().expect("read c")
 }
 
+/// Direct single-kernel launch of the ARCH-APPROPRIATE matmul — resolves the device's
+/// arch and goes through the same [`build_matmul_dispatch`] / [`cfg_for_arch`] wrapper
+/// `matmul()`'s non-split-K path uses, so graph-vs-direct comparisons are valid on any
+/// card (gfx942 asm / gfx1151 generic), not just the one this was written on.
+fn launch_matmul_dispatch(name: &str, n: usize, a: &Tensor, b: &Tensor) -> Vec<f32> {
+    let arch = crate::target::resolve_arch(&a.device()).expect("resolve device arch");
+    let cfg = cfg_for_arch(arch, n);
+    launch_matmul(name, n, cfg, move |ker| build_matmul_dispatch(ker, arch, n, cfg), a, b)
+}
+
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_graph_amd -- --ignored --nocapture`.
 ///
 /// The graph-native `matmul` (a `custom_kernel` / `Op::Call` node) matches **(a)**
@@ -551,8 +586,7 @@ fn test_matmul_graph_amd() {
     for n in [256usize, 512, 1024] {
         let (a, b) = matmul_inputs(n);
         let expected = matmul_reference(&a, &b);
-        let cfg = cfg_for_n(n);
-        let direct = launch_matmul("matmul_direct", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
+        let direct = launch_matmul_dispatch("matmul_direct", n, &a, &b);
 
         let mut g = crate::kernels::matmul::matmul(&a, &b).expect("graph matmul").expect("matmul kernel applies");
         g.realize().expect("realize graph matmul");
@@ -565,9 +599,8 @@ fn test_matmul_graph_amd() {
     }
 }
 
-/// The size-adaptive matmul is correct at every N, picking [`SMALL_CFG`] for
-/// small N (where a larger block under-occupies the machine) and [`MID_CFG`]
-/// otherwise.
+/// The gfx942 asm matmul (`gemm_core_asm`) is correct at every N, picking the 256²
+/// [`BLOCK256_CFG`] for large N and the 128² [`BLOCK128_CFG`] below (via [`cfg_for_gfx942`]).
 ///
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_adaptive_amd -- --ignored --nocapture`.
 #[test]
@@ -575,11 +608,10 @@ fn test_matmul_graph_amd() {
 fn test_matmul_adaptive_amd() {
     for n in [256usize, 512, 768, 1024, 2048] {
         let (a, b) = matmul_inputs(n);
-        let cfg = cfg_for_n(n);
-        let got = launch_matmul("matmul_adaptive", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
+        let got = launch_matmul_dispatch("matmul_adaptive", n, &a, &b);
         let expected = matmul_reference(&a, &b);
         let max_abs = max_abs_err(&got, &expected);
-        println!("adaptive N={n} (block={}): max abs error = {max_abs:e}", cfg.block);
+        println!("adaptive N={n}: max abs error = {max_abs:e}");
         assert!(max_abs < 5e-2, "adaptive N={n}: max abs error {max_abs} exceeds 5e-2");
     }
 }
