@@ -464,23 +464,23 @@ pub(crate) fn build_fa_mw_rdb(
     let ctx = FaCtx { warp: &warp, lp: &lp, q_reg_t: &q_reg_t, q_blk: &q_blk, warpid: &warpid, causal, valid_len };
     let FaScratch { k_reg, k_reg_t, v_reg, att, att_mma, max_vec_last, att_smem } = sc;
 
-    // Prefetch/commit placement differs by masking mode:
+    // Prefetch/commit placement. The asm commit-LATE path is CDNA (gfx942, wave64) ONLY — it
+    // emits gfx9/CDNA inline asm (`*_vec_asm` `ds_write_b64`, `arch::gfx9::s_waitcnt_lgkmcnt`,
+    // wave64 swizzle); everything else takes the arch-generic tracked commit-EARLY path:
     //
-    // * **Causal** — commit EARLY (tracked), gated by the in-slice `war_fence2` (folding the
-    //   commits via `extra_war`), closed with plain [`Loop::close_carry`]. `close_barrier`
-    //   can't be used (it reorders the causal-mask WHERE past its consumer, orphaning the
-    //   renderer's SSA — see the prologue note).
+    // * **Tracked commit-early** — causal (any arch), OR non-causal on non-CDNA (e.g. gfx1151
+    //   RDNA, wave32). Commit BEFORE the slice, gated by the in-slice `war_fence2` (folding the
+    //   commits via `extra_war`), closed with plain [`Loop::close_carry`]. This is also the only
+    //   correct causal path — `close_barrier` reorders the causal-mask WHERE past its consumer.
     //
-    // * **Non-causal** — no mask WHERE, so adopt the matmul's asm-pinned commit-LATE pipeline:
-    //   a *tracked* vec8 global load (`stage_*_vec_asm`, `sched_barrier(0)`-pinned) left in
-    //   flight across QKᵀ+softmax+A·V, then an **asm** `ds_write` commit (schedule-opaque, so
-    //   the late order survives -O3 — a tracked commit gets re-bunched next to the load,
-    //   exposing ~24% of runtime as `s_waitcnt vmcnt(0)`). The load's precise `vmcnt` then
-    //   lands at the late commit. `close_barrier` folds the loop-tail workgroup fence into the
-    //   END (cycle-free — commits are END deps, not a commit-dep barrier spliced into the
-    //   carry); an explicit `lgkmcnt(0)` drain (the asm `ds_write` is opaque to that fence)
-    //   is threaded in as an END dep so the next iteration's collaborative gather sees it.
-    let (norm_vec, o_reg) = if causal {
+    // * **Asm commit-late** — non-causal on CDNA. The matmul's asm-pinned pipeline: a *tracked*
+    //   vec8 global load (`stage_*_vec_asm`, `sched_barrier(0)`-pinned) left in flight across
+    //   QKᵀ+softmax+A·V, then an **asm** `ds_write` commit (schedule-opaque, so the late order
+    //   survives -O3 — a tracked commit gets re-bunched next to the load, exposing ~24% of
+    //   runtime as `s_waitcnt vmcnt(0)`). `close_barrier` folds the loop-tail fence into the END
+    //   (commits as END deps); the explicit `lgkmcnt(0)` drain covers the asm `ds_write` (opaque
+    //   to that fence) so the next iteration's collaborative gather sees the commit.
+    let (norm_vec, o_reg) = if causal || !ker.caps.arch.is_cdna() {
         let s_k = g.stage_global_to_reg(&k_smem, &k_l, &pf_kidx, 1);
         let s_v = g.stage_global_to_reg(&v_smem, &v_l, &pf_kidx, 1);
         let commit_k = g.commit_reg_to_local(k_nxt, &s_k, false);
