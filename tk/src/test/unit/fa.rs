@@ -322,6 +322,13 @@ fn test_fa_mw_rdb_amd() {
     for n in [512usize, 1024, 2048] {
         run_fa_amd_case(1, n, 2, 64, FaPath { q_blk: 32, kv_blk: 32, unroll: false });
     }
+    // d=128 (causal): the other common head dim — exercises the d>64 K-fragment loop
+    // (8 WMMA K-steps) and the 2-subtile LDS swizzle (cols=128 → general swizzle path),
+    // both at {16,16} and the bigger {16,32} KV super-block.
+    for n in [512usize, 1024, 2048] {
+        run_fa_amd_case(1, n, 2, 128, FaPath { q_blk: 16, kv_blk: 16, unroll: false });
+    }
+    run_fa_amd_case(1, 1024, 2, 128, FaPath { q_blk: 16, kv_blk: 32, unroll: false });
 }
 
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_mw_rdb_unroll_amd -- --ignored --nocapture`.
@@ -540,6 +547,45 @@ fn test_fa_noncausal_f16_amd() {
     let max_abs = got.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
     println!("fa[noncausal,f16] B={b} N={n} H={h} D={d}: max abs error = {max_abs:e}");
     assert!(max_abs <= 2e-2, "non-causal f16 FA exceeds tol (max abs {max_abs:e})");
+}
+
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_noncausal_d128_amd -- --ignored --nocapture`.
+///
+/// Non-causal, **bf16, d=128** via the graph entry vs full-bidirectional SDPA — the
+/// bench regime at the larger head dim. Validates the hardware `exp2_hw` and the
+/// 2-subtile K/V LDS swizzle (cols=128) end-to-end at d=128. Tol 2e-2.
+#[test]
+#[ignore]
+fn test_fa_noncausal_d128_amd() {
+    use crate::kernels::fa::{FaOpts, flash_attention_with};
+    use svod_tensor::Tensor;
+
+    let (b, n, h, d) = (1usize, 512usize, 8usize, 128usize);
+    let mk = || {
+        let mut t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::BFloat16).expect("cast bf16");
+        t.realize().expect("realize");
+        t
+    };
+    let (q, k, v) = (mk(), mk(), mk());
+
+    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: None })
+        .expect("fa noncausal d128")
+        .expect("FA kernel applies");
+    let mut og_f = og.cast(DType::Float32).expect("og→f32");
+    og_f.realize().expect("realize og");
+    let got: Vec<f32> = og_f.as_vec::<f32>().expect("read og");
+
+    let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("permute");
+    let (qp, kp, vp) = (perm(&q), perm(&k), perm(&v));
+    let ref_bhnd = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(false).call().expect("sdpa");
+    let mut reference = ref_bhnd.try_permute(&[0, 2, 1, 3]).expect("permute back");
+    reference.realize().expect("realize reference");
+    let expected = reference.as_vec::<f32>().expect("read reference");
+
+    assert_eq!(got.len(), expected.len(), "length mismatch");
+    let max_abs = got.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
+    println!("fa[noncausal,bf16] B={b} N={n} H={h} D={d}: max abs error = {max_abs:e}");
+    assert!(max_abs <= 2e-2, "non-causal bf16 d=128 FA exceeds tol (max abs {max_abs:e})");
 }
 
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_noncausal_f16_masked_amd -- --ignored --nocapture`.

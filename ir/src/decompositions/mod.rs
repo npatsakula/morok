@@ -162,8 +162,18 @@ pub fn amd_decomposition_patterns() -> TypedPatternMatcher<()> {
         use svod_dtype::ScalarDType::{Float16, Float32, Float64};
         matches!(d.base(), Float16 | Float32 | Float64)
     }
+    // `exp2` renders natively on amdgcn for **f32** (`@llvm.exp2.f32` → the hardware
+    // `v_exp_f32`; the f64 path is blocked by `guard_unsupported_f64_transcendental`,
+    // so only f64 truly needs the Sleef polynomial). Leaving f32 `exp2` native mirrors
+    // tinygrad's LLVM renderer (native `EXP2` intrinsic, decompose only f64) and avoids
+    // the ~140-`v_cndmask` polynomial on softmax-VALU-bound kernels (flash-attention).
+    // f16 keeps the polynomial (no reliable `@llvm.exp2.f16` lowering). f32-only guard,
+    // so f16/bf16/f64 `exp2` and every other transcendental are unchanged.
+    fn exp2_native(d: &DType) -> bool {
+        matches!(d.base(), svod_dtype::ScalarDType::Float32)
+    }
     patterns! {
-        Exp2(src) if transc(&src.dtype()) ~> |src| xexp2(src),
+        Exp2(src) if transc(&src.dtype()) && !exp2_native(&src.dtype()) ~> |src| xexp2(src),
         Log2(src) if transc(&src.dtype()) ~> |src| xlog2(src),
         Exp(src)  if transc(&src.dtype()) ~> |src| xexp(src),
         Log(src)  if transc(&src.dtype()) ~> |src| xlog(src),
@@ -178,7 +188,7 @@ pub fn amd_decomposition_patterns() -> TypedPatternMatcher<()> {
         // bf16/fp8/int fall back to f32 then cast back (tinygrad's cast arm).
         // Int `Pow` would otherwise hit `@llvm.pow.f64`, which amdgcn can't
         // select; bf16/fp8 transcendentals have no native intrinsic either.
-        Exp2(src) ~> |src| xexp2(&src.cast(DType::Float32)).cast(src.dtype()),
+        Exp2(src) if !exp2_native(&src.dtype()) ~> |src| xexp2(&src.cast(DType::Float32)).cast(src.dtype()),
         Log2(src) ~> |src| xlog2(&src.cast(DType::Float32)).cast(src.dtype()),
         Exp(src)  ~> |src| xexp(&src.cast(DType::Float32)).cast(src.dtype()),
         Log(src)  ~> |src| xlog(&src.cast(DType::Float32)).cast(src.dtype()),

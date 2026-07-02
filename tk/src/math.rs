@@ -155,7 +155,10 @@ impl<'k> Group<'k> {
     }
 
     // ── unary ─────────────────────────────────────────────────────────────────
-    /// `exp2(a)` element-wise.
+    /// `exp2(a)` element-wise. On AMD the f32 `Op::Exp2` renders as the hardware
+    /// `v_exp_f32` (the decomposition pass leaves f32 native — see
+    /// `ir::decompositions::amd_decomposition_patterns`); f16/f64 take the Sleef
+    /// polynomial.
     pub fn exp2<T: RegTile<'k>>(&self, a: T) -> T {
         self.map(a, |x, _| x.try_exp2().expect("tk exp2"))
     }

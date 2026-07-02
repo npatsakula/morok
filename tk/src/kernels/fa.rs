@@ -238,7 +238,10 @@ fn fa_softmax_pv<'k>(
 
     // Online-softmax rescale `exp2(prev_max - new_max)` as a same-shape vec−vec op
     // — reuses `max_vec_last`'s buffer (dead after this), so no scratch `scale_vec`
-    // and no hand-rolled `load_at` merge.
+    // and no hand-rolled `load_at` merge. The f32 `exp2` renders as the hardware
+    // `v_exp_f32` (the AMD decomposition leaves f32 `Op::Exp2` native — see
+    // `ir::decompositions::amd_decomposition_patterns`), not the Sleef polynomial —
+    // the softmax exp is FA's dominant cost (VALU-bound 24:1 vs MFMA).
     let scale_vec = (max_vec_last - &max_vec).exp2();
 
     o_reg = o_reg * &scale_vec;
@@ -366,8 +369,15 @@ pub(crate) fn build_fa_mw_rdb(
     // WMMA input (RDNA); on CDNA the fragments coincide and the relayout is a register copy.
 
     // 2×-size shared K/V LDS double buffers (one `kv_blk_rows × d` block per half).
-    let k_smem = ker.shared_db((kv_blk_rows, d), in_dt.clone(), row);
-    let v_smem = ker.shared_db((kv_blk_rows, d), in_dt.clone(), row);
+    // **Swizzled** (`_sw`): the plain row-major layout aliases every row onto bank 0
+    // (row stride d·2B = 128B = 32 banks), so the collaborative ds_read gathers (esp.
+    // the transposed V read down a column) bank-conflict ~4.2×/LDS-instr — measured
+    // SQ_LDS_BANK_CONFLICT 24.2M, 43% of all wait. The subtile-major XOR swizzle (the
+    // matmul's bank-conflict fix) spreads each row across distinct banks. The tracked
+    // commit/gather both address through `swizzled_st_offset`, so store and load stay
+    // consistent by construction; the parity half-offset is applied post-swizzle.
+    let k_smem = ker.shared_db_sw((kv_blk_rows, d), in_dt.clone(), row);
+    let v_smem = ker.shared_db_sw((kv_blk_rows, d), in_dt.clone(), row);
     let half_k = k_smem.half_elems() as i64;
     let half_v = v_smem.half_elems() as i64;
 
