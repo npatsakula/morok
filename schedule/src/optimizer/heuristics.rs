@@ -750,7 +750,7 @@ fn estimate_total_elements(scheduler: &Scheduler) -> i64 {
 ///
 /// - Only enters the loop when `prod(output_shape[upcastable_dims]) >= 1024`
 /// - Terminates when `upcast_size() >= 32`
-/// - Uses factors `[3, 4]`
+/// - Uses factor `[4]` (pow2 only — see below on the dropped odd factor `3`)
 /// - Ranks by `(num_strides, sum_strides)` ascending (fewest strides = best)
 /// - Excludes axes NOT stride-0 in any buffer (broadcast check)
 pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
@@ -758,6 +758,18 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
 
     let mut applied = false;
     let mut upcasted_axes: Vec<usize> = Vec::new();
+
+    // Pow2-only UPCAST. An odd (>1) contiguous upcast width has no native vector
+    // store (no hardware has an odd sub-word vector op, and the coalescer caps folds
+    // at pow2), so it only ever left a run of scalar stores — which amdgcn (LLVM 18)
+    // re-merges into an `<odd x _>` vector store and mis-selects for sub-32-bit types
+    // (a half `<3 x half>` truncstore mis-lowers to an out-of-bounds global write →
+    // GPU memory fault). Restricting the factor to a power of two keeps the fold a
+    // clean aligned `<N x _>`. This targets the elementwise contiguous-store path (where
+    // the fault manifests); the masked-upcast path (predicated stores over a ragged
+    // boundary dim) and the matmul tensor-core upcast (its own `[5,4,3,2]` MMA factors,
+    // interleaved epilogue layout) are separate paths and keep their odd factors.
+    let upcast_factors: &[usize] = &[4];
 
     loop {
         // While prod(output_shape[upcastable_dims]) >= 1024 and upcast_size() < 32:
@@ -831,7 +843,7 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
                 continue;
             }
 
-            for &upcast_amount in &[3usize, 4] {
+            for &upcast_amount in upcast_factors {
                 let size = if let Op::Range { end, .. } = rng.op()
                     && let Op::Const(cv) = end.op()
                     && let svod_ir::ConstValue::Int(sz) = cv.0
