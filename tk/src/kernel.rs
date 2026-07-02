@@ -36,8 +36,19 @@ pub struct Kernel {
 
     /// Tracked ranges, closed together by [`Kernel::finish`] / [`Kernel::endrange`].
     range_stack: RefCell<Vec<Arc<UOp>>>,
-    /// Terminal `(store, buffer)` pairs, consumed by `finish`/`endrange`.
+    /// Terminal `(store, buffer)` pairs, consumed by `finish`/`endrange`. EVERY
+    /// register-tile finalization (`transpose`/`copy`/`add_rv`/`mma`/`reduce`, via
+    /// `finalize_tile`) pushes here too, not just global stores — so the stack is not
+    /// "the N outputs", it's every intermediate. [`Self::finish`] therefore keys on
+    /// `output_bufs` (below) by buffer identity, not stack position.
     store_stack: RefCell<Vec<(Arc<UOp>, Arc<UOp>)>>,
+    /// The bound OUTPUT global buffers (their pre-store `Param`/`Buffer` uops), recorded by
+    /// [`crate::scaffold`]'s `bind_abi`. [`Self::finish`] selects the SINK roots as the LAST
+    /// store to each of these (by buffer identity) — robust to store-prep (`transpose`/`add_rv`)
+    /// interleaved between the global stores, which would otherwise fall out of a positional
+    /// last-N window and get DCE'd. Empty when a kernel binds globals by raw `gl()` (no
+    /// `bind_abi`); then `finish` falls back to the old positional LIFO pop.
+    output_bufs: RefCell<Vec<Arc<UOp>>>,
 
     /// When set, the register compute primitives ([`crate::Group`]'s
     /// `mma`/`map`/`copy`/`clear`/`transpose`/`reduce`) emit **fully unrolled**
@@ -88,6 +99,7 @@ impl Kernel {
             range_id: Cell::new(0),
             range_stack: RefCell::new(Vec::new()),
             store_stack: RefCell::new(Vec::new()),
+            output_bufs: RefCell::new(Vec::new()),
             unroll: Cell::new(false),
         }
     }
@@ -216,6 +228,13 @@ impl Kernel {
         self.store_stack.borrow_mut().push((store, buf));
     }
 
+    /// Record the bound OUTPUT global buffers (their pre-store uops), so [`Self::finish`] can
+    /// select the SINK roots by buffer identity instead of store-stack position. Called once
+    /// by `bind_abi`.
+    pub(crate) fn record_output_bufs(&self, bufs: impl IntoIterator<Item = Arc<UOp>>) {
+        *self.output_bufs.borrow_mut() = bufs.into_iter().collect();
+    }
+
     /// Close every tracked range and group the last `stores` terminal stores
     /// into the final kernel SINK (carrying `opts_to_apply = Some(vec![])` so
     /// the optimizer leaves this hand-lowered body untouched).
@@ -237,12 +256,37 @@ impl Kernel {
             rngs.len()
         );
 
-        let mut store_uops = Vec::with_capacity(stores);
-        for _ in 0..stores {
-            let (store, _buf) = self.store_stack.borrow_mut().pop().expect("finish: store stack underflow");
-            store_uops.push(store);
-        }
-        store_uops.reverse(); // restore declaration order
+        let outputs = self.output_bufs.borrow();
+        let store_uops: Vec<Arc<UOp>> = if stores > 0 && outputs.len() >= stores {
+            // Robust path: the LAST store recorded to each of the last `stores` bound OUTPUT
+            // buffers, matched by buffer identity — independent of store-stack position. This
+            // is why store-prep (`transpose`/`add_rv`, which also `push_store`) interleaved
+            // between the global stores no longer drops an output (a positional last-N window
+            // would push the earlier output store out and DCE its whole slice). `outputs` is in
+            // declaration order; the last `stores` of them are the finished sinks.
+            let stack = self.store_stack.borrow();
+            outputs[outputs.len() - stores..]
+                .iter()
+                .map(|buf| {
+                    stack
+                        .iter()
+                        .rev()
+                        .find_map(|(store, b)| Arc::ptr_eq(b, buf).then(|| store.clone()))
+                        .unwrap_or_else(|| panic!("finish: no terminal store recorded for a bound output buffer"))
+                })
+                .collect()
+        } else {
+            // Fallback (globals bound by raw `gl()`, no `bind_abi`): pop the last `stores`
+            // positionally — the caller must emit its global stores last (the historical
+            // contract), since without recorded outputs there is nothing to key on.
+            let mut stack = self.store_stack.borrow_mut();
+            let mut v = Vec::with_capacity(stores);
+            for _ in 0..stores {
+                v.push(stack.pop().expect("finish: store stack underflow").0);
+            }
+            v.reverse();
+            v
+        };
 
         // Each terminal store is already an `END(STORE)` / `END(GROUP(STORE..))`
         // closing its own loops (the Group ops self-end so their `After`-rewraps

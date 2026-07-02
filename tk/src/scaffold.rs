@@ -46,8 +46,11 @@ impl Kernel {
     /// hand-written sequence. A conditional/optional buffer binds with a plain
     /// [`Kernel::gl`] *after* this call (trailing-only — never interleaved).
     pub fn bind_abi(&self, outputs: &[GlSpec], inputs: &[GlSpec]) -> (Vec<GL>, Vec<GL>) {
-        let outs = outputs.iter().map(|s| self.gl(&s.shape, s.dtype.clone())).collect();
+        let outs: Vec<GL> = outputs.iter().map(|s| self.gl(&s.shape, s.dtype.clone())).collect();
         let ins = inputs.iter().map(|s| self.gl(&s.shape, s.dtype.clone())).collect();
+        // Record the output buffers so `finish` keys the SINK on buffer identity (robust to
+        // store-prep interleaved between the global stores) rather than store-stack position.
+        self.record_output_bufs(outs.iter().map(|g| g.uop().clone()));
         (outs, ins)
     }
 
