@@ -92,8 +92,9 @@ fn gemm_ready() -> Option<&'static HblShim> {
 const MAX_WS: u64 = 256 * 1024 * 1024; // hipBLASLt heuristic workspace cap
 const WARMUP: c_int = 3;
 // Mirrors TILE in shims/hipblaslt_shim.cpp: the shim tiles output n into ≤2048
-// chunks to dodge the gfx1151 large-N fault, so rows with n above this run tiled
-// and are labelled "vendor_tiled" (not a silent cap).
+// chunks to dodge the large-output GEMM fault (gfx1151 illegal-access AND the
+// MI300X-VF Tensile host-init SIGSEGV), so rows with n above this run tiled and are
+// labelled "vendor_tiled" (not a silent cap).
 const VENDOR_TILE: i64 = 2048;
 
 fn iters_to_c(iters: u64) -> c_int {
@@ -183,7 +184,7 @@ fn bench_kmeans_full(group: &mut BenchmarkGroup<'_, WallTime>, shim: &HblShim, n
     unsafe { (shim.kmeans_destroy)(plan) };
 }
 
-/// Square `C[n,n] = A·Bᵀ` (B in `[N,K]`, the HK contract) — the hipBLASLt floor for
+/// Square `C[n,n] = A·Bᵀ` (B in `[N,K]`, the B[N,K] contract) — the hipBLASLt floor for
 /// `svod_tk::matmul`. `trans_b: 1` makes the vendor compute the identical `A·Bᵀ`.
 fn bench_matmul(c: &mut Criterion) {
     let Some(shim) = gemm_ready() else {
@@ -191,8 +192,12 @@ fn bench_matmul(c: &mut Criterion) {
         return;
     };
     let mut group = c.benchmark_group("matmul");
-    // hipBLASLt shim SIGSEGVs (Tensile host init) past 2048 on this VF — keep the
-    // vendor floor at the runnable sizes; the tk `--bench matmul` covers 4096/8192.
+    // hipBLASLt/Tensile host-init SIGSEGVs past ~2048 on this VF. The shim tiles the
+    // output-n to ≤2048 to dodge it (see `arch_tile_cap`), which rescues knn/kmeans
+    // (their only large dim IS the output n). But a SQUARE matmul is m=n=k: n-tiling
+    // shrinks only the output — m and k stay large and still fault — so the vendor
+    // matmul floor stays capped at the runnable sizes here (full 3D m/n/k tiling would
+    // be needed for 4096/8192). The tk `--bench matmul` covers 4096/8192 natively.
     for &n in &[1024usize, 2048] {
         group.throughput(Throughput::Elements((2.0 * (n as f64).powi(3)) as u64)); // 2·M·N·K
         let i = n as i64;

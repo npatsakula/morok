@@ -20,9 +20,12 @@ use svod_dtype::DType;
 use svod_runtime::{ExecutionPlan, ProfileOptions, RunProfile};
 use svod_tensor::Tensor;
 
-/// A realized random bf16 tensor on the env-selected device.
-pub fn randn_bf16(shape: &[usize]) -> Tensor {
-    let mut t = Tensor::randn(shape).expect("randn").cast(DType::BFloat16).expect("→bf16");
+/// A realized random bf16 tensor on the env-selected device — generated NATIVELY in
+/// bf16 (no f32 round-trip / `cast`), via [`Tensor::rand_with`]. Uniform `[0,1)`; these
+/// are perf benches (device-time timing only), so the distribution is immaterial.
+pub fn rand_bf16(shape: &[usize]) -> Tensor {
+    let dev = svod_dtype::default_device::default_device();
+    let mut t = Tensor::rand_with(shape, DType::BFloat16, dev).expect("rand bf16");
     t.realize().expect("realize");
     t
 }

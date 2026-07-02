@@ -9,7 +9,7 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 mod common;
-use common::{bench_plan, randn_bf16, requirements_met};
+use common::{bench_plan, rand_bf16, requirements_met};
 
 /// Attention as the model runs it: `svod_tk::flash_attention_with` — the exact GigaAM
 /// encoder call (non-causal, `[B, T, H, d_k]` layout, optional key padding; here
@@ -25,7 +25,7 @@ fn bench_fa(c: &mut Criterion) {
     for &n in &[512usize, 1024, 2048] {
         // Non-causal attention FLOPs: QKᵀ + P·V, each 2·B·H·N²·d.
         group.throughput(Throughput::Elements((4.0 * (b * h * d) as f64 * (n as f64).powi(2)) as u64));
-        let (q, k, v) = (randn_bf16(&[b, n, h, d]), randn_bf16(&[b, n, h, d]), randn_bf16(&[b, n, h, d]));
+        let (q, k, v) = (rand_bf16(&[b, n, h, d]), rand_bf16(&[b, n, h, d]), rand_bf16(&[b, n, h, d]));
 
         // The model's exact call: non-causal, no key padding.
         let mut fa = svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens: None })

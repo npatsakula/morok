@@ -8,7 +8,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use svod_dtype::DType;
 
 mod common;
-use common::{bench_plan, randn_bf16, requirements_met};
+use common::{bench_plan, rand_bf16, requirements_met};
 
 /// The svod-tk hand matmul (`svod_tk::matmul`, a graph-native `custom_kernel` node) vs
 /// svod's generic `Tensor::matmul` reference — both timed through `prepare()` →
@@ -23,15 +23,15 @@ fn bench_matmul(c: &mut Criterion) {
     let mut group = c.benchmark_group("matmul");
     for &n in &[1024usize, 2048, 4096, 8192] {
         group.throughput(Throughput::Elements((2.0 * (n as f64).powi(3)) as u64)); // 2·M·N·K
-        let a = randn_bf16(&[n, n]);
-        let b = randn_bf16(&[n, n]);
+        let a = rand_bf16(&[n, n]);
+        let b = rand_bf16(&[n, n]);
 
         let mut y = svod_tk::matmul(&a, &b).expect("tk matmul").expect("matmul kernel applies");
         let plan = y.prepare().expect("prepare matmul");
         group.bench_with_input(BenchmarkId::new("tk", n), &n, |bencher, _| bench_plan(bencher, &plan));
 
         // Reference: svod's generic bf16→f32 GEMM (the matmul a user would write).
-        // `matmul` now follows the HK contract `C = A·Bᵀ` (B in [N,K]), so the generic
+        // `matmul` now follows the B[N,K] contract `C = A·Bᵀ` (B in [N,K]), so the generic
         // reference transposes B too — same op, apples-to-apples throughput.
         let bt = b.try_permute(&[1, 0]).expect("bᵀ");
         let mut reft = a.matmul_with().other(&bt).dtype(DType::Float32).call().expect("ref matmul");

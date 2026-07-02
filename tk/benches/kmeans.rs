@@ -10,7 +10,7 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 mod common;
-use common::{bench_plan, randn_bf16, requirements_met};
+use common::{bench_plan, rand_bf16, requirements_met};
 
 /// The generic-graph **GEMM-argmin** k-means assignment baseline — what you'd
 /// write *without* the fused kernel: materialise the full `[N, K]` squared-L2
@@ -49,8 +49,8 @@ fn bench_kmeans(c: &mut Criterion) {
         group.throughput(Throughput::Elements((2.0 * (n * k * d) as f64) as u64));
 
         if gpu {
-            let xb = randn_bf16(&[n, d]);
-            let cb = randn_bf16(&[k, d]);
+            let xb = rand_bf16(&[n, d]);
+            let cb = rand_bf16(&[k, d]);
 
             // tk: fused running argmin.
             let (_ids, mut dists) =

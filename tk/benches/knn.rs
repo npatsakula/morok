@@ -15,7 +15,7 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 mod common;
-use common::{bench_plan, randn_bf16, requirements_met};
+use common::{bench_plan, rand_bf16, requirements_met};
 
 /// The generic-graph **GEMM-topk** KNN baseline — what you'd write *without* the fused
 /// kernel: materialise the full `[N, M]` squared-L2 distance matrix in HBM
@@ -88,8 +88,8 @@ fn bench_knn(c: &mut Criterion) {
         group.throughput(Throughput::Elements((2.0 * (n * m * d) as f64) as u64));
 
         if gpu {
-            let xb = randn_bf16(&[n, d]);
-            let cb = randn_bf16(&[m, d]);
+            let xb = rand_bf16(&[n, d]);
+            let cb = rand_bf16(&[m, d]);
 
             // tk: fused running top-K. `prepare()`-ing `dists` realises the kernel + the
             // sort/gather tail (the indices are a shared intermediate of the same graph).

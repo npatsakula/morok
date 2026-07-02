@@ -76,14 +76,23 @@ struct GemmPlan {
 inline bool ok(hipblasStatus_t s) { return s == HIPBLAS_STATUS_SUCCESS; }
 inline bool ok(hipError_t s) { return s == hipSuccess; }
 
-// Output-tiling cap for the gfx1151 large-N small-K GEMM fault: 2048 on gfx1151,
-// 0 (no tiling — single GEMM) on every other arch (gfx942/MI300X have no such
-// fault). Cached device-0 arch probe.
+// Output-tiling cap (dodges a large-output GEMM fault by splitting output-n into
+// ≤2048 chunks): 2048 on gfx1151 AND on the MI300X-VF, 0 (no tiling — single GEMM)
+// elsewhere. Two distinct faults, same mitigation:
+//   • gfx1151: hipBLASLt illegal-access on large-N small-K GEMMs.
+//   • MI300X-VF (gfx942, virtualized): hipBLASLt/Tensile host-init SIGSEGVs at
+//     `create` (heuristic get) once any GEMM dim exceeds ~2048 — so knn (M=16384)
+//     and kmeans (K=4096), whose only large dim is the output n, previously
+//     crashed here untiled. Bare-metal MI300X has neither fault → single GEMM (the
+//     truest floor). Detected via the marketing name ("AMD Instinct MI300X VF");
+//     `gcnArchName` is plain "gfx942" for both bare-metal and VF. Cached device-0 probe.
 inline int64_t arch_tile_cap() {
     static const int64_t cap = [] {
         hipDeviceProp_t p{};
         if (hipGetDeviceProperties(&p, 0) != hipSuccess) return int64_t{2048};
-        return std::strncmp(p.gcnArchName, "gfx1151", 7) == 0 ? int64_t{2048} : int64_t{0};
+        const bool gfx1151 = std::strncmp(p.gcnArchName, "gfx1151", 7) == 0;
+        const bool mi300x_vf = std::strstr(p.name, "VF") != nullptr;
+        return (gfx1151 || mi300x_vf) ? int64_t{2048} : int64_t{0};
     }();
     return cap;
 }
