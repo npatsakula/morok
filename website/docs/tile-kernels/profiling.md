@@ -41,7 +41,7 @@ flowchart TD
 | **1 — device time** | per-kernel GPU execution time | GPU-clock dispatch timestamps | yes |
 | **2 — roofline** | derived **GFLOP/s** and **GB/s** | FLOP estimate from the kernel's IR; bytes from the plan's buffers | yes (rates need time) |
 | **3 — static occupancy** | VGPR / SGPR / LDS / scratch usage and VGPR-limited **occupancy %** | decoded from the AMD kernel descriptor | no — pure static decode |
-| **4 — hardware counters (PMC)** | SQ-block counters: busy cycles, waves launched, VALU instructions issued | PM4 perf-counter packets, summed across the compute grid | yes, on a stable GPU |
+| **4 — hardware counters (PMC)** | SQ/GRBM/L2 counters — busy cycles, waves, VALU/SALU, LDS bank conflicts, MFMA-busy, L2 hit/miss — plus derived metrics (MFMA util, bank-conflict rate, achieved clock) | PM4 perf-counter packets (gfx11: on the ring; gfx942: AQL vendor packets, gang-run across XCCs) | yes, on a stable GPU |
 
 A few details worth knowing:
 
@@ -52,10 +52,14 @@ A few details worth knowing:
   an occupancy %. On CDNA3 (wave64) the resources (VGPR/SGPR/LDS/scratch) are still decoded and
   shown, but the occupancy column reads `-` because that geometry is not modeled. Occupancy here is
   the **VGPR-limited** first-order limiter only — LDS and workgroup limits are not folded in.
-- **Tier 4** programs the SQ-block counters via PM4 packets and sums them across the grid. The
-  three implemented counters are `sqbusy` (busy cycles), `waves` (waves launched), and `valu`
-  (VALU instructions issued) — together they answer the ILP/occupancy question that timing alone
-  cannot.
+- **Tier 4** programs the perf counters via PM4 and sums them across the grid (on gfx942, across
+  all XCCs). Availability is per-arch: **gfx11 (RDNA3.5)** exposes three SQ selectors — `sqbusy`,
+  `waves`, `valu`. **gfx942 (CDNA3)** exposes the full set — `sqbusy`, `waves`, `valu`, `salu`,
+  `bankconflict`, `ldsact`, `mfmabusy`, `mfma`, `gui` (GRBM active), `l2hit`, `l2miss` — and the
+  report adds columns *derived* from them, matched to rocprofiler-compute's gfx942 definitions:
+  `bankconf` (conflicts per clean access), `valuutil`, `mfmaduty` (MFMA / SQ-busy), `mfmautil`
+  (clock-normalized MFMA utilization), `sclk` (achieved core clock), and `l2hitpct`. Selecting a
+  counter the running arch does not implement is dropped with a warning, not an error.
 
 The report's columns adapt to what was collected: a Tier-1-only run prints just timing, and the
 GFLOP/s, resource, and counter columns appear only when their tier ran.
@@ -137,7 +141,8 @@ let opts = ProfileOptions {
 | Env var | Effect |
 |---------|--------|
 | `SVOD_PROFILE_ITERS` | replay count for the min-merge (clamped to at least 1) |
-| `SVOD_PMC` | Tier-4 selection: empty or `0` → off; `1` → the default counter set; otherwise a comma-separated token list (`sqbusy`, `waves`, `valu`) |
+| `SVOD_PMC` | Tier-4 selection: empty or `0` → off; `1` → the default counter set; otherwise a comma-separated token list. Tokens: `sqbusy`, `waves`, `valu`, `salu`, `bankconflict`, `ldsact`, `mfmabusy`, `mfma`, `gui`, `l2hit`, `l2miss` (gfx942; gfx11 supports `sqbusy`/`waves`/`valu`) |
+| `SVOD_PMC_FORCE` | `1` bypasses the stable-power-state gate on parts that cannot reach it (e.g. SR-IOV VFs). Event counts stay valid; cycle counters scale with the achieved clock, so read `sclk` and prefer the clock-normalized `mfmautil` (see limitations) |
 
 ```bash
 # Profile with 20 replays and the default hardware counters.
@@ -213,23 +218,30 @@ shows `-`** for those kernels. (GB/s still works, since bytes come from the plan
 IR.) Compute the roofline for hand kernels by hand from the algorithm's known FLOP count and the
 Tier-1 device time.
 
-**Tier 4 needs a stable power state.** The PM4 hardware counters are only meaningful when the GPU
-holds a fixed clock. On the default `auto` power state the profiler does *not* fail — it degrades:
-it reports timing only and prints a one-line note that counters need the `profile_standard` state.
-Put the GPU in that state first (e.g. `amd-smi set -l stable_std`), then re-run with `SVOD_PMC`.
+**Tier 4 wants a stable power state — but can work without one.** Cycle counters (`sqbusy`, `gui`)
+scale with the core clock, so they are most comparable at a fixed clock. On the default `auto`
+state the profiler does *not* fail — it degrades to timing only and notes that counters want the
+`profile_standard` state; put the GPU there first (e.g. `amd-smi set -l stable_std`), then re-run
+with `SVOD_PMC`. On parts that *cannot* pin a pstate (SR-IOV VFs), set `SVOD_PMC_FORCE=1` to collect
+anyway: **event** counts (bank conflicts, waves, MFMA-busy, VALU) are clock-independent and stay
+correct, and `mfmautil` is normalized against the device's peak clock (`MFMA / (F_peak · wall)`) so
+it stays comparable across clocks. The `sclk` column reports the clock the run actually achieved.
 
-**Tier 4 is gfx11 (RDNA3.5) only, and external profilers can't see svod at all.** The PM4 counter
-programming in `device/src/amd/pmc.rs` is keyed to the `GC_11_5_0` register table and exposes just
-three selectors (`sqbusy`, `waves`, `valu`) — there is no MFMA-duty-cycle or LDS-bank-conflict
-counter, and nothing for CDNA3 (gfx942). Reaching for `rocprofv3` / `rocprof-compute` instead does
-**not** work either: svod submits AQL/PM4 to its *own* KFD compute queue (own ring + doorbell),
-bypassing ROCr/HSA, so the rocprofiler-sdk HSA interception captures **zero** dispatches from a svod
-process. To get gfx942 hardware counters (MFMA util, bank conflicts, stall breakdown) for a `tk`
-kernel today, take it out of svod's runtime: dump the kernel IR (`SVOD_DUMP_AMD_IR=<dir>`), compile
-it to a code object with svod's own flags
-(`clang -x ir -c -O2 --target=amdgcn-amd-amdhsa -mcpu=gfx942 -mcumode -nogpulib`, then link with
-`ld.lld -shared`), and `hipModuleLoad` it from a tiny HIP harness — that dispatch *is* ROCr-visible,
-so `rocprofv3 -i counters.txt` profiles the identical machine code.
+**External profilers still can't see svod — but the in-process counters now cover gfx942 too.**
+Both **gfx11** (`GC_11_5_0`, three SQ selectors, PM4 on the ring) and **gfx942** (`GC_9_4_3`, the
+full SQ/GRBM/L2 set + derived metrics) are supported in-process; the gfx942 path submits the perfmon
+PM4 as **AQL vendor packets** bracketing the dispatch, gang-executed across all XCCs, mirroring
+ROCr's aqlprofile — its counts are validated bit-for-bit against `rocprofv3` on the same kernel.
+Reaching for `rocprofv3` / `rocprof-compute` directly still does **not** work: svod submits AQL/PM4
+to its *own* KFD compute queue (own ring + doorbell), bypassing ROCr/HSA, so the rocprofiler-sdk HSA
+interception captures **zero** dispatches from a svod process. That external path is now only an
+*independent cross-check*: dump the kernel IR (`SVOD_DUMP_AMD_IR=<dir>`), compile it to a code object
+with svod's own flags (`clang -x ir -c -O2 --target=amdgcn-amd-amdhsa -mcpu=gfx942 -mcumode
+-nogpulib`, then link with `ld.lld -shared`), and `hipModuleLoad` it from a tiny HIP harness — that
+dispatch *is* ROCr-visible, so `rocprofv3 -i counters.txt` profiles the identical machine code. Note
+that `rocprofv3`'s counter mode serializes each dispatch, padding its active-cycle window ~3× vs
+svod's tight in-process window, so **event** counts match but **cycle**-derived numbers (`gui`,
+`mfmautil`) will differ — svod's is the tighter, truer window.
 :::
 
 ---
@@ -242,6 +254,7 @@ so `rocprofv3 -i counters.txt` profiles the identical machine code.
 | "Is this kernel compute- or bandwidth-bound?" | the Tier-2 GFLOP/s and GB/s columns (graph kernels), or compute the roofline by hand (tk kernels) |
 | "Why is occupancy low — registers or LDS?" | the Tier-3 VGPR/SGPR/LDS/occ% columns (no run needed) |
 | "Is the kernel issuing enough VALU work per busy cycle?" | Tier-4 `SVOD_PMC=1`, on a `profile_standard` GPU |
+| "Is my gfx942 kernel matrix-bound or LDS/softmax-bound?" | Tier-4 on gfx942: `SVOD_PMC=mfmabusy,gui` (→ `mfmautil`) and `SVOD_PMC=bankconflict,ldsact` (→ `bankconf`) — low MFMA util + high conflict rate ⇒ LDS/softmax-bound |
 | "How does this compare to the graph-native baseline over many runs?" | `cargo bench --profile-time` — see [Debugging → Timing on real hardware](./debugging) |
 
 For correctness and structural checks rather than performance, stay in [Debugging](./debugging);
