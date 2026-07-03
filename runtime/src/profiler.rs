@@ -116,6 +116,12 @@ impl KernelProfile {
             _ => self.wall,
         }
     }
+
+    /// Whether [`gpu_or_wall`](Self::gpu_or_wall) returned a device-stamped
+    /// duration (both GPU timestamps present) rather than the host-wall fallback.
+    pub fn is_gpu_stamped(&self) -> bool {
+        self.gpu_start_ns.is_some() && self.gpu_end_ns.is_some()
+    }
 }
 
 /// Which hardware counters to collect during a profiled run.
@@ -382,8 +388,99 @@ struct TableRow {
     bytes: u64,
     resources: Option<KernelResources>,
     counters: BTreeMap<PmcCounter, u64>,
+    /// Device constants for derived-metric normalization (from the CounterSet).
+    derived_ctx: DerivedCtx,
     has_static: bool,
+    /// Whether every dispatch aggregated into this row was GPU-timestamped.
+    gpu_stamped: bool,
 }
+
+/// Device constants needed to normalize cross-block derived metrics (MFMA
+/// utilization divides an SE-summed SQ counter by an XCC-summed GRBM counter).
+/// Carried from [`svod_device::CounterSet`]; `0` means unknown.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DerivedCtx {
+    pub xcc_num: u32,
+    pub device_simds: u32,
+    /// Peak engine clock in MHz (reference `F_peak`); `0` = unknown.
+    pub peak_clk_mhz: u32,
+    /// Total device execution time (seconds) the row's summed counters span —
+    /// used to normalize cycle-count metrics against wall time (clock-invariant).
+    /// `0.0` when no GPU timestamp was captured.
+    pub wall_secs: f64,
+    /// Whether `wall_secs` is a device-stamped duration (vs the host wall-clock
+    /// fallback, which includes submit overhead). Clock-derived metrics
+    /// (`mfmautil`, `sclk`) self-hide unless this is set — a host wall would give
+    /// a meaningless clock.
+    pub gpu_stamped: bool,
+}
+
+/// A derived-metric column: a short header and a ratio computed from a row's raw
+/// counters (+ device constants), or `None` when inputs are absent/insufficient
+/// (so the column self-hides).
+pub(crate) type DerivedFn = fn(&BTreeMap<PmcCounter, u64>, DerivedCtx) -> Option<f64>;
+
+/// `num/den`, present only when both counters were collected and `den > 0`.
+pub(crate) fn cratio(m: &BTreeMap<PmcCounter, u64>, num: PmcCounter, den: PmcCounter) -> Option<f64> {
+    let n = *m.get(&num)?;
+    let d = *m.get(&den)?;
+    (d > 0).then(|| n as f64 / d as f64)
+}
+
+/// Derived hardware-counter metrics, matched to AMD rocprofiler(-compute) gfx942
+/// definitions. Each appears as an adaptive column only when at least one row can
+/// compute it.
+pub(crate) const DERIVED: &[(&str, DerivedFn)] = &[
+    // rocprofiler-compute gfx942: conflicts / (idx_active − conflicts).
+    ("bankconf", |m, _| {
+        let c = *m.get(&PmcCounter::LdsBankConflict)?;
+        let a = *m.get(&PmcCounter::LdsIdxActive)?;
+        a.checked_sub(c).filter(|d| *d > 0).map(|d| c as f64 / d as f64)
+    }),
+    ("valuutil", |m, _| cratio(m, PmcCounter::SqInstsValu, PmcCounter::SqBusyCycles)),
+    // rocprofiler-compute gfx942 MfmaUtil, derived via achieved-clock
+    // normalization so it is comparable across dispatch paths at different core
+    // clocks. rocprofiler defines it as MFMA-busy / (GRBM_GUI_ACTIVE/XCC · CU·4),
+    // but GRBM_GUI_ACTIVE is a *core-clock cycle* counter, so on a variable-clock
+    // part (e.g. gfx942 SR-IOV VF without a pinned pstate) that denominator drifts
+    // with clock. We replace the clocked GUI term with its clock-invariant
+    // identity — active_cycles/XCC at the *peak* clock is `F_peak · wall` — giving
+    // MFMA-busy / (F_peak · wall · device_simds). MFMA-busy is fixed work-cycles
+    // and `wall` is real seconds, so the result is clock-independent. Its absolute
+    // value reflects THIS dispatch's window: svod's tight in-process window
+    // (wall ≈ kernel time) reads higher than a rocprofv3 PMC-mode dispatch, which
+    // serializes/drains and so spans a wider active window — the two won't
+    // cross-match on the same kernel (svod's is the tighter/truer one). For a
+    // cross-tool-robust matrix signal use `mfmaduty`. Self-hides without F_peak, a
+    // captured GPU wall time, or the SIMD count.
+    ("mfmautil", |m, ctx| {
+        let mfma = *m.get(&PmcCounter::ValuMfmaBusyCycles)? as f64;
+        let denom = ctx.peak_clk_mhz as f64 * 1e6 * ctx.wall_secs * ctx.device_simds as f64;
+        (ctx.gpu_stamped && denom > 0.0).then(|| mfma / denom)
+    }),
+    // Achieved core clock in GHz (rocprof "achieved sclk"): active cycles per XCD
+    // over real time, `(GRBM_GUI_ACTIVE / XCC) / wall`. Makes the clock the VF
+    // actually ran at explicit — the correction factor behind `mfmautil` above.
+    ("sclk", |m, ctx| {
+        let gui = *m.get(&PmcCounter::GrbmGuiActive)? as f64;
+        (ctx.gpu_stamped && ctx.xcc_num > 0 && ctx.wall_secs > 0.0)
+            .then(|| gui / ctx.xcc_num as f64 / ctx.wall_secs / 1e9)
+    }),
+    // svod's own matrix-duty metric (kernel_instr.md §1): fraction of SQ-busy
+    // cycles the MFMA pipe was busy. Both operands are per-SIMD SQ counters
+    // validated within ~5% of rocprofv3, GRBM-free and clock-stable — a
+    // cross-check on `mfmautil` that needs no timestamp. NOT rocprofiler's
+    // absolute MfmaUtil (that is `mfmautil`).
+    ("mfmaduty", |m, _| cratio(m, PmcCounter::ValuMfmaBusyCycles, PmcCounter::SqBusyCycles)),
+    // L2 hit rate as a percentage. Named `l2hitpct` so its column header does not
+    // collide with the raw `L2Hit` counter's `l2hit` token.
+    ("l2hitpct", |m, _| {
+        let h = *m.get(&PmcCounter::L2Hit)?;
+        let miss = *m.get(&PmcCounter::L2Miss)?;
+        let d = h + miss;
+        (d > 0).then(|| 100.0 * h as f64 / d as f64)
+    }),
+];
 
 /// Format a roofline rate (GFLOP/s or GB/s) in giga-units/s; `-` when the count
 /// is unknown, zero, or the elapsed time is non-positive.
@@ -409,13 +506,18 @@ fn render_stage_table(s: &StageProfile) -> String {
                 bytes: 0,
                 resources: None,
                 counters: BTreeMap::new(),
+                derived_ctx: DerivedCtx::default(),
                 has_static: false,
+                gpu_stamped: true,
             });
             rows.len() - 1
         });
         let r = &mut rows[i];
         r.count += 1;
         r.total += k.gpu_or_wall();
+        // A row's wall is device-derived only if EVERY dispatch was GPU-stamped;
+        // one host-wall fallback taints the sum for clock derivation.
+        r.gpu_stamped &= k.is_gpu_stamped();
         if let Some(si) = &k.static_info {
             r.has_static = true;
             // Sum flops only while every dispatch had a reliable estimate.
@@ -432,9 +534,28 @@ fn render_stage_table(s: &StageProfile) -> String {
             for (&c, &v) in &cs.values {
                 *r.counters.entry(c).or_insert(0) += v;
             }
+            // Device constants are device-wide (same for every dispatch); adopt
+            // the first non-zero ones seen.
+            if r.derived_ctx.device_simds == 0 {
+                r.derived_ctx = DerivedCtx {
+                    xcc_num: cs.xcc_num,
+                    device_simds: cs.device_simds,
+                    peak_clk_mhz: cs.peak_clk_mhz,
+                    wall_secs: 0.0,
+                    gpu_stamped: false,
+                };
+            }
         }
     }
     rows.sort_by_key(|r| std::cmp::Reverse(r.total));
+    // Wall time the row's summed cycle counters span (device time when the GPU
+    // stamped it, else host-wall fallback). Set before the derived-column filter
+    // so wall-normalized metrics (mfmautil, sclk) can decide whether to appear;
+    // they additionally require `gpu_stamped` so a host wall never derives a clock.
+    for r in &mut rows {
+        r.derived_ctx.wall_secs = r.total.as_secs_f64();
+        r.derived_ctx.gpu_stamped = r.gpu_stamped;
+    }
 
     let any_static = rows.iter().any(|r| r.has_static);
     let any_res = rows.iter().any(|r| r.resources.is_some());
@@ -452,6 +573,13 @@ fn render_stage_table(s: &StageProfile) -> String {
     }
     for c in &counter_cols {
         header.push(c.token().into());
+    }
+    // Derived columns follow the raw counters; keep only those computable for at
+    // least one row (same "appears when data present" contract as the counters).
+    let derived_cols: Vec<&(&str, DerivedFn)> =
+        DERIVED.iter().filter(|(_, f)| rows.iter().any(|r| f(&r.counters, r.derived_ctx).is_some())).collect();
+    for (label, _) in &derived_cols {
+        header.push((*label).into());
     }
 
     let grand: Duration = rows.iter().map(|r| r.total).sum();
@@ -481,6 +609,9 @@ fn render_stage_table(s: &StageProfile) -> String {
         }
         for c in &counter_cols {
             cells.push(r.counters.get(c).map(u64::to_string).unwrap_or_else(|| "-".into()));
+        }
+        for (_, f) in &derived_cols {
+            cells.push(f(&r.counters, r.derived_ctx).map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()));
         }
         body.push(cells);
     }

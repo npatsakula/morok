@@ -7,9 +7,11 @@
 
 use std::collections::BTreeMap;
 
-/// A hardware performance counter selectable via PMC. The current set is the
-/// SQ block (gfx11/RDNA3.5), which answers the ILP/occupancy question: VALU
-/// instructions issued vs SQ-busy cycles, plus waves launched.
+/// A hardware performance counter selectable via PMC. Names are arch-neutral;
+/// each backend maps them to its block/perf-select values. The SQ subset answers
+/// the ILP/occupancy question (VALU vs SQ-busy cycles, waves launched); the
+/// gfx942 (CDNA3) additions cover LDS bank conflicts, MFMA occupancy, and L2
+/// hit/miss so derived-metric rows can be computed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PmcCounter {
     /// Cycles the shader sequencer (SQ) was busy.
@@ -18,6 +20,22 @@ pub enum PmcCounter {
     SqWaves,
     /// VALU instructions issued.
     SqInstsValu,
+    /// SALU instructions issued.
+    SqInstsSalu,
+    /// LDS bank-conflict cycles.
+    LdsBankConflict,
+    /// LDS index-unit active cycles (denominator for the conflict rate).
+    LdsIdxActive,
+    /// GRBM GUI-active cycles (denominator for MFMA utilization).
+    GrbmGuiActive,
+    /// L2 (TCC) cache hits.
+    L2Hit,
+    /// L2 (TCC) cache misses.
+    L2Miss,
+    /// Cycles the VALU was busy issuing MFMA (matrix) instructions.
+    ValuMfmaBusyCycles,
+    /// MFMA (matrix) instructions issued.
+    InstsMfma,
 }
 
 impl PmcCounter {
@@ -27,6 +45,14 @@ impl PmcCounter {
             Self::SqBusyCycles => "sqbusy",
             Self::SqWaves => "waves",
             Self::SqInstsValu => "valu",
+            Self::SqInstsSalu => "salu",
+            Self::LdsBankConflict => "bankconflict",
+            Self::LdsIdxActive => "ldsact",
+            Self::GrbmGuiActive => "gui",
+            Self::L2Hit => "l2hit",
+            Self::L2Miss => "l2miss",
+            Self::ValuMfmaBusyCycles => "mfmabusy",
+            Self::InstsMfma => "mfma",
         }
     }
 
@@ -36,11 +62,21 @@ impl PmcCounter {
             "sqbusy" | "busy" => Self::SqBusyCycles,
             "waves" => Self::SqWaves,
             "valu" => Self::SqInstsValu,
+            "salu" => Self::SqInstsSalu,
+            "bankconflict" => Self::LdsBankConflict,
+            "ldsact" => Self::LdsIdxActive,
+            "gui" => Self::GrbmGuiActive,
+            "l2hit" => Self::L2Hit,
+            "l2miss" => Self::L2Miss,
+            "mfmabusy" => Self::ValuMfmaBusyCycles,
+            "mfma" => Self::InstsMfma,
             _ => return None,
         })
     }
 
-    /// All implemented counters (the default selection).
+    /// The arch-neutral default selection (SQ occupancy triple). Kept small so a
+    /// bare `SVOD_PMC=1` works on every supported arch; the gfx942-only counters
+    /// are opt-in by token.
     pub fn all() -> [PmcCounter; 3] {
         [Self::SqBusyCycles, Self::SqWaves, Self::SqInstsValu]
     }
@@ -51,6 +87,16 @@ impl PmcCounter {
 #[derive(Debug, Clone, Default)]
 pub struct CounterSet {
     pub values: BTreeMap<PmcCounter, u64>,
+    /// Number of XCC compute engines the counters were summed over (0 = unknown).
+    /// Needed to normalize cross-block derived metrics (e.g. MFMA utilization,
+    /// which divides an SE-summed SQ counter by an XCC-summed GRBM counter).
+    pub xcc_num: u32,
+    /// Device-total SIMD lane count (`CU_NUM · SIMDs_per_CU`, 0 = unknown), the
+    /// MFMA-utilization denominator's `CU_NUM · 4` term on gfx9.
+    pub device_simds: u32,
+    /// Peak engine clock in MHz (0 = unknown), the reference `F_peak` for
+    /// achieved-clock (`sclk`) derivation and clock-normalized MFMA utilization.
+    pub peak_clk_mhz: u32,
 }
 
 /// Per-kernel static GPU resource usage, decoded from the compiled program's

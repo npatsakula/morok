@@ -55,7 +55,7 @@ pub const COPY_RING_BYTES: usize = 1024 * 1024;
 /// ring (wait, HDP flush, acquire_mem, the SET_SH_REG stream, DISPATCH_DIRECT,
 /// RELEASE_MEM — a typical dispatch is ~150). Bounds in-flight dispatches so
 /// the host can never lap the ring.
-const MAX_DISPATCH_DWORDS: usize = 1024;
+pub(crate) const MAX_DISPATCH_DWORDS: usize = 1024;
 /// Max un-retired dispatches allowed before back-pressure blocks the host.
 /// Chosen so the combined ring footprint stays at half the ring even in the
 /// worst case (`* MAX_DISPATCH_DWORDS`), leaving generous margin while still
@@ -425,7 +425,10 @@ impl AmdComputeQueue {
     /// path is unsupported anyway. Same logic as `create`'s `is_pm4` decision.
     pub fn will_use_pm4(core: &AmdDeviceCore) -> bool {
         let force_aql = std::env::var("SVOD_AMD_AQL").ok().map(|s| s != "0").unwrap_or(false);
-        !force_aql && core.node.num_xcc.max(1) == 1
+        if force_aql {
+            return false;
+        }
+        core.node.num_xcc.max(1) == 1
     }
 
     pub fn create(allocator: &AmdAllocator) -> Result<Box<Self>> {
@@ -746,6 +749,39 @@ impl AmdComputeQueue {
         } else {
             self.submit_aql(&[kd, bar])
         }
+    }
+
+    /// Dispatch a kernel bracketed by Tier-4 PMC perf-counter PM4, submitted the
+    /// way ROCr/aqlprofile does: the perfmon start/read streams ride as AQL
+    /// vendor PM4-IB packets around the kernel dispatch on this AQL queue, so the
+    /// perfmon IB is **gang-executed by every XCC's CP** (the broadcast SQ
+    /// programming reaches all XCCs and the read's per-XCC `PRED_EXEC` lands each
+    /// XCC's counters in distinct offsets — which the raw forced-PM4 ring could
+    /// not do). Order, in ONE atomic ring write + doorbell:
+    /// `vendor_ib(start) → kernel dispatch(completion=0) → vendor_ib(read) →
+    /// barrier_and(completion)`. The kernel packet MUST have `completion_signal =
+    /// 0` (the trailing `barrier_and` carries completion, gating on retirement
+    /// across all XCCs — the multi-XCC completion path). AQL queues only.
+    pub fn dispatch_aql_with_pmc(
+        &self,
+        pmc_start_ib_gpu: u64,
+        pmc_start_dwords: u32,
+        packet: &hsa_kernel_dispatch_packet_t,
+        pmc_read_ib_gpu: u64,
+        pmc_read_dwords: u32,
+        completion: u64,
+    ) -> Result<()> {
+        debug_assert!(!self.is_pm4, "dispatch_aql_with_pmc on PM4 queue");
+        // SAFETY: `hsa_kernel_dispatch_packet_t` is `#[repr(C)]`, exactly 64 bytes
+        // (= 16 dwords); reinterpret as the dword array `submit_aql` takes.
+        let mut kd = [0u32; 16];
+        unsafe { std::ptr::copy_nonoverlapping(packet as *const _ as *const u32, kd.as_mut_ptr(), 16) };
+        self.submit_aql(&[
+            build_aql_vendor_ib_packet(pmc_start_ib_gpu, pmc_start_dwords),
+            kd,
+            build_aql_vendor_ib_packet(pmc_read_ib_gpu, pmc_read_dwords),
+            build_barrier_and(completion),
+        ])
     }
 
     /// Patch the AQL `amd_queue_t` scratch descriptor in the GART page. The AQL

@@ -8,6 +8,7 @@
 
 #![cfg(unix)]
 
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use object::elf::{ELFCLASS64, ELFDATA2LSB, EM_AMDGPU};
@@ -574,7 +575,89 @@ impl std::fmt::Debug for AmdProgram {
     }
 }
 
+/// Per-dispatch PMC state shared by the PM4 and AQL dispatch arms: the
+/// arch-filtered counter list, the readback buffer + host pointer, and the built
+/// start/read PM4 streams. Produced by [`AmdProgram::build_pmc`]; `None` there
+/// means no counters collect for this dispatch (not profiling, PMC unsupported
+/// on this exact GPU, gfx9-on-PM4, or the requested set filtered empty).
+struct PmcSetup {
+    counters: Vec<crate::profile::PmcCounter>,
+    layout: crate::amd::pmc::PmcLayout,
+    rb: RawBuffer,
+    rb_host: NonNull<u8>,
+    start: Vec<u32>,
+    read: Vec<u32>,
+}
+
+/// The AQL vendor PM4-IB buffers wrapping a [`PmcSetup`]'s start/read streams,
+/// plus their GPU addresses and dword counts. Kept alive in the returned
+/// [`crate::amd::pmc::PmcHandle`] (the CP walks them while the dispatch is in
+/// flight). Named fields replace a positional tuple to avoid rebind hazards.
+struct AqlPmcIbs {
+    start_ib: RawBuffer,
+    start_gpu: u64,
+    start_dw: u32,
+    read_ib: RawBuffer,
+    read_gpu: u64,
+    read_dw: u32,
+}
+
 impl AmdProgram {
+    /// Build the per-dispatch [`PmcSetup`] for this dispatch, or `None` when no
+    /// counters collect. Shared by both dispatch arms so the arch gate, counter
+    /// filtering, readback alloc, and stream build live in ONE place.
+    ///
+    /// - `aql`: `true` for the multi-XCC AQL vendor-IB path (streams self-flush;
+    ///   gfx9 SQ PMC is permitted). `false` for the single-XCC PM4-ring path,
+    ///   where gfx9 SQ counters read zero on the raw ring, so gfx9 PMC is refused
+    ///   (returns `None`) rather than emitting silently-zero streams.
+    /// - `stream_ts`: `(start, end)` timestamp addresses to bracket the kernel
+    ///   with `release_mem` probes INSIDE the streams (AQL). `None` on PM4, where
+    ///   `dispatch_pm4` emits the probes itself (passing it here would double-stamp).
+    fn build_pmc(
+        &self,
+        owner: &crate::amd::connector::OwnerCtx,
+        profile: bool,
+        aql: bool,
+        stream_ts: Option<(u64, u64)>,
+    ) -> Result<Option<PmcSetup>> {
+        if !profile || !crate::amd::pmc::pmc_supported(self.dev.arch) {
+            return Ok(None);
+        }
+        let Some(arch) = crate::amd::pmc::PmcArch::for_arch(self.dev.arch) else {
+            return Ok(None);
+        };
+        // gfx9 (CDNA) SQ counters read 0 on the raw single-XCC PM4 ring — they
+        // only latch via the multi-XCC AQL vendor-IB gang path. Never emit
+        // zero-reading SQ streams on PM4; gfx942 is always multi-XCC (AQL) so
+        // this only guards a misrouted config.
+        if arch.is_gfx9() && !aql {
+            return Ok(None);
+        }
+        // Filter the requested counters to the arch's supported set — user
+        // `SVOD_PMC=…` may name counters undefined on this arch (e.g. an L2 or
+        // MFMA counter on gfx11). Drop-and-warn instead of panicking downstream.
+        let (counters, dropped): (Vec<_>, Vec<_>) = owner.pmc_counters().into_iter().partition(|&c| arch.supports(c));
+        if !dropped.is_empty() {
+            let names: Vec<&str> = dropped.iter().map(|c| c.token()).collect();
+            debug!("PMC: dropping counters unsupported on {}: {:?}", self.dev.arch.mcpu(), names);
+        }
+        if counters.is_empty() {
+            return Ok(None);
+        }
+        let grid = crate::amd::pmc::PmcGrid::from_node(&self.dev.node, &arch);
+        let layout = crate::amd::pmc::PmcLayout::plan(&arch, &counters, &grid);
+        let rb = crate::amd::AmdAllocator::new(self.device_id)?.alloc_uncached(layout.total_bytes.max(64))?;
+        let (rb_gpu, rb_host) = match &rb {
+            RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
+            _ => return Err(Error::Runtime { message: "PMC readback buffer not host-visible".into() }),
+        };
+        // AQL streams self-flush (no external completion flush); PM4 streams ride
+        // the ring and rely on the dispatch's completion `release_mem`.
+        let (start, read) = crate::amd::pmc::build_streams(&arch, &counters, &grid, &layout, rb_gpu, stream_ts, aql);
+        Ok(Some(PmcSetup { counters, layout, rb, rb_host, start, read }))
+    }
+
     /// Owner-scoped dispatch entry point. Reads queue / kernarg arena / scratch
     /// / PM4 counter from the owner's shared `PoolQueue`. Holds the queue's
     /// dispatch lock across the WHOLE op (kernarg bump + write + dispatch) so on
@@ -732,24 +815,30 @@ impl AmdProgram {
                 None
             };
             let ts_addrs = ts.as_ref().map(|s| (s.start_ts_addr(), s.end_ts_addr()));
-            // PMC: when counters are armed (gfx11 only) on a profiling dispatch,
-            // allocate a host-visible GTT readback buffer and build the PM4
-            // program/read streams that bracket the dispatch.
-            let pmc_counters = if profile && self.target_major == 11 { owner.pmc_counters() } else { Vec::new() };
-            let pmc = if pmc_counters.is_empty() {
-                None
-            } else {
-                let grid = crate::amd::pmc::PmcGrid::from_node(&self.dev.node);
-                let bytes = crate::amd::pmc::readback_bytes(pmc_counters.len(), &grid);
-                let buf = crate::amd::AmdAllocator::new(self.device_id)?.alloc_uncached(bytes.max(64))?;
-                let (gpu, host) = match &buf {
-                    crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-                    _ => return Err(Error::Runtime { message: "PMC readback buffer not host-visible".into() }),
-                };
-                let (start, read) = crate::amd::pmc::build_streams(&pmc_counters, &grid, gpu);
-                Some((buf, host, grid, start, read))
-            };
-            let (pmc_start, pmc_read): (&[u32], &[u32]) = pmc.as_ref().map_or((&[], &[]), |(_, _, _, s, r)| (s, r));
+            // PMC: build the readback buffer + start/read streams (gfx11 only on
+            // this raw PM4 ring — gfx9 SQ is routed to AQL by `build_pmc`). The
+            // streams carry NO timestamp probes: `dispatch_pm4` emits its own
+            // `release_mem` ts probes from `ts_addrs` (passing them into the
+            // streams too would double-stamp).
+            let pmc = self.build_pmc(owner, profile, /*aql=*/ false, /*stream_ts=*/ None)?;
+            // Ring-budget guard: the PM4-inlined PMC stream + the dispatch's own
+            // exec/barrier/ts packets must fit one ring dispatch. A `debug_assert`
+            // in `push_pm4` compiles out in release, so enforce it here as a hard
+            // error rather than risk ring corruption on a pathological topology.
+            if let Some(p) = &pmc {
+                const PM4_DISPATCH_OVERHEAD_DWORDS: usize = 128;
+                let inlined = p.start.len() + p.read.len();
+                if inlined + PM4_DISPATCH_OVERHEAD_DWORDS > crate::amd::queue::MAX_DISPATCH_DWORDS {
+                    return Err(Error::Runtime {
+                        message: format!(
+                            "PMC PM4 stream ({inlined} dwords + overhead) exceeds ring per-dispatch budget ({}); \
+                             reduce the counter set",
+                            crate::amd::queue::MAX_DISPATCH_DWORDS,
+                        ),
+                    });
+                }
+            }
+            let (pmc_start, pmc_read): (&[u32], &[u32]) = pmc.as_ref().map_or((&[], &[]), |p| (&p.start, &p.read));
             let v = queue.dispatch_pm4(
                 pool,
                 self.rsrc1,
@@ -777,22 +866,69 @@ impl AmdProgram {
             // Build the returned handle: a PMC handle (timestamps + counters) when
             // counters were collected, else the bare timestamp signal.
             let handle: Option<Arc<dyn crate::sync::DispatchTimestamps>> = match (ts, pmc) {
-                (Some(sig), Some((buf, host, grid, _, _))) => {
-                    Some(Arc::new(crate::amd::pmc::PmcHandle::new(sig, buf, host, pmc_counters, grid.instances())))
-                }
+                (Some(sig), Some(p)) => Some(Arc::new(
+                    crate::amd::pmc::PmcHandle::new(sig, p.rb, p.rb_host, p.counters, p.layout).with_device(
+                        self.dev.node.num_xcc,
+                        self.dev.node.simd_count,
+                        self.dev.node.max_engine_clk_fcompute,
+                    ),
+                )),
                 (Some(sig), None) => Some(sig),
                 (None, _) => None,
             };
             Ok(handle)
         } else {
-            // AQL path: completion via the kernel packet's own native
-            // `completion_signal` (the packet processor decrements the countdown
-            // signal on retirement). The dispatch-header BARRIER bit serialises
-            // execution against the prior packet, and its system-scope
-            // acquire/release fences provide coherence on the in-order queue.
+            // AQL path: completion via a trailing signal (native `completion_signal`
+            // for a plain dispatch; a `barrier_and` on the PMC path). The
+            // dispatch-header BARRIER bit serialises execution against the prior
+            // packet, and its system-scope acquire/release fences provide coherence.
             let priv_seg = self.kd.private_segment_fixed_size;
             let group_seg = self.kd.group_segment_fixed_size;
             let sig = pool.acquire_signal()?;
+
+            // PMC timestamp signal: on the PMC path the kernel's `completion_signal`
+            // MUST stay 0 (`dispatch_aql_with_pmc`'s multi-XCC precondition — a
+            // per-kernel completion strand hazards the gang run and its EOP release
+            // fence would land inside the perfmon window). So kernel time instead
+            // comes from `release_mem` timestamp probes the vendor IBs write into
+            // THIS signal's ts fields (bracketing the kernel, flush-free so the
+            // counts are untouched). `arm(0)`: is_done immediately, ts zeroed.
+            let ts = if profile && crate::amd::pmc::pmc_supported(self.dev.arch) {
+                let s = pool.acquire_signal()?;
+                s.arm(0);
+                Some(s)
+            } else {
+                None
+            };
+            let ts_addrs = ts.as_ref().map(|s| (s.start_ts_addr(), s.end_ts_addr()));
+
+            // Tier-4 PMC (gfx9, multi-XCC): the perfmon start/read PM4 rides as AQL
+            // vendor PM4-IB packets around the dispatch, gang-executed by every
+            // XCC's CP. The vendor packets appear ONLY on a profiling run with
+            // counters armed. The `ts_addrs` inject the kernel-bracketing probes.
+            let pmc = self.build_pmc(owner, profile, /*aql=*/ true, ts_addrs)?;
+            let pmc_ibs = match &pmc {
+                Some(p) => {
+                    let alloc = crate::amd::AmdAllocator::new(self.device_id)?;
+                    let (start_ib, start_gpu) = alloc_pm4_ib(&alloc, &p.start)?;
+                    let (read_ib, read_gpu) = alloc_pm4_ib(&alloc, &p.read)?;
+                    Some(AqlPmcIbs {
+                        start_ib,
+                        start_gpu,
+                        start_dw: p.start.len() as u32,
+                        read_ib,
+                        read_gpu,
+                        read_dw: p.read.len() as u32,
+                    })
+                }
+                None => None,
+            };
+
+            // On the PMC path the kernel carries NO completion signal — the trailing
+            // `barrier_and` (`sig`) is the harvest gate; kernel time comes from the
+            // vendor-IB `release_mem` probes (into `ts`). Off the PMC path the kernel
+            // completes into `sig` and the CP auto-stamps it.
+            let completion_signal = if pmc.is_some() { 0 } else { sig.signal_handle() };
             let packet = build_dispatch_packet(
                 [l[0] as u16, l[1] as u16, l[2] as u16],
                 [(g[0] * l[0]) as u32, (g[1] * l[1]) as u32, (g[2] * l[2]) as u32],
@@ -800,14 +936,55 @@ impl AmdProgram {
                 group_seg,
                 self.aql_prog_addr,
                 kernarg_gpu,
-                /*completion_signal=*/ sig.signal_handle(),
+                completion_signal,
             );
-            queue.dispatch_aql_native(&packet)?;
+            match &pmc_ibs {
+                Some(ib) => queue.dispatch_aql_with_pmc(
+                    ib.start_gpu,
+                    ib.start_dw,
+                    &packet,
+                    ib.read_gpu,
+                    ib.read_dw,
+                    sig.signal_handle(),
+                )?,
+                None => queue.dispatch_aql_native(&packet)?,
+            }
             pool.register_inflight(Arc::clone(&sig));
             owner.set_newest(Arc::clone(&sig));
+
+            // Build the returned handle NOW (before the wait) so an error path can
+            // leak it wholesale: it owns every GPU-visible allocation the CP may
+            // still touch (readback buffer, vendor IBs, ts signal).
+            let handle: Option<Arc<dyn crate::sync::DispatchTimestamps>> = match (pmc, pmc_ibs) {
+                (Some(p), Some(ib)) => {
+                    // Kernel time comes from `ts` (the vendor-IB release_mem probes),
+                    // NOT `sig` (the barrier_and gate, whose stamp is the barrier's
+                    // own window).
+                    let ts = ts.expect("PMC path acquires ts above");
+                    Some(Arc::new(
+                        crate::amd::pmc::PmcHandle::new(ts, p.rb, p.rb_host, p.counters, p.layout)
+                            .with_device(
+                                self.dev.node.num_xcc,
+                                self.dev.node.simd_count,
+                                self.dev.node.max_engine_clk_fcompute,
+                            )
+                            .keep_alive(vec![ib.start_ib, ib.read_ib]),
+                    ))
+                }
+                _ => Some(Arc::clone(&sig) as Arc<dyn crate::sync::DispatchTimestamps>),
+            };
+
             // Release the dispatch lock before the blocking wait (see PM4 arm).
             drop(_disp);
             if wait && let Err(e) = sig.wait_done(30_000) {
+                // Timeout/halt ⇒ the queue is stranded and the CP may still walk
+                // the PMC vendor IBs / readback buffer and write the ts signal.
+                // Leak the handle so none of those GPU-owned allocations are freed
+                // out from under the CP (UAF); the device is poisoned/unrecoverable
+                // anyway. `sig` survives via the pool's in-flight FIFO clone.
+                if let Some(h) = handle {
+                    std::mem::forget(h);
+                }
                 // If the CP halted the queue on an exception (e.g. 0x401
                 // insufficient-scratch), surface that code instead of a blind
                 // timeout.
@@ -822,9 +999,25 @@ impl AmdProgram {
                 }
                 return Err(e);
             }
-            Ok(Some(sig as Arc<dyn crate::sync::DispatchTimestamps>))
+            Ok(handle)
         }
     }
+}
+
+/// Allocate a CP-readable, page-rounded uncached GTT buffer holding a PM4 dword
+/// stream (for an AQL vendor PM4-IB packet), returning `(buffer, gpu_addr)`. The
+/// buffer must outlive the dispatch (the CP walks it in flight), so the caller
+/// keeps it in the [`crate::amd::pmc::PmcHandle`].
+fn alloc_pm4_ib(alloc: &crate::amd::AmdAllocator, dwords: &[u32]) -> Result<(crate::allocator::RawBuffer, u64)> {
+    let bytes = (dwords.len() * 4).max(16).next_multiple_of(0x1000);
+    let buf = alloc.alloc_uncached(bytes)?;
+    let (gpu, host) = match &buf {
+        crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
+        _ => return Err(Error::Runtime { message: "PMC vendor-IB buffer not host-visible".into() }),
+    };
+    // SAFETY: `host` owns `bytes` >= dwords.len()*4; sole writer before submit.
+    unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr() as *const u8, host.as_ptr(), dwords.len() * 4) };
+    Ok((buf, gpu))
 }
 
 impl Program for AmdProgram {

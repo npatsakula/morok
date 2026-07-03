@@ -1,11 +1,12 @@
 //! Unit tests for the profiler data model, table rendering (GPU-free), and
 //! [`RunProfile::merge`] accumulation semantics.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use svod_device::PmcCounter;
 
-use crate::profiler::{PmcSelection, ProfileOptions, RunProfile, StageProfile, parse_pmc};
+use crate::profiler::{DERIVED, DerivedCtx, PmcSelection, ProfileOptions, RunProfile, StageProfile, cratio, parse_pmc};
 
 #[test]
 fn pmc_counter_token_roundtrip() {
@@ -42,6 +43,58 @@ fn profile_options_default() {
     assert_eq!(o.iters, 1);
     assert!(o.static_analysis);
     assert_eq!(o.counters, PmcSelection::None);
+}
+
+#[test]
+fn cratio_requires_both_inputs_and_nonzero_denominator() {
+    let mut m = BTreeMap::new();
+    // Denominator absent → None.
+    assert_eq!(cratio(&m, PmcCounter::SqInstsValu, PmcCounter::SqBusyCycles), None);
+    m.insert(PmcCounter::SqBusyCycles, 0);
+    // Numerator absent → None even with denominator present.
+    assert_eq!(cratio(&m, PmcCounter::SqInstsValu, PmcCounter::SqBusyCycles), None);
+    m.insert(PmcCounter::SqInstsValu, 50);
+    // Zero denominator → None (no divide-by-zero).
+    assert_eq!(cratio(&m, PmcCounter::SqInstsValu, PmcCounter::SqBusyCycles), None);
+    m.insert(PmcCounter::SqBusyCycles, 200);
+    assert_eq!(cratio(&m, PmcCounter::SqInstsValu, PmcCounter::SqBusyCycles), Some(0.25));
+}
+
+#[test]
+fn derived_metric_formulas() {
+    let lookup = |label: &str| DERIVED.iter().find(|(l, _)| *l == label).map(|(_, f)| *f).expect("derived col");
+    let ctx = DerivedCtx { xcc_num: 8, device_simds: 1216, peak_clk_mhz: 2100, wall_secs: 1e-6, gpu_stamped: true };
+    let mut m = BTreeMap::new();
+    m.insert(PmcCounter::LdsBankConflict, 3);
+    m.insert(PmcCounter::LdsIdxActive, 12);
+    m.insert(PmcCounter::ValuMfmaBusyCycles, 40);
+    m.insert(PmcCounter::SqBusyCycles, 80);
+    m.insert(PmcCounter::GrbmGuiActive, 100);
+    m.insert(PmcCounter::L2Hit, 30);
+    m.insert(PmcCounter::L2Miss, 10);
+    // rocprofiler bank-conflict rate: conflicts / (idx_active − conflicts) = 3/(12−3).
+    assert_eq!(lookup("bankconf")(&m, ctx), Some(3.0 / 9.0));
+    // MfmaUtil via achieved-clock normalization: mfma / (F_peak · wall · simds).
+    assert_eq!(lookup("mfmautil")(&m, ctx), Some(40.0 / (2100e6 * 1e-6 * 1216.0)));
+    // Achieved sclk (GHz): (gui / xcc) / wall / 1e9 = (100/8)/1e-6/1e9.
+    assert_eq!(lookup("sclk")(&m, ctx), Some(100.0 / 8.0 / 1e-6 / 1e9));
+    // svod matrix-duty (GRBM-free): mfma-busy / sq-busy = 40/80.
+    assert_eq!(lookup("mfmaduty")(&m, ctx), Some(0.5));
+    // L2 hit percentage: 100·30/(30+10). Column named `l2hitpct` (no `l2hit` clash).
+    assert_eq!(lookup("l2hitpct")(&m, ctx), Some(75.0));
+    // valuutil self-hides when its SQ inputs are absent.
+    assert_eq!(lookup("valuutil")(&m, ctx), None);
+    // mfmautil self-hides without F_peak / wall time (can't normalize).
+    assert_eq!(lookup("mfmautil")(&m, DerivedCtx::default()), None);
+    // mfmautil / sclk self-hide when the wall is host-derived (not GPU-stamped) —
+    // a host wall (submit overhead) would yield a meaningless clock.
+    assert_eq!(lookup("mfmautil")(&m, DerivedCtx { gpu_stamped: false, ..ctx }), None);
+    assert_eq!(lookup("sclk")(&m, DerivedCtx { gpu_stamped: false, ..ctx }), None);
+    // sclk self-hides without a captured wall time.
+    assert_eq!(lookup("sclk")(&m, DerivedCtx { wall_secs: 0.0, ..ctx }), None);
+    // L2 hit rate self-hides when a side is missing.
+    m.remove(&PmcCounter::L2Miss);
+    assert_eq!(lookup("l2hitpct")(&m, ctx), None);
 }
 
 #[test]

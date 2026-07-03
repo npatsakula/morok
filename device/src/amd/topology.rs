@@ -41,6 +41,10 @@ pub struct AmdNode {
     pub wave_front_size: u32,
     /// Number of XCC compute engines. Defaults to 1 when the field is absent.
     pub num_xcc: u32,
+    /// Peak engine (compute) clock in MHz, from KFD's `max_engine_clk_fcompute`
+    /// (0 when absent). Used as the reference `F_peak` for achieved-clock (`sclk`)
+    /// derivation and clock-normalized MFMA utilization on variable-clock parts.
+    pub max_engine_clk_fcompute: u32,
     /// Maximum number of independent compute queues KFD will give us on this
     /// device. Defaults to 8 when the field is absent.
     pub num_cp_queues: u32,
@@ -113,6 +117,7 @@ pub fn enumerate() -> Vec<AmdNode> {
             lds_size_in_kb: map.get("lds_size_in_kb").copied().unwrap_or(0) as u32,
             wave_front_size: map.get("wave_front_size").copied().unwrap_or(0) as u32,
             num_xcc: map.get("num_xcc").copied().unwrap_or(1) as u32,
+            max_engine_clk_fcompute: map.get("max_engine_clk_fcompute").copied().unwrap_or(0) as u32,
             num_cp_queues: map.get("num_cp_queues").copied().unwrap_or(8) as u32,
             // KFD exposes `max_slots_scratch_cu` directly on some kernels;
             // fall back to simd_per_cu * max_waves_per_simd (the natural
