@@ -29,7 +29,7 @@ pub use build::{Builder, Elem, F32};
 pub use error::{Error, Result};
 pub use graph::graph_kernel;
 pub use ir::{Node, TileId, TileIr};
-pub use kernels::{Program, elementwise_add, lds_roundtrip, matmul, sum_reduce};
+pub use kernels::{Program, elementwise_add, lds_roundtrip, matmul, matmul_lds, sum_reduce};
 pub use pass::{Band, Fold, Pass, Pipeline, Strategy};
 pub use passes::{ConstFoldPass, UnrollPass, optimize_addressing};
 

@@ -140,6 +140,10 @@ CK makes the softmax-P → PV-A relayout **free** on gfx942 by dispatching QK wi
 
 **The one abstraction to steal (CK):** LDS layout as a **composable coordinate-transform descriptor** consulted by BOTH the store loop and the `ds_read` loop (so they can never disagree), with the invariant that the innermost KPack (vector) dim stays `pass_through`. This is precisely §2.4; build the swizzle as a transform value, not copy-loop arithmetic.
 
+### Step 1a shipped: LDS-staged single-accumulator matmul (device-verified; the reuse lesson, quantified)
+
+`matmul_lds` (kernels.rs) — one 16×16 output tile per WG, but A[16,K] and B[K,16] staged into LDS **once** before the K-loop (single fill barrier, NO per-K-step refill ⇒ NO single-buffer WAR), K-loop reads fragments from LDS, single f32 accumulator. **Bit-exact on gfx942 at 32/64/128 (`max_abs_err=0`)** — isolates and proves the LDS-in-matmul machinery (fill loops + barrier + LDS fragment gather + carry) apart from the multi-accumulator/WAR complexity of 1b. Two separate single-store fill loops avoid the multi-store-per-END issue; `barrier` wraps an `End` passthrough (tk-legal). **Harness result (the point): it is NOT a perf path — n=256 ~15% slower than rolled (LDS overhead, zero reuse); n=512 ~20× slower (K=512 ⇒ 32 KB LDS ⇒ occupancy 1).** Staging the full K-strip for ONE output tile is pathological — it confirms empirically that **the stage must be amortised over a big tile (reuse), which is exactly step 1b**: stage K_STEP (≈64, small LDS) and reuse it across a BM×BN accumulator grid. 1a is the correctness stone that de-risks the machinery; 1b is where the win is. (Kept in the bench only at n=256 as the correctness gate + that datapoint.)
+
 ---
 
 ## 6. Cross-cutting: registers, ownership, the AGPR gap

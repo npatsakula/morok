@@ -5,7 +5,7 @@ use svod_dtype::DType;
 use svod_ir::Op;
 
 use crate::ir::{Node, RegClass, Residency, TileIr};
-use crate::kernels::{elementwise_add, lds_roundtrip, matmul, sum_reduce};
+use crate::kernels::{elementwise_add, lds_roundtrip, matmul, matmul_lds, sum_reduce};
 use crate::lower;
 
 // ── the ADT: interning, disambiguators, residency/reg-class fields ───────────
@@ -93,6 +93,24 @@ fn matmul_carries_wmma_and_loop_edges() {
     assert!(topo.iter().any(|u| matches!(u.op(), Op::After { .. })), "loop-carry needs After edges");
     assert!(topo.iter().any(|u| matches!(u.op(), Op::Range { .. })), "the K reduction needs a RANGE");
     assert!(topo.iter().any(|u| matches!(u.op(), Op::End { .. })), "the K RANGE must be closed by an END");
+}
+
+#[test]
+fn matmul_lds_lowering_is_spec_valid() {
+    // The LDS-staged matmul: fill loops + a fill barrier + K-loop fragment gathers
+    // from LDS + the single-accumulator carry must lower to spec-valid UOp.
+    let p = matmul_lds(32, 32, 32);
+    lower::verify(&p).expect("LDS-staged matmul must lower to spec-valid UOp");
+}
+
+#[test]
+fn matmul_lds_carries_lds_barrier_and_wmma() {
+    let p = matmul_lds(32, 32, 32);
+    let sink = lower::lower(&p.ir, p.sink, &p.name);
+    let topo = sink.toposort();
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))), "staged matmul needs LDS buffers");
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "the fill needs a barrier before the gathers");
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "matmul needs a WMMA");
 }
 
 #[test]
