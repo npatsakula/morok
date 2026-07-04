@@ -38,7 +38,7 @@ pub enum Swizzle {
 /// must be a 1/2/4-byte type (bf16/f16/f32 in practice). An 8-byte element
 /// (f64/i64) panics; this is a kernel-authoring precondition, the USE-face
 /// kernels only allocate bf16/f32 LDS tiles.
-fn swizzle_bytes(cols: usize, itemsize: i64) -> i64 {
+pub(crate) fn swizzle_bytes(cols: usize, itemsize: i64) -> i64 {
     let uw = cols / 16; // underlying width in 16-col tiles
     match itemsize {
         1 | 2 => {
@@ -138,12 +138,22 @@ impl Swizzle {
             return row.mul(&subtile_u).add(&col.xor(&delta));
         }
         // General (multi-subtile) layout: `addr = (col/subtile)*rows*subtile +
-        // row*subtile + col%subtile` (st.cuh:101). XOR its byte address per
-        // st.cuh:103 and divide back to elements (the delta is a multiple of
-        // `itemsize`, so the element-space XOR equals the byte-space one).
+        // row*subtile + col%subtile` (st.cuh:101), then the bank XOR. Written in the
+        // ADDITIVE form `outer*rows*subtile + row*subtile + (col%subtile ^ delta)` —
+        // mathematically identical to `full_addr ^ delta` (proof: `delta = (row%16)*…`
+        // because `outer*rows*subtile*itemsize` is a multiple of `repeat` when `rows%16==0`,
+        // so it drops from the `%repeat` in `delta`; and `delta < subtile` with
+        // `col%subtile < subtile`, so `col%subtile ^ delta` cannot carry into the
+        // `row*subtile`/`outer` terms). The additive form keeps the `outer`/`row`
+        // (fragment-step) terms OUTSIDE the XOR, so LLVM can fold a compile-time
+        // fragment offset into the `ds_read offset:` immediate — the whole-address
+        // `addr ^ delta` form (below, pre-fix) buried the fragment step inside the XOR,
+        // which is nonlinear w.r.t. addition, defeating the fold.
         let outer = col.idiv(&subtile_u);
-        let addr = outer.mul(&cidx(rows as i64 * subtile)).add(&row.mul(&subtile_u)).add(&col.mod_(&subtile_u));
-        let sw_bytes = addr.mul(&cidx(itemsize)).mod_(&cidx(repeat)).shr(&cidx(7)).shl(&cidx(3));
-        addr.xor(&sw_bytes.idiv(&cidx(itemsize)))
+        let col_in = col.mod_(&subtile_u);
+        let r16 = row.mod_(&cidx(16));
+        let dbytes = r16.mul(&cidx(subtile * itemsize)).mod_(&cidx(repeat)).shr(&cidx(7)).shl(&cidx(3));
+        let delta = dbytes.idiv(&cidx(itemsize));
+        outer.mul(&cidx(rows as i64 * subtile)).add(&row.mul(&subtile_u)).add(&col_in.xor(&delta))
     }
 }

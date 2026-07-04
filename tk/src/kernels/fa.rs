@@ -54,6 +54,19 @@ fn iconst(v: i64) -> Arc<UOp> {
     UOp::const_(DType::Index, ConstValue::Int(v))
 }
 
+/// Whether the production FA entries emit the fully-unrolled body for head-dim `d`.
+///
+/// Unrolling makes the per-fragment LDS-gather step a *compile-time constant*, which
+/// is the prerequisite for LLVM to fold the swizzled fragment offset into the
+/// `ds_read … offset:` immediate (see [`crate::swizzle::Swizzle::tile_offset`]'s
+/// additive form). That fold only exists for the *general multi-subtile* LDS layout
+/// (`d ≥ 128`): there it clears the address-recompute spill and cuts the vendor-shape
+/// d128 kernel ~21%. At `d = 64` the swizzle is single-subtile (already fold-friendly)
+/// so unrolling is perf-neutral and only costs code size — hence the rolled default.
+fn fa_unroll(d: usize) -> bool {
+    d >= 128
+}
+
 /// The GPU arch(es) the **production graph** flash-attention ([`flash_attention_with`]
 /// → [`build_fa_mw_rdb`]) is built for: gfx942 (CDNA MFMA, wave64) and gfx1151
 /// (RDNA3.5 WMMA, wave32). The rolled double-buffer builder arch-selects the WMMA
@@ -564,7 +577,7 @@ pub fn flash_attention_forward_mw_rdb(o: &mut Tensor, q: &Tensor, k: &Tensor, v:
             h,
             h_kv,
             d,
-            FaConfig { q_blk, kv_blk, ..Default::default() },
+            FaConfig { q_blk, kv_blk, unroll: fa_unroll(d), ..Default::default() },
             in_dtype.clone(),
             false,
         );
@@ -714,7 +727,7 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
                     h,
                     h_kv,
                     d,
-                    FaConfig { q_blk, kv_blk, causal, ..Default::default() },
+                    FaConfig { q_blk, kv_blk, causal, unroll: fa_unroll(d) },
                     build_dtype.clone(),
                     masked,
                 );
