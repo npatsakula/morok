@@ -80,6 +80,14 @@ impl RenderContext {
         }
 
         let name = match uop.op() {
+            // A vector-dtyped scalar `Const` renders as a splatted vector literal
+            // `<T v, …>`, not the bare `v` (`<N x T> -1` is invalid LLVM). Splat at
+            // the render layer (as tinygrad's `pm_render` does) so const-folding
+            // upstream still matches a plain `Const`.
+            Op::Const(cv) if uop.dtype().vcount() > 1 => {
+                let splat = vec![cv.0; uop.dtype().vcount()];
+                self.render_vconst(&splat, uop)
+            }
             Op::Const(cv) => lconst(&cv.0, &uop.dtype()),
             Op::VConst { values } => self.render_vconst(values, uop),
             Op::Param { slot, device: None, .. } => format!("%data{slot}"),
