@@ -5,7 +5,9 @@ use svod_dtype::DType;
 use svod_ir::Op;
 
 use crate::ir::{Node, RegClass, Residency, TileIr};
-use crate::kernels::{elementwise_add, lds_roundtrip, matmul, matmul_lds, matmul_lds_tiled, sum_reduce};
+use crate::kernels::{
+    elementwise_add, lds_roundtrip, matmul, matmul_lds, matmul_lds_kblock, matmul_lds_tiled, sum_reduce,
+};
 use crate::lower;
 
 // ── the ADT: interning, disambiguators, residency/reg-class fields ───────────
@@ -93,6 +95,25 @@ fn matmul_carries_wmma_and_loop_edges() {
     assert!(topo.iter().any(|u| matches!(u.op(), Op::After { .. })), "loop-carry needs After edges");
     assert!(topo.iter().any(|u| matches!(u.op(), Op::Range { .. })), "the K reduction needs a RANGE");
     assert!(topo.iter().any(|u| matches!(u.op(), Op::End { .. })), "the K RANGE must be closed by an END");
+}
+
+#[test]
+fn matmul_lds_kblock_lowering_is_spec_valid() {
+    // The K-blocked kernel: per-K-block fill + TWO barriers (RAW + WAR) + the reused
+    // 2×2 accumulator grid, all inside one K-loop, must lower to spec-valid UOp.
+    let p = matmul_lds_kblock(64, 64, 64, 32, 32);
+    lower::verify(&p).expect("K-blocked LDS matmul must lower to spec-valid UOp");
+}
+
+#[test]
+fn matmul_lds_kblock_carries_two_barriers_per_kstep() {
+    // Structural: the single-buffer WAR needs a RAW fence (after fill) AND a WAR fence
+    // (after the LDS reads) — at least two Barriers in the K-loop body.
+    let p = matmul_lds_kblock(32, 32, 16, 32, 32);
+    let sink = lower::lower(&p.ir, p.sink, &p.name);
+    let topo = sink.toposort();
+    let bars = topo.iter().filter(|u| matches!(u.op(), Op::Barrier { .. })).count();
+    assert!(bars >= 2, "single-buffer K-blocking needs RAW + WAR barriers, got {bars}");
 }
 
 #[test]

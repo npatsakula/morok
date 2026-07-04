@@ -295,6 +295,44 @@ fn fill_lds(
     b.end(st, &[fr])
 }
 
+/// Unrolled collaborative global→LDS fill (NO inner range — usable inside the K-loop
+/// without a loop nest): each lane writes `epl` elements `flat = lane·epl + e`, mapping
+/// LDS position `flat` to global `(tile_row_base + flat/cols_lds)·grow_stride +
+/// tile_col_base + flat%cols_lds`. `tile_col_base`/`tile_row_base` may be per-K-block
+/// (carry the loop counter) so the strip is re-staged each iteration. Returns the `epl`
+/// store effects to fence with a barrier.
+#[allow(clippy::too_many_arguments)]
+fn fill_lds_unrolled(
+    b: &mut Builder,
+    lds: Lds<BF16>,
+    src: Buf<BF16>,
+    epl: usize,
+    lane: Idx,
+    cols_lds: i64,
+    tile_row_base: Idx,
+    tile_col_base: Idx,
+    grow_stride: i64,
+) -> Vec<Effect> {
+    let epl_c = b.idx_const(epl as i64);
+    let lane_epl = b.idx_mul(lane, epl_c);
+    let cols_c = b.idx_const(cols_lds);
+    let gstride = b.idx_const(grow_stride);
+    (0..epl)
+        .map(|e| {
+            let ec = b.idx_const(e as i64);
+            let flat = b.idx_add(lane_epl, ec);
+            let r = b.idx_div(flat, cols_c);
+            let c = b.idx_mod(flat, cols_c);
+            let grow = b.idx_add(tile_row_base, r);
+            let goff = b.idx_mul(grow, gstride);
+            let goff = b.idx_add(goff, tile_col_base);
+            let goff = b.idx_add(goff, c);
+            let v = b.load(src, goff);
+            b.store_lds(lds, flat, v)
+        })
+        .collect()
+}
+
 /// Gather one 16×16 bf16 fragment from an already-staged LDS tile `lds` into `dst`,
 /// ordered after the fill `bar` (the cross-lane LDS read edge). Same
 /// `base + row·stride + col` addressing as [`gather_frag`], but reading LDS not global.
@@ -527,4 +565,136 @@ pub fn matmul_lds_tiled(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> P
 
     let (ir, sink) = b.finish(&roots);
     Program { ir, sink, name: "tk2_matmul_tiled".into() }
+}
+
+/// **K-blocked, LDS-staged, block-tiled** matmul (DESIGN.md §5b step 1b-ii — the
+/// occupancy win). Like [`matmul_lds_tiled`] (bm×bn tile, `(bm/16)×(bn/16)` reused
+/// accumulators) but the A/B strips are re-staged **per K-fragment inside the K-loop**
+/// (K_STEP = 16) instead of the whole K at once — so the LDS footprint is a tiny
+/// `(bm·16 + 16·bn)·2` bytes **independent of K** (bm=bn=64 ⇒ 4 KB ⇒ ~16 resident
+/// workgroups), keeping occupancy high at any K. This is the fix for 1b-i's occupancy
+/// collapse. The single LDS buffer is reused every iteration, so each K-block needs two
+/// workgroup barriers (mirroring tk's `gemm_core`): a **RAW** fence after the fill (reads
+/// see the staged data) and a **WAR** fence after the LDS reads (the next fill must not
+/// overwrite until every lane finished reading). The WAR fence is routed into the
+/// accumulator reads so it is scoped inside the K-loop. `m/n` multiples of `bm/bn`;
+/// `bm/bn/k` multiples of 16.
+#[allow(clippy::needless_range_loop)]
+pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
+    assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
+    assert!(m.is_multiple_of(bm) && n.is_multiple_of(bn), "m/n must tile by bm/bn");
+    let mut b = Builder::new("tk2_matmul_kblock");
+
+    let c = b.global::<F32>(m * n);
+    let a = b.global::<BF16>(m * k);
+    let bmat = b.global::<BF16>(k * n);
+
+    let tile_m = b.grid_axis(0, (m / bm) as i64);
+    let tile_n = b.grid_axis(1, (n / bn) as i64);
+    let lane = b.block_axis(WARP as i64);
+
+    let a_map = FragMap::gfx942_16x16(false);
+    let bc_map = FragMap::gfx942_16x16(true);
+    let ept = a_map.ept;
+    let (ri, cj) = (bm / EDGE, bn / EDGE);
+
+    // Single-buffered K_STEP=16 strips: A[bm,16], B[16,bn]. Footprint independent of K.
+    let a_smem = b.define_local::<BF16>(bm * EDGE);
+    let b_smem = b.define_local::<BF16>(EDGE * bn);
+    let epl_a = bm * EDGE / WARP;
+    let epl_b = EDGE * bn / WARP;
+
+    let bm_c = b.idx_const(bm as i64);
+    let bn_c = b.idx_const(bn as i64);
+    let tm_bm = b.idx_mul(tile_m, bm_c); // A row base (rows): tile_m·bm
+    let tn_bn = b.idx_mul(tile_n, bn_c); // B col base (cols): tile_n·bn
+
+    // ── accumulators: one 16×16 f32 fragment per (i,j), zero-initialised. ──
+    let acc: Vec<Frag<F32>> = (0..ri * cj).map(|_| b.define_frag::<F32>(bc_map)).collect();
+    let inited: Vec<Effect> = acc
+        .iter()
+        .map(|&ac| {
+            let init_r = b.range(ept as i64);
+            let init_c = b.counter(init_r);
+            let zf = b.f32(0.0);
+            let s = b.store_frag_elem(ac, init_c, zf);
+            b.end(s, &[init_r])
+        })
+        .collect();
+
+    // ── K-loop over K/16 fragments; re-stage the strips each iteration. ──
+    let kr = b.range((k / EDGE) as i64);
+    let tk = b.counter(kr);
+    let e16 = b.idx_const(EDGE as i64);
+    let tk16 = b.idx_mul(tk, e16); // K-block column/row base: tk·16
+
+    // Fill A[bm,16] (K-col base tk·16, stride K) and B[16,bn] (K-row base tk·16, stride N).
+    let mut fill_stores: Vec<TileId> = Vec::with_capacity(epl_a + epl_b);
+    let fa = fill_lds_unrolled(&mut b, a_smem, a, epl_a, lane, EDGE as i64, tm_bm, tk16, k as i64);
+    let fb = fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, lane, bn as i64, tk16, tn_bn, n as i64);
+    let fill_head = fa[0];
+    fill_stores.extend(fa.iter().skip(1).chain(fb.iter()).map(|e| e.dep()));
+    // RAW fence: the whole strip is staged before any lane gathers a fragment.
+    let fill_bar = b.barrier(fill_head, &fill_stores);
+
+    // ── read the reused fragments from LDS (after the RAW fence). ──
+    let a_frags: Vec<Frag<BF16>> = (0..ri).map(|_| b.define_frag::<BF16>(a_map)).collect();
+    let b_frags: Vec<Frag<BF16>> = (0..cj).map(|_| b.define_frag::<BF16>(bc_map)).collect();
+    let mut gathers: Vec<TileId> = Vec::new();
+    let a_vecs: Vec<Val<BF16>> = (0..ri)
+        .map(|i| {
+            let base = b.idx_const((i * EDGE * EDGE) as i64); // A-frag i: a_smem row-block i (stride 16)
+            let st = gather_frag_lds(&mut b, a_frags[i], a_smem, base, EDGE as i64, lane, fill_bar);
+            gathers.extend(st.iter().copied());
+            b.load_frag_vec_after(a_frags[i], &st)
+        })
+        .collect();
+    let b_vecs: Vec<Val<BF16>> = (0..cj)
+        .map(|j| {
+            let base = b.idx_const((j * EDGE) as i64); // B-frag j: b_smem col-block j (stride bn)
+            let st = gather_frag_lds(&mut b, b_frags[j], b_smem, base, bn as i64, lane, fill_bar);
+            gathers.extend(st.iter().copied());
+            b.load_frag_vec_after(b_frags[j], &st)
+        })
+        .collect();
+
+    // WAR fence: every lane finished reading LDS before the next K-block's fill.
+    let war_head = Effect(gathers[0]);
+    let war_bar = b.barrier(war_head, &gathers[1..]);
+
+    // ── one MFMA per accumulator; the acc read routes through the WAR fence (scoping it
+    //    inside the K-loop) plus its init + range loop-carry edges. ──
+    let mut stores: Vec<Effect> = Vec::with_capacity(ri * cj);
+    for i in 0..ri {
+        for j in 0..cj {
+            let idx = i * cj + j;
+            let acc_read = b.load_frag_vec_after(acc[idx], &[inited[idx].dep(), kr.dep(), war_bar.dep()]);
+            let out = b.mma(a_vecs[i], b_vecs[j], acc_read, ept);
+            stores.push(b.store_frag_vec(acc[idx], out));
+        }
+    }
+    let last = *stores.last().expect("at least one accumulator");
+    let others: Vec<TileId> = stores[..stores.len() - 1].iter().map(|e| e.dep()).collect();
+    let combined = b.combine(last, &others);
+    let ended = b.end(combined, &[kr]);
+
+    // ── post-loop: each accumulator reads its final value, scatters to C. ──
+    let n_c = b.idx_const(n as i64);
+    let mut roots = Vec::new();
+    for i in 0..ri {
+        for j in 0..cj {
+            let idx = i * cj + j;
+            let acc_final = b.frag_after(acc[idx], &[ended.dep()]);
+            let i16 = b.idx_const((i * EDGE) as i64);
+            let row = b.idx_add(tm_bm, i16);
+            let row_n = b.idx_mul(row, n_c);
+            let j16 = b.idx_const((j * EDGE) as i64);
+            let col = b.idx_add(tn_bn, j16);
+            let base_c = b.idx_add(row_n, col);
+            roots.extend(scatter_frag(&mut b, acc_final, c, base_c, n as i64, lane));
+        }
+    }
+
+    let (ir, sink) = b.finish(&roots);
+    Program { ir, sink, name: "tk2_matmul_kblock".into() }
 }
