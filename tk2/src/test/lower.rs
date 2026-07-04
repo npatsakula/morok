@@ -5,7 +5,7 @@ use svod_dtype::DType;
 use svod_ir::Op;
 
 use crate::ir::{Node, RegClass, Residency, TileIr};
-use crate::kernels::{elementwise_add, lds_roundtrip, matmul, matmul_lds, sum_reduce};
+use crate::kernels::{elementwise_add, lds_roundtrip, matmul, matmul_lds, matmul_lds_tiled, sum_reduce};
 use crate::lower;
 
 // ── the ADT: interning, disambiguators, residency/reg-class fields ───────────
@@ -93,6 +93,25 @@ fn matmul_carries_wmma_and_loop_edges() {
     assert!(topo.iter().any(|u| matches!(u.op(), Op::After { .. })), "loop-carry needs After edges");
     assert!(topo.iter().any(|u| matches!(u.op(), Op::Range { .. })), "the K reduction needs a RANGE");
     assert!(topo.iter().any(|u| matches!(u.op(), Op::End { .. })), "the K RANGE must be closed by an END");
+}
+
+#[test]
+fn matmul_lds_tiled_lowering_is_spec_valid() {
+    // The multi-accumulator reuse kernel: a 2×2 fragment grid (4 loop-carried
+    // accumulators closed by ONE End via combine) + LDS staging must lower spec-valid.
+    let p = matmul_lds_tiled(64, 64, 32, 32, 32);
+    lower::verify(&p).expect("block-tiled LDS matmul must lower to spec-valid UOp");
+}
+
+#[test]
+fn matmul_lds_tiled_carries_four_wmma() {
+    // Structural: a 32×32 tile = 4 accumulators ⇒ 4 WMMAs per K-step, one Barrier.
+    let p = matmul_lds_tiled(32, 32, 16, 32, 32);
+    let sink = lower::lower(&p.ir, p.sink, &p.name);
+    let topo = sink.toposort();
+    let wmmas = topo.iter().filter(|u| matches!(u.op(), Op::Wmma { .. })).count();
+    assert_eq!(wmmas, 4, "a 2×2 fragment grid over a single K-fragment needs 4 WMMAs, got {wmmas}");
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "the fill needs a barrier");
 }
 
 #[test]

@@ -19,7 +19,7 @@ use svod_tensor::testing::allclose_f32;
 mod common;
 use common::{bench_plan, rand_bf16, requirements_met};
 
-use svod_tk2::{Program, graph_kernel, matmul, matmul_lds, optimize_addressing};
+use svod_tk2::{Program, graph_kernel, matmul, matmul_lds_tiled, optimize_addressing};
 
 /// f32 ground truth `A·B` over the SAME bf16-rounded operands (both kernel and
 /// reference see the realized bf16 values cast up to f32).
@@ -77,17 +77,22 @@ fn bench_matmul(c: &mut Criterion) {
         assert_correct(&y1, &p1, &expected, n, "unroll+fold");
         group.bench_with_input(BenchmarkId::new("unroll+fold", n), &n, |bch, _| bench_plan(bch, &p1));
 
-        // LDS-staged, single accumulator (step 1a): one 16×16 output tile per WG with
-        // the A/B strips staged through LDS. It stages the FULL K-strip once for a
-        // SINGLE output tile — zero reuse — so it is only a *correctness* stone, never a
-        // perf path: at n=256 it costs ~15% over rolled (LDS overhead, no benefit), and
-        // at larger K it degrades pathologically (K=512 ⇒ 32 KB LDS ⇒ occupancy 1 ⇒
-        // ~20× slower). Run only at n=256 as the device correctness gate + that datapoint;
-        // the actual LDS win needs the bigger tile that AMORTISES the stage (step 1b).
+        // LDS-staged, block-tiled REUSE (step 1b-i): a bm×bn output tile per WG staging
+        // A[bm,K]+B[K,bn] once and reusing each fragment across the tile. Device-correct,
+        // but the harness shows it LOSES to naive here (64×64: 32µs, 32×32: 28µs vs 17.8µs)
+        // — a big tile at n=256 yields only (256/bm)² workgroups (16 for 64×64!), so the GPU
+        // is grid-starved and the full-K stage forces low occupancy (64/32 KB LDS). Reuse
+        // alone is not the win: it needs K-blocking (small per-WG LDS ⇒ high occupancy) AND
+        // large n (enough tiles to fill 304 CUs) — step 1b-ii. Kept as the correctness gate
+        // + that occupancy datapoint. Stages the full K-strip, so K=n bounded: 2·(bm+bn)·K ≤ 64 KB.
         if n == 256 {
-            let (y2, p2) = plan_of(matmul_lds(n, n, n), n, n, &a, &b);
-            assert_correct(&y2, &p2, &expected, n, "lds-staged");
-            group.bench_with_input(BenchmarkId::new("lds-staged", n), &n, |bch, _| bench_plan(bch, &p2));
+            for (bm, bn) in [(64usize, 64usize), (32, 32)] {
+                let (yt, pt) = plan_of(matmul_lds_tiled(n, n, n, bm, bn), n, n, &a, &b);
+                assert_correct(&yt, &pt, &expected, n, "tiled");
+                group.bench_with_input(BenchmarkId::new(format!("tiled{bm}x{bn}"), n), &n, |bch, _| {
+                    bench_plan(bch, &pt)
+                });
+            }
         }
     }
     group.finish();

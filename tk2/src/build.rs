@@ -397,6 +397,18 @@ impl Builder {
         Effect(self.ir.intern(Node::End { body: e.0, ranges }))
     }
 
+    /// Combine effects: route store `e` through completion of `deps` (other stores),
+    /// yielding ONE effect ordered after all of them. This is how a loop carrying
+    /// MULTIPLE accumulators closes its single `End`: a RANGE admits one END, so the
+    /// other accumulators' stores are folded in here as a shared input (they stay
+    /// in-loop — each already depends on the range — and survive DCE), and the MMAs are
+    /// NOT serialized against each other (only this combine waits for all). The tk
+    /// `endrange_to` obligation, expressed as an ordering edge instead of acc-read
+    /// chaining. Every accumulator then reads its final value post-loop via `.after([end])`.
+    pub fn combine(&mut self, e: Effect, deps: &[TileId]) -> Effect {
+        Effect(self.after_buf(e.0, deps))
+    }
+
     /// A register handle re-bound to observe `deps` (the post-loop carried read:
     /// `reg.after([end])`). Returns a fresh [`Reg`] over the ordering-wrapped buffer.
     pub fn reg_after<E: Elem>(&mut self, reg: Reg<E>, deps: &[TileId]) -> Reg<E> {

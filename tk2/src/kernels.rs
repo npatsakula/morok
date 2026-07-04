@@ -10,7 +10,7 @@
 //!   post-loop read through `reg.after([end])`, the exact edges whose omission is a
 //!   silent miscompile (mirrors `tk/src/group/reduce.rs`).
 
-use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds};
+use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId, TileIr};
 
 /// A finished tile-IR program: the arena, its sink root, and the kernel name.
@@ -402,4 +402,129 @@ pub fn matmul_lds(m: usize, n: usize, k: usize) -> Program {
 
     let (ir, sink) = b.finish(&roots);
     Program { ir, sink, name: "tk2_matmul_lds".into() }
+}
+
+/// **LDS-staged, block-tiled** matmul (DESIGN.md §5b step 1b, the reuse lever): one
+/// `bm × bn` output tile per workgroup (one 64-lane warp), computing an `(bm/16) ×
+/// (bn/16)` grid of 16×16 accumulator fragments. A[bm,K] and B[K,bn] are staged into
+/// LDS **once** (single fill barrier, no per-K-step refill ⇒ no WAR — K bounded by LDS),
+/// then per K-fragment the warp gathers `bm/16` A-fragments and `bn/16` B-fragments from
+/// LDS and issues `(bm/16)·(bn/16)` MFMAs — **each staged A-fragment is reused across all
+/// `bn/16` columns, each B-fragment across all `bm/16` rows** (the reuse the naive/1a
+/// kernels lack). The K-loop carries all `(bm/16)·(bn/16)` accumulators; its single `End`
+/// closes around them via [`Builder::combine`] (one END per RANGE). Multi-accumulator +
+/// reuse in isolation from the K-blocking WAR (that is step 1b-ii). `m/n` multiples of
+/// `bm/bn`; `bm/bn/k` multiples of 16; `(bm·K + K·bn)·2 ≤ 64 KB`.
+// The fragment-grid loops index `a_vecs[i]`/`b_vecs[j]` while also needing `i`/`j` for the
+// accumulator index and the C tile origin, so a range loop is clearer than a zip.
+#[allow(clippy::needless_range_loop)]
+pub fn matmul_lds_tiled(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
+    assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
+    assert!(m.is_multiple_of(bm) && n.is_multiple_of(bn), "m/n must tile by bm/bn");
+    assert!(2 * (bm * k + k * bn) <= 64 * 1024, "staged A+B strips ({bm}×{k} + {k}×{bn} bf16) exceed 64 KB LDS");
+    let mut b = Builder::new("tk2_matmul_tiled");
+
+    let c = b.global::<F32>(m * n);
+    let a = b.global::<BF16>(m * k);
+    let bmat = b.global::<BF16>(k * n);
+
+    let tile_m = b.grid_axis(0, (m / bm) as i64);
+    let tile_n = b.grid_axis(1, (n / bn) as i64);
+    let lane = b.block_axis(WARP as i64);
+
+    let a_map = FragMap::gfx942_16x16(false);
+    let bc_map = FragMap::gfx942_16x16(true);
+    let ept = a_map.ept;
+    let (ri, cj) = (bm / EDGE, bn / EDGE); // fragment-grid rows / cols
+
+    // ── stage the full A[bm,K] and B[K,bn] tile-strips into LDS (once). ──
+    let lds_a = b.define_local::<BF16>(bm * k);
+    let lds_b = b.define_local::<BF16>(k * bn);
+    let zero = b.idx_const(0);
+    let bm_c = b.idx_const(bm as i64);
+    let bn_c = b.idx_const(bn as i64);
+    let tm_bm = b.idx_mul(tile_m, bm_c); // A row base (rows): tile_m·bm
+    let tn_bn = b.idx_mul(tile_n, bn_c); // B col base (cols): tile_n·bn
+    let fa = fill_lds(&mut b, lds_a, a, (bm * k / WARP) as i64, lane, k as i64, tm_bm, zero, k as i64);
+    let fb = fill_lds(&mut b, lds_b, bmat, (k * bn / WARP) as i64, lane, bn as i64, zero, tn_bn, n as i64);
+    let bar = b.barrier(fa, &[fb.dep()]);
+
+    // ── accumulators: one 16×16 f32 fragment per (i,j), each zero-initialised. ──
+    let acc: Vec<Frag<F32>> = (0..ri * cj).map(|_| b.define_frag::<F32>(bc_map)).collect();
+    let inited: Vec<Effect> = acc
+        .iter()
+        .map(|&ac| {
+            let init_r = b.range(ept as i64);
+            let init_c = b.counter(init_r);
+            let zf = b.f32(0.0);
+            let s = b.store_frag_elem(ac, init_c, zf);
+            b.end(s, &[init_r])
+        })
+        .collect();
+
+    // ── K-loop: gather A/B fragments from LDS (reused), one MFMA per (i,j,k-frag). ──
+    let kr = b.range((k / EDGE) as i64);
+    let tk = b.counter(kr);
+    let e16 = b.idx_const(EDGE as i64);
+    let e16bn = b.idx_const((EDGE * bn) as i64);
+    let tk16 = b.idx_mul(tk, e16); // A-frag K-column base: tk·16 (stride K)
+    let tk16bn = b.idx_mul(tk, e16bn); // B-frag K-row base: tk·16·bn (stride bn)
+
+    // A-fragment i: LDS base i·16·K + tk·16, row stride K — reused across all columns j.
+    let a_frags: Vec<Frag<BF16>> = (0..ri).map(|_| b.define_frag::<BF16>(a_map)).collect();
+    let a_vecs: Vec<Val<BF16>> = (0..ri)
+        .map(|i| {
+            let row_off = b.idx_const((i * EDGE * k) as i64);
+            let base = b.idx_add(row_off, tk16);
+            let st = gather_frag_lds(&mut b, a_frags[i], lds_a, base, k as i64, lane, bar);
+            b.load_frag_vec_after(a_frags[i], &st)
+        })
+        .collect();
+    // B-fragment j: LDS base tk·16·bn + j·16, row stride bn — reused across all rows i.
+    let b_frags: Vec<Frag<BF16>> = (0..cj).map(|_| b.define_frag::<BF16>(bc_map)).collect();
+    let b_vecs: Vec<Val<BF16>> = (0..cj)
+        .map(|j| {
+            let col_off = b.idx_const((j * EDGE) as i64);
+            let base = b.idx_add(tk16bn, col_off);
+            let st = gather_frag_lds(&mut b, b_frags[j], lds_b, base, bn as i64, lane, bar);
+            b.load_frag_vec_after(b_frags[j], &st)
+        })
+        .collect();
+
+    // One MFMA per accumulator; collect the stores to close the loop around all of them.
+    let mut stores: Vec<Effect> = Vec::with_capacity(ri * cj);
+    for i in 0..ri {
+        for j in 0..cj {
+            let idx = i * cj + j;
+            let acc_read = b.load_frag_vec_after(acc[idx], &[inited[idx].dep(), kr.dep()]);
+            let out = b.mma(a_vecs[i], b_vecs[j], acc_read, ept);
+            stores.push(b.store_frag_vec(acc[idx], out));
+        }
+    }
+    // One END per RANGE: combine the accumulators' stores into the last, close around it.
+    let last = *stores.last().expect("at least one accumulator");
+    let others: Vec<TileId> = stores[..stores.len() - 1].iter().map(|e| e.dep()).collect();
+    let combined = b.combine(last, &others);
+    let ended = b.end(combined, &[kr]);
+
+    // ── post-loop: each accumulator reads its final value after the loop, scatters to C. ──
+    let n_c = b.idx_const(n as i64);
+    let mut roots = Vec::new();
+    for i in 0..ri {
+        for j in 0..cj {
+            let idx = i * cj + j;
+            let acc_final = b.frag_after(acc[idx], &[ended.dep()]);
+            // base_c = (tile_m·bm + i·16)·N + tile_n·bn + j·16
+            let i16 = b.idx_const((i * EDGE) as i64);
+            let row = b.idx_add(tm_bm, i16);
+            let row_n = b.idx_mul(row, n_c);
+            let j16 = b.idx_const((j * EDGE) as i64);
+            let col = b.idx_add(tn_bn, j16);
+            let base_c = b.idx_add(row_n, col);
+            roots.extend(scatter_frag(&mut b, acc_final, c, base_c, n as i64, lane));
+        }
+    }
+
+    let (ir, sink) = b.finish(&roots);
+    Program { ir, sink, name: "tk2_matmul_tiled".into() }
 }
