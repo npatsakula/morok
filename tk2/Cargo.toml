@@ -1,0 +1,19 @@
+[package]
+name = "svod-tk2"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "From-scratch Rust tile-IR DSL: interned tile-IR, verified lowering, strategy-combinator pass runner (Step 1 skeleton)"
+
+[dependencies]
+svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.3" }
+svod-ir = { path = "../ir", version = "=0.1.0-alpha.3" }
+svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.3" }
+svod-codegen = { path = "../codegen", version = "=0.1.0-alpha.3" }
+svod-device = { path = "../device", version = "=0.1.0-alpha.3" }
+svod-runtime = { path = "../runtime", version = "=0.1.0-alpha.3" }
+svod-tensor = { path = "../tensor", version = "=0.1.0-alpha.3" }
+smallvec = { workspace = true }
+snafu = "0.8.9"

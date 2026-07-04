@@ -3733,6 +3733,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "svod-tk2"
+version = "0.1.0-alpha.3"
+dependencies = [
+ "smallvec",
+ "snafu 0.8.9",
+ "svod-codegen",
+ "svod-device",
+ "svod-dtype",
+ "svod-ir",
+ "svod-runtime",
+ "svod-schedule",
+ "svod-tensor",
+]
+
+[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -12,6 +12,7 @@ members = [
   "schedule",
   "tensor",
   "tk",
+  "tk2",
 ]
 exclude = ["submodules"]
 

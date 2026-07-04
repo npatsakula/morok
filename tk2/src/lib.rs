@@ -1,0 +1,33 @@
+//! `svod-tk2` — a from-scratch Rust tile-IR DSL (the replacement for the svod-tk
+//! layer). **Step 1: the minimal end-to-end skeleton** — the architecture spine
+//! "naive tile-IR → verified lowering → correct (slow) device-UOp → runs on
+//! device", with NO optimizations yet. The settled design lives in `tk2/DESIGN.md`.
+//!
+//! The four pieces (each a module):
+//! - [`ir`] — the interned, hash-consed tile-IR ADT (§1-§2): ONE DAG carrying
+//!   algorithm + (eventually) schedule as data, with ordering as first-class edges.
+//! - [`build`] — the typed builder emitting `Copy` [`ir::TileId`] handles, gently
+//!   typed (sealed dtype trait) per §OPEN-2.
+//! - [`lower`] — the verified lowering to a device-UOp SINK, then through svod's
+//!   existing `program_from_sink → do_linearize → type_verify → render` path (§D).
+//! - [`pass`] — the strategy-combinator pass runner with bands + contracts + a
+//!   nanopass identity-default folder (§2.6). No real passes yet — scaffolding.
+//!
+//! [`kernels`] authors the two proof kernels; [`launch`] dispatches on device.
+
+pub mod build;
+pub mod error;
+pub mod ir;
+pub mod kernels;
+pub mod launch;
+pub mod lower;
+pub mod pass;
+
+pub use build::{Builder, Elem, F32};
+pub use error::{Error, Result};
+pub use ir::{Node, TileId, TileIr};
+pub use kernels::{Program, elementwise_add, sum_reduce};
+pub use pass::{Band, Fold, Pass, Pipeline, Strategy};
+
+#[cfg(test)]
+mod test;
