@@ -197,6 +197,20 @@ pub fn load_off(buf: &Arc<UOp>, offset: Arc<UOp>) -> Arc<UOp> {
     UOp::load().buffer(buf.clone()).index(idx).call()
 }
 
+/// Vector LOAD of `lanes` contiguous elements from `buf` starting at the flattened
+/// `idxs` position (the fragment's innermost `ept` run, trailing index `0`) — ONE
+/// aligned `load <lanes x T>` instead of `lanes` scalar loads + an `insertelement`
+/// chain. Requires the trailing tile axis (the `ept` element) to be unit-stride
+/// (svod's register-tile layout), so `[.., 0..lanes)` is contiguous.
+pub fn load_vec_at(buf: &Arc<UOp>, shape: &[usize], idxs: &[Idx], lanes: usize) -> Arc<UOp> {
+    let idx = flat_index(buf, shape, idxs);
+    let elem = match buf.dtype() {
+        DType::Ptr { base, .. } => (*base).clone(),
+        dt => dt,
+    };
+    UOp::load().buffer(buf.clone()).index(idx).dtype(elem.vec(lanes).expect("load_vec_at: scalar element")).call()
+}
+
 /// Gated INDEX (ptr=true) at a flat `offset`: a STORE through it writes only when
 /// `gate` is true (out-of-bounds writes are dropped) — the masked-store form.
 pub fn index_off_gated(buf: &Arc<UOp>, offset: Arc<UOp>, gate: Arc<UOp>) -> Arc<UOp> {

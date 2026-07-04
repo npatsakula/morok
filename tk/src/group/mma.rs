@@ -10,7 +10,7 @@ use svod_ir::{AxisType, RendererDevice, UOp, WmmaMetadata, WmmaUpcastAxes};
 use svod_schedule::optimizer::{Renderer, TensorCore};
 
 use super::Group;
-use crate::index::{Idx, flat_index, load_at};
+use crate::index::{Idx, flat_index, load_vec_at};
 use crate::tile::RT;
 
 /// Bridge a scheduler [`TensorCore`] (the per-arch×dtype matrix-op table, the
@@ -121,6 +121,16 @@ impl<'k> Group<'k> {
         self.mma(c, a, b, true, false, false)
     }
 
+    /// [`Self::mma_atb`] emitting the matrix op as an inline-`asm sideeffect` MFMA
+    /// (opaque to the AMDGPU machine scheduler, so the inner-loop program order
+    /// survives `-O3`) instead of the `@llvm.amdgcn.mfma.*` intrinsic — the [`Self::mma_atb`]
+    /// counterpart of [`Self::mma_abt_asm`]. Used by the gfx942 flash-attention microkernel
+    /// (both the QKᵀ and A·V matmuls are `AtB`). Valid only for the f32-accumulating
+    /// bf16 K=16 MFMA; on non-CDNA targets the asm flag is inert (the intrinsic renders).
+    pub fn mma_atb_asm(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
+        self.mma(c, a, b, true, false, true)
+    }
+
     /// `C += Aᵀ·Bᵀ` (tinygrad `mma_AtBt`): both fragments read transposed.
     ///
     /// # Panics
@@ -158,30 +168,21 @@ impl<'k> Group<'k> {
         let width = self.ker.raw_range(w_end, AxisType::Loop);
         let inner = self.ker.raw_range(k_end, AxisType::Reduce);
 
-        let a_in = UOp::vectorize(
-            (0..a_w)
-                .map(|i| {
-                    let idx = if a_t {
-                        [Idx::from(&inner), Idx::from(&height), Idx::Const(i)]
-                    } else {
-                        [Idx::from(&height), Idx::from(&inner), Idx::Const(i)]
-                    };
-                    load_at(a.uop(), a.shape(), &idx)
-                })
-                .collect(),
-        );
-        let b_in = UOp::vectorize(
-            (0..b_w)
-                .map(|i| {
-                    let idx = if b_t {
-                        [Idx::from(&width), Idx::from(&inner), Idx::Const(i)]
-                    } else {
-                        [Idx::from(&inner), Idx::from(&width), Idx::Const(i)]
-                    };
-                    load_at(b.uop(), b.shape(), &idx)
-                })
-                .collect(),
-        );
+        // ONE vector load per operand (the `ept` run is unit-stride) instead of `ept`
+        // scalar loads + insertelement — the base index carries the loop ranges, the
+        // vector width is the static `ept`.
+        let a_idx0 = if a_t {
+            [Idx::from(&inner), Idx::from(&height), Idx::Const(0)]
+        } else {
+            [Idx::from(&height), Idx::from(&inner), Idx::Const(0)]
+        };
+        let a_in = load_vec_at(a.uop(), a.shape(), &a_idx0, a_w as usize);
+        let b_idx0 = if b_t {
+            [Idx::from(&width), Idx::from(&inner), Idx::Const(0)]
+        } else {
+            [Idx::from(&inner), Idx::from(&width), Idx::Const(0)]
+        };
+        let b_in = load_vec_at(b.uop(), b.shape(), &b_idx0, b_w as usize);
         // The accumulator read must depend on the reduce range `inner`, or it is
         // loop-invariant w.r.t. the K loop and gets hoisted *out* of it — every
         // K-iteration would then re-read the pre-loop C and the WMMA's
@@ -189,20 +190,14 @@ impl<'k> Group<'k> {
         // (`acc.after([..reduce_range]).index(..)`): the `After([inner])` keeps
         // the read inside the K loop so it observes the prior iteration's store.
         let c_acc = c.uop().after(smallvec![inner.clone()]);
-        let d_in = UOp::vectorize(
-            (0..c_w)
-                .map(|i| load_at(&c_acc, c.shape(), &[Idx::from(&height), Idx::from(&width), Idx::Const(i)]))
-                .collect(),
-        );
+        let d_in =
+            load_vec_at(&c_acc, c.shape(), &[Idx::from(&height), Idx::from(&width), Idx::Const(0)], c_w as usize);
 
         let out = UOp::wmma(a_in, b_in, d_in, meta);
-        let c_i: Vec<Arc<UOp>> = (0..c_w)
-            .map(|i| {
-                flat_index(c.uop(), c.shape(), &[Idx::from(&height), Idx::from(&width), Idx::Const(i)])
-                    .store(out.gep(vec![i as usize]))
-            })
-            .collect();
-        let c_store = UOp::group(c_i).end(smallvec![height, width, inner]);
+        // ONE vector store of the whole `<c_w x f32>` fragment result.
+        let c_store = flat_index(c.uop(), c.shape(), &[Idx::from(&height), Idx::from(&width), Idx::Const(0)])
+            .store(out)
+            .end(smallvec![height, width, inner]);
         self.finalize_reg(c, c_store)
     }
 
@@ -241,30 +236,21 @@ impl<'k> Group<'k> {
                 // `c.after([inner])` loop-carry).
                 let mut frag_prev: Option<Arc<UOp>> = None;
                 for k in 0..k_end {
-                    let a_in = UOp::vectorize(
-                        (0..a_w)
-                            .map(|i| {
-                                let idx = if a_t {
-                                    [Idx::Const(k), Idx::Const(h), Idx::Const(i)]
-                                } else {
-                                    [Idx::Const(h), Idx::Const(k), Idx::Const(i)]
-                                };
-                                load_at(a.uop(), a.shape(), &idx)
-                            })
-                            .collect(),
-                    );
-                    let b_in = UOp::vectorize(
-                        (0..b_w)
-                            .map(|i| {
-                                let idx = if b_t {
-                                    [Idx::Const(w), Idx::Const(k), Idx::Const(i)]
-                                } else {
-                                    [Idx::Const(k), Idx::Const(w), Idx::Const(i)]
-                                };
-                                load_at(b.uop(), b.shape(), &idx)
-                            })
-                            .collect(),
-                    );
+                    // ONE vector load of the fragment's `ept` run (unit-stride trailing
+                    // axis) instead of `ept` scalar loads + insertelement — collapses the
+                    // per-element load/shuffle bloat that inflated VGPR pressure.
+                    let a_idx0 = if a_t {
+                        [Idx::Const(k), Idx::Const(h), Idx::Const(0)]
+                    } else {
+                        [Idx::Const(h), Idx::Const(k), Idx::Const(0)]
+                    };
+                    let a_in = load_vec_at(a.uop(), a.shape(), &a_idx0, a_w as usize);
+                    let b_idx0 = if b_t {
+                        [Idx::Const(w), Idx::Const(k), Idx::Const(0)]
+                    } else {
+                        [Idx::Const(k), Idx::Const(w), Idx::Const(0)]
+                    };
+                    let b_in = load_vec_at(b.uop(), b.shape(), &b_idx0, b_w as usize);
                     // Accumulator source: the prior k-step's store for this
                     // fragment; on k==0 the incoming `c` carrying the
                     // fragment-scoping dep on the previous fragment's store.
@@ -282,19 +268,12 @@ impl<'k> Group<'k> {
                     // hoisted out (see `Group::anchor`); subsequent k/fragment reads
                     // chain through their stores, which are already loop-scoped.
                     let c_src = if deps.is_empty() { self.anchor(c.uop()) } else { c.uop().after(deps) };
-                    let d_in = UOp::vectorize(
-                        (0..c_w)
-                            .map(|i| load_at(&c_src, c.shape(), &[Idx::Const(h), Idx::Const(w), Idx::Const(i)]))
-                            .collect(),
-                    );
+                    let d_in =
+                        load_vec_at(&c_src, c.shape(), &[Idx::Const(h), Idx::Const(w), Idx::Const(0)], c_w as usize);
                     let out = UOp::wmma(a_in, b_in, d_in, meta.clone());
-                    let c_i: Vec<Arc<UOp>> = (0..c_w)
-                        .map(|i| {
-                            flat_index(c.uop(), c.shape(), &[Idx::Const(h), Idx::Const(w), Idx::Const(i)])
-                                .store(out.gep(vec![i as usize]))
-                        })
-                        .collect();
-                    frag_prev = Some(UOp::group(c_i));
+                    // ONE vector store of the whole `<c_w x f32>` fragment result.
+                    frag_prev =
+                        Some(flat_index(c.uop(), c.shape(), &[Idx::Const(h), Idx::Const(w), Idx::Const(0)]).store(out));
                 }
                 prev_frag = frag_prev;
             }
