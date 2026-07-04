@@ -89,11 +89,47 @@ pub enum BinOp {
     Max,
 }
 
-/// Integer addressing arithmetic (the const-foldable index band, §2.4).
+/// Integer addressing arithmetic (the const-foldable index band, §2.4). `Mod`/`Div`
+/// carry the per-lane fragment `lane_rc` map (row = lane % rows, col = lane / rows …);
+/// they are the div/mod the const-fold pass will later collapse for aligned shapes.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum IndexOp {
     Add,
     Mul,
+    Mod,
+    Div,
+}
+
+/// A register-tile **fragment** lane→(row,col) map — the CDNA 16×16×16 MFMA per-lane
+/// layout, mirrored verbatim from tk's `RT_16X16` (`tk/src/tiles.rs`) + `lane_rc`
+/// (`tk/src/group/mod.rs`). Each of the `threads` lanes holds `ept` elements of one
+/// base fragment; element `inner` of lane `L` maps to:
+/// - `transpose == false` (the A / Row operand): `(row = L % rows, col = (L / rows)·stride + inner)`
+/// - `transpose == true`  (the B, C / Col operands): `(row = (L / cols)·stride + inner, col = L % cols)`
+///
+/// This is the load-bearing, silent-garbage-prone datum: a wrong map still lowers and
+/// runs, computing plausible-looking garbage — the device allclose is the real proof.
+/// It rides as **data on the tile** (`TileMeta::frag`), per DESIGN.md §B/§2.5.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct FragMap {
+    /// Base-fragment rows (16 for the gfx942 MFMA edge).
+    pub rows: usize,
+    /// Base-fragment cols (16).
+    pub cols: usize,
+    /// Elements each lane holds for one base fragment (4 for gfx942 bf16→f32).
+    pub ept: usize,
+    /// The lane-group column step (`= ept` for gfx942; the K spread across lane-groups).
+    pub stride: usize,
+    /// Column-major-in-registers (the B/C operands); selects the transposed `lane_rc` branch.
+    pub transpose: bool,
+}
+
+impl FragMap {
+    /// The gfx942 16×16×16 base fragment (`RT_16X16`): `ept = stride = 4`. `transpose`
+    /// selects Row (A) vs Col (B, C) — the only knob the naive matmul varies.
+    pub const fn gfx942_16x16(transpose: bool) -> Self {
+        FragMap { rows: 16, cols: 16, ept: 4, stride: 4, transpose }
+    }
 }
 
 /// A scope index source: a grid dimension or the block (thread) index. Nesting of
@@ -128,6 +164,11 @@ pub enum Node {
     /// A per-lane register accumulator cell (`DefineReg`). `id` is the per-kernel
     /// deterministic slot AND the disambiguator (svod's correctness obligation).
     DefineReg { id: u32, dtype: DType, len: usize },
+    /// A per-lane register **fragment** tile: an `ept`-element `DefineReg` carrying its
+    /// [`FragMap`] lane→(row,col) layout as data (§B/§2.5). Lowers identically to a
+    /// [`Node::DefineReg`] of `frag.ept` elements; the map drives the `lane_rc`
+    /// addressing in the fragment gather/scatter and the `ept` of the MMA operand.
+    DefineFrag { id: u32, dtype: DType, frag: FragMap },
     /// A grid/block index value (`Special`), carrying its bound.
     Axis { axis: ScopeAxis, bound: i64 },
     /// A loop counter (`Range`). `id` disambiguates identically-bounded loops.
@@ -142,6 +183,19 @@ pub enum Node {
     EltwiseBinary { op: BinOp, a: TileId, b: TileId },
     /// Store `value` into `buf` at flat `offset` (an effect).
     StoreGlobal { buf: TileId, offset: TileId, value: TileId },
+    /// Vector LOAD of a whole `ept`-element per-lane fragment run from register `buf`
+    /// (offset 0) — the `<ept × dtype>` operand a WMMA consumes (mirrors tk's
+    /// `load_vec_at`). `buf` is a `DefineFrag` (optionally `After`-wrapped for the
+    /// loop-carry / post-gather read).
+    LoadRegVec { buf: TileId, ept: usize, dtype: DType },
+    /// Vector STORE of a `<ept × f32>` fragment `value` into register `buf` at offset 0
+    /// — the WMMA accumulator write-back (an effect).
+    StoreRegVec { buf: TileId, value: TileId },
+    /// A single K-fragment matrix multiply-accumulate `D = A·B + C` → one
+    /// [`Op::Wmma`](svod_ir::Op::Wmma) (gfx942 16×16×16 bf16→f32 MFMA intrinsic).
+    /// `a`/`b` are bf16 `LoadRegVec` operands, `c` the f32 accumulator operand; the
+    /// result is an f32 `<ept × f32>` vector stored back via [`Node::StoreRegVec`].
+    Mma { a: TileId, b: TileId, c: TileId, ept: usize },
     /// Ordering edge: `val` is routed through completion of every dep in `deps`.
     After { val: TileId, deps: Edges },
     /// Close `ranges` loop(s) around effect `body` (one `End` per `Range`).
@@ -160,11 +214,21 @@ pub struct TileMeta {
     pub layout: Layout,
     pub residency: Residency,
     pub reg_class: RegClass,
+    /// The per-lane fragment lane→(row,col) map, present only on register-fragment
+    /// tiles ([`Node::DefineFrag`]) — the tile carries its own MFMA layout as data.
+    pub frag: Option<FragMap>,
 }
 
 impl TileMeta {
     fn value(shape: Shape, dtype: DType, residency: Residency) -> Self {
-        TileMeta { shape, dtype: Some(dtype), layout: Layout::contiguous(), residency, reg_class: RegClass::Vgpr }
+        TileMeta {
+            shape,
+            dtype: Some(dtype),
+            layout: Layout::contiguous(),
+            residency,
+            reg_class: RegClass::Vgpr,
+            frag: None,
+        }
     }
     fn effect() -> Self {
         TileMeta {
@@ -173,6 +237,7 @@ impl TileMeta {
             layout: Layout::contiguous(),
             residency: Residency::Reg,
             reg_class: RegClass::Vgpr,
+            frag: None,
         }
     }
 }
@@ -260,6 +325,9 @@ impl TileIr {
             Node::StoreGlobal { buf, offset, value } => {
                 Node::StoreGlobal { buf: f(buf), offset: f(offset), value: f(value) }
             }
+            Node::LoadRegVec { buf, ept, dtype } => Node::LoadRegVec { buf: f(buf), ept, dtype },
+            Node::StoreRegVec { buf, value } => Node::StoreRegVec { buf: f(buf), value: f(value) },
+            Node::Mma { a, b, c, ept } => Node::Mma { a: f(a), b: f(b), c: f(c), ept },
             Node::After { val, deps } => Node::After { val: f(val), deps: deps.into_iter().map(&mut f).collect() },
             Node::End { body, ranges } => Node::End { body: f(body), ranges: ranges.into_iter().map(&mut f).collect() },
             Node::Sink { roots } => Node::Sink { roots: roots.into_iter().map(&mut f).collect() },
@@ -286,6 +354,11 @@ impl TileIr {
             Node::DefineReg { dtype, len, .. } => {
                 TileMeta::value(SmallVec::from_slice(&[*len]), dtype.clone(), Residency::Reg)
             }
+            Node::DefineFrag { dtype, frag, .. } => {
+                let mut m = TileMeta::value(SmallVec::from_slice(&[frag.ept]), dtype.clone(), Residency::Reg);
+                m.frag = Some(*frag);
+                m
+            }
             Node::Axis { .. } | Node::Range { .. } => TileMeta::value(SmallVec::new(), DType::Index, Residency::Reg),
             Node::Const { dtype, .. } => TileMeta::value(SmallVec::new(), dtype.clone(), Residency::Reg),
             Node::IndexAlu { .. } => TileMeta::value(SmallVec::new(), DType::Index, Residency::Reg),
@@ -294,10 +367,18 @@ impl TileIr {
                 let dt = self.meta(*a).dtype.clone().unwrap_or(DType::Float32);
                 TileMeta::value(SmallVec::new(), dt, Residency::Reg)
             }
+            // A fragment vector value: an `ept`-lane register vector (bookkeeping only;
+            // the lowered UOp carries the true `dtype.vec(ept)`).
+            Node::LoadRegVec { dtype, ept, .. } => {
+                TileMeta::value(SmallVec::from_slice(&[*ept]), dtype.clone(), Residency::Reg)
+            }
+            Node::Mma { ept, .. } => TileMeta::value(SmallVec::from_slice(&[*ept]), DType::Float32, Residency::Reg),
             // `After` is a passthrough of its value (an ordering edge routed
             // through it), so it carries the value's residency/dtype/layout.
             Node::After { val, .. } => self.meta(*val).clone(),
-            Node::StoreGlobal { .. } | Node::End { .. } | Node::Sink { .. } => TileMeta::effect(),
+            Node::StoreGlobal { .. } | Node::StoreRegVec { .. } | Node::End { .. } | Node::Sink { .. } => {
+                TileMeta::effect()
+            }
         }
     }
 }

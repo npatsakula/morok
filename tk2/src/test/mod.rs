@@ -3,3 +3,4 @@
 mod device;
 mod lower;
 mod pass;
+mod passes;

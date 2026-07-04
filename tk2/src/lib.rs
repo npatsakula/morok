@@ -22,12 +22,14 @@ pub mod kernels;
 pub mod launch;
 pub mod lower;
 pub mod pass;
+pub mod passes;
 
 pub use build::{Builder, Elem, F32};
 pub use error::{Error, Result};
 pub use ir::{Node, TileId, TileIr};
-pub use kernels::{Program, elementwise_add, sum_reduce};
+pub use kernels::{Program, elementwise_add, matmul, sum_reduce};
 pub use pass::{Band, Fold, Pass, Pipeline, Strategy};
+pub use passes::{ConstFoldPass, UnrollPass, optimize_addressing};
 
 #[cfg(test)]
 mod test;

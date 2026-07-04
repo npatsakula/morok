@@ -5,7 +5,7 @@ use svod_dtype::DType;
 use svod_ir::Op;
 
 use crate::ir::{Node, RegClass, Residency, TileIr};
-use crate::kernels::{elementwise_add, sum_reduce};
+use crate::kernels::{elementwise_add, matmul, sum_reduce};
 use crate::lower;
 
 // ── the ADT: interning, disambiguators, residency/reg-class fields ───────────
@@ -71,6 +71,28 @@ fn sum_reduce_lowering_is_spec_valid() {
     // (this is where all prior loop-carry pain lived).
     let p = sum_reduce(256);
     lower::verify(&p).expect("loop-carried sum reduction must lower to spec-valid UOp");
+}
+
+#[test]
+fn matmul_lowering_is_spec_valid() {
+    // The naive matmul: fragment gather + 16×16×16 WMMA + loop-carried f32
+    // accumulator must lower to spec-valid UOp (integer addresses, matched ALU
+    // dtypes, one RANGE per END, movement lowered away).
+    let p = matmul(64, 64, 64);
+    lower::verify(&p).expect("naive matmul must lower to spec-valid UOp");
+}
+
+#[test]
+fn matmul_carries_wmma_and_loop_edges() {
+    // Structural check: the WMMA op plus the loop-carry ordering edges (After) and
+    // the K-loop RANGE/END scoping are present in the lowered graph.
+    let p = matmul(32, 32, 32);
+    let sink = lower::lower(&p.ir, p.sink, &p.name);
+    let topo = sink.toposort();
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "matmul needs a WMMA");
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::After { .. })), "loop-carry needs After edges");
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::Range { .. })), "the K reduction needs a RANGE");
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::End { .. })), "the K RANGE must be closed by an END");
 }
 
 #[test]

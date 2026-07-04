@@ -12,7 +12,7 @@ use std::marker::PhantomData;
 
 use svod_dtype::DType;
 
-use crate::ir::{BinOp, IndexOp, Node, Scalar, ScopeAxis, TileId, TileIr};
+use crate::ir::{BinOp, FragMap, IndexOp, Node, Scalar, ScopeAxis, TileId, TileIr};
 
 mod sealed {
     pub trait Sealed {}
@@ -31,6 +31,16 @@ impl sealed::Sealed for F32 {}
 impl Elem for F32 {
     fn dtype() -> DType {
         DType::Float32
+    }
+}
+
+/// bfloat16 — the matrix-core operand dtype (the matmul's A/B inputs; f32 accumulate).
+#[derive(Copy, Clone, Debug)]
+pub struct BF16;
+impl sealed::Sealed for BF16 {}
+impl Elem for BF16 {
+    fn dtype() -> DType {
+        DType::BFloat16
     }
 }
 
@@ -60,6 +70,16 @@ pub struct Buf<E: Elem> {
 pub struct Reg<E: Elem> {
     pub id: TileId,
     pub len: usize,
+    _e: PhantomData<E>,
+}
+
+/// A register-**fragment** handle: a per-lane MFMA fragment carrying its
+/// [`FragMap`] lane→(row,col) layout as data. The map drives the `lane_rc`
+/// addressing in the fragment gather/scatter and the `ept` of the MMA operands.
+#[derive(Copy, Clone, Debug)]
+pub struct Frag<E: Elem> {
+    pub id: TileId,
+    pub map: FragMap,
     _e: PhantomData<E>,
 }
 
@@ -174,6 +194,38 @@ impl Builder {
     pub fn idx_mul(&mut self, a: Idx, b: Idx) -> Idx {
         Idx(self.ir.intern(Node::IndexAlu { op: IndexOp::Mul, a: a.0, b: b.0 }))
     }
+    pub fn idx_mod(&mut self, a: Idx, b: Idx) -> Idx {
+        Idx(self.ir.intern(Node::IndexAlu { op: IndexOp::Mod, a: a.0, b: b.0 }))
+    }
+    pub fn idx_div(&mut self, a: Idx, b: Idx) -> Idx {
+        Idx(self.ir.intern(Node::IndexAlu { op: IndexOp::Div, a: a.0, b: b.0 }))
+    }
+
+    /// The per-lane `(row, col)` within a base fragment — tk's `lane_rc`
+    /// (`tk/src/group/mod.rs`) for the gfx942 non-interleaved MFMA fragment, built
+    /// from explicit `IndexAlu` div/mod (the const-foldable index band, §2.4):
+    /// - Row (`transpose = false`, the A operand): `row = lane % rows`,
+    ///   `col = (lane / rows)·stride + inner`.
+    /// - Col (`transpose = true`, the B / C operands): `row = (lane / cols)·stride + inner`,
+    ///   `col = lane % cols`.
+    pub fn lane_rc(&mut self, map: FragMap, lane: Idx, inner: Idx) -> (Idx, Idx) {
+        let stride = self.idx_const(map.stride as i64);
+        if map.transpose {
+            let cols = self.idx_const(map.cols as i64);
+            let lg = self.idx_div(lane, cols);
+            let lg = self.idx_mul(lg, stride);
+            let row = self.idx_add(lg, inner);
+            let col = self.idx_mod(lane, cols);
+            (row, col)
+        } else {
+            let rows = self.idx_const(map.rows as i64);
+            let row = self.idx_mod(lane, rows);
+            let lg = self.idx_div(lane, rows);
+            let lg = self.idx_mul(lg, stride);
+            let col = self.idx_add(lg, inner);
+            (row, col)
+        }
+    }
 
     // ── loads / stores (movement, lowered to INDEX + LOAD/STORE) ─────────────
 
@@ -224,6 +276,59 @@ impl Builder {
 
     fn binary<E: Elem>(&mut self, op: BinOp, a: Val<E>, b: Val<E>) -> Val<E> {
         Val::wrap(self.ir.intern(Node::EltwiseBinary { op, a: a.id, b: b.id }))
+    }
+
+    // ── register fragments + MMA (the naive matmul vocabulary) ───────────────
+
+    /// Allocate a per-lane register fragment carrying its [`FragMap`] MFMA lane-map.
+    pub fn define_frag<E: Elem>(&mut self, map: FragMap) -> Frag<E> {
+        let id = self.ir.fresh_reg_id();
+        let id = self.ir.intern(Node::DefineFrag { id, dtype: E::dtype(), frag: map });
+        Frag { id, map, _e: PhantomData }
+    }
+
+    /// Store an `E` value into a fragment cell at flat `offset` (a gather-scatter
+    /// element write / the accumulator init).
+    pub fn store_frag_elem<E: Elem>(&mut self, f: Frag<E>, offset: Idx, value: Val<E>) -> Effect {
+        Effect(self.ir.intern(Node::StoreGlobal { buf: f.id, offset: offset.0, value: value.id }))
+    }
+
+    /// Load an `E` value from a fragment cell at flat `offset` (the post-loop scatter
+    /// read; `f` is typically [`Self::frag_after`]-wrapped to observe the loop `End`).
+    pub fn load_frag_elem<E: Elem>(&mut self, f: Frag<E>, offset: Idx) -> Val<E> {
+        Val::wrap(self.ir.intern(Node::LoadGlobal { buf: f.id, offset: offset.0, dtype: E::dtype() }))
+    }
+
+    /// Vector-read the whole `ept`-element fragment run as a WMMA operand.
+    pub fn load_frag_vec<E: Elem>(&mut self, f: Frag<E>) -> Val<E> {
+        Val::wrap(self.ir.intern(Node::LoadRegVec { buf: f.id, ept: f.map.ept, dtype: E::dtype() }))
+    }
+
+    /// Vector-read the fragment run through completion of `deps` — the loop-carried
+    /// accumulator read (`acc.after([init, range])`) / the post-gather operand read
+    /// (`frag.after([gather stores])`).
+    pub fn load_frag_vec_after<E: Elem>(&mut self, f: Frag<E>, deps: &[TileId]) -> Val<E> {
+        let after = self.after_buf(f.id, deps);
+        Val::wrap(self.ir.intern(Node::LoadRegVec { buf: after, ept: f.map.ept, dtype: E::dtype() }))
+    }
+
+    /// Vector-store an f32 fragment result back into the accumulator (the WMMA
+    /// write-back / loop-carry store).
+    pub fn store_frag_vec(&mut self, f: Frag<F32>, value: Val<F32>) -> Effect {
+        Effect(self.ir.intern(Node::StoreRegVec { buf: f.id, value: value.id }))
+    }
+
+    /// One K-fragment MFMA `D = A·B + C` (gfx942 16×16×16 bf16→f32). `a`/`b` are the
+    /// bf16 fragment operands, `c` the f32 accumulator; returns the f32 result vector.
+    pub fn mma(&mut self, a: Val<BF16>, b: Val<BF16>, c: Val<F32>, ept: usize) -> Val<F32> {
+        Val::wrap(self.ir.intern(Node::Mma { a: a.id, b: b.id, c: c.id, ept }))
+    }
+
+    /// A fragment handle re-bound to observe `deps` (the post-loop carried read:
+    /// `acc.after([end])`), symmetric with [`Self::reg_after`].
+    pub fn frag_after<E: Elem>(&mut self, f: Frag<E>, deps: &[TileId]) -> Frag<E> {
+        let id = self.after_buf(f.id, deps);
+        Frag { id, map: f.map, _e: PhantomData }
     }
 
     // ── ordering edges (first-class, §2.1) ───────────────────────────────────
