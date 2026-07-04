@@ -5,7 +5,7 @@ use svod_dtype::DType;
 use svod_ir::Op;
 
 use crate::ir::{Node, RegClass, Residency, TileIr};
-use crate::kernels::{elementwise_add, matmul, sum_reduce};
+use crate::kernels::{elementwise_add, lds_roundtrip, matmul, sum_reduce};
 use crate::lower;
 
 // ── the ADT: interning, disambiguators, residency/reg-class fields ───────────
@@ -93,6 +93,26 @@ fn matmul_carries_wmma_and_loop_edges() {
     assert!(topo.iter().any(|u| matches!(u.op(), Op::After { .. })), "loop-carry needs After edges");
     assert!(topo.iter().any(|u| matches!(u.op(), Op::Range { .. })), "the K reduction needs a RANGE");
     assert!(topo.iter().any(|u| matches!(u.op(), Op::End { .. })), "the K RANGE must be closed by an END");
+}
+
+#[test]
+fn lds_roundtrip_lowering_is_spec_valid() {
+    // The LDS proof: DefineLocal + a cross-lane Barrier + LDS load/store must lower to
+    // spec-valid UOp (this is where the store→barrier→load ordering pain would live).
+    let p = lds_roundtrip(64);
+    lower::verify(&p).expect("cross-lane LDS round-trip must lower to spec-valid UOp");
+}
+
+#[test]
+fn lds_roundtrip_carries_local_and_barrier() {
+    // Structural check: the lowered graph carries the shared-memory allocation
+    // (DefineLocal), the workgroup fence (Barrier), and the cross-lane read's After edge.
+    let p = lds_roundtrip(64);
+    let sink = lower::lower(&p.ir, p.sink, &p.name);
+    let topo = sink.toposort();
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))), "LDS stage needs a DefineLocal");
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "cross-lane read needs a Barrier fence");
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::After { .. })), "the post-barrier read routes through an After");
 }
 
 #[test]

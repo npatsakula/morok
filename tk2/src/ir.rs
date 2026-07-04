@@ -164,6 +164,13 @@ pub enum Node {
     /// A per-lane register accumulator cell (`DefineReg`). `id` is the per-kernel
     /// deterministic slot AND the disambiguator (svod's correctness obligation).
     DefineReg { id: u32, dtype: DType, len: usize },
+    /// A shared-memory (LDS) buffer allocation (`DefineLocal`) of `len` `dtype`
+    /// elements. `id` is the per-kernel deterministic slot AND the hash-cons
+    /// disambiguator — two LDS tiles must NOT collapse (the renderer names LDS
+    /// `@local{id}`; a collision aliases distinct shared buffers = a miscompile). LDS
+    /// load/store reuse [`Node::LoadGlobal`]/[`Node::StoreGlobal`] against this buffer
+    /// (the ptr's `Local` address space carries the residency).
+    DefineLocal { id: u32, dtype: DType, len: usize },
     /// A per-lane register **fragment** tile: an `ept`-element `DefineReg` carrying its
     /// [`FragMap`] lane→(row,col) layout as data (§B/§2.5). Lowers identically to a
     /// [`Node::DefineReg`] of `frag.ept` elements; the map drives the `lane_rc`
@@ -196,6 +203,14 @@ pub enum Node {
     /// `a`/`b` are bf16 `LoadRegVec` operands, `c` the f32 accumulator operand; the
     /// result is an f32 `<ept × f32>` vector stored back via [`Node::StoreRegVec`].
     Mma { a: TileId, b: TileId, c: TileId, ept: usize },
+    /// A workgroup synchronization barrier (`s.barrier`): `body` (a store) passes
+    /// through as the effect, and every write in `deps` is fenced — all must complete
+    /// before any consumer routed [`Node::After`] this barrier proceeds. This is the
+    /// `store → barrier → load` order the cross-lane LDS stage needs, carried as a
+    /// first-class node: a missing store→load edge would be a silent wrong answer (the
+    /// exact class §2.1 targets), so the barrier is structural, not implicit. Mirrors
+    /// tk's `store.barrier(deps)` idiom (`tk/src/kernel.rs`).
+    Barrier { body: TileId, deps: Edges },
     /// Ordering edge: `val` is routed through completion of every dep in `deps`.
     After { val: TileId, deps: Edges },
     /// Close `ranges` loop(s) around effect `body` (one `End` per `Range`).
@@ -254,6 +269,7 @@ pub struct TileIr {
     next_range: u32,
     next_reg: u32,
     next_slot: u32,
+    next_local: u32,
 }
 
 impl TileIr {
@@ -314,6 +330,13 @@ impl TileIr {
         self.next_reg += 1;
         r
     }
+    /// A fresh LDS slot / disambiguator (a separate namespace from regs — the
+    /// renderer names LDS `@local{id}`, so two shared tiles must not share an id).
+    pub fn fresh_local_id(&mut self) -> u32 {
+        let l = self.next_local;
+        self.next_local += 1;
+        l
+    }
 
     /// Apply `f` to each operand handle of `node`, returning a rebuilt node — the
     /// primitive the nanopass folder recurses through (children already rewritten).
@@ -328,6 +351,9 @@ impl TileIr {
             Node::LoadRegVec { buf, ept, dtype } => Node::LoadRegVec { buf: f(buf), ept, dtype },
             Node::StoreRegVec { buf, value } => Node::StoreRegVec { buf: f(buf), value: f(value) },
             Node::Mma { a, b, c, ept } => Node::Mma { a: f(a), b: f(b), c: f(c), ept },
+            Node::Barrier { body, deps } => {
+                Node::Barrier { body: f(body), deps: deps.into_iter().map(&mut f).collect() }
+            }
             Node::After { val, deps } => Node::After { val: f(val), deps: deps.into_iter().map(&mut f).collect() },
             Node::End { body, ranges } => Node::End { body: f(body), ranges: ranges.into_iter().map(&mut f).collect() },
             Node::Sink { roots } => Node::Sink { roots: roots.into_iter().map(&mut f).collect() },
@@ -354,6 +380,9 @@ impl TileIr {
             Node::DefineReg { dtype, len, .. } => {
                 TileMeta::value(SmallVec::from_slice(&[*len]), dtype.clone(), Residency::Reg)
             }
+            Node::DefineLocal { dtype, len, .. } => {
+                TileMeta::value(SmallVec::from_slice(&[*len]), dtype.clone(), Residency::Lds)
+            }
             Node::DefineFrag { dtype, frag, .. } => {
                 let mut m = TileMeta::value(SmallVec::from_slice(&[frag.ept]), dtype.clone(), Residency::Reg);
                 m.frag = Some(*frag);
@@ -376,9 +405,11 @@ impl TileIr {
             // `After` is a passthrough of its value (an ordering edge routed
             // through it), so it carries the value's residency/dtype/layout.
             Node::After { val, .. } => self.meta(*val).clone(),
-            Node::StoreGlobal { .. } | Node::StoreRegVec { .. } | Node::End { .. } | Node::Sink { .. } => {
-                TileMeta::effect()
-            }
+            Node::StoreGlobal { .. }
+            | Node::StoreRegVec { .. }
+            | Node::Barrier { .. }
+            | Node::End { .. }
+            | Node::Sink { .. } => TileMeta::effect(),
         }
     }
 }

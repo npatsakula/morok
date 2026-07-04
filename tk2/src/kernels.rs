@@ -89,6 +89,40 @@ pub fn sum_reduce(n: usize) -> Program {
     Program { ir, sink, name: "tk2_sum".into() }
 }
 
+/// A cross-lane LDS round-trip: one workgroup of `n` lanes stages `in[lane] → lds[lane]`,
+/// a workgroup **barrier** fences every lane's write, then each lane reads its
+/// neighbour `lds[(lane+1) % n]` back — a read only correct *past* the barrier — and
+/// stores it to `out[lane]`. Result: `out[i] = in[(i+1) % n]` (a rotation). This is the
+/// proof that the `DefineLocal` + `Barrier` + LDS load/store machinery and the
+/// `store → barrier → load` ordering edge work (the reuse-lever foundation).
+pub fn lds_roundtrip(n: usize) -> Program {
+    let mut b = Builder::new("tk2_lds_roundtrip");
+
+    // ABI slots: output (0) before input (1).
+    let out = b.global::<F32>(n);
+    let inp = b.global::<F32>(n);
+    let lds = b.define_local::<F32>(n);
+
+    // One workgroup, `n` lanes. Each lane fills its own LDS slot from global.
+    let lane = b.block_axis(n as i64);
+    let v = b.load(inp, lane);
+    let staged = b.store_lds(lds, lane, v);
+
+    // Fence: every lane's LDS write completes before any cross-lane read.
+    let bar = b.barrier(staged, &[]);
+
+    // Neighbour read `lds[(lane+1) % n]`, ordered AFTER the barrier (the cross-lane edge).
+    let one = b.idx_const(1);
+    let np = b.idx_const(n as i64);
+    let lp1 = b.idx_add(lane, one);
+    let nbr = b.idx_mod(lp1, np);
+    let rot = b.load_lds_after(lds, nbr, &[bar.dep()]);
+    let st = b.store(out, lane, rot);
+
+    let (ir, sink) = b.finish(&[st]);
+    Program { ir, sink, name: "tk2_lds_roundtrip".into() }
+}
+
 /// The gfx942 MFMA edge — one 16×16×16 fragment per workgroup, one 64-lane warp.
 const EDGE: usize = 16;
 const WARP: usize = 64;

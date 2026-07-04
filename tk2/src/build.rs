@@ -73,6 +73,17 @@ pub struct Reg<E: Elem> {
     _e: PhantomData<E>,
 }
 
+/// A shared-memory (LDS) buffer handle. Unlike [`Buf`] it binds no ABI slot — it is a
+/// per-kernel `DefineLocal` allocation staged from global by the workgroup and read
+/// back (cross-lane) after a [`Builder::barrier`]. The block-tiling reuse lever lives
+/// here: one LDS strip fill feeds many MFMAs.
+#[derive(Copy, Clone, Debug)]
+pub struct Lds<E: Elem> {
+    pub id: TileId,
+    pub len: usize,
+    _e: PhantomData<E>,
+}
+
 /// A register-**fragment** handle: a per-lane MFMA fragment carrying its
 /// [`FragMap`] lane→(row,col) layout as data. The map drives the `lane_rc`
 /// addressing in the fragment gather/scatter and the `ept` of the MMA operands.
@@ -146,6 +157,15 @@ impl Builder {
         let id = self.ir.fresh_reg_id();
         let id = self.ir.intern(Node::DefineReg { id, dtype: E::dtype(), len });
         Reg { id, len, _e: PhantomData }
+    }
+
+    /// Allocate a shared-memory (LDS) buffer of `len` `E`-elements (a fresh,
+    /// disambiguated `DefineLocal` slot). Stage into it with [`Self::store_lds`], fence
+    /// with [`Self::barrier`], and read back (cross-lane) with [`Self::load_lds_after`].
+    pub fn define_local<E: Elem>(&mut self, len: usize) -> Lds<E> {
+        let id = self.ir.fresh_local_id();
+        let id = self.ir.intern(Node::DefineLocal { id, dtype: E::dtype(), len });
+        Lds { id, len, _e: PhantomData }
     }
 
     /// The grid index along `axis` with the given `bound` (the launch geometry
@@ -257,6 +277,33 @@ impl Builder {
     /// Store an `E` value into a register cell at flat `offset`.
     pub fn store_reg<E: Elem>(&mut self, reg: Reg<E>, offset: Idx, value: Val<E>) -> Effect {
         Effect(self.ir.intern(Node::StoreGlobal { buf: reg.id, offset: offset.0, value: value.id }))
+    }
+
+    // ── shared-memory (LDS) staging + barrier (§2.5, the reuse lever) ─────────
+
+    /// Store an `E` value into an LDS buffer at flat `offset` — the global→LDS stage
+    /// write (a lane fills its share of the shared strip).
+    pub fn store_lds<E: Elem>(&mut self, lds: Lds<E>, offset: Idx, value: Val<E>) -> Effect {
+        Effect(self.ir.intern(Node::StoreGlobal { buf: lds.id, offset: offset.0, value: value.id }))
+    }
+
+    /// Load an `E` value from an LDS buffer at flat `offset` **ordered after** the
+    /// staging barrier (and any other `deps`): the cross-lane read of a staged tile.
+    /// The `After` edge on the buffer makes the store→barrier→load order explicit —
+    /// omitting it is the silent-miscompile class (§2.1). Prefer this over any bare
+    /// LDS load (a lane may read another lane's write only past the barrier).
+    pub fn load_lds_after<E: Elem>(&mut self, lds: Lds<E>, offset: Idx, deps: &[TileId]) -> Val<E> {
+        let after = self.after_buf(lds.id, deps);
+        Val::wrap(self.ir.intern(Node::LoadGlobal { buf: after, offset: offset.0, dtype: E::dtype() }))
+    }
+
+    /// A workgroup barrier fencing `body` (a store) plus every write in `deps`: all
+    /// must complete before any consumer routed [`Self::load_lds_after`] (or otherwise
+    /// `After` the returned effect) proceeds. The `store → barrier → load` fence the
+    /// LDS stage needs (mirrors tk's `store.barrier(deps)`).
+    pub fn barrier(&mut self, body: Effect, deps: &[TileId]) -> Effect {
+        let deps = deps.iter().copied().collect();
+        Effect(self.ir.intern(Node::Barrier { body: body.0, deps }))
     }
 
     // ── elementwise binary ops (dtype-matched by construction) ───────────────

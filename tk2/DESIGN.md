@@ -113,6 +113,35 @@ CK makes the softmax-P → PV-A relayout **free** on gfx942 by dispatching QK wi
 
 ---
 
+## 5b. Matmul optimization ladder — tk+HK+CK synthesis (2026-07-04, from 3 parallel teardowns)
+
+**All three references converge on the SAME design** (independent confirmation):
+
+| Dimension | tk `gemm_core_asm` | HK cdna3 | CK `comp_v3` | tk2 target |
+|---|---|---|---|---|
+| Block tile M×N×K | 256×256×64 | 256×256×64 | 256×256×64 | 256×256×64 (grow into it) |
+| Warps/WG | 8 (2×4) | 8 (2×4) | 4 (2×2) | start small |
+| MFMA | `16×16×16` bf16 | `16×16×16` bf16 | `32×32×8` bf16 (K-iterated) | **16×16×16** (native, matches tk2 frag) |
+| Accumulator | VGPR (C-in-reg), 2×64×64/wave | VGPR, 128 f32/lane | VGPR, 256 f32/lane | VGPR (**AGPR ruled out by all 3**) |
+| Reuse factor | ≈256 (tile edge) | 256 | 128 MAC/elem | ≈256 (vs naive's **0**) |
+| LDS | single buf, reg-staged prefetch | single buf (64KB full), reg-prefetch d1 | `comp_v3`: 2-stage reg prefetch, 1 LDS buf | single buf first |
+| Swizzle | whole-tile XOR, b64-granular | XOR `addr^(((addr%rep)>>7)<<3)`, b64 | XOR at KPack=8-elem (128-bit), inner dim `pass_through` | XOR, KPack-granular pass-through |
+
+**The verdict on asm vs compiler (the ceiling question) — RESOLVED by CK:** CK's `comp_v3` inner loop is **fully compiler-visible** — `__builtin_amdgcn_mfma_*` intrinsics + `__builtin_amdgcn_sched_group_barrier(mask,count,0)` groups whose counts are **analytically computed** from tile geometry + a per-arch latency model (`HotLoopScheduler`, comp_v3.hpp:261-426). **No inline asm in the pipeline loop.** Asm is only two optional escape hatches: (1) **AGPR-pin** accumulators (non-default `WGAttrCtlEnum`; NOT needed — VGPR accumulators are the default and all 3 use them for the 256² matmul), (2) **direct global→LDS** `buffer_load…lds` (only the `comp_async` 3-stage memory-hiding pipeline needs it). So the ≈450→805 TF gap tk hit with asm is **NOT intrinsically asm-only**: HK reaches 763 TF and CK reaches peak with intrinsics+`sched_group_barrier`; tk fell short (446 TF) because *svod's IR presented the schedule to LLVM worse than hipcc presents HK's C++*, not because intrinsics can't express it. **The open, harness-decidable bet for tk2: emit `sched_group_barrier` with analytic counts over a compiler-visible loop and see if the cleaner tk2 IR lets LLVM reach HK/CK-level — avoiding the asm channel entirely.**
+
+**The increment ladder (each individually harness-gated; sizes from the tk perf ladder):**
+1. **LDS + block-tiling reuse** — the big structural win (memory-bound naive → compute-bound; reuse 0→256×). *Needs the LDS IR extension (below).* This is the first build.
+2. **XOR LDS swizzle** at b64/b128 KPack granularity, inner (vector) dim `pass_through` so `ds_read_b64` stays coalesced — **the single biggest MFMA-util lever** (tk: bank-conflicts 2e8→0, util 33%→54%). Models §2.4 Layout-as-transform-graph: swizzle = one `Xor` transform node, const-folded.
+3. **Base+offset immediate gather** (one swizzled base VGPR + `offset:` immediate per K-row) — kills register spills; the fold that makes #2 pay.
+4. **`sched_group_barrier` + `s_setprio` schedule steering** (compiler-visible; the CK `HotLoopScheduler` shape) — the asm-vs-intrinsic bet. Needs tk2 to emit sched intrinsics at chosen points + (eventually) a per-arch latency model for the group counts.
+5. *(deferred — needs codegen escape hatches)* **direct-to-LDS async 3-stage pipeline** (`buffer_load…lds`) for true MI300X memory hiding, and the AGPR hatch only if a future kernel needs it. **NOT double-buffering-via-2nd-LDS-buffer early** — tk + CK agree it's neutral when occupancy (2 WG/CU) already hides global latency.
+
+**LDS IR extension (prerequisite for step 1; the immediate build):** `Residency::Lds` is a declared-but-unwired enum today. Add: an IR `DefineLocal{id,dtype,len}` node (→ `UOp::define_local(id, dtype)`, `AddrSpace::Local` ptr), a `Barrier{deps}` node (→ `UOp::barrier(deps)`), and LDS-addressed load/store (reuse `LoadGlobal`/`StoreGlobal` against an LDS buffer, or add `Load/StoreLocal`). Builder primitives to stage a strip global→LDS + a workgroup barrier. **Linearizer danger zone:** LDS store→barrier→load must carry ordering as first-class `After`/`Barrier` edges (a missing edge = silent miscompile, the exact class §2.1 targets) — this is the correctness-critical part to own, not delegate.
+
+**The one abstraction to steal (CK):** LDS layout as a **composable coordinate-transform descriptor** consulted by BOTH the store loop and the `ds_read` loop (so they can never disagree), with the invariant that the innermost KPack (vector) dim stays `pass_through`. This is precisely §2.4; build the swizzle as a transform value, not copy-loop arithmetic.
+
+---
+
 ## 6. Cross-cutting: registers, ownership, the AGPR gap
 
 **6A — Register class + residency as enum fields on tile-IR values** (§2.5).
