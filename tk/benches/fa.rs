@@ -43,6 +43,21 @@ fn bench_fa(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("sdpa", n), &n, |bencher, _| bench_plan(bencher, &ref_plan));
     }
     group.finish();
+    let mut vg = c.benchmark_group("fa_hk_svod");
+    for &d in &[64usize, 128] {
+        let (b, h, hk, n) = (4usize, 32usize, 8usize, 1024usize);
+        vg.throughput(Throughput::Elements((4.0 * (b * h * d) as f64 * (n as f64).powi(2)) as u64));
+        let q = rand_bf16(&[b, n, h, d]);
+        let k = rand_bf16(&[b, n, hk, d]);
+        let v = rand_bf16(&[b, n, hk, d]);
+        if let Ok(Some(mut fa)) =
+            svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens: None })
+        {
+            let pl = fa.prepare().unwrap();
+            vg.bench_with_input(BenchmarkId::new("tk", d), &d, |bch, _| bench_plan(bch, &pl));
+        }
+    }
+    vg.finish();
 }
 
 criterion_group! {

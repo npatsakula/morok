@@ -306,9 +306,7 @@ fn bench_fa(c: &mut Criterion) {
             let f = 4.0 * (b * h * d) as f64 * (n as f64).powi(2) * if causal == 1 { 0.5 } else { 1.0 };
             group.throughput(Throughput::Elements(f as u64));
             // SAFETY: the shim self-allocates; null == no CK instance for this shape / no device.
-            let plan = unsafe {
-                (shim.create)(b as c_int, h as c_int, h_kv as c_int, n as c_int, d as c_int, causal)
-            };
+            let plan = unsafe { (shim.create)(b as c_int, h as c_int, h_kv as c_int, n as c_int, d as c_int, causal) };
             if plan.is_null() {
                 eprintln!("svod-tk vendor fa (CK): no fmha instance for d={d} causal={causal}; skipping");
                 continue;

@@ -202,7 +202,17 @@ set(SUPPORTED_GPU_TARGETS ''${CK_GPU_TARGETS})'
           ++ nativeBuildInputs
           ++ [ rocm.rocminfo ];
         shellHook = ''
-          export LD_LIBRARY_PATH=${libs}:${rocmLibPath}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+          export LD_LIBRARY_PATH=${libs}:${rocmLibPath}:${
+            pkgs.lib.makeLibraryPath [
+              pkgs.sqlite
+              pkgs.elfutils
+              pkgs.zlib
+              pkgs.zstd
+              pkgs.libdrm
+              pkgs.ncurses
+              pkgs.stdenv.cc.cc.lib
+            ]
+          }''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
         '';
       }
     );
