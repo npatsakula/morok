@@ -1,5 +1,6 @@
 mod arch;
 mod bitonic;
+mod direct_lds;
 mod elementwise;
 mod fa;
 mod grid;

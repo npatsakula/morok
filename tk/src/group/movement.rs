@@ -545,6 +545,126 @@ impl<'k> Group<'k> {
         self.finalize_st(st, ended)
     }
 
+    /// **Hardware direct global→LDS DMA** (gfx942 `global_load_lds_dword`): stream a
+    /// `(rows, cols)` bf16 tile from GLOBAL straight into LDS with **no VGPR round-trip
+    /// and no `vmcnt` dependency on the compute registers** — the CK-style async
+    /// memory-hiding load the register-staged prefetch can't do. Each lane DMAs one
+    /// dword (2×bf16); the hardware LDS write is **lane-contiguous** (`m0`-based, the
+    /// per-lane LDS ptr is `readfirstlane`'d to a wave-uniform base), so the LDS
+    /// destination is the tile's **row-major (non-swizzled)** layout — the swizzle,
+    /// if any, must be expressed on the *global read address* side, not here. Closes
+    /// with a workgroup barrier: the DMA completion is `vmcnt`-tracked and the barrier
+    /// drain gates the subsequent LDS gather.
+    pub fn fill_local_direct(&self, dst: ST, src: &GL, idxs: &[Idx], axis: usize) -> ST {
+        self.fill_direct_impl(dst, src, idxs, axis, true)
+    }
+
+    /// [`Self::fill_local_direct`] **without** the trailing workgroup barrier — the
+    /// software-pipeline primitive. Issue the DMA of the next KV block into the other
+    /// double-buffer half, run the current block's compute concurrently (the DMA
+    /// streams to LDS in the background), then `s_waitcnt vmcnt(0)` + fence once at the
+    /// loop tail before the next iteration gathers the freshly-DMA'd half. The
+    /// returned `ST`'s uop IS the DMA — thread it into the tail drain/fence.
+    #[allow(dead_code)] // banked: the pipelined direct-to-LDS FA path (VGPR-relief lever)
+    pub fn fill_local_direct_nobar(&self, dst: ST, src: &GL, idxs: &[Idx], axis: usize) -> ST {
+        self.fill_direct_impl(dst, src, idxs, axis, false)
+    }
+
+    fn fill_direct_impl(&self, dst: ST, src: &GL, idxs: &[Idx], axis: usize, barrier: bool) -> ST {
+        let itemsize = dst.elem().base().bytes() as i64;
+        assert_eq!(itemsize, 2, "direct fill: bf16-only (dword = 2×bf16)");
+        assert_eq!(src.elem(), dst.elem(), "direct fill: cast unsupported");
+        let dword_elems = 4 / itemsize; // 2 bf16 per global_load_lds_dword
+        let cols = dst.cols as i64;
+        assert_eq!(cols % dword_elems, 0, "direct fill: cols {cols} not dword-aligned");
+        let total_dwords = dst.rows as i64 * cols / dword_elems;
+        let gt = self.group_threads() as i64;
+        assert_eq!(total_dwords % gt, 0, "direct fill: {total_dwords} dwords not a multiple of {gt} threads");
+        let total_calls = total_dwords / gt;
+
+        let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
+        let idxs_t = scaled_idxs(idxs, axis, dst.rows as i64, cols);
+        let src_i_base = flat_offset(src.shape(), &idxs_t);
+
+        let outer = self.ker.raw_range(total_calls, AxisType::Loop);
+        let dword_idx = iadd(&imul(&outer, gt), &self.laneid());
+        // `elem` is the LANE-CONTIGUOUS physical LDS slot (m0-relative) this dword lands
+        // in. Invert the tile's element→slot layout to the `(r,c)` the slot must hold, so
+        // the per-lane GLOBAL read fetches exactly that element — the layout (fragment
+        // order AND the XOR swizzle) is carried on the read-address side, since the LDS
+        // write is fixed lane-contiguous.
+        let elem = imul(&dword_idx, dword_elems);
+        let (r, c) = match dst.base.swizzle {
+            Swizzle::Identity => {
+                // Plain fragment-major (subtile-major): slot = frag·(base_rows·base_cols)
+                // + r_in·base_cols + c_in.
+                let base_rows = dst.base.base.rows as i64;
+                let base_cols = dst.base.base.cols as i64;
+                let frag_size = base_rows * base_cols;
+                let w_frags = cols / base_cols;
+                let frag = idiv(&elem, frag_size);
+                let within = imod(&elem, frag_size);
+                let frag_row = idiv(&frag, w_frags);
+                let frag_col = imod(&frag, w_frags);
+                let r = iadd(&imul(&frag_row, base_rows), &idiv(&within, base_cols));
+                let c = iadd(&imul(&frag_col, base_cols), &imod(&within, base_cols));
+                (r, c)
+            }
+            _ => {
+                // XOR swizzle (subtile-major + bank XOR), inverting `Swizzle::tile_offset`'s
+                // general branch: slot = addr ^ delta, where addr = (c/subtile)·rows·subtile
+                // + r·subtile + c%subtile and delta = ((addr·itemsize % repeat)>>7<<3)/itemsize.
+                // The delta touches only bits BELOW those it depends on, so the physical
+                // slot and `addr` agree there → delta(slot) == delta(addr): recover
+                // delta from the slot, un-XOR to `addr`, then decompose to (r,c). Handles
+                // both single- and multi-subtile (d=64 and d=128).
+                let sb = crate::swizzle::swizzle_bytes(cols as usize, itemsize);
+                let subtile = sb / itemsize;
+                let repeat = sb << 4;
+                let delta =
+                    elem.mul(&cidx(itemsize)).mod_(&cidx(repeat)).shr(&cidx(7)).shl(&cidx(3)).idiv(&cidx(itemsize));
+                let addr = elem.xor(&delta);
+                let rs = dst.rows as i64 * subtile;
+                let outer = addr.idiv(&cidx(rs));
+                let rem = addr.mod_(&cidx(rs));
+                let r = rem.idiv(&cidx(subtile));
+                let c = outer.mul(&cidx(subtile)).add(&rem.mod_(&cidx(subtile)));
+                (r, c)
+            }
+        };
+
+        // Global source pointer (addrspace 1): src_base + r·row_stride + c.
+        let goff = iadd(&src_i_base, &iadd(&imul(&r, row_stride), &c));
+        let gptr = UOp::custom(
+            smallvec![index_off(src.uop(), goff)],
+            "addrspacecast ptr {0} to ptr addrspace(1)".to_string(),
+            svod_dtype::DType::Int32,
+        );
+        // LDS destination pointer (addrspace 3): the lane-contiguous slot `elem`, plus
+        // the double-buffer parity base offset (which `swizzled_st_offset` folds in for
+        // the gather side — mirror it here so the DMA writes the correct half).
+        let lds_slot = match dst.base_offset() {
+            Some(bo) => iadd(&elem, bo),
+            None => elem,
+        };
+        let lptr = UOp::custom(
+            smallvec![index_off(dst.uop(), lds_slot)],
+            "addrspacecast ptr {0} to ptr addrspace(3)".to_string(),
+            svod_dtype::DType::Int32,
+        );
+        // The DMA: void side-effect, no SSA result; the declare is auto-hoisted + deduped.
+        let dma = UOp::custom(
+            smallvec![gptr, lptr],
+            "declare void @llvm.amdgcn.global.load.lds(ptr addrspace(1) nocapture, ptr addrspace(3) nocapture, i32, i32, i32)\n\
+             call void @llvm.amdgcn.global.load.lds(ptr addrspace(1) {0}, ptr addrspace(3) {1}, i32 4, i32 0, i32 0)"
+                .to_string(),
+            svod_dtype::DType::Void,
+        );
+        let stored = dma.end(smallvec![outer]);
+        let ended = if barrier { stored.barrier(SmallVec::new()) } else { stored };
+        self.finalize_st(dst, ended)
+    }
+
     /// LOCAL→REG fragment gather: each lane reads its WMMA fragment lanes from
     /// the (swizzled) LDS tile.
     pub(super) fn load_local_to_reg(&self, rt: RT<'k>, st: &ST, dst_idxs: &[Idx], idxs: &[Idx]) -> RT<'k> {

@@ -41,6 +41,15 @@ pub fn s_waitcnt_lgkmcnt(n: i64, dep: Arc<UOp>) -> Arc<UOp> {
     UOp::custom(smallvec![dep], format!("call void asm sideeffect \"s_waitcnt lgkmcnt({n})\", \"\"()"), DType::Void)
 }
 
+/// `s_waitcnt vmcnt(n)`: drain outstanding VMEM traffic down to `n`. The
+/// completion signal for the `global_load_lds` direct-to-LDS DMA (a VMEM op that
+/// streams global→LDS): issue the DMA, run the compute concurrently, then drain
+/// `vmcnt(0)` before the next gather reads the just-DMA'd LDS buffer.
+#[allow(dead_code)] // banked: paired with the direct-to-LDS FA path (see `fill_local_direct_nobar`)
+pub fn s_waitcnt_vmcnt(n: i64, dep: Arc<UOp>) -> Arc<UOp> {
+    UOp::custom(smallvec![dep], format!("call void asm sideeffect \"s_waitcnt vmcnt({n})\", \"\"()"), DType::Void)
+}
+
 /// A **bare** `s_barrier` — the workgroup execution barrier with NO memory
 /// `fence`, emitted as opaque `asm sideeffect`. svod's [`UOp::barrier`] renders
 /// `fence release / s_barrier / fence acquire`; that acq/rel pair is itself a
