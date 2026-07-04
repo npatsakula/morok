@@ -9,5 +9,7 @@ runtime/src/test/
 schedule/src/test/
 tensor/src/test/
 tk/src/test/
+tk2/src/test/
 tensor/benches/
+tk2/benches/
 submodules/

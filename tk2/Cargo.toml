@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "From-scratch Rust tile-IR DSL: interned tile-IR, verified lowering, strategy-combinator pass runner (Step 1 skeleton)"
+autobenches = false # explicit [[bench]] entries below; `benches/common.rs` is a shared module, not a bench
 
 [dependencies]
 svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.3" }
@@ -17,3 +18,11 @@ svod-runtime = { path = "../runtime", version = "=0.1.0-alpha.3" }
 svod-tensor = { path = "../tensor", version = "=0.1.0-alpha.3" }
 smallvec = { workspace = true }
 snafu = "0.8.9"
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+
+# GPU device-time bench (criterion) sharing `benches/common.rs`.
+[[bench]]
+name = "matmul"
+harness = false

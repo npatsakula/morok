@@ -65,28 +65,60 @@ fn cidx(v: i64) -> Arc<UOp> {
     UOp::const_(DType::Index, ConstValue::Int(v))
 }
 
-/// Lower the tile-IR reachable from `sink` to a device-UOp SINK. Children have
-/// strictly smaller ids than their parents (the arena interns bottom-up), so a
-/// single ascending pass suffices — every operand is already lowered.
+/// Lower the tile-IR reachable from `sink` to a device-UOp SINK, minting a fresh
+/// `PARAM` per [`Node::Global`] (the direct-launch ABI). Children have strictly
+/// smaller ids than their parents (the arena interns bottom-up), so a single
+/// ascending pass suffices — every operand is already lowered.
 pub fn lower(ir: &TileIr, sink: TileId, name: &str) -> Arc<UOp> {
+    lower_with_globals(ir, sink, name, None)
+}
+
+/// Lower `program` against externally-supplied PARAM placeholders — the
+/// `custom_kernel` graph-node path ([`crate::graph`]). Each [`Node::Global`]`{slot}`
+/// binds `placeholders[slot]` (unwrapped to its flat PARAM) instead of minting a
+/// fresh param, so the kernel's ABI globals ARE the graph's buffers. Returns the
+/// **raw** SINK: unlike the direct path this re-enters the tensor `prepare()`
+/// pipeline, which runs the `Index`-dtype lowering + backend decompose itself (so
+/// `lower_and_prepare`'s pre-render rewrites must NOT be applied here — mirrors tk's
+/// `graph_launch`, whose closure likewise returns the un-rewritten `finish()` SINK).
+pub fn lower_as_graph_node(program: &Program, placeholders: &[Arc<UOp>]) -> Arc<UOp> {
+    lower_with_globals(&program.ir, program.sink, &program.name, Some(placeholders))
+}
+
+fn lower_with_globals(ir: &TileIr, sink: TileId, name: &str, globals: Option<&[Arc<UOp>]>) -> Arc<UOp> {
     let mut low: Vec<Option<Arc<UOp>>> = vec![None; ir.len()];
     for i in 0..ir.len() {
-        let uop = lower_node(ir, TileId(i as u32), &low, name);
+        let uop = lower_node(ir, TileId(i as u32), &low, name, globals);
         low[i] = Some(uop);
     }
     low[sink.0 as usize].clone().expect("sink was lowered")
+}
+
+/// Unwrap a `custom_kernel` placeholder (`PARAM` or `RESHAPE(PARAM)`) to its flat
+/// 1-D pointer buffer — hand-built kernels index the flat PARAM directly, never the
+/// multi-dim reshape view (mirrors `tk/src/index.rs::flat_ptr`; tk2 stays tk-free).
+fn flat_param(placeholder: &Arc<UOp>) -> Arc<UOp> {
+    match placeholder.op() {
+        Op::Reshape { src, .. } => src.clone(),
+        _ => placeholder.clone(),
+    }
 }
 
 fn get(low: &[Option<Arc<UOp>>], id: TileId) -> Arc<UOp> {
     low[id.0 as usize].clone().expect("operand lowered before use")
 }
 
-fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str) -> Arc<UOp> {
+fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, globals: Option<&[Arc<UOp>]>) -> Arc<UOp> {
     match ir.node(id).clone() {
-        Node::Global { slot, dtype, len } => {
-            let ptr = dtype.ptr(Some(len), AddrSpace::Global).expect("global element is a scalar");
-            UOp::param(slot as usize, len, ptr, None)
-        }
+        // Graph-node path: bind the supplied placeholder (flattened) as this global;
+        // direct path: mint a fresh PARAM for the slot.
+        Node::Global { slot, dtype, len } => match globals {
+            Some(ph) => flat_param(&ph[slot as usize]),
+            None => {
+                let ptr = dtype.ptr(Some(len), AddrSpace::Global).expect("global element is a scalar");
+                UOp::param(slot as usize, len, ptr, None)
+            }
+        },
         Node::DefineReg { id: rid, dtype, len } => UOp::define_reg_typed_with_id(len, dtype, rid as usize),
         // A fragment reg is a `DefineReg` of `frag.ept` per-lane elements; the lane-map
         // is consumed by the builder-side `lane_rc` addressing, not the lowering.

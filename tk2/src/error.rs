@@ -65,4 +65,13 @@ pub enum Error {
         #[snafu(source(from(svod_device::Error, Box::new)))]
         source: Box<svod_device::Error>,
     },
+
+    /// Wrapping the tk2 kernel SINK as a `custom_kernel` (`Op::Call`) graph node —
+    /// the opaque, schedulable/profilable form ([`crate::graph`]) — failed.
+    #[snafu(display("graph kernel {name:?}: {source}"))]
+    GraphKernel {
+        name: String,
+        #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
+        source: Box<svod_tensor::error::Error>,
+    },
 }

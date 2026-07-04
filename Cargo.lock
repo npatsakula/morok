@@ -3736,6 +3736,7 @@ dependencies = [
 name = "svod-tk2"
 version = "0.1.0-alpha.3"
 dependencies = [
+ "criterion",
  "smallvec",
  "snafu 0.8.9",
  "svod-codegen",

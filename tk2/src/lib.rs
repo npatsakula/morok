@@ -17,6 +17,7 @@
 
 pub mod build;
 pub mod error;
+pub mod graph;
 pub mod ir;
 pub mod kernels;
 pub mod launch;
@@ -26,6 +27,7 @@ pub mod passes;
 
 pub use build::{Builder, Elem, F32};
 pub use error::{Error, Result};
+pub use graph::graph_kernel;
 pub use ir::{Node, TileId, TileIr};
 pub use kernels::{Program, elementwise_add, matmul, sum_reduce};
 pub use pass::{Band, Fold, Pass, Pipeline, Strategy};
