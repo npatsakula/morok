@@ -215,8 +215,9 @@ fn matmul_lds_kblock_clustered_lowers_and_balances_the_wave_phase() {
     // the 8-cluster schedule placing per-cluster barriers + set_prio brackets + the warp-phase
     // ping-pong. It must lower spec-valid, carry the SetPrio brackets, and the wave barriers must be
     // balanced (eq=0 count == eq=1 count == 1) — else `matmul_..._clustered` would have panicked in
-    // `verify_warp_phase_balance` at construction. (Value-anchored SchedFence walls are NOT emitted —
-    // proven to trigger VGPR spill; the positional `wall_after_barriers` pass is the opt-in path.)
+    // `verify_warp_phase_balance` at construction. The clustered kernel now gathers via the asm
+    // `ds_read_b64 offset:N` primitive (LdsPtrAs3 + DsReadB64) and re-enables the positional
+    // `wall_after_barriers` lattice (SchedWallMarker) — both must lower spec-valid.
     let count = |p: &crate::Program, pred: &dyn Fn(&Node) -> bool| {
         (0..p.ir.len()).filter(|&i| pred(p.ir.node(crate::ir::TileId(i as u32)))).count()
     };
@@ -225,7 +226,9 @@ fn matmul_lds_kblock_clustered_lowers_and_balances_the_wave_phase() {
     assert!(count(&p, &|n| matches!(n, Node::SetPrio { .. })) > 0, "compute clusters ⇒ SetPrio nodes");
     assert_eq!(count(&p, &|n| matches!(n, Node::WaveBarrier { eq: 1, .. })), 1, "one eq=1 prologue wave barrier");
     assert_eq!(count(&p, &|n| matches!(n, Node::WaveBarrier { eq: 0, .. })), 1, "one eq=0 epilogue wave barrier");
-    // Composes with the refinement passes (the per-slice gather stays the fusible LdsCol form).
+    // Composes with the refinement passes: VectorizePass is a no-op on the asm gather (no fusible
+    // scalar run), and SwizzlePass folds the (fragment-invariant) XOR delta into the asm base offset's
+    // `lds_col` — so the swizzled clustered kernel still lowers spec-valid.
     let sw = crate::kernels::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64)
         .apply(crate::passes::VectorizePass)
         .apply(crate::passes::SwizzlePass);

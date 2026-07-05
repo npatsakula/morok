@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use snafu::ResultExt;
 use svod_dtype::{AddrSpace, AmdArch, DType};
 use svod_ir::{AxisId, AxisType, ConstValue, KernelInfo, Op, UOp, WmmaMetadata, WmmaUpcastAxes};
@@ -233,6 +233,38 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             let mut desc = wmma_desc(&a.dtype().scalar_dtype());
             desc.asm = asm;
             UOp::wmma(a, b, c, desc)
+        }
+        // The shared base VGPR of an asm gather: INDEX the (After-wrapped) LDS buffer at the
+        // lane's `elem==0` flat offset, then `addrspacecast` it to `addrspace(3)` — one custom,
+        // one `$1` VGPR that every fragment's `ds_read_b64 offset:N` reads from (mirrors tk's
+        // `base_as3`). The `After` on `buf` carries the RAW-barrier ordering (the address depends
+        // on the barrier), so the reads can't observe stale LDS.
+        Node::LdsPtrAs3 { buf, base } => {
+            let (buf, base) = (get(low, buf), get(low, base));
+            let idx =
+                UOp::index().buffer(buf).indices(vec![base]).ptr(true).call().expect("LdsPtrAs3 INDEX construction");
+            UOp::custom(smallvec![idx], "addrspacecast ptr {0} to ptr addrspace(3)".to_string(), DType::Int32)
+        }
+        // ONE `ds_read_b64 $0, $1 offset:N` gather (gfx942 §5c). The `sideeffect` asm reads
+        // `<ept×i16>` from `base_ptr + off_bytes`; `prev` (the prior fragment's store) rides as an
+        // ordering-only operand so the reads stay in program order under one loop `END` and cannot
+        // hoist across the `s_barrier`s. Bitcast the `<ept×i16>` result to the `<ept×bf16>` operand.
+        Node::DsReadB64 { base_ptr, off_bytes, ept, dtype, prev } => {
+            let base_ptr = get(low, base_ptr);
+            let mut deps: SmallVec<[Arc<UOp>; 4]> = smallvec![base_ptr];
+            if let Some(p) = prev {
+                deps.push(get(low, p));
+            }
+            let i16v = DType::Int16.vec(ept).expect("ds_read_b64: i16 vec");
+            let read = UOp::custom(
+                deps,
+                format!(
+                    "call <{ept} x i16> asm sideeffect \"ds_read_b64 $0, $1 offset:{off_bytes}\", \"=v,v\"\
+                     (ptr addrspace(3) {{0}})"
+                ),
+                i16v,
+            );
+            read.bitcast(dtype.vec(ept).expect("ds_read_b64: bf16 vec"))
         }
         Node::Barrier { body, deps } => {
             let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();

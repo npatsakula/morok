@@ -481,6 +481,27 @@ impl Builder {
         Val::wrap(self.ir.intern(Node::LoadVecAt { buf: after, base: base.0, ept, dtype: E::dtype() }))
     }
 
+    /// The addr(3) **base pointer** of an LDS tile at flat element `base`, ordered after `raw`
+    /// (the RAW barrier — the ordering rides the buffer handle, exactly as [`Self::load_lds_after`]):
+    /// ONE `addrspacecast(index_off(lds, base))` VGPR the slice's [`Self::ds_read_b64`] gathers all
+    /// read from (DESIGN §5c — HK's operand gather is ONE base + a per-fragment `offset:` immediate,
+    /// so the `lane_rc` address is materialised once, not per fragment; the VGPR-spill-cliff cure).
+    pub fn lds_ptr_as3<E: Elem>(&mut self, lds: Lds<E>, base: Idx, raw: &[TileId]) -> Idx {
+        let buf = if raw.is_empty() { lds.id } else { self.after_buf(lds.id, raw) };
+        Idx(self.ir.intern(Node::LdsPtrAs3 { buf, base: base.0 }))
+    }
+
+    /// ONE inline-asm `ds_read_b64 $d, $base offset:N` LDS gather (gfx942 §5c — HK's only asm):
+    /// reads the `ept`-element bf16 run at `base_ptr + off_bytes` into a fresh `<ept×E>` value.
+    /// `off_bytes` is a compile-time immediate (≤ 65535); `prev` is the prior fragment's store
+    /// (an ordering-only operand chaining the `sideeffect` reads in program order so they can't
+    /// hoist across the barriers — the silent-stale-read class). Store the value into the operand
+    /// fragment with [`Self::store_frag_vec`]; the WMMA reads it via [`Self::load_frag_vec_after`].
+    pub fn ds_read_b64<E: Elem>(&mut self, base_ptr: Idx, off_bytes: i64, ept: usize, prev: Option<TileId>) -> Val<E> {
+        assert!((0..=65535).contains(&off_bytes), "ds_read_b64 offset {off_bytes}B exceeds the 16-bit immediate");
+        Val::wrap(self.ir.intern(Node::DsReadB64 { base_ptr: base_ptr.0, off_bytes, ept, dtype: E::dtype(), prev }))
+    }
+
     /// One K-fragment MFMA `D = A·B + C` (gfx942 16×16×16 bf16→f32) via the **intrinsic**.
     /// `a`/`b` are the bf16 fragment operands, `c` the f32 accumulator; returns the f32 result.
     pub fn mma(&mut self, a: Val<BF16>, b: Val<BF16>, c: Val<F32>, ept: usize) -> Val<F32> {

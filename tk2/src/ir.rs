@@ -245,6 +245,23 @@ pub enum Node {
     /// live ranges past the VGPR spill cliff (§5c: the asm channel is how HK stays at 254 VGPR).
     /// The accumulator `"0"` tie keeps the K-reduction in one physical register either way.
     Mma { a: TileId, b: TileId, c: TileId, ept: usize, asm: bool },
+    /// The addr(3) **base pointer** of an LDS tile at flat element `base` —
+    /// `addrspacecast(index_off(buf, base))` → ONE base VGPR shared by a slice's
+    /// [`Node::DsReadB64`] gathers (DESIGN §5c — HK's operand gather reads from ONE base +
+    /// a per-fragment `offset:` immediate, so the `lane_rc` div/mod address is materialised
+    /// once, not per fragment; that collapse is what breaks the VGPR-spill cliff). `buf` may
+    /// be `After`-wrapped (the RAW ordering rides the buffer, exactly as the scalar
+    /// [`Node::LoadGlobal`] LDS read). Lowers to a `Int32`-typed `Op::Custom`.
+    LdsPtrAs3 { buf: TileId, base: TileId },
+    /// ONE inline-asm `ds_read_b64 $d, $base offset:N` LDS gather (gfx942, DESIGN §5c — the
+    /// ONLY asm HipKittens uses; its MFMA/set_prio/sched.barrier are all intrinsics we already
+    /// emit): reads the `ept`-element bf16 run at `base_ptr + off_bytes` into a fresh
+    /// `<ept×bf16>` value. `off_bytes` is a compile-time immediate (`≤ 65535`, the 16-bit
+    /// `offset:` field); `prev` chains the `sideeffect` reads in program order (an ordering-only
+    /// operand — the prior fragment's store — so the reads can't hoist across the barriers, the
+    /// silent-stale-read class §2.1). Renders as `read.bitcast(<ept×bf16>)` of the `<ept×i16>`
+    /// asm result.
+    DsReadB64 { base_ptr: TileId, off_bytes: i64, ept: usize, dtype: DType, prev: Option<TileId> },
     /// A workgroup synchronization barrier (`s.barrier`): `body` (a store) passes
     /// through as the effect, and every write in `deps` is fenced — all must complete
     /// before any consumer routed [`Node::After`] this barrier proceeds. This is the
@@ -430,6 +447,10 @@ impl TileIr {
                 Node::VecBuild { elements: elements.into_iter().map(&mut f).collect(), dtype }
             }
             Node::Mma { a, b, c, ept, asm } => Node::Mma { a: f(a), b: f(b), c: f(c), ept, asm },
+            Node::LdsPtrAs3 { buf, base } => Node::LdsPtrAs3 { buf: f(buf), base: f(base) },
+            Node::DsReadB64 { base_ptr, off_bytes, ept, dtype, prev } => {
+                Node::DsReadB64 { base_ptr: f(base_ptr), off_bytes, ept, dtype, prev: prev.map(&mut f) }
+            }
             Node::Barrier { body, deps } => {
                 Node::Barrier { body: f(body), deps: deps.into_iter().map(&mut f).collect() }
             }
@@ -487,6 +508,12 @@ impl TileIr {
                 TileMeta::value(SmallVec::from_slice(&[*ept]), dtype.clone(), Residency::Reg)
             }
             Node::Mma { ept, .. } => TileMeta::value(SmallVec::from_slice(&[*ept]), DType::Float32, Residency::Reg),
+            // The addr(3) base pointer VGPR (Int32-typed, mirroring tk's `base_as3` custom).
+            Node::LdsPtrAs3 { .. } => TileMeta::value(SmallVec::new(), DType::Int32, Residency::Reg),
+            // The asm gather's `<ept×bf16>` operand value.
+            Node::DsReadB64 { dtype, ept, .. } => {
+                TileMeta::value(SmallVec::from_slice(&[*ept]), dtype.clone(), Residency::Reg)
+            }
             // A scalar extracted from a vector; a `len`-vector built from scalars.
             Node::VecExtract { dtype, .. } => TileMeta::value(SmallVec::new(), dtype.clone(), Residency::Reg),
             Node::VecBuild { elements, dtype } => {

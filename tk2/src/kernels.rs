@@ -671,6 +671,58 @@ fn gather_frag_lds_run(
         .collect()
 }
 
+/// **Asm `ds_read_b64` gather** of a whole operand slice — the ONE asm HipKittens uses (DESIGN
+/// §5c). All `frags` of an operand differ only by a COMPILE-TIME tile offset (fragment `i` sits at
+/// LDS row `i·EDGE`), so the lane's base LDS address is materialised **once** — `lane_rc(elem 0) +
+/// warp/run offset`, routed through [`Builder::lds_col`] so `SwizzlePass` folds the (fragment-
+/// invariant, since `i·EDGE` is a multiple of 16) XOR delta into that single base — then fragment
+/// `i` reads `ds_read_b64 $dst, $base offset:(i·EDGE·inner·2)`. ONE base VGPR + immediates replaces
+/// the per-fragment div/mod address that [`gather_frag_lds_run`] spills under the barrier walls.
+/// `warp_off` is the wave's row (A) / col (B) offset; `run_base = s·EDGE`; `inner` = the LDS tile's
+/// col count (`k_step`). Stores each read into its fragment and reads it back (the WMMA operand),
+/// mirroring the scalar path's shape. Returns `(operand reads, store fence tokens)`.
+#[allow(clippy::too_many_arguments)]
+fn gather_frags_asm(
+    b: &mut Builder,
+    frags: &[Frag<BF16>],
+    lds: Lds<BF16>,
+    warp_off: Option<Idx>,
+    run_base: usize,
+    inner: usize,
+    wlane: Idx,
+    raw: &[TileId],
+) -> (Vec<Val<BF16>>, Vec<TileId>) {
+    let map = frags[0].map;
+    // Base LDS element offset at fragment 0, element 0 (outer_base = 0): the lane's slot plus the
+    // wave/run offset, with the swizzle hole at `lds_col` (flat = `run`; SwizzlePass = `run ^ delta`).
+    let zero = b.idx_const(0);
+    let (frag_row, frag_col) = b.lane_rc(map, wlane, zero);
+    let (outer_frag, run_frag) = if map.transpose { (frag_col, frag_row) } else { (frag_row, frag_col) };
+    let outer0 = add_opt(b, outer_frag, warp_off);
+    let run0 = offset_by(b, run_frag, run_base);
+    let inner_c = b.idx_const(inner as i64);
+    let col_part = b.lds_col(outer0, run0, inner);
+    let row_off = b.idx_mul(outer0, inner_c);
+    let base_off = b.idx_add(row_off, col_part);
+    // ONE base VGPR (addr(3) cast), After-wrapped by `raw` so the reads land past the RAW barrier.
+    let base_ptr = b.lds_ptr_as3(lds, base_off, raw);
+
+    let itemsize = 2i64; // bf16
+    let step_bytes = EDGE as i64 * inner as i64 * itemsize; // fragment-row `offset:` step
+    let mut vecs = Vec::with_capacity(frags.len());
+    let mut stores = Vec::with_capacity(frags.len());
+    let mut prev: Option<TileId> = None;
+    for (i, &f) in frags.iter().enumerate() {
+        let off_bytes = i as i64 * step_bytes;
+        let v: Val<BF16> = b.ds_read_b64(base_ptr, off_bytes, map.ept, prev);
+        let st = b.store_frag_vec(f, v);
+        prev = Some(st.dep());
+        stores.push(st.dep());
+        vecs.push(b.load_frag_vec_after(f, &[st.dep()]));
+    }
+    (vecs, stores)
+}
+
 /// Gather one 16×16 bf16 fragment from an already-staged LDS tile `lds` into `dst`,
 /// ordered after the fill `bar` (the cross-lane LDS read edge). Same
 /// `base + row·stride + col` addressing as [`gather_frag`], but reading LDS not global.
@@ -1258,6 +1310,7 @@ fn pipeline_clustered<Op, Reg>(
     accs: &[Frag<F32>],
     inited: &[Effect],
     warp_row: Option<Idx>,
+    asm_gather: bool,
     schedule: &[Cluster],
     mut prefetch: impl FnMut(&mut Builder, Idx) -> (Reg, Vec<TileId>),
     mut commit: impl FnMut(&mut Builder, Idx, &Reg, &[TileId]) -> Vec<Effect>,
@@ -1311,9 +1364,15 @@ fn pipeline_clustered<Op, Reg>(
     let mut carried: Vec<TileId> = body.prev_store[..n_acc - 1].to_vec();
     carried.push(body.raw_next.expect("steady schedule must contain a commit cluster"));
     carried.push(body.tail_barrier.expect("steady body must end on a cluster barrier"));
-    // HK positional wall lattice (`b.wall_marker()`) is OFF until the asm `ds_read_b64 offset:N`
-    // gather lands: the walls only stop spilling once that collapses the addressing VGPRs (the ONE
-    // asm HK actually uses — its MFMA/setprio/sched.barrier are intrinsics, which we already emit).
+    // HK positional wall lattice (`b.wall_marker()`): the `sched.barrier(0)` paired with every
+    // `s_barrier` pins the opaque `sideeffect` asm `ds_read_b64`s inside their cluster. WITHOUT it the
+    // machine scheduler can float a gather across a barrier and the clustered kernel RACES (observed a
+    // flaky wrong result on device with the walls off); it is load-bearing for the asm gather's
+    // correctness, not just a perf knob — so it is tied to `asm_gather`, and stays off for the scalar
+    // gather (where it only extended live ranges into the spill cliff).
+    if asm_gather {
+        carried.push(b.wall_marker().dep());
+    }
     let combined = b.combine(last, &carried);
     let ended = b.end(combined, &[kr]);
     let acc_loop: Vec<Frag<F32>> = accs.iter().map(|a| b.frag_after(*a, &[ended.dep()])).collect();
@@ -1390,6 +1449,7 @@ fn kblock_impl(
     k_step: usize,
     stages: usize,
     clustered: bool,
+    asm_gather: bool,
 ) -> Program {
     assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
     assert!(k_step.is_multiple_of(EDGE) && k.is_multiple_of(k_step), "k_step multiple of 16, K multiple of k_step");
@@ -1400,6 +1460,10 @@ fn kblock_impl(
     // The clustered §5c schedule only applies at stages=2 (it decomposes the register-staged body);
     // it falls back to the whole-block hooks when the pipeline collapses to stages=1.
     let clustered = clustered && stages == 2;
+    // The asm `ds_read_b64 offset:N` gather is the clustered path's spill cure (§5c) — it only
+    // steers the per-slice `gather_slice` (the whole-block kloop keeps the compiler-visible gather).
+    // gfx942-only; tk2 hardcodes gfx942, so the flag alone gates it.
+    let asm_gather = asm_gather && clustered;
     // Workgroup output tile = (bm·wm) × (bn·wn), computed by a wm×wn grid of 64-lane warps.
     let (big_m, big_n, nthreads) = (bm * wm, bn * wn, wm * wn * WARP);
     assert!(m.is_multiple_of(big_m) && n.is_multiple_of(big_n), "m/n must tile by (bm·wm)/(bn·wn)");
@@ -1575,6 +1639,7 @@ fn kblock_impl(
             &acc,
             &inited,
             warp_row,
+            asm_gather,
             &sched,
             &mut prefetch_fn,
             &mut commit_fn,
@@ -1582,40 +1647,55 @@ fn kblock_impl(
                 let a_frags: Vec<Frag<BF16>> = (0..ri).map(|_| b.define_frag::<BF16>(a_map)).collect();
                 let b_frags: Vec<Frag<BF16>> = (0..cj).map(|_| b.define_frag::<BF16>(bc_map)).collect();
                 let mut gathers: Vec<TileId> = Vec::new();
-                let a_vecs: Vec<Val<BF16>> = (0..ri)
-                    .map(|i| {
-                        let st = gather_frag_lds_run(
-                            b,
-                            a_frags[i],
-                            a_smem,
-                            i * EDGE,
-                            warp_row_off,
-                            s * EDGE,
-                            k_step,
-                            wlane,
-                            raw,
-                        );
-                        gathers.extend(st.iter().copied());
-                        b.load_frag_vec_after(a_frags[i], &st)
-                    })
-                    .collect();
-                let b_vecs: Vec<Val<BF16>> = (0..cj)
-                    .map(|j| {
-                        let st = gather_frag_lds_run(
-                            b,
-                            b_frags[j],
-                            b_smem,
-                            j * EDGE,
-                            warp_col_off,
-                            s * EDGE,
-                            k_step,
-                            wlane,
-                            raw,
-                        );
-                        gathers.extend(st.iter().copied());
-                        b.load_frag_vec_after(b_frags[j], &st)
-                    })
-                    .collect();
+                let (a_vecs, b_vecs): (Vec<Val<BF16>>, Vec<Val<BF16>>) = if asm_gather {
+                    // The asm `ds_read_b64 offset:N` gather: ONE base VGPR per operand + a per-fragment
+                    // immediate (HK's exact recipe — the addressing-VGPR collapse that stops spilling).
+                    let (a_vecs, ga) =
+                        gather_frags_asm(b, &a_frags, a_smem, warp_row_off, s * EDGE, k_step, wlane, raw);
+                    let (b_vecs, gb) =
+                        gather_frags_asm(b, &b_frags, b_smem, warp_col_off, s * EDGE, k_step, wlane, raw);
+                    gathers.extend(ga);
+                    gathers.extend(gb);
+                    (a_vecs, b_vecs)
+                } else {
+                    // The compiler-visible scalar gather (the fallback: per-element `lane_rc` addressing,
+                    // fused to `LoadVecAt` by VectorizePass) — the spilling path the asm gather replaces.
+                    let a_vecs: Vec<Val<BF16>> = (0..ri)
+                        .map(|i| {
+                            let st = gather_frag_lds_run(
+                                b,
+                                a_frags[i],
+                                a_smem,
+                                i * EDGE,
+                                warp_row_off,
+                                s * EDGE,
+                                k_step,
+                                wlane,
+                                raw,
+                            );
+                            gathers.extend(st.iter().copied());
+                            b.load_frag_vec_after(a_frags[i], &st)
+                        })
+                        .collect();
+                    let b_vecs: Vec<Val<BF16>> = (0..cj)
+                        .map(|j| {
+                            let st = gather_frag_lds_run(
+                                b,
+                                b_frags[j],
+                                b_smem,
+                                j * EDGE,
+                                warp_col_off,
+                                s * EDGE,
+                                k_step,
+                                wlane,
+                                raw,
+                            );
+                            gathers.extend(st.iter().copied());
+                            b.load_frag_vec_after(b_frags[j], &st)
+                        })
+                        .collect();
+                    (a_vecs, b_vecs)
+                };
                 // op_anchor = an operand VALUE (the first A fragment) for `set_prio` to anchor on.
                 let op_anchor = a_vecs[0].id;
                 ((a_vecs, b_vecs), gathers, op_anchor)
@@ -1665,7 +1745,7 @@ fn kblock_impl(
 /// K_STEP=16 — the first tk2 matmul to beat naive at scale. See [`kblock_impl`]. Compose
 /// `.apply(`[`SwizzlePass`](crate::passes::SwizzlePass)`)` for the bank-swizzled variant.
 pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, 1, 1, EDGE, 1, false)
+    kblock_impl(m, n, k, bm, bn, 1, 1, EDGE, 1, false, false)
 }
 
 /// **Multi-warp** K-blocked matmul (DESIGN.md §5b, the bigger-tile lever): a `wm×wn` grid
@@ -1685,7 +1765,7 @@ pub fn matmul_lds_kblock_mw(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 1, false)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 1, false, false)
 }
 
 /// **Register-staged pipelined** multi-warp K-blocked matmul (`stages=2`, DESIGN §5b): the
@@ -1704,7 +1784,7 @@ pub fn matmul_lds_kblock_mw_pipe(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, false)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, false, false)
 }
 
 /// The **clustered HK replica** (DESIGN §5c): [`matmul_lds_kblock_mw_pipe`]'s tile + stages=2
@@ -1724,7 +1804,7 @@ pub fn matmul_lds_kblock_mw_clustered(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true)
 }
 
 /// The **vectorised** K-blocked kernel: the scalar-gather base with
@@ -1750,5 +1830,5 @@ pub fn matmul_lds_kblock_sw(m: usize, n: usize, k: usize, bm: usize, bn: usize, 
 /// swizzle. `k_step ∈ {16,32,64}` if swizzling; bigger `k_step` = fewer barriers, more LDS
 /// + operand VGPR (the occupancy trade the harness resolves).
 pub fn matmul_lds_kblock_ks(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, 1, 1, k_step, 1, false)
+    kblock_impl(m, n, k, bm, bn, 1, 1, k_step, 1, false, false)
 }
