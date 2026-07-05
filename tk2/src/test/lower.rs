@@ -136,20 +136,32 @@ fn matmul_lds_kblock_ks64_lowering_is_spec_valid() {
 }
 
 #[test]
-fn matmul_kblock_gathers_and_fills_are_vectorised() {
-    // Gathers AND both fills are vectorised into `<ept×bf16>` LoadVecAt/StoreVecAt (→
-    // ds_read/ds_write_b64). For a 64×64 tile at K_STEP=16 (ri=cj=4, ksteps=1): 4 A gathers
-    // + 4 B gathers + 4 A-fill global loads + 4 B-fill (register-transpose) global loads =
-    // 16 LoadVecAt; 4 A-fill + 4 B-fill LDS stores = 8 StoreVecAt. The B fill's register
-    // transpose is 16 VecExtract (a column per row-vector) + 4 VecBuild (the packed b64s).
-    use crate::ir::{Node as N, TileId};
-    let p = crate::kernels::matmul_lds_kblock_ks(64, 64, 64, 64, 64, 16);
-    let count = |pred: &dyn Fn(&N) -> bool| (0..p.ir.len()).filter(|&i| pred(p.ir.node(TileId(i as u32)))).count();
-    assert_eq!(count(&|n| matches!(n, N::LoadVecAt { .. })), 16, "8 gather + 8 fill vector loads");
-    assert_eq!(count(&|n| matches!(n, N::StoreVecAt { .. })), 8, "4 A-fill + 4 B-fill vector LDS stores");
-    assert_eq!(count(&|n| matches!(n, N::VecExtract { .. })), 16, "B register transpose: 16 column extracts");
-    assert_eq!(count(&|n| matches!(n, N::VecBuild { .. })), 4, "B register transpose: 4 packed b64 columns");
-    lower::verify(&p).expect("vectorised matmul must lower to spec-valid UOp");
+fn vectorize_pass_fuses_the_scalar_gathers() {
+    // The base kernel emits SCALAR gathers: for a 64×64 tile at K_STEP=16 (ri=cj=4, ksteps=1)
+    // the 8 fragment gathers are 8·ept = 32 scalar `store_frag_elem` (StoreGlobal into a bf16
+    // frag), and the only LoadVecAt are the 8 fill vector loads (A-fill 4 + B-transpose 4).
+    // `.apply(VectorizePass)` fuses each ept run → +8 gather LoadVecAt (16 total) and turns the
+    // 32 scalar frag stores into 8 StoreRegVec — none survive. Fills stay builder-structural.
+    use crate::ir::Node as N;
+    use crate::passes::{VectorizePass, reachable};
+    let base = crate::kernels::matmul_lds_kblock_ks(64, 64, 64, 64, 64, 16);
+    let scalar_frag_stores = |ir: &crate::ir::TileIr, root| {
+        reachable(ir, root)
+            .into_iter()
+            .filter(|&id| {
+                matches!(ir.node(id), N::StoreGlobal { buf, .. } if matches!(ir.node(*buf), N::DefineFrag { dtype, .. } if *dtype == svod_dtype::DType::BFloat16))
+            })
+            .count()
+    };
+    assert_eq!(scalar_frag_stores(&base.ir, base.sink), 32, "base: 8 gathers × ept=4 scalar frag stores");
+
+    let vec = base.apply(VectorizePass);
+    assert_eq!(scalar_frag_stores(&vec.ir, vec.sink), 0, "VectorizePass fuses every scalar gather run");
+    let count = |pred: &dyn Fn(&N) -> bool| {
+        reachable(&vec.ir, vec.sink).into_iter().filter(|&id| pred(vec.ir.node(id))).count()
+    };
+    assert_eq!(count(&|n| matches!(n, N::LoadVecAt { .. })), 16, "8 fused gather + 8 fill vector loads");
+    lower::verify(&vec).expect("vectorised matmul must lower to spec-valid UOp");
 }
 
 #[test]

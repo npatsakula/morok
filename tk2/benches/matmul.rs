@@ -19,7 +19,7 @@ use svod_tensor::testing::allclose_f32;
 mod common;
 use common::{bench_plan, rand_bf16, requirements_met};
 
-use svod_tk2::{Program, SwizzlePass, graph_kernel, matmul, matmul_lds_kblock_ks, optimize_addressing};
+use svod_tk2::{Program, graph_kernel, matmul, matmul_lds_kblock_sw, matmul_lds_kblock_vec, optimize_addressing};
 
 /// f32 ground truth `A·B` over the SAME bf16-rounded operands (both kernel and
 /// reference see the realized bf16 values cast up to f32).
@@ -82,12 +82,15 @@ fn bench_matmul(c: &mut Criterion) {
         // K_STEP=64 (the 4×-fewer-barriers win), compare the flat-layout BASE vs the same
         // base `.apply(SwizzlePass)` — the swizzle is a composable layout pass now, so this
         // is the top-level `.apply` model measured end-to-end.
-        let base = matmul_lds_kblock_ks(n, n, n, 64, 64, 64);
-        let (yb, pb) = plan_of(base, n, n, &a, &b);
+        // `.apply(VectorizePass)` fuses the scalar gather runs to ds_read_b64 (flat), and
+        // `.apply(VectorizePass).apply(SwizzlePass)` the production bank-swizzled variant —
+        // the top-level composable-pass model measured end-to-end (fills are builder-vectorised).
+        let flat = matmul_lds_kblock_vec(n, n, n, 64, 64, 64);
+        let (yb, pb) = plan_of(flat, n, n, &a, &b);
         assert_correct(&yb, &pb, &expected, n, "kblock_ks64");
         group.bench_with_input(BenchmarkId::new("kblock_ks64", n), &n, |bch, _| bench_plan(bch, &pb));
 
-        let swizzled = matmul_lds_kblock_ks(n, n, n, 64, 64, 64).apply(SwizzlePass);
+        let swizzled = matmul_lds_kblock_sw(n, n, n, 64, 64, 64);
         let (ysw, psw) = plan_of(swizzled, n, n, &a, &b);
         assert_correct(&ysw, &psw, &expected, n, "kblock_sw64");
         group.bench_with_input(BenchmarkId::new("kblock_sw64", n), &n, |bch, _| bench_plan(bch, &psw));

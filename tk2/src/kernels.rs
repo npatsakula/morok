@@ -490,23 +490,19 @@ fn offset_by(b: &mut Builder, idx: Idx, base: usize) -> Idx {
     }
 }
 
-/// **Vectorised** gather of one 16×16 fragment from an `[outer, inner]` row-major LDS tile
-/// whose **inner** axis is the fragment's contiguous `ept` run: ONE `<ept×bf16>` LDS load
-/// at the run start ([`Node::LoadVecAt`] → `ds_read_b64`) + ONE vector store into `dst`
-/// replaces the `ept` scalar loads. It serves **both** operands because each maps its ept
-/// run onto the inner axis — A (Row) runs along its `k_step` columns; B (Col), staged
-/// **transposed** as `b_smem[bn, k_step]`, runs along its `k_step` rows — so `map.transpose`
-/// alone picks which lane-coordinate is the fixed `outer` and which is the run.
+/// **Scalar** gather of one 16×16 fragment from an `[outer, inner]` row-major LDS tile — the
+/// fusible base form: `ept` per-element `load_lds_after` + `store_frag_elem`, each at
+/// `outer·inner + LdsCol(outer, run+e, inner)`. It serves **both** operands via `map.transpose`
+/// (A/Row runs its ept along `k_step` columns; B/Col, staged transposed as `b_smem[bn,k_step]`,
+/// runs along its `k_step` rows — `transpose` picks the fixed `outer` vs the run).
 ///
-/// The run start goes through [`Builder::lds_col`] (identity until [`SwizzlePass`]), so
-/// vectorisation and swizzle **compose**: the swizzle `delta` is `ept`-aligned (`>>7<<3>>1`
-/// ⇒ a multiple of 4 = ept) and the run start is `ept`-aligned, so `(wc+t)^delta ==
-/// (wc^delta)+t` for `t ∈ 0..ept` — the b64 chunk relocates as a unit and the run stays
-/// contiguous. `outer_base`/`run_base` are the fragment's tile origins along each axis;
-/// `inner` is the inner (`k_step`) dimension length (the LDS row stride). Returns the store
-/// effect (the WAR edge).
+/// The per-element `LdsCol` is the composable hole: `.apply(SwizzlePass)` XORs each element's
+/// column, and `.apply(`[`VectorizePass`](crate::passes::VectorizePass)`)` fuses the `ept`
+/// contiguous loads into ONE `ds_read_b64`. Both compose because the swizzle `delta` is
+/// `ept`-aligned (`>>7<<3>>1` ⇒ ×4 = ept) and the run start is `ept`-aligned, so the b64 chunk
+/// relocates as a unit and the run stays contiguous (§5b). Returns the `ept` store edges.
 #[allow(clippy::too_many_arguments)]
-fn gather_frag_lds_vec(
+fn gather_frag_lds_run(
     b: &mut Builder,
     dst: Frag<BF16>,
     lds: Lds<BF16>,
@@ -515,20 +511,22 @@ fn gather_frag_lds_vec(
     inner: usize,
     lane: Idx,
     bar: Effect,
-) -> TileId {
-    let zero = b.idx_const(0);
-    let (frag_row, frag_col) = b.lane_rc(dst.map, lane, zero); // the run start (inner = 0)
-    // Col-layout (B) runs its ept along rows → outer = col; Row-layout (A) runs along
-    // columns → outer = row. `inner` is the k_step axis in both.
-    let (outer_frag, run_frag) = if dst.map.transpose { (frag_col, frag_row) } else { (frag_row, frag_col) };
-    let outer = offset_by(b, outer_frag, outer_base);
-    let run = offset_by(b, run_frag, run_base);
-    let col_part = b.lds_col(outer, run, inner); // flat until SwizzlePass relocates the b64 chunk
+) -> Vec<TileId> {
     let inner_c = b.idx_const(inner as i64);
-    let row_off = b.idx_mul(outer, inner_c);
-    let base = b.idx_add(row_off, col_part);
-    let v = b.load_lds_vec_after(lds, base, dst.map.ept, &[bar.dep()]);
-    b.store_frag_vec(dst, v).dep()
+    (0..dst.map.ept)
+        .map(|e| {
+            let e_idx = b.idx_const(e as i64);
+            let (frag_row, frag_col) = b.lane_rc(dst.map, lane, e_idx);
+            let (outer_frag, run_frag) = if dst.map.transpose { (frag_col, frag_row) } else { (frag_row, frag_col) };
+            let outer = offset_by(b, outer_frag, outer_base);
+            let run = offset_by(b, run_frag, run_base);
+            let col_part = b.lds_col(outer, run, inner); // the swizzle/vectorise hole
+            let row_off = b.idx_mul(outer, inner_c);
+            let off = b.idx_add(row_off, col_part);
+            let v = b.load_lds_after(lds, off, &[bar.dep()]);
+            b.store_frag_elem(dst, e_idx, v).dep()
+        })
+        .collect()
 }
 
 /// Gather one 16×16 bf16 fragment from an already-staged LDS tile `lds` into `dst`,
@@ -862,8 +860,8 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
             (0..ksteps)
                 .map(|kf| {
                     // A-frag (i,kf): a_smem[bm,k_step] row-block i, K-block kf (cols k_step).
-                    // Vectorised (contiguous Row run) → one ds_read_b64 + one vector store.
-                    let s = gather_frag_lds_vec(
+                    // Scalar run (the base); VectorizePass fuses it to one ds_read_b64.
+                    let s = gather_frag_lds_run(
                         &mut b,
                         a_frags[i][kf],
                         a_smem,
@@ -873,8 +871,8 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
                         lane,
                         fill_bar,
                     );
-                    gathers.push(s);
-                    b.load_frag_vec_after(a_frags[i][kf], &[s])
+                    gathers.extend(s.iter().copied());
+                    b.load_frag_vec_after(a_frags[i][kf], &s)
                 })
                 .collect()
         })
@@ -884,8 +882,8 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
             (0..cj)
                 .map(|j| {
                     // B-frag (kf,j): b_smem[bn,k_step] (transposed) col-block j, K-block kf.
-                    // Vectorised (contiguous k_step run) → one ds_read_b64 + one vector store.
-                    let s = gather_frag_lds_vec(
+                    // Scalar run (the base); VectorizePass fuses it to one ds_read_b64.
+                    let s = gather_frag_lds_run(
                         &mut b,
                         b_frags[kf][j],
                         b_smem,
@@ -895,8 +893,8 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
                         lane,
                         fill_bar,
                     );
-                    gathers.push(s);
-                    b.load_frag_vec_after(b_frags[kf][j], &[s])
+                    gathers.extend(s.iter().copied());
+                    b.load_frag_vec_after(b_frags[kf][j], &s)
                 })
                 .collect()
         })
@@ -952,11 +950,20 @@ pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> 
     kblock_impl(m, n, k, bm, bn, EDGE)
 }
 
-/// [`matmul_lds_kblock_ks`] with the [`SwizzlePass`](crate::passes::SwizzlePass) layout
-/// refinement composed via [`Program::apply`] — the swizzle is now a top-level `.apply`
-/// pass, not hand-woven. `bm/bn/k_step ∈ {16,32,64}` (single-subtile).
+/// The **vectorised** K-blocked kernel: the scalar-gather base with
+/// [`VectorizePass`](crate::passes::VectorizePass) fusing each `ept` gather run into one
+/// `ds_read_b64`. The `.apply` composition of the gather refinement (fills are already
+/// vectorised in the builder — structural, not a pass; DESIGN §5b).
+pub fn matmul_lds_kblock_vec(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize) -> Program {
+    matmul_lds_kblock_ks(m, n, k, bm, bn, k_step).apply(crate::passes::VectorizePass)
+}
+
+/// The production K-blocked kernel: scalar-gather base `.apply(VectorizePass).apply(SwizzlePass)`
+/// — vectorise the gathers to `ds_read_b64` **then** bank-swizzle the b64 chunks (order
+/// matters: VectorizePass fuses the clean `LdsCol(outer, run+e)` runs; after swizzle the
+/// `^delta` form isn't cleanly fusible). `bm/bn/k_step ∈ {16,32,64}` (single-subtile).
 pub fn matmul_lds_kblock_sw(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize) -> Program {
-    matmul_lds_kblock_ks(m, n, k, bm, bn, k_step).apply(crate::passes::SwizzlePass)
+    matmul_lds_kblock_ks(m, n, k, bm, bn, k_step).apply(crate::passes::VectorizePass).apply(crate::passes::SwizzlePass)
 }
 
 /// The tunable K-blocked kernel (the **base**, flat layout): `k_step`-wide strips staged

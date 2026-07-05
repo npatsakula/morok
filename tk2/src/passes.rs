@@ -428,6 +428,105 @@ impl Fold for Swizzle {
 }
 
 // ============================================================================
+// VectorizePass — fuse each scalar gather run into one ds_read_b64 (DESIGN §5b)
+// ============================================================================
+
+/// Fuse each fragment's `ept` **contiguous scalar** LDS gather loads into ONE `<ept×bf16>`
+/// vector load ([`Node::LoadVecAt`] → `ds_read_b64`) + a [`Node::StoreRegVec`]. The base
+/// kernel emits the scalar run ([`gather_frag_lds_run`](crate::kernels)); this is the
+/// composable gather refinement (`.apply(VectorizePass)`), the counterpart to
+/// [`SwizzlePass`] — the two commute (the fused load's base *is* the `inner = 0` element's
+/// offset, whose `LdsCol` the swizzle relocates chunk-wise; §5b). Fills stay builder-
+/// structural (the B transpose isn't a fusible run — a scalar B-fill needs no transpose).
+pub struct VectorizePass;
+
+/// A fusible gather: a bf16 `DefineFrag` written by exactly `ept` `StoreGlobal`s at const
+/// offsets `0..ept` whose values are scalar `LoadGlobal`s. Returns each such frag → `ept`.
+fn gather_frags(ir: &TileIr, root: TileId) -> HashMap<TileId, usize> {
+    let mut writers: HashMap<TileId, (usize, Vec<i64>)> = HashMap::new();
+    for id in reachable(ir, root) {
+        let Node::StoreGlobal { buf, offset, value } = ir.node(id) else { continue };
+        let Node::DefineFrag { dtype, frag, .. } = ir.node(*buf) else { continue };
+        if *dtype != DType::BFloat16 || !matches!(ir.node(*value), Node::LoadGlobal { .. }) {
+            continue;
+        }
+        let Some(e) = int_const(ir, *offset) else { continue };
+        let w = writers.entry(*buf).or_insert((frag.ept, Vec::new()));
+        w.1.push(e);
+    }
+    writers
+        .into_iter()
+        .filter_map(|(f, (ept, mut es))| {
+            es.sort_unstable();
+            (es.len() == ept && es.iter().enumerate().all(|(i, &e)| e == i as i64)).then_some((f, ept))
+        })
+        .collect()
+}
+
+impl Pass for VectorizePass {
+    fn name(&self) -> &str {
+        "vectorize_gathers"
+    }
+    fn band(&self) -> Band {
+        Band::Tiling
+    }
+    /// Postcondition: no fusible scalar gather run survives — every one is now a vector load.
+    fn ensures(&self, ir: &TileIr, root: TileId) -> bool {
+        gather_frags(ir, root).is_empty()
+    }
+    fn apply(&self, ir: &mut TileIr, root: TileId) -> Result<TileId, PassError> {
+        let valid = gather_frags(ir, root);
+        Ok(fold(&mut VecGather { valid, fused: HashMap::new() }, ir, root))
+    }
+}
+
+/// The folder: replace each gather group's `ept` scalar stores with one vector store, and
+/// dedup the edge lists that referenced them (they now all point at the fused store).
+struct VecGather {
+    valid: HashMap<TileId, usize>,
+    fused: HashMap<TileId, TileId>,
+}
+
+/// Order-preserving de-duplication of an edge list (the `ept`→1 collapse leaves duplicates).
+fn dedup(edges: &Edges) -> Edges {
+    let mut seen = HashSet::new();
+    edges.iter().copied().filter(|e| seen.insert(*e)).collect()
+}
+
+impl Fold for VecGather {
+    fn fold_node(&mut self, ir: &mut TileIr, node: Node) -> TileId {
+        match node {
+            // A gather store: the `inner = 0` leader synthesises the fused vector load/store
+            // (its offset is the run start); later elements collapse onto it. Leaders fold
+            // first (emitted first ⇒ smaller id ⇒ visited first by the ascending-id driver).
+            Node::StoreGlobal { buf, offset, value } if self.valid.contains_key(&buf) => {
+                let ept = self.valid[&buf];
+                if int_const(ir, offset) == Some(0) {
+                    let Node::LoadGlobal { buf: lds, offset: base, dtype } = ir.node(value).clone() else {
+                        unreachable!("gather store value is a scalar LoadGlobal")
+                    };
+                    let vec = ir.intern(Node::LoadVecAt { buf: lds, base, ept, dtype });
+                    let fused = ir.intern(Node::StoreRegVec { buf, value: vec });
+                    self.fused.insert(buf, fused);
+                    fused
+                } else {
+                    self.fused[&buf]
+                }
+            }
+            // Edge lists that routed through the collapsed scalar stores: dedup the now-
+            // coincident fused ids (the barrier drops its body from its own fence set).
+            Node::After { val, deps } => ir.intern(Node::After { val, deps: dedup(&deps) }),
+            Node::Barrier { body, deps } => {
+                let deps = dedup(&deps).into_iter().filter(|&d| d != body).collect();
+                ir.intern(Node::Barrier { body, deps })
+            }
+            Node::Sink { roots } => ir.intern(Node::Sink { roots: dedup(&roots) }),
+            other => ir.intern(other),
+        }
+    }
+}
+
+// ============================================================================
 // The addressing pipeline
 // ============================================================================
 
