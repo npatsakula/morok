@@ -273,6 +273,11 @@ pub enum Node {
     /// asm/control-flow primitive (tk2 forbids authoring If/EndIf, so the predicate rides inside
     /// the asm). Balance-critical: an `eq=0`/`eq=1` count mismatch deadlocks the workgroup.
     WaveBarrier { eq: i64, deps: Edges },
+    /// The **HK barrier-wall opt-in** (DESIGN §5c): a void sentinel that makes the codegen
+    /// `wall_after_barriers` pass pair every `s_barrier` in this kernel with a positional
+    /// `sched.barrier(0)` — the cluster wall lattice, placed by stream position (not value-anchored,
+    /// so it cannot float into the prefetch). Emit once; kept live by folding into the `End`.
+    SchedWallMarker,
     /// Ordering edge: `val` is routed through completion of every dep in `deps`.
     After { val: TileId, deps: Edges },
     /// Close `ranges` loop(s) around effect `body` (one `End` per `Range`).
@@ -426,6 +431,7 @@ impl TileIr {
             Node::SchedFence { mask, deps } => Node::SchedFence { mask, deps: deps.into_iter().map(&mut f).collect() },
             Node::SetPrio { level, deps } => Node::SetPrio { level, deps: deps.into_iter().map(&mut f).collect() },
             Node::WaveBarrier { eq, deps } => Node::WaveBarrier { eq, deps: deps.into_iter().map(&mut f).collect() },
+            Node::SchedWallMarker => Node::SchedWallMarker,
             Node::After { val, deps } => Node::After { val: f(val), deps: deps.into_iter().map(&mut f).collect() },
             Node::End { body, ranges } => Node::End { body: f(body), ranges: ranges.into_iter().map(&mut f).collect() },
             Node::Sink { roots } => Node::Sink { roots: roots.into_iter().map(&mut f).collect() },
@@ -491,6 +497,7 @@ impl TileIr {
             | Node::SchedFence { .. }
             | Node::SetPrio { .. }
             | Node::WaveBarrier { .. }
+            | Node::SchedWallMarker
             | Node::End { .. }
             | Node::Sink { .. } => TileMeta::effect(),
         }

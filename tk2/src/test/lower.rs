@@ -212,16 +212,16 @@ fn matmul_lds_kblock_pipe_lowers_and_splits_prologue_steady_epilogue() {
 #[test]
 fn matmul_lds_kblock_clustered_lowers_and_balances_the_wave_phase() {
     // The §5c clustered HK replica (2 warp-rows → 128², 4 K-blocks, ksteps=4): the interpreter walks
-    // the 8-cluster schedule placing sched_fence + set_prio + per-cluster barriers + the warp-phase
-    // ping-pong. It must lower spec-valid, carry all three sched-control node kinds, and the wave
-    // barriers must be balanced (eq=0 count == eq=1 count == 1) — else `matmul_..._clustered` would
-    // have panicked in `verify_warp_phase_balance` at construction.
+    // the 8-cluster schedule placing per-cluster barriers + set_prio brackets + the warp-phase
+    // ping-pong. It must lower spec-valid, carry the SetPrio brackets, and the wave barriers must be
+    // balanced (eq=0 count == eq=1 count == 1) — else `matmul_..._clustered` would have panicked in
+    // `verify_warp_phase_balance` at construction. (Value-anchored SchedFence walls are NOT emitted —
+    // proven to trigger VGPR spill; the positional `wall_after_barriers` pass is the opt-in path.)
     let count = |p: &crate::Program, pred: &dyn Fn(&Node) -> bool| {
         (0..p.ir.len()).filter(|&i| pred(p.ir.node(crate::ir::TileId(i as u32)))).count()
     };
     let p = crate::kernels::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64);
     lower::verify(&p).expect("clustered HK replica must lower to spec-valid UOp");
-    assert!(count(&p, &|n| matches!(n, Node::SchedFence { .. })) > 0, "clusters ⇒ SchedFence nodes");
     assert!(count(&p, &|n| matches!(n, Node::SetPrio { .. })) > 0, "compute clusters ⇒ SetPrio nodes");
     assert_eq!(count(&p, &|n| matches!(n, Node::WaveBarrier { eq: 1, .. })), 1, "one eq=1 prologue wave barrier");
     assert_eq!(count(&p, &|n| matches!(n, Node::WaveBarrier { eq: 0, .. })), 1, "one eq=0 epilogue wave barrier");

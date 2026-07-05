@@ -94,9 +94,9 @@ fn setprio(prio: i64) -> Arc<UOp> {
 }
 
 /// `@llvm.amdgcn.sched.barrier(mask)`: a hard fence the machine scheduler may not
-/// move any instruction across. Reserved for the Stage 2 attention comb; harmful
-/// for GEMM (it pins the load/MFMA overlap).
-#[allow(dead_code)]
+/// move any instruction across. Harmful for GEMM only when *value-anchored* (it floats
+/// into the prefetch and pins the load/MFMA overlap); placed **positionally** right after
+/// each `s_barrier` (see [`wall_after_barriers`]) it reproduces HK's cluster wall lattice.
 fn sched_barrier(mask: i64) -> Arc<UOp> {
     UOp::custom(
         smallvec![],
@@ -137,6 +137,49 @@ pub fn apply_pipeline_scheduling(nodes: Vec<Arc<UOp>>, target: LlvmTarget) -> Ve
         out.push(node);
         if is_marker {
             out.push(iglp_opt(0));
+        }
+    }
+    out
+}
+
+/// Sentinel a kernel carries to opt into HK-style barrier walling ([`wall_after_barriers`]).
+/// A valid LLVM line comment, so an un-lowered marker is inert.
+const WALL_PREFIX: &str = "; svod.sched.wall_barriers";
+
+/// The opt-in marker: emit once (kept live so it survives DCE) to request that
+/// [`wall_after_barriers`] pair every `s_barrier` with a `sched.barrier(0)`.
+pub fn wall_marker() -> Arc<UOp> {
+    UOp::custom(smallvec![], WALL_PREFIX.to_string(), DType::Void)
+}
+
+fn is_wall_marker(node: &Arc<UOp>) -> bool {
+    matches!(node.op(), Op::Custom { code, .. } if code.starts_with(WALL_PREFIX))
+}
+
+/// Splice `@llvm.amdgcn.sched.barrier(0)` immediately after EVERY `s_barrier` in the
+/// **linearized** stream — HK's 1:1 `s_barrier`↔`sched.barrier(0)` wall lattice. This is
+/// *positional* (a fixed stream index), so unlike a value-anchored `sched.barrier` it cannot
+/// float into the prefetch and force early `vmcnt` drains — a wall only forbids instruction
+/// *motion* across each cluster boundary while the load latency still overlaps naturally.
+/// Opt-in (only a stream carrying a [`wall_marker`]) and CDNA-only, so safe over every kernel.
+/// tk2's `WaveBarrier` is inline asm (not `Op::Barrier`), so the prologue/epilogue wave-phase
+/// barriers are correctly left unwalled — only the hot-loop cluster/RAW/WAR barriers get walls.
+pub fn wall_after_barriers(nodes: Vec<Arc<UOp>>, target: LlvmTarget) -> Vec<Arc<UOp>> {
+    if !target.amd_arch().is_some_and(|a| a.is_cdna()) {
+        return nodes;
+    }
+    if !nodes.iter().any(is_wall_marker) {
+        return nodes;
+    }
+    let mut out: Vec<Arc<UOp>> = Vec::with_capacity(nodes.len() + 16);
+    for node in nodes {
+        if is_wall_marker(&node) {
+            continue; // drop the sentinel so it does not render as a stray comment
+        }
+        let is_barrier = matches!(node.op(), Op::Barrier { .. });
+        out.push(node);
+        if is_barrier {
+            out.push(sched_barrier(0));
         }
     }
     out

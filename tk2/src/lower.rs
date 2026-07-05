@@ -245,11 +245,17 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             );
             UOp::custom(deps, code, DType::Void)
         }
-        // `s_setprio level` as inline `asm sideeffect` — schedule-opaque, pins its own position.
+        // `s_setprio level` via the native intrinsic (NOT inline `asm sideeffect`): the AMDGPU
+        // scheduler models the intrinsic form, so all prio pairs survive + stay positioned (the asm
+        // form gets DCE'd/merged — HK uses the intrinsic).
         Node::SetPrio { level, deps } => {
             let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();
-            UOp::custom(deps, format!("call void asm sideeffect \"s_setprio {level}\", \"\"()"), DType::Void)
+            let code =
+                format!("declare void @llvm.amdgcn.s.setprio(i16)\ncall void @llvm.amdgcn.s.setprio(i16 {level})");
+            UOp::custom(deps, code, DType::Void)
         }
+        // The HK barrier-wall opt-in → the codegen sentinel `wall_after_barriers` keys on.
+        Node::SchedWallMarker => svod_codegen::llvm::sched::wall_marker(),
         // The wave-phase asymmetric barrier (`if warp_row==eq: s_barrier`) — the predicated
         // `readfirstlane`+`s_cmp`+`s_cbranch`+`s_barrier` asm block (mirrors tk's `wave_phase_barrier`);
         // `deps[0]` is the warp_row operand (cast to i32; value ∈ {0,1} so exact). The skip label is

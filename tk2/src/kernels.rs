@@ -1164,14 +1164,12 @@ fn run_clustered_body<Op, Reg>(
     for cluster in schedule {
         match cluster {
             Cluster::Mem(mc) => {
-                // prefetch block k+1 (steady only) → the load values are the load-pin anchors.
-                let mut anchors: Vec<TileId> = Vec::new();
+                // prefetch block k+1 (steady only) into VGPRs (in flight across the MFMAs).
                 if mc.prefetch
                     && let Some(kn) = k_next
                 {
-                    let (r, a) = prefetch(b, kn);
+                    let (r, _) = prefetch(b, kn);
                     reg = Some(r);
-                    anchors = a;
                 }
                 // gather the listed slices (carried RAW seed + the prior cluster's boundary tokens).
                 let mut gdeps = seed.to_vec();
@@ -1200,14 +1198,14 @@ fn run_clustered_body<Op, Reg>(
                 if this_gathers.is_empty() {
                     continue;
                 }
-                // the workgroup barrier fences this cluster's gather reads (correctness); the pin
-                // fence anchors on the prefetch load VALUES (perf). Both ride `entry` to stay live.
-                let bar = b.barrier(Effect(this_gathers[0]), &this_gathers[1..]).dep();
+                // the workgroup barrier fences this cluster's gather reads (correctness); its BODY is
+                // the LAST gather so the sync lands after the whole cluster. No sched fence: walls
+                // regress (VGPR spill, above); if opted into, the positional pass adds them.
+                let bar = b
+                    .barrier(Effect(this_gathers[this_gathers.len() - 1]), &this_gathers[..this_gathers.len() - 1])
+                    .dep();
                 tail_barrier = Some(bar);
                 entry = vec![bar];
-                if !anchors.is_empty() {
-                    entry.push(b.sched_fence(0, &anchors).dep());
-                }
             }
             Cluster::Compute(s) => {
                 let (op, op_anchor) = operands[*s].as_ref().map(|(o, a)| (o, *a)).expect("gather before mma");
@@ -1223,17 +1221,22 @@ fn run_clustered_body<Op, Reg>(
                     })
                     .collect();
                 let new = mma_slice(b, *s, op, &reads);
-                let new0 = new[0].id;
+                // Anchor the closing controls on ALL MFMA results / the LAST store so they land
+                // AFTER the whole 32-MFMA cluster, not after MFMA #1 (the faithfulness fix — svod
+                // positions a barrier at its BODY, and a custom after its VALUE deps). Anchoring on
+                // `new[0]` wedged the boundary s_barrier + s_setprio(0) + sched.barrier(0) inside the
+                // MFMA stream, collapsing the priority window and the ping-pong overlap.
+                let new_ids: Vec<TileId> = new.iter().map(|v| v.id).collect();
                 let stores: Vec<Effect> = (0..n_acc).map(|ij| b.store_frag_vec(accs[ij], new[ij])).collect();
                 prev_store = stores.iter().map(|e| e.dep()).collect();
                 first_compute = false;
-                // set_prio(0) + the cluster fence anchor on the MFMA-result VALUE; the workgroup
-                // barrier fences the acc stores. All three ride `entry` into the next cluster.
-                let prio0 = b.set_prio(0, &[new0]).dep();
-                let fence = b.sched_fence(0, &[new0]).dep();
-                let bar = b.barrier(Effect(prev_store[0]), &prev_store[1..]).dep();
+                let prio0 = b.set_prio(0, &new_ids).dep();
+                let bar = b.barrier(stores[n_acc - 1], &prev_store[..n_acc - 1]).dep();
                 tail_barrier = Some(bar);
-                entry = vec![bar, prio0, fence];
+                // No value-anchored fence here: the positional `wall_after_barriers` pass pairs this
+                // `s_barrier` with a `sched.barrier(0)` at the true boundary (can't float). set_prio
+                // stays (intrinsic) — the walls hold the cluster structure so all prio pairs survive.
+                entry = vec![bar, prio0];
             }
         }
     }
@@ -1308,6 +1311,10 @@ fn pipeline_clustered<Op, Reg>(
     let mut carried: Vec<TileId> = body.prev_store[..n_acc - 1].to_vec();
     carried.push(body.raw_next.expect("steady schedule must contain a commit cluster"));
     carried.push(body.tail_barrier.expect("steady body must end on a cluster barrier"));
+    // NB: the HK positional barrier-wall lattice (`b.wall_marker()`) is deliberately NOT emitted:
+    // proven (ISA) to box the MFMAs correctly but push svod's dataflow register allocation past the
+    // 256-VGPR spill cliff (fresh frag regs/slice + whole-prefetch-live) → 20 spills, worse than the
+    // plain pipe. The wall infra stays available (opt-in) for an asm / register-tightened kernel.
     let combined = b.combine(last, &carried);
     let ended = b.end(combined, &[kr]);
     let acc_loop: Vec<Frag<F32>> = accs.iter().map(|a| b.frag_after(*a, &[ended.dep()])).collect();

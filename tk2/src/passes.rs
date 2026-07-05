@@ -526,6 +526,7 @@ impl Fold for VecGather {
             Node::SchedFence { mask, deps } => ir.intern(Node::SchedFence { mask, deps: dedup(&deps) }),
             Node::SetPrio { level, deps } => ir.intern(Node::SetPrio { level, deps: dedup(&deps) }),
             Node::WaveBarrier { eq, deps } => ir.intern(Node::WaveBarrier { eq, deps: dedup(&deps) }),
+            Node::SchedWallMarker => ir.intern(Node::SchedWallMarker),
             other => ir.intern(other),
         }
     }

@@ -77,6 +77,9 @@ impl Renderer for LlvmTextRenderer {
         // gfx9 machine scheduling controls (s_setprio brackets, sched.barrier fences,
         // the attention interleave comb). No-op on non-CDNA targets / unmarked kernels.
         let nodes = crate::llvm::sched::apply_pipeline_scheduling(nodes, self.target);
+        // HK-style wall lattice: pair every `s_barrier` with a positional `sched.barrier(0)`
+        // (opt-in via a `wall_marker`). No-op on non-CDNA / unmarked kernels.
+        let nodes = crate::llvm::sched::wall_after_barriers(nodes, self.target);
 
         for (i, node) in nodes.iter().enumerate() {
             tracing::debug!(position = i, op = node.op().as_ref(), id = node.id, "linearized node");

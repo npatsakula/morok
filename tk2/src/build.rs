@@ -396,6 +396,13 @@ impl Builder {
         Idx(self.after_buf(idx.0, deps))
     }
 
+    /// The **HK barrier-wall opt-in** (DESIGN §5c): a void sentinel making codegen pair every
+    /// `s_barrier` in this kernel with a positional `sched.barrier(0)`. Emit once; fold its
+    /// [`Effect`] into the loop `End` so it stays live (it has no natural consumer).
+    pub fn wall_marker(&mut self) -> Effect {
+        Effect(self.ir.intern(Node::SchedWallMarker))
+    }
+
     /// The **wave-phase asymmetric barrier** (`if warp_row == eq: s_barrier`, DESIGN §5c/3c) —
     /// `warp_row` is operand[0], `after` are ordering anchors. Route its [`Effect`] into a
     /// downstream consumer to keep it live and ordered (an un-executed barrier deadlocks, so it
