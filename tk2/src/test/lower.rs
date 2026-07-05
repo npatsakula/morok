@@ -136,6 +136,16 @@ fn matmul_lds_kblock_ks64_lowering_is_spec_valid() {
 }
 
 #[test]
+fn matmul_kblock_a_gather_is_vectorised() {
+    // The A (Row) gather is one `<ept×bf16>` LoadVecAt (→ ds_read_b64), not ept scalar
+    // loads — spec-valid + carries the vector LOAD op.
+    let p = crate::kernels::matmul_lds_kblock_ks(64, 64, 64, 64, 64, 16);
+    let has_vecat = (0..p.ir.len()).any(|i| matches!(p.ir.node(crate::ir::TileId(i as u32)), Node::LoadVecAt { .. }));
+    assert!(has_vecat, "the A gather must emit a vector LoadVecAt");
+    lower::verify(&p).expect("A-vectorised matmul must lower to spec-valid UOp");
+}
+
+#[test]
 fn matmul_lds_kblock_lowering_is_spec_valid() {
     // The K-blocked kernel: per-K-block fill + TWO barriers (RAW + WAR) + the reused
     // 2×2 accumulator grid, all inside one K-loop, must lower to spec-valid UOp.

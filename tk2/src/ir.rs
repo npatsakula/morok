@@ -213,6 +213,12 @@ pub enum Node {
     /// `load_vec_at`). `buf` is a `DefineFrag` (optionally `After`-wrapped for the
     /// loop-carry / post-gather read).
     LoadRegVec { buf: TileId, ept: usize, dtype: DType },
+    /// Vector LOAD of `ept` **contiguous** elements from an LDS/global `buf` starting at
+    /// flat `base` — one `LOAD(INDEX(buf,[base]), <ept×dtype>)`, which the AMD renderer
+    /// lowers to a `ds_read_b64`/`b128` (the vectorised gather; the reused mechanism, not a
+    /// hand-written intrinsic). Requires the `ept` run to be contiguous + aligned (the A /
+    /// Row operand; B is strided until the `[N,K]` transpose). `buf` may be `After`-wrapped.
+    LoadVecAt { buf: TileId, base: TileId, ept: usize, dtype: DType },
     /// Vector STORE of a `<ept × f32>` fragment `value` into register `buf` at offset 0
     /// — the WMMA accumulator write-back (an effect).
     StoreRegVec { buf: TileId, value: TileId },
@@ -368,6 +374,7 @@ impl TileIr {
                 Node::StoreGlobal { buf: f(buf), offset: f(offset), value: f(value) }
             }
             Node::LoadRegVec { buf, ept, dtype } => Node::LoadRegVec { buf: f(buf), ept, dtype },
+            Node::LoadVecAt { buf, base, ept, dtype } => Node::LoadVecAt { buf: f(buf), base: f(base), ept, dtype },
             Node::StoreRegVec { buf, value } => Node::StoreRegVec { buf: f(buf), value: f(value) },
             Node::Mma { a, b, c, ept } => Node::Mma { a: f(a), b: f(b), c: f(c), ept },
             Node::Barrier { body, deps } => {
@@ -419,7 +426,7 @@ impl TileIr {
             }
             // A fragment vector value: an `ept`-lane register vector (bookkeeping only;
             // the lowered UOp carries the true `dtype.vec(ept)`).
-            Node::LoadRegVec { dtype, ept, .. } => {
+            Node::LoadRegVec { dtype, ept, .. } | Node::LoadVecAt { dtype, ept, .. } => {
                 TileMeta::value(SmallVec::from_slice(&[*ept]), dtype.clone(), Residency::Reg)
             }
             Node::Mma { ept, .. } => TileMeta::value(SmallVec::from_slice(&[*ept]), DType::Float32, Residency::Reg),

@@ -189,6 +189,19 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
                 .expect("LOAD_VEC index construction");
             UOp::load().buffer(buf).index(idx).dtype(dtype.vec(ept).expect("fragment element is a scalar")).call()
         }
+        // ONE `<ept×dtype>` vector load of a contiguous run at flat `base` — a scalar-index
+        // vector-dtype LOAD (the LDS analog of `LoadRegVec`), which the AMD renderer lowers
+        // to `ds_read_b64`/`b128`. `base` must start an aligned contiguous `ept`-run.
+        Node::LoadVecAt { buf, base, ept, dtype } => {
+            let (buf, base) = (get(low, buf), get(low, base));
+            let idx = UOp::index()
+                .buffer(buf.clone())
+                .indices(vec![base])
+                .ptr(true)
+                .call()
+                .expect("VEC_AT index construction");
+            UOp::load().buffer(buf).index(idx).dtype(dtype.vec(ept).expect("vec element is a scalar")).call()
+        }
         // ONE vector store of the WMMA result back into the accumulator fragment reg.
         Node::StoreRegVec { buf, value } => {
             let (buf, val) = (get(low, buf), get(low, value));

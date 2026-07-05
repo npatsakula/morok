@@ -399,6 +399,43 @@ fn gather_frag_lds_sw(
         .collect()
 }
 
+/// **Vectorised** gather of one 16×16 A (Row) fragment: the `ept` run is contiguous
+/// columns (`lane_rc` col = base + inner), so ONE `<ept×bf16>` LDS load at the run start
+/// ([`Node::LoadVecAt`] → `ds_read_b64`) + ONE vector store into `dst` replaces the `ept`
+/// scalar loads/stores of [`gather_frag_lds_sw`]. Returns the single store effect (the WAR
+/// edge). B (Col) is strided so it stays scalar until the `b_smem[bn,k_step]` transpose.
+#[allow(clippy::too_many_arguments)]
+fn gather_frag_lds_vec(
+    b: &mut Builder,
+    dst: Frag<BF16>,
+    lds: Lds<BF16>,
+    row_base: usize,
+    col_base: usize,
+    cols: usize,
+    lane: Idx,
+    bar: Effect,
+) -> TileId {
+    let zero = b.idx_const(0);
+    let (frag_row, frag_col0) = b.lane_rc(dst.map, lane, zero); // the run start (inner = 0)
+    let wr = if row_base == 0 {
+        frag_row
+    } else {
+        let rb = b.idx_const(row_base as i64);
+        b.idx_add(frag_row, rb)
+    };
+    let wc = if col_base == 0 {
+        frag_col0
+    } else {
+        let cb = b.idx_const(col_base as i64);
+        b.idx_add(frag_col0, cb)
+    };
+    let cols_c = b.idx_const(cols as i64);
+    let row_off = b.idx_mul(wr, cols_c);
+    let base = b.idx_add(row_off, wc);
+    let v = b.load_lds_vec_after(lds, base, dst.map.ept, &[bar.dep()]);
+    b.store_frag_vec(dst, v).dep()
+}
+
 /// Gather one 16×16 bf16 fragment from an already-staged LDS tile `lds` into `dst`,
 /// ordered after the fill `bar` (the cross-lane LDS read edge). Same
 /// `base + row·stride + col` addressing as [`gather_frag`], but reading LDS not global.
@@ -721,10 +758,19 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
             (0..ksteps)
                 .map(|kf| {
                     // A-frag (i,kf): a_smem[bm,k_step] row-block i, K-block kf (cols k_step).
-                    let st =
-                        gather_frag_lds_sw(&mut b, a_frags[i][kf], a_smem, i * EDGE, kf * EDGE, k_step, lane, fill_bar);
-                    gathers.extend(st.iter().copied());
-                    b.load_frag_vec_after(a_frags[i][kf], &st)
+                    // Vectorised (contiguous Row run) → one ds_read_b64 + one vector store.
+                    let s = gather_frag_lds_vec(
+                        &mut b,
+                        a_frags[i][kf],
+                        a_smem,
+                        i * EDGE,
+                        kf * EDGE,
+                        k_step,
+                        lane,
+                        fill_bar,
+                    );
+                    gathers.push(s);
+                    b.load_frag_vec_after(a_frags[i][kf], &[s])
                 })
                 .collect()
         })

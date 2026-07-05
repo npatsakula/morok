@@ -377,10 +377,18 @@ impl Builder {
         Val::wrap(self.ir.intern(Node::LoadRegVec { buf: after, ept: f.map.ept, dtype: E::dtype() }))
     }
 
-    /// Vector-store an f32 fragment result back into the accumulator (the WMMA
-    /// write-back / loop-carry store).
-    pub fn store_frag_vec(&mut self, f: Frag<F32>, value: Val<F32>) -> Effect {
+    /// Vector-store a whole `ept`-element fragment run — the WMMA accumulator write-back
+    /// (f32) or the vectorised gather's write into a bf16 operand fragment.
+    pub fn store_frag_vec<E: Elem>(&mut self, f: Frag<E>, value: Val<E>) -> Effect {
         Effect(self.ir.intern(Node::StoreRegVec { buf: f.id, value: value.id }))
+    }
+
+    /// ONE `<ept×E>` vector load of a contiguous LDS run at flat `base`, ordered after
+    /// `deps` (the fill barrier) — the vectorised fragment gather ([`Node::LoadVecAt`] →
+    /// `ds_read_b64`). Replaces `ept` scalar `load_lds_after` for a contiguous run.
+    pub fn load_lds_vec_after<E: Elem>(&mut self, lds: Lds<E>, base: Idx, ept: usize, deps: &[TileId]) -> Val<E> {
+        let after = self.after_buf(lds.id, deps);
+        Val::wrap(self.ir.intern(Node::LoadVecAt { buf: after, base: base.0, ept, dtype: E::dtype() }))
     }
 
     /// One K-fragment MFMA `D = A·B + C` (gfx942 16×16×16 bf16→f32). `a`/`b` are the
