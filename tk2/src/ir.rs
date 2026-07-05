@@ -264,6 +264,15 @@ pub enum Node {
     /// array stays fed). Emitted as `asm sideeffect` (schedule-opaque by construction), so it
     /// pins its own position. Arch-gated (§2.8): a no-op where the arch has no priority model.
     SetPrio { level: i64, deps: Edges },
+    /// The **wave-phase asymmetric barrier** (DESIGN §5c/3c): only lanes whose `warp_row == eq`
+    /// run the `s_barrier` (a `readfirstlane`+`s_cmp`+`s_cbranch`+`s_barrier` asm block, mirroring
+    /// tk's `wave_phase_barrier`). `deps[0]` IS the `warp_row` index operand; `deps[1..]` are
+    /// ordering anchors. Placing an `eq=1` barrier in the prologue and an `eq=0` in the epilogue
+    /// phase-offsets the two warp-groups one cluster apart (so one group's MFMA clusters overlap
+    /// the other's memory clusters — the fill that makes the per-cluster barriers pay). The ONE
+    /// asm/control-flow primitive (tk2 forbids authoring If/EndIf, so the predicate rides inside
+    /// the asm). Balance-critical: an `eq=0`/`eq=1` count mismatch deadlocks the workgroup.
+    WaveBarrier { eq: i64, deps: Edges },
     /// Ordering edge: `val` is routed through completion of every dep in `deps`.
     After { val: TileId, deps: Edges },
     /// Close `ranges` loop(s) around effect `body` (one `End` per `Range`).
@@ -416,6 +425,7 @@ impl TileIr {
             }
             Node::SchedFence { mask, deps } => Node::SchedFence { mask, deps: deps.into_iter().map(&mut f).collect() },
             Node::SetPrio { level, deps } => Node::SetPrio { level, deps: deps.into_iter().map(&mut f).collect() },
+            Node::WaveBarrier { eq, deps } => Node::WaveBarrier { eq, deps: deps.into_iter().map(&mut f).collect() },
             Node::After { val, deps } => Node::After { val: f(val), deps: deps.into_iter().map(&mut f).collect() },
             Node::End { body, ranges } => Node::End { body: f(body), ranges: ranges.into_iter().map(&mut f).collect() },
             Node::Sink { roots } => Node::Sink { roots: roots.into_iter().map(&mut f).collect() },
@@ -480,6 +490,7 @@ impl TileIr {
             | Node::Barrier { .. }
             | Node::SchedFence { .. }
             | Node::SetPrio { .. }
+            | Node::WaveBarrier { .. }
             | Node::End { .. }
             | Node::Sink { .. } => TileMeta::effect(),
         }

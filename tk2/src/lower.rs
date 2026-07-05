@@ -22,6 +22,10 @@ use crate::error::{self, Result};
 use crate::ir::{BinOp, IndexOp, Node, Scalar, ScopeAxis, TileId, TileIr};
 use crate::kernels::Program;
 
+/// Per-construction unique id for the [`Node::WaveBarrier`] asm skip-label, so `clang -O3`
+/// loop-unrolling can never emit two copies of the same `.Lwpb{n}:` label.
+static WAVE_PHASE_LABEL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The gfx942 16×16×16 bf16→f32 MFMA descriptor, reproduced verbatim from tk's
 /// `wmma_desc`/`wmma_from_tc` (`tk/src/group/mma.rs`): the per-arch×dtype
 /// [`TensorCore`](svod_schedule::optimizer::TensorCore) table is the single source
@@ -249,6 +253,25 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
         Node::SetPrio { level, deps } => {
             let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();
             UOp::custom(deps, format!("call void asm sideeffect \"s_setprio {level}\", \"\"()"), DType::Void)
+        }
+        // The wave-phase asymmetric barrier (`if warp_row==eq: s_barrier`) — the predicated
+        // `readfirstlane`+`s_cmp`+`s_cbranch`+`s_barrier` asm block (mirrors tk's `wave_phase_barrier`);
+        // `deps[0]` is the warp_row operand (cast to i32; value ∈ {0,1} so exact). The skip label is
+        // minted per construction so clang `-O3` unroll never duplicates it.
+        Node::WaveBarrier { eq, deps } => {
+            let mut lowered: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();
+            lowered[0] = lowered[0].cast(DType::Int32);
+            let uid = WAVE_PHASE_LABEL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let label = format!(".Lwpb{uid}");
+            UOp::custom(
+                lowered,
+                format!(
+                    "call i32 asm sideeffect \"v_readfirstlane_b32 $0, $1\\0A\\09\
+                     s_cmp_eq_u32 $0, {eq}\\0A\\09s_cbranch_scc0 {label}\\0A\\09s_barrier\\0A\\09\
+                     {label}:\", \"=s,v,~{{{{scc}}}}\"(i32 {{0}})"
+                ),
+                DType::Int32,
+            )
         }
         Node::After { val, deps } => {
             let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();

@@ -388,6 +388,17 @@ impl Builder {
         Effect(self.ir.intern(Node::SetPrio { level, deps }))
     }
 
+    /// The **wave-phase asymmetric barrier** (`if warp_row == eq: s_barrier`, DESIGN §5c/3c) —
+    /// `warp_row` is operand[0], `after` are ordering anchors. Route its [`Effect`] into a
+    /// downstream consumer to keep it live and ordered (an un-executed barrier deadlocks, so it
+    /// must never be DCE'd). Place OUTSIDE the loop (prologue `eq=1` / epilogue `eq=0`) — the asm
+    /// skip-label is uniquified per construction, not per clang-unrolled copy.
+    pub fn wave_barrier(&mut self, warp_row: Idx, eq: i64, after: &[TileId]) -> Effect {
+        let mut deps: crate::ir::Edges = smallvec::smallvec![warp_row.0];
+        deps.extend(after.iter().copied());
+        Effect(self.ir.intern(Node::WaveBarrier { eq, deps }))
+    }
+
     // ── elementwise binary ops (dtype-matched by construction) ───────────────
 
     pub fn add<E: Elem>(&mut self, a: Val<E>, b: Val<E>) -> Val<E> {

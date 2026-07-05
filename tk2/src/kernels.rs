@@ -914,6 +914,31 @@ struct FillRegs {
     b: Option<Vec<Vec<Val<BF16>>>>,
 }
 
+/// The per-cluster **bracketing policy** the harness sweeps (DESIGN §5c) — which
+/// schedule-steering controls [`kloop_2stage_clustered`] places at each cluster boundary.
+/// Correctness is invariant to every flag; only the machine schedule changes.
+#[derive(Copy, Clone, Debug)]
+pub struct Bracket {
+    /// `sched_fence(0)` after the register-staged prefetch — the load-pin that keeps block
+    /// k+1's global loads in flight across the MFMAs (the measured 0.42 root-cause cure, §5c/3a).
+    pub load_pin: bool,
+    /// `sched_fence(0)` at every cluster boundary (a compiler-only separator; no workgroup sync).
+    pub cluster_fence: bool,
+    /// `set_prio(1)/(0)` around each compute cluster (the compute wave wins SIMD issue).
+    pub prio: bool,
+    /// A real workgroup `s_barrier` at every cluster boundary. OFF for 3b (the barrier-flood
+    /// regression without the 3c warp-phase ping-pong); 3c turns it on with the phase offset.
+    pub per_cluster_barrier: bool,
+}
+
+impl Default for Bracket {
+    fn default() -> Self {
+        // The smallest coherent arm: pin the loads + fence the clusters; prio/barrier are
+        // additive sweep arms (the isolated fence regressed, so start minimal — §5c).
+        Bracket { load_pin: true, cluster_fence: true, prio: false, per_cluster_barrier: false }
+    }
+}
+
 /// The **K-reduction map-reduce combinator** (DESIGN §5b — the first-class loop, so
 /// ping-pong is a `stages` field, not a fragile whole-loop `.apply` pass). It owns the
 /// structural skeleton — the `Range`/`End`, the per-block K base `tk·k_step`, the RAW
@@ -1078,6 +1103,140 @@ fn kloop_2stage<Op, Reg>(
     acc_loop.iter().zip(stores_e).map(|(a, s)| b.frag_after(*a, &[s.dep()])).collect()
 }
 
+/// The **clustered** register-staged pipeline (DESIGN §5c/3b): the same single-buffer
+/// prologue/steady/epilogue as [`kloop_2stage`], but the steady body is decomposed into a
+/// per-slice **memory-cluster / compute-cluster** sequence with the schedule-steering `Bracket`
+/// placed by rule — the coherent-schedule fix for the load-sink (a lone fence regressed; only the
+/// cluster structure pays). Per slice `s`: a memory cluster (gather slice `s`, reading the carried
+/// RAW) then a compute cluster (`set_prio` · the `n_acc` MFMAs of slice `s` · `set_prio`). The
+/// accumulators **round-trip through their frags between clusters** (`store_frag_vec` →
+/// `load_frag_vec_after([fence])`) — a same-register f32 write/read that preserves the MFMA order
+/// (so bit-exact) while giving each cluster an ordering anchor the void sched effects can ride.
+/// Workgroup barriers stay at just the carried-RAW + WAR (no per-cluster barrier unless
+/// `br.per_cluster_barrier`); the cluster separators are cheap `sched_fence`s.
+#[allow(clippy::too_many_arguments)]
+fn kloop_2stage_clustered<Op, Reg>(
+    b: &mut Builder,
+    nblocks: usize,
+    k_step: usize,
+    ksteps: usize,
+    br: Bracket,
+    accs: &[Frag<F32>],
+    inited: &[Effect],
+    mut prefetch: impl FnMut(&mut Builder, Idx) -> (Reg, Vec<TileId>),
+    mut commit: impl FnMut(&mut Builder, Idx, &Reg, &[TileId]) -> Vec<Effect>,
+    mut gather_slice: impl FnMut(&mut Builder, usize, &[TileId]) -> (Op, Vec<TileId>),
+    mut mma_slice: impl FnMut(&mut Builder, usize, &Op, &[Val<F32>]) -> Vec<Val<F32>>,
+) -> Vec<Frag<F32>> {
+    assert!(nblocks >= 2, "kloop_2stage_clustered needs nblocks ≥ 2");
+    let n_acc = accs.len();
+    let ks_c = b.idx_const(k_step as i64);
+    let one = b.idx_const(1);
+
+    // ── prologue: commit block 0 into LDS (no WAR). ──
+    let zero = b.idx_const(0);
+    let (reg0, _) = prefetch(b, zero);
+    let fill0 = commit(b, zero, &reg0, &[]);
+    let fill0_deps: Vec<TileId> = fill0[1..].iter().map(|e| e.dep()).collect();
+    let raw_seed = b.barrier(fill0[0], &fill0_deps);
+
+    // ── steady loop over blocks 0..nblocks-1. ──
+    let kr = b.range((nblocks - 1) as i64);
+    let tk = b.counter(kr);
+    let k_next_idx = b.idx_add(tk, one);
+    let k_next = b.idx_mul(k_next_idx, ks_c);
+
+    // prefetch block k+1 + the load-pin (a `sched_fence(0)` past the loads, kept live by the first
+    // gather routing after it). This is the cluster-native version of the 3a load-pin.
+    let (reg_next, anchors) = prefetch(b, k_next);
+    let mut entry: Option<TileId> = br.load_pin.then(|| b.sched_fence(0, &anchors).dep());
+
+    // per-slice clusters — one compute cluster's stores feed the next's reads (the acc round-trip).
+    let mut all_gathers: Vec<TileId> = Vec::new();
+    let mut prev_store: Vec<TileId> = Vec::new();
+    for s in 0..ksteps {
+        // ── memory cluster: gather slice s (carried RAW [raw_seed, range] + the prior cluster). ──
+        let mut raw_s: Vec<TileId> = vec![raw_seed.dep(), kr.dep()];
+        raw_s.extend(entry);
+        let (op_s, gathers_s) = gather_slice(b, s, &raw_s);
+        all_gathers.extend(gathers_s.iter().copied());
+        entry = Some(cluster_boundary(b, br, &gathers_s));
+
+        // ── compute cluster: set_prio(1); the n_acc MFMAs of slice s; set_prio(0). ──
+        let prio1 = br.prio.then(|| b.set_prio(1, entry.as_slice()).dep());
+        let read_anchor = prio1.or(entry);
+        let acc_reads: Vec<Val<F32>> = (0..n_acc)
+            .map(|ij| {
+                let mut deps: Vec<TileId> =
+                    if s == 0 { vec![inited[ij].dep(), kr.dep()] } else { vec![prev_store[ij]] };
+                deps.extend(read_anchor);
+                b.load_frag_vec_after(accs[ij], &deps)
+            })
+            .collect();
+        let new = mma_slice(b, s, &op_s, &acc_reads);
+        let stores: Vec<Effect> = (0..n_acc).map(|ij| b.store_frag_vec(accs[ij], new[ij])).collect();
+        prev_store = stores.iter().map(|e| e.dep()).collect();
+        let prio0 = br.prio.then(|| b.set_prio(0, &prev_store).dep());
+        let comp_anchor: Vec<TileId> = prio0.map(|p| vec![p]).unwrap_or_else(|| prev_store.clone());
+        entry = Some(cluster_boundary(b, br, &comp_anchor));
+    }
+
+    // ── WAR barrier over EVERY slice's gathers (+ the last cluster), then commit k+1, then raw_next. ──
+    let mut war_deps: Vec<TileId> = all_gathers[1..].to_vec();
+    war_deps.extend(entry);
+    let war = b.barrier(Effect(all_gathers[0]), &war_deps);
+    let fill_next = commit(b, k_next, &reg_next, &[war.dep()]);
+    let fill_next_deps: Vec<TileId> = fill_next[1..].iter().map(|e| e.dep()).collect();
+    let raw_next = b.barrier(fill_next[0], &fill_next_deps);
+
+    // ── loop close: combine the last-slice stores + raw_next (LDS carry) under one End. ──
+    let last = Effect(prev_store[n_acc - 1]);
+    let mut carried: Vec<TileId> = prev_store[..n_acc - 1].to_vec();
+    carried.push(raw_next.dep());
+    let combined = b.combine(last, &carried);
+    let ended = b.end(combined, &[kr]);
+    let acc_loop: Vec<Frag<F32>> = accs.iter().map(|a| b.frag_after(*a, &[ended.dep()])).collect();
+
+    // ── epilogue: per-slice gather + MFMA the last block (via the End's carried RAW). No commit. ──
+    let mut ep_entry: Option<TileId> = None;
+    let mut ep_prev: Vec<TileId> = Vec::new();
+    for s in 0..ksteps {
+        let mut raw_s: Vec<TileId> = vec![ended.dep()];
+        raw_s.extend(ep_entry);
+        let (op_s, gathers_s) = gather_slice(b, s, &raw_s);
+        ep_entry = Some(cluster_boundary(b, br, &gathers_s));
+        let prio1 = br.prio.then(|| b.set_prio(1, ep_entry.as_slice()).dep());
+        let read_anchor = prio1.or(ep_entry);
+        let acc_reads: Vec<Val<F32>> = (0..n_acc)
+            .map(|ij| {
+                let mut deps: Vec<TileId> = if s == 0 { Vec::new() } else { vec![ep_prev[ij]] };
+                deps.extend(read_anchor);
+                b.load_frag_vec_after(acc_loop[ij], &deps)
+            })
+            .collect();
+        let new = mma_slice(b, s, &op_s, &acc_reads);
+        let stores: Vec<Effect> = (0..n_acc).map(|ij| b.store_frag_vec(acc_loop[ij], new[ij])).collect();
+        ep_prev = stores.iter().map(|e| e.dep()).collect();
+        let prio0 = br.prio.then(|| b.set_prio(0, &ep_prev).dep());
+        let comp_anchor: Vec<TileId> = prio0.map(|p| vec![p]).unwrap_or_else(|| ep_prev.clone());
+        ep_entry = Some(cluster_boundary(b, br, &comp_anchor));
+    }
+    acc_loop.iter().zip(ep_prev).map(|(a, s)| b.frag_after(*a, &[s])).collect()
+}
+
+/// The cluster boundary control (DESIGN §5c): a real workgroup `s_barrier` if
+/// `per_cluster_barrier` (3c), else a cheap `sched_fence(0)` if `cluster_fence`, else just the
+/// last effect (no separator). Returns the token the next cluster routes after.
+fn cluster_boundary(b: &mut Builder, br: Bracket, anchor: &[TileId]) -> TileId {
+    if br.per_cluster_barrier {
+        b.barrier(Effect(anchor[0]), &anchor[1..]).dep()
+    } else if br.cluster_fence {
+        b.sched_fence(0, anchor).dep()
+    } else {
+        *anchor.last().expect("cluster has at least one effect")
+    }
+}
+
 /// **K-blocked, LDS-staged, block-tiled** matmul (DESIGN.md §5b step 1b-ii — the
 /// occupancy win). Like [`matmul_lds_tiled`] (bm×bn tile, `(bm/16)×(bn/16)` reused
 /// accumulators) but the A/B strips are re-staged **per K-fragment inside the K-loop**
@@ -1104,6 +1263,7 @@ fn kblock_impl(
     wn: usize,
     k_step: usize,
     stages: usize,
+    bracket: Option<Bracket>,
 ) -> Program {
     assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
     assert!(k_step.is_multiple_of(EDGE) && k.is_multiple_of(k_step), "k_step multiple of 16, K multiple of k_step");
@@ -1111,6 +1271,9 @@ fn kblock_impl(
     assert!(stages == 1 || stages == 2, "kblock: stages ∈ {{1, 2}}");
     // stages=2 (register-staged pipeline) needs ≥2 K-blocks to overlap; single-block K = stages=1.
     let stages = if k / k_step >= 2 { stages } else { 1 };
+    // The clustered §5c schedule only applies at stages=2 (it decomposes the register-staged body);
+    // it falls back to the whole-block hooks when the pipeline collapses to stages=1.
+    let bracket = if stages == 2 { bracket } else { None };
     // Workgroup output tile = (bm·wm) × (bn·wn), computed by a wm×wn grid of 64-lane warps.
     let (big_m, big_n, nthreads) = (bm * wm, bn * wn, wm * wn * WARP);
     assert!(m.is_multiple_of(big_m) && n.is_multiple_of(big_n), "m/n must tile by (bm·wm)/(bn·wn)");
@@ -1173,108 +1336,169 @@ fn kblock_impl(
         })
         .collect();
 
-    // ── the K-reduction, via the map-reduce combinator (DESIGN §5b). The three hooks are
-    //    this kernel's fill / gather / MFMA; the combinator owns the loop + barriers + carry. ──
-    let acc_final = kloop(
-        &mut b,
-        k / k_step,
-        k_step,
-        stages,
-        &acc,
-        &inited,
-        // prefetch (global→VGPR): A b64 chunks + B micro-tile rows (or None → scalar B in commit).
-        // Also return the loaded value tiles as the load-pin anchors (DESIGN §5c/3a).
-        |b, k_base| {
-            let a = fill_lds_vec_prefetch(b, a, epl_a, tid, k_step as i64, tm_bm, k_base, k as i64);
-            let bt = b_transpose_vec_ok(k_step, big_n, nthreads).then(|| {
-                fill_lds_transpose_vec_prefetch(b, bmat, tid, nthreads, k_step, big_n, k_base, tn_bn, n as i64)
-            });
-            let mut anchors: Vec<TileId> = a.iter().map(|v| v.id).collect();
-            if let Some(bt) = &bt {
-                anchors.extend(bt.iter().flat_map(|row| row.iter().map(|v| v.id)));
-            }
-            (FillRegs { a, b: bt }, anchors)
-        },
-        // commit (VGPR→ds_write LDS): A + transposed B; the scalar B fallback fills from global here.
-        // `deps` (the WAR barrier, stages=2) rides on the LDS handle via `lds_after`, so the whole
-        // strip's commit is fenced after the previous block's gather — the fill fns stay dep-agnostic.
-        |b, k_base, reg, deps| {
-            let (a_dst, b_dst) =
-                if deps.is_empty() { (a_smem, b_smem) } else { (b.lds_after(a_smem, deps), b.lds_after(b_smem, deps)) };
-            let fa = fill_lds_vec_commit(b, a_dst, &reg.a, epl_a, tid, k_step as i64);
-            let fb = match &reg.b {
-                Some(bt) => fill_lds_transpose_vec_commit(b, b_dst, bt, tid, nthreads, k_step, big_n),
-                None => fill_lds_unrolled(b, b_dst, bmat, epl_b, tid, k_step as i64, k_base, tn_bn, n as i64, true),
-            };
-            fa.into_iter().chain(fb).collect()
-        },
-        // gather: the reused A[i][kf] (warp_row rows) + B[kf][j] (warp_col N-rows) fragments —
-        // scalar runs VectorizePass fuses. Returns the operand bundle + the gather (WAR) edges.
-        |b, _slot, raw| {
-            let a_frags: Vec<Vec<Frag<BF16>>> =
-                (0..ri).map(|_| (0..ksteps).map(|_| b.define_frag::<BF16>(a_map)).collect()).collect();
-            let b_frags: Vec<Vec<Frag<BF16>>> =
-                (0..ksteps).map(|_| (0..cj).map(|_| b.define_frag::<BF16>(bc_map)).collect()).collect();
-            let mut gathers: Vec<TileId> = Vec::new();
-            let a_vecs: Vec<Vec<Val<BF16>>> = (0..ri)
-                .map(|i| {
-                    (0..ksteps)
-                        .map(|kf| {
-                            let s = gather_frag_lds_run(
-                                b,
-                                a_frags[i][kf],
-                                a_smem,
-                                i * EDGE,
-                                warp_row_off,
-                                kf * EDGE,
-                                k_step,
-                                wlane,
-                                raw,
-                            );
-                            gathers.extend(s.iter().copied());
-                            b.load_frag_vec_after(a_frags[i][kf], &s)
-                        })
-                        .collect()
-                })
-                .collect();
-            let b_vecs: Vec<Vec<Val<BF16>>> = (0..ksteps)
-                .map(|kf| {
-                    (0..cj)
-                        .map(|j| {
-                            let s = gather_frag_lds_run(
-                                b,
-                                b_frags[kf][j],
-                                b_smem,
-                                j * EDGE,
-                                warp_col_off,
-                                kf * EDGE,
-                                k_step,
-                                wlane,
-                                raw,
-                            );
-                            gathers.extend(s.iter().copied());
-                            b.load_frag_vec_after(b_frags[kf][j], &s)
-                        })
-                        .collect()
-                })
-                .collect();
-            ((a_vecs, b_vecs), gathers)
-        },
-        // mma: chain `ksteps` MFMAs per accumulator over the block's K-fragments.
-        |b, (a_vecs, b_vecs), acc_reads| {
-            let mut out = Vec::with_capacity(ri * cj);
-            for i in 0..ri {
-                for j in 0..cj {
-                    let mut c_acc = acc_reads[i * cj + j];
-                    for kf in 0..ksteps {
-                        c_acc = b.mma(a_vecs[i][kf], b_vecs[kf][j], c_acc, ept);
+    // ── the K-reduction, via the map-reduce combinator (DESIGN §5b/§5c). The prefetch/commit
+    //    fills are shared; `bracket=None` runs the whole-block gather/mma (the 452-TF path,
+    //    byte-identical under hash-consing), `Some(br)` the per-slice clustered schedule (§5c). ──
+    // prefetch (global→VGPR): A b64 chunks + B micro-tile rows; returns the load-pin anchors.
+    let mut prefetch_fn = |b: &mut Builder, k_base: Idx| {
+        let a = fill_lds_vec_prefetch(b, a, epl_a, tid, k_step as i64, tm_bm, k_base, k as i64);
+        let bt = b_transpose_vec_ok(k_step, big_n, nthreads)
+            .then(|| fill_lds_transpose_vec_prefetch(b, bmat, tid, nthreads, k_step, big_n, k_base, tn_bn, n as i64));
+        let mut anchors: Vec<TileId> = a.iter().map(|v| v.id).collect();
+        if let Some(bt) = &bt {
+            anchors.extend(bt.iter().flat_map(|row| row.iter().map(|v| v.id)));
+        }
+        (FillRegs { a, b: bt }, anchors)
+    };
+    // commit (VGPR→ds_write LDS): the WAR `deps` ride the LDS handle via `lds_after`.
+    let mut commit_fn = |b: &mut Builder, k_base: Idx, reg: &FillRegs, deps: &[TileId]| {
+        let (a_dst, b_dst) =
+            if deps.is_empty() { (a_smem, b_smem) } else { (b.lds_after(a_smem, deps), b.lds_after(b_smem, deps)) };
+        let fa = fill_lds_vec_commit(b, a_dst, &reg.a, epl_a, tid, k_step as i64);
+        let fb = match &reg.b {
+            Some(bt) => fill_lds_transpose_vec_commit(b, b_dst, bt, tid, nthreads, k_step, big_n),
+            None => fill_lds_unrolled(b, b_dst, bmat, epl_b, tid, k_step as i64, k_base, tn_bn, n as i64, true),
+        };
+        fa.into_iter().chain(fb).collect()
+    };
+
+    let acc_final = match bracket {
+        // Whole-block hooks: gather all `ksteps` slices → chain all MFMAs (the stages≤2 base).
+        None => kloop(
+            &mut b,
+            k / k_step,
+            k_step,
+            stages,
+            &acc,
+            &inited,
+            &mut prefetch_fn,
+            &mut commit_fn,
+            |b, _slot, raw| {
+                let a_frags: Vec<Vec<Frag<BF16>>> =
+                    (0..ri).map(|_| (0..ksteps).map(|_| b.define_frag::<BF16>(a_map)).collect()).collect();
+                let b_frags: Vec<Vec<Frag<BF16>>> =
+                    (0..ksteps).map(|_| (0..cj).map(|_| b.define_frag::<BF16>(bc_map)).collect()).collect();
+                let mut gathers: Vec<TileId> = Vec::new();
+                let a_vecs: Vec<Vec<Val<BF16>>> = (0..ri)
+                    .map(|i| {
+                        (0..ksteps)
+                            .map(|kf| {
+                                let s = gather_frag_lds_run(
+                                    b,
+                                    a_frags[i][kf],
+                                    a_smem,
+                                    i * EDGE,
+                                    warp_row_off,
+                                    kf * EDGE,
+                                    k_step,
+                                    wlane,
+                                    raw,
+                                );
+                                gathers.extend(s.iter().copied());
+                                b.load_frag_vec_after(a_frags[i][kf], &s)
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let b_vecs: Vec<Vec<Val<BF16>>> = (0..ksteps)
+                    .map(|kf| {
+                        (0..cj)
+                            .map(|j| {
+                                let s = gather_frag_lds_run(
+                                    b,
+                                    b_frags[kf][j],
+                                    b_smem,
+                                    j * EDGE,
+                                    warp_col_off,
+                                    kf * EDGE,
+                                    k_step,
+                                    wlane,
+                                    raw,
+                                );
+                                gathers.extend(s.iter().copied());
+                                b.load_frag_vec_after(b_frags[kf][j], &s)
+                            })
+                            .collect()
+                    })
+                    .collect();
+                ((a_vecs, b_vecs), gathers)
+            },
+            |b, (a_vecs, b_vecs), acc_reads| {
+                let mut out = Vec::with_capacity(ri * cj);
+                for i in 0..ri {
+                    for j in 0..cj {
+                        let mut c_acc = acc_reads[i * cj + j];
+                        for kf in 0..ksteps {
+                            c_acc = b.mma(a_vecs[i][kf], b_vecs[kf][j], c_acc, ept);
+                        }
+                        out.push(c_acc);
                     }
-                    out.push(c_acc);
                 }
-            }
-            out
-        },
-    );
+                out
+            },
+        ),
+        // Per-slice clustered hooks: gather slice `s` (ri A + cj B) → one MFMA per accumulator.
+        Some(br) => kloop_2stage_clustered(
+            &mut b,
+            k / k_step,
+            k_step,
+            ksteps,
+            br,
+            &acc,
+            &inited,
+            &mut prefetch_fn,
+            &mut commit_fn,
+            |b, s, raw| {
+                let a_frags: Vec<Frag<BF16>> = (0..ri).map(|_| b.define_frag::<BF16>(a_map)).collect();
+                let b_frags: Vec<Frag<BF16>> = (0..cj).map(|_| b.define_frag::<BF16>(bc_map)).collect();
+                let mut gathers: Vec<TileId> = Vec::new();
+                let a_vecs: Vec<Val<BF16>> = (0..ri)
+                    .map(|i| {
+                        let st = gather_frag_lds_run(
+                            b,
+                            a_frags[i],
+                            a_smem,
+                            i * EDGE,
+                            warp_row_off,
+                            s * EDGE,
+                            k_step,
+                            wlane,
+                            raw,
+                        );
+                        gathers.extend(st.iter().copied());
+                        b.load_frag_vec_after(a_frags[i], &st)
+                    })
+                    .collect();
+                let b_vecs: Vec<Val<BF16>> = (0..cj)
+                    .map(|j| {
+                        let st = gather_frag_lds_run(
+                            b,
+                            b_frags[j],
+                            b_smem,
+                            j * EDGE,
+                            warp_col_off,
+                            s * EDGE,
+                            k_step,
+                            wlane,
+                            raw,
+                        );
+                        gathers.extend(st.iter().copied());
+                        b.load_frag_vec_after(b_frags[j], &st)
+                    })
+                    .collect();
+                ((a_vecs, b_vecs), gathers)
+            },
+            |b, _s, (a_vecs, b_vecs), acc_reads| {
+                let mut out = Vec::with_capacity(ri * cj);
+                for i in 0..ri {
+                    for j in 0..cj {
+                        out.push(b.mma(a_vecs[i], b_vecs[j], acc_reads[i * cj + j], ept));
+                    }
+                }
+                out
+            },
+        ),
+    };
 
     // ── post-loop: each accumulator scatters its final value to C. ──
     let n_c = b.idx_const(n as i64);
@@ -1303,7 +1527,7 @@ fn kblock_impl(
 /// K_STEP=16 — the first tk2 matmul to beat naive at scale. See [`kblock_impl`]. Compose
 /// `.apply(`[`SwizzlePass`](crate::passes::SwizzlePass)`)` for the bank-swizzled variant.
 pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, 1, 1, EDGE, 1)
+    kblock_impl(m, n, k, bm, bn, 1, 1, EDGE, 1, None)
 }
 
 /// **Multi-warp** K-blocked matmul (DESIGN.md §5b, the bigger-tile lever): a `wm×wn` grid
@@ -1323,7 +1547,7 @@ pub fn matmul_lds_kblock_mw(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 1)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 1, None)
 }
 
 /// **Register-staged pipelined** multi-warp K-blocked matmul (`stages=2`, DESIGN §5b): the
@@ -1342,7 +1566,27 @@ pub fn matmul_lds_kblock_mw_pipe(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, None)
+}
+
+/// The **clustered** register-staged pipeline (DESIGN §5c/3b): [`matmul_lds_kblock_mw_pipe`]'s
+/// tile + stages=2 overlap, but the steady body is decomposed into per-slice memory/compute
+/// clusters with the schedule-steering [`Bracket`] placed by one combinator rule (`sched_fence`
+/// load-pin + cluster separators, optional `set_prio`, optional per-cluster barrier) — the
+/// coherent-schedule cure for LLVM sinking the prefetch loads. `br` is the harness-swept policy.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_lds_kblock_mw_clustered(
+    m: usize,
+    n: usize,
+    k: usize,
+    bm: usize,
+    bn: usize,
+    wm: usize,
+    wn: usize,
+    k_step: usize,
+    br: Bracket,
+) -> Program {
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, Some(br))
 }
 
 /// The **vectorised** K-blocked kernel: the scalar-gather base with
@@ -1368,5 +1612,5 @@ pub fn matmul_lds_kblock_sw(m: usize, n: usize, k: usize, bm: usize, bn: usize, 
 /// swizzle. `k_step ∈ {16,32,64}` if swizzling; bigger `k_step` = fewer barriers, more LDS
 /// + operand VGPR (the occupancy trade the harness resolves).
 pub fn matmul_lds_kblock_ks(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, 1, 1, k_step, 1)
+    kblock_impl(m, n, k, bm, bn, 1, 1, k_step, 1, None)
 }

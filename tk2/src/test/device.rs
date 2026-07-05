@@ -116,6 +116,51 @@ fn matmul_pipeline_stages2_is_bit_exact_on_gfx942() {
     }
 }
 
+/// The **clustered §5c schedule** correctness gate: the per-slice memory/compute cluster
+/// decomposition + the `Bracket` sched controls must be invariant to correctness (a carry or
+/// acc-round-trip slip shows as a wrong C). Swept over the bracket flags, base AND vec+swizzle.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::matmul_clustered --nocapture`
+#[test]
+#[ignore]
+fn matmul_clustered_bracket_sweep_is_bit_exact_on_gfx942() {
+    use crate::kernels::Bracket;
+    use svod_tensor::testing::allclose_f32;
+    let (m, n, k) = (128usize, 128, 256);
+    let dev = svod_dtype::default_device::default_device();
+    let mut a = Tensor::rand_with(&[m, k], DType::BFloat16, dev.clone()).expect("rand a");
+    let mut b = Tensor::rand_with(&[k, n], DType::BFloat16, dev).expect("rand b");
+    a.realize().expect("realize a");
+    b.realize().expect("realize b");
+    let bf = b.cast(DType::Float32).expect("b→f32");
+    let mut rt = a.cast(DType::Float32).expect("a→f32").matmul(&bf).expect("ref matmul");
+    rt.realize().expect("realize ref");
+    let expected = rt.as_vec::<f32>().expect("read ref");
+    let atol = 0.02 * (k as f32).sqrt();
+
+    let base = Bracket::default();
+    let brackets = [
+        ("pin+fence", base),
+        ("+prio", Bracket { prio: true, ..base }),
+        ("+cbar", Bracket { per_cluster_barrier: true, ..base }),
+    ];
+    for (label, br) in brackets {
+        for (suffix, apply_passes) in [("base", false), ("vec+sw", true)] {
+            let mut prog = crate::kernels::matmul_lds_kblock_mw_clustered(m, n, k, 64, 64, 2, 2, 64, br);
+            if apply_passes {
+                prog = prog.apply(VectorizePass).apply(SwizzlePass);
+            }
+            let out = Tensor::empty(&[m, n], DType::Float32);
+            let mut y = graph_kernel(prog, out, &[&a, &b]).expect("wrap");
+            let plan = y.prepare().expect("prepare");
+            plan.execute().expect("execute");
+            let got = y.as_vec::<f32>().expect("read output");
+            let report = allclose_f32(&got, &expected, atol, 2e-2);
+            println!("clustered {label}/{suffix} {m}×{n}×{k}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+            assert!(report.ok, "clustered {label}/{suffix} must match reference: {}", report.message);
+        }
+    }
+}
+
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::sum_reduce_runs_on_gfx942 --nocapture`
 #[test]
 #[ignore]

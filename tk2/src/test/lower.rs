@@ -210,6 +210,33 @@ fn matmul_lds_kblock_pipe_lowers_and_splits_prologue_steady_epilogue() {
 }
 
 #[test]
+fn matmul_lds_kblock_clustered_lowers_and_places_the_bracket() {
+    // The §5c clustered schedule (2×2 → 128², 4 K-blocks, ksteps=4): per-slice memory/compute
+    // clusters with the Bracket placed by rule must lower spec-valid, and the sched controls must
+    // appear/disappear with the flags (correctness invariant to all of them).
+    use crate::kernels::Bracket;
+    let count = |p: &crate::Program, pred: &dyn Fn(&Node) -> bool| {
+        (0..p.ir.len()).filter(|&i| pred(p.ir.node(crate::ir::TileId(i as u32)))).count()
+    };
+    // load_pin + cluster_fence, no prio: every SchedFence present, no SetPrio.
+    let base = Bracket { load_pin: true, cluster_fence: true, prio: false, per_cluster_barrier: false };
+    let p = crate::kernels::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64, base);
+    lower::verify(&p).expect("clustered matmul must lower to spec-valid UOp");
+    assert!(count(&p, &|n| matches!(n, Node::SchedFence { .. })) > 0, "cluster_fence ⇒ SchedFence nodes");
+    assert_eq!(count(&p, &|n| matches!(n, Node::SetPrio { .. })), 0, "prio off ⇒ no SetPrio");
+    // + prio: SetPrio appears; still bit-exact-shaped (verify).
+    let prio = Bracket { prio: true, ..base };
+    let pp = crate::kernels::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64, prio);
+    lower::verify(&pp).expect("clustered+prio must lower spec-valid");
+    assert!(count(&pp, &|n| matches!(n, Node::SetPrio { .. })) > 0, "prio on ⇒ SetPrio nodes");
+    // Composes with the refinement passes (the per-slice gather stays the fusible LdsCol form).
+    let sw = crate::kernels::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64, base)
+        .apply(crate::passes::VectorizePass)
+        .apply(crate::passes::SwizzlePass);
+    lower::verify(&sw).expect("clustered.apply(Vectorize).apply(Swizzle) must lower spec-valid");
+}
+
+#[test]
 fn matmul_lds_kblock_carries_two_barriers_per_kstep() {
     // Structural: the single-buffer WAR needs a RAW fence (after fill) AND a WAR fence
     // (after the LDS reads) — at least two Barriers in the K-loop body.

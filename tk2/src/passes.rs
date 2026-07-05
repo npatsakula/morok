@@ -521,6 +521,11 @@ impl Fold for VecGather {
                 ir.intern(Node::Barrier { body, deps })
             }
             Node::Sink { roots } => ir.intern(Node::Sink { roots: dedup(&roots) }),
+            // Schedule controls anchored on the collapsed scalar gather stores: dedup the now-
+            // coincident fused ids (§5c cluster fences ride the same edges the gather stores did).
+            Node::SchedFence { mask, deps } => ir.intern(Node::SchedFence { mask, deps: dedup(&deps) }),
+            Node::SetPrio { level, deps } => ir.intern(Node::SetPrio { level, deps: dedup(&deps) }),
+            Node::WaveBarrier { eq, deps } => ir.intern(Node::WaveBarrier { eq, deps: dedup(&deps) }),
             other => ir.intern(other),
         }
     }
