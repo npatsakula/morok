@@ -74,14 +74,14 @@ fn gfx9_layout_per_block_records() {
     let grid = PmcGrid { xcc: 8, se: 4, sa: 1, wgp: 1 };
     let counters = [
         PmcCounter::SqWaves,            // SQ per-SE: xcc*se = 32 records
-        PmcCounter::SqBusyCycles,       // SQ per-SIMD: xcc*se*4 = 128 records
-        PmcCounter::ValuMfmaBusyCycles, // SQ per-SIMD: 128 records
+        PmcCounter::SqBusyCycles,       // SQ per-SE (simd_mask=0xf aggregates SIMDs): 32 records
+        PmcCounter::ValuMfmaBusyCycles, // SQ per-SE: 32 records
         PmcCounter::GrbmGuiActive,      // GRBM per-XCC: xcc = 8 records
         PmcCounter::L2Hit,              // TCC: xcc*16 = 128 records
         PmcCounter::L2Miss,             // TCC: 128 records
     ];
     let layout = PmcLayout::plan(&arch, &counters, &grid);
-    let expected = [32usize, 128, 128, 8, 128, 128];
+    let expected = [32usize, 32, 32, 8, 128, 128];
     let mut off = 0usize;
     for (rec, &recs) in layout.recs.iter().zip(&expected) {
         assert_eq!(rec.records, recs);
