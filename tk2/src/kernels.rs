@@ -778,6 +778,60 @@ pub fn matmul_lds_tiled(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> P
     Program { ir, sink, name: "tk2_matmul_tiled".into() }
 }
 
+/// The **K-reduction map-reduce combinator** (DESIGN §5b — the first-class loop, so
+/// ping-pong is a `stages` field, not a fragile whole-loop `.apply` pass). It owns the
+/// structural skeleton — the `Range`/`End`, the per-block K base `tk·k_step`, the RAW
+/// (post-fill) + WAR (post-gather) barriers, the loop-carried accumulator reads
+/// (`[init, range, war]`) and their `combine`d `End`, and the post-loop `frag_after` — while
+/// the caller supplies the three kernel-specific hooks: `stage` (global→LDS fill, returns its
+/// fence edges; the first is the barrier head), `gather` (LDS→fragment reads, returns the
+/// operand bundle `Op` + its fence edges), and `mma` (the MFMA chains over the carried
+/// accumulators). This is `stages=1` — the single-buffer kernel; `stages=2` (ping-pong) will
+/// reuse the SAME three hooks under a prologue/steady/epilogue expansion with a `buf%2`
+/// rotation (the `slot` argument, ignored here). Returns the accumulators re-bound after the
+/// loop `End` (for the caller's scatter).
+#[allow(clippy::too_many_arguments)]
+fn kloop<Op>(
+    b: &mut Builder,
+    nblocks: usize,
+    k_step: usize,
+    accs: &[Frag<F32>],
+    inited: &[Effect],
+    mut stage: impl FnMut(&mut Builder, Idx, usize) -> Vec<Effect>,
+    mut gather: impl FnMut(&mut Builder, usize, Effect) -> (Op, Vec<TileId>),
+    mut mma: impl FnMut(&mut Builder, &Op, &[Val<F32>]) -> Vec<Val<F32>>,
+) -> Vec<Frag<F32>> {
+    let kr = b.range(nblocks as i64);
+    let tk = b.counter(kr);
+    let ks_c = b.idx_const(k_step as i64);
+    let k_base = b.idx_mul(tk, ks_c); // K-block base: tk·k_step
+
+    // fill the K-block strip into LDS → RAW fence (the whole strip staged before any gather).
+    let fill = stage(b, k_base, 0);
+    let fill_deps: Vec<TileId> = fill[1..].iter().map(|e| e.dep()).collect();
+    let raw = b.barrier(fill[0], &fill_deps);
+
+    // gather the reused fragments → WAR fence (every lane read before the next block's fill).
+    let (op, gathers) = gather(b, 0, raw);
+    let war = b.barrier(Effect(gathers[0]), &gathers[1..]);
+
+    // carried accumulator reads route [init, range, WAR]; chain the MFMAs; store back.
+    let acc_reads: Vec<Val<F32>> = accs
+        .iter()
+        .enumerate()
+        .map(|(i, a)| b.load_frag_vec_after(*a, &[inited[i].dep(), kr.dep(), war.dep()]))
+        .collect();
+    let new = mma(b, &op, &acc_reads);
+    let stores: Vec<Effect> = accs.iter().zip(new).map(|(a, v)| b.store_frag_vec(*a, v)).collect();
+
+    // one `End` per RANGE: combine the accumulators' stores into the last, close around it.
+    let last = *stores.last().expect("at least one accumulator");
+    let others: Vec<TileId> = stores[..stores.len() - 1].iter().map(|e| e.dep()).collect();
+    let combined = b.combine(last, &others);
+    let ended = b.end(combined, &[kr]);
+    accs.iter().map(|a| b.frag_after(*a, &[ended.dep()])).collect()
+}
+
 /// **K-blocked, LDS-staged, block-tiled** matmul (DESIGN.md §5b step 1b-ii — the
 /// occupancy win). Like [`matmul_lds_tiled`] (bm×bn tile, `(bm/16)×(bn/16)` reused
 /// accumulators) but the A/B strips are re-staged **per K-fragment inside the K-loop**
@@ -860,114 +914,98 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, wm: usize, wn
         })
         .collect();
 
-    // ── K-loop over K/k_step blocks; re-stage the k_step-wide strips each iteration. ──
-    let kr = b.range((k / k_step) as i64);
-    let tk = b.counter(kr);
-    let ks_c = b.idx_const(k_step as i64);
-    let tk_ks = b.idx_mul(tk, ks_c); // K-block column/row base: tk·k_step
-
-    // Fill A[bm,k_step] (LDS rows = M, cols = K; K-col base tk·k_step, stride K) and B
-    // **transposed** into b_smem[bn,k_step] (LDS rows = N, cols = K) so B's ept run is
-    // contiguous and vectorises like A — global K = tk·k_step + col, N = tn·bn + row, stride N.
-    let mut fill_stores: Vec<TileId> = Vec::with_capacity(epl_a / 4 + epl_b);
-    // A (Row, contiguous both sides) fills vectorised in b64 chunks. B (transposed) needs a
-    // register transpose to vectorise across its differing global/LDS axes — used when the
-    // strip tiles exactly, else the scalar fill (§5b).
-    let fa = fill_lds_vec(&mut b, a_smem, a, epl_a, tid, k_step as i64, tm_bm, tk_ks, k as i64);
-    let fb = if b_transpose_vec_ok(k_step, big_n, nthreads) {
-        fill_lds_transpose_vec(&mut b, b_smem, bmat, tid, nthreads, k_step, big_n, tk_ks, tn_bn, n as i64)
-    } else {
-        fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, tid, k_step as i64, tk_ks, tn_bn, n as i64, true)
-    };
-    let fill_head = fa[0];
-    fill_stores.extend(fa.iter().skip(1).chain(fb.iter()).map(|e| e.dep()));
-    // RAW fence: the whole strip is staged before any lane gathers a fragment.
-    let fill_bar = b.barrier(fill_head, &fill_stores);
-
-    // ── read the reused fragments from LDS (after the RAW fence): A[i][kf], B[kf][j].
-    //    Each A-fragment is reused across all cols j, each B-fragment across all rows i;
-    //    pre-gathering the whole block lets the WAR fence route into the accumulator reads. ──
-    let a_frags: Vec<Vec<Frag<BF16>>> =
-        (0..ri).map(|_| (0..ksteps).map(|_| b.define_frag::<BF16>(a_map)).collect()).collect();
-    let b_frags: Vec<Vec<Frag<BF16>>> =
-        (0..ksteps).map(|_| (0..cj).map(|_| b.define_frag::<BF16>(bc_map)).collect()).collect();
-    let mut gathers: Vec<TileId> = Vec::new();
-    let a_vecs: Vec<Vec<Val<BF16>>> = (0..ri)
-        .map(|i| {
-            (0..ksteps)
+    // ── the K-reduction, via the map-reduce combinator (DESIGN §5b). The three hooks are
+    //    this kernel's fill / gather / MFMA; the combinator owns the loop + barriers + carry. ──
+    let acc_final = kloop(
+        &mut b,
+        k / k_step,
+        k_step,
+        &acc,
+        &inited,
+        // stage: fill A (vectorised b64) + B (register-transpose or scalar) into LDS at K = k_base.
+        |b, k_base, _slot| {
+            let fa = fill_lds_vec(b, a_smem, a, epl_a, tid, k_step as i64, tm_bm, k_base, k as i64);
+            let fb = if b_transpose_vec_ok(k_step, big_n, nthreads) {
+                fill_lds_transpose_vec(b, b_smem, bmat, tid, nthreads, k_step, big_n, k_base, tn_bn, n as i64)
+            } else {
+                fill_lds_unrolled(b, b_smem, bmat, epl_b, tid, k_step as i64, k_base, tn_bn, n as i64, true)
+            };
+            fa.into_iter().chain(fb).collect()
+        },
+        // gather: the reused A[i][kf] (warp_row rows) + B[kf][j] (warp_col N-rows) fragments —
+        // scalar runs VectorizePass fuses. Returns the operand bundle + the gather (WAR) edges.
+        |b, _slot, raw| {
+            let a_frags: Vec<Vec<Frag<BF16>>> =
+                (0..ri).map(|_| (0..ksteps).map(|_| b.define_frag::<BF16>(a_map)).collect()).collect();
+            let b_frags: Vec<Vec<Frag<BF16>>> =
+                (0..ksteps).map(|_| (0..cj).map(|_| b.define_frag::<BF16>(bc_map)).collect()).collect();
+            let mut gathers: Vec<TileId> = Vec::new();
+            let a_vecs: Vec<Vec<Val<BF16>>> = (0..ri)
+                .map(|i| {
+                    (0..ksteps)
+                        .map(|kf| {
+                            let s = gather_frag_lds_run(
+                                b,
+                                a_frags[i][kf],
+                                a_smem,
+                                i * EDGE,
+                                warp_row_off,
+                                kf * EDGE,
+                                k_step,
+                                wlane,
+                                raw,
+                            );
+                            gathers.extend(s.iter().copied());
+                            b.load_frag_vec_after(a_frags[i][kf], &s)
+                        })
+                        .collect()
+                })
+                .collect();
+            let b_vecs: Vec<Vec<Val<BF16>>> = (0..ksteps)
                 .map(|kf| {
-                    // A-frag (i,kf): this warp's rows (warp_row·bm) + sub-tile row-block i.
-                    // Scalar run (the base); VectorizePass fuses it to one ds_read_b64.
-                    let s = gather_frag_lds_run(
-                        &mut b,
-                        a_frags[i][kf],
-                        a_smem,
-                        i * EDGE,
-                        warp_row_off,
-                        kf * EDGE,
-                        k_step,
-                        wlane,
-                        fill_bar,
-                    );
-                    gathers.extend(s.iter().copied());
-                    b.load_frag_vec_after(a_frags[i][kf], &s)
+                    (0..cj)
+                        .map(|j| {
+                            let s = gather_frag_lds_run(
+                                b,
+                                b_frags[kf][j],
+                                b_smem,
+                                j * EDGE,
+                                warp_col_off,
+                                kf * EDGE,
+                                k_step,
+                                wlane,
+                                raw,
+                            );
+                            gathers.extend(s.iter().copied());
+                            b.load_frag_vec_after(b_frags[kf][j], &s)
+                        })
+                        .collect()
                 })
-                .collect()
-        })
-        .collect();
-    let b_vecs: Vec<Vec<Val<BF16>>> = (0..ksteps)
-        .map(|kf| {
-            (0..cj)
-                .map(|j| {
-                    // B-frag (kf,j): this warp's N-rows (warp_col·bn) + sub-tile col-block j
-                    // (b_smem[big_n,k_step] transposed). VectorizePass fuses it to ds_read_b64.
-                    let s = gather_frag_lds_run(
-                        &mut b,
-                        b_frags[kf][j],
-                        b_smem,
-                        j * EDGE,
-                        warp_col_off,
-                        kf * EDGE,
-                        k_step,
-                        wlane,
-                        fill_bar,
-                    );
-                    gathers.extend(s.iter().copied());
-                    b.load_frag_vec_after(b_frags[kf][j], &s)
-                })
-                .collect()
-        })
-        .collect();
-
-    // WAR fence: every lane finished reading LDS before the next K-block's fill.
-    let war_head = Effect(gathers[0]);
-    let war_bar = b.barrier(war_head, &gathers[1..]);
-
-    // ── per accumulator, chain `ksteps` MFMAs (D = A·B + C over the block's K-fragments);
-    //    the acc read routes through the WAR fence + its init/range loop-carry edges. ──
-    let mut stores: Vec<Effect> = Vec::with_capacity(ri * cj);
-    for i in 0..ri {
-        for j in 0..cj {
-            let idx = i * cj + j;
-            let mut c_acc = b.load_frag_vec_after(acc[idx], &[inited[idx].dep(), kr.dep(), war_bar.dep()]);
-            for kf in 0..ksteps {
-                c_acc = b.mma(a_vecs[i][kf], b_vecs[kf][j], c_acc, ept);
+                .collect();
+            ((a_vecs, b_vecs), gathers)
+        },
+        // mma: chain `ksteps` MFMAs per accumulator over the block's K-fragments.
+        |b, (a_vecs, b_vecs), acc_reads| {
+            let mut out = Vec::with_capacity(ri * cj);
+            for i in 0..ri {
+                for j in 0..cj {
+                    let mut c_acc = acc_reads[i * cj + j];
+                    for kf in 0..ksteps {
+                        c_acc = b.mma(a_vecs[i][kf], b_vecs[kf][j], c_acc, ept);
+                    }
+                    out.push(c_acc);
+                }
             }
-            stores.push(b.store_frag_vec(acc[idx], c_acc));
-        }
-    }
-    let last = *stores.last().expect("at least one accumulator");
-    let others: Vec<TileId> = stores[..stores.len() - 1].iter().map(|e| e.dep()).collect();
-    let combined = b.combine(last, &others);
-    let ended = b.end(combined, &[kr]);
+            out
+        },
+    );
 
-    // ── post-loop: each accumulator reads its final value, scatters to C. ──
+    // ── post-loop: each accumulator scatters its final value to C. ──
     let n_c = b.idx_const(n as i64);
     let mut roots = Vec::new();
     for i in 0..ri {
         for j in 0..cj {
             let idx = i * cj + j;
-            let acc_final = b.frag_after(acc[idx], &[ended.dep()]);
             // C row/col = workgroup origin + this warp's sub-tile offset + fragment block i/j.
             let i16 = b.idx_const((i * EDGE) as i64);
             let row = b.idx_add(tm_bm, i16);
@@ -977,7 +1015,7 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, wm: usize, wn
             let col = b.idx_add(tn_bn, j16);
             let col = add_opt(&mut b, col, warp_col_off);
             let base_c = b.idx_add(row_n, col);
-            roots.extend(scatter_frag(&mut b, acc_final, c, base_c, n as i64, wlane));
+            roots.extend(scatter_frag(&mut b, acc_final[idx], c, base_c, n as i64, wlane));
         }
     }
 
