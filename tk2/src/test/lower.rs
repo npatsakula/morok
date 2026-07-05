@@ -136,13 +136,18 @@ fn matmul_lds_kblock_ks64_lowering_is_spec_valid() {
 }
 
 #[test]
-fn matmul_kblock_a_gather_is_vectorised() {
-    // The A (Row) gather is one `<ept×bf16>` LoadVecAt (→ ds_read_b64), not ept scalar
-    // loads — spec-valid + carries the vector LOAD op.
+fn matmul_kblock_gathers_are_vectorised() {
+    // BOTH operand gathers are one `<ept×bf16>` LoadVecAt (→ ds_read_b64), not ept scalar
+    // loads: A (Row) runs along its k_step columns; B (Col), staged transposed as
+    // b_smem[bn,k_step], runs along its k_step rows. For a 64×64 tile at K_STEP=16 that is
+    // `ri·ksteps` (4) A gathers + `ksteps·cj` (4) B gathers = 8 vector LDS loads, and the
+    // gather emits no `store_frag_elem` (every fragment write is a vector store).
+    use crate::ir::{Node as N, TileId};
     let p = crate::kernels::matmul_lds_kblock_ks(64, 64, 64, 64, 64, 16);
-    let has_vecat = (0..p.ir.len()).any(|i| matches!(p.ir.node(crate::ir::TileId(i as u32)), Node::LoadVecAt { .. }));
-    assert!(has_vecat, "the A gather must emit a vector LoadVecAt");
-    lower::verify(&p).expect("A-vectorised matmul must lower to spec-valid UOp");
+    let count = |pred: &dyn Fn(&N) -> bool| (0..p.ir.len()).filter(|&i| pred(p.ir.node(TileId(i as u32)))).count();
+    let vecat = count(&|n| matches!(n, N::LoadVecAt { .. }));
+    assert_eq!(vecat, 8, "both A and B gathers must each emit a vector LoadVecAt (4 + 4)");
+    lower::verify(&p).expect("vectorised matmul must lower to spec-valid UOp");
 }
 
 #[test]

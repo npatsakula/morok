@@ -170,6 +170,20 @@ The HK/CK/tk **XOR bank swizzle** (`swizzle_col`, kernels.rs): for a single-subt
 
 **Finding the `.apply` A/B made trivial (base vs `.apply(SwizzlePass)`): at K_STEP=64 the FLAT base is FASTER than swizzled** — N=1024 45.6 vs 83.8µs, N=2048 179 vs 214µs. The swizzle's per-access XOR addressing bloats VGPR 96→172 and costs more than the conflicts it removes (bankconf 6.2→0.73, yet flat wins — conflicts are NOT binding). **The swizzle is currently a pessimisation** — only visible once it's a separable pass, not woven in. It pays later (swizzle-at-KPack-granularity *with* vectorisation); for now `.apply(SwizzlePass)` is optional and the harness says leave it off. (Also note: the flat ks64 base at 45.6µs@1024 is the fastest small-N kernel yet — I'd only ever benched the *swizzled* ks64 before.) **NEXT (unchanged): vectorisation** — emit vector-index mem ops + `devectorize` (below-boundary reuse; NOT `heuristics.rs`, which is the optimizer's axis-selection tk2 replaces), swizzle-at-vector-granularity, B[N,K] transpose. Then it too is an `.apply` refinement.
 
+### Vectorised gathers (A + B) shipped — and swizzle FLIPS from pessimisation to 2× win (the composition thesis, measured)
+
+Both operand gathers are now ONE `<ept×bf16>` LDS vector load (`Node::LoadVecAt` → **`ds_read_b64`**) instead of `ept` scalar `ds_read`s. A (Row) already ran contiguous along its `k_step` columns; **B (Col) needed a transpose** — stage `b_smem` as `[bn, k_step]` (LDS row = N, col = K; `fill_lds_unrolled(transpose=true)` maps global K→col, N→row) so B's ept run walks the contiguous inner axis too. One `gather_frag_lds_vec` now serves both via `map.transpose` (picks which lane-coord is the fixed `outer` vs the run). **Crucially the vec gather routes its run-start through `LdsCol`** (not a flat base) so vectorisation and swizzle *compose*: the swizzle `delta` is `ept`-aligned (`>>7<<3>>1` ⇒ ×4 = ept) and the run-start is ept-aligned, so `(wc+t)^delta == (wc^delta)+t` — the b64 chunk relocates as a unit, the run stays contiguous. (This also fixed a latent break: the earlier flat A-vec gather silently mismatched the swizzled A-fill — host tests can't see it, only the device correctness gate; the `LdsCol` routing repairs it. Bit-exact now, flat + swizzle, N=64…512, K_STEP 16/64.)
+
+**Harness (bm=bn=64, base vs `.apply(SwizzlePass)`, both vectorised, both bit-exact):**
+
+| N | flat-vec `ks64` | swizzle-vec `sw64` | speedup |
+|---|---|---|---|
+| 1024 | 50.8 µs | 47.6 µs | 1.07× |
+| 2048 | 257 µs | **129 µs** | **1.99×** |
+| 4096 | 1949 µs (70 TF) | **921 µs (149 TF)** | **2.12×** |
+
+**The prior finding inverts.** With *scalar* gathers, swizzle was a pessimisation (its per-access XOR VALU exceeded the conflict benefit; conflicts weren't binding). With *vectorised b64* gathers, the wide reads make bank conflicts the binding constraint, and swizzle removes them: at fixed (vectorised) state, **swizzle is ~2× faster than flat at scale**. This is the design thesis — vectorisation and swizzle *compose* — validated on device: ~149 TF at 4096, roughly 2× the prior best (~70 TF) and ~39% of tk's ~380 TF compiler-visible ceiling (was ~24%). Production config is now **vectorised + swizzled**; the flat path only wins the grid-starved small-N corner marginally. **NEXT: fill vectorisation** (the fill still emits `epl` scalar global-load + `ds_write` per lane — emit wide vector runs + add `devectorize`/`pm_render` to the lowering path to split b128), then package the whole gather+fill+swizzle bundle as a `VectorizePass` refinement; then bigger tile + register-staged prefetch for occupancy at low N, then `sched_group_barrier`.
+
 ---
 
 ## 6. Cross-cutting: registers, ownership, the AGPR gap

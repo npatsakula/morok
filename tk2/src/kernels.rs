@@ -312,10 +312,13 @@ fn fill_lds(
 }
 
 /// Unrolled collaborative global→LDS fill (NO inner range — usable inside the K-loop
-/// without a loop nest): each lane writes `epl` elements `flat = lane·epl + e`, mapping
-/// LDS position `flat` to global `(tile_row_base + flat/cols_lds)·grow_stride +
-/// tile_col_base + flat%cols_lds`. `tile_col_base`/`tile_row_base` may be per-K-block
-/// (carry the loop counter) so the strip is re-staged each iteration. Returns the `epl`
+/// without a loop nest): each lane writes `epl` elements `flat = lane·epl + e` into the
+/// LDS tile position `flat` (logical `[.., cols_lds]`, `r = flat/cols_lds`, `c =
+/// flat%cols_lds`). The **global** element is `(tile_row_base + gr)·grow_stride +
+/// tile_col_base + gc`, where `(gr, gc) = (r, c)` for a straight fill or `(c, r)` when
+/// `transpose` (so a `[bn, k_step]` LDS tile is filled from the `[K, N]` B strip: the LDS
+/// row `r` is the N coordinate, the LDS col `c` is the K coordinate). `tile_*_base` may
+/// carry the K-loop counter so the strip is re-staged each iteration. Returns the `epl`
 /// store effects to fence with a barrier.
 #[allow(clippy::too_many_arguments)]
 fn fill_lds_unrolled(
@@ -328,6 +331,7 @@ fn fill_lds_unrolled(
     tile_row_base: Idx,
     tile_col_base: Idx,
     grow_stride: i64,
+    transpose: bool,
 ) -> Vec<Effect> {
     let epl_c = b.idx_const(epl as i64);
     let lane_epl = b.idx_mul(lane, epl_c);
@@ -339,10 +343,12 @@ fn fill_lds_unrolled(
             let flat = b.idx_add(lane_epl, ec);
             let r = b.idx_div(flat, cols_c);
             let c = b.idx_mod(flat, cols_c);
-            let grow = b.idx_add(tile_row_base, r);
+            // Global coord: (r, c) straight, or (c, r) transposed (B's [bn,k_step] tile).
+            let (gr, gc) = if transpose { (c, r) } else { (r, c) };
+            let grow = b.idx_add(tile_row_base, gr);
             let goff = b.idx_mul(grow, gstride);
             let goff = b.idx_add(goff, tile_col_base);
-            let goff = b.idx_add(goff, c);
+            let goff = b.idx_add(goff, gc);
             let v = b.load(src, goff);
             // LDS store position `r·cols + LdsCol(r, c)` — flat by default, or the bank
             // swizzle once `SwizzlePass` materialises the LdsCol (a composable refinement).
@@ -354,84 +360,53 @@ fn fill_lds_unrolled(
         .collect()
 }
 
-/// Gather one 16×16 bf16 fragment from an already-staged LDS tile `lds` into `dst`,
-/// ordered after the fill `bar`. The tile origin is compile-time `(row_base, col_base)`
-/// in a `[.., cols]` LDS tile (the K-blocked strip's per-fragment offset), so the full
-/// in-tile coord is `(row_base + frag_row, col_base + frag_col)` and the LDS offset is
-/// `wr·cols + (wc | swizzle_col(wr,wc,cols))`. `swizzle` must match the fill.
-#[allow(clippy::too_many_arguments)]
-fn gather_frag_lds_sw(
-    b: &mut Builder,
-    dst: Frag<BF16>,
-    lds: Lds<BF16>,
-    row_base: usize,
-    col_base: usize,
-    cols: usize,
-    lane: Idx,
-    bar: Effect,
-) -> Vec<TileId> {
-    let cols_c = b.idx_const(cols as i64);
-    (0..dst.map.ept)
-        .map(|inner| {
-            let inner_idx = b.idx_const(inner as i64);
-            let (frag_row, frag_col) = b.lane_rc(dst.map, lane, inner_idx);
-            // Whole-tile (row, col) — the swizzle XORs the *whole* column as a unit
-            // (col_base spans multiple 16-fragments in the B strip), so fold the const base in.
-            let wr = if row_base == 0 {
-                frag_row
-            } else {
-                let rb = b.idx_const(row_base as i64);
-                b.idx_add(frag_row, rb)
-            };
-            let wc = if col_base == 0 {
-                frag_col
-            } else {
-                let cb = b.idx_const(col_base as i64);
-                b.idx_add(frag_col, cb)
-            };
-            // `wr·cols + LdsCol(wr, wc)` — flat until `SwizzlePass` swizzles the LdsCol.
-            let col_part = b.lds_col(wr, wc, cols);
-            let row_off = b.idx_mul(wr, cols_c);
-            let off = b.idx_add(row_off, col_part);
-            let v = b.load_lds_after(lds, off, &[bar.dep()]);
-            b.store_frag_elem(dst, inner_idx, v).dep()
-        })
-        .collect()
+/// `idx + base` (folding the `base == 0` identity so the flat path stays clean).
+fn offset_by(b: &mut Builder, idx: Idx, base: usize) -> Idx {
+    if base == 0 {
+        idx
+    } else {
+        let c = b.idx_const(base as i64);
+        b.idx_add(idx, c)
+    }
 }
 
-/// **Vectorised** gather of one 16×16 A (Row) fragment: the `ept` run is contiguous
-/// columns (`lane_rc` col = base + inner), so ONE `<ept×bf16>` LDS load at the run start
-/// ([`Node::LoadVecAt`] → `ds_read_b64`) + ONE vector store into `dst` replaces the `ept`
-/// scalar loads/stores of [`gather_frag_lds_sw`]. Returns the single store effect (the WAR
-/// edge). B (Col) is strided so it stays scalar until the `b_smem[bn,k_step]` transpose.
+/// **Vectorised** gather of one 16×16 fragment from an `[outer, inner]` row-major LDS tile
+/// whose **inner** axis is the fragment's contiguous `ept` run: ONE `<ept×bf16>` LDS load
+/// at the run start ([`Node::LoadVecAt`] → `ds_read_b64`) + ONE vector store into `dst`
+/// replaces the `ept` scalar loads. It serves **both** operands because each maps its ept
+/// run onto the inner axis — A (Row) runs along its `k_step` columns; B (Col), staged
+/// **transposed** as `b_smem[bn, k_step]`, runs along its `k_step` rows — so `map.transpose`
+/// alone picks which lane-coordinate is the fixed `outer` and which is the run.
+///
+/// The run start goes through [`Builder::lds_col`] (identity until [`SwizzlePass`]), so
+/// vectorisation and swizzle **compose**: the swizzle `delta` is `ept`-aligned (`>>7<<3>>1`
+/// ⇒ a multiple of 4 = ept) and the run start is `ept`-aligned, so `(wc+t)^delta ==
+/// (wc^delta)+t` for `t ∈ 0..ept` — the b64 chunk relocates as a unit and the run stays
+/// contiguous. `outer_base`/`run_base` are the fragment's tile origins along each axis;
+/// `inner` is the inner (`k_step`) dimension length (the LDS row stride). Returns the store
+/// effect (the WAR edge).
 #[allow(clippy::too_many_arguments)]
 fn gather_frag_lds_vec(
     b: &mut Builder,
     dst: Frag<BF16>,
     lds: Lds<BF16>,
-    row_base: usize,
-    col_base: usize,
-    cols: usize,
+    outer_base: usize,
+    run_base: usize,
+    inner: usize,
     lane: Idx,
     bar: Effect,
 ) -> TileId {
     let zero = b.idx_const(0);
-    let (frag_row, frag_col0) = b.lane_rc(dst.map, lane, zero); // the run start (inner = 0)
-    let wr = if row_base == 0 {
-        frag_row
-    } else {
-        let rb = b.idx_const(row_base as i64);
-        b.idx_add(frag_row, rb)
-    };
-    let wc = if col_base == 0 {
-        frag_col0
-    } else {
-        let cb = b.idx_const(col_base as i64);
-        b.idx_add(frag_col0, cb)
-    };
-    let cols_c = b.idx_const(cols as i64);
-    let row_off = b.idx_mul(wr, cols_c);
-    let base = b.idx_add(row_off, wc);
+    let (frag_row, frag_col) = b.lane_rc(dst.map, lane, zero); // the run start (inner = 0)
+    // Col-layout (B) runs its ept along rows → outer = col; Row-layout (A) runs along
+    // columns → outer = row. `inner` is the k_step axis in both.
+    let (outer_frag, run_frag) = if dst.map.transpose { (frag_col, frag_row) } else { (frag_row, frag_col) };
+    let outer = offset_by(b, outer_frag, outer_base);
+    let run = offset_by(b, run_frag, run_base);
+    let col_part = b.lds_col(outer, run, inner); // flat until SwizzlePass relocates the b64 chunk
+    let inner_c = b.idx_const(inner as i64);
+    let row_off = b.idx_mul(outer, inner_c);
+    let base = b.idx_add(row_off, col_part);
     let v = b.load_lds_vec_after(lds, base, dst.map.ept, &[bar.dep()]);
     b.store_frag_vec(dst, v).dep()
 }
@@ -736,10 +711,12 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
     let ks_c = b.idx_const(k_step as i64);
     let tk_ks = b.idx_mul(tk, ks_c); // K-block column/row base: tk·k_step
 
-    // Fill A[bm,k_step] (K-col base tk·k_step, stride K) and B[k_step,bn] (K-row base, stride N).
+    // Fill A[bm,k_step] (LDS rows = M, cols = K; K-col base tk·k_step, stride K) and B
+    // **transposed** into b_smem[bn,k_step] (LDS rows = N, cols = K) so B's ept run is
+    // contiguous and vectorises like A — global K = tk·k_step + col, N = tn·bn + row, stride N.
     let mut fill_stores: Vec<TileId> = Vec::with_capacity(epl_a + epl_b);
-    let fa = fill_lds_unrolled(&mut b, a_smem, a, epl_a, lane, k_step as i64, tm_bm, tk_ks, k as i64);
-    let fb = fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, lane, bn as i64, tk_ks, tn_bn, n as i64);
+    let fa = fill_lds_unrolled(&mut b, a_smem, a, epl_a, lane, k_step as i64, tm_bm, tk_ks, k as i64, false);
+    let fb = fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, lane, k_step as i64, tk_ks, tn_bn, n as i64, true);
     let fill_head = fa[0];
     fill_stores.extend(fa.iter().skip(1).chain(fb.iter()).map(|e| e.dep()));
     // RAW fence: the whole strip is staged before any lane gathers a fragment.
@@ -779,11 +756,20 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
         .map(|kf| {
             (0..cj)
                 .map(|j| {
-                    // B-frag (kf,j): b_smem[k_step,bn] K-block kf, col-block j (cols bn).
-                    let st =
-                        gather_frag_lds_sw(&mut b, b_frags[kf][j], b_smem, kf * EDGE, j * EDGE, bn, lane, fill_bar);
-                    gathers.extend(st.iter().copied());
-                    b.load_frag_vec_after(b_frags[kf][j], &st)
+                    // B-frag (kf,j): b_smem[bn,k_step] (transposed) col-block j, K-block kf.
+                    // Vectorised (contiguous k_step run) → one ds_read_b64 + one vector store.
+                    let s = gather_frag_lds_vec(
+                        &mut b,
+                        b_frags[kf][j],
+                        b_smem,
+                        j * EDGE,
+                        kf * EDGE,
+                        k_step,
+                        lane,
+                        fill_bar,
+                    );
+                    gathers.push(s);
+                    b.load_frag_vec_after(b_frags[kf][j], &[s])
                 })
                 .collect()
         })
