@@ -98,12 +98,19 @@ fn bench_matmul(c: &mut Criterion) {
         assert_correct(&ysw, &psw, &expected, n, "kblock_sw64");
         group.bench_with_input(BenchmarkId::new("kblock_sw64", n), &n, |bch, _| bench_plan(bch, &psw));
 
-        // Multi-warp: a 2×2 warp grid → one 128×128 workgroup tile (vectorised + swizzled),
-        // amortising the two barriers over 4× more MFMAs (the bigger-tile lever).
-        let mw = matmul_lds_kblock_mw(n, n, n, 64, 64, 2, 2, 64).apply(VectorizePass).apply(SwizzlePass);
-        let (ymw, pmw) = plan_of(mw, n, n, &a, &b);
+        // Multi-warp bigger tiles (vectorised + swizzled), the barrier-amortisation lever:
+        // a 2×2 warp grid → 128×128, a 4×4 grid → 256×256. Each wins in its own N regime
+        // (enough workgroups to fill 304 CUs): 128² at mid-N, 256² at large-N (385 TF@4096 —
+        // tk's ceiling). The crossover is why production needs shape dispatch.
+        let mw128 = matmul_lds_kblock_mw(n, n, n, 64, 64, 2, 2, 64).apply(VectorizePass).apply(SwizzlePass);
+        let (ymw, pmw) = plan_of(mw128, n, n, &a, &b);
         assert_correct(&ymw, &pmw, &expected, n, "kblock_mw128");
         group.bench_with_input(BenchmarkId::new("kblock_mw128", n), &n, |bch, _| bench_plan(bch, &pmw));
+
+        let mw256 = matmul_lds_kblock_mw(n, n, n, 64, 64, 4, 4, 64).apply(VectorizePass).apply(SwizzlePass);
+        let (ymw2, pmw2) = plan_of(mw256, n, n, &a, &b);
+        assert_correct(&ymw2, &pmw2, &expected, n, "kblock_mw256");
+        group.bench_with_input(BenchmarkId::new("kblock_mw256", n), &n, |bch, _| bench_plan(bch, &pmw2));
     }
     group.finish();
 }
