@@ -235,6 +235,21 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();
             get(low, body).barrier(deps)
         }
+        // A machine-scheduler fence (`sched.barrier`) → a void `Op::Custom` whose `deps` are the
+        // ordering anchors (the mask is Rust-substituted, so no `{N}` placeholders → deps are
+        // pure happens-after). The AMDGPU backend hoists+dedups the `declare`.
+        Node::SchedFence { mask, deps } => {
+            let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();
+            let code = format!(
+                "declare void @llvm.amdgcn.sched.barrier(i32)\ncall void @llvm.amdgcn.sched.barrier(i32 {mask})"
+            );
+            UOp::custom(deps, code, DType::Void)
+        }
+        // `s_setprio level` as inline `asm sideeffect` — schedule-opaque, pins its own position.
+        Node::SetPrio { level, deps } => {
+            let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();
+            UOp::custom(deps, format!("call void asm sideeffect \"s_setprio {level}\", \"\"()"), DType::Void)
+        }
         Node::After { val, deps } => {
             let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();
             get(low, val).after(deps)

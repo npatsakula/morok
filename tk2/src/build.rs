@@ -369,6 +369,25 @@ impl Builder {
         Effect(self.ir.intern(Node::Barrier { body: body.0, deps }))
     }
 
+    /// A **machine-scheduler fence** (`sched.barrier(mask)`, DESIGN §5c) positioned right after
+    /// `anchors` — the load-pin that keeps the register-staged prefetch in flight: `anchors` are
+    /// the prefetch load values, so the fence sits just past them and the AMDGPU scheduler may
+    /// not sink them below it. Route the fence's [`Effect`] into a downstream consumer's deps to
+    /// keep it live and force the rest of the body after it. `mask = 0` = a total fence.
+    pub fn sched_fence(&mut self, mask: i64, anchors: &[TileId]) -> Effect {
+        let deps = anchors.iter().copied().collect();
+        Effect(self.ir.intern(Node::SchedFence { mask, deps }))
+    }
+
+    /// A **wave issue-priority** control (`s_setprio level`, DESIGN §5c), positioned after `after`.
+    /// Bracket an MFMA cluster `set_prio(1, [entry]) … set_prio(0, [mma results])` so the compute
+    /// wave wins SIMD issue over the co-resident loading wave. Route its [`Effect`] into a
+    /// downstream consumer to keep it live and ordered.
+    pub fn set_prio(&mut self, level: i64, after: &[TileId]) -> Effect {
+        let deps = after.iter().copied().collect();
+        Effect(self.ir.intern(Node::SetPrio { level, deps }))
+    }
+
     // ── elementwise binary ops (dtype-matched by construction) ───────────────
 
     pub fn add<E: Elem>(&mut self, a: Val<E>, b: Val<E>) -> Val<E> {

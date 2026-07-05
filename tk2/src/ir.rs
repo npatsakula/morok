@@ -248,6 +248,22 @@ pub enum Node {
     /// exact class §2.1 targets), so the barrier is structural, not implicit. Mirrors
     /// tk's `store.barrier(deps)` idiom (`tk/src/kernel.rs`).
     Barrier { body: TileId, deps: Edges },
+    /// A **machine-scheduler fence** (`@llvm.amdgcn.sched.barrier(mask)`, DESIGN §5c): a
+    /// void side-effect the AMDGPU scheduler may not move any instruction across (mask 0 =
+    /// total). Positioned in the instruction stream *right after* `deps` (its ordering
+    /// anchors — typically the prefetch loads), so a later consumer routed after it cannot
+    /// float above it and the anchored loads cannot sink below it — the **load-pin** that
+    /// keeps the register-staged prefetch in flight across the MFMAs (the measured cure for
+    /// LLVM sinking the loads to the loop tail). Unlike [`Node::Barrier`] this is NOT a
+    /// workgroup sync — it is purely a compiler scheduling boundary. Kept live + ordered by
+    /// a downstream consumer that lists it in *its* deps.
+    SchedFence { mask: i64, deps: Edges },
+    /// A **wave issue-priority** control (`s_setprio level`, DESIGN §5c): a void side-effect
+    /// positioned after `deps`. Bracketing an MFMA cluster with `set_prio(1) … set_prio(0)`
+    /// makes the compute wave win SIMD issue over the co-resident loading wave (the systolic
+    /// array stays fed). Emitted as `asm sideeffect` (schedule-opaque by construction), so it
+    /// pins its own position. Arch-gated (§2.8): a no-op where the arch has no priority model.
+    SetPrio { level: i64, deps: Edges },
     /// Ordering edge: `val` is routed through completion of every dep in `deps`.
     After { val: TileId, deps: Edges },
     /// Close `ranges` loop(s) around effect `body` (one `End` per `Range`).
@@ -398,6 +414,8 @@ impl TileIr {
             Node::Barrier { body, deps } => {
                 Node::Barrier { body: f(body), deps: deps.into_iter().map(&mut f).collect() }
             }
+            Node::SchedFence { mask, deps } => Node::SchedFence { mask, deps: deps.into_iter().map(&mut f).collect() },
+            Node::SetPrio { level, deps } => Node::SetPrio { level, deps: deps.into_iter().map(&mut f).collect() },
             Node::After { val, deps } => Node::After { val: f(val), deps: deps.into_iter().map(&mut f).collect() },
             Node::End { body, ranges } => Node::End { body: f(body), ranges: ranges.into_iter().map(&mut f).collect() },
             Node::Sink { roots } => Node::Sink { roots: roots.into_iter().map(&mut f).collect() },
@@ -460,6 +478,8 @@ impl TileIr {
             | Node::StoreRegVec { .. }
             | Node::StoreVecAt { .. }
             | Node::Barrier { .. }
+            | Node::SchedFence { .. }
+            | Node::SetPrio { .. }
             | Node::End { .. }
             | Node::Sink { .. } => TileMeta::effect(),
         }

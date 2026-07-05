@@ -934,7 +934,7 @@ fn kloop<Op, Reg>(
     stages: usize,
     accs: &[Frag<F32>],
     inited: &[Effect],
-    prefetch: impl FnMut(&mut Builder, Idx) -> Reg,
+    prefetch: impl FnMut(&mut Builder, Idx) -> (Reg, Vec<TileId>),
     commit: impl FnMut(&mut Builder, Idx, &Reg, &[TileId]) -> Vec<Effect>,
     gather: impl FnMut(&mut Builder, usize, &[TileId]) -> (Op, Vec<TileId>),
     mma: impl FnMut(&mut Builder, &Op, &[Val<F32>]) -> Vec<Val<F32>>,
@@ -955,7 +955,7 @@ fn kloop_1stage<Op, Reg>(
     k_step: usize,
     accs: &[Frag<F32>],
     inited: &[Effect],
-    mut prefetch: impl FnMut(&mut Builder, Idx) -> Reg,
+    mut prefetch: impl FnMut(&mut Builder, Idx) -> (Reg, Vec<TileId>),
     mut commit: impl FnMut(&mut Builder, Idx, &Reg, &[TileId]) -> Vec<Effect>,
     mut gather: impl FnMut(&mut Builder, usize, &[TileId]) -> (Op, Vec<TileId>),
     mut mma: impl FnMut(&mut Builder, &Op, &[Val<F32>]) -> Vec<Val<F32>>,
@@ -966,8 +966,9 @@ fn kloop_1stage<Op, Reg>(
     let k_base = b.idx_mul(tk, ks_c); // K-block base: tk·k_step
 
     // fill the K-block strip into LDS: prefetch (global→VGPR) then commit (VGPR→ds_write),
-    // fused at stages=1 → RAW fence (the whole strip staged before any gather).
-    let reg = prefetch(b, k_base);
+    // fused at stages=1 → RAW fence (the whole strip staged before any gather). No load-pin at
+    // stages=1 (the fill is consumed this same iteration by design — no cross-block overlap).
+    let (reg, _anchors) = prefetch(b, k_base);
     let fill = commit(b, k_base, &reg, &[]);
     let fill_deps: Vec<TileId> = fill[1..].iter().map(|e| e.dep()).collect();
     let raw = b.barrier(fill[0], &fill_deps);
@@ -1010,7 +1011,7 @@ fn kloop_2stage<Op, Reg>(
     k_step: usize,
     accs: &[Frag<F32>],
     inited: &[Effect],
-    mut prefetch: impl FnMut(&mut Builder, Idx) -> Reg,
+    mut prefetch: impl FnMut(&mut Builder, Idx) -> (Reg, Vec<TileId>),
     mut commit: impl FnMut(&mut Builder, Idx, &Reg, &[TileId]) -> Vec<Effect>,
     mut gather: impl FnMut(&mut Builder, usize, &[TileId]) -> (Op, Vec<TileId>),
     mut mma: impl FnMut(&mut Builder, &Op, &[Val<F32>]) -> Vec<Val<F32>>,
@@ -1019,9 +1020,11 @@ fn kloop_2stage<Op, Reg>(
     let ks_c = b.idx_const(k_step as i64);
     let one = b.idx_const(1);
 
-    // ── prologue: commit block 0 into LDS (plain, no WAR — nothing to overwrite yet). ──
+    // ── prologue: commit block 0 into LDS (plain, no WAR — nothing to overwrite yet). No pin:
+    //    the prologue loads are committed immediately, before the loop, so they need not stay
+    //    in flight. ──
     let zero = b.idx_const(0);
-    let reg0 = prefetch(b, zero);
+    let (reg0, _) = prefetch(b, zero);
     let fill0 = commit(b, zero, &reg0, &[]);
     let fill0_deps: Vec<TileId> = fill0[1..].iter().map(|e| e.dep()).collect();
     let raw_seed = b.barrier(fill0[0], &fill0_deps);
@@ -1033,7 +1036,9 @@ fn kloop_2stage<Op, Reg>(
     let k_next = b.idx_mul(k_next_idx, ks_c); // next block base: (tk+1)·k_step
 
     // prefetch block k+1 EARLY (global→VGPR, in-flight across the MFMAs) — the latency hide.
-    let reg_next = prefetch(b, k_next);
+    // (The `anchors` — prefetch load tiles — feed the cluster combinator's load-pin; a lone
+    // `sched_fence` here regresses, so single-buffer stages=2 stays fence-free. See §5c/3b.)
+    let (reg_next, _anchors) = prefetch(b, k_next);
 
     // gather block k via the loop-carried RAW ([raw_seed, range] → the previous commit).
     let (op, gathers) = gather(b, 0, &[raw_seed.dep(), kr.dep()]);
@@ -1178,12 +1183,17 @@ fn kblock_impl(
         &acc,
         &inited,
         // prefetch (global→VGPR): A b64 chunks + B micro-tile rows (or None → scalar B in commit).
+        // Also return the loaded value tiles as the load-pin anchors (DESIGN §5c/3a).
         |b, k_base| {
             let a = fill_lds_vec_prefetch(b, a, epl_a, tid, k_step as i64, tm_bm, k_base, k as i64);
             let bt = b_transpose_vec_ok(k_step, big_n, nthreads).then(|| {
                 fill_lds_transpose_vec_prefetch(b, bmat, tid, nthreads, k_step, big_n, k_base, tn_bn, n as i64)
             });
-            FillRegs { a, b: bt }
+            let mut anchors: Vec<TileId> = a.iter().map(|v| v.id).collect();
+            if let Some(bt) = &bt {
+                anchors.extend(bt.iter().flat_map(|row| row.iter().map(|v| v.id)));
+            }
+            (FillRegs { a, b: bt }, anchors)
         },
         // commit (VGPR→ds_write LDS): A + transposed B; the scalar B fallback fills from global here.
         // `deps` (the WAR barrier, stages=2) rides on the LDS handle via `lds_after`, so the whole
