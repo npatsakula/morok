@@ -370,10 +370,14 @@ fn fill_lds_unrolled(
 /// never straddles a row). B stays on the scalar [`fill_lds_unrolled`] — its transpose makes
 /// the global read strided, so it can't be a contiguous vector load. Returns the chunk store
 /// effects to fence.
+/// The **prefetch** half (global→VGPR): issue the `epl/VEC` coalesced b64 global `load_vec`s
+/// into registers, no LDS write. Returns the loaded chunks in `cc` order for [`fill_lds_vec_commit`]
+/// (which shares the addressing nodes via hash-consing, so prefetch-then-commit == the old
+/// fused fill bit-for-bit). Splitting them lets a `stages=2` pipeline hoist the load ahead of
+/// the MFMAs (register-staged prefetch; §5b).
 #[allow(clippy::too_many_arguments)]
-fn fill_lds_vec(
+fn fill_lds_vec_prefetch(
     b: &mut Builder,
-    lds: Lds<BF16>,
     src: Buf<BF16>,
     epl: usize,
     lane: Idx,
@@ -381,7 +385,7 @@ fn fill_lds_vec(
     tile_row_base: Idx,
     tile_col_base: Idx,
     grow_stride: i64,
-) -> Vec<Effect> {
+) -> Vec<Val<BF16>> {
     const VEC: usize = 4; // b64 = 4 bf16 (KPack / swizzle granularity)
     assert!(
         epl.is_multiple_of(VEC) && (cols_lds as usize).is_multiple_of(VEC),
@@ -402,12 +406,29 @@ fn fill_lds_vec(
             let goff = b.idx_mul(grow, gstride);
             let goff = b.idx_add(goff, tile_col_base);
             let goff = b.idx_add(goff, c);
-            let v = b.load_vec(src, goff, VEC);
-            // LDS: `r·cols + LdsCol(r, c)` — flat until SwizzlePass relocates the b64 chunk.
+            b.load_vec(src, goff, VEC)
+        })
+        .collect()
+}
+
+/// The **commit** half (VGPR→LDS): `ds_write_b64` each prefetched chunk into LDS at
+/// `r·cols + LdsCol(r, c)` (swizzle-safe b64 granularity). `loaded` is [`fill_lds_vec_prefetch`]'s
+/// output; the `r`/`c` addressing hash-cons-shares that half's nodes. Returns the store effects.
+fn fill_lds_vec_commit(b: &mut Builder, lds: Lds<BF16>, loaded: &[Val<BF16>], epl: usize, lane: Idx, cols_lds: i64) -> Vec<Effect> {
+    const VEC: usize = 4;
+    let epl_c = b.idx_const(epl as i64);
+    let lane_epl = b.idx_mul(lane, epl_c);
+    let cols_c = b.idx_const(cols_lds);
+    (0..epl / VEC)
+        .map(|cc| {
+            let ec = b.idx_const((cc * VEC) as i64);
+            let flat = b.idx_add(lane_epl, ec);
+            let r = b.idx_div(flat, cols_c);
+            let c = b.idx_mod(flat, cols_c);
             let col = b.lds_col(r, c, cols_lds as usize);
             let rc = b.idx_mul(r, cols_c);
             let dst_off = b.idx_add(rc, col);
-            b.store_lds_vec(lds, dst_off, v)
+            b.store_lds_vec(lds, dst_off, loaded[cc])
         })
         .collect()
 }
@@ -429,10 +450,12 @@ fn b_transpose_vec_ok(k_step: usize, bn: usize, nthreads: usize) -> bool {
 /// register shuffle replacing `2·VEC²` scalar load/stores. The LDS row (N) still exchanges
 /// across lanes in shared memory; the register transpose only reconciles the fill's own
 /// load/store axes. Gated by [`b_transpose_vec_ok`]. Returns the store effects to fence.
+/// The **prefetch** half of the register-transpose B fill (global→VGPR): per `VEC×VEC`
+/// micro-tile, load the `VEC` coalesced b64 rows into registers. Returns them per micro-tile
+/// for [`fill_lds_transpose_vec_commit`] (the register transpose + `ds_write` half).
 #[allow(clippy::too_many_arguments)]
-fn fill_lds_transpose_vec(
+fn fill_lds_transpose_vec_prefetch(
     b: &mut Builder,
-    lds: Lds<BF16>,
     src: Buf<BF16>,
     tid: Idx,
     nthreads: usize,
@@ -441,32 +464,55 @@ fn fill_lds_transpose_vec(
     k_base: Idx,
     n_base: Idx,
     grow_stride: i64,
+) -> Vec<Vec<Val<BF16>>> {
+    const VEC: usize = 4;
+    let nb_count = bn / VEC;
+    let per_lane = k_step * bn / (VEC * VEC) / nthreads;
+    let (nb_c, vec_c, gstride) = (b.idx_const(nb_count as i64), b.idx_const(VEC as i64), b.idx_const(grow_stride));
+    (0..per_lane)
+        .map(|t| {
+            let bi = offset_by(b, tid, t * nthreads);
+            let kb = b.idx_div(bi, nb_c);
+            let nb = b.idx_mod(bi, nb_c);
+            let k0 = b.idx_mul(kb, vec_c);
+            let n0 = b.idx_mul(nb, vec_c);
+            (0..VEC)
+                .map(|i| {
+                    let ic = b.idx_const(i as i64);
+                    let ki = b.idx_add(k0, ic);
+                    let ki = b.idx_add(k_base, ki);
+                    let goff = b.idx_mul(ki, gstride);
+                    let goff = b.idx_add(goff, n_base);
+                    let goff = b.idx_add(goff, n0);
+                    b.load_vec(src, goff, VEC)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The **commit** half: register-transpose each micro-tile's rows (`vec_extract` a column,
+/// `vec_build` it) and `ds_write_b64` to the transposed LDS. `loaded` is the prefetch output;
+/// the `kb`/`nb`/`k0`/`n0` addressing hash-cons-shares that half's nodes.
+fn fill_lds_transpose_vec_commit(
+    b: &mut Builder,
+    lds: Lds<BF16>,
+    loaded: &[Vec<Val<BF16>>],
+    tid: Idx,
+    nthreads: usize,
+    k_step: usize,
+    bn: usize,
 ) -> Vec<Effect> {
     const VEC: usize = 4;
-    let nb_count = bn / VEC; // micro-tiles along N
-    let per_lane = k_step * bn / (VEC * VEC) / nthreads;
-    let (nb_c, vec_c, kstep_c, gstride) =
-        (b.idx_const(nb_count as i64), b.idx_const(VEC as i64), b.idx_const(k_step as i64), b.idx_const(grow_stride));
-    let mut stores = Vec::with_capacity(per_lane * VEC);
-    for t in 0..per_lane {
-        // This thread's micro-tile bi = t·nthreads + tid → block coords (kb, nb) → origin (k0, n0).
+    let nb_count = bn / VEC;
+    let (nb_c, vec_c, kstep_c) = (b.idx_const(nb_count as i64), b.idx_const(VEC as i64), b.idx_const(k_step as i64));
+    let mut stores = Vec::with_capacity(loaded.len() * VEC);
+    for (t, rows) in loaded.iter().enumerate() {
         let bi = offset_by(b, tid, t * nthreads);
         let kb = b.idx_div(bi, nb_c);
         let nb = b.idx_mod(bi, nb_c);
         let k0 = b.idx_mul(kb, vec_c);
         let n0 = b.idx_mul(nb, vec_c);
-        // Load VEC coalesced b64 rows: row i = B[k_base + k0 + i][n_base + n0 .. +VEC].
-        let rows: Vec<Val<BF16>> = (0..VEC)
-            .map(|i| {
-                let ic = b.idx_const(i as i64);
-                let ki = b.idx_add(k0, ic);
-                let ki = b.idx_add(k_base, ki);
-                let goff = b.idx_mul(ki, gstride);
-                let goff = b.idx_add(goff, n_base);
-                let goff = b.idx_add(goff, n0);
-                b.load_vec(src, goff, VEC)
-            })
-            .collect();
         // Transpose in registers + store VEC b64 to LDS row (n0+j), k_step run k0..k0+VEC.
         for j in 0..VEC {
             let col: Vec<Val<BF16>> = rows.iter().map(|&r| b.vec_extract(r, j)).collect();
@@ -778,6 +824,15 @@ pub fn matmul_lds_tiled(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> P
     Program { ir, sink, name: "tk2_matmul_tiled".into() }
 }
 
+/// The register-staged fill bundle carried between [`kloop`]'s prefetch and commit hooks:
+/// A's b64 chunks and (vectorised path) B's per-micro-tile rows, held in VGPRs. `b = None`
+/// selects the scalar B fallback (committed straight from global). At `stages=2` the prefetch
+/// runs a K-block ahead of the commit so the global-load latency overlaps the MFMAs.
+struct FillRegs {
+    a: Vec<Val<BF16>>,
+    b: Option<Vec<Vec<Val<BF16>>>>,
+}
+
 /// The **K-reduction map-reduce combinator** (DESIGN §5b — the first-class loop, so
 /// ping-pong is a `stages` field, not a fragile whole-loop `.apply` pass). It owns the
 /// structural skeleton — the `Range`/`End`, the per-block K base `tk·k_step`, the RAW
@@ -791,23 +846,28 @@ pub fn matmul_lds_tiled(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> P
 /// rotation (the `slot` argument, ignored here). Returns the accumulators re-bound after the
 /// loop `End` (for the caller's scatter).
 #[allow(clippy::too_many_arguments)]
-fn kloop<Op>(
+fn kloop<Op, Reg>(
     b: &mut Builder,
     nblocks: usize,
     k_step: usize,
+    stages: usize,
     accs: &[Frag<F32>],
     inited: &[Effect],
-    mut stage: impl FnMut(&mut Builder, Idx, usize) -> Vec<Effect>,
+    mut prefetch: impl FnMut(&mut Builder, Idx) -> Reg,
+    mut commit: impl FnMut(&mut Builder, Idx, &Reg) -> Vec<Effect>,
     mut gather: impl FnMut(&mut Builder, usize, Effect) -> (Op, Vec<TileId>),
     mut mma: impl FnMut(&mut Builder, &Op, &[Val<F32>]) -> Vec<Val<F32>>,
 ) -> Vec<Frag<F32>> {
+    assert_eq!(stages, 1, "kloop: only stages=1 is implemented (the stages=2 pipeline is phase 2b)");
     let kr = b.range(nblocks as i64);
     let tk = b.counter(kr);
     let ks_c = b.idx_const(k_step as i64);
     let k_base = b.idx_mul(tk, ks_c); // K-block base: tk·k_step
 
-    // fill the K-block strip into LDS → RAW fence (the whole strip staged before any gather).
-    let fill = stage(b, k_base, 0);
+    // fill the K-block strip into LDS: prefetch (global→VGPR) then commit (VGPR→ds_write),
+    // fused at stages=1 → RAW fence (the whole strip staged before any gather).
+    let reg = prefetch(b, k_base);
+    let fill = commit(b, k_base, &reg);
     let fill_deps: Vec<TileId> = fill[1..].iter().map(|e| e.dep()).collect();
     let raw = b.barrier(fill[0], &fill_deps);
 
@@ -920,15 +980,22 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, wm: usize, wn
         &mut b,
         k / k_step,
         k_step,
+        1, // stages=1 (single-buffer); stages=2 register-staged prefetch is phase 2b
         &acc,
         &inited,
-        // stage: fill A (vectorised b64) + B (register-transpose or scalar) into LDS at K = k_base.
-        |b, k_base, _slot| {
-            let fa = fill_lds_vec(b, a_smem, a, epl_a, tid, k_step as i64, tm_bm, k_base, k as i64);
-            let fb = if b_transpose_vec_ok(k_step, big_n, nthreads) {
-                fill_lds_transpose_vec(b, b_smem, bmat, tid, nthreads, k_step, big_n, k_base, tn_bn, n as i64)
-            } else {
-                fill_lds_unrolled(b, b_smem, bmat, epl_b, tid, k_step as i64, k_base, tn_bn, n as i64, true)
+        // prefetch (global→VGPR): A b64 chunks + B micro-tile rows (or None → scalar B in commit).
+        |b, k_base| {
+            let a = fill_lds_vec_prefetch(b, a, epl_a, tid, k_step as i64, tm_bm, k_base, k as i64);
+            let bt = b_transpose_vec_ok(k_step, big_n, nthreads)
+                .then(|| fill_lds_transpose_vec_prefetch(b, bmat, tid, nthreads, k_step, big_n, k_base, tn_bn, n as i64));
+            FillRegs { a, b: bt }
+        },
+        // commit (VGPR→ds_write LDS): A + transposed B; the scalar B fallback fills from global here.
+        |b, k_base, reg| {
+            let fa = fill_lds_vec_commit(b, a_smem, &reg.a, epl_a, tid, k_step as i64);
+            let fb = match &reg.b {
+                Some(bt) => fill_lds_transpose_vec_commit(b, b_smem, bt, tid, nthreads, k_step, big_n),
+                None => fill_lds_unrolled(b, b_smem, bmat, epl_b, tid, k_step as i64, k_base, tn_bn, n as i64, true),
             };
             fa.into_iter().chain(fb).collect()
         },
