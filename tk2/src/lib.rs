@@ -30,7 +30,8 @@ pub use error::{Error, Result};
 pub use graph::graph_kernel;
 pub use ir::{Node, TileId, TileIr};
 pub use kernels::{
-    Program, elementwise_add, lds_roundtrip, matmul, matmul_lds, matmul_lds_kblock, matmul_lds_tiled, sum_reduce,
+    Program, elementwise_add, lds_roundtrip, matmul, matmul_lds, matmul_lds_kblock, matmul_lds_kblock_sw,
+    matmul_lds_tiled, sum_reduce,
 };
 pub use pass::{Band, Fold, Pass, Pipeline, Strategy};
 pub use passes::{ConstFoldPass, UnrollPass, optimize_addressing};

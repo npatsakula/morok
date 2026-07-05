@@ -220,6 +220,15 @@ impl Builder {
     pub fn idx_div(&mut self, a: Idx, b: Idx) -> Idx {
         Idx(self.ir.intern(Node::IndexAlu { op: IndexOp::Div, a: a.0, b: b.0 }))
     }
+    pub fn idx_xor(&mut self, a: Idx, b: Idx) -> Idx {
+        Idx(self.ir.intern(Node::IndexAlu { op: IndexOp::Xor, a: a.0, b: b.0 }))
+    }
+    pub fn idx_shr(&mut self, a: Idx, b: Idx) -> Idx {
+        Idx(self.ir.intern(Node::IndexAlu { op: IndexOp::Shr, a: a.0, b: b.0 }))
+    }
+    pub fn idx_shl(&mut self, a: Idx, b: Idx) -> Idx {
+        Idx(self.ir.intern(Node::IndexAlu { op: IndexOp::Shl, a: a.0, b: b.0 }))
+    }
 
     /// The per-lane `(row, col)` within a base fragment — tk's `lane_rc`
     /// (`tk/src/group/mod.rs`) for the gfx942 non-interleaved MFMA fragment, built

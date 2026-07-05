@@ -98,6 +98,14 @@ fn matmul_carries_wmma_and_loop_edges() {
 }
 
 #[test]
+fn matmul_lds_kblock_sw_lowering_is_spec_valid() {
+    // The bank-swizzled K-blocked kernel (XOR/shift index ops in the LDS addressing)
+    // must lower to spec-valid UOp — the swizzle is a bijection, numerically transparent.
+    let p = crate::kernels::matmul_lds_kblock_sw(64, 64, 64, 64, 64);
+    lower::verify(&p).expect("swizzled K-blocked matmul must lower to spec-valid UOp");
+}
+
+#[test]
 fn matmul_lds_kblock_lowering_is_spec_valid() {
     // The K-blocked kernel: per-K-block fill + TWO barriers (RAW + WAR) + the reused
     // 2×2 accumulator grid, all inside one K-loop, must lower to spec-valid UOp.

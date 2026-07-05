@@ -353,6 +353,9 @@ impl Fold for ConstFold {
                         0
                     }
                 }
+                IndexOp::Xor => x ^ y,
+                IndexOp::Shr => x >> y,
+                IndexOp::Shl => x << y,
             };
             return ir.intern(Node::Const { scalar: Scalar::Int(v), dtype: DType::Index });
         }

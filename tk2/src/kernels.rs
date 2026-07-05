@@ -295,6 +295,29 @@ fn fill_lds(
     b.end(st, &[fr])
 }
 
+/// The HipKittens/CK LDS **bank swizzle** for a single-subtile bf16 tile (cols ∈
+/// {16,32,64} ⇒ subtile == cols): map in-tile `(row, col)` to `col ^ delta(row)`, where
+/// `delta = (((row%16)·cols·2) >> 7 << 3) / 2` — the byte-XOR `((addr%repeat)>>7)<<3`
+/// (HK `st.cuh:110`, tk `swizzle.rs::tile_offset`) reduced for the single-subtile case
+/// (the `%repeat` is identity since `row%16 < 16`, and `delta < cols` so it never carries
+/// into the row). Applied identically on fill-store and gather-load, it is a bijection —
+/// numerically transparent — that scatters rows `r, r±4, …` off the same bank (the 4-way
+/// conflict the flat layout suffers), the biggest single MFMA-util lever (tk 33%→54%).
+/// The full LDS offset is `row·cols + swizzle_col(row, col, cols)`.
+fn swizzle_col(b: &mut Builder, row: Idx, col: Idx, cols: usize) -> Idx {
+    let c16 = b.idx_const(16);
+    let r16 = b.idx_mod(row, c16);
+    let sb2 = b.idx_const((cols * 2) as i64); // swizzle_bytes = cols·itemsize (bf16)
+    let t = b.idx_mul(r16, sb2);
+    let c7 = b.idx_const(7);
+    let t = b.idx_shr(t, c7);
+    let c3 = b.idx_const(3);
+    let t = b.idx_shl(t, c3);
+    let c1 = b.idx_const(1);
+    let delta = b.idx_shr(t, c1); // >> log2(itemsize) = /2
+    b.idx_xor(col, delta)
+}
+
 /// Unrolled collaborative global→LDS fill (NO inner range — usable inside the K-loop
 /// without a loop nest): each lane writes `epl` elements `flat = lane·epl + e`, mapping
 /// LDS position `flat` to global `(tile_row_base + flat/cols_lds)·grow_stride +
@@ -312,6 +335,7 @@ fn fill_lds_unrolled(
     tile_row_base: Idx,
     tile_col_base: Idx,
     grow_stride: i64,
+    swizzle: bool,
 ) -> Vec<Effect> {
     let epl_c = b.idx_const(epl as i64);
     let lane_epl = b.idx_mul(lane, epl_c);
@@ -328,7 +352,61 @@ fn fill_lds_unrolled(
             let goff = b.idx_add(goff, tile_col_base);
             let goff = b.idx_add(goff, c);
             let v = b.load(src, goff);
-            b.store_lds(lds, flat, v)
+            // LDS store position: flat (`r·cols + c`), or the bank-swizzled `r·cols +
+            // (c ^ delta(r))` — the same bijection the gather applies, so it is transparent.
+            let dst_off = if swizzle {
+                let sw = swizzle_col(b, r, c, cols_lds as usize);
+                let rc = b.idx_mul(r, cols_c);
+                b.idx_add(rc, sw)
+            } else {
+                flat
+            };
+            b.store_lds(lds, dst_off, v)
+        })
+        .collect()
+}
+
+/// Gather one 16×16 bf16 fragment from an already-staged LDS tile `lds` into `dst`,
+/// ordered after the fill `bar`. The tile origin is compile-time `(row_base, col_base)`
+/// in a `[.., cols]` LDS tile (the K-blocked strip's per-fragment offset), so the full
+/// in-tile coord is `(row_base + frag_row, col_base + frag_col)` and the LDS offset is
+/// `wr·cols + (wc | swizzle_col(wr,wc,cols))`. `swizzle` must match the fill.
+#[allow(clippy::too_many_arguments)]
+fn gather_frag_lds_sw(
+    b: &mut Builder,
+    dst: Frag<BF16>,
+    lds: Lds<BF16>,
+    row_base: usize,
+    col_base: usize,
+    cols: usize,
+    lane: Idx,
+    bar: Effect,
+    swizzle: bool,
+) -> Vec<TileId> {
+    let cols_c = b.idx_const(cols as i64);
+    (0..dst.map.ept)
+        .map(|inner| {
+            let inner_idx = b.idx_const(inner as i64);
+            let (frag_row, frag_col) = b.lane_rc(dst.map, lane, inner_idx);
+            // Whole-tile (row, col) — the swizzle must XOR the *whole* column as a unit
+            // (col_base spans multiple 16-fragments in the B strip), so fold the const base in.
+            let wr = if row_base == 0 {
+                frag_row
+            } else {
+                let rb = b.idx_const(row_base as i64);
+                b.idx_add(frag_row, rb)
+            };
+            let wc = if col_base == 0 {
+                frag_col
+            } else {
+                let cb = b.idx_const(col_base as i64);
+                b.idx_add(frag_col, cb)
+            };
+            let col_part = if swizzle { swizzle_col(b, wr, wc, cols) } else { wc };
+            let row_off = b.idx_mul(wr, cols_c);
+            let off = b.idx_add(row_off, col_part);
+            let v = b.load_lds_after(lds, off, &[bar.dep()]);
+            b.store_frag_elem(dst, inner_idx, v).dep()
         })
         .collect()
 }
@@ -578,12 +656,18 @@ pub fn matmul_lds_tiled(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> P
 /// see the staged data) and a **WAR** fence after the LDS reads (the next fill must not
 /// overwrite until every lane finished reading). The WAR fence is routed into the
 /// accumulator reads so it is scoped inside the K-loop. `m/n` multiples of `bm/bn`;
-/// `bm/bn/k` multiples of 16.
+/// `bm/bn/k` multiples of 16. `swizzle` applies the HK/CK LDS bank-XOR ([`swizzle_col`])
+/// to the fill+gather (bm/bn ∈ {16,32,64} — single-subtile — required when swizzling).
 #[allow(clippy::needless_range_loop)]
-pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
+fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, swizzle: bool) -> Program {
     assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
     assert!(m.is_multiple_of(bm) && n.is_multiple_of(bn), "m/n must tile by bm/bn");
-    let mut b = Builder::new("tk2_matmul_kblock");
+    assert!(
+        !swizzle || (matches!(bm, 16 | 32 | 64) && matches!(bn, 16 | 32 | 64)),
+        "the single-subtile swizzle needs bm/bn ∈ {{16,32,64}}"
+    );
+    let name = if swizzle { "tk2_matmul_kblock_sw" } else { "tk2_matmul_kblock" };
+    let mut b = Builder::new(name);
 
     let c = b.global::<F32>(m * n);
     let a = b.global::<BF16>(m * k);
@@ -630,8 +714,8 @@ pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> 
 
     // Fill A[bm,16] (K-col base tk·16, stride K) and B[16,bn] (K-row base tk·16, stride N).
     let mut fill_stores: Vec<TileId> = Vec::with_capacity(epl_a + epl_b);
-    let fa = fill_lds_unrolled(&mut b, a_smem, a, epl_a, lane, EDGE as i64, tm_bm, tk16, k as i64);
-    let fb = fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, lane, bn as i64, tk16, tn_bn, n as i64);
+    let fa = fill_lds_unrolled(&mut b, a_smem, a, epl_a, lane, EDGE as i64, tm_bm, tk16, k as i64, swizzle);
+    let fb = fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, lane, bn as i64, tk16, tn_bn, n as i64, swizzle);
     let fill_head = fa[0];
     fill_stores.extend(fa.iter().skip(1).chain(fb.iter()).map(|e| e.dep()));
     // RAW fence: the whole strip is staged before any lane gathers a fragment.
@@ -643,16 +727,16 @@ pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> 
     let mut gathers: Vec<TileId> = Vec::new();
     let a_vecs: Vec<Val<BF16>> = (0..ri)
         .map(|i| {
-            let base = b.idx_const((i * EDGE * EDGE) as i64); // A-frag i: a_smem row-block i (stride 16)
-            let st = gather_frag_lds(&mut b, a_frags[i], a_smem, base, EDGE as i64, lane, fill_bar);
+            // A-frag i: a_smem[bm,16] row-block i (row_base i·16, col_base 0, cols 16).
+            let st = gather_frag_lds_sw(&mut b, a_frags[i], a_smem, i * EDGE, 0, EDGE, lane, fill_bar, swizzle);
             gathers.extend(st.iter().copied());
             b.load_frag_vec_after(a_frags[i], &st)
         })
         .collect();
     let b_vecs: Vec<Val<BF16>> = (0..cj)
         .map(|j| {
-            let base = b.idx_const((j * EDGE) as i64); // B-frag j: b_smem col-block j (stride bn)
-            let st = gather_frag_lds(&mut b, b_frags[j], b_smem, base, bn as i64, lane, fill_bar);
+            // B-frag j: b_smem[16,bn] col-block j (row_base 0, col_base j·16, cols bn).
+            let st = gather_frag_lds_sw(&mut b, b_frags[j], b_smem, 0, j * EDGE, bn, lane, fill_bar, swizzle);
             gathers.extend(st.iter().copied());
             b.load_frag_vec_after(b_frags[j], &st)
         })
@@ -696,5 +780,19 @@ pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> 
     }
 
     let (ir, sink) = b.finish(&roots);
-    Program { ir, sink, name: "tk2_matmul_kblock".into() }
+    Program { ir, sink, name: name.into() }
+}
+
+/// K-blocked LDS-reuse matmul (DESIGN.md §5b step 1b-ii), flat LDS layout — the first
+/// tk2 matmul to beat naive at scale. See [`kblock_impl`].
+pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
+    kblock_impl(m, n, k, bm, bn, false)
+}
+
+/// [`matmul_lds_kblock`] with the HK/CK LDS **bank swizzle** ([`swizzle_col`]) on the
+/// fill + gather — the biggest single MFMA-util lever (the flat layout's 4-way bank
+/// conflict, measured at bankconf≈1.4, is what starves the matrix unit). `bm/bn ∈
+/// {16,32,64}` (single-subtile).
+pub fn matmul_lds_kblock_sw(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
+    kblock_impl(m, n, k, bm, bn, true)
 }

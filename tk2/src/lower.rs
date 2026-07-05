@@ -148,6 +148,9 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
                 IndexOp::Mul => a.mul(&b),
                 IndexOp::Mod => a.mod_(&b),
                 IndexOp::Div => a.idiv(&b),
+                IndexOp::Xor => a.xor(&b),
+                IndexOp::Shr => a.shr(&b),
+                IndexOp::Shl => a.shl(&b),
             }
         }
         Node::LoadGlobal { buf, offset, .. } => {

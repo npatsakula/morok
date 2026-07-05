@@ -19,7 +19,7 @@ use svod_tensor::testing::allclose_f32;
 mod common;
 use common::{bench_plan, rand_bf16, requirements_met};
 
-use svod_tk2::{Program, graph_kernel, matmul, matmul_lds_kblock, optimize_addressing};
+use svod_tk2::{Program, graph_kernel, matmul, matmul_lds_kblock, matmul_lds_kblock_sw, optimize_addressing};
 
 /// f32 ground truth `A·B` over the SAME bf16-rounded operands (both kernel and
 /// reference see the realized bf16 values cast up to f32).
@@ -85,6 +85,12 @@ fn bench_matmul(c: &mut Criterion) {
         let (yk, pk) = plan_of(matmul_lds_kblock(n, n, n, 64, 64), n, n, &a, &b);
         assert_correct(&yk, &pk, &expected, n, "kblock");
         group.bench_with_input(BenchmarkId::new("kblock64x64", n), &n, |bch, _| bench_plan(bch, &pk));
+
+        // + the HK/CK LDS bank swizzle on fill+gather — the biggest MFMA-util lever
+        // (the flat layout's 4-way bank conflict, bankconf≈1.4, starves the matrix unit).
+        let (ys, ps) = plan_of(matmul_lds_kblock_sw(n, n, n, 64, 64), n, n, &a, &b);
+        assert_correct(&ys, &ps, &expected, n, "kblock_sw");
+        group.bench_with_input(BenchmarkId::new("kblock_sw64x64", n), &n, |bch, _| bench_plan(bch, &ps));
     }
     group.finish();
 }

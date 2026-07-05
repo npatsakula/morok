@@ -98,6 +98,13 @@ pub enum IndexOp {
     Mul,
     Mod,
     Div,
+    /// Bitwise XOR — the LDS bank swizzle (`col ^ delta`), a bijection applied
+    /// identically on fill-store and gather-load so it never changes the result.
+    Xor,
+    /// Logical shift-right (the swizzle's `>> 7` bank-bit extraction).
+    Shr,
+    /// Logical shift-left (the swizzle's `<< 3` bank placement).
+    Shl,
 }
 
 /// A register-tile **fragment** lane→(row,col) map — the CDNA 16×16×16 MFMA per-lane
