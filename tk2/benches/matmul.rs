@@ -19,7 +19,7 @@ use svod_tensor::testing::allclose_f32;
 mod common;
 use common::{bench_plan, rand_bf16, requirements_met};
 
-use svod_tk2::{Program, graph_kernel, matmul, matmul_lds_kblock, matmul_lds_kblock_sw, optimize_addressing};
+use svod_tk2::{Program, graph_kernel, matmul, matmul_lds_kblock_ks, optimize_addressing};
 
 /// f32 ground truth `A·B` over the SAME bf16-rounded operands (both kernel and
 /// reference see the realized bf16 values cast up to f32).
@@ -77,20 +77,16 @@ fn bench_matmul(c: &mut Criterion) {
         assert_correct(&y1, &p1, &expected, n, "unroll+fold");
         group.bench_with_input(BenchmarkId::new("unroll+fold", n), &n, |bch, _| bench_plan(bch, &p1));
 
-        // K-blocked LDS reuse (step 1b-ii, the occupancy win): a 64×64 output tile with
-        // A/B strips re-staged per K-fragment (K_STEP=16), so LDS is a tiny 4 KB
-        // independent of K ⇒ high occupancy at any n, with reuse across the 4×4
-        // accumulator grid. Two workgroup barriers per K-block (RAW + WAR). This runs at
-        // every n (unlike 1b-i's full-K stage) — the reuse-with-occupancy comparison.
-        let (yk, pk) = plan_of(matmul_lds_kblock(n, n, n, 64, 64), n, n, &a, &b);
-        assert_correct(&yk, &pk, &expected, n, "kblock");
-        group.bench_with_input(BenchmarkId::new("kblock64x64", n), &n, |bch, _| bench_plan(bch, &pk));
-
-        // + the HK/CK LDS bank swizzle on fill+gather — the biggest MFMA-util lever
-        // (the flat layout's 4-way bank conflict, bankconf≈1.4, starves the matrix unit).
-        let (ys, ps) = plan_of(matmul_lds_kblock_sw(n, n, n, 64, 64), n, n, &a, &b);
-        assert_correct(&ys, &ps, &expected, n, "kblock_sw");
-        group.bench_with_input(BenchmarkId::new("kblock_sw64x64", n), &n, |bch, _| bench_plan(bch, &ps));
+        // K-blocked LDS reuse (step 1b-ii): 64×64 tile, A/B strips re-staged per K-block,
+        // reuse across the 4×4 accumulator grid, two barriers per block (RAW + WAR),
+        // swizzled. Sweep K_STEP: 16 (barrier-flood, high occ) vs 64 (4× fewer barriers,
+        // but bigger LDS + operand VGPR ⇒ lower occ) — the occupancy/barrier trade the
+        // harness resolves. All swizzled (single-subtile bm/bn/k_step ∈ {16,32,64}).
+        for ks in [16usize, 64] {
+            let (yk, pk) = plan_of(matmul_lds_kblock_ks(n, n, n, 64, 64, ks, true), n, n, &a, &b);
+            assert_correct(&yk, &pk, &expected, n, "kblock_ks");
+            group.bench_with_input(BenchmarkId::new(format!("kblock_sw_ks{ks}"), n), &n, |bch, _| bench_plan(bch, &pk));
+        }
     }
     group.finish();
 }

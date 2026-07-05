@@ -106,6 +106,13 @@ fn matmul_lds_kblock_sw_lowering_is_spec_valid() {
 }
 
 #[test]
+fn matmul_lds_kblock_ks64_lowering_is_spec_valid() {
+    // K_STEP=64: a k_step-wide fill + an inner chain of k_step/16 MFMAs per accumulator.
+    let p = crate::kernels::matmul_lds_kblock_ks(64, 64, 128, 64, 64, 64, true);
+    lower::verify(&p).expect("K_STEP=64 matmul must lower to spec-valid UOp");
+}
+
+#[test]
 fn matmul_lds_kblock_lowering_is_spec_valid() {
     // The K-blocked kernel: per-K-block fill + TWO barriers (RAW + WAR) + the reused
     // 2×2 accumulator grid, all inside one K-loop, must lower to spec-valid UOp.

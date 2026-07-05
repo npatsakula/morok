@@ -659,12 +659,13 @@ pub fn matmul_lds_tiled(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> P
 /// `bm/bn/k` multiples of 16. `swizzle` applies the HK/CK LDS bank-XOR ([`swizzle_col`])
 /// to the fill+gather (bm/bn ∈ {16,32,64} — single-subtile — required when swizzling).
 #[allow(clippy::needless_range_loop)]
-fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, swizzle: bool) -> Program {
+fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize, swizzle: bool) -> Program {
     assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
+    assert!(k_step.is_multiple_of(EDGE) && k.is_multiple_of(k_step), "k_step multiple of 16, K multiple of k_step");
     assert!(m.is_multiple_of(bm) && n.is_multiple_of(bn), "m/n must tile by bm/bn");
     assert!(
-        !swizzle || (matches!(bm, 16 | 32 | 64) && matches!(bn, 16 | 32 | 64)),
-        "the single-subtile swizzle needs bm/bn ∈ {{16,32,64}}"
+        !swizzle || (matches!(bm, 16 | 32 | 64) && matches!(bn, 16 | 32 | 64) && matches!(k_step, 16 | 32 | 64)),
+        "the single-subtile swizzle needs bm/bn/k_step ∈ {{16,32,64}}"
     );
     let name = if swizzle { "tk2_matmul_kblock_sw" } else { "tk2_matmul_kblock" };
     let mut b = Builder::new(name);
@@ -681,12 +682,13 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, swizzle: bool
     let bc_map = FragMap::gfx942_16x16(true);
     let ept = a_map.ept;
     let (ri, cj) = (bm / EDGE, bn / EDGE);
+    let ksteps = k_step / EDGE; // K-fragments per staged block (amortises the 2 barriers)
 
-    // Single-buffered K_STEP=16 strips: A[bm,16], B[16,bn]. Footprint independent of K.
-    let a_smem = b.define_local::<BF16>(bm * EDGE);
-    let b_smem = b.define_local::<BF16>(EDGE * bn);
-    let epl_a = bm * EDGE / WARP;
-    let epl_b = EDGE * bn / WARP;
+    // Single-buffered K_STEP strips: A[bm,k_step], B[k_step,bn]. Footprint ∝ k_step, ⊥ K.
+    let a_smem = b.define_local::<BF16>(bm * k_step);
+    let b_smem = b.define_local::<BF16>(k_step * bn);
+    let epl_a = bm * k_step / WARP;
+    let epl_b = k_step * bn / WARP;
 
     let bm_c = b.idx_const(bm as i64);
     let bn_c = b.idx_const(bn as i64);
@@ -706,39 +708,71 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, swizzle: bool
         })
         .collect();
 
-    // ── K-loop over K/16 fragments; re-stage the strips each iteration. ──
-    let kr = b.range((k / EDGE) as i64);
+    // ── K-loop over K/k_step blocks; re-stage the k_step-wide strips each iteration. ──
+    let kr = b.range((k / k_step) as i64);
     let tk = b.counter(kr);
-    let e16 = b.idx_const(EDGE as i64);
-    let tk16 = b.idx_mul(tk, e16); // K-block column/row base: tk·16
+    let ks_c = b.idx_const(k_step as i64);
+    let tk_ks = b.idx_mul(tk, ks_c); // K-block column/row base: tk·k_step
 
-    // Fill A[bm,16] (K-col base tk·16, stride K) and B[16,bn] (K-row base tk·16, stride N).
+    // Fill A[bm,k_step] (K-col base tk·k_step, stride K) and B[k_step,bn] (K-row base, stride N).
     let mut fill_stores: Vec<TileId> = Vec::with_capacity(epl_a + epl_b);
-    let fa = fill_lds_unrolled(&mut b, a_smem, a, epl_a, lane, EDGE as i64, tm_bm, tk16, k as i64, swizzle);
-    let fb = fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, lane, bn as i64, tk16, tn_bn, n as i64, swizzle);
+    let fa = fill_lds_unrolled(&mut b, a_smem, a, epl_a, lane, k_step as i64, tm_bm, tk_ks, k as i64, swizzle);
+    let fb = fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, lane, bn as i64, tk_ks, tn_bn, n as i64, swizzle);
     let fill_head = fa[0];
     fill_stores.extend(fa.iter().skip(1).chain(fb.iter()).map(|e| e.dep()));
     // RAW fence: the whole strip is staged before any lane gathers a fragment.
     let fill_bar = b.barrier(fill_head, &fill_stores);
 
-    // ── read the reused fragments from LDS (after the RAW fence). ──
-    let a_frags: Vec<Frag<BF16>> = (0..ri).map(|_| b.define_frag::<BF16>(a_map)).collect();
-    let b_frags: Vec<Frag<BF16>> = (0..cj).map(|_| b.define_frag::<BF16>(bc_map)).collect();
+    // ── read the reused fragments from LDS (after the RAW fence): A[i][kf], B[kf][j].
+    //    Each A-fragment is reused across all cols j, each B-fragment across all rows i;
+    //    pre-gathering the whole block lets the WAR fence route into the accumulator reads. ──
+    let a_frags: Vec<Vec<Frag<BF16>>> =
+        (0..ri).map(|_| (0..ksteps).map(|_| b.define_frag::<BF16>(a_map)).collect()).collect();
+    let b_frags: Vec<Vec<Frag<BF16>>> =
+        (0..ksteps).map(|_| (0..cj).map(|_| b.define_frag::<BF16>(bc_map)).collect()).collect();
     let mut gathers: Vec<TileId> = Vec::new();
-    let a_vecs: Vec<Val<BF16>> = (0..ri)
+    let a_vecs: Vec<Vec<Val<BF16>>> = (0..ri)
         .map(|i| {
-            // A-frag i: a_smem[bm,16] row-block i (row_base i·16, col_base 0, cols 16).
-            let st = gather_frag_lds_sw(&mut b, a_frags[i], a_smem, i * EDGE, 0, EDGE, lane, fill_bar, swizzle);
-            gathers.extend(st.iter().copied());
-            b.load_frag_vec_after(a_frags[i], &st)
+            (0..ksteps)
+                .map(|kf| {
+                    // A-frag (i,kf): a_smem[bm,k_step] row-block i, K-block kf (cols k_step).
+                    let st = gather_frag_lds_sw(
+                        &mut b,
+                        a_frags[i][kf],
+                        a_smem,
+                        i * EDGE,
+                        kf * EDGE,
+                        k_step,
+                        lane,
+                        fill_bar,
+                        swizzle,
+                    );
+                    gathers.extend(st.iter().copied());
+                    b.load_frag_vec_after(a_frags[i][kf], &st)
+                })
+                .collect()
         })
         .collect();
-    let b_vecs: Vec<Val<BF16>> = (0..cj)
-        .map(|j| {
-            // B-frag j: b_smem[16,bn] col-block j (row_base 0, col_base j·16, cols bn).
-            let st = gather_frag_lds_sw(&mut b, b_frags[j], b_smem, 0, j * EDGE, bn, lane, fill_bar, swizzle);
-            gathers.extend(st.iter().copied());
-            b.load_frag_vec_after(b_frags[j], &st)
+    let b_vecs: Vec<Vec<Val<BF16>>> = (0..ksteps)
+        .map(|kf| {
+            (0..cj)
+                .map(|j| {
+                    // B-frag (kf,j): b_smem[k_step,bn] K-block kf, col-block j (cols bn).
+                    let st = gather_frag_lds_sw(
+                        &mut b,
+                        b_frags[kf][j],
+                        b_smem,
+                        kf * EDGE,
+                        j * EDGE,
+                        bn,
+                        lane,
+                        fill_bar,
+                        swizzle,
+                    );
+                    gathers.extend(st.iter().copied());
+                    b.load_frag_vec_after(b_frags[kf][j], &st)
+                })
+                .collect()
         })
         .collect();
 
@@ -746,15 +780,17 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, swizzle: bool
     let war_head = Effect(gathers[0]);
     let war_bar = b.barrier(war_head, &gathers[1..]);
 
-    // ── one MFMA per accumulator; the acc read routes through the WAR fence (scoping it
-    //    inside the K-loop) plus its init + range loop-carry edges. ──
+    // ── per accumulator, chain `ksteps` MFMAs (D = A·B + C over the block's K-fragments);
+    //    the acc read routes through the WAR fence + its init/range loop-carry edges. ──
     let mut stores: Vec<Effect> = Vec::with_capacity(ri * cj);
     for i in 0..ri {
         for j in 0..cj {
             let idx = i * cj + j;
-            let acc_read = b.load_frag_vec_after(acc[idx], &[inited[idx].dep(), kr.dep(), war_bar.dep()]);
-            let out = b.mma(a_vecs[i], b_vecs[j], acc_read, ept);
-            stores.push(b.store_frag_vec(acc[idx], out));
+            let mut c_acc = b.load_frag_vec_after(acc[idx], &[inited[idx].dep(), kr.dep(), war_bar.dep()]);
+            for kf in 0..ksteps {
+                c_acc = b.mma(a_vecs[i][kf], b_vecs[kf][j], c_acc, ept);
+            }
+            stores.push(b.store_frag_vec(acc[idx], c_acc));
         }
     }
     let last = *stores.last().expect("at least one accumulator");
@@ -783,16 +819,32 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, swizzle: bool
     Program { ir, sink, name: name.into() }
 }
 
-/// K-blocked LDS-reuse matmul (DESIGN.md §5b step 1b-ii), flat LDS layout — the first
-/// tk2 matmul to beat naive at scale. See [`kblock_impl`].
+/// K-blocked LDS-reuse matmul (DESIGN.md §5b step 1b-ii), flat LDS layout, K_STEP=16 —
+/// the first tk2 matmul to beat naive at scale. See [`kblock_impl`].
 pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, false)
+    kblock_impl(m, n, k, bm, bn, EDGE, false)
 }
 
 /// [`matmul_lds_kblock`] with the HK/CK LDS **bank swizzle** ([`swizzle_col`]) on the
-/// fill + gather — the biggest single MFMA-util lever (the flat layout's 4-way bank
-/// conflict, measured at bankconf≈1.4, is what starves the matrix unit). `bm/bn ∈
-/// {16,32,64}` (single-subtile).
+/// fill + gather. `bm/bn ∈ {16,32,64}` (single-subtile).
 pub fn matmul_lds_kblock_sw(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, true)
+    kblock_impl(m, n, k, bm, bn, EDGE, true)
+}
+
+/// The tunable K-blocked kernel: `k_step`-wide strips staged per outer K-block, with
+/// `k_step/16` chained MFMAs per accumulator — **amortising the two per-block barriers
+/// over `k_step/16` K-fragments** (the K_STEP=16 barrier flood was the measured matrix
+/// starve). `swizzle` applies the LDS bank-XOR. `k_step ∈ {16,32,64}` (single-subtile);
+/// the bigger `k_step`, the fewer barriers but the more LDS + operand VGPR (the
+/// occupancy trade the harness resolves).
+pub fn matmul_lds_kblock_ks(
+    m: usize,
+    n: usize,
+    k: usize,
+    bm: usize,
+    bn: usize,
+    k_step: usize,
+    swizzle: bool,
+) -> Program {
+    kblock_impl(m, n, k, bm, bn, k_step, swizzle)
 }
