@@ -191,6 +191,25 @@ fn matmul_lds_kblock_multiwarp_lowers_and_derives_warps() {
 }
 
 #[test]
+fn matmul_lds_kblock_pipe_lowers_and_splits_prologue_steady_epilogue() {
+    // stages=2 register-staged pipeline (2×2 → 128×128 tile, 4 K-blocks). The prologue commit +
+    // steady range(nblocks-1) + epilogue gather each emit their own gather/commit/barrier cluster,
+    // so it must still lower spec-valid — the carried-RAW + WAR + register carry composed correctly.
+    let p = crate::kernels::matmul_lds_kblock_mw_pipe(128, 128, 256, 64, 64, 2, 2, 64);
+    lower::verify(&p).expect("pipelined (stages=2) K-blocked matmul must lower to spec-valid UOp");
+    // The steady loop is one block shorter than the K-block count: range(nblocks-1) = range(3).
+    let has_short_loop =
+        (0..p.ir.len()).any(|i| matches!(p.ir.node(crate::ir::TileId(i as u32)), Node::Range { trips: 3, .. }));
+    assert!(has_short_loop, "stages=2 steady loop must be range(nblocks-1)");
+    // Single-block K (nblocks=1) falls back to stages=1 — no range(0), the full-K loop is range(1).
+    let one = crate::kernels::matmul_lds_kblock_mw_pipe(128, 128, 64, 64, 64, 2, 2, 64);
+    lower::verify(&one).expect("single-block pipelined matmul must fall back and lower spec-valid");
+    let has_zero_loop =
+        (0..one.ir.len()).any(|i| matches!(one.ir.node(crate::ir::TileId(i as u32)), Node::Range { trips: 0, .. }));
+    assert!(!has_zero_loop, "single-block K must fall back to stages=1, not emit a range(0) steady loop");
+}
+
+#[test]
 fn matmul_lds_kblock_carries_two_barriers_per_kstep() {
     // Structural: the single-buffer WAR needs a RAW fence (after fill) AND a WAR fence
     // (after the LDS reads) — at least two Barriers in the K-loop body.

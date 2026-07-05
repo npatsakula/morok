@@ -314,6 +314,16 @@ impl Builder {
         Effect(self.ir.intern(Node::StoreGlobal { buf: after, offset: offset.0, value: value.id }))
     }
 
+    /// An LDS handle re-bound so **every** write through it observes `deps` (the WAR barrier):
+    /// the whole-strip commit-after-WAR for the `stages=2` pipeline. Wrapping the buffer once
+    /// (vs. threading `deps` into each `store_lds*`) keeps the vectorised/scalar fill functions
+    /// dep-agnostic — the ordering rides on the destination handle they already write to. The
+    /// buffer analog of [`Self::frag_after`].
+    pub fn lds_after<E: Elem>(&mut self, lds: Lds<E>, deps: &[TileId]) -> Lds<E> {
+        let id = self.after_buf(lds.id, deps);
+        Lds { id, len: lds.len, _e: PhantomData }
+    }
+
     /// ONE `<ept×E>` vector load of a contiguous **global** run at flat `base` (the
     /// coalesced, vectorised fill read → `buffer_load_dwordx*`) — the global mirror of
     /// [`Self::load_lds_vec_after`], no ordering edge (a plain source read).

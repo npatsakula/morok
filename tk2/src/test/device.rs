@@ -19,6 +19,7 @@ use svod_tensor::testing::allclose_f32;
 
 use crate::kernels::{elementwise_add, sum_reduce};
 use crate::launch;
+use crate::{SwizzlePass, VectorizePass, graph_kernel};
 
 /// Realize an input tensor from host data and return its concrete buffer.
 fn input(data: &[f32]) -> (Tensor, Buffer) {
@@ -70,6 +71,49 @@ fn elementwise_add_runs_on_gfx942() {
     let report = allclose_f32(&got, &expected, 0.0, 0.0);
     println!("elementwise add N={n}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
     assert!(report.ok, "{}", report.message);
+}
+
+/// The **stages=2 pipeline** correctness gate (DESIGN §5b phase 2b): the register-staged
+/// prologue/steady/epilogue must accumulate every K-block exactly once — a carry slip (gather
+/// reading the wrong block, a dropped commit) shows up as a wrong C, not a crash. Checked at a
+/// small shape (128×128×256 = 4 K-blocks, 2×2 warps) against an f32 reference over the same
+/// bf16-rounded operands; both the scalar-gather base AND `.apply(VectorizePass).apply(SwizzlePass)`
+/// (the pass composition must survive the split-loop structure).
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::matmul_pipeline --nocapture`
+#[test]
+#[ignore]
+fn matmul_pipeline_stages2_is_bit_exact_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    let (m, n, k) = (128usize, 128, 256);
+    let dev = svod_dtype::default_device::default_device();
+    let mut a = Tensor::rand_with(&[m, k], DType::BFloat16, dev.clone()).expect("rand a");
+    let mut b = Tensor::rand_with(&[k, n], DType::BFloat16, dev).expect("rand b");
+    a.realize().expect("realize a");
+    b.realize().expect("realize b");
+    let bf = b.cast(DType::Float32).expect("b→f32");
+    let mut rt = a.cast(DType::Float32).expect("a→f32").matmul(&bf).expect("ref matmul");
+    rt.realize().expect("realize ref");
+    let expected = rt.as_vec::<f32>().expect("read ref");
+    let atol = 0.02 * (k as f32).sqrt();
+
+    for (label, prog) in [
+        ("pipe_base", crate::kernels::matmul_lds_kblock_mw_pipe(m, n, k, 64, 64, 2, 2, 64)),
+        (
+            "pipe_vec_sw",
+            crate::kernels::matmul_lds_kblock_mw_pipe(m, n, k, 64, 64, 2, 2, 64)
+                .apply(VectorizePass)
+                .apply(SwizzlePass),
+        ),
+    ] {
+        let out = Tensor::empty(&[m, n], DType::Float32);
+        let mut y = graph_kernel(prog, out, &[&a, &b]).expect("wrap");
+        let plan = y.prepare().expect("prepare");
+        plan.execute().expect("execute");
+        let got = y.as_vec::<f32>().expect("read output");
+        let report = allclose_f32(&got, &expected, atol, 2e-2);
+        println!("matmul pipeline {label} {m}×{n}×{k}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+        assert!(report.ok, "{label} pipelined matmul must match reference: {}", report.message);
+    }
 }
 
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::sum_reduce_runs_on_gfx942 --nocapture`

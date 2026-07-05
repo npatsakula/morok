@@ -53,7 +53,10 @@ fn lds_carry_through_barrier_is_correct_and_the_test_catches_a_stale_carry() {
             let stale: Vec<f32> = (0..n).map(|l| t as f32 * iv[(l + 1) % n]).collect();
             assert!(allclose_f32(&broken, &stale, 1e-3, 1e-4).ok, "n={n} t={t}: broken must equal the stale-read");
             if t > 1 {
-                assert!(!allclose_f32(&broken, &expected, 1e-3, 1e-4).ok, "n={n} t={t}: broken must differ (test not blind)");
+                assert!(
+                    !allclose_f32(&broken, &expected, 1e-3, 1e-4).ok,
+                    "n={n} t={t}: broken must differ (test not blind)"
+                );
             }
         }
     }

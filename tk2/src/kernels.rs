@@ -486,7 +486,14 @@ fn fill_lds_vec_prefetch(
 /// The **commit** half (VGPR→LDS): `ds_write_b64` each prefetched chunk into LDS at
 /// `r·cols + LdsCol(r, c)` (swizzle-safe b64 granularity). `loaded` is [`fill_lds_vec_prefetch`]'s
 /// output; the `r`/`c` addressing hash-cons-shares that half's nodes. Returns the store effects.
-fn fill_lds_vec_commit(b: &mut Builder, lds: Lds<BF16>, loaded: &[Val<BF16>], epl: usize, lane: Idx, cols_lds: i64) -> Vec<Effect> {
+fn fill_lds_vec_commit(
+    b: &mut Builder,
+    lds: Lds<BF16>,
+    loaded: &[Val<BF16>],
+    epl: usize,
+    lane: Idx,
+    cols_lds: i64,
+) -> Vec<Effect> {
     const VEC: usize = 4;
     let epl_c = b.idx_const(epl as i64);
     let lane_epl = b.idx_mul(lane, epl_c);
@@ -640,7 +647,7 @@ fn gather_frag_lds_run(
     run_base: usize,
     inner: usize,
     lane: Idx,
-    bar: Effect,
+    raw_deps: &[TileId],
 ) -> Vec<TileId> {
     let inner_c = b.idx_const(inner as i64);
     (0..dst.map.ept)
@@ -656,7 +663,9 @@ fn gather_frag_lds_run(
             let col_part = b.lds_col(outer, run, inner); // the swizzle/vectorise hole
             let row_off = b.idx_mul(outer, inner_c);
             let off = b.idx_add(row_off, col_part);
-            let v = b.load_lds_after(lds, off, &[bar.dep()]);
+            // `raw_deps` = the fill RAW barrier (stages=1) or the carried `[raw_seed, range]`
+            // (stages=2) — the read observes the previous iteration's commit either way.
+            let v = b.load_lds_after(lds, off, raw_deps);
             b.store_frag_elem(dst, e_idx, v).dep()
         })
         .collect()
@@ -925,12 +934,32 @@ fn kloop<Op, Reg>(
     stages: usize,
     accs: &[Frag<F32>],
     inited: &[Effect],
+    prefetch: impl FnMut(&mut Builder, Idx) -> Reg,
+    commit: impl FnMut(&mut Builder, Idx, &Reg, &[TileId]) -> Vec<Effect>,
+    gather: impl FnMut(&mut Builder, usize, &[TileId]) -> (Op, Vec<TileId>),
+    mma: impl FnMut(&mut Builder, &Op, &[Val<F32>]) -> Vec<Val<F32>>,
+) -> Vec<Frag<F32>> {
+    match stages {
+        1 => kloop_1stage(b, nblocks, k_step, accs, inited, prefetch, commit, gather, mma),
+        2 => kloop_2stage(b, nblocks, k_step, accs, inited, prefetch, commit, gather, mma),
+        s => panic!("kloop: unsupported stages={s} (1 = single-buffer, 2 = register-staged pipeline)"),
+    }
+}
+
+/// The **single-buffer** K-reduction (`stages=1`): each iteration fills its own K-block into
+/// LDS (RAW fence), gathers, WAR fence, MFMAs. Two barriers per block; no cross-block overlap.
+#[allow(clippy::too_many_arguments)]
+fn kloop_1stage<Op, Reg>(
+    b: &mut Builder,
+    nblocks: usize,
+    k_step: usize,
+    accs: &[Frag<F32>],
+    inited: &[Effect],
     mut prefetch: impl FnMut(&mut Builder, Idx) -> Reg,
-    mut commit: impl FnMut(&mut Builder, Idx, &Reg) -> Vec<Effect>,
-    mut gather: impl FnMut(&mut Builder, usize, Effect) -> (Op, Vec<TileId>),
+    mut commit: impl FnMut(&mut Builder, Idx, &Reg, &[TileId]) -> Vec<Effect>,
+    mut gather: impl FnMut(&mut Builder, usize, &[TileId]) -> (Op, Vec<TileId>),
     mut mma: impl FnMut(&mut Builder, &Op, &[Val<F32>]) -> Vec<Val<F32>>,
 ) -> Vec<Frag<F32>> {
-    assert_eq!(stages, 1, "kloop: only stages=1 is implemented (the stages=2 pipeline is phase 2b)");
     let kr = b.range(nblocks as i64);
     let tk = b.counter(kr);
     let ks_c = b.idx_const(k_step as i64);
@@ -939,12 +968,12 @@ fn kloop<Op, Reg>(
     // fill the K-block strip into LDS: prefetch (global→VGPR) then commit (VGPR→ds_write),
     // fused at stages=1 → RAW fence (the whole strip staged before any gather).
     let reg = prefetch(b, k_base);
-    let fill = commit(b, k_base, &reg);
+    let fill = commit(b, k_base, &reg, &[]);
     let fill_deps: Vec<TileId> = fill[1..].iter().map(|e| e.dep()).collect();
     let raw = b.barrier(fill[0], &fill_deps);
 
     // gather the reused fragments → WAR fence (every lane read before the next block's fill).
-    let (op, gathers) = gather(b, 0, raw);
+    let (op, gathers) = gather(b, 0, &[raw.dep()]);
     let war = b.barrier(Effect(gathers[0]), &gathers[1..]);
 
     // carried accumulator reads route [init, range, WAR]; chain the MFMAs; store back.
@@ -964,6 +993,86 @@ fn kloop<Op, Reg>(
     accs.iter().map(|a| b.frag_after(*a, &[ended.dep()])).collect()
 }
 
+/// The **register-staged software pipeline** (`stages=2`, DESIGN §5b — the HK ping-pong shape,
+/// proven expressible by the `lds_carry_loop` microkernel). ONE LDS buffer, but block `k+1`'s
+/// global load is hoisted into VGPRs (`prefetch`) so it flies in-flight across block `k`'s MFMAs,
+/// and its `ds_write` (`commit`) is deferred behind the WAR barrier — hiding the DRAM latency the
+/// single-buffer kernel exposes. The loop carries THREE things across the back-edge: the register
+/// accumulators (register carry, `combine`/`End`), and the RAW barrier that lets iteration `t`'s
+/// gather read iteration `t-1`'s commit (LDS carry, `[raw_seed, range]`). Structure:
+/// **prologue** commits block 0; **steady** `range(nblocks-1)` prefetches `k+1`, gathers `k` via the
+/// carried RAW, MFMAs, WARs, commits `k+1` after the WAR; **epilogue** gathers + MFMAs the last
+/// block (whose commit was the loop's final iteration). Requires `nblocks ≥ 2`.
+#[allow(clippy::too_many_arguments)]
+fn kloop_2stage<Op, Reg>(
+    b: &mut Builder,
+    nblocks: usize,
+    k_step: usize,
+    accs: &[Frag<F32>],
+    inited: &[Effect],
+    mut prefetch: impl FnMut(&mut Builder, Idx) -> Reg,
+    mut commit: impl FnMut(&mut Builder, Idx, &Reg, &[TileId]) -> Vec<Effect>,
+    mut gather: impl FnMut(&mut Builder, usize, &[TileId]) -> (Op, Vec<TileId>),
+    mut mma: impl FnMut(&mut Builder, &Op, &[Val<F32>]) -> Vec<Val<F32>>,
+) -> Vec<Frag<F32>> {
+    assert!(nblocks >= 2, "kloop_2stage needs nblocks ≥ 2 (single-block K falls back to stages=1)");
+    let ks_c = b.idx_const(k_step as i64);
+    let one = b.idx_const(1);
+
+    // ── prologue: commit block 0 into LDS (plain, no WAR — nothing to overwrite yet). ──
+    let zero = b.idx_const(0);
+    let reg0 = prefetch(b, zero);
+    let fill0 = commit(b, zero, &reg0, &[]);
+    let fill0_deps: Vec<TileId> = fill0[1..].iter().map(|e| e.dep()).collect();
+    let raw_seed = b.barrier(fill0[0], &fill0_deps);
+
+    // ── steady loop over blocks 0..nblocks-1: gather k (carried RAW), MFMA, commit k+1. ──
+    let kr = b.range((nblocks - 1) as i64);
+    let tk = b.counter(kr);
+    let k_next_idx = b.idx_add(tk, one);
+    let k_next = b.idx_mul(k_next_idx, ks_c); // next block base: (tk+1)·k_step
+
+    // prefetch block k+1 EARLY (global→VGPR, in-flight across the MFMAs) — the latency hide.
+    let reg_next = prefetch(b, k_next);
+
+    // gather block k via the loop-carried RAW ([raw_seed, range] → the previous commit).
+    let (op, gathers) = gather(b, 0, &[raw_seed.dep(), kr.dep()]);
+    let war = b.barrier(Effect(gathers[0]), &gathers[1..]);
+
+    // carried accumulator reads [init, range, WAR]; chain the MFMAs; store back (register carry).
+    let acc_reads: Vec<Val<F32>> = accs
+        .iter()
+        .enumerate()
+        .map(|(i, a)| b.load_frag_vec_after(*a, &[inited[i].dep(), kr.dep(), war.dep()]))
+        .collect();
+    let new = mma(b, &op, &acc_reads);
+    let stores: Vec<Effect> = accs.iter().zip(new).map(|(a, v)| b.store_frag_vec(*a, v)).collect();
+
+    // commit block k+1 AFTER the WAR (single buffer: the overwrite must follow this block's reads),
+    // then RAW-fence it as the carry-out for the next iteration's gather.
+    let fill_next = commit(b, k_next, &reg_next, &[war.dep()]);
+    let fill_next_deps: Vec<TileId> = fill_next[1..].iter().map(|e| e.dep()).collect();
+    let raw_next = b.barrier(fill_next[0], &fill_next_deps);
+
+    // one `End` per RANGE: fold the other accumulators' stores AND raw_next (the LDS carry) into
+    // the last store's combine, so the single End carries both the register and LDS state.
+    let last = *stores.last().expect("at least one accumulator");
+    let mut carried: Vec<TileId> = stores[..stores.len() - 1].iter().map(|e| e.dep()).collect();
+    carried.push(raw_next.dep());
+    let combined = b.combine(last, &carried);
+    let ended = b.end(combined, &[kr]);
+    let acc_loop: Vec<Frag<F32>> = accs.iter().map(|a| b.frag_after(*a, &[ended.dep()])).collect();
+
+    // ── epilogue: gather + MFMA the last block (committed by the loop's final iteration; read via
+    //    the End's carried RAW). No commit — nothing overwrites the strip after this. ──
+    let (op_e, gathers_e) = gather(b, 0, &[ended.dep()]);
+    let war_e = b.barrier(Effect(gathers_e[0]), &gathers_e[1..]);
+    let acc_reads_e: Vec<Val<F32>> = acc_loop.iter().map(|a| b.load_frag_vec_after(*a, &[war_e.dep()])).collect();
+    let new_e = mma(b, &op_e, &acc_reads_e);
+    let stores_e: Vec<Effect> = acc_loop.iter().zip(new_e).map(|(a, v)| b.store_frag_vec(*a, v)).collect();
+    acc_loop.iter().zip(stores_e).map(|(a, s)| b.frag_after(*a, &[s.dep()])).collect()
+}
+
 /// **K-blocked, LDS-staged, block-tiled** matmul (DESIGN.md §5b step 1b-ii — the
 /// occupancy win). Like [`matmul_lds_tiled`] (bm×bn tile, `(bm/16)×(bn/16)` reused
 /// accumulators) but the A/B strips are re-staged **per K-fragment inside the K-loop**
@@ -980,10 +1089,23 @@ fn kloop<Op, Reg>(
 /// turns it into the bank-swizzled one — the swizzle is a **composable refinement**, not
 /// hand-woven here (bm/bn/k_step ∈ {16,32,64} for the single-subtile swizzle).
 #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
-fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, wm: usize, wn: usize, k_step: usize) -> Program {
+fn kblock_impl(
+    m: usize,
+    n: usize,
+    k: usize,
+    bm: usize,
+    bn: usize,
+    wm: usize,
+    wn: usize,
+    k_step: usize,
+    stages: usize,
+) -> Program {
     assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
     assert!(k_step.is_multiple_of(EDGE) && k.is_multiple_of(k_step), "k_step multiple of 16, K multiple of k_step");
     assert!(wm >= 1 && wn >= 1, "at least one warp per axis");
+    assert!(stages == 1 || stages == 2, "kblock: stages ∈ {{1, 2}}");
+    // stages=2 (register-staged pipeline) needs ≥2 K-blocks to overlap; single-block K = stages=1.
+    let stages = if k / k_step >= 2 { stages } else { 1 };
     // Workgroup output tile = (bm·wm) × (bn·wn), computed by a wm×wn grid of 64-lane warps.
     let (big_m, big_n, nthreads) = (bm * wm, bn * wn, wm * wn * WARP);
     assert!(m.is_multiple_of(big_m) && n.is_multiple_of(big_n), "m/n must tile by (bm·wm)/(bn·wn)");
@@ -1052,22 +1174,27 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, wm: usize, wn
         &mut b,
         k / k_step,
         k_step,
-        1, // stages=1 (single-buffer); stages=2 register-staged prefetch is phase 2b
+        stages,
         &acc,
         &inited,
         // prefetch (global→VGPR): A b64 chunks + B micro-tile rows (or None → scalar B in commit).
         |b, k_base| {
             let a = fill_lds_vec_prefetch(b, a, epl_a, tid, k_step as i64, tm_bm, k_base, k as i64);
-            let bt = b_transpose_vec_ok(k_step, big_n, nthreads)
-                .then(|| fill_lds_transpose_vec_prefetch(b, bmat, tid, nthreads, k_step, big_n, k_base, tn_bn, n as i64));
+            let bt = b_transpose_vec_ok(k_step, big_n, nthreads).then(|| {
+                fill_lds_transpose_vec_prefetch(b, bmat, tid, nthreads, k_step, big_n, k_base, tn_bn, n as i64)
+            });
             FillRegs { a, b: bt }
         },
         // commit (VGPR→ds_write LDS): A + transposed B; the scalar B fallback fills from global here.
-        |b, k_base, reg| {
-            let fa = fill_lds_vec_commit(b, a_smem, &reg.a, epl_a, tid, k_step as i64);
+        // `deps` (the WAR barrier, stages=2) rides on the LDS handle via `lds_after`, so the whole
+        // strip's commit is fenced after the previous block's gather — the fill fns stay dep-agnostic.
+        |b, k_base, reg, deps| {
+            let (a_dst, b_dst) =
+                if deps.is_empty() { (a_smem, b_smem) } else { (b.lds_after(a_smem, deps), b.lds_after(b_smem, deps)) };
+            let fa = fill_lds_vec_commit(b, a_dst, &reg.a, epl_a, tid, k_step as i64);
             let fb = match &reg.b {
-                Some(bt) => fill_lds_transpose_vec_commit(b, b_smem, bt, tid, nthreads, k_step, big_n),
-                None => fill_lds_unrolled(b, b_smem, bmat, epl_b, tid, k_step as i64, k_base, tn_bn, n as i64, true),
+                Some(bt) => fill_lds_transpose_vec_commit(b, b_dst, bt, tid, nthreads, k_step, big_n),
+                None => fill_lds_unrolled(b, b_dst, bmat, epl_b, tid, k_step as i64, k_base, tn_bn, n as i64, true),
             };
             fa.into_iter().chain(fb).collect()
         },
@@ -1166,7 +1293,7 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, wm: usize, wn
 /// K_STEP=16 — the first tk2 matmul to beat naive at scale. See [`kblock_impl`]. Compose
 /// `.apply(`[`SwizzlePass`](crate::passes::SwizzlePass)`)` for the bank-swizzled variant.
 pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, 1, 1, EDGE)
+    kblock_impl(m, n, k, bm, bn, 1, 1, EDGE, 1)
 }
 
 /// **Multi-warp** K-blocked matmul (DESIGN.md §5b, the bigger-tile lever): a `wm×wn` grid
@@ -1186,7 +1313,26 @@ pub fn matmul_lds_kblock_mw(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 1)
+}
+
+/// **Register-staged pipelined** multi-warp K-blocked matmul (`stages=2`, DESIGN §5b): the
+/// [`matmul_lds_kblock_mw`] tile shape, but each K-block's global load is prefetched into VGPRs
+/// ahead of the MFMAs and its `ds_write` deferred behind the WAR barrier — the HK ping-pong
+/// latency hide, proven expressible by `lds_carry_loop`. The scalar-gather base; compose
+/// `.apply(VectorizePass).apply(SwizzlePass)` for the production variant.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_lds_kblock_mw_pipe(
+    m: usize,
+    n: usize,
+    k: usize,
+    bm: usize,
+    bn: usize,
+    wm: usize,
+    wn: usize,
+    k_step: usize,
+) -> Program {
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2)
 }
 
 /// The **vectorised** K-blocked kernel: the scalar-gather base with
@@ -1212,5 +1358,5 @@ pub fn matmul_lds_kblock_sw(m: usize, n: usize, k: usize, bm: usize, bn: usize, 
 /// swizzle. `k_step ∈ {16,32,64}` if swizzling; bigger `k_step` = fewer barriers, more LDS
 /// + operand VGPR (the occupancy trade the harness resolves).
 pub fn matmul_lds_kblock_ks(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, 1, 1, k_step)
+    kblock_impl(m, n, k, bm, bn, 1, 1, k_step, 1)
 }

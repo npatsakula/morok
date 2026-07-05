@@ -20,8 +20,8 @@ mod common;
 use common::{bench_plan, rand_bf16, requirements_met};
 
 use svod_tk2::{
-    Program, SwizzlePass, VectorizePass, graph_kernel, matmul, matmul_lds_kblock_mw, matmul_lds_kblock_sw,
-    matmul_lds_kblock_vec, optimize_addressing,
+    Program, SwizzlePass, VectorizePass, graph_kernel, matmul, matmul_lds_kblock_mw, matmul_lds_kblock_mw_pipe,
+    matmul_lds_kblock_sw, matmul_lds_kblock_vec, optimize_addressing,
 };
 
 /// f32 ground truth `A·B` over the SAME bf16-rounded operands (both kernel and
@@ -111,6 +111,20 @@ fn bench_matmul(c: &mut Criterion) {
         let (ymw2, pmw2) = plan_of(mw256, n, n, &a, &b);
         assert_correct(&ymw2, &pmw2, &expected, n, "kblock_mw256");
         group.bench_with_input(BenchmarkId::new("kblock_mw256", n), &n, |bch, _| bench_plan(bch, &pmw2));
+
+        // stages=2 register-staged pipeline (DESIGN §5b phase 2b): the same 128²/256² tiles, but
+        // block k+1's global load flies in-flight across block k's MFMAs (deferred ds_write behind
+        // the WAR). The latency-hide lever that should move MfmaUtil off the single-buffer 0.33 —
+        // gated here bit-exact vs the reference, and profiled via `--profile-time` for the counter.
+        let mw128p = matmul_lds_kblock_mw_pipe(n, n, n, 64, 64, 2, 2, 64).apply(VectorizePass).apply(SwizzlePass);
+        let (ymwp, pmwp) = plan_of(mw128p, n, n, &a, &b);
+        assert_correct(&ymwp, &pmwp, &expected, n, "kblock_mw128_pipe");
+        group.bench_with_input(BenchmarkId::new("kblock_mw128_pipe", n), &n, |bch, _| bench_plan(bch, &pmwp));
+
+        let mw256p = matmul_lds_kblock_mw_pipe(n, n, n, 64, 64, 4, 4, 64).apply(VectorizePass).apply(SwizzlePass);
+        let (ymw2p, pmw2p) = plan_of(mw256p, n, n, &a, &b);
+        assert_correct(&ymw2p, &pmw2p, &expected, n, "kblock_mw256_pipe");
+        group.bench_with_input(BenchmarkId::new("kblock_mw256_pipe", n), &n, |bch, _| bench_plan(bch, &pmw2p));
     }
     group.finish();
 }
