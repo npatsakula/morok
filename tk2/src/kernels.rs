@@ -1311,10 +1311,9 @@ fn pipeline_clustered<Op, Reg>(
     let mut carried: Vec<TileId> = body.prev_store[..n_acc - 1].to_vec();
     carried.push(body.raw_next.expect("steady schedule must contain a commit cluster"));
     carried.push(body.tail_barrier.expect("steady body must end on a cluster barrier"));
-    // NB: the HK positional barrier-wall lattice (`b.wall_marker()`) is deliberately NOT emitted:
-    // proven (ISA) to box the MFMAs correctly but push svod's dataflow register allocation past the
-    // 256-VGPR spill cliff (fresh frag regs/slice + whole-prefetch-live) → 20 spills, worse than the
-    // plain pipe. The wall infra stays available (opt-in) for an asm / register-tightened kernel.
+    // HK positional wall lattice (`b.wall_marker()`) is OFF until the asm `ds_read_b64 offset:N`
+    // gather lands: the walls only stop spilling once that collapses the addressing VGPRs (the ONE
+    // asm HK actually uses — its MFMA/setprio/sched.barrier are intrinsics, which we already emit).
     let combined = b.combine(last, &carried);
     let ended = b.end(combined, &[kr]);
     let acc_loop: Vec<Frag<F32>> = accs.iter().map(|a| b.frag_after(*a, &[ended.dep()])).collect();
@@ -1625,6 +1624,8 @@ fn kblock_impl(
                 let mut out = Vec::with_capacity(ri * cj);
                 for i in 0..ri {
                     for j in 0..cj {
+                        // Intrinsic MFMA — HK uses the intrinsic too (`@llvm.amdgcn.mfma`); the asm is
+                        // only the ds_read_b64 gather. asm MFMA regressed and is not HK's approach.
                         out.push(b.mma(a_vecs[i], b_vecs[j], acc_reads[i * cj + j], ept));
                     }
                 }

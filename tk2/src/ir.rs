@@ -239,7 +239,12 @@ pub enum Node {
     /// [`Op::Wmma`](svod_ir::Op::Wmma) (gfx942 16×16×16 bf16→f32 MFMA intrinsic).
     /// `a`/`b` are bf16 `LoadRegVec` operands, `c` the f32 accumulator operand; the
     /// result is an f32 `<ept × f32>` vector stored back via [`Node::StoreRegVec`].
-    Mma { a: TileId, b: TileId, c: TileId, ept: usize },
+    /// One K-fragment MFMA. `asm = true` renders it as inline `asm sideeffect`
+    /// (`v_mfma_f32_16x16x16_bf16`, `=v,v,v,0`) instead of the intrinsic — schedule-opaque, so
+    /// the cluster program order survives `-O3` WITHOUT the `sched.barrier(0)` walls that extend
+    /// live ranges past the VGPR spill cliff (§5c: the asm channel is how HK stays at 254 VGPR).
+    /// The accumulator `"0"` tie keeps the K-reduction in one physical register either way.
+    Mma { a: TileId, b: TileId, c: TileId, ept: usize, asm: bool },
     /// A workgroup synchronization barrier (`s.barrier`): `body` (a store) passes
     /// through as the effect, and every write in `deps` is fenced — all must complete
     /// before any consumer routed [`Node::After`] this barrier proceeds. This is the
@@ -424,7 +429,7 @@ impl TileIr {
             Node::VecBuild { elements, dtype } => {
                 Node::VecBuild { elements: elements.into_iter().map(&mut f).collect(), dtype }
             }
-            Node::Mma { a, b, c, ept } => Node::Mma { a: f(a), b: f(b), c: f(c), ept },
+            Node::Mma { a, b, c, ept, asm } => Node::Mma { a: f(a), b: f(b), c: f(c), ept, asm },
             Node::Barrier { body, deps } => {
                 Node::Barrier { body: f(body), deps: deps.into_iter().map(&mut f).collect() }
             }

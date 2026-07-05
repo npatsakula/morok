@@ -225,11 +225,14 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             let elems: SmallVec<[Arc<UOp>; 4]> = elements.iter().map(|e| get(low, *e)).collect();
             UOp::vectorize(elems)
         }
-        // One K-fragment MFMA: `D = A·B + C`, the gfx942 16×16×16 bf16→f32 intrinsic.
-        Node::Mma { a, b, c, .. } => {
+        // One K-fragment MFMA `D = A·B + C` (gfx942 16×16×16 bf16→f32). `asm` flips the shared
+        // `render_wmma_amd` to the inline `asm sideeffect` form (schedule-opaque; the `=v,v,v,0` acc
+        // tie is identical either way) — the renderer already handles both.
+        Node::Mma { a, b, c, asm, .. } => {
             let (a, b, c) = (get(low, a), get(low, b), get(low, c));
-            let dtype_in = a.dtype().scalar_dtype();
-            UOp::wmma(a, b, c, wmma_desc(&dtype_in))
+            let mut desc = wmma_desc(&a.dtype().scalar_dtype());
+            desc.asm = asm;
+            UOp::wmma(a, b, c, desc)
         }
         Node::Barrier { body, deps } => {
             let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();

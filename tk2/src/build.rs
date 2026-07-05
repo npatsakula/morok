@@ -481,10 +481,17 @@ impl Builder {
         Val::wrap(self.ir.intern(Node::LoadVecAt { buf: after, base: base.0, ept, dtype: E::dtype() }))
     }
 
-    /// One K-fragment MFMA `D = A·B + C` (gfx942 16×16×16 bf16→f32). `a`/`b` are the
-    /// bf16 fragment operands, `c` the f32 accumulator; returns the f32 result vector.
+    /// One K-fragment MFMA `D = A·B + C` (gfx942 16×16×16 bf16→f32) via the **intrinsic**.
+    /// `a`/`b` are the bf16 fragment operands, `c` the f32 accumulator; returns the f32 result.
     pub fn mma(&mut self, a: Val<BF16>, b: Val<BF16>, c: Val<F32>, ept: usize) -> Val<F32> {
-        Val::wrap(self.ir.intern(Node::Mma { a: a.id, b: b.id, c: c.id, ept }))
+        Val::wrap(self.ir.intern(Node::Mma { a: a.id, b: b.id, c: c.id, ept, asm: false }))
+    }
+
+    /// The **asm** MFMA (`v_mfma_f32_16x16x16_bf16` as inline `asm sideeffect`, §5c): schedule-opaque
+    /// so the cluster order survives `-O3` without the `sched.barrier(0)` walls that spill. Numerically
+    /// identical to [`Self::mma`]. gfx942-only (the renderer falls back to the intrinsic on RDNA).
+    pub fn mma_asm(&mut self, a: Val<BF16>, b: Val<BF16>, c: Val<F32>, ept: usize) -> Val<F32> {
+        Val::wrap(self.ir.intern(Node::Mma { a: a.id, b: b.id, c: c.id, ept, asm: true }))
     }
 
     /// A fragment handle re-bound to observe `deps` (the post-loop carried read:
