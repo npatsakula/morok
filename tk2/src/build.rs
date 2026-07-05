@@ -305,6 +305,15 @@ impl Builder {
         Effect(self.ir.intern(Node::StoreGlobal { buf: lds.id, offset: offset.0, value: value.id }))
     }
 
+    /// Store into an LDS buffer **ordered after** `deps` (the buffer handle observes them):
+    /// the pipeline's commit-after-WAR — the write that overwrites the strip must follow the
+    /// previous iteration's gather (the WAR barrier), carried through `[seed, range]`. The
+    /// `After` edge on the destination buffer is the store analog of [`Self::load_lds_after`].
+    pub fn store_lds_after<E: Elem>(&mut self, lds: Lds<E>, offset: Idx, value: Val<E>, deps: &[TileId]) -> Effect {
+        let after = self.after_buf(lds.id, deps);
+        Effect(self.ir.intern(Node::StoreGlobal { buf: after, offset: offset.0, value: value.id }))
+    }
+
     /// ONE `<ept×E>` vector load of a contiguous **global** run at flat `base` (the
     /// coalesced, vectorised fill read → `buffer_load_dwordx*`) — the global mirror of
     /// [`Self::load_lds_vec_after`], no ordering edge (a plain source read).

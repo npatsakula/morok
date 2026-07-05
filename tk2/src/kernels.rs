@@ -139,6 +139,78 @@ pub fn lds_roundtrip(n: usize) -> Program {
     Program { ir, sink, name: "tk2_lds_roundtrip".into() }
 }
 
+/// **LDS-carry-through-barrier proof** (DESIGN §5b — the `kloop stages=2` prerequisite): a
+/// `T`-iteration loop that reads LDS written by the *previous* iteration through a **loop-
+/// carried RAW barrier**, plus a same-iteration WAR ([`Builder::store_lds_after`]) — the exact
+/// edge pattern the register-staged-prefetch pipeline needs, isolated on a toy so a carry bug
+/// surfaces here, not as silent garbage in the 385-TF kernel.
+///
+/// Per iteration `t`: gather the neighbour `lds[(lane+1)%n]` (ordered after the carried RAW
+/// barrier), accumulate it, then **overwrite** `lds[lane]` with it (a rotation) *after* the WAR
+/// fence, and RAW-fence the write for the next iteration. With `lds[lane] = in[lane]` seeded,
+/// `S_t[lane] = in[(lane+t)%n]`, so `out[lane] = Σ_{t=0}^{T-1} in[(lane+1+t)%n]`. If `broken`,
+/// the gather's loop-carry `range` edge is omitted so it always re-reads the *seed* state —
+/// `out[lane] = T·in[(lane+1)%n]` — proving the test distinguishes a correct carry from a stale one.
+pub fn lds_carry_loop(n: usize, t: usize, broken: bool) -> Program {
+    let mut b = Builder::new("tk2_lds_carry");
+
+    let out = b.global::<F32>(n); // slot 0
+    let inp = b.global::<F32>(n); // slot 1
+    let lds = b.define_local::<F32>(n);
+    let acc = b.define_reg::<F32>(1);
+
+    let lane = b.block_axis(n as i64);
+    let zero_idx = b.idx_const(0);
+    let one = b.idx_const(1);
+    let np = b.idx_const(n as i64);
+
+    // ── init acc = 0 (the sum_reduce init shape). ──
+    let ir = b.range(1);
+    let ic = b.counter(ir);
+    let zf = b.f32(0.0);
+    let s0 = b.store_reg(acc, ic, zf);
+    let acc_init = b.end(s0, &[ir]);
+
+    // ── prologue: lds[lane] = in[lane]; barrier (the RAW-carry seed = state S_0). ──
+    let v0 = b.load(inp, lane);
+    let staged = b.store_lds(lds, lane, v0);
+    let raw_seed = b.barrier(staged, &[]);
+
+    // ── loop t in 0..T. ──
+    let tr = b.range(t as i64);
+    let _tk = b.counter(tr);
+    let lp1 = b.idx_add(lane, one);
+    let nbr = b.idx_mod(lp1, np);
+
+    // gather the neighbour, ordered after the *loop-carried* RAW barrier ([seed, range] → the
+    // previous iteration's commit). `broken` drops the range edge → always re-reads S_0.
+    let gather_deps: Vec<TileId> = if broken { vec![raw_seed.dep()] } else { vec![raw_seed.dep(), tr.dep()] };
+    let v = b.load_lds_after(lds, nbr, &gather_deps);
+
+    // acc += v (register carry, proven).
+    let acc_c = b.load_reg_after(acc, zero_idx, &[acc_init.dep(), tr.dep()]);
+    let na = b.add(acc_c, v);
+    let s_acc = b.store_reg(acc, zero_idx, na);
+
+    // WAR fence (s_acc depends on v ⇒ the gather is done), then overwrite lds[lane]=v after it,
+    // and RAW-fence the write as the carry-out for the next iteration's gather.
+    let war = b.barrier(s_acc, &[]);
+    let commit = b.store_lds_after(lds, lane, v, &[war.dep()]);
+    let raw_next = b.barrier(commit, &[]);
+
+    // one End per RANGE: combine the acc store (register carry) + raw_next (LDS-RAW carry).
+    let combined = b.combine(s_acc, &[raw_next.dep()]);
+    let ended = b.end(combined, &[tr]);
+
+    // ── post-loop: out[lane] = acc. ──
+    let acc_f = b.reg_after(acc, &[ended.dep()]);
+    let res = b.load_reg(acc_f, zero_idx);
+    let ost = b.store(out, lane, res);
+
+    let (ir2, sink) = b.finish(&[ost]);
+    Program { ir: ir2, sink, name: "tk2_lds_carry".into() }
+}
+
 /// The gfx942 MFMA edge — one 16×16×16 fragment per workgroup, one 64-lane warp.
 const EDGE: usize = 16;
 const WARP: usize = 64;
