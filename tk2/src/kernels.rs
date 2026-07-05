@@ -412,6 +412,74 @@ fn fill_lds_vec(
         .collect()
 }
 
+/// True when the register-transpose B fill tiles the strip exactly (every lane owns the
+/// same whole number of `VEC×VEC` micro-tiles). `(k_step·bn)/VEC² % WARP == 0`.
+fn b_transpose_vec_ok(k_step: usize, bn: usize) -> bool {
+    const VEC: usize = 4;
+    k_step.is_multiple_of(VEC) && bn.is_multiple_of(VEC) && (k_step * bn).is_multiple_of(WARP * VEC * VEC)
+}
+
+/// **Register-transpose** vectorised fill for the transposed B tile `b_smem[bn, k_step]`.
+/// B's global read is N-contiguous but its transposed LDS write is K-contiguous — different
+/// axes — so a plain vector copy can't serve both. Each lane instead cooperatively loads a
+/// `VEC×VEC` micro-tile (VEC coalesced b64 rows, one per K), **transposes it in registers**
+/// (`vec_extract` a column out of each row-vector, `vec_build` it back), and stores VEC b64
+/// to the transposed LDS (one contiguous k_step run per N-row) — `2·VEC` vector mem ops + a
+/// register shuffle replacing `2·VEC²` scalar load/stores. The LDS row (N) still exchanges
+/// across lanes in shared memory; the register transpose only reconciles the fill's own
+/// load/store axes. Gated by [`b_transpose_vec_ok`]. Returns the store effects to fence.
+#[allow(clippy::too_many_arguments)]
+fn fill_lds_transpose_vec(
+    b: &mut Builder,
+    lds: Lds<BF16>,
+    src: Buf<BF16>,
+    lane: Idx,
+    k_step: usize,
+    bn: usize,
+    k_base: Idx,
+    n_base: Idx,
+    grow_stride: i64,
+) -> Vec<Effect> {
+    const VEC: usize = 4;
+    let nb_count = bn / VEC; // micro-tiles along N
+    let per_lane = k_step * bn / (VEC * VEC) / WARP;
+    let (nb_c, vec_c, kstep_c, gstride) =
+        (b.idx_const(nb_count as i64), b.idx_const(VEC as i64), b.idx_const(k_step as i64), b.idx_const(grow_stride));
+    let mut stores = Vec::with_capacity(per_lane * VEC);
+    for t in 0..per_lane {
+        // This lane's micro-tile bi = t·WARP + lane → block coords (kb, nb) → tile origin (k0, n0).
+        let bi = offset_by(b, lane, t * WARP);
+        let kb = b.idx_div(bi, nb_c);
+        let nb = b.idx_mod(bi, nb_c);
+        let k0 = b.idx_mul(kb, vec_c);
+        let n0 = b.idx_mul(nb, vec_c);
+        // Load VEC coalesced b64 rows: row i = B[k_base + k0 + i][n_base + n0 .. +VEC].
+        let rows: Vec<Val<BF16>> = (0..VEC)
+            .map(|i| {
+                let ic = b.idx_const(i as i64);
+                let ki = b.idx_add(k0, ic);
+                let ki = b.idx_add(k_base, ki);
+                let goff = b.idx_mul(ki, gstride);
+                let goff = b.idx_add(goff, n_base);
+                let goff = b.idx_add(goff, n0);
+                b.load_vec(src, goff, VEC)
+            })
+            .collect();
+        // Transpose in registers + store VEC b64 to LDS row (n0+j), k_step run k0..k0+VEC.
+        for j in 0..VEC {
+            let col: Vec<Val<BF16>> = rows.iter().map(|&r| b.vec_extract(r, j)).collect();
+            let bt = b.vec_build(&col);
+            let jc = b.idx_const(j as i64);
+            let nrow = b.idx_add(n0, jc);
+            let col_part = b.lds_col(nrow, k0, k_step);
+            let nrow_off = b.idx_mul(nrow, kstep_c);
+            let dst = b.idx_add(nrow_off, col_part);
+            stores.push(b.store_lds_vec(lds, dst, bt));
+        }
+    }
+    stores
+}
+
 /// `idx + base` (folding the `base == 0` identity so the flat path stays clean).
 fn offset_by(b: &mut Builder, idx: Idx, base: usize) -> Idx {
     if base == 0 {
@@ -767,10 +835,15 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
     // **transposed** into b_smem[bn,k_step] (LDS rows = N, cols = K) so B's ept run is
     // contiguous and vectorises like A — global K = tk·k_step + col, N = tn·bn + row, stride N.
     let mut fill_stores: Vec<TileId> = Vec::with_capacity(epl_a / 4 + epl_b);
-    // A (Row, contiguous both sides) fills vectorised in b64 chunks; B (transposed) stays
-    // scalar — its strided global read can't be a contiguous vector load (§5b).
+    // A (Row, contiguous both sides) fills vectorised in b64 chunks. B (transposed) needs a
+    // register transpose to vectorise across its differing global/LDS axes — used when the
+    // strip tiles exactly, else the scalar fill (§5b).
     let fa = fill_lds_vec(&mut b, a_smem, a, epl_a, lane, k_step as i64, tm_bm, tk_ks, k as i64);
-    let fb = fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, lane, k_step as i64, tk_ks, tn_bn, n as i64, true);
+    let fb = if b_transpose_vec_ok(k_step, bn) {
+        fill_lds_transpose_vec(&mut b, b_smem, bmat, lane, k_step, bn, tk_ks, tn_bn, n as i64)
+    } else {
+        fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, lane, k_step as i64, tk_ks, tn_bn, n as i64, true)
+    };
     let fill_head = fa[0];
     fill_stores.extend(fa.iter().skip(1).chain(fb.iter()).map(|e| e.dep()));
     // RAW fence: the whole strip is staged before any lane gathers a fragment.

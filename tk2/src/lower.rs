@@ -218,6 +218,13 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
                 UOp::index().buffer(buf).indices(vec![base]).ptr(true).call().expect("VEC_AT store index construction");
             idx.store(val)
         }
+        // Extract one scalar lane from a vector (`gep`); build a vector from scalars
+        // (`vectorize`) — the register-transpose pair (read a column, pack it).
+        Node::VecExtract { vec, index, .. } => get(low, vec).gep(vec![index]),
+        Node::VecBuild { elements, .. } => {
+            let elems: SmallVec<[Arc<UOp>; 4]> = elements.iter().map(|e| get(low, *e)).collect();
+            UOp::vectorize(elems)
+        }
         // One K-fragment MFMA: `D = A·B + C`, the gfx942 16×16×16 bf16→f32 intrinsic.
         Node::Mma { a, b, c, .. } => {
             let (a, b, c) = (get(low, a), get(low, b), get(low, c));

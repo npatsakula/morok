@@ -136,17 +136,19 @@ fn matmul_lds_kblock_ks64_lowering_is_spec_valid() {
 }
 
 #[test]
-fn matmul_kblock_gathers_and_a_fill_are_vectorised() {
-    // Both operand gathers AND the A fill are vectorised into `<ept×bf16>` LoadVecAt/
-    // StoreVecAt (→ ds_read/ds_write_b64), not scalar. For a 64×64 tile at K_STEP=16
-    // (ri=cj=4, ksteps=1): `ri·ksteps` (4) A gathers + `ksteps·cj` (4) B gathers +
-    // `epl_a/4` (16/4=4) A-fill vector global loads = 12 LoadVecAt; the A fill's 4 LDS
-    // stores are StoreVecAt. B fill stays scalar (its transpose strides the global read).
+fn matmul_kblock_gathers_and_fills_are_vectorised() {
+    // Gathers AND both fills are vectorised into `<ept×bf16>` LoadVecAt/StoreVecAt (→
+    // ds_read/ds_write_b64). For a 64×64 tile at K_STEP=16 (ri=cj=4, ksteps=1): 4 A gathers
+    // + 4 B gathers + 4 A-fill global loads + 4 B-fill (register-transpose) global loads =
+    // 16 LoadVecAt; 4 A-fill + 4 B-fill LDS stores = 8 StoreVecAt. The B fill's register
+    // transpose is 16 VecExtract (a column per row-vector) + 4 VecBuild (the packed b64s).
     use crate::ir::{Node as N, TileId};
     let p = crate::kernels::matmul_lds_kblock_ks(64, 64, 64, 64, 64, 16);
     let count = |pred: &dyn Fn(&N) -> bool| (0..p.ir.len()).filter(|&i| pred(p.ir.node(TileId(i as u32)))).count();
-    assert_eq!(count(&|n| matches!(n, N::LoadVecAt { .. })), 12, "8 gather + 4 A-fill vector loads");
-    assert_eq!(count(&|n| matches!(n, N::StoreVecAt { .. })), 4, "4 A-fill vector LDS stores");
+    assert_eq!(count(&|n| matches!(n, N::LoadVecAt { .. })), 16, "8 gather + 8 fill vector loads");
+    assert_eq!(count(&|n| matches!(n, N::StoreVecAt { .. })), 8, "4 A-fill + 4 B-fill vector LDS stores");
+    assert_eq!(count(&|n| matches!(n, N::VecExtract { .. })), 16, "B register transpose: 16 column extracts");
+    assert_eq!(count(&|n| matches!(n, N::VecBuild { .. })), 4, "B register transpose: 4 packed b64 columns");
     lower::verify(&p).expect("vectorised matmul must lower to spec-valid UOp");
 }
 

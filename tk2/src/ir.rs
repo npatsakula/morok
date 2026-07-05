@@ -227,6 +227,14 @@ pub enum Node {
     /// (the vectorised fill; the store mirror of [`Node::LoadVecAt`]). Requires the `ept`
     /// run contiguous + aligned (the A / Row fill; B stays scalar under the transpose).
     StoreVecAt { buf: TileId, base: TileId, value: TileId },
+    /// Extract scalar element `index` from vector value `vec` → `vec.gep([index])`
+    /// ([`Op::Gep`](svod_ir::Op::Gep)). The register-transpose primitive (read a column
+    /// out of a loaded row-vector); `dtype` is the scalar element type.
+    VecExtract { vec: TileId, index: usize, dtype: DType },
+    /// Build a `<len × dtype>` vector from scalar `elements` → `UOp::vectorize(elements)`
+    /// ([`Op::Vectorize`](svod_ir::Op::Vectorize)). The register-transpose store operand
+    /// (pack a transposed column of scalars into one b64 for a `ds_write_b64`).
+    VecBuild { elements: SmallVec<[TileId; 4]>, dtype: DType },
     /// A single K-fragment matrix multiply-accumulate `D = A·B + C` → one
     /// [`Op::Wmma`](svod_ir::Op::Wmma) (gfx942 16×16×16 bf16→f32 MFMA intrinsic).
     /// `a`/`b` are bf16 `LoadRegVec` operands, `c` the f32 accumulator operand; the
@@ -382,6 +390,10 @@ impl TileIr {
             Node::LoadVecAt { buf, base, ept, dtype } => Node::LoadVecAt { buf: f(buf), base: f(base), ept, dtype },
             Node::StoreRegVec { buf, value } => Node::StoreRegVec { buf: f(buf), value: f(value) },
             Node::StoreVecAt { buf, base, value } => Node::StoreVecAt { buf: f(buf), base: f(base), value: f(value) },
+            Node::VecExtract { vec, index, dtype } => Node::VecExtract { vec: f(vec), index, dtype },
+            Node::VecBuild { elements, dtype } => {
+                Node::VecBuild { elements: elements.into_iter().map(&mut f).collect(), dtype }
+            }
             Node::Mma { a, b, c, ept } => Node::Mma { a: f(a), b: f(b), c: f(c), ept },
             Node::Barrier { body, deps } => {
                 Node::Barrier { body: f(body), deps: deps.into_iter().map(&mut f).collect() }
@@ -436,6 +448,11 @@ impl TileIr {
                 TileMeta::value(SmallVec::from_slice(&[*ept]), dtype.clone(), Residency::Reg)
             }
             Node::Mma { ept, .. } => TileMeta::value(SmallVec::from_slice(&[*ept]), DType::Float32, Residency::Reg),
+            // A scalar extracted from a vector; a `len`-vector built from scalars.
+            Node::VecExtract { dtype, .. } => TileMeta::value(SmallVec::new(), dtype.clone(), Residency::Reg),
+            Node::VecBuild { elements, dtype } => {
+                TileMeta::value(SmallVec::from_slice(&[elements.len()]), dtype.clone(), Residency::Reg)
+            }
             // `After` is a passthrough of its value (an ordering edge routed
             // through it), so it carries the value's residency/dtype/layout.
             Node::After { val, .. } => self.meta(*val).clone(),

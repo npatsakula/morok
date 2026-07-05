@@ -319,6 +319,18 @@ impl Builder {
         Effect(self.ir.intern(Node::StoreVecAt { buf: lds.id, base: base.0, value: value.id }))
     }
 
+    /// Extract scalar element `index` from a vector value ([`Node::VecExtract`] → `gep`).
+    pub fn vec_extract<E: Elem>(&mut self, v: Val<E>, index: usize) -> Val<E> {
+        Val::wrap(self.ir.intern(Node::VecExtract { vec: v.id, index, dtype: E::dtype() }))
+    }
+
+    /// Build a `<len×E>` vector from scalar `elements` ([`Node::VecBuild`] → `vectorize`) —
+    /// the register-transpose store operand.
+    pub fn vec_build<E: Elem>(&mut self, elements: &[Val<E>]) -> Val<E> {
+        let elems = elements.iter().map(|e| e.id).collect();
+        Val::wrap(self.ir.intern(Node::VecBuild { elements: elems, dtype: E::dtype() }))
+    }
+
     /// Load an `E` value from an LDS buffer at flat `offset` **ordered after** the
     /// staging barrier (and any other `deps`): the cross-lane read of a staged tile.
     /// The `After` edge on the buffer makes the store→barrier→load order explicit —
