@@ -173,6 +173,24 @@ fn matmul_lds_kblock_lowering_is_spec_valid() {
 }
 
 #[test]
+fn matmul_lds_kblock_multiwarp_lowers_and_derives_warps() {
+    // Multi-warp (2×2 → 128×128 tile): block size = 4·64 = 256 (one lidx0 SPECIAL of
+    // bound 256), the warp split adds idx_div/idx_mod, and it lowers to spec-valid UOp.
+    let p = crate::kernels::matmul_lds_kblock_mw(128, 128, 64, 64, 64, 2, 2, 64);
+    let has_block_256 = (0..p.ir.len()).any(|i| {
+        matches!(p.ir.node(crate::ir::TileId(i as u32)), Node::Axis { axis: crate::ir::ScopeAxis::Block, bound: 256 })
+    });
+    assert!(has_block_256, "multi-warp workgroup must be a single 256-thread block axis");
+    lower::verify(&p).expect("multi-warp K-blocked matmul must lower to spec-valid UOp");
+    // Single-warp stays a 64-thread block (no warp-split div/mod overhead).
+    let sw = crate::kernels::matmul_lds_kblock_ks(64, 64, 64, 64, 64, 64);
+    let has_block_64 = (0..sw.ir.len()).any(|i| {
+        matches!(sw.ir.node(crate::ir::TileId(i as u32)), Node::Axis { axis: crate::ir::ScopeAxis::Block, bound: 64 })
+    });
+    assert!(has_block_64, "single-warp workgroup stays a 64-thread block");
+}
+
+#[test]
 fn matmul_lds_kblock_carries_two_barriers_per_kstep() {
     // Structural: the single-buffer WAR needs a RAW fence (after fill) AND a WAR fence
     // (after the LDS reads) — at least two Barriers in the K-loop body.

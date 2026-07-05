@@ -19,7 +19,10 @@ use svod_tensor::testing::allclose_f32;
 mod common;
 use common::{bench_plan, rand_bf16, requirements_met};
 
-use svod_tk2::{Program, graph_kernel, matmul, matmul_lds_kblock_sw, matmul_lds_kblock_vec, optimize_addressing};
+use svod_tk2::{
+    Program, SwizzlePass, VectorizePass, graph_kernel, matmul, matmul_lds_kblock_mw, matmul_lds_kblock_sw,
+    matmul_lds_kblock_vec, optimize_addressing,
+};
 
 /// f32 ground truth `A·B` over the SAME bf16-rounded operands (both kernel and
 /// reference see the realized bf16 values cast up to f32).
@@ -94,6 +97,13 @@ fn bench_matmul(c: &mut Criterion) {
         let (ysw, psw) = plan_of(swizzled, n, n, &a, &b);
         assert_correct(&ysw, &psw, &expected, n, "kblock_sw64");
         group.bench_with_input(BenchmarkId::new("kblock_sw64", n), &n, |bch, _| bench_plan(bch, &psw));
+
+        // Multi-warp: a 2×2 warp grid → one 128×128 workgroup tile (vectorised + swizzled),
+        // amortising the two barriers over 4× more MFMAs (the bigger-tile lever).
+        let mw = matmul_lds_kblock_mw(n, n, n, 64, 64, 2, 2, 64).apply(VectorizePass).apply(SwizzlePass);
+        let (ymw, pmw) = plan_of(mw, n, n, &a, &b);
+        assert_correct(&ymw, &pmw, &expected, n, "kblock_mw128");
+        group.bench_with_input(BenchmarkId::new("kblock_mw128", n), &n, |bch, _| bench_plan(bch, &pmw));
     }
     group.finish();
 }

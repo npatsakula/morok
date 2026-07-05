@@ -412,11 +412,12 @@ fn fill_lds_vec(
         .collect()
 }
 
-/// True when the register-transpose B fill tiles the strip exactly (every lane owns the
-/// same whole number of `VEC×VEC` micro-tiles). `(k_step·bn)/VEC² % WARP == 0`.
-fn b_transpose_vec_ok(k_step: usize, bn: usize) -> bool {
+/// True when the register-transpose B fill tiles the strip exactly (every one of the
+/// `nthreads` threads owns the same whole number of `VEC×VEC` micro-tiles).
+/// `(k_step·bn)/VEC² % nthreads == 0`. `bn` here is the whole-workgroup B tile (bn·wn).
+fn b_transpose_vec_ok(k_step: usize, bn: usize, nthreads: usize) -> bool {
     const VEC: usize = 4;
-    k_step.is_multiple_of(VEC) && bn.is_multiple_of(VEC) && (k_step * bn).is_multiple_of(WARP * VEC * VEC)
+    k_step.is_multiple_of(VEC) && bn.is_multiple_of(VEC) && (k_step * bn).is_multiple_of(nthreads * VEC * VEC)
 }
 
 /// **Register-transpose** vectorised fill for the transposed B tile `b_smem[bn, k_step]`.
@@ -433,7 +434,8 @@ fn fill_lds_transpose_vec(
     b: &mut Builder,
     lds: Lds<BF16>,
     src: Buf<BF16>,
-    lane: Idx,
+    tid: Idx,
+    nthreads: usize,
     k_step: usize,
     bn: usize,
     k_base: Idx,
@@ -442,13 +444,13 @@ fn fill_lds_transpose_vec(
 ) -> Vec<Effect> {
     const VEC: usize = 4;
     let nb_count = bn / VEC; // micro-tiles along N
-    let per_lane = k_step * bn / (VEC * VEC) / WARP;
+    let per_lane = k_step * bn / (VEC * VEC) / nthreads;
     let (nb_c, vec_c, kstep_c, gstride) =
         (b.idx_const(nb_count as i64), b.idx_const(VEC as i64), b.idx_const(k_step as i64), b.idx_const(grow_stride));
     let mut stores = Vec::with_capacity(per_lane * VEC);
     for t in 0..per_lane {
-        // This lane's micro-tile bi = t·WARP + lane → block coords (kb, nb) → tile origin (k0, n0).
-        let bi = offset_by(b, lane, t * WARP);
+        // This thread's micro-tile bi = t·nthreads + tid → block coords (kb, nb) → origin (k0, n0).
+        let bi = offset_by(b, tid, t * nthreads);
         let kb = b.idx_div(bi, nb_c);
         let nb = b.idx_mod(bi, nb_c);
         let k0 = b.idx_mul(kb, vec_c);
@@ -490,6 +492,15 @@ fn offset_by(b: &mut Builder, idx: Idx, base: usize) -> Idx {
     }
 }
 
+/// `idx + off` when a runtime offset is present (the multi-warp wave offset); the identity
+/// when `None` (the single-warp path, kept byte-identical — no spurious `+0` node).
+fn add_opt(b: &mut Builder, idx: Idx, off: Option<Idx>) -> Idx {
+    match off {
+        Some(o) => b.idx_add(idx, o),
+        None => idx,
+    }
+}
+
 /// **Scalar** gather of one 16×16 fragment from an `[outer, inner]` row-major LDS tile — the
 /// fusible base form: `ept` per-element `load_lds_after` + `store_frag_elem`, each at
 /// `outer·inner + LdsCol(outer, run+e, inner)`. It serves **both** operands via `map.transpose`
@@ -507,6 +518,7 @@ fn gather_frag_lds_run(
     dst: Frag<BF16>,
     lds: Lds<BF16>,
     outer_base: usize,
+    outer_warp: Option<Idx>,
     run_base: usize,
     inner: usize,
     lane: Idx,
@@ -518,7 +530,10 @@ fn gather_frag_lds_run(
             let e_idx = b.idx_const(e as i64);
             let (frag_row, frag_col) = b.lane_rc(dst.map, lane, e_idx);
             let (outer_frag, run_frag) = if dst.map.transpose { (frag_col, frag_row) } else { (frag_row, frag_col) };
+            // The fixed-axis coordinate: intra-wave lane_rc + compile-time sub-tile base +
+            // (multi-warp) the wave's runtime row/col offset into the shared LDS tile.
             let outer = offset_by(b, outer_frag, outer_base);
+            let outer = add_opt(b, outer, outer_warp);
             let run = offset_by(b, run_frag, run_base);
             let col_part = b.lds_col(outer, run, inner); // the swizzle/vectorise hole
             let row_off = b.idx_mul(outer, inner_c);
@@ -778,37 +793,59 @@ pub fn matmul_lds_tiled(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> P
 /// the flat layout is the base; `.apply(`[`SwizzlePass`](crate::passes::SwizzlePass)`)`
 /// turns it into the bank-swizzled one — the swizzle is a **composable refinement**, not
 /// hand-woven here (bm/bn/k_step ∈ {16,32,64} for the single-subtile swizzle).
-#[allow(clippy::needless_range_loop)]
-fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize) -> Program {
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, wm: usize, wn: usize, k_step: usize) -> Program {
     assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
     assert!(k_step.is_multiple_of(EDGE) && k.is_multiple_of(k_step), "k_step multiple of 16, K multiple of k_step");
-    assert!(m.is_multiple_of(bm) && n.is_multiple_of(bn), "m/n must tile by bm/bn");
+    assert!(wm >= 1 && wn >= 1, "at least one warp per axis");
+    // Workgroup output tile = (bm·wm) × (bn·wn), computed by a wm×wn grid of 64-lane warps.
+    let (big_m, big_n, nthreads) = (bm * wm, bn * wn, wm * wn * WARP);
+    assert!(m.is_multiple_of(big_m) && n.is_multiple_of(big_n), "m/n must tile by (bm·wm)/(bn·wn)");
     let mut b = Builder::new("tk2_matmul_kblock");
 
     let c = b.global::<F32>(m * n);
     let a = b.global::<BF16>(m * k);
     let bmat = b.global::<BF16>(k * n);
 
-    let tile_m = b.grid_axis(0, (m / bm) as i64);
-    let tile_n = b.grid_axis(1, (n / bn) as i64);
-    let lane = b.block_axis(WARP as i64);
+    let tile_m = b.grid_axis(0, (m / big_m) as i64);
+    let tile_n = b.grid_axis(1, (n / big_n) as i64);
+    let tid = b.block_axis(nthreads as i64);
+
+    // Warp split: the fill spans all `nthreads`; each warp computes one bm×bn sub-tile at
+    // (warp_row·bm, warp_col·bn). Single-warp keeps `wlane = tid` and no runtime offset
+    // (byte-identical to the pre-multi-warp kernel).
+    let (wlane, warp_row_off, warp_col_off) = if wm * wn == 1 {
+        (tid, None, None)
+    } else {
+        let warp_c = b.idx_const(WARP as i64);
+        let wn_c = b.idx_const(wn as i64);
+        let bm_c = b.idx_const(bm as i64);
+        let bn_c = b.idx_const(bn as i64);
+        let warp = b.idx_div(tid, warp_c);
+        let wlane = b.idx_mod(tid, warp_c);
+        let warp_row = b.idx_div(warp, wn_c);
+        let warp_col = b.idx_mod(warp, wn_c);
+        let row_off = b.idx_mul(warp_row, bm_c);
+        let col_off = b.idx_mul(warp_col, bn_c);
+        (wlane, Some(row_off), Some(col_off))
+    };
 
     let a_map = FragMap::gfx942_16x16(false);
     let bc_map = FragMap::gfx942_16x16(true);
     let ept = a_map.ept;
-    let (ri, cj) = (bm / EDGE, bn / EDGE);
+    let (ri, cj) = (bm / EDGE, bn / EDGE); // per-warp accumulator grid
     let ksteps = k_step / EDGE; // K-fragments per staged block (amortises the 2 barriers)
 
-    // Single-buffered K_STEP strips: A[bm,k_step], B[k_step,bn]. Footprint ∝ k_step, ⊥ K.
-    let a_smem = b.define_local::<BF16>(bm * k_step);
-    let b_smem = b.define_local::<BF16>(k_step * bn);
-    let epl_a = bm * k_step / WARP;
-    let epl_b = k_step * bn / WARP;
+    // Single-buffered K_STEP strips over the WHOLE workgroup tile: A[big_m,k_step], B[big_n,k_step].
+    let a_smem = b.define_local::<BF16>(big_m * k_step);
+    let b_smem = b.define_local::<BF16>(k_step * big_n);
+    let epl_a = big_m * k_step / nthreads;
+    let epl_b = k_step * big_n / nthreads;
 
-    let bm_c = b.idx_const(bm as i64);
-    let bn_c = b.idx_const(bn as i64);
-    let tm_bm = b.idx_mul(tile_m, bm_c); // A row base (rows): tile_m·bm
-    let tn_bn = b.idx_mul(tile_n, bn_c); // B col base (cols): tile_n·bn
+    let big_m_c = b.idx_const(big_m as i64);
+    let big_n_c = b.idx_const(big_n as i64);
+    let tm_bm = b.idx_mul(tile_m, big_m_c); // workgroup A row origin: tile_m·big_m
+    let tn_bn = b.idx_mul(tile_n, big_n_c); // workgroup B col origin: tile_n·big_n
 
     // ── accumulators: one 16×16 f32 fragment per (i,j), zero-initialised. ──
     let acc: Vec<Frag<F32>> = (0..ri * cj).map(|_| b.define_frag::<F32>(bc_map)).collect();
@@ -836,11 +873,11 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
     // A (Row, contiguous both sides) fills vectorised in b64 chunks. B (transposed) needs a
     // register transpose to vectorise across its differing global/LDS axes — used when the
     // strip tiles exactly, else the scalar fill (§5b).
-    let fa = fill_lds_vec(&mut b, a_smem, a, epl_a, lane, k_step as i64, tm_bm, tk_ks, k as i64);
-    let fb = if b_transpose_vec_ok(k_step, bn) {
-        fill_lds_transpose_vec(&mut b, b_smem, bmat, lane, k_step, bn, tk_ks, tn_bn, n as i64)
+    let fa = fill_lds_vec(&mut b, a_smem, a, epl_a, tid, k_step as i64, tm_bm, tk_ks, k as i64);
+    let fb = if b_transpose_vec_ok(k_step, big_n, nthreads) {
+        fill_lds_transpose_vec(&mut b, b_smem, bmat, tid, nthreads, k_step, big_n, tk_ks, tn_bn, n as i64)
     } else {
-        fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, lane, k_step as i64, tk_ks, tn_bn, n as i64, true)
+        fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, tid, k_step as i64, tk_ks, tn_bn, n as i64, true)
     };
     let fill_head = fa[0];
     fill_stores.extend(fa.iter().skip(1).chain(fb.iter()).map(|e| e.dep()));
@@ -859,16 +896,17 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
         .map(|i| {
             (0..ksteps)
                 .map(|kf| {
-                    // A-frag (i,kf): a_smem[bm,k_step] row-block i, K-block kf (cols k_step).
+                    // A-frag (i,kf): this warp's rows (warp_row·bm) + sub-tile row-block i.
                     // Scalar run (the base); VectorizePass fuses it to one ds_read_b64.
                     let s = gather_frag_lds_run(
                         &mut b,
                         a_frags[i][kf],
                         a_smem,
                         i * EDGE,
+                        warp_row_off,
                         kf * EDGE,
                         k_step,
-                        lane,
+                        wlane,
                         fill_bar,
                     );
                     gathers.extend(s.iter().copied());
@@ -881,16 +919,17 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
         .map(|kf| {
             (0..cj)
                 .map(|j| {
-                    // B-frag (kf,j): b_smem[bn,k_step] (transposed) col-block j, K-block kf.
-                    // Scalar run (the base); VectorizePass fuses it to one ds_read_b64.
+                    // B-frag (kf,j): this warp's N-rows (warp_col·bn) + sub-tile col-block j
+                    // (b_smem[big_n,k_step] transposed). VectorizePass fuses it to ds_read_b64.
                     let s = gather_frag_lds_run(
                         &mut b,
                         b_frags[kf][j],
                         b_smem,
                         j * EDGE,
+                        warp_col_off,
                         kf * EDGE,
                         k_step,
-                        lane,
+                        wlane,
                         fill_bar,
                     );
                     gathers.extend(s.iter().copied());
@@ -929,13 +968,16 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
         for j in 0..cj {
             let idx = i * cj + j;
             let acc_final = b.frag_after(acc[idx], &[ended.dep()]);
+            // C row/col = workgroup origin + this warp's sub-tile offset + fragment block i/j.
             let i16 = b.idx_const((i * EDGE) as i64);
             let row = b.idx_add(tm_bm, i16);
+            let row = add_opt(&mut b, row, warp_row_off);
             let row_n = b.idx_mul(row, n_c);
             let j16 = b.idx_const((j * EDGE) as i64);
             let col = b.idx_add(tn_bn, j16);
+            let col = add_opt(&mut b, col, warp_col_off);
             let base_c = b.idx_add(row_n, col);
-            roots.extend(scatter_frag(&mut b, acc_final, c, base_c, n as i64, lane));
+            roots.extend(scatter_frag(&mut b, acc_final, c, base_c, n as i64, wlane));
         }
     }
 
@@ -947,7 +989,27 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
 /// K_STEP=16 — the first tk2 matmul to beat naive at scale. See [`kblock_impl`]. Compose
 /// `.apply(`[`SwizzlePass`](crate::passes::SwizzlePass)`)` for the bank-swizzled variant.
 pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, EDGE)
+    kblock_impl(m, n, k, bm, bn, 1, 1, EDGE)
+}
+
+/// **Multi-warp** K-blocked matmul (DESIGN.md §5b, the bigger-tile lever): a `wm×wn` grid
+/// of 64-lane warps (block size `wm·wn·64`) collaboratively fills one shared
+/// `(bm·wm)×(bn·wn)` LDS tile, then each warp computes its own `bm×bn` sub-tile — 4× the
+/// output tile per workgroup at the same per-warp VGPR, amortising the two barriers over
+/// `wm·wn×` more MFMAs and lifting low-N occupancy. The scalar-gather base; compose
+/// `.apply(VectorizePass).apply(SwizzlePass)` for the production variant.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_lds_kblock_mw(
+    m: usize,
+    n: usize,
+    k: usize,
+    bm: usize,
+    bn: usize,
+    wm: usize,
+    wn: usize,
+    k_step: usize,
+) -> Program {
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step)
 }
 
 /// The **vectorised** K-blocked kernel: the scalar-gather base with
@@ -973,5 +1035,5 @@ pub fn matmul_lds_kblock_sw(m: usize, n: usize, k: usize, bm: usize, bn: usize, 
 /// swizzle. `k_step ∈ {16,32,64}` if swizzling; bigger `k_step` = fewer barriers, more LDS
 /// + operand VGPR (the occupancy trade the harness resolves).
 pub fn matmul_lds_kblock_ks(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, k_step)
+    kblock_impl(m, n, k, bm, bn, 1, 1, k_step)
 }
