@@ -75,3 +75,34 @@ pub fn run(program: &Program, buffers: &[Buffer]) -> Result<()> {
         prog.execute(&ptrs, &vals, Some(dims.global_size), dims.local_size, true).context(error::DispatchSnafu { name })
     }
 }
+
+/// Compile `program` for the given device spec and return `(llvm_ir_source, code_object_bytes)` —
+/// the rendered amdgcn LLVM IR and the compiled ELF code object, WITHOUT dispatching. The ISA
+/// validation route: dump the `.co` and `llvm-objdump-20 -d` it (the exact runtime ISA), or clang
+/// the `.ll`. Shares the lower → decompose → render → compile prefix of [`run`].
+pub fn compile_artifacts(program: &Program, device_spec: &svod_dtype::DeviceSpec) -> Result<(String, Vec<u8>)> {
+    let device = svod_runtime::DEVICE_FACTORIES
+        .device(device_spec, svod_device::registry::registry())
+        .context(error::DeviceResolveSnafu { spec: format!("{device_spec:?}") })?;
+
+    let sink = lower::lower_and_prepare(program);
+    let sink = match device.renderer.decompositor() {
+        Some(matcher) => svod_ir::decompositions::decompose_with(&sink, &matcher),
+        None => sink,
+    };
+
+    let uop_program = program_pipeline::program_from_sink(sink, device.device.clone());
+    let name = program.name.clone();
+    let rendered = program_pipeline::get_program(
+        &uop_program,
+        device.renderer.as_ref(),
+        device.compiler.as_ref(),
+        Some(&name),
+        ProgramTarget::Source,
+    )
+    .context(error::CompileSnafu { name: name.clone() })?;
+    let src = ProgramSpec::from_uop(&rendered).context(error::CompileSnafu { name: name.clone() })?.src;
+    let (_compiled_program, compiled) =
+        program_pipeline::do_compile(&rendered, device.compiler.as_ref()).context(error::CompileSnafu { name })?;
+    Ok((src, compiled.bytes))
+}

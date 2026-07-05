@@ -154,6 +154,124 @@ fn matmul_clustered_hk_replica_is_bit_exact_on_gfx942() {
     }
 }
 
+/// The **compute-resident HK microkernel** (the apples-to-apples benchmark) correctness gate: the
+/// steady loop drops the streaming prefetch/commit and re-reads a resident block-0 tile every
+/// iteration, so it computes `nblocks · (A[:, 0:k_step] · B[0:k_step, :])`. Bit-exact vs an f32
+/// host reference over the SAME bf16-rounded operands (the block-0 product scaled by nblocks) —
+/// proving the schedule executes correctly (right acc round-trip, no carry slip, no deadlock)
+/// even though it is not a full GEMM. Same tiling as the clustered replica (wm=2 phase groups).
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::matmul_resident --nocapture`
+#[test]
+#[ignore]
+fn matmul_resident_microkernel_is_bit_exact_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    let (m, n, k, k_step) = (256usize, 256, 256, 64);
+    let nblocks = (k / k_step) as f32;
+    let dev = svod_dtype::default_device::default_device();
+    let mut a = Tensor::rand_with(&[m, k], DType::BFloat16, dev.clone()).expect("rand a");
+    let mut b = Tensor::rand_with(&[k, n], DType::BFloat16, dev).expect("rand b");
+    a.realize().expect("realize a");
+    b.realize().expect("realize b");
+    // Host reference over the realized bf16 values (cast to f32): nblocks · (A[:,0:k_step] @ B[0:k_step,:]).
+    let mut af_t = a.cast(DType::Float32).expect("a→f32");
+    let mut bf_t = b.cast(DType::Float32).expect("b→f32");
+    af_t.realize().expect("realize a→f32");
+    bf_t.realize().expect("realize b→f32");
+    let af = af_t.as_vec::<f32>().expect("read a");
+    let bf = bf_t.as_vec::<f32>().expect("read b");
+    let mut expected = vec![0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut acc = 0f32;
+            for kk in 0..k_step {
+                acc += af[row * k + kk] * bf[kk * n + col];
+            }
+            expected[row * n + col] = nblocks * acc;
+        }
+    }
+    let atol = 0.02 * (k as f32).sqrt();
+
+    // HK tiling: bm=128, bn=64, wm=2, wn=4 (warp_row = warp/4 ∈ {0,1} = the two phase groups).
+    for (suffix, apply_passes) in [("base", false), ("vec+sw", true)] {
+        let mut prog = crate::kernels::matmul_lds_kblock_mw_resident(m, n, k, 128, 64, 2, 4, k_step);
+        if apply_passes {
+            prog = prog.apply(VectorizePass).apply(SwizzlePass);
+        }
+        let out = Tensor::empty(&[m, n], DType::Float32);
+        let mut y = graph_kernel(prog, out, &[&a, &b]).expect("wrap");
+        let plan = y.prepare().expect("prepare");
+        plan.execute().expect("execute");
+        let got = y.as_vec::<f32>().expect("read output");
+        assert!(got.iter().all(|v| v.is_finite()), "resident/{suffix}: output has NaN/inf");
+        let report = allclose_f32(&got, &expected, atol, 2e-2);
+        println!("resident microkernel/{suffix} {m}×{n}×{k}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+        assert!(report.ok, "resident microkernel/{suffix} must match nblocks·block0 reference: {}", report.message);
+    }
+}
+
+/// Dump the **compute-resident microkernel**'s amdgcn LLVM IR + compiled code object to the
+/// scratchpad for ISA validation (the `.co` disassembles via `llvm-objdump-20 -d`; the `.ll` via
+/// `clang-20 -O3 --target=amdgcn-amd-amdhsa -mcpu=gfx942`). Large K (4096) so the steady loop runs
+/// enough iterations to measure. Env `SVOD_DUMP_DIR` overrides the output directory.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::dump_resident_isa --nocapture`
+#[test]
+#[ignore]
+fn dump_resident_isa() {
+    let dir = std::env::var("SVOD_DUMP_DIR").unwrap_or_else(|_| "/tmp/tk2_isa".into());
+    std::fs::create_dir_all(&dir).expect("mkdir dump dir");
+    let device_spec = Tensor::empty(&[1], DType::Float32).device();
+    // HK tiling (bm=128, bn=64, wm=2, wn=4, k_step=64); the production vec+swizzle passes.
+    let prog = crate::kernels::matmul_lds_kblock_mw_resident(4096, 4096, 4096, 128, 64, 2, 4, 64)
+        .apply(VectorizePass)
+        .apply(SwizzlePass);
+    let (src, bytes) = crate::launch::compile_artifacts(&prog, &device_spec).expect("compile artifacts");
+    std::fs::write(format!("{dir}/resident.ll"), &src).expect("write ll");
+    std::fs::write(format!("{dir}/resident.co"), &bytes).expect("write co");
+    println!("resident ISA dumped: {dir}/resident.ll ({} B), {dir}/resident.co ({} B)", src.len(), bytes.len());
+}
+
+/// The **apples-to-apples mfmautil measurement** (the whole point): profile the compute-resident
+/// microkernel's steady state and print the rocprofiler-compute gfx942 MfmaUtil, side by side with
+/// the DRAM-streaming clustered kernel (the 0.24 baseline) — both at HK's tiling, both vec+swizzle.
+/// The resident loop is pure `ds_read`+MFMA (ISA-verified: zero `global_load`), so its mfmautil is
+/// the schedule's compute efficiency with memory-boundedness removed; compare to HK's own 0.65.
+/// Needs `SVOD_PMC_FORCE=1` (VF device). Prints the full profile table (mfmautil column).
+/// `SVOD_DEVICE=AMD:0 SVOD_PMC_FORCE=1 cargo test -p svod-tk2 --lib -- --ignored device::resident_mfmautil --nocapture`
+#[test]
+#[ignore]
+fn resident_mfmautil_vs_streaming() {
+    use svod_runtime::{PmcCounter, PmcSelection, ProfileOptions};
+    let (m, n, k) = (4096usize, 4096, 4096);
+    let dev = svod_dtype::default_device::default_device();
+    let mut a = Tensor::rand_with(&[m, k], DType::BFloat16, dev.clone()).expect("rand a");
+    let mut b = Tensor::rand_with(&[k, n], DType::BFloat16, dev).expect("rand b");
+    a.realize().expect("realize a");
+    b.realize().expect("realize b");
+
+    // mfmautil needs mfmabusy + gui; sqbusy gives the timestamp-free mfmaduty cross-check.
+    let opts = ProfileOptions {
+        iters: 3,
+        static_analysis: false,
+        counters: PmcSelection::Custom(vec![
+            PmcCounter::ValuMfmaBusyCycles,
+            PmcCounter::GrbmGuiActive,
+            PmcCounter::SqBusyCycles,
+        ]),
+    };
+
+    for (label, prog) in [
+        ("resident (compute-resident)", crate::kernels::matmul_lds_kblock_mw_resident(m, n, k, 128, 64, 2, 4, 64)),
+        ("streaming (clustered)", crate::kernels::matmul_lds_kblock_mw_clustered(m, n, k, 128, 64, 2, 4, 64)),
+    ] {
+        let prog = prog.apply(VectorizePass).apply(SwizzlePass);
+        let out = Tensor::empty(&[m, n], DType::Float32);
+        let mut y = graph_kernel(prog, out, &[&a, &b]).expect("wrap");
+        let plan = y.prepare().expect("prepare");
+        let report = plan.profile(&opts).expect("profile");
+        println!("\n===== {label} {m}×{n}×{k} =====\n{}", report.render_table());
+    }
+}
+
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::sum_reduce_runs_on_gfx942 --nocapture`
 #[test]
 #[ignore]

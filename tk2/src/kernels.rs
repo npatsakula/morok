@@ -1215,6 +1215,7 @@ fn pipeline_clustered<Op, Reg>(
     inited: &[Effect],
     warp_row: Option<Idx>,
     asm_gather: bool,
+    resident: bool,
     schedule: &[Cluster],
     mut prefetch: impl FnMut(&mut Builder, Idx) -> (Reg, Vec<TileId>),
     mut commit: impl FnMut(&mut Builder, Idx, &Reg, &[TileId]) -> Vec<Effect>,
@@ -1247,6 +1248,12 @@ fn pipeline_clustered<Op, Reg>(
     let k_next_idx = b.idx_add(tk, one);
     let k_next = b.idx_mul(k_next_idx, ks_c);
     let carry: Vec<Vec<TileId>> = (0..n_acc).map(|ij| vec![inited[ij].dep(), kr.dep()]).collect();
+    // **Compute-resident** (§ HK apples-to-apples): the whole tile is staged ONCE in the prologue
+    // (block 0), so the steady loop drops the per-iteration prefetch/commit — `k_next = None` skips
+    // BOTH (the gathers still fire, re-reading the resident block via `[loop_seed, kr]`). The loop is
+    // then pure `ds_read` + MFMA with ZERO `global_load`/`ds_write` — the fair measurement of the
+    // clustered schedule with memory-boundedness removed (result = nblocks·block-0 product).
+    let steady_k_next = if resident { None } else { Some(k_next) };
     let body = run_clustered_body(
         b,
         schedule,
@@ -1255,18 +1262,22 @@ fn pipeline_clustered<Op, Reg>(
         accs,
         &[loop_seed, kr.dep()],
         &carry,
-        Some(k_next),
+        steady_k_next,
         &mut prefetch,
         &mut commit,
         &mut gather_slice,
         &mut mma_slice,
     );
 
-    // ── loop close: fold the last-slice stores, raw_next (LDS carry), AND the final cluster's
-    //    barrier (tail_barrier — else DCE drops it → unbalanced count → deadlock) under one End. ──
+    // ── loop close: fold the last-slice stores, raw_next (LDS carry, streaming only), AND the final
+    //    cluster's barrier (tail_barrier — else DCE drops it → unbalanced count → deadlock) under one
+    //    End. Resident has no in-loop commit, so no raw_next carry (the LDS is loop-invariant). ──
     let last = Effect(body.prev_store[n_acc - 1]);
     let mut carried: Vec<TileId> = body.prev_store[..n_acc - 1].to_vec();
-    carried.push(body.raw_next.expect("steady schedule must contain a commit cluster"));
+    match body.raw_next {
+        Some(rn) => carried.push(rn),
+        None => assert!(resident, "streaming schedule must contain a commit cluster (raw_next carry)"),
+    }
     carried.push(body.tail_barrier.expect("steady body must end on a cluster barrier"));
     // HK positional wall lattice (`b.wall_marker()`): the `sched.barrier(0)` paired with every
     // `s_barrier` pins the opaque `sideeffect` asm `ds_read_b64`s inside their cluster. WITHOUT it the
@@ -1354,6 +1365,7 @@ fn kblock_impl(
     stages: usize,
     clustered: bool,
     asm_gather: bool,
+    resident: bool,
 ) -> Program {
     assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
     assert!(k_step.is_multiple_of(EDGE) && k.is_multiple_of(k_step), "k_step multiple of 16, K multiple of k_step");
@@ -1368,6 +1380,9 @@ fn kblock_impl(
     // steers the per-slice `gather_slice` (the whole-block kloop keeps the compiler-visible gather).
     // gfx942-only; tk2 hardcodes gfx942, so the flag alone gates it.
     let asm_gather = asm_gather && clustered;
+    // Compute-residency (stage the tile once, no steady-loop global load) only makes sense for the
+    // clustered pipeline — it decomposes that body into the HK schedule with prefetch/commit dropped.
+    let resident = resident && clustered;
     // Workgroup output tile = (bm·wm) × (bn·wn), computed by a wm×wn grid of 64-lane warps.
     let (big_m, big_n, nthreads) = (bm * wm, bn * wn, wm * wn * WARP);
     assert!(m.is_multiple_of(big_m) && n.is_multiple_of(big_n), "m/n must tile by (bm·wm)/(bn·wn)");
@@ -1522,6 +1537,7 @@ fn kblock_impl(
             &inited,
             warp_row,
             asm_gather,
+            resident,
             &sched,
             &mut prefetch_fn,
             &mut commit_fn,
@@ -1584,7 +1600,7 @@ fn kblock_impl(
 /// K_STEP=16 — the first tk2 matmul to beat naive at scale. See [`kblock_impl`]. Compose
 /// `.apply(`[`SwizzlePass`](crate::passes::SwizzlePass)`)` for the bank-swizzled variant.
 pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, 1, 1, EDGE, 1, false, false)
+    kblock_impl(m, n, k, bm, bn, 1, 1, EDGE, 1, false, false, false)
 }
 
 /// **Multi-warp** K-blocked matmul (DESIGN.md §5b, the bigger-tile lever): a `wm×wn` grid
@@ -1604,7 +1620,7 @@ pub fn matmul_lds_kblock_mw(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 1, false, false)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 1, false, false, false)
 }
 
 /// **Register-staged pipelined** multi-warp K-blocked matmul (`stages=2`, DESIGN §5b): the
@@ -1623,7 +1639,7 @@ pub fn matmul_lds_kblock_mw_pipe(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, false, false)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, false, false, false)
 }
 
 /// The **clustered HK replica** (DESIGN §5c): [`matmul_lds_kblock_mw_pipe`]'s tile + stages=2
@@ -1643,7 +1659,32 @@ pub fn matmul_lds_kblock_mw_clustered(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, false)
+}
+
+/// The **compute-resident HK microkernel** (the apples-to-apples benchmark): identical to
+/// [`matmul_lds_kblock_mw_clustered`] — same 256² tile, HK tiling, 8-cluster [`hk_schedule`],
+/// per-cluster `s_barrier`/`set_prio`, warp-phase ping-pong, asm `ds_read_b64` gather — EXCEPT the
+/// whole tile (block 0) is staged into LDS ONCE in the prologue and the steady loop **drops the
+/// prefetch/commit**: it re-reads that resident block every iteration, so the loop is pure
+/// `ds_read` + MFMA with **ZERO `global_load` and ZERO `ds_write`**. This isolates the clustered
+/// SCHEDULE quality from memory-boundedness (the streaming kernel measures mfmautil 0.24 at 4096
+/// with 32 global-loads/iter; HK's own compute-resident micro measures 0.65). NOT a full GEMM: it
+/// computes `nblocks · (A[:, 0:k_step] · B[0:k_step, :])` (the resident block-0 product accumulated
+/// `nblocks` times) — a well-defined, bit-exact-checkable reduction. Use HK's tiling
+/// `(bm=128, bn=64, wm=2, wn=4, k_step=64)`; `k/k_step ≥ 2` (else no steady loop to measure).
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_lds_kblock_mw_resident(
+    m: usize,
+    n: usize,
+    k: usize,
+    bm: usize,
+    bn: usize,
+    wm: usize,
+    wn: usize,
+    k_step: usize,
+) -> Program {
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, true)
 }
 
 /// The **vectorised** K-blocked kernel: the scalar-gather base with
@@ -1669,5 +1710,5 @@ pub fn matmul_lds_kblock_sw(m: usize, n: usize, k: usize, bm: usize, bn: usize, 
 /// swizzle. `k_step ∈ {16,32,64}` if swizzling; bigger `k_step` = fewer barriers, more LDS
 /// + operand VGPR (the occupancy trade the harness resolves).
 pub fn matmul_lds_kblock_ks(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, 1, 1, k_step, 1, false, false)
+    kblock_impl(m, n, k, bm, bn, 1, 1, k_step, 1, false, false, false)
 }
