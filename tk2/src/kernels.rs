@@ -12,12 +12,28 @@
 
 use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId, TileIr};
+use crate::pass::Pass;
 
 /// A finished tile-IR program: the arena, its sink root, and the kernel name.
 pub struct Program {
     pub ir: TileIr,
     pub sink: TileId,
     pub name: String,
+}
+
+impl Program {
+    /// Apply a refinement [`Pass`] to this program, returning the transformed program —
+    /// the top-level `.apply` composition (DESIGN §1): `matmul_staged(cfg).apply(SwizzlePass)
+    /// .apply(VectorizePass)`. The pass's `requires`/`ensures` contracts are checked around
+    /// it (a failed contract or pass is a kernel-authoring bug, so it panics rather than
+    /// threading a Result through the fluent chain — mirrors `run_kernel`'s expect idiom).
+    pub fn apply(mut self, pass: impl Pass) -> Self {
+        assert!(pass.requires(&self.ir, self.sink), "pass {}: precondition failed", pass.name());
+        let root = pass.apply(&mut self.ir, self.sink).unwrap_or_else(|e| panic!("pass {}: {e:?}", pass.name()));
+        assert!(pass.ensures(&self.ir, root), "pass {}: postcondition failed", pass.name());
+        self.sink = root;
+        self
+    }
 }
 
 /// Tiled elementwise add: `n_tiles` workgroups, each looping over `tile` elements
@@ -295,29 +311,6 @@ fn fill_lds(
     b.end(st, &[fr])
 }
 
-/// The HipKittens/CK LDS **bank swizzle** for a single-subtile bf16 tile (cols ∈
-/// {16,32,64} ⇒ subtile == cols): map in-tile `(row, col)` to `col ^ delta(row)`, where
-/// `delta = (((row%16)·cols·2) >> 7 << 3) / 2` — the byte-XOR `((addr%repeat)>>7)<<3`
-/// (HK `st.cuh:110`, tk `swizzle.rs::tile_offset`) reduced for the single-subtile case
-/// (the `%repeat` is identity since `row%16 < 16`, and `delta < cols` so it never carries
-/// into the row). Applied identically on fill-store and gather-load, it is a bijection —
-/// numerically transparent — that scatters rows `r, r±4, …` off the same bank (the 4-way
-/// conflict the flat layout suffers), the biggest single MFMA-util lever (tk 33%→54%).
-/// The full LDS offset is `row·cols + swizzle_col(row, col, cols)`.
-fn swizzle_col(b: &mut Builder, row: Idx, col: Idx, cols: usize) -> Idx {
-    let c16 = b.idx_const(16);
-    let r16 = b.idx_mod(row, c16);
-    let sb2 = b.idx_const((cols * 2) as i64); // swizzle_bytes = cols·itemsize (bf16)
-    let t = b.idx_mul(r16, sb2);
-    let c7 = b.idx_const(7);
-    let t = b.idx_shr(t, c7);
-    let c3 = b.idx_const(3);
-    let t = b.idx_shl(t, c3);
-    let c1 = b.idx_const(1);
-    let delta = b.idx_shr(t, c1); // >> log2(itemsize) = /2
-    b.idx_xor(col, delta)
-}
-
 /// Unrolled collaborative global→LDS fill (NO inner range — usable inside the K-loop
 /// without a loop nest): each lane writes `epl` elements `flat = lane·epl + e`, mapping
 /// LDS position `flat` to global `(tile_row_base + flat/cols_lds)·grow_stride +
@@ -335,7 +328,6 @@ fn fill_lds_unrolled(
     tile_row_base: Idx,
     tile_col_base: Idx,
     grow_stride: i64,
-    swizzle: bool,
 ) -> Vec<Effect> {
     let epl_c = b.idx_const(epl as i64);
     let lane_epl = b.idx_mul(lane, epl_c);
@@ -352,15 +344,11 @@ fn fill_lds_unrolled(
             let goff = b.idx_add(goff, tile_col_base);
             let goff = b.idx_add(goff, c);
             let v = b.load(src, goff);
-            // LDS store position: flat (`r·cols + c`), or the bank-swizzled `r·cols +
-            // (c ^ delta(r))` — the same bijection the gather applies, so it is transparent.
-            let dst_off = if swizzle {
-                let sw = swizzle_col(b, r, c, cols_lds as usize);
-                let rc = b.idx_mul(r, cols_c);
-                b.idx_add(rc, sw)
-            } else {
-                flat
-            };
+            // LDS store position `r·cols + LdsCol(r, c)` — flat by default, or the bank
+            // swizzle once `SwizzlePass` materialises the LdsCol (a composable refinement).
+            let col = b.lds_col(r, c, cols_lds as usize);
+            let rc = b.idx_mul(r, cols_c);
+            let dst_off = b.idx_add(rc, col);
             b.store_lds(lds, dst_off, v)
         })
         .collect()
@@ -381,14 +369,13 @@ fn gather_frag_lds_sw(
     cols: usize,
     lane: Idx,
     bar: Effect,
-    swizzle: bool,
 ) -> Vec<TileId> {
     let cols_c = b.idx_const(cols as i64);
     (0..dst.map.ept)
         .map(|inner| {
             let inner_idx = b.idx_const(inner as i64);
             let (frag_row, frag_col) = b.lane_rc(dst.map, lane, inner_idx);
-            // Whole-tile (row, col) — the swizzle must XOR the *whole* column as a unit
+            // Whole-tile (row, col) — the swizzle XORs the *whole* column as a unit
             // (col_base spans multiple 16-fragments in the B strip), so fold the const base in.
             let wr = if row_base == 0 {
                 frag_row
@@ -402,7 +389,8 @@ fn gather_frag_lds_sw(
                 let cb = b.idx_const(col_base as i64);
                 b.idx_add(frag_col, cb)
             };
-            let col_part = if swizzle { swizzle_col(b, wr, wc, cols) } else { wc };
+            // `wr·cols + LdsCol(wr, wc)` — flat until `SwizzlePass` swizzles the LdsCol.
+            let col_part = b.lds_col(wr, wc, cols);
             let row_off = b.idx_mul(wr, cols_c);
             let off = b.idx_add(row_off, col_part);
             let v = b.load_lds_after(lds, off, &[bar.dep()]);
@@ -656,19 +644,16 @@ pub fn matmul_lds_tiled(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> P
 /// see the staged data) and a **WAR** fence after the LDS reads (the next fill must not
 /// overwrite until every lane finished reading). The WAR fence is routed into the
 /// accumulator reads so it is scoped inside the K-loop. `m/n` multiples of `bm/bn`;
-/// `bm/bn/k` multiples of 16. `swizzle` applies the HK/CK LDS bank-XOR ([`swizzle_col`])
-/// to the fill+gather (bm/bn ∈ {16,32,64} — single-subtile — required when swizzling).
+/// `bm/bn/k` multiples of 16. Emits the LDS addressing through [`Builder::lds_col`], so
+/// the flat layout is the base; `.apply(`[`SwizzlePass`](crate::passes::SwizzlePass)`)`
+/// turns it into the bank-swizzled one — the swizzle is a **composable refinement**, not
+/// hand-woven here (bm/bn/k_step ∈ {16,32,64} for the single-subtile swizzle).
 #[allow(clippy::needless_range_loop)]
-fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize, swizzle: bool) -> Program {
+fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize) -> Program {
     assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
     assert!(k_step.is_multiple_of(EDGE) && k.is_multiple_of(k_step), "k_step multiple of 16, K multiple of k_step");
     assert!(m.is_multiple_of(bm) && n.is_multiple_of(bn), "m/n must tile by bm/bn");
-    assert!(
-        !swizzle || (matches!(bm, 16 | 32 | 64) && matches!(bn, 16 | 32 | 64) && matches!(k_step, 16 | 32 | 64)),
-        "the single-subtile swizzle needs bm/bn/k_step ∈ {{16,32,64}}"
-    );
-    let name = if swizzle { "tk2_matmul_kblock_sw" } else { "tk2_matmul_kblock" };
-    let mut b = Builder::new(name);
+    let mut b = Builder::new("tk2_matmul_kblock");
 
     let c = b.global::<F32>(m * n);
     let a = b.global::<BF16>(m * k);
@@ -716,8 +701,8 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
 
     // Fill A[bm,k_step] (K-col base tk·k_step, stride K) and B[k_step,bn] (K-row base, stride N).
     let mut fill_stores: Vec<TileId> = Vec::with_capacity(epl_a + epl_b);
-    let fa = fill_lds_unrolled(&mut b, a_smem, a, epl_a, lane, k_step as i64, tm_bm, tk_ks, k as i64, swizzle);
-    let fb = fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, lane, bn as i64, tk_ks, tn_bn, n as i64, swizzle);
+    let fa = fill_lds_unrolled(&mut b, a_smem, a, epl_a, lane, k_step as i64, tm_bm, tk_ks, k as i64);
+    let fb = fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, lane, bn as i64, tk_ks, tn_bn, n as i64);
     let fill_head = fa[0];
     fill_stores.extend(fa.iter().skip(1).chain(fb.iter()).map(|e| e.dep()));
     // RAW fence: the whole strip is staged before any lane gathers a fragment.
@@ -736,17 +721,8 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
             (0..ksteps)
                 .map(|kf| {
                     // A-frag (i,kf): a_smem[bm,k_step] row-block i, K-block kf (cols k_step).
-                    let st = gather_frag_lds_sw(
-                        &mut b,
-                        a_frags[i][kf],
-                        a_smem,
-                        i * EDGE,
-                        kf * EDGE,
-                        k_step,
-                        lane,
-                        fill_bar,
-                        swizzle,
-                    );
+                    let st =
+                        gather_frag_lds_sw(&mut b, a_frags[i][kf], a_smem, i * EDGE, kf * EDGE, k_step, lane, fill_bar);
                     gathers.extend(st.iter().copied());
                     b.load_frag_vec_after(a_frags[i][kf], &st)
                 })
@@ -758,17 +734,8 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
             (0..cj)
                 .map(|j| {
                     // B-frag (kf,j): b_smem[k_step,bn] K-block kf, col-block j (cols bn).
-                    let st = gather_frag_lds_sw(
-                        &mut b,
-                        b_frags[kf][j],
-                        b_smem,
-                        kf * EDGE,
-                        j * EDGE,
-                        bn,
-                        lane,
-                        fill_bar,
-                        swizzle,
-                    );
+                    let st =
+                        gather_frag_lds_sw(&mut b, b_frags[kf][j], b_smem, kf * EDGE, j * EDGE, bn, lane, fill_bar);
                     gathers.extend(st.iter().copied());
                     b.load_frag_vec_after(b_frags[kf][j], &st)
                 })
@@ -816,35 +783,29 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
     }
 
     let (ir, sink) = b.finish(&roots);
-    Program { ir, sink, name: name.into() }
+    Program { ir, sink, name: "tk2_matmul_kblock".into() }
 }
 
-/// K-blocked LDS-reuse matmul (DESIGN.md §5b step 1b-ii), flat LDS layout, K_STEP=16 —
-/// the first tk2 matmul to beat naive at scale. See [`kblock_impl`].
+/// K-blocked LDS-reuse matmul (DESIGN.md §5b step 1b-ii), **flat LDS layout** (the base),
+/// K_STEP=16 — the first tk2 matmul to beat naive at scale. See [`kblock_impl`]. Compose
+/// `.apply(`[`SwizzlePass`](crate::passes::SwizzlePass)`)` for the bank-swizzled variant.
 pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, EDGE, false)
+    kblock_impl(m, n, k, bm, bn, EDGE)
 }
 
-/// [`matmul_lds_kblock`] with the HK/CK LDS **bank swizzle** ([`swizzle_col`]) on the
-/// fill + gather. `bm/bn ∈ {16,32,64}` (single-subtile).
-pub fn matmul_lds_kblock_sw(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, EDGE, true)
+/// [`matmul_lds_kblock_ks`] with the [`SwizzlePass`](crate::passes::SwizzlePass) layout
+/// refinement composed via [`Program::apply`] — the swizzle is now a top-level `.apply`
+/// pass, not hand-woven. `bm/bn/k_step ∈ {16,32,64}` (single-subtile).
+pub fn matmul_lds_kblock_sw(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize) -> Program {
+    matmul_lds_kblock_ks(m, n, k, bm, bn, k_step).apply(crate::passes::SwizzlePass)
 }
 
-/// The tunable K-blocked kernel: `k_step`-wide strips staged per outer K-block, with
-/// `k_step/16` chained MFMAs per accumulator — **amortising the two per-block barriers
-/// over `k_step/16` K-fragments** (the K_STEP=16 barrier flood was the measured matrix
-/// starve). `swizzle` applies the LDS bank-XOR. `k_step ∈ {16,32,64}` (single-subtile);
-/// the bigger `k_step`, the fewer barriers but the more LDS + operand VGPR (the
-/// occupancy trade the harness resolves).
-pub fn matmul_lds_kblock_ks(
-    m: usize,
-    n: usize,
-    k: usize,
-    bm: usize,
-    bn: usize,
-    k_step: usize,
-    swizzle: bool,
-) -> Program {
-    kblock_impl(m, n, k, bm, bn, k_step, swizzle)
+/// The tunable K-blocked kernel (the **base**, flat layout): `k_step`-wide strips staged
+/// per outer K-block, `k_step/16` chained MFMAs per accumulator — **amortising the two
+/// per-block barriers over `k_step/16` K-fragments** (the K_STEP=16 barrier flood was the
+/// measured matrix starve). Apply [`SwizzlePass`](crate::passes::SwizzlePass) for the
+/// swizzle. `k_step ∈ {16,32,64}` if swizzling; bigger `k_step` = fewer barriers, more LDS
+/// + operand VGPR (the occupancy trade the harness resolves).
+pub fn matmul_lds_kblock_ks(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize) -> Program {
+    kblock_impl(m, n, k, bm, bn, k_step)
 }

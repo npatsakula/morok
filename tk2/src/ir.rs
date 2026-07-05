@@ -45,6 +45,10 @@ pub enum Transform {
     PassThrough,
     /// A strided embed of a logical axis (stubbed: carries the stride only).
     Embed { stride: i64 },
+    /// The HK/CK bank-conflict-avoiding XOR swizzle (§2.4, §5b): `col ^ delta(row)` over a
+    /// `cols`-wide LDS tile. Set on an LDS tile's layout by `SwizzlePass` and materialised
+    /// at each [`Node::LdsCol`] access — the first `.apply`-able layout refinement.
+    Xor { cols: usize },
 }
 
 /// A tile's addressing layout: an ordered chain of [`Transform`]s (a graph, in a
@@ -191,6 +195,13 @@ pub enum Node {
     Const { scalar: Scalar, dtype: DType },
     /// Integer addressing arithmetic.
     IndexAlu { op: IndexOp, a: TileId, b: TileId },
+    /// A **layout-application point** on an LDS tile access: the logical in-tile
+    /// `(row, col)` of a `cols`-wide tile, to be materialised to a flat column offset by
+    /// the tile's [`Layout`]. The base kernel emits it as the identity (`PassThrough`,
+    /// lowering to just `col`); `SwizzlePass` rewrites it to the bank XOR
+    /// `col ^ delta(row)` (§2.4 / §5b) — the `.apply`-able refinement, so the swizzle is a
+    /// composable layout attribute, not hand-woven into the kernel's addressing.
+    LdsCol { row: TileId, col: TileId, cols: usize },
     /// Load a scalar/tile from `buf` (a `Global`/`DefineReg`) at flat `offset`.
     LoadGlobal { buf: TileId, offset: TileId, dtype: DType },
     /// An elementwise binary op on two loaded values.
@@ -350,6 +361,7 @@ impl TileIr {
     pub fn map_children(node: &Node, mut f: impl FnMut(TileId) -> TileId) -> Node {
         match node.clone() {
             Node::IndexAlu { op, a, b } => Node::IndexAlu { op, a: f(a), b: f(b) },
+            Node::LdsCol { row, col, cols } => Node::LdsCol { row: f(row), col: f(col), cols },
             Node::LoadGlobal { buf, offset, dtype } => Node::LoadGlobal { buf: f(buf), offset: f(offset), dtype },
             Node::EltwiseBinary { op, a, b } => Node::EltwiseBinary { op, a: f(a), b: f(b) },
             Node::StoreGlobal { buf, offset, value } => {
@@ -397,7 +409,9 @@ impl TileIr {
             }
             Node::Axis { .. } | Node::Range { .. } => TileMeta::value(SmallVec::new(), DType::Index, Residency::Reg),
             Node::Const { dtype, .. } => TileMeta::value(SmallVec::new(), dtype.clone(), Residency::Reg),
-            Node::IndexAlu { .. } => TileMeta::value(SmallVec::new(), DType::Index, Residency::Reg),
+            Node::IndexAlu { .. } | Node::LdsCol { .. } => {
+                TileMeta::value(SmallVec::new(), DType::Index, Residency::Reg)
+            }
             Node::LoadGlobal { dtype, .. } => TileMeta::value(SmallVec::new(), dtype.clone(), Residency::Reg),
             Node::EltwiseBinary { a, .. } => {
                 let dt = self.meta(*a).dtype.clone().unwrap_or(DType::Float32);

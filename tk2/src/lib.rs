@@ -34,7 +34,7 @@ pub use kernels::{
     matmul_lds_kblock_sw, matmul_lds_tiled, sum_reduce,
 };
 pub use pass::{Band, Fold, Pass, Pipeline, Strategy};
-pub use passes::{ConstFoldPass, UnrollPass, optimize_addressing};
+pub use passes::{ConstFoldPass, SwizzlePass, UnrollPass, optimize_addressing};
 
 #[cfg(test)]
 mod test;

@@ -101,14 +101,37 @@ fn matmul_carries_wmma_and_loop_edges() {
 fn matmul_lds_kblock_sw_lowering_is_spec_valid() {
     // The bank-swizzled K-blocked kernel (XOR/shift index ops in the LDS addressing)
     // must lower to spec-valid UOp — the swizzle is a bijection, numerically transparent.
-    let p = crate::kernels::matmul_lds_kblock_sw(64, 64, 64, 64, 64);
+    let p = crate::kernels::matmul_lds_kblock_sw(64, 64, 64, 64, 64, 16);
     lower::verify(&p).expect("swizzled K-blocked matmul must lower to spec-valid UOp");
+}
+
+#[test]
+fn swizzle_pass_materialises_the_layout() {
+    // The `.apply` model: the BASE kernel carries `LdsCol` layout points (flat until
+    // materialised); `.apply(SwizzlePass)` replaces every one with the bank XOR (none
+    // survive), and the result stays spec-valid — the swizzle is a composable refinement.
+    use crate::ir::TileIr;
+    use crate::passes::SwizzlePass;
+    let base = crate::kernels::matmul_lds_kblock_ks(64, 64, 64, 64, 64, 16);
+    let base_has_ldscol =
+        (0..base.ir.len()).any(|i| matches!(base.ir.node(crate::ir::TileId(i as u32)), Node::LdsCol { .. }));
+    assert!(base_has_ldscol, "the base kernel must carry LdsCol layout points");
+
+    let sw = base.apply(SwizzlePass);
+    let count_ldscol = |ir: &TileIr| {
+        crate::passes::reachable(ir, sw.sink)
+            .into_iter()
+            .filter(|&id| matches!(ir.node(id), Node::LdsCol { .. }))
+            .count()
+    };
+    assert_eq!(count_ldscol(&sw.ir), 0, "SwizzlePass must materialise every LdsCol (none may survive)");
+    lower::verify(&sw).expect("swizzled program must still lower to spec-valid UOp");
 }
 
 #[test]
 fn matmul_lds_kblock_ks64_lowering_is_spec_valid() {
     // K_STEP=64: a k_step-wide fill + an inner chain of k_step/16 MFMAs per accumulator.
-    let p = crate::kernels::matmul_lds_kblock_ks(64, 64, 128, 64, 64, 64, true);
+    let p = crate::kernels::matmul_lds_kblock_ks(64, 64, 128, 64, 64, 64);
     lower::verify(&p).expect("K_STEP=64 matmul must lower to spec-valid UOp");
 }
 

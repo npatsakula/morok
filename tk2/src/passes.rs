@@ -376,6 +376,58 @@ impl Fold for ConstFold {
 }
 
 // ============================================================================
+// SwizzlePass — the first `.apply`-able layout refinement (DESIGN §2.4 / §5b)
+// ============================================================================
+
+/// Materialise every [`Node::LdsCol`] to the HK/CK bank-conflict-avoiding XOR
+/// `col ^ delta(row)`, turning the flat LDS layout into the swizzled one. The base
+/// kernel emits `LdsCol` as the identity (a composable hole); `.apply(SwizzlePass)`
+/// fills it — so the swizzle is a **layout refinement pass**, not hand-woven addressing.
+/// Single-subtile bf16 formula (`cols ∈ {16,32,64}`), verified bit-exact + cross-checked
+/// against HK `st.cuh` / CK `make_xor_transform` (§5b).
+pub struct SwizzlePass;
+
+impl Pass for SwizzlePass {
+    fn name(&self) -> &str {
+        "lds_bank_swizzle"
+    }
+    fn band(&self) -> Band {
+        Band::MemoryPlacement
+    }
+    /// Postcondition: no `LdsCol` remains — every layout point is materialised.
+    fn ensures(&self, ir: &TileIr, root: TileId) -> bool {
+        reachable(ir, root).into_iter().all(|id| !matches!(ir.node(id), Node::LdsCol { .. }))
+    }
+    fn apply(&self, ir: &mut TileIr, root: TileId) -> Result<TileId, PassError> {
+        Ok(fold(&mut Swizzle, ir, root))
+    }
+}
+
+/// The nanopass folder: `LdsCol{row,col,cols}` → `col ^ (((row%16)·cols·2 >> 7 << 3) >> 1)`.
+struct Swizzle;
+
+impl Fold for Swizzle {
+    fn fold_node(&mut self, ir: &mut TileIr, node: Node) -> TileId {
+        let Node::LdsCol { row, col, cols } = node else {
+            return ir.intern(node);
+        };
+        let konst = |ir: &mut TileIr, v: i64| ir.intern(Node::Const { scalar: Scalar::Int(v), dtype: DType::Index });
+        let alu = |ir: &mut TileIr, op, a, b| ir.intern(Node::IndexAlu { op, a, b });
+        let c16 = konst(ir, 16);
+        let r16 = alu(ir, IndexOp::Mod, row, c16);
+        let sb2 = konst(ir, (cols * 2) as i64); // swizzle_bytes = cols · itemsize (bf16)
+        let t = alu(ir, IndexOp::Mul, r16, sb2);
+        let c7 = konst(ir, 7);
+        let t = alu(ir, IndexOp::Shr, t, c7);
+        let c3 = konst(ir, 3);
+        let t = alu(ir, IndexOp::Shl, t, c3);
+        let c1 = konst(ir, 1);
+        let delta = alu(ir, IndexOp::Shr, t, c1); // >> log2(itemsize)
+        alu(ir, IndexOp::Xor, col, delta)
+    }
+}
+
+// ============================================================================
 // The addressing pipeline
 // ============================================================================
 

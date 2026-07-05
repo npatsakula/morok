@@ -153,6 +153,10 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
                 IndexOp::Shl => a.shl(&b),
             }
         }
+        // Identity (PassThrough): the base kernel's LDS col is flat. `SwizzlePass`
+        // materialises the XOR before lowering when the swizzle layout is applied, so a
+        // surviving `LdsCol` here means the un-swizzled path.
+        Node::LdsCol { col, .. } => get(low, col),
         Node::LoadGlobal { buf, offset, .. } => {
             let (buf, off) = (get(low, buf), get(low, offset));
             let idx =

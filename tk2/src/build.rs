@@ -230,6 +230,15 @@ impl Builder {
         Idx(self.ir.intern(Node::IndexAlu { op: IndexOp::Shl, a: a.0, b: b.0 }))
     }
 
+    /// A **layout-application point** for the column of a `cols`-wide LDS tile access at
+    /// logical `(row, col)` — [`Node::LdsCol`]. It lowers to `col` (flat) unless
+    /// `SwizzlePass` has rewritten it to the bank XOR. The full LDS offset is
+    /// `row·cols + lds_col(row, col, cols)`; emit it wherever an LDS tile is addressed so
+    /// the swizzle stays a composable `.apply` refinement, not hand-woven arithmetic.
+    pub fn lds_col(&mut self, row: Idx, col: Idx, cols: usize) -> Idx {
+        Idx(self.ir.intern(Node::LdsCol { row: row.0, col: col.0, cols }))
+    }
+
     /// The per-lane `(row, col)` within a base fragment — tk's `lane_rc`
     /// (`tk/src/group/mod.rs`) for the gfx942 non-interleaved MFMA fragment, built
     /// from explicit `IndexAlu` div/mod (the const-foldable index band, §2.4):
