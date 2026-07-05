@@ -402,8 +402,6 @@ struct TableRow {
 pub(crate) struct DerivedCtx {
     pub xcc_num: u32,
     pub device_simds: u32,
-    /// Peak engine clock in MHz (reference `F_peak`); `0` = unknown.
-    pub peak_clk_mhz: u32,
     /// Total device execution time (seconds) the row's summed counters span —
     /// used to normalize cycle-count metrics against wall time (clock-invariant).
     /// `0.0` when no GPU timestamp was captured.
@@ -438,25 +436,20 @@ pub(crate) const DERIVED: &[(&str, DerivedFn)] = &[
         a.checked_sub(c).filter(|d| *d > 0).map(|d| c as f64 / d as f64)
     }),
     ("valuutil", |m, _| cratio(m, PmcCounter::SqInstsValu, PmcCounter::SqBusyCycles)),
-    // rocprofiler-compute gfx942 MfmaUtil, derived via achieved-clock
-    // normalization so it is comparable across dispatch paths at different core
-    // clocks. rocprofiler defines it as MFMA-busy / (GRBM_GUI_ACTIVE/XCC · CU·4),
-    // but GRBM_GUI_ACTIVE is a *core-clock cycle* counter, so on a variable-clock
-    // part (e.g. gfx942 SR-IOV VF without a pinned pstate) that denominator drifts
-    // with clock. We replace the clocked GUI term with its clock-invariant
-    // identity — active_cycles/XCC at the *peak* clock is `F_peak · wall` — giving
-    // MFMA-busy / (F_peak · wall · device_simds). MFMA-busy is fixed work-cycles
-    // and `wall` is real seconds, so the result is clock-independent. Its absolute
-    // value reflects THIS dispatch's window: svod's tight in-process window
-    // (wall ≈ kernel time) reads higher than a rocprofv3 PMC-mode dispatch, which
-    // serializes/drains and so spans a wider active window — the two won't
-    // cross-match on the same kernel (svod's is the tighter/truer one). For a
-    // cross-tool-robust matrix signal use `mfmaduty`. Self-hides without F_peak, a
-    // captured GPU wall time, or the SIMD count.
+    // rocprofiler-compute gfx942 MfmaUtil (`analysis_configs/gfx942/…compute_pipeline.yaml`):
+    // MFMA-busy / (4·CU_per_GPU · GRBM_GUI_ACTIVE_per_XCD) — a **measured** denominator
+    // (active core-clock cycles per XCD), replacing the old `F_peak·wall` estimate (KFD's
+    // nominal `max_engine_clk_fcompute` under-counted the active window under clock boost).
+    // Now lands in [0,1] and cross-matches the physical duty (tk 4096 → 0.65 = 648/982 TF)
+    // once the SQ capture's redundant ×4 SIMD over-sum was fixed (`device/amd/pmc.rs`
+    // `sq_simd_iters → 1`; `simd_mask=0xf` already aggregates the 4 SIMDs). Needs `gui`
+    // collected (add to `SVOD_PMC`); `mfmaduty` remains the timestamp-free relative check.
     ("mfmautil", |m, ctx| {
         let mfma = *m.get(&PmcCounter::ValuMfmaBusyCycles)? as f64;
-        let denom = ctx.peak_clk_mhz as f64 * 1e6 * ctx.wall_secs * ctx.device_simds as f64;
-        (ctx.gpu_stamped && denom > 0.0).then(|| mfma / denom)
+        let gui = *m.get(&PmcCounter::GrbmGuiActive)? as f64;
+        let per_xcd = (ctx.xcc_num > 0).then(|| gui / ctx.xcc_num as f64)?;
+        let denom = ctx.device_simds as f64 * per_xcd;
+        (denom > 0.0).then(|| mfma / denom)
     }),
     // Achieved core clock in GHz (rocprof "achieved sclk"): active cycles per XCD
     // over real time, `(GRBM_GUI_ACTIVE / XCC) / wall`. Makes the clock the VF
@@ -537,13 +530,8 @@ fn render_stage_table(s: &StageProfile) -> String {
             // Device constants are device-wide (same for every dispatch); adopt
             // the first non-zero ones seen.
             if r.derived_ctx.device_simds == 0 {
-                r.derived_ctx = DerivedCtx {
-                    xcc_num: cs.xcc_num,
-                    device_simds: cs.device_simds,
-                    peak_clk_mhz: cs.peak_clk_mhz,
-                    wall_secs: 0.0,
-                    gpu_stamped: false,
-                };
+                r.derived_ctx =
+                    DerivedCtx { xcc_num: cs.xcc_num, device_simds: cs.device_simds, wall_secs: 0.0, gpu_stamped: false };
             }
         }
     }

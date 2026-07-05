@@ -94,9 +94,6 @@ pub struct CounterSet {
     /// Device-total SIMD lane count (`CU_NUM · SIMDs_per_CU`, 0 = unknown), the
     /// MFMA-utilization denominator's `CU_NUM · 4` term on gfx9.
     pub device_simds: u32,
-    /// Peak engine clock in MHz (0 = unknown), the reference `F_peak` for
-    /// achieved-clock (`sclk`) derivation and clock-normalized MFMA utilization.
-    pub peak_clk_mhz: u32,
 }
 
 /// Per-kernel static GPU resource usage, decoded from the compiled program's

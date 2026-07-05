@@ -28,11 +28,6 @@ const SET_UCONFIG_START: u64 = pm4::PACKET3_SET_UCONFIG_REG_START as u64;
 /// Number of TCC (L2) instances iterated for a gfx9 L2 counter.
 const TCC_INSTANCES: u32 = 16;
 
-/// SIMDs per SE that the gfx9 SQ perfcounter is replicated across (4 SIMDs/CU on
-/// CDNA). Each must be read via `instance_index` and summed — a per-SE-only read
-/// captures one SIMD and under-counts by this factor.
-const SQ_SIMDS_PER_SE: u32 = 4;
-
 /// `regRLC_PERFMON_CLK_CNTL` GC segment-1 offset (abs `0xDCBF`, UCONFIG). Absent
 /// from the vendored register table. Writing `1` disables RLC perfmon
 /// clock-gating (required on gfx9/CDNA or the SQ perfmon clock stays gated and
@@ -224,12 +219,6 @@ impl PmcArch {
         );
     }
 
-    /// gfx9: index one (SE, SIMD) — `se_index` + `instance_index=simd`, SH
-    /// broadcast. Selects a single SIMD's replicated SQ counter for readback.
-    fn grbm_index_se_simd(&self, out: &mut Vec<u32>, se: u32, simd: u32) {
-        self.wreg(out, "regGRBM_GFX_INDEX", &[("se_index", se), ("instance_index", simd), ("sh_broadcast_writes", 1)]);
-    }
-
     /// gfx9: index one instance (a TCC channel), broadcasting across SE and SH.
     fn grbm_index_instance(&self, out: &mut Vec<u32>, inst: u32) {
         self.wreg(
@@ -332,20 +321,6 @@ struct Gfx9Sched {
     pcid: u32,
     perf_sel: u32,
     records: usize,
-    /// SIMD instances to iterate+sum per SE for an SQ counter: `SQ_SIMDS_PER_SE`
-    /// for per-SIMD counters (bank-conflict, VALU/MFMA busy, insts, busy-cycles),
-    /// `1` for per-SE counters (`SqWaves`, read via SE broadcast). Ignored off SQ.
-    simd_iters: u32,
-}
-
-/// SIMDs to read+sum for a given SQ counter. `SqWaves` is a per-SE count (the
-/// SIMD reads all return the SE total), so summing SIMDs would 4×-overcount it;
-/// every other SQ counter is per-SIMD and must be summed across SIMDs.
-fn sq_simd_iters(c: PmcCounter) -> u32 {
-    match c {
-        PmcCounter::SqWaves => 1,
-        _ => SQ_SIMDS_PER_SE,
-    }
 }
 
 /// Assign each counter a per-block SELECT slot (in request order) and its record
@@ -359,16 +334,15 @@ fn gfx9_schedule(counters: &[PmcCounter], grid: &PmcGrid) -> Vec<Gfx9Sched> {
             let (block, perf_sel) = gfx9_block_sel(c);
             let pcid = next[block.slot()];
             next[block.slot()] += 1;
-            let simd_iters = if block == PmcBlock::Sq { sq_simd_iters(c) } else { 1 };
             let records = match block {
-                // Per (XCC, SE, SIMD): per-SIMD SQ counters are replicated per SIMD
-                // within each SE — reading per-SE captures one SIMD, so iterate all
-                // SIMDs and sum to match rocprofv3's per-XCC aggregate.
-                PmcBlock::Sq => (grid.xcc * grid.se * simd_iters) as usize,
+                // One read per (XCC, SE): the SQ SELECT's `simd_mask=0xf` aggregates all 4
+                // SIMDs into the SE-global total, so a per-SE read already matches rocprofv3's
+                // per-XCC aggregate (iterating `instance_index` per SIMD would 4×-overcount).
+                PmcBlock::Sq => (grid.xcc * grid.se) as usize,
                 PmcBlock::Grbm => grid.xcc as usize,
                 PmcBlock::Tcc => (grid.xcc * TCC_INSTANCES) as usize,
             };
-            Gfx9Sched { block, pcid, perf_sel, records, simd_iters }
+            Gfx9Sched { block, pcid, perf_sel, records }
         })
         .collect()
 }
@@ -577,19 +551,9 @@ fn build_streams_gfx9(
                 j += 1;
             };
             match s.block {
-                PmcBlock::Sq if s.simd_iters > 1 => {
-                    // Per-SIMD counter: index each SIMD (`instance_index`) within
-                    // each SE and sum, else only 1 of SQ_SIMDS_PER_SE is captured
-                    // (a 4× under-count vs rocprofv3).
-                    for se in 0..grid.se {
-                        for simd in 0..s.simd_iters {
-                            arch.grbm_index_se_simd(&mut inner, se, simd);
-                            copy_at(&mut inner);
-                        }
-                    }
-                }
                 PmcBlock::Sq => {
-                    // Per-SE counter (SqWaves): SE broadcast reads the SE total.
+                    // Every SQ counter: one SE-broadcast read per SE (the `simd_mask=0xf`
+                    // SELECT already aggregates the 4 SIMDs into the SE total).
                     for se in 0..grid.se {
                         arch.grbm_index_se(&mut inner, se);
                         copy_at(&mut inner);
@@ -638,9 +602,8 @@ pub struct PmcHandle {
     counters: Vec<PmcCounter>,
     layout: PmcLayout,
     /// Device topology carried into [`CounterSet`] so the profiler can normalize
-    /// cross-block derived metrics (MFMA utilization) and derive achieved clock.
-    /// `(num_xcc, device_simds, peak_clk_mhz)`.
-    device: (u32, u32, u32),
+    /// cross-block derived metrics (MFMA utilization). `(num_xcc, device_simds)`.
+    device: (u32, u32),
     /// Extra GPU buffers kept alive until harvest — the AQL path's two vendor
     /// PM4-IB buffers (the CP reads them while the dispatch is in flight; freeing
     /// them early would let the CP walk unmapped VRAM). Empty on the PM4 path,
@@ -661,14 +624,13 @@ impl PmcHandle {
         counters: Vec<PmcCounter>,
         layout: PmcLayout,
     ) -> Self {
-        Self { ts, _buf: buf, host, counters, layout, device: (0, 0, 0), _ib_bufs: Vec::new() }
+        Self { ts, _buf: buf, host, counters, layout, device: (0, 0), _ib_bufs: Vec::new() }
     }
 
     /// Attach the device topology used to normalize cross-block derived metrics:
-    /// `num_xcc`, the device-total SIMD count (`simd_count`), and the peak engine
-    /// clock in MHz (reference `F_peak` for achieved-clock derivation).
-    pub fn with_device(mut self, num_xcc: u32, device_simds: u32, peak_clk_mhz: u32) -> Self {
-        self.device = (num_xcc, device_simds, peak_clk_mhz);
+    /// `num_xcc` and the device-total SIMD count (`simd_count`).
+    pub fn with_device(mut self, num_xcc: u32, device_simds: u32) -> Self {
+        self.device = (num_xcc, device_simds);
         self
     }
 
@@ -707,6 +669,6 @@ impl crate::sync::DispatchTimestamps for PmcHandle {
             }
             values.insert(c, sum);
         }
-        Some(CounterSet { values, xcc_num: self.device.0, device_simds: self.device.1, peak_clk_mhz: self.device.2 })
+        Some(CounterSet { values, xcc_num: self.device.0, device_simds: self.device.1 })
     }
 }

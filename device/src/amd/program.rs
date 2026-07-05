@@ -867,11 +867,8 @@ impl AmdProgram {
             // counters were collected, else the bare timestamp signal.
             let handle: Option<Arc<dyn crate::sync::DispatchTimestamps>> = match (ts, pmc) {
                 (Some(sig), Some(p)) => Some(Arc::new(
-                    crate::amd::pmc::PmcHandle::new(sig, p.rb, p.rb_host, p.counters, p.layout).with_device(
-                        self.dev.node.num_xcc,
-                        self.dev.node.simd_count,
-                        self.dev.node.max_engine_clk_fcompute,
-                    ),
+                    crate::amd::pmc::PmcHandle::new(sig, p.rb, p.rb_host, p.counters, p.layout)
+                        .with_device(self.dev.node.num_xcc, self.dev.node.simd_count),
                 )),
                 (Some(sig), None) => Some(sig),
                 (None, _) => None,
@@ -963,11 +960,7 @@ impl AmdProgram {
                     let ts = ts.expect("PMC path acquires ts above");
                     Some(Arc::new(
                         crate::amd::pmc::PmcHandle::new(ts, p.rb, p.rb_host, p.counters, p.layout)
-                            .with_device(
-                                self.dev.node.num_xcc,
-                                self.dev.node.simd_count,
-                                self.dev.node.max_engine_clk_fcompute,
-                            )
+                            .with_device(self.dev.node.num_xcc, self.dev.node.simd_count)
                             .keep_alive(vec![ib.start_ib, ib.read_ib]),
                     ))
                 }

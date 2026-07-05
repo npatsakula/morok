@@ -63,7 +63,7 @@ fn cratio_requires_both_inputs_and_nonzero_denominator() {
 #[test]
 fn derived_metric_formulas() {
     let lookup = |label: &str| DERIVED.iter().find(|(l, _)| *l == label).map(|(_, f)| *f).expect("derived col");
-    let ctx = DerivedCtx { xcc_num: 8, device_simds: 1216, peak_clk_mhz: 2100, wall_secs: 1e-6, gpu_stamped: true };
+    let ctx = DerivedCtx { xcc_num: 8, device_simds: 1216, wall_secs: 1e-6, gpu_stamped: true };
     let mut m = BTreeMap::new();
     m.insert(PmcCounter::LdsBankConflict, 3);
     m.insert(PmcCounter::LdsIdxActive, 12);
@@ -74,8 +74,8 @@ fn derived_metric_formulas() {
     m.insert(PmcCounter::L2Miss, 10);
     // rocprofiler bank-conflict rate: conflicts / (idx_active − conflicts) = 3/(12−3).
     assert_eq!(lookup("bankconf")(&m, ctx), Some(3.0 / 9.0));
-    // MfmaUtil via achieved-clock normalization: mfma / (F_peak · wall · simds).
-    assert_eq!(lookup("mfmautil")(&m, ctx), Some(40.0 / (2100e6 * 1e-6 * 1216.0)));
+    // rocprofiler MfmaUtil: mfma / (device_simds · GRBM_GUI_ACTIVE_per_XCD) = 40/(1216·100/8).
+    assert_eq!(lookup("mfmautil")(&m, ctx), Some(40.0 / (1216.0 * 100.0 / 8.0)));
     // Achieved sclk (GHz): (gui / xcc) / wall / 1e9 = (100/8)/1e-6/1e9.
     assert_eq!(lookup("sclk")(&m, ctx), Some(100.0 / 8.0 / 1e-6 / 1e9));
     // svod matrix-duty (GRBM-free): mfma-busy / sq-busy = 40/80.
@@ -84,11 +84,10 @@ fn derived_metric_formulas() {
     assert_eq!(lookup("l2hitpct")(&m, ctx), Some(75.0));
     // valuutil self-hides when its SQ inputs are absent.
     assert_eq!(lookup("valuutil")(&m, ctx), None);
-    // mfmautil self-hides without F_peak / wall time (can't normalize).
+    // mfmautil self-hides without the GRBM denominator (xcc_num = 0 in the default ctx).
     assert_eq!(lookup("mfmautil")(&m, DerivedCtx::default()), None);
-    // mfmautil / sclk self-hide when the wall is host-derived (not GPU-stamped) —
-    // a host wall (submit overhead) would yield a meaningless clock.
-    assert_eq!(lookup("mfmautil")(&m, DerivedCtx { gpu_stamped: false, ..ctx }), None);
+    // sclk self-hides when the wall is host-derived (not GPU-stamped) — a host wall
+    // (submit overhead) would yield a meaningless clock. (mfmautil is now clock-free.)
     assert_eq!(lookup("sclk")(&m, DerivedCtx { gpu_stamped: false, ..ctx }), None);
     // sclk self-hides without a captured wall time.
     assert_eq!(lookup("sclk")(&m, DerivedCtx { wall_secs: 0.0, ..ctx }), None);
