@@ -222,6 +222,11 @@ pub enum Node {
     /// Vector STORE of a `<ept × f32>` fragment `value` into register `buf` at offset 0
     /// — the WMMA accumulator write-back (an effect).
     StoreRegVec { buf: TileId, value: TileId },
+    /// Vector STORE of a `<ept × dtype>` `value` into an LDS/global `buf` at flat `base`
+    /// — one `STORE(INDEX(buf,[base]), value)`, the AMD renderer's `ds_write_b64`/`b128`
+    /// (the vectorised fill; the store mirror of [`Node::LoadVecAt`]). Requires the `ept`
+    /// run contiguous + aligned (the A / Row fill; B stays scalar under the transpose).
+    StoreVecAt { buf: TileId, base: TileId, value: TileId },
     /// A single K-fragment matrix multiply-accumulate `D = A·B + C` → one
     /// [`Op::Wmma`](svod_ir::Op::Wmma) (gfx942 16×16×16 bf16→f32 MFMA intrinsic).
     /// `a`/`b` are bf16 `LoadRegVec` operands, `c` the f32 accumulator operand; the
@@ -376,6 +381,7 @@ impl TileIr {
             Node::LoadRegVec { buf, ept, dtype } => Node::LoadRegVec { buf: f(buf), ept, dtype },
             Node::LoadVecAt { buf, base, ept, dtype } => Node::LoadVecAt { buf: f(buf), base: f(base), ept, dtype },
             Node::StoreRegVec { buf, value } => Node::StoreRegVec { buf: f(buf), value: f(value) },
+            Node::StoreVecAt { buf, base, value } => Node::StoreVecAt { buf: f(buf), base: f(base), value: f(value) },
             Node::Mma { a, b, c, ept } => Node::Mma { a: f(a), b: f(b), c: f(c), ept },
             Node::Barrier { body, deps } => {
                 Node::Barrier { body: f(body), deps: deps.into_iter().map(&mut f).collect() }
@@ -435,6 +441,7 @@ impl TileIr {
             Node::After { val, .. } => self.meta(*val).clone(),
             Node::StoreGlobal { .. }
             | Node::StoreRegVec { .. }
+            | Node::StoreVecAt { .. }
             | Node::Barrier { .. }
             | Node::End { .. }
             | Node::Sink { .. } => TileMeta::effect(),

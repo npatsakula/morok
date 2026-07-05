@@ -360,6 +360,58 @@ fn fill_lds_unrolled(
         .collect()
 }
 
+/// **Vectorised** collaborative global→LDS fill for the **non-transposed** (A / Row) tile,
+/// whose lane run is contiguous on *both* sides: each lane's `epl` elements form contiguous
+/// columns within one LDS row, so the run splits into `epl/VEC` b64 chunks — ONE
+/// `<VEC×bf16>` global `load_vec` (coalesced) + ONE `<VEC×bf16>` `store_lds_vec`
+/// (`ds_write_b64`) per chunk, replacing `VEC` scalar load/store pairs. The store routes
+/// its chunk base through `lds_col` at b64 granularity so it stays swizzle-safe (the delta
+/// is `VEC`-aligned; §5b). Requires `epl % VEC == 0` and `cols_lds % VEC == 0` (so a chunk
+/// never straddles a row). B stays on the scalar [`fill_lds_unrolled`] — its transpose makes
+/// the global read strided, so it can't be a contiguous vector load. Returns the chunk store
+/// effects to fence.
+#[allow(clippy::too_many_arguments)]
+fn fill_lds_vec(
+    b: &mut Builder,
+    lds: Lds<BF16>,
+    src: Buf<BF16>,
+    epl: usize,
+    lane: Idx,
+    cols_lds: i64,
+    tile_row_base: Idx,
+    tile_col_base: Idx,
+    grow_stride: i64,
+) -> Vec<Effect> {
+    const VEC: usize = 4; // b64 = 4 bf16 (KPack / swizzle granularity)
+    assert!(
+        epl.is_multiple_of(VEC) && (cols_lds as usize).is_multiple_of(VEC),
+        "vectorised fill needs VEC-aligned epl/cols"
+    );
+    let epl_c = b.idx_const(epl as i64);
+    let lane_epl = b.idx_mul(lane, epl_c);
+    let cols_c = b.idx_const(cols_lds);
+    let gstride = b.idx_const(grow_stride);
+    (0..epl / VEC)
+        .map(|cc| {
+            let ec = b.idx_const((cc * VEC) as i64);
+            let flat = b.idx_add(lane_epl, ec); // chunk start (VEC-aligned ⇒ stays in one row)
+            let r = b.idx_div(flat, cols_c);
+            let c = b.idx_mod(flat, cols_c);
+            // Global: contiguous `VEC`-run at (tile_row_base + r)·stride + tile_col_base + c.
+            let grow = b.idx_add(tile_row_base, r);
+            let goff = b.idx_mul(grow, gstride);
+            let goff = b.idx_add(goff, tile_col_base);
+            let goff = b.idx_add(goff, c);
+            let v = b.load_vec(src, goff, VEC);
+            // LDS: `r·cols + LdsCol(r, c)` — flat until SwizzlePass relocates the b64 chunk.
+            let col = b.lds_col(r, c, cols_lds as usize);
+            let rc = b.idx_mul(r, cols_c);
+            let dst_off = b.idx_add(rc, col);
+            b.store_lds_vec(lds, dst_off, v)
+        })
+        .collect()
+}
+
 /// `idx + base` (folding the `base == 0` identity so the flat path stays clean).
 fn offset_by(b: &mut Builder, idx: Idx, base: usize) -> Idx {
     if base == 0 {
@@ -714,8 +766,10 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize
     // Fill A[bm,k_step] (LDS rows = M, cols = K; K-col base tk·k_step, stride K) and B
     // **transposed** into b_smem[bn,k_step] (LDS rows = N, cols = K) so B's ept run is
     // contiguous and vectorises like A — global K = tk·k_step + col, N = tn·bn + row, stride N.
-    let mut fill_stores: Vec<TileId> = Vec::with_capacity(epl_a + epl_b);
-    let fa = fill_lds_unrolled(&mut b, a_smem, a, epl_a, lane, k_step as i64, tm_bm, tk_ks, k as i64, false);
+    let mut fill_stores: Vec<TileId> = Vec::with_capacity(epl_a / 4 + epl_b);
+    // A (Row, contiguous both sides) fills vectorised in b64 chunks; B (transposed) stays
+    // scalar — its strided global read can't be a contiguous vector load (§5b).
+    let fa = fill_lds_vec(&mut b, a_smem, a, epl_a, lane, k_step as i64, tm_bm, tk_ks, k as i64);
     let fb = fill_lds_unrolled(&mut b, b_smem, bmat, epl_b, lane, k_step as i64, tk_ks, tn_bn, n as i64, true);
     let fill_head = fa[0];
     fill_stores.extend(fa.iter().skip(1).chain(fb.iter()).map(|e| e.dep()));

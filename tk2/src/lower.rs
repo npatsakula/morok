@@ -209,6 +209,15 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
                 UOp::index().buffer(buf).indices(vec![cidx(0)]).ptr(true).call().expect("STORE_VEC index construction");
             idx.store(val)
         }
+        // ONE `<ept×dtype>` vector store of a contiguous run at flat `base` — the store
+        // mirror of `LoadVecAt`, which the AMD renderer lowers to `ds_write_b64`/`b128`
+        // (the vectorised fill). `base` must start an aligned contiguous `ept`-run.
+        Node::StoreVecAt { buf, base, value } => {
+            let (buf, base, val) = (get(low, buf), get(low, base), get(low, value));
+            let idx =
+                UOp::index().buffer(buf).indices(vec![base]).ptr(true).call().expect("VEC_AT store index construction");
+            idx.store(val)
+        }
         // One K-fragment MFMA: `D = A·B + C`, the gfx942 16×16×16 bf16→f32 intrinsic.
         Node::Mma { a, b, c, .. } => {
             let (a, b, c) = (get(low, a), get(low, b), get(low, c));

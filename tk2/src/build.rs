@@ -305,6 +305,20 @@ impl Builder {
         Effect(self.ir.intern(Node::StoreGlobal { buf: lds.id, offset: offset.0, value: value.id }))
     }
 
+    /// ONE `<ept×E>` vector load of a contiguous **global** run at flat `base` (the
+    /// coalesced, vectorised fill read → `buffer_load_dwordx*`) — the global mirror of
+    /// [`Self::load_lds_vec_after`], no ordering edge (a plain source read).
+    pub fn load_vec<E: Elem>(&mut self, buf: Buf<E>, base: Idx, ept: usize) -> Val<E> {
+        Val::wrap(self.ir.intern(Node::LoadVecAt { buf: buf.id, base: base.0, ept, dtype: E::dtype() }))
+    }
+
+    /// ONE `<ept×E>` vector store of a contiguous LDS run at flat `base` ([`Node::StoreVecAt`]
+    /// → `ds_write_b64`/`b128`) — the store mirror of [`Self::load_lds_vec_after`], replacing
+    /// `ept` scalar `store_lds` for a contiguous, aligned run (the vectorised fill).
+    pub fn store_lds_vec<E: Elem>(&mut self, lds: Lds<E>, base: Idx, value: Val<E>) -> Effect {
+        Effect(self.ir.intern(Node::StoreVecAt { buf: lds.id, base: base.0, value: value.id }))
+    }
+
     /// Load an `E` value from an LDS buffer at flat `offset` **ordered after** the
     /// staging barrier (and any other `deps`): the cross-lane read of a staged tile.
     /// The `After` edge on the buffer makes the store→barrier→load order explicit —
