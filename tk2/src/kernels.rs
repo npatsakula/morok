@@ -1128,18 +1128,15 @@ struct BodyOut {
     tail_barrier: Option<TileId>,
 }
 
-/// Close a cluster (DESIGN §5c): a `sched_fence(0)` over the cluster's effects (pins the
-/// compiler-visible ops in their cluster) then a workgroup `s_barrier` — the boundary the two
-/// warp-phases traverse one cluster out of step. Returns the barrier token the next cluster follows.
-fn close_cluster(b: &mut Builder, anchor: &[TileId]) -> TileId {
-    let fence = b.sched_fence(0, anchor);
-    b.barrier(fence, &[]).dep()
-}
-
-/// Walk a `&[Cluster]` schedule once, emitting the memory/compute clusters with their brackets and
-/// threading the acc frag round-trip + the entry-token chain + the WAR. Used for BOTH the steady
-/// body (with prefetch/commit, `k_next=Some`, `carry[ij]=[inited,kr]`) and the epilogue (no
-/// prefetch/commit, `k_next=None`, `carry[ij]=[]`, reading the post-loop `acc_loop` frags).
+/// Walk a `&[Cluster]` schedule once, emitting each memory/compute cluster with its bracket and
+/// threading the acc frag round-trip + the `entry` boundary tokens + the WAR. Used for BOTH the
+/// steady body (`k_next=Some`, `carry[ij]=[inited,kr]`) and the epilogue (`k_next=None`,
+/// `carry[ij]=[]`, reading the post-loop `acc_loop` frags). **Value-anchoring (§5c):** every
+/// schedule-steering custom (`set_prio`/`sched_fence`) anchors on a VALUE (the operand `op_anchor`
+/// or the MFMA result `new[0]`), never a barrier — svod's renderer can't name a barrier as a
+/// custom dep. The correctness ordering rides the separate barrier/`After` channel: the `entry`
+/// tokens (a per-cluster `s_barrier` plus the live sched customs) route into the next cluster's
+/// `load_*_after` deps, which `After` handles for barriers and customs alike.
 #[allow(clippy::too_many_arguments)]
 fn run_clustered_body<Op, Reg>(
     b: &mut Builder,
@@ -1152,13 +1149,13 @@ fn run_clustered_body<Op, Reg>(
     k_next: Option<Idx>,
     prefetch: &mut impl FnMut(&mut Builder, Idx) -> (Reg, Vec<TileId>),
     commit: &mut impl FnMut(&mut Builder, Idx, &Reg, &[TileId]) -> Vec<Effect>,
-    gather_slice: &mut impl FnMut(&mut Builder, usize, &[TileId]) -> (Op, Vec<TileId>),
+    gather_slice: &mut impl FnMut(&mut Builder, usize, &[TileId]) -> (Op, Vec<TileId>, TileId),
     mma_slice: &mut impl FnMut(&mut Builder, usize, &Op, &[Val<F32>]) -> Vec<Val<F32>>,
 ) -> BodyOut {
-    let mut entry: Option<TileId> = None;
+    let mut entry: Vec<TileId> = Vec::new();
     let mut prev_store: Vec<TileId> = Vec::new();
     let mut all_gathers: Vec<TileId> = Vec::new();
-    let mut operands: Vec<Option<Op>> = (0..ksteps).map(|_| None).collect();
+    let mut operands: Vec<Option<(Op, TileId)>> = (0..ksteps).map(|_| None).collect();
     let mut reg: Option<Reg> = None;
     let mut raw_next: Option<TileId> = None;
     let mut tail_barrier: Option<TileId> = None;
@@ -1167,68 +1164,76 @@ fn run_clustered_body<Op, Reg>(
     for cluster in schedule {
         match cluster {
             Cluster::Mem(mc) => {
-                // prefetch block k+1 (steady only) → the load-pin anchors for this cluster's fence.
+                // prefetch block k+1 (steady only) → the load values are the load-pin anchors.
                 let mut anchors: Vec<TileId> = Vec::new();
                 if mc.prefetch
-                    && let Some(kn) = k_next {
-                        let (r, a) = prefetch(b, kn);
-                        reg = Some(r);
-                        anchors = a;
-                    }
-                // gather the listed slices (carried RAW seed + the prior cluster's barrier).
+                    && let Some(kn) = k_next
+                {
+                    let (r, a) = prefetch(b, kn);
+                    reg = Some(r);
+                    anchors = a;
+                }
+                // gather the listed slices (carried RAW seed + the prior cluster's boundary tokens).
                 let mut gdeps = seed.to_vec();
-                gdeps.extend(entry);
+                gdeps.extend(&entry);
                 let mut this_gathers: Vec<TileId> = Vec::new();
                 for &s in &mc.gathers {
-                    let (op, g) = gather_slice(b, s, &gdeps);
+                    let (op, g, op_anchor) = gather_slice(b, s, &gdeps);
                     this_gathers.extend(g.iter().copied());
-                    operands[s] = Some(op);
+                    operands[s] = Some((op, op_anchor));
                 }
                 all_gathers.extend(this_gathers.iter().copied());
-                // commit block k+1 (steady only): WAR-fence EVERY gather, then ds_write, then the
-                // LDS-RAW carry barrier. Its barrier IS this cluster's boundary.
+                // commit block k+1 (steady only): WAR-fence EVERY gather, ds_write, LDS-RAW carry.
                 if mc.commit
-                    && let (Some(kn), Some(r)) = (k_next, reg.as_ref()) {
-                        let mut war_deps: Vec<TileId> = all_gathers[1..].to_vec();
-                        war_deps.extend(entry);
-                        let war = b.barrier(Effect(all_gathers[0]), &war_deps);
-                        let fill = commit(b, kn, r, &[war.dep()]);
-                        let fill_deps: Vec<TileId> = fill[1..].iter().map(|e| e.dep()).collect();
-                        let rn = b.barrier(fill[0], &fill_deps).dep();
-                        raw_next = Some(rn);
-                        tail_barrier = Some(rn);
-                        entry = Some(rn);
-                        continue;
-                    }
-                // close the memory cluster (skip a cluster that produced nothing — e.g. the
-                // commit cluster in the epilogue, where k_next is None).
-                let mut anchor = anchors;
-                anchor.extend(this_gathers);
-                if anchor.is_empty() {
+                    && let (Some(kn), Some(r)) = (k_next, reg.as_ref())
+                {
+                    let war = b.barrier(Effect(all_gathers[0]), &all_gathers[1..]);
+                    let fill = commit(b, kn, r, &[war.dep()]);
+                    let fill_deps: Vec<TileId> = fill[1..].iter().map(|e| e.dep()).collect();
+                    let rn = b.barrier(fill[0], &fill_deps).dep();
+                    raw_next = Some(rn);
+                    tail_barrier = Some(rn);
+                    entry = vec![rn];
                     continue;
                 }
-                let bar = close_cluster(b, &anchor);
+                // skip a cluster that produced nothing (e.g. the commit cluster in the epilogue).
+                if this_gathers.is_empty() {
+                    continue;
+                }
+                // the workgroup barrier fences this cluster's gather reads (correctness); the pin
+                // fence anchors on the prefetch load VALUES (perf). Both ride `entry` to stay live.
+                let bar = b.barrier(Effect(this_gathers[0]), &this_gathers[1..]).dep();
                 tail_barrier = Some(bar);
-                entry = Some(bar);
+                entry = vec![bar];
+                if !anchors.is_empty() {
+                    entry.push(b.sched_fence(0, &anchors).dep());
+                }
             }
             Cluster::Compute(s) => {
-                let op = operands[*s].as_ref().expect("gather slice must precede its mma slice");
-                let prio1 = b.set_prio(1, entry.as_slice()).dep();
+                let (op, op_anchor) = operands[*s].as_ref().map(|(o, a)| (o, *a)).expect("gather before mma");
+                // set_prio(1) anchored on an operand VALUE; the acc reads route through it (live +
+                // before the MFMAs) AND through the prior cluster's `entry` (barrier + customs).
+                let prio1 = b.set_prio(1, &[op_anchor]).dep();
                 let reads: Vec<Val<F32>> = (0..n_acc)
                     .map(|ij| {
                         let mut deps = if first_compute { carry[ij].clone() } else { vec![prev_store[ij]] };
+                        deps.extend(&entry);
                         deps.push(prio1);
                         b.load_frag_vec_after(accs[ij], &deps)
                     })
                     .collect();
                 let new = mma_slice(b, *s, op, &reads);
+                let new0 = new[0].id;
                 let stores: Vec<Effect> = (0..n_acc).map(|ij| b.store_frag_vec(accs[ij], new[ij])).collect();
                 prev_store = stores.iter().map(|e| e.dep()).collect();
                 first_compute = false;
-                let prio0 = b.set_prio(0, &prev_store).dep();
-                let bar = close_cluster(b, &[prio0]);
+                // set_prio(0) + the cluster fence anchor on the MFMA-result VALUE; the workgroup
+                // barrier fences the acc stores. All three ride `entry` into the next cluster.
+                let prio0 = b.set_prio(0, &[new0]).dep();
+                let fence = b.sched_fence(0, &[new0]).dep();
+                let bar = b.barrier(Effect(prev_store[0]), &prev_store[1..]).dep();
                 tail_barrier = Some(bar);
-                entry = Some(bar);
+                entry = vec![bar, prio0, fence];
             }
         }
     }
@@ -1237,10 +1242,10 @@ fn run_clustered_body<Op, Reg>(
 
 /// The **clustered pipeline interpreter** (DESIGN §5c) — walks a `&[Cluster]` schedule, owning ALL
 /// scheduling placement (the per-cluster `sched_fence(0)`+`s_barrier`+`set_prio` bracket, and the
-/// warp-phase ping-pong when `warp_row` is `Some`: an eq=1 barrier in the prologue offsets warp-row
-/// 1 one cluster, an eq=0 in the epilogue rebalances it) and the carries (acc via `combine`/`End`,
-/// the LDS-RAW via the commit barrier). The author supplies only the schedule + the four hooks. The
-/// compiler-visible single-LDS register-staged HK replica; the balance is checked in `kblock_impl`.
+/// warp-phase ping-pong when `warp_row` is `Some`) and the carries. The wave barriers are ordered
+/// after the block-0 commit via `idx_after` (the warp_row operand carries the barrier ordering — a
+/// value, so it renders). The author supplies only the schedule + hooks; balance is checked in
+/// `kblock_impl`. The compiler-visible single-LDS register-staged HK replica.
 #[allow(clippy::too_many_arguments)]
 fn pipeline_clustered<Op, Reg>(
     b: &mut Builder,
@@ -1253,7 +1258,7 @@ fn pipeline_clustered<Op, Reg>(
     schedule: &[Cluster],
     mut prefetch: impl FnMut(&mut Builder, Idx) -> (Reg, Vec<TileId>),
     mut commit: impl FnMut(&mut Builder, Idx, &Reg, &[TileId]) -> Vec<Effect>,
-    mut gather_slice: impl FnMut(&mut Builder, usize, &[TileId]) -> (Op, Vec<TileId>),
+    mut gather_slice: impl FnMut(&mut Builder, usize, &[TileId]) -> (Op, Vec<TileId>, TileId),
     mut mma_slice: impl FnMut(&mut Builder, usize, &Op, &[Val<F32>]) -> Vec<Val<F32>>,
 ) -> Vec<Frag<F32>> {
     assert!(nblocks >= 2, "pipeline_clustered needs nblocks ≥ 2");
@@ -1261,14 +1266,18 @@ fn pipeline_clustered<Op, Reg>(
     let ks_c = b.idx_const(k_step as i64);
     let one = b.idx_const(1);
 
-    // ── prologue: commit block 0; the eq=1 wave-phase barrier offsets warp-row 1 one cluster. ──
+    // ── prologue: commit block 0; the eq=1 wave-phase barrier (ordered after the commit via the
+    //    warp_row operand carrying the raw_seed edge) offsets warp-row 1 one cluster. ──
     let zero = b.idx_const(0);
     let (reg0, _) = prefetch(b, zero);
     let fill0 = commit(b, zero, &reg0, &[]);
     let fill0_deps: Vec<TileId> = fill0[1..].iter().map(|e| e.dep()).collect();
     let raw_seed = b.barrier(fill0[0], &fill0_deps);
     let loop_seed = match warp_row {
-        Some(wr) => b.wave_barrier(wr, 1, &[raw_seed.dep()]).dep(),
+        Some(wr) => {
+            let wr_seeded = b.idx_after(wr, &[raw_seed.dep()]);
+            b.wave_barrier(wr_seeded, 1, &[]).dep()
+        }
         None => raw_seed.dep(),
     };
 
@@ -1321,9 +1330,9 @@ fn pipeline_clustered<Op, Reg>(
         &mut mma_slice,
     );
     let scatter_seed = warp_row.map(|wr| {
-        let mut anchors = ep.prev_store.clone();
-        anchors.extend(ep.tail_barrier);
-        b.wave_barrier(wr, 0, &anchors).dep()
+        let anchor = ep.tail_barrier.expect("epilogue must end on a cluster barrier");
+        let wr_seeded = b.idx_after(wr, &[anchor]);
+        b.wave_barrier(wr_seeded, 0, &[]).dep()
     });
     acc_loop
         .iter()
@@ -1601,7 +1610,9 @@ fn kblock_impl(
                         b.load_frag_vec_after(b_frags[j], &st)
                     })
                     .collect();
-                ((a_vecs, b_vecs), gathers)
+                // op_anchor = an operand VALUE (the first A fragment) for `set_prio` to anchor on.
+                let op_anchor = a_vecs[0].id;
+                ((a_vecs, b_vecs), gathers, op_anchor)
             },
             |b, _s, (a_vecs, b_vecs), acc_reads| {
                 let mut out = Vec::with_capacity(ri * cj);

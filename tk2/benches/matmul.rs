@@ -20,8 +20,8 @@ mod common;
 use common::{bench_plan, rand_bf16, requirements_met};
 
 use svod_tk2::{
-    Program, SwizzlePass, VectorizePass, graph_kernel, matmul, matmul_lds_kblock_mw, matmul_lds_kblock_mw_pipe,
-    matmul_lds_kblock_sw, matmul_lds_kblock_vec, optimize_addressing,
+    Program, SwizzlePass, VectorizePass, graph_kernel, matmul, matmul_lds_kblock_mw, matmul_lds_kblock_mw_clustered,
+    matmul_lds_kblock_mw_pipe, matmul_lds_kblock_sw, matmul_lds_kblock_vec, optimize_addressing,
 };
 
 /// f32 ground truth `A·B` over the SAME bf16-rounded operands (both kernel and
@@ -125,9 +125,16 @@ fn bench_matmul(c: &mut Criterion) {
         let (ymw2p, pmw2p) = plan_of(mw256p, n, n, &a, &b);
         assert_correct(&ymw2p, &pmw2p, &expected, n, "kblock_mw256_pipe");
         group.bench_with_input(BenchmarkId::new("kblock_mw256_pipe", n), &n, |bch, _| bench_plan(bch, &pmw2p));
-        // NB: the §5c clustered HK replica (`matmul_lds_kblock_mw_clustered`) is correctness-gated
-        // via the device test only — no bench arm until the COMPLETE replica (warp-phase ping-pong
-        // included) is bit-exact, so we never perf-measure a knowingly-incomplete copy of HK.
+        // §5c clustered HK replica (256² tile, HK tiling bm=128/bn=64/wm=2/wn=4): the COMPLETE
+        // schedule — 8 clusters + per-cluster s_barrier + set_prio + sched_fence + the warp-phase
+        // ping-pong. Now bit-exact, so measured: does the full co-designed schedule reach HK's 0.65?
+        let hk = matmul_lds_kblock_mw_clustered(n, n, n, 128, 64, 2, 4, 64).apply(VectorizePass).apply(SwizzlePass);
+        let (yhk, phk) = plan_of(hk, n, n, &a, &b);
+        assert_correct(&yhk, &phk, &expected, n, "kblock_hk");
+        group.bench_with_input(BenchmarkId::new("kblock_hk", n), &n, |bch, _| bench_plan(bch, &phk));
+        // FINDING (4096): the complete HK replica REGRESSES — 317→475µs, mfmautil 0.40→0.23. Isolated:
+        // the 2-warp-row tiling (VGPR 64→128, occupancy) costs ~14% and the cluster+ping-pong schedule
+        // another ~31%. HK's compiler-visible transcription does NOT reach 0.65; the plain pipe wins.
     }
     group.finish();
 }

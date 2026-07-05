@@ -388,6 +388,14 @@ impl Builder {
         Effect(self.ir.intern(Node::SetPrio { level, deps }))
     }
 
+    /// An index value re-bound to observe `deps` (an ordering edge on a *value*, §5c): the way a
+    /// schedule-steering custom (`wave_barrier`/`set_prio`) is ordered after a barrier without
+    /// taking the barrier as a `Op::Custom` dep (which the renderer can't name) — the warp_row
+    /// operand carries the ordering, mirroring tk's `a_smem.after([barrier])` (`gfx942.rs:156`).
+    pub fn idx_after(&mut self, idx: Idx, deps: &[TileId]) -> Idx {
+        Idx(self.after_buf(idx.0, deps))
+    }
+
     /// The **wave-phase asymmetric barrier** (`if warp_row == eq: s_barrier`, DESIGN §5c/3c) —
     /// `warp_row` is operand[0], `after` are ordering anchors. Route its [`Effect`] into a
     /// downstream consumer to keep it live and ordered (an un-executed barrier deadlocks, so it
