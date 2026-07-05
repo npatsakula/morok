@@ -20,9 +20,8 @@ mod common;
 use common::{bench_plan, rand_bf16, requirements_met};
 
 use svod_tk2::{
-    Bracket, Program, SwizzlePass, VectorizePass, graph_kernel, matmul, matmul_lds_kblock_mw,
-    matmul_lds_kblock_mw_clustered, matmul_lds_kblock_mw_pipe, matmul_lds_kblock_sw, matmul_lds_kblock_vec,
-    optimize_addressing,
+    Program, SwizzlePass, VectorizePass, graph_kernel, matmul, matmul_lds_kblock_mw, matmul_lds_kblock_mw_pipe,
+    matmul_lds_kblock_sw, matmul_lds_kblock_vec, optimize_addressing,
 };
 
 /// f32 ground truth `A·B` over the SAME bf16-rounded operands (both kernel and
@@ -126,21 +125,9 @@ fn bench_matmul(c: &mut Criterion) {
         let (ymw2p, pmw2p) = plan_of(mw256p, n, n, &a, &b);
         assert_correct(&ymw2p, &pmw2p, &expected, n, "kblock_mw256_pipe");
         group.bench_with_input(BenchmarkId::new("kblock_mw256_pipe", n), &n, |bch, _| bench_plan(bch, &pmw2p));
-
-        // §5c clustered schedule sweep (256² tile): the per-slice memory/compute cluster
-        // decomposition with the Bracket placed by rule — does the COHERENT structure (vs the
-        // regressing isolated fences) lift MfmaUtil off the pipe's 0.42? Swept fence-only / +prio.
-        let base = Bracket::default();
-        let bare = Bracket { load_pin: false, cluster_fence: false, prio: false, per_cluster_barrier: false };
-        for (tag, br) in
-            [("clustered_bare", bare), ("clustered", base), ("clustered_prio", Bracket { prio: true, ..base })]
-        {
-            let prog =
-                matmul_lds_kblock_mw_clustered(n, n, n, 64, 64, 4, 4, 64, br).apply(VectorizePass).apply(SwizzlePass);
-            let (yc, pc) = plan_of(prog, n, n, &a, &b);
-            assert_correct(&yc, &pc, &expected, n, tag);
-            group.bench_with_input(BenchmarkId::new(tag, n), &n, |bch, _| bench_plan(bch, &pc));
-        }
+        // NB: the §5c clustered HK replica (`matmul_lds_kblock_mw_clustered`) is correctness-gated
+        // via the device test only — no bench arm until the COMPLETE replica (warp-phase ping-pong
+        // included) is bit-exact, so we never perf-measure a knowingly-incomplete copy of HK.
     }
     group.finish();
 }

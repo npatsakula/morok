@@ -22,10 +22,6 @@ use crate::error::{self, Result};
 use crate::ir::{BinOp, IndexOp, Node, Scalar, ScopeAxis, TileId, TileIr};
 use crate::kernels::Program;
 
-/// Per-construction unique id for the [`Node::WaveBarrier`] asm skip-label, so `clang -O3`
-/// loop-unrolling can never emit two copies of the same `.Lwpb{n}:` label.
-static WAVE_PHASE_LABEL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// The gfx942 16×16×16 bf16→f32 MFMA descriptor, reproduced verbatim from tk's
 /// `wmma_desc`/`wmma_from_tc` (`tk/src/group/mma.rs`): the per-arch×dtype
 /// [`TensorCore`](svod_schedule::optimizer::TensorCore) table is the single source
@@ -261,8 +257,9 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
         Node::WaveBarrier { eq, deps } => {
             let mut lowered: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();
             lowered[0] = lowered[0].cast(DType::Int32);
-            let uid = WAVE_PHASE_LABEL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let label = format!(".Lwpb{uid}");
+            // The node's own interned id is a unique, deterministic label — hash-consing collapses
+            // structurally-identical wave barriers to one node (lowered once), so no global counter.
+            let label = format!(".Lwpb{}", id.0);
             UOp::custom(
                 lowered,
                 format!(

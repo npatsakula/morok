@@ -210,27 +210,23 @@ fn matmul_lds_kblock_pipe_lowers_and_splits_prologue_steady_epilogue() {
 }
 
 #[test]
-fn matmul_lds_kblock_clustered_lowers_and_places_the_bracket() {
-    // The §5c clustered schedule (2×2 → 128², 4 K-blocks, ksteps=4): per-slice memory/compute
-    // clusters with the Bracket placed by rule must lower spec-valid, and the sched controls must
-    // appear/disappear with the flags (correctness invariant to all of them).
-    use crate::kernels::Bracket;
+fn matmul_lds_kblock_clustered_lowers_and_balances_the_wave_phase() {
+    // The §5c clustered HK replica (2 warp-rows → 128², 4 K-blocks, ksteps=4): the interpreter walks
+    // the 8-cluster schedule placing sched_fence + set_prio + per-cluster barriers + the warp-phase
+    // ping-pong. It must lower spec-valid, carry all three sched-control node kinds, and the wave
+    // barriers must be balanced (eq=0 count == eq=1 count == 1) — else `matmul_..._clustered` would
+    // have panicked in `verify_warp_phase_balance` at construction.
     let count = |p: &crate::Program, pred: &dyn Fn(&Node) -> bool| {
         (0..p.ir.len()).filter(|&i| pred(p.ir.node(crate::ir::TileId(i as u32)))).count()
     };
-    // load_pin + cluster_fence, no prio: every SchedFence present, no SetPrio.
-    let base = Bracket { load_pin: true, cluster_fence: true, prio: false, per_cluster_barrier: false };
-    let p = crate::kernels::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64, base);
-    lower::verify(&p).expect("clustered matmul must lower to spec-valid UOp");
-    assert!(count(&p, &|n| matches!(n, Node::SchedFence { .. })) > 0, "cluster_fence ⇒ SchedFence nodes");
-    assert_eq!(count(&p, &|n| matches!(n, Node::SetPrio { .. })), 0, "prio off ⇒ no SetPrio");
-    // + prio: SetPrio appears; still bit-exact-shaped (verify).
-    let prio = Bracket { prio: true, ..base };
-    let pp = crate::kernels::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64, prio);
-    lower::verify(&pp).expect("clustered+prio must lower spec-valid");
-    assert!(count(&pp, &|n| matches!(n, Node::SetPrio { .. })) > 0, "prio on ⇒ SetPrio nodes");
+    let p = crate::kernels::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64);
+    lower::verify(&p).expect("clustered HK replica must lower to spec-valid UOp");
+    assert!(count(&p, &|n| matches!(n, Node::SchedFence { .. })) > 0, "clusters ⇒ SchedFence nodes");
+    assert!(count(&p, &|n| matches!(n, Node::SetPrio { .. })) > 0, "compute clusters ⇒ SetPrio nodes");
+    assert_eq!(count(&p, &|n| matches!(n, Node::WaveBarrier { eq: 1, .. })), 1, "one eq=1 prologue wave barrier");
+    assert_eq!(count(&p, &|n| matches!(n, Node::WaveBarrier { eq: 0, .. })), 1, "one eq=0 epilogue wave barrier");
     // Composes with the refinement passes (the per-slice gather stays the fusible LdsCol form).
-    let sw = crate::kernels::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64, base)
+    let sw = crate::kernels::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64)
         .apply(crate::passes::VectorizePass)
         .apply(crate::passes::SwizzlePass);
     lower::verify(&sw).expect("clustered.apply(Vectorize).apply(Swizzle) must lower spec-valid");
