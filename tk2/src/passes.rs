@@ -433,7 +433,7 @@ impl Fold for Swizzle {
 
 /// Fuse each fragment's `ept` **contiguous scalar** LDS gather loads into ONE `<ept×bf16>`
 /// vector load ([`Node::LoadVecAt`] → `ds_read_b64`) + a [`Node::StoreRegVec`]. The base
-/// kernel emits the scalar run ([`gather_frag_lds_run`](crate::kernels)); this is the
+/// kernel emits the scalar run (`LdsView::gather`, the movement layer); this is the
 /// composable gather refinement (`.apply(VectorizePass)`), the counterpart to
 /// [`SwizzlePass`] — the two commute (the fused load's base *is* the `inner = 0` element's
 /// offset, whose `LdsCol` the swizzle relocates chunk-wise; §5b). Fills stay builder-

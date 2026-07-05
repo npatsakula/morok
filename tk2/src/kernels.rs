@@ -12,6 +12,7 @@
 
 use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, Node, TileId, TileIr};
+use crate::movement::LdsView;
 use crate::pass::Pass;
 
 /// A finished tile-IR program: the arena, its sink root, and the kernel name.
@@ -212,7 +213,7 @@ pub fn lds_carry_loop(n: usize, t: usize, broken: bool) -> Program {
 }
 
 /// The gfx942 MFMA edge — one 16×16×16 fragment per workgroup, one 64-lane warp.
-const EDGE: usize = 16;
+pub(crate) const EDGE: usize = 16;
 const WARP: usize = 64;
 
 /// Gather one 16×16 bf16 fragment straight from GLOBAL into the register fragment
@@ -608,7 +609,7 @@ fn fill_lds_transpose_vec_commit(
 }
 
 /// `idx + base` (folding the `base == 0` identity so the flat path stays clean).
-fn offset_by(b: &mut Builder, idx: Idx, base: usize) -> Idx {
+pub(crate) fn offset_by(b: &mut Builder, idx: Idx, base: usize) -> Idx {
     if base == 0 {
         idx
     } else {
@@ -619,108 +620,11 @@ fn offset_by(b: &mut Builder, idx: Idx, base: usize) -> Idx {
 
 /// `idx + off` when a runtime offset is present (the multi-warp wave offset); the identity
 /// when `None` (the single-warp path, kept byte-identical — no spurious `+0` node).
-fn add_opt(b: &mut Builder, idx: Idx, off: Option<Idx>) -> Idx {
+pub(crate) fn add_opt(b: &mut Builder, idx: Idx, off: Option<Idx>) -> Idx {
     match off {
         Some(o) => b.idx_add(idx, o),
         None => idx,
     }
-}
-
-/// **Scalar** gather of one 16×16 fragment from an `[outer, inner]` row-major LDS tile — the
-/// fusible base form: `ept` per-element `load_lds_after` + `store_frag_elem`, each at
-/// `outer·inner + LdsCol(outer, run+e, inner)`. It serves **both** operands via `map.transpose`
-/// (A/Row runs its ept along `k_step` columns; B/Col, staged transposed as `b_smem[bn,k_step]`,
-/// runs along its `k_step` rows — `transpose` picks the fixed `outer` vs the run).
-///
-/// The per-element `LdsCol` is the composable hole: `.apply(SwizzlePass)` XORs each element's
-/// column, and `.apply(`[`VectorizePass`](crate::passes::VectorizePass)`)` fuses the `ept`
-/// contiguous loads into ONE `ds_read_b64`. Both compose because the swizzle `delta` is
-/// `ept`-aligned (`>>7<<3>>1` ⇒ ×4 = ept) and the run start is `ept`-aligned, so the b64 chunk
-/// relocates as a unit and the run stays contiguous (§5b). Returns the `ept` store edges.
-#[allow(clippy::too_many_arguments)]
-fn gather_frag_lds_run(
-    b: &mut Builder,
-    dst: Frag<BF16>,
-    lds: Lds<BF16>,
-    outer_base: usize,
-    outer_warp: Option<Idx>,
-    run_base: usize,
-    inner: usize,
-    lane: Idx,
-    raw_deps: &[TileId],
-) -> Vec<TileId> {
-    let inner_c = b.idx_const(inner as i64);
-    (0..dst.map.ept)
-        .map(|e| {
-            let e_idx = b.idx_const(e as i64);
-            let (frag_row, frag_col) = b.lane_rc(dst.map, lane, e_idx);
-            let (outer_frag, run_frag) = if dst.map.transpose { (frag_col, frag_row) } else { (frag_row, frag_col) };
-            // The fixed-axis coordinate: intra-wave lane_rc + compile-time sub-tile base +
-            // (multi-warp) the wave's runtime row/col offset into the shared LDS tile.
-            let outer = offset_by(b, outer_frag, outer_base);
-            let outer = add_opt(b, outer, outer_warp);
-            let run = offset_by(b, run_frag, run_base);
-            let col_part = b.lds_col(outer, run, inner); // the swizzle/vectorise hole
-            let row_off = b.idx_mul(outer, inner_c);
-            let off = b.idx_add(row_off, col_part);
-            // `raw_deps` = the fill RAW barrier (stages=1) or the carried `[raw_seed, range]`
-            // (stages=2) — the read observes the previous iteration's commit either way.
-            let v = b.load_lds_after(lds, off, raw_deps);
-            b.store_frag_elem(dst, e_idx, v).dep()
-        })
-        .collect()
-}
-
-/// **Asm `ds_read_b64` gather** of a whole operand slice — the ONE asm HipKittens uses (DESIGN
-/// §5c). All `frags` of an operand differ only by a COMPILE-TIME tile offset (fragment `i` sits at
-/// LDS row `i·EDGE`), so the lane's base LDS address is materialised **once** — `lane_rc(elem 0) +
-/// warp/run offset`, routed through [`Builder::lds_col`] so `SwizzlePass` folds the (fragment-
-/// invariant, since `i·EDGE` is a multiple of 16) XOR delta into that single base — then fragment
-/// `i` reads `ds_read_b64 $dst, $base offset:(i·EDGE·inner·2)`. ONE base VGPR + immediates replaces
-/// the per-fragment div/mod address that [`gather_frag_lds_run`] spills under the barrier walls.
-/// `warp_off` is the wave's row (A) / col (B) offset; `run_base = s·EDGE`; `inner` = the LDS tile's
-/// col count (`k_step`). Stores each read into its fragment and reads it back (the WMMA operand),
-/// mirroring the scalar path's shape. Returns `(operand reads, store fence tokens)`.
-#[allow(clippy::too_many_arguments)]
-fn gather_frags_asm(
-    b: &mut Builder,
-    frags: &[Frag<BF16>],
-    lds: Lds<BF16>,
-    warp_off: Option<Idx>,
-    run_base: usize,
-    inner: usize,
-    wlane: Idx,
-    raw: &[TileId],
-) -> (Vec<Val<BF16>>, Vec<TileId>) {
-    let map = frags[0].map;
-    // Base LDS element offset at fragment 0, element 0 (outer_base = 0): the lane's slot plus the
-    // wave/run offset, with the swizzle hole at `lds_col` (flat = `run`; SwizzlePass = `run ^ delta`).
-    let zero = b.idx_const(0);
-    let (frag_row, frag_col) = b.lane_rc(map, wlane, zero);
-    let (outer_frag, run_frag) = if map.transpose { (frag_col, frag_row) } else { (frag_row, frag_col) };
-    let outer0 = add_opt(b, outer_frag, warp_off);
-    let run0 = offset_by(b, run_frag, run_base);
-    let inner_c = b.idx_const(inner as i64);
-    let col_part = b.lds_col(outer0, run0, inner);
-    let row_off = b.idx_mul(outer0, inner_c);
-    let base_off = b.idx_add(row_off, col_part);
-    // ONE base VGPR (addr(3) cast), After-wrapped by `raw` so the reads land past the RAW barrier.
-    let base_ptr = b.lds_ptr_as3(lds, base_off, raw);
-
-    let itemsize = 2i64; // bf16
-    let step_bytes = EDGE as i64 * inner as i64 * itemsize; // fragment-row `offset:` step
-    let mut vecs = Vec::with_capacity(frags.len());
-    let mut stores = Vec::with_capacity(frags.len());
-    let mut prev: Option<TileId> = None;
-    for (i, &f) in frags.iter().enumerate() {
-        let off_bytes = i as i64 * step_bytes;
-        let v: Val<BF16> = b.ds_read_b64(base_ptr, off_bytes, map.ept, prev);
-        let st = b.store_frag_vec(f, v);
-        prev = Some(st.dep());
-        stores.push(st.dep());
-        vecs.push(b.load_frag_vec_after(f, &[st.dep()]));
-    }
-    (vecs, stores)
 }
 
 /// Gather one 16×16 bf16 fragment from an already-staged LDS tile `lds` into `dst`,
@@ -1553,6 +1457,14 @@ fn kblock_impl(
         fa.into_iter().chain(fb).collect()
     };
 
+    // The two operand VIEWS (the movement layer, `movement::LdsView`): the tile origin/warp
+    // offset/K-run/map/residency ride as DATA on the handle, so the gather call sites name NO
+    // addressing params (HK's `load(rt, st)`). `asm_gather` is the view's arch/residency dispatch —
+    // gfx942 `ds_read_b64` vs the scalar intrinsic (§5c/§2.8). The SAME `LdsView::gather` serves the
+    // whole-block and clustered paths (and FA's K/V gather, by how the view is constructed).
+    let a_view = LdsView::new(a_smem, a_map, ri, k_step, warp_row_off, wlane, asm_gather);
+    let b_view = LdsView::new(b_smem, bc_map, cj, k_step, warp_col_off, wlane, asm_gather);
+
     let sched = hk_schedule();
     let acc_final = if !clustered {
         // Whole-block hooks: gather all `ksteps` slices → chain all MFMAs (the stages≤2 base).
@@ -1566,62 +1478,32 @@ fn kblock_impl(
             &mut prefetch_fn,
             &mut commit_fn,
             |b, _slot, raw| {
-                let a_frags: Vec<Vec<Frag<BF16>>> =
-                    (0..ri).map(|_| (0..ksteps).map(|_| b.define_frag::<BF16>(a_map)).collect()).collect();
-                let b_frags: Vec<Vec<Frag<BF16>>> =
-                    (0..ksteps).map(|_| (0..cj).map(|_| b.define_frag::<BF16>(bc_map)).collect()).collect();
+                // Gather each K-slice via the operand views (all `ri`/`cj` fragments per slice).
+                // `a_slices[kf][i]` / `b_slices[kf][j]` — the addressing rides the view.
                 let mut gathers: Vec<TileId> = Vec::new();
-                let a_vecs: Vec<Vec<Val<BF16>>> = (0..ri)
-                    .map(|i| {
-                        (0..ksteps)
-                            .map(|kf| {
-                                let s = gather_frag_lds_run(
-                                    b,
-                                    a_frags[i][kf],
-                                    a_smem,
-                                    i * EDGE,
-                                    warp_row_off,
-                                    kf * EDGE,
-                                    k_step,
-                                    wlane,
-                                    raw,
-                                );
-                                gathers.extend(s.iter().copied());
-                                b.load_frag_vec_after(a_frags[i][kf], &s)
-                            })
-                            .collect()
-                    })
-                    .collect();
-                let b_vecs: Vec<Vec<Val<BF16>>> = (0..ksteps)
+                let a_slices: Vec<Vec<Val<BF16>>> = (0..ksteps)
                     .map(|kf| {
-                        (0..cj)
-                            .map(|j| {
-                                let s = gather_frag_lds_run(
-                                    b,
-                                    b_frags[kf][j],
-                                    b_smem,
-                                    j * EDGE,
-                                    warp_col_off,
-                                    kf * EDGE,
-                                    k_step,
-                                    wlane,
-                                    raw,
-                                );
-                                gathers.extend(s.iter().copied());
-                                b.load_frag_vec_after(b_frags[kf][j], &s)
-                            })
-                            .collect()
+                        let (v, g) = a_view.slice(kf).gather(b, raw);
+                        gathers.extend(g);
+                        v
                     })
                     .collect();
-                ((a_vecs, b_vecs), gathers)
+                let b_slices: Vec<Vec<Val<BF16>>> = (0..ksteps)
+                    .map(|kf| {
+                        let (v, g) = b_view.slice(kf).gather(b, raw);
+                        gathers.extend(g);
+                        v
+                    })
+                    .collect();
+                ((a_slices, b_slices), gathers)
             },
-            |b, (a_vecs, b_vecs), acc_reads| {
+            |b, (a_slices, b_slices), acc_reads| {
                 let mut out = Vec::with_capacity(ri * cj);
                 for i in 0..ri {
                     for j in 0..cj {
                         let mut c_acc = acc_reads[i * cj + j];
                         for kf in 0..ksteps {
-                            c_acc = b.mma(a_vecs[i][kf], b_vecs[kf][j], c_acc, ept);
+                            c_acc = b.mma(a_slices[kf][i], b_slices[kf][j], c_acc, ept);
                         }
                         out.push(c_acc);
                     }
@@ -1644,58 +1526,15 @@ fn kblock_impl(
             &mut prefetch_fn,
             &mut commit_fn,
             |b, s, raw| {
-                let a_frags: Vec<Frag<BF16>> = (0..ri).map(|_| b.define_frag::<BF16>(a_map)).collect();
-                let b_frags: Vec<Frag<BF16>> = (0..cj).map(|_| b.define_frag::<BF16>(bc_map)).collect();
+                // One gather per operand VIEW at K-slice `s` — the view's `asm` field dispatches the
+                // `ds_read_b64` asm gather (ONE base VGPR + per-fragment immediate) vs the scalar
+                // fallback (per-element `lane_rc`, fused to `LoadVecAt` by VectorizePass). No
+                // addressing params at the call site — they ride the view.
                 let mut gathers: Vec<TileId> = Vec::new();
-                let (a_vecs, b_vecs): (Vec<Val<BF16>>, Vec<Val<BF16>>) = if asm_gather {
-                    // The asm `ds_read_b64 offset:N` gather: ONE base VGPR per operand + a per-fragment
-                    // immediate (HK's exact recipe — the addressing-VGPR collapse that stops spilling).
-                    let (a_vecs, ga) =
-                        gather_frags_asm(b, &a_frags, a_smem, warp_row_off, s * EDGE, k_step, wlane, raw);
-                    let (b_vecs, gb) =
-                        gather_frags_asm(b, &b_frags, b_smem, warp_col_off, s * EDGE, k_step, wlane, raw);
-                    gathers.extend(ga);
-                    gathers.extend(gb);
-                    (a_vecs, b_vecs)
-                } else {
-                    // The compiler-visible scalar gather (the fallback: per-element `lane_rc` addressing,
-                    // fused to `LoadVecAt` by VectorizePass) — the spilling path the asm gather replaces.
-                    let a_vecs: Vec<Val<BF16>> = (0..ri)
-                        .map(|i| {
-                            let st = gather_frag_lds_run(
-                                b,
-                                a_frags[i],
-                                a_smem,
-                                i * EDGE,
-                                warp_row_off,
-                                s * EDGE,
-                                k_step,
-                                wlane,
-                                raw,
-                            );
-                            gathers.extend(st.iter().copied());
-                            b.load_frag_vec_after(a_frags[i], &st)
-                        })
-                        .collect();
-                    let b_vecs: Vec<Val<BF16>> = (0..cj)
-                        .map(|j| {
-                            let st = gather_frag_lds_run(
-                                b,
-                                b_frags[j],
-                                b_smem,
-                                j * EDGE,
-                                warp_col_off,
-                                s * EDGE,
-                                k_step,
-                                wlane,
-                                raw,
-                            );
-                            gathers.extend(st.iter().copied());
-                            b.load_frag_vec_after(b_frags[j], &st)
-                        })
-                        .collect();
-                    (a_vecs, b_vecs)
-                };
+                let (a_vecs, ga) = a_view.slice(s).gather(b, raw);
+                let (b_vecs, gb) = b_view.slice(s).gather(b, raw);
+                gathers.extend(ga);
+                gathers.extend(gb);
                 // op_anchor = an operand VALUE (the first A fragment) for `set_prio` to anchor on.
                 let op_anchor = a_vecs[0].id;
                 ((a_vecs, b_vecs), gathers, op_anchor)

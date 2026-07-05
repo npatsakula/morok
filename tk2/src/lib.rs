@@ -22,6 +22,7 @@ pub mod ir;
 pub mod kernels;
 pub mod launch;
 pub mod lower;
+pub(crate) mod movement;
 pub mod pass;
 pub mod passes;
 
