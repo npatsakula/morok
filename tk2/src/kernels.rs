@@ -384,65 +384,14 @@ fn fill_lds(
     b.end(st, &[fr])
 }
 
-/// Unrolled collaborative global→LDS fill (NO inner range — usable inside the K-loop
-/// without a loop nest): each lane writes `epl` elements `flat = lane·epl + e` into the
-/// LDS tile position `flat` (logical `[.., cols_lds]`, `r = flat/cols_lds`, `c =
-/// flat%cols_lds`). The **global** element is `(tile_row_base + gr)·grow_stride +
-/// tile_col_base + gc`, where `(gr, gc) = (r, c)` for a straight fill or `(c, r)` when
-/// `transpose` (so a `[bn, k_step]` LDS tile is filled from the `[K, N]` B strip: the LDS
-/// row `r` is the N coordinate, the LDS col `c` is the K coordinate). `tile_*_base` may
-/// carry the K-loop counter so the strip is re-staged each iteration. Returns the `epl`
-/// store effects to fence with a barrier.
-#[allow(clippy::too_many_arguments)]
-fn fill_lds_unrolled(
-    b: &mut Builder,
-    lds: Lds<BF16>,
-    src: Buf<BF16>,
-    epl: usize,
-    lane: Idx,
-    cols_lds: i64,
-    tile_row_base: Idx,
-    tile_col_base: Idx,
-    grow_stride: i64,
-    transpose: bool,
-) -> Vec<Effect> {
-    let epl_c = b.idx_const(epl as i64);
-    let lane_epl = b.idx_mul(lane, epl_c);
-    let cols_c = b.idx_const(cols_lds);
-    let gstride = b.idx_const(grow_stride);
-    (0..epl)
-        .map(|e| {
-            let ec = b.idx_const(e as i64);
-            let flat = b.idx_add(lane_epl, ec);
-            let r = b.idx_div(flat, cols_c);
-            let c = b.idx_mod(flat, cols_c);
-            // Global coord: (r, c) straight, or (c, r) transposed (B's [bn,k_step] tile).
-            let (gr, gc) = if transpose { (c, r) } else { (r, c) };
-            let grow = b.idx_add(tile_row_base, gr);
-            let goff = b.idx_mul(grow, gstride);
-            let goff = b.idx_add(goff, tile_col_base);
-            let goff = b.idx_add(goff, gc);
-            let v = b.load(src, goff);
-            // LDS store position `r·cols + LdsCol(r, c)` — flat by default, or the bank
-            // swizzle once `SwizzlePass` materialises the LdsCol (a composable refinement).
-            let col = b.lds_col(r, c, cols_lds as usize);
-            let rc = b.idx_mul(r, cols_c);
-            let dst_off = b.idx_add(rc, col);
-            b.store_lds(lds, dst_off, v)
-        })
-        .collect()
-}
-
-/// **Vectorised** collaborative global→LDS fill for the **non-transposed** (A / Row) tile,
-/// whose lane run is contiguous on *both* sides: each lane's `epl` elements form contiguous
-/// columns within one LDS row, so the run splits into `epl/VEC` b64 chunks — ONE
-/// `<VEC×bf16>` global `load_vec` (coalesced) + ONE `<VEC×bf16>` `store_lds_vec`
-/// (`ds_write_b64`) per chunk, replacing `VEC` scalar load/store pairs. The store routes
-/// its chunk base through `lds_col` at b64 granularity so it stays swizzle-safe (the delta
-/// is `VEC`-aligned; §5b). Requires `epl % VEC == 0` and `cols_lds % VEC == 0` (so a chunk
-/// never straddles a row). B stays on the scalar [`fill_lds_unrolled`] — its transpose makes
-/// the global read strided, so it can't be a contiguous vector load. Returns the chunk store
-/// effects to fence.
+/// **Vectorised** collaborative global→LDS fill for a **K-contiguous** tile — serves BOTH A[M,K]
+/// and B[N,K] (HK's pre-transposed B), since both are K-contiguous on the global side. Each lane's
+/// `epl` elements form contiguous columns within one LDS row, so the run splits into b64 chunks —
+/// ONE coalesced b128/b64 global `load_vec` (see [`fill_lds_vec_prefetch`]) + `ds_write_b64`
+/// `store_lds_vec` per b64 chunk. The store routes its chunk base through `lds_col` at b64
+/// granularity so it stays swizzle-safe (the delta is `VEC`-aligned; §5b). Requires `epl % VEC == 0`
+/// and `cols_lds % VEC == 0` (so a chunk never straddles a row). No register transpose, no `v_perm`.
+/// Returns the chunk store effects to fence.
 /// The **prefetch** half (global→VGPR): issue the `epl/VEC` coalesced b64 global `load_vec`s
 /// into registers, no LDS write. Returns the loaded chunks in `cc` order for [`fill_lds_vec_commit`]
 /// (which shares the addressing nodes via hash-consing, so prefetch-then-commit == the old
@@ -459,29 +408,46 @@ fn fill_lds_vec_prefetch(
     tile_col_base: Idx,
     grow_stride: i64,
 ) -> Vec<Val<BF16>> {
-    const VEC: usize = 4; // b64 = 4 bf16 (KPack / swizzle granularity)
+    const VEC: usize = 4; // b64 = 4 bf16: the LDS-store / swizzle granularity (unchanged)
+    // Global-load width: **b128** (8 bf16, `buffer_load_dwordx4`) when the lane run tiles it,
+    // else b64. This mirrors HK exactly — `raw.buffer.load.i128` into registers, then 2×
+    // `ds_write_b64` to LDS: one wide coalesced global load, split back into VEC-wide b64
+    // chunks the swizzle-safe [`fill_lds_vec_commit`] stores independently (a b128 LDS write
+    // would straddle the b64-granular XOR swizzle boundary). Half the VMEM instructions.
+    let gvec = if epl.is_multiple_of(8) { 8 } else { VEC };
     assert!(
-        epl.is_multiple_of(VEC) && (cols_lds as usize).is_multiple_of(VEC),
-        "vectorised fill needs VEC-aligned epl/cols"
+        epl.is_multiple_of(VEC) && (cols_lds as usize).is_multiple_of(gvec),
+        "vectorised fill needs VEC-aligned epl and gvec-aligned cols"
     );
     let epl_c = b.idx_const(epl as i64);
     let lane_epl = b.idx_mul(lane, epl_c);
     let cols_c = b.idx_const(cols_lds);
     let gstride = b.idx_const(grow_stride);
-    (0..epl / VEC)
-        .map(|cc| {
-            let ec = b.idx_const((cc * VEC) as i64);
-            let flat = b.idx_add(lane_epl, ec); // chunk start (VEC-aligned ⇒ stays in one row)
-            let r = b.idx_div(flat, cols_c);
-            let c = b.idx_mod(flat, cols_c);
-            // Global: contiguous `VEC`-run at (tile_row_base + r)·stride + tile_col_base + c.
-            let grow = b.idx_add(tile_row_base, r);
-            let goff = b.idx_mul(grow, gstride);
-            let goff = b.idx_add(goff, tile_col_base);
-            let goff = b.idx_add(goff, c);
-            b.load_vec(src, goff, VEC)
-        })
-        .collect()
+    let mut out = Vec::with_capacity(epl / VEC);
+    for cg in 0..epl / gvec {
+        let ec = b.idx_const((cg * gvec) as i64);
+        let flat = b.idx_add(lane_epl, ec); // gvec-aligned chunk start (stays in one row)
+        let r = b.idx_div(flat, cols_c);
+        let c = b.idx_mod(flat, cols_c);
+        // Global: contiguous `gvec`-run at (tile_row_base + r)·stride + tile_col_base + c.
+        let grow = b.idx_add(tile_row_base, r);
+        let goff = b.idx_mul(grow, gstride);
+        let goff = b.idx_add(goff, tile_col_base);
+        let goff = b.idx_add(goff, c);
+        let wide = b.load_vec(src, goff, gvec); // ONE b128 (or b64) coalesced global load
+        // Split into VEC-wide b64 chunks (register-only — the b128 already lands in adjacent
+        // VGPRs, so the extract/build fold away). Preserves the old `Vec<Val>` order + the
+        // commit's hash-cons-shared addressing (chunk `cg` yields old chunks `2cg`, `2cg+1`).
+        for h in 0..gvec / VEC {
+            if gvec == VEC {
+                out.push(wide);
+            } else {
+                let half: Vec<Val<BF16>> = (0..VEC).map(|e| b.vec_extract(wide, h * VEC + e)).collect();
+                out.push(b.vec_build(&half));
+            }
+        }
+    }
+    out
 }
 
 /// The **commit** half (VGPR→LDS): `ds_write_b64` each prefetched chunk into LDS at
@@ -511,101 +477,6 @@ fn fill_lds_vec_commit(
             b.store_lds_vec(lds, dst_off, loaded[cc])
         })
         .collect()
-}
-
-/// True when the register-transpose B fill tiles the strip exactly (every one of the
-/// `nthreads` threads owns the same whole number of `VEC×VEC` micro-tiles).
-/// `(k_step·bn)/VEC² % nthreads == 0`. `bn` here is the whole-workgroup B tile (bn·wn).
-fn b_transpose_vec_ok(k_step: usize, bn: usize, nthreads: usize) -> bool {
-    const VEC: usize = 4;
-    k_step.is_multiple_of(VEC) && bn.is_multiple_of(VEC) && (k_step * bn).is_multiple_of(nthreads * VEC * VEC)
-}
-
-/// **Register-transpose** vectorised fill for the transposed B tile `b_smem[bn, k_step]`.
-/// B's global read is N-contiguous but its transposed LDS write is K-contiguous — different
-/// axes — so a plain vector copy can't serve both. Each lane instead cooperatively loads a
-/// `VEC×VEC` micro-tile (VEC coalesced b64 rows, one per K), **transposes it in registers**
-/// (`vec_extract` a column out of each row-vector, `vec_build` it back), and stores VEC b64
-/// to the transposed LDS (one contiguous k_step run per N-row) — `2·VEC` vector mem ops + a
-/// register shuffle replacing `2·VEC²` scalar load/stores. The LDS row (N) still exchanges
-/// across lanes in shared memory; the register transpose only reconciles the fill's own
-/// load/store axes. Gated by [`b_transpose_vec_ok`]. Returns the store effects to fence.
-/// The **prefetch** half of the register-transpose B fill (global→VGPR): per `VEC×VEC`
-/// micro-tile, load the `VEC` coalesced b64 rows into registers. Returns them per micro-tile
-/// for [`fill_lds_transpose_vec_commit`] (the register transpose + `ds_write` half).
-#[allow(clippy::too_many_arguments)]
-fn fill_lds_transpose_vec_prefetch(
-    b: &mut Builder,
-    src: Buf<BF16>,
-    tid: Idx,
-    nthreads: usize,
-    k_step: usize,
-    bn: usize,
-    k_base: Idx,
-    n_base: Idx,
-    grow_stride: i64,
-) -> Vec<Vec<Val<BF16>>> {
-    const VEC: usize = 4;
-    let nb_count = bn / VEC;
-    let per_lane = k_step * bn / (VEC * VEC) / nthreads;
-    let (nb_c, vec_c, gstride) = (b.idx_const(nb_count as i64), b.idx_const(VEC as i64), b.idx_const(grow_stride));
-    (0..per_lane)
-        .map(|t| {
-            let bi = offset_by(b, tid, t * nthreads);
-            let kb = b.idx_div(bi, nb_c);
-            let nb = b.idx_mod(bi, nb_c);
-            let k0 = b.idx_mul(kb, vec_c);
-            let n0 = b.idx_mul(nb, vec_c);
-            (0..VEC)
-                .map(|i| {
-                    let ic = b.idx_const(i as i64);
-                    let ki = b.idx_add(k0, ic);
-                    let ki = b.idx_add(k_base, ki);
-                    let goff = b.idx_mul(ki, gstride);
-                    let goff = b.idx_add(goff, n_base);
-                    let goff = b.idx_add(goff, n0);
-                    b.load_vec(src, goff, VEC)
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// The **commit** half: register-transpose each micro-tile's rows (`vec_extract` a column,
-/// `vec_build` it) and `ds_write_b64` to the transposed LDS. `loaded` is the prefetch output;
-/// the `kb`/`nb`/`k0`/`n0` addressing hash-cons-shares that half's nodes.
-fn fill_lds_transpose_vec_commit(
-    b: &mut Builder,
-    lds: Lds<BF16>,
-    loaded: &[Vec<Val<BF16>>],
-    tid: Idx,
-    nthreads: usize,
-    k_step: usize,
-    bn: usize,
-) -> Vec<Effect> {
-    const VEC: usize = 4;
-    let nb_count = bn / VEC;
-    let (nb_c, vec_c, kstep_c) = (b.idx_const(nb_count as i64), b.idx_const(VEC as i64), b.idx_const(k_step as i64));
-    let mut stores = Vec::with_capacity(loaded.len() * VEC);
-    for (t, rows) in loaded.iter().enumerate() {
-        let bi = offset_by(b, tid, t * nthreads);
-        let kb = b.idx_div(bi, nb_c);
-        let nb = b.idx_mod(bi, nb_c);
-        let k0 = b.idx_mul(kb, vec_c);
-        let n0 = b.idx_mul(nb, vec_c);
-        // Transpose in registers + store VEC b64 to LDS row (n0+j), k_step run k0..k0+VEC.
-        for j in 0..VEC {
-            let col: Vec<Val<BF16>> = rows.iter().map(|&r| b.vec_extract(r, j)).collect();
-            let bt = b.vec_build(&col);
-            let jc = b.idx_const(j as i64);
-            let nrow = b.idx_add(n0, jc);
-            let col_part = b.lds_col(nrow, k0, k_step);
-            let nrow_off = b.idx_mul(nrow, kstep_c);
-            let dst = b.idx_add(nrow_off, col_part);
-            stores.push(b.store_lds_vec(lds, dst, bt));
-        }
-    }
-    stores
 }
 
 /// `idx + base` (folding the `base == 0` identity so the flat path stays clean).
@@ -861,13 +732,13 @@ pub fn matmul_lds_tiled(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> P
     Program { ir, sink, name: "tk2_matmul_tiled".into() }
 }
 
-/// The register-staged fill bundle carried between [`kloop`]'s prefetch and commit hooks:
-/// A's b64 chunks and (vectorised path) B's per-micro-tile rows, held in VGPRs. `b = None`
-/// selects the scalar B fallback (committed straight from global). At `stages=2` the prefetch
-/// runs a K-block ahead of the commit so the global-load latency overlaps the MFMAs.
+/// The register-staged fill bundle carried between [`kloop`]'s prefetch and commit hooks: A's and
+/// B's b64/b128 chunks held in VGPRs. Since B is taken **`[N,K]`** (HK's pre-transposed layout), its
+/// fill is the SAME trivial coalesced `load→ds_write` as A — no register transpose, no `v_perm`. At
+/// `stages=2` the prefetch runs a K-block ahead of the commit so the global-load latency overlaps.
 struct FillRegs {
     a: Vec<Val<BF16>>,
-    b: Option<Vec<Vec<Val<BF16>>>>,
+    b: Vec<Val<BF16>>,
 }
 
 /// A **memory cluster**'s contents (DESIGN §5c): the register-staged ops + gather slices it
@@ -1390,7 +1261,10 @@ fn kblock_impl(
 
     let c = b.global::<F32>(m * n);
     let a = b.global::<BF16>(m * k);
-    let bmat = b.global::<BF16>(k * n);
+    // B is taken **`[N,K]`** (HK's pre-transposed contract): K contiguous, so the fill is the trivial
+    // coalesced copy A uses — no in-kernel transpose, no `v_perm`. The whole `matmul_lds_kblock*`
+    // family therefore computes `A·Bᵀ` (distinct from the pedagogical `matmul`/`matmul_lds*`, A·B).
+    let bmat = b.global::<BF16>(n * k);
 
     let tile_m = b.grid_axis(0, (m / big_m) as i64);
     let tile_n = b.grid_axis(1, (n / big_n) as i64);
@@ -1451,24 +1325,21 @@ fn kblock_impl(
     //    byte-identical under hash-consing), `Some(br)` the per-slice clustered schedule (§5c). ──
     // prefetch (global→VGPR): A b64 chunks + B micro-tile rows; returns the load-pin anchors.
     let mut prefetch_fn = |b: &mut Builder, k_base: Idx| {
+        // A[big_m, k_step] and B[big_n, k_step] are BOTH K-contiguous (A[M,K], B[N,K]) → the identical
+        // trivial coalesced fill: `tile_row_base` = the M/N origin, `grow_stride` = K, `tile_col_base`
+        // = k_base. No transpose, no `v_perm` — B's fill IS A's fill.
         let a = fill_lds_vec_prefetch(b, a, epl_a, tid, k_step as i64, tm_bm, k_base, k as i64);
-        let bt = b_transpose_vec_ok(k_step, big_n, nthreads)
-            .then(|| fill_lds_transpose_vec_prefetch(b, bmat, tid, nthreads, k_step, big_n, k_base, tn_bn, n as i64));
+        let bt = fill_lds_vec_prefetch(b, bmat, epl_b, tid, k_step as i64, tn_bn, k_base, k as i64);
         let mut anchors: Vec<TileId> = a.iter().map(|v| v.id).collect();
-        if let Some(bt) = &bt {
-            anchors.extend(bt.iter().flat_map(|row| row.iter().map(|v| v.id)));
-        }
+        anchors.extend(bt.iter().map(|v| v.id));
         (FillRegs { a, b: bt }, anchors)
     };
     // commit (VGPR→ds_write LDS): the WAR `deps` ride the LDS handle via `lds_after`.
-    let mut commit_fn = |b: &mut Builder, k_base: Idx, reg: &FillRegs, deps: &[TileId]| {
+    let mut commit_fn = |b: &mut Builder, _k_base: Idx, reg: &FillRegs, deps: &[TileId]| {
         let (a_dst, b_dst) =
             if deps.is_empty() { (a_smem, b_smem) } else { (b.lds_after(a_smem, deps), b.lds_after(b_smem, deps)) };
         let fa = fill_lds_vec_commit(b, a_dst, &reg.a, epl_a, tid, k_step as i64);
-        let fb = match &reg.b {
-            Some(bt) => fill_lds_transpose_vec_commit(b, b_dst, bt, tid, nthreads, k_step, big_n),
-            None => fill_lds_unrolled(b, b_dst, bmat, epl_b, tid, k_step as i64, k_base, tn_bn, n as i64, true),
-        };
+        let fb = fill_lds_vec_commit(b, b_dst, &reg.b, epl_b, tid, k_step as i64);
         fa.into_iter().chain(fb).collect()
     };
 

@@ -139,8 +139,9 @@ fn matmul_lds_kblock_ks64_lowering_is_spec_valid() {
 fn vectorize_pass_fuses_the_scalar_gathers() {
     // The base kernel emits SCALAR gathers: for a 64×64 tile at K_STEP=16 (ri=cj=4, ksteps=1)
     // the 8 fragment gathers are 8·ept = 32 scalar `store_frag_elem` (StoreGlobal into a bf16
-    // frag), and the only LoadVecAt are the 8 fill vector loads (A-fill 4 + B-transpose 4).
-    // `.apply(VectorizePass)` fuses each ept run → +8 gather LoadVecAt (16 total) and turns the
+    // frag), and the only LoadVecAt are the fill vector loads. With B taken [N,K] (HK), A and B
+    // BOTH use the trivial b128 fill: A-fill 2 + B-fill 2 (epl=16 → 2 `dwordx4` each) = 4.
+    // `.apply(VectorizePass)` fuses each ept run → +8 gather LoadVecAt (12 total) and turns the
     // 32 scalar frag stores into 8 StoreRegVec — none survive. Fills stay builder-structural.
     use crate::ir::Node as N;
     use crate::passes::{VectorizePass, reachable};
@@ -160,7 +161,7 @@ fn vectorize_pass_fuses_the_scalar_gathers() {
     let count = |pred: &dyn Fn(&N) -> bool| {
         reachable(&vec.ir, vec.sink).into_iter().filter(|&id| pred(vec.ir.node(id))).count()
     };
-    assert_eq!(count(&|n| matches!(n, N::LoadVecAt { .. })), 16, "8 fused gather + 8 fill vector loads");
+    assert_eq!(count(&|n| matches!(n, N::LoadVecAt { .. })), 12, "8 fused gather + 4 fill vector loads (A-fill 2 + B-fill 2, both b128)");
     lower::verify(&vec).expect("vectorised matmul must lower to spec-valid UOp");
 }
 

@@ -30,6 +30,29 @@ fn input(data: &[f32]) -> (Tensor, Buffer) {
     (t, buf)
 }
 
+/// Realize `t` as an f32 host vector (bf16 operands cast to f32 first).
+fn as_f32_vec(t: &Tensor) -> Vec<f32> {
+    let mut f = t.cast(DType::Float32).expect("→f32");
+    f.realize().expect("realize f32");
+    f.as_vec::<f32>().expect("read f32")
+}
+
+/// Host f32 reference for `C = A·Bᵀ` — A`[m,k]`, B`[n,k]` (HK's [N,K] B contract, both K-contiguous):
+/// `C[row,col] = Σ_k A[row,k]·B[col,k]`. The `matmul_lds_kblock*` family computes this.
+fn ab_t_ref(af: &[f32], bf: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let mut e = vec![0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut acc = 0f32;
+            for kk in 0..k {
+                acc += af[row * k + kk] * bf[col * k + kk];
+            }
+            e[row * n + col] = acc;
+        }
+    }
+    e
+}
+
 /// Allocate + register a fresh output buffer for an empty tensor (the svod analog
 /// of tinygrad's `b.allocate()` inside `run_linear`; mirrors tk's `realize_buffer`).
 fn output(n: usize) -> (Tensor, Buffer) {
@@ -87,13 +110,10 @@ fn matmul_pipeline_stages2_is_bit_exact_on_gfx942() {
     let (m, n, k) = (128usize, 128, 256);
     let dev = svod_dtype::default_device::default_device();
     let mut a = Tensor::rand_with(&[m, k], DType::BFloat16, dev.clone()).expect("rand a");
-    let mut b = Tensor::rand_with(&[k, n], DType::BFloat16, dev).expect("rand b");
+    let mut b = Tensor::rand_with(&[n, k], DType::BFloat16, dev).expect("rand b"); // B is [N,K] (A·Bᵀ)
     a.realize().expect("realize a");
     b.realize().expect("realize b");
-    let bf = b.cast(DType::Float32).expect("b→f32");
-    let mut rt = a.cast(DType::Float32).expect("a→f32").matmul(&bf).expect("ref matmul");
-    rt.realize().expect("realize ref");
-    let expected = rt.as_vec::<f32>().expect("read ref");
+    let expected = ab_t_ref(&as_f32_vec(&a), &as_f32_vec(&b), m, n, k);
     let atol = 0.02 * (k as f32).sqrt();
 
     for (label, prog) in [
@@ -128,13 +148,10 @@ fn matmul_clustered_hk_replica_is_bit_exact_on_gfx942() {
     let (m, n, k) = (256usize, 256, 256);
     let dev = svod_dtype::default_device::default_device();
     let mut a = Tensor::rand_with(&[m, k], DType::BFloat16, dev.clone()).expect("rand a");
-    let mut b = Tensor::rand_with(&[k, n], DType::BFloat16, dev).expect("rand b");
+    let mut b = Tensor::rand_with(&[n, k], DType::BFloat16, dev).expect("rand b"); // B is [N,K] (A·Bᵀ)
     a.realize().expect("realize a");
     b.realize().expect("realize b");
-    let bf = b.cast(DType::Float32).expect("b→f32");
-    let mut rt = a.cast(DType::Float32).expect("a→f32").matmul(&bf).expect("ref matmul");
-    rt.realize().expect("realize ref");
-    let expected = rt.as_vec::<f32>().expect("read ref");
+    let expected = ab_t_ref(&as_f32_vec(&a), &as_f32_vec(&b), m, n, k);
     let atol = 0.02 * (k as f32).sqrt();
 
     // HK tiling: bm=128, bn=64, wm=2, wn=4 (warp_row = warp/4 ∈ {0,1} = the two phase groups).
@@ -169,22 +186,17 @@ fn matmul_resident_microkernel_is_bit_exact_on_gfx942() {
     let nblocks = (k / k_step) as f32;
     let dev = svod_dtype::default_device::default_device();
     let mut a = Tensor::rand_with(&[m, k], DType::BFloat16, dev.clone()).expect("rand a");
-    let mut b = Tensor::rand_with(&[k, n], DType::BFloat16, dev).expect("rand b");
+    let mut b = Tensor::rand_with(&[n, k], DType::BFloat16, dev).expect("rand b"); // B is [N,K] (A·Bᵀ)
     a.realize().expect("realize a");
     b.realize().expect("realize b");
-    // Host reference over the realized bf16 values (cast to f32): nblocks · (A[:,0:k_step] @ B[0:k_step,:]).
-    let mut af_t = a.cast(DType::Float32).expect("a→f32");
-    let mut bf_t = b.cast(DType::Float32).expect("b→f32");
-    af_t.realize().expect("realize a→f32");
-    bf_t.realize().expect("realize b→f32");
-    let af = af_t.as_vec::<f32>().expect("read a");
-    let bf = bf_t.as_vec::<f32>().expect("read b");
+    // Host reference over the realized bf16→f32 values: nblocks · (A[:,0:k_step] · Bᵀ[0:k_step,:]).
+    let (af, bf) = (as_f32_vec(&a), as_f32_vec(&b));
     let mut expected = vec![0f32; m * n];
     for row in 0..m {
         for col in 0..n {
             let mut acc = 0f32;
             for kk in 0..k_step {
-                acc += af[row * k + kk] * bf[kk * n + col];
+                acc += af[row * k + kk] * bf[col * k + kk];
             }
             expected[row * n + col] = nblocks * acc;
         }
@@ -230,6 +242,27 @@ fn dump_resident_isa() {
     println!("resident ISA dumped: {dir}/resident.ll ({} B), {dir}/resident.co ({} B)", src.len(), bytes.len());
 }
 
+/// Dump the **DRAM-streaming clustered** kernel's amdgcn LLVM IR + compiled code object to the
+/// scratchpad for ISA validation (sibling of [`dump_resident_isa`]). Same shape/tiling; this one
+/// keeps the streaming global-prefetch + LDS-commit path so its steady loop shows the
+/// `global_load`/`ds_write`/`ds_read` traffic to diff against HK's b128 buffer_load path.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::dump_streaming_isa --nocapture`
+#[test]
+#[ignore]
+fn dump_streaming_isa() {
+    let dir = std::env::var("SVOD_DUMP_DIR").unwrap_or_else(|_| "/tmp/tk2_isa".into());
+    std::fs::create_dir_all(&dir).expect("mkdir dump dir");
+    let device_spec = Tensor::empty(&[1], DType::Float32).device();
+    // HK tiling (bm=128, bn=64, wm=2, wn=4, k_step=64); the production vec+swizzle passes.
+    let prog = crate::kernels::matmul_lds_kblock_mw_clustered(4096, 4096, 4096, 128, 64, 2, 4, 64)
+        .apply(VectorizePass)
+        .apply(SwizzlePass);
+    let (src, bytes) = crate::launch::compile_artifacts(&prog, &device_spec).expect("compile artifacts");
+    std::fs::write(format!("{dir}/streaming.ll"), &src).expect("write ll");
+    std::fs::write(format!("{dir}/streaming.co"), &bytes).expect("write co");
+    println!("streaming ISA dumped: {dir}/streaming.ll ({} B), {dir}/streaming.co ({} B)", src.len(), bytes.len());
+}
+
 /// The **apples-to-apples mfmautil measurement** (the whole point): profile the compute-resident
 /// microkernel's steady state and print the rocprofiler-compute gfx942 MfmaUtil, side by side with
 /// the DRAM-streaming clustered kernel (the 0.24 baseline) — both at HK's tiling, both vec+swizzle.
@@ -244,7 +277,7 @@ fn resident_mfmautil_vs_streaming() {
     let (m, n, k) = (4096usize, 4096, 4096);
     let dev = svod_dtype::default_device::default_device();
     let mut a = Tensor::rand_with(&[m, k], DType::BFloat16, dev.clone()).expect("rand a");
-    let mut b = Tensor::rand_with(&[k, n], DType::BFloat16, dev).expect("rand b");
+    let mut b = Tensor::rand_with(&[n, k], DType::BFloat16, dev).expect("rand b"); // B is [N,K] (A·Bᵀ)
     a.realize().expect("realize a");
     b.realize().expect("realize b");
 

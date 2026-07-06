@@ -65,7 +65,10 @@ fn bench_matmul(c: &mut Criterion) {
         group.throughput(Throughput::Elements((2.0 * (n as f64).powi(3)) as u64)); // 2·M·N·K
         let a = rand_bf16(&[n, n]);
         let b = rand_bf16(&[n, n]);
-        let expected = reference(&a, &b);
+        let expected = reference(&a, &b); // A·B — the standalone `matmul` arms
+        // The `matmul_lds_kblock*` family takes B as [N,K] and computes A·Bᵀ (HK's contract), so its
+        // reference transposes B (fast GPU matmul, not a host loop — this runs at N=4096).
+        let expected_abt = reference(&a, &b.try_transpose(0, 1).expect("Bᵀ for A·Bᵀ reference"));
 
         // Rolled: the naive K-loop with per-step div/mod gather addressing.
         let (y0, p0) = plan_of(matmul(n, n, n), n, n, &a, &b);
@@ -90,12 +93,12 @@ fn bench_matmul(c: &mut Criterion) {
         // the top-level composable-pass model measured end-to-end (fills are builder-vectorised).
         let flat = matmul_lds_kblock_vec(n, n, n, 64, 64, 64);
         let (yb, pb) = plan_of(flat, n, n, &a, &b);
-        assert_correct(&yb, &pb, &expected, n, "kblock_ks64");
+        assert_correct(&yb, &pb, &expected_abt, n, "kblock_ks64");
         group.bench_with_input(BenchmarkId::new("kblock_ks64", n), &n, |bch, _| bench_plan(bch, &pb));
 
         let swizzled = matmul_lds_kblock_sw(n, n, n, 64, 64, 64);
         let (ysw, psw) = plan_of(swizzled, n, n, &a, &b);
-        assert_correct(&ysw, &psw, &expected, n, "kblock_sw64");
+        assert_correct(&ysw, &psw, &expected_abt, n, "kblock_sw64");
         group.bench_with_input(BenchmarkId::new("kblock_sw64", n), &n, |bch, _| bench_plan(bch, &psw));
 
         // Multi-warp bigger tiles (vectorised + swizzled), the barrier-amortisation lever:
@@ -104,12 +107,12 @@ fn bench_matmul(c: &mut Criterion) {
         // tk's ceiling). The crossover is why production needs shape dispatch.
         let mw128 = matmul_lds_kblock_mw(n, n, n, 64, 64, 2, 2, 64).apply(VectorizePass).apply(SwizzlePass);
         let (ymw, pmw) = plan_of(mw128, n, n, &a, &b);
-        assert_correct(&ymw, &pmw, &expected, n, "kblock_mw128");
+        assert_correct(&ymw, &pmw, &expected_abt, n, "kblock_mw128");
         group.bench_with_input(BenchmarkId::new("kblock_mw128", n), &n, |bch, _| bench_plan(bch, &pmw));
 
         let mw256 = matmul_lds_kblock_mw(n, n, n, 64, 64, 4, 4, 64).apply(VectorizePass).apply(SwizzlePass);
         let (ymw2, pmw2) = plan_of(mw256, n, n, &a, &b);
-        assert_correct(&ymw2, &pmw2, &expected, n, "kblock_mw256");
+        assert_correct(&ymw2, &pmw2, &expected_abt, n, "kblock_mw256");
         group.bench_with_input(BenchmarkId::new("kblock_mw256", n), &n, |bch, _| bench_plan(bch, &pmw2));
 
         // stages=2 register-staged pipeline (DESIGN §5b phase 2b): the same 128²/256² tiles, but
@@ -118,19 +121,19 @@ fn bench_matmul(c: &mut Criterion) {
         // gated here bit-exact vs the reference, and profiled via `--profile-time` for the counter.
         let mw128p = matmul_lds_kblock_mw_pipe(n, n, n, 64, 64, 2, 2, 64).apply(VectorizePass).apply(SwizzlePass);
         let (ymwp, pmwp) = plan_of(mw128p, n, n, &a, &b);
-        assert_correct(&ymwp, &pmwp, &expected, n, "kblock_mw128_pipe");
+        assert_correct(&ymwp, &pmwp, &expected_abt, n, "kblock_mw128_pipe");
         group.bench_with_input(BenchmarkId::new("kblock_mw128_pipe", n), &n, |bch, _| bench_plan(bch, &pmwp));
 
         let mw256p = matmul_lds_kblock_mw_pipe(n, n, n, 64, 64, 4, 4, 64).apply(VectorizePass).apply(SwizzlePass);
         let (ymw2p, pmw2p) = plan_of(mw256p, n, n, &a, &b);
-        assert_correct(&ymw2p, &pmw2p, &expected, n, "kblock_mw256_pipe");
+        assert_correct(&ymw2p, &pmw2p, &expected_abt, n, "kblock_mw256_pipe");
         group.bench_with_input(BenchmarkId::new("kblock_mw256_pipe", n), &n, |bch, _| bench_plan(bch, &pmw2p));
         // §5c clustered HK replica (256² tile, HK tiling bm=128/bn=64/wm=2/wn=4): the COMPLETE
         // schedule — 8 clusters + per-cluster s_barrier + set_prio + sched_fence + the warp-phase
         // ping-pong. Now bit-exact, so measured: does the full co-designed schedule reach HK's 0.65?
         let hk = matmul_lds_kblock_mw_clustered(n, n, n, 128, 64, 2, 4, 64).apply(VectorizePass).apply(SwizzlePass);
         let (yhk, phk) = plan_of(hk, n, n, &a, &b);
-        assert_correct(&yhk, &phk, &expected, n, "kblock_hk");
+        assert_correct(&yhk, &phk, &expected_abt, n, "kblock_hk");
         group.bench_with_input(BenchmarkId::new("kblock_hk", n), &n, |bch, _| bench_plan(bch, &phk));
         // FINDING (4096): the complete HK replica REGRESSES — 317→475µs, mfmautil 0.40→0.23. Isolated:
         // the 2-warp-row tiling (VGPR 64→128, occupancy) costs ~14% and the cluster+ping-pong schedule
