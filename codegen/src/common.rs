@@ -180,3 +180,39 @@ pub fn format_custom_template_strict(template: &str, args: &[String]) -> Result<
 
     Ok(out)
 }
+
+/// The set of argument indices a custom template actually SUBSTITUTES (`{N}`, or the auto-numbered
+/// `{}`), ignoring `{{`/`}}` literal escapes. An arg index NOT in this set is never rendered into the
+/// output, so its operand is an ORDERING-ONLY dep (like an [`Op::After`] dep): the linearizer honours
+/// it for scheduling but the renderer must not force it to an SSA name — which lets a CUSTOM take a
+/// happens-after edge on an effect (e.g. a `Barrier`, which has no name). Mirrors the parse in
+/// [`validate_custom_template_strict`]; validation still runs, so mixed auto/manual is rejected upstream.
+pub fn referenced_placeholders(template: &str) -> std::collections::HashSet<usize> {
+    let mut refs = std::collections::HashSet::new();
+    let mut chars = template.chars().peekable();
+    let mut auto_idx = 0usize;
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            if matches!(chars.peek(), Some('{')) {
+                chars.next();
+                continue;
+            }
+            let mut token = String::new();
+            for next in chars.by_ref() {
+                if next == '}' {
+                    break;
+                }
+                token.push(next);
+            }
+            if token.is_empty() {
+                refs.insert(auto_idx);
+                auto_idx += 1;
+            } else if let Ok(idx) = token.parse::<usize>() {
+                refs.insert(idx);
+            }
+        } else if ch == '}' && matches!(chars.peek(), Some('}')) {
+            chars.next();
+        }
+    }
+    refs
+}

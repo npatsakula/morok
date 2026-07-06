@@ -600,7 +600,17 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         // (e.g. `fmul float {0}, 2.0` → `%vN = fmul float %op, 2.0`) — the LLVM
         // type lives in the RHS, so unlike C there is no separate declaration.
         Op::Custom { deps, code } => {
-            let args: Vec<String> = deps.iter().map(|dep| ctx.get(dep).to_string()).collect();
+            // Resolve to an SSA name ONLY the deps a `{N}`/`{}` placeholder actually substitutes;
+            // unreferenced deps are ORDERING-ONLY (honoured by the linearizer, never rendered) — as
+            // with `Op::After`. This lets a CUSTOM (e.g. `s_setprio`) take a happens-after edge on an
+            // effect such as a `Barrier`, which has no name. Output is unchanged for existing customs
+            // (their unreferenced deps were never emitted; force-naming them was the only obstacle).
+            let referenced = crate::common::referenced_placeholders(code);
+            let args: Vec<String> = deps
+                .iter()
+                .enumerate()
+                .map(|(i, dep)| if referenced.contains(&i) { ctx.get(dep).to_string() } else { String::new() })
+                .collect();
             let rendered = match crate::common::format_custom_template_strict(code, &args) {
                 Ok(s) => s,
                 Err(e) => {
