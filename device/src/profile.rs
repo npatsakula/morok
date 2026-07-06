@@ -36,6 +36,13 @@ pub enum PmcCounter {
     ValuMfmaBusyCycles,
     /// MFMA (matrix) instructions issued.
     InstsMfma,
+    /// Cycles ≥1 wave was stalled at a `s_waitcnt` (any counter) — total wait bubble.
+    SqWaitAny,
+    /// Cycles stalled specifically waiting on an outstanding LDS op (`lgkmcnt`) — the
+    /// bubble the barrier fences force (`fence release` → auto `s_waitcnt lgkmcnt(0)`).
+    SqWaitInstLds,
+    /// Cycles a VMEM (global-memory) instruction was active — the streaming-load footprint.
+    SqActiveInstVmem,
 }
 
 impl PmcCounter {
@@ -53,6 +60,9 @@ impl PmcCounter {
             Self::L2Miss => "l2miss",
             Self::ValuMfmaBusyCycles => "mfmabusy",
             Self::InstsMfma => "mfma",
+            Self::SqWaitAny => "waitany",
+            Self::SqWaitInstLds => "waitlds",
+            Self::SqActiveInstVmem => "vmemact",
         }
     }
 
@@ -70,6 +80,9 @@ impl PmcCounter {
             "l2miss" => Self::L2Miss,
             "mfmabusy" => Self::ValuMfmaBusyCycles,
             "mfma" => Self::InstsMfma,
+            "waitany" => Self::SqWaitAny,
+            "waitlds" => Self::SqWaitInstLds,
+            "vmemact" => Self::SqActiveInstVmem,
             _ => return None,
         })
     }

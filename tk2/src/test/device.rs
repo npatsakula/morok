@@ -289,6 +289,11 @@ fn resident_mfmautil_vs_streaming() {
             PmcCounter::ValuMfmaBusyCycles,
             PmcCounter::GrbmGuiActive,
             PmcCounter::SqBusyCycles,
+            // Where do the non-MFMA cycles go? `waitlds` = stalled on lgkmcnt (the barrier-fence drain);
+            // `waitany` = total s_waitcnt stall; `vmemact` = global-load footprint.
+            PmcCounter::SqWaitInstLds,
+            PmcCounter::SqWaitAny,
+            PmcCounter::SqActiveInstVmem,
         ]),
     };
 

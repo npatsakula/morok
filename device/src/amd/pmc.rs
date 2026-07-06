@@ -104,6 +104,10 @@ fn gfx9_block_sel(c: PmcCounter) -> (PmcBlock, u32) {
         PmcCounter::LdsBankConflict => (PmcBlock::Sq, 126),
         PmcCounter::ValuMfmaBusyCycles => (PmcBlock::Sq, 77),
         PmcCounter::InstsMfma => (PmcBlock::Sq, 56),
+        // gfx942 SQ wait/active selects (cross-checked vs tinygrad pmc.py['gfx942']).
+        PmcCounter::SqWaitAny => (PmcBlock::Sq, 90),
+        PmcCounter::SqWaitInstLds => (PmcBlock::Sq, 96),
+        PmcCounter::SqActiveInstVmem => (PmcBlock::Sq, 102),
         PmcCounter::GrbmGuiActive => (PmcBlock::Grbm, 2),
         PmcCounter::L2Hit => (PmcBlock::Tcc, 17),
         PmcCounter::L2Miss => (PmcBlock::Tcc, 19),
