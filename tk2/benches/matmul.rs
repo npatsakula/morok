@@ -62,7 +62,10 @@ fn bench_matmul(c: &mut Criterion) {
         return;
     }
     let mut group = c.benchmark_group("tk2_matmul");
-    for &n in &[1024usize, 2048, 4096] {
+    // 8192 added for the grid-FULL fair comparison vs HK (at 4096 the 256² tile makes only 256 WGs
+    // for 304 CUs → ~24% idle → device-wide mfmautil deflated; at 8192 the grid fills). The slow
+    // single-warp / naive variants are gated to n≤4096 (they'd take minutes at 8192).
+    for &n in &[1024usize, 2048, 4096, 8192] {
         group.throughput(Throughput::Elements((2.0 * (n as f64).powi(3)) as u64)); // 2·M·N·K
         let a = rand_bf16(&[n, n]);
         let b = rand_bf16(&[n, n]);
@@ -71,36 +74,33 @@ fn bench_matmul(c: &mut Criterion) {
         // reference transposes B (fast GPU matmul, not a host loop — this runs at N=4096).
         let expected_abt = reference(&a, &b.try_transpose(0, 1).expect("Bᵀ for A·Bᵀ reference"));
 
-        // Rolled: the naive K-loop with per-step div/mod gather addressing.
-        let (y0, p0) = plan_of(matmul(n, n, n), n, n, &a, &b);
-        assert_correct(&y0, &p0, &expected, n, "rolled");
-        group.bench_with_input(BenchmarkId::new("rolled", n), &n, |bch, _| bench_plan(bch, &p0));
+        // Slow single-warp / naive variants — only up to 4096 (they take minutes at 8192, and 8192
+        // exists only for the grid-full big-tile comparison).
+        if n <= 4096 {
+            // Rolled: the naive K-loop with per-step div/mod gather addressing.
+            let (y0, p0) = plan_of(matmul(n, n, n), n, n, &a, &b);
+            assert_correct(&y0, &p0, &expected, n, "rolled");
+            group.bench_with_input(BenchmarkId::new("rolled", n), &n, |bch, _| bench_plan(bch, &p0));
 
-        // Unroll + const-fold: the two addressing passes, applied to the tile-IR.
-        let mut opt = matmul(n, n, n);
-        let root = optimize_addressing(&mut opt.ir, opt.sink).expect("addressing pipeline");
-        let opt = Program { ir: opt.ir, sink: root, name: opt.name };
-        let (y1, p1) = plan_of(opt, n, n, &a, &b);
-        assert_correct(&y1, &p1, &expected, n, "unroll+fold");
-        group.bench_with_input(BenchmarkId::new("unroll+fold", n), &n, |bch, _| bench_plan(bch, &p1));
+            // Unroll + const-fold: the two addressing passes, applied to the tile-IR.
+            let mut opt = matmul(n, n, n);
+            let root = optimize_addressing(&mut opt.ir, opt.sink).expect("addressing pipeline");
+            let opt = Program { ir: opt.ir, sink: root, name: opt.name };
+            let (y1, p1) = plan_of(opt, n, n, &a, &b);
+            assert_correct(&y1, &p1, &expected, n, "unroll+fold");
+            group.bench_with_input(BenchmarkId::new("unroll+fold", n), &n, |bch, _| bench_plan(bch, &p1));
 
-        // K-blocked LDS reuse (step 1b-ii): 64×64 tile, A/B strips re-staged per K-block,
-        // reuse across the 4×4 accumulator grid, two barriers per block (RAW + WAR). At
-        // K_STEP=64 (the 4×-fewer-barriers win), compare the flat-layout BASE vs the same
-        // base `.apply(SwizzlePass)` — the swizzle is a composable layout pass now, so this
-        // is the top-level `.apply` model measured end-to-end.
-        // `.apply(VectorizePass)` fuses the scalar gather runs to ds_read_b64 (flat), and
-        // `.apply(VectorizePass).apply(SwizzlePass)` the production bank-swizzled variant —
-        // the top-level composable-pass model measured end-to-end (fills are builder-vectorised).
-        let flat = matmul_lds_kblock_vec(n, n, n, 64, 64, 64);
-        let (yb, pb) = plan_of(flat, n, n, &a, &b);
-        assert_correct(&yb, &pb, &expected_abt, n, "kblock_ks64");
-        group.bench_with_input(BenchmarkId::new("kblock_ks64", n), &n, |bch, _| bench_plan(bch, &pb));
+            // K-blocked LDS reuse (step 1b-ii): 64×64 tile, flat vs `.apply(SwizzlePass)`.
+            let flat = matmul_lds_kblock_vec(n, n, n, 64, 64, 64);
+            let (yb, pb) = plan_of(flat, n, n, &a, &b);
+            assert_correct(&yb, &pb, &expected_abt, n, "kblock_ks64");
+            group.bench_with_input(BenchmarkId::new("kblock_ks64", n), &n, |bch, _| bench_plan(bch, &pb));
 
-        let swizzled = matmul_lds_kblock_sw(n, n, n, 64, 64, 64);
-        let (ysw, psw) = plan_of(swizzled, n, n, &a, &b);
-        assert_correct(&ysw, &psw, &expected_abt, n, "kblock_sw64");
-        group.bench_with_input(BenchmarkId::new("kblock_sw64", n), &n, |bch, _| bench_plan(bch, &psw));
+            let swizzled = matmul_lds_kblock_sw(n, n, n, 64, 64, 64);
+            let (ysw, psw) = plan_of(swizzled, n, n, &a, &b);
+            assert_correct(&ysw, &psw, &expected_abt, n, "kblock_sw64");
+            group.bench_with_input(BenchmarkId::new("kblock_sw64", n), &n, |bch, _| bench_plan(bch, &psw));
+        }
 
         // Multi-warp bigger tiles (vectorised + swizzled), the barrier-amortisation lever:
         // a 2×2 warp grid → 128×128, a 4×4 grid → 256×256. Each wins in its own N regime

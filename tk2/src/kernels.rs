@@ -857,9 +857,15 @@ fn kloop_2stage<Op, Reg>(
     let new = mma(b, &op, &acc_reads);
     let stores: Vec<Effect> = accs.iter().zip(new).map(|(a, v)| b.store_frag_vec(*a, v)).collect();
 
-    // commit block k+1 AFTER the WAR (single buffer: the overwrite must follow this block's reads),
-    // then RAW-fence it as the carry-out for the next iteration's gather.
-    let fill_next = commit(b, k_next, &reg_next, &[war.dep()]);
+    // commit block k+1 AFTER the WAR (single buffer: the overwrite must follow this block's reads) AND
+    // after the MFMA stores — deferring the `ds_write` past the ~128 MFMAs keeps the register-staged
+    // prefetch load in flight across them, hiding the ~775-cyc global-load latency. Without this, LLVM
+    // sinks the commit next to the load (to free the load VGPR early under pressure) and drains `vmcnt`
+    // immediately — the measured binding stall (SQ_WAIT vmcnt-dominated, mfmautil deflated). WAR-safe:
+    // the commit is still after block k's gather (via `war`); the MFMA-store deps only push it later.
+    let mut commit_after: Vec<TileId> = vec![war.dep()];
+    commit_after.extend(stores.iter().map(|e| e.dep()));
+    let fill_next = commit(b, k_next, &reg_next, &commit_after);
     let fill_next_deps: Vec<TileId> = fill_next[1..].iter().map(|e| e.dep()).collect();
     let raw_next = b.barrier(fill_next[0], &fill_next_deps);
 
