@@ -507,10 +507,11 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             }
         };
         let loop_seed = match warp_row {
-            Some(wr) => {
-                let wr_seeded = b.idx_after(wr, &[raw_seed.dep()]);
-                b.wave_barrier(wr_seeded, 1, &[]).dep()
-            }
+            // The eq=1 wave-phase barrier ordered after the prologue commit (`raw_seed`). The barrier
+            // rides as an ordering-only dep (`deps[1..]`, unreferenced by the WaveBarrier template) — no
+            // longer laundered through `idx_after` into the warp_row operand now that a CUSTOM accepts
+            // a happens-after edge on an effect (Stage A).
+            Some(wr) => b.wave_barrier(wr, 1, &[raw_seed.dep()]).dep(),
             None => raw_seed.dep(),
         };
 
@@ -561,9 +562,10 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         let ep =
             run_body(b, &clusters, &mut hooks, ksteps, n_acc, &acc_loop, &[ended.dep()], &ep_carry, None, commit_drain);
         let scatter_seed = warp_row.map(|wr| {
+            // The eq=0 rebalance barrier ordered after the epilogue's last cluster barrier — the barrier
+            // rides as an ordering-only dep (Stage A), not laundered through `idx_after` into warp_row.
             let anchor = ep.tail_barrier.expect("epilogue must end on a cluster barrier");
-            let wr_seeded = b.idx_after(wr, &[anchor]);
-            b.wave_barrier(wr_seeded, 0, &[]).dep()
+            b.wave_barrier(wr, 0, &[anchor]).dep()
         });
         let out: Vec<Frag<F32>> = acc_loop
             .iter()
