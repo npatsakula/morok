@@ -12,7 +12,7 @@
 
 use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, Node, TileId, TileIr};
-use crate::movement::LdsView;
+use crate::movement::SharedTile;
 use crate::pass::Pass;
 
 /// A finished tile-IR program: the arena, its sink root, and the kernel name.
@@ -382,101 +382,6 @@ fn fill_lds(
     let v = b.load(src, goff);
     let st = b.store_lds(lds, flat, v);
     b.end(st, &[fr])
-}
-
-/// **Vectorised** collaborative global→LDS fill for a **K-contiguous** tile — serves BOTH A[M,K]
-/// and B[N,K] (HK's pre-transposed B), since both are K-contiguous on the global side. Each lane's
-/// `epl` elements form contiguous columns within one LDS row, so the run splits into b64 chunks —
-/// ONE coalesced b128/b64 global `load_vec` (see [`fill_lds_vec_prefetch`]) + `ds_write_b64`
-/// `store_lds_vec` per b64 chunk. The store routes its chunk base through `lds_col` at b64
-/// granularity so it stays swizzle-safe (the delta is `VEC`-aligned; §5b). Requires `epl % VEC == 0`
-/// and `cols_lds % VEC == 0` (so a chunk never straddles a row). No register transpose, no `v_perm`.
-/// Returns the chunk store effects to fence.
-/// The **prefetch** half (global→VGPR): issue the `epl/VEC` coalesced b64 global `load_vec`s
-/// into registers, no LDS write. Returns the loaded chunks in `cc` order for [`fill_lds_vec_commit`]
-/// (which shares the addressing nodes via hash-consing, so prefetch-then-commit == the old
-/// fused fill bit-for-bit). Splitting them lets a `stages=2` pipeline hoist the load ahead of
-/// the MFMAs (register-staged prefetch; §5b).
-#[allow(clippy::too_many_arguments)]
-fn fill_lds_vec_prefetch(
-    b: &mut Builder,
-    src: Buf<BF16>,
-    epl: usize,
-    lane: Idx,
-    cols_lds: i64,
-    tile_row_base: Idx,
-    tile_col_base: Idx,
-    grow_stride: i64,
-) -> Vec<Val<BF16>> {
-    const VEC: usize = 4; // b64 = 4 bf16: the LDS-store / swizzle granularity (unchanged)
-    // Global-load width: **b128** (8 bf16, `buffer_load_dwordx4`) when the lane run tiles it,
-    // else b64. This mirrors HK exactly — `raw.buffer.load.i128` into registers, then 2×
-    // `ds_write_b64` to LDS: one wide coalesced global load, split back into VEC-wide b64
-    // chunks the swizzle-safe [`fill_lds_vec_commit`] stores independently (a b128 LDS write
-    // would straddle the b64-granular XOR swizzle boundary). Half the VMEM instructions.
-    let gvec = if epl.is_multiple_of(8) { 8 } else { VEC };
-    assert!(
-        epl.is_multiple_of(VEC) && (cols_lds as usize).is_multiple_of(gvec),
-        "vectorised fill needs VEC-aligned epl and gvec-aligned cols"
-    );
-    let epl_c = b.idx_const(epl as i64);
-    let lane_epl = b.idx_mul(lane, epl_c);
-    let cols_c = b.idx_const(cols_lds);
-    let gstride = b.idx_const(grow_stride);
-    let mut out = Vec::with_capacity(epl / VEC);
-    for cg in 0..epl / gvec {
-        let ec = b.idx_const((cg * gvec) as i64);
-        let flat = b.idx_add(lane_epl, ec); // gvec-aligned chunk start (stays in one row)
-        let r = b.idx_div(flat, cols_c);
-        let c = b.idx_mod(flat, cols_c);
-        // Global: contiguous `gvec`-run at (tile_row_base + r)·stride + tile_col_base + c.
-        let grow = b.idx_add(tile_row_base, r);
-        let goff = b.idx_mul(grow, gstride);
-        let goff = b.idx_add(goff, tile_col_base);
-        let goff = b.idx_add(goff, c);
-        let wide = b.load_vec(src, goff, gvec); // ONE b128 (or b64) coalesced global load
-        // Split into VEC-wide b64 chunks (register-only — the b128 already lands in adjacent
-        // VGPRs, so the extract/build fold away). Preserves the old `Vec<Val>` order + the
-        // commit's hash-cons-shared addressing (chunk `cg` yields old chunks `2cg`, `2cg+1`).
-        for h in 0..gvec / VEC {
-            if gvec == VEC {
-                out.push(wide);
-            } else {
-                let half: Vec<Val<BF16>> = (0..VEC).map(|e| b.vec_extract(wide, h * VEC + e)).collect();
-                out.push(b.vec_build(&half));
-            }
-        }
-    }
-    out
-}
-
-/// The **commit** half (VGPR→LDS): `ds_write_b64` each prefetched chunk into LDS at
-/// `r·cols + LdsCol(r, c)` (swizzle-safe b64 granularity). `loaded` is [`fill_lds_vec_prefetch`]'s
-/// output; the `r`/`c` addressing hash-cons-shares that half's nodes. Returns the store effects.
-fn fill_lds_vec_commit(
-    b: &mut Builder,
-    lds: Lds<BF16>,
-    loaded: &[Val<BF16>],
-    epl: usize,
-    lane: Idx,
-    cols_lds: i64,
-) -> Vec<Effect> {
-    const VEC: usize = 4;
-    let epl_c = b.idx_const(epl as i64);
-    let lane_epl = b.idx_mul(lane, epl_c);
-    let cols_c = b.idx_const(cols_lds);
-    (0..epl / VEC)
-        .map(|cc| {
-            let ec = b.idx_const((cc * VEC) as i64);
-            let flat = b.idx_add(lane_epl, ec);
-            let r = b.idx_div(flat, cols_c);
-            let c = b.idx_mod(flat, cols_c);
-            let col = b.lds_col(r, c, cols_lds as usize);
-            let rc = b.idx_mul(r, cols_c);
-            let dst_off = b.idx_add(rc, col);
-            b.store_lds_vec(lds, dst_off, loaded[cc])
-        })
-        .collect()
 }
 
 /// `idx + base` (folding the `base == 0` identity so the flat path stays clean).
@@ -1307,6 +1212,22 @@ fn kblock_impl(
     let tm_bm = b.idx_mul(tile_m, big_m_c); // workgroup A row origin: tile_m·big_m
     let tn_bn = b.idx_mul(tile_n, big_n_c); // workgroup B col origin: tile_n·big_n
 
+    // The read + write movement handles, minted from ONE `SharedTile` per operand so the fill and the
+    // gather share the tile's `cols`/swizzle and cannot desync. `gather_view` → `LdsView` (HK's
+    // `load(rt,st)`); `stage_view` → `LdsStage` (the collaborative global→LDS fill, `load(st,gl)`) —
+    // the tile origin/warp-offset/K-run/map/residency ride as DATA on the handles, so the gather AND
+    // commit call sites name NO addressing params. `asm_gather` is the gather's arch dispatch (gfx942
+    // `ds_read_b64` vs the scalar intrinsic). The SAME handles serve the whole-block and clustered
+    // paths (and FA's K/V gather + stage, by how they are constructed).
+    let a_tile = SharedTile::new(a_smem, k_step);
+    let b_tile = SharedTile::new(b_smem, k_step);
+    let a_view = a_tile.gather_view(a_map, ri, warp_row_off, wlane, asm_gather);
+    let b_view = b_tile.gather_view(bc_map, cj, warp_col_off, wlane, asm_gather);
+    // A[M,K] and B[N,K] are BOTH K-contiguous → the identical trivial coalesced fill: `origin` = the
+    // M/N row base, `grow_stride` = K. No transpose, no `v_perm` — B's fill IS A's fill.
+    let a_stage = a_tile.stage_view(a, epl_a, tid, tm_bm, k as i64);
+    let b_stage = b_tile.stage_view(bmat, epl_b, tid, tn_bn, k as i64);
+
     // ── accumulators: one 16×16 f32 fragment per (i,j), zero-initialised. ──
     let acc: Vec<Frag<F32>> = (0..ri * cj).map(|_| b.define_frag::<F32>(bc_map)).collect();
     let inited: Vec<Effect> = acc
@@ -1320,36 +1241,23 @@ fn kblock_impl(
         })
         .collect();
 
-    // ── the K-reduction, via the map-reduce combinator (DESIGN §5b/§5c). The prefetch/commit
-    //    fills are shared; `bracket=None` runs the whole-block gather/mma (the 452-TF path,
-    //    byte-identical under hash-consing), `Some(br)` the per-slice clustered schedule (§5c). ──
-    // prefetch (global→VGPR): A b64 chunks + B micro-tile rows; returns the load-pin anchors.
+    // ── the K-reduction, via the map-reduce combinator (DESIGN §5b/§5c). The prefetch/commit fills
+    //    ride the `LdsStage` handle; `bracket=None` runs the whole-block gather/mma (byte-identical
+    //    under hash-consing), the clustered schedule (§5c) drives the per-slice path. ──
+    // prefetch (global→VGPR): the load-pin anchors returned for the sched fence.
     let mut prefetch_fn = |b: &mut Builder, k_base: Idx| {
-        // A[big_m, k_step] and B[big_n, k_step] are BOTH K-contiguous (A[M,K], B[N,K]) → the identical
-        // trivial coalesced fill: `tile_row_base` = the M/N origin, `grow_stride` = K, `tile_col_base`
-        // = k_base. No transpose, no `v_perm` — B's fill IS A's fill.
-        let a = fill_lds_vec_prefetch(b, a, epl_a, tid, k_step as i64, tm_bm, k_base, k as i64);
-        let bt = fill_lds_vec_prefetch(b, bmat, epl_b, tid, k_step as i64, tn_bn, k_base, k as i64);
+        let a = a_stage.prefetch(b, k_base);
+        let bt = b_stage.prefetch(b, k_base);
         let mut anchors: Vec<TileId> = a.iter().map(|v| v.id).collect();
         anchors.extend(bt.iter().map(|v| v.id));
         (FillRegs { a, b: bt }, anchors)
     };
-    // commit (VGPR→ds_write LDS): the WAR `deps` ride the LDS handle via `lds_after`.
+    // commit (VGPR→ds_write LDS): the WAR `deps` ride each stage's LDS handle via `lds_after`.
     let mut commit_fn = |b: &mut Builder, _k_base: Idx, reg: &FillRegs, deps: &[TileId]| {
-        let (a_dst, b_dst) =
-            if deps.is_empty() { (a_smem, b_smem) } else { (b.lds_after(a_smem, deps), b.lds_after(b_smem, deps)) };
-        let fa = fill_lds_vec_commit(b, a_dst, &reg.a, epl_a, tid, k_step as i64);
-        let fb = fill_lds_vec_commit(b, b_dst, &reg.b, epl_b, tid, k_step as i64);
+        let fa = a_stage.commit(b, &reg.a, deps);
+        let fb = b_stage.commit(b, &reg.b, deps);
         fa.into_iter().chain(fb).collect()
     };
-
-    // The two operand VIEWS (the movement layer, `movement::LdsView`): the tile origin/warp
-    // offset/K-run/map/residency ride as DATA on the handle, so the gather call sites name NO
-    // addressing params (HK's `load(rt, st)`). `asm_gather` is the view's arch/residency dispatch —
-    // gfx942 `ds_read_b64` vs the scalar intrinsic (§5c/§2.8). The SAME `LdsView::gather` serves the
-    // whole-block and clustered paths (and FA's K/V gather, by how the view is constructed).
-    let a_view = LdsView::new(a_smem, a_map, ri, k_step, warp_row_off, wlane, asm_gather);
-    let b_view = LdsView::new(b_smem, bc_map, cj, k_step, warp_col_off, wlane, asm_gather);
 
     let sched = hk_schedule();
     let acc_final = if !clustered {

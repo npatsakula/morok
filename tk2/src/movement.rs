@@ -15,7 +15,7 @@
 //! the scalar-then-`VectorizePass` intrinsic path is the RDNA/fallback. The **same** method serves
 //! matmul's A/B operands and (by construction — a different tile shape/origin) FA's K/V gather.
 
-use crate::build::{Builder, Elem, Frag, Idx, Lds, Val};
+use crate::build::{Buf, Builder, Effect, Elem, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId};
 use crate::kernels::{EDGE, add_opt, offset_by};
 
@@ -52,22 +52,6 @@ pub(crate) struct LdsView<E: Elem> {
 }
 
 impl<E: Elem> LdsView<E> {
-    /// Construct a view over the `lds` operand tile: `n_frags` fragments along the outer axis, the
-    /// LDS tile `inner`-wide, addressed by `lane` (+ the wave's `warp_off`), with the arch dispatch
-    /// `asm`. The K-run starts at slice 0; select another with [`Self::slice`].
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        lds: Lds<E>,
-        map: FragMap,
-        n_frags: usize,
-        inner: usize,
-        warp_off: Option<Idx>,
-        lane: Idx,
-        asm: bool,
-    ) -> Self {
-        LdsView { lds, map, n_frags, inner, warp_off, run: 0, lane, asm }
-    }
-
     /// Re-view the same LDS tile at K-slice `s` (inner base `s·EDGE`) — the `.slice(i, s)` selector.
     pub(crate) fn slice(self, s: usize) -> Self {
         LdsView { run: s * EDGE, ..self }
@@ -157,5 +141,122 @@ impl<E: Elem> LdsView<E> {
             vecs.push(b.load_frag_vec_after(f, &[st.dep()]));
         }
         (vecs, stores)
+    }
+}
+
+/// The **shared LDS operand tile** — the layout owner. It mints BOTH movement handles ([`LdsView`]
+/// for the read/gather side, [`LdsStage`] for the write/commit side) from one place, so the fill and
+/// the gather **cannot disagree** on the tile's `cols`/swizzle (a desync = silent bank corruption).
+/// A `Copy` descriptor: many views share one tile (A vs B).
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct SharedTile<E: Elem> {
+    lds: Lds<E>,
+    cols: usize, // the inner (column) width — `k_step`; the flat-layout row stride AND the swizzle period
+}
+
+impl<E: Elem> SharedTile<E> {
+    pub(crate) fn new(lds: Lds<E>, cols: usize) -> Self {
+        SharedTile { lds, cols }
+    }
+
+    /// Mint the **read/gather** view (the operand-fragment handle). `inner`/swizzle come from the tile.
+    pub(crate) fn gather_view(self, map: FragMap, n_frags: usize, warp_off: Option<Idx>, lane: Idx, asm: bool) -> LdsView<E> {
+        LdsView { lds: self.lds, map, n_frags, inner: self.cols, warp_off, run: 0, lane, asm }
+    }
+
+    /// Mint the **write/commit** stage (the collaborative global→LDS fill handle). `src` is the global
+    /// source (K-contiguous `[M,K]`/`[N,K]`), `origin` the tile's M/N row base, `grow_stride` the
+    /// global row stride (`K`); `epl` elements per lane. The K-column base is passed per iteration to
+    /// [`LdsStage::prefetch`].
+    pub(crate) fn stage_view(self, src: Buf<E>, epl: usize, lane: Idx, origin: Idx, grow_stride: i64) -> LdsStage<E> {
+        LdsStage { src, lds: self.lds, epl, lane, cols: self.cols as i64, origin, grow_stride }
+    }
+}
+
+/// A **rich view over the write/commit side** of a [`SharedTile`] — the movement handle symmetric to
+/// [`LdsView`]. It carries, as DATA, the collaborative fill's addressing (`src`/`origin`/`grow_stride`
+/// /`epl`/`lane`/`cols`), so the call site names none of it — the write-side answer to HK's
+/// `load(st, gl)`. The fill is the trivial b128 `load_vec`→`ds_write_b64` (post-`[N,K]`-B: K-contiguous,
+/// no transpose, no `v_perm`) shared by A and B.
+///
+/// The two halves mirror [`LdsView::gather`]'s split: [`Self::prefetch`] (global→VGPR, no ordering)
+/// and [`Self::commit`] (VGPR→LDS, the WAR ordering ridden onto the LDS handle via `lds_after` — the
+/// write-side analog of `gather`'s `raw` param). Returns the store-fence tokens the RAW barrier
+/// consumes (the inverse of `gather`, which consumes the RAW and returns fence tokens).
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct LdsStage<E: Elem> {
+    src: Buf<E>,
+    lds: Lds<E>,
+    epl: usize,
+    lane: Idx,
+    cols: i64,
+    origin: Idx,
+    grow_stride: i64,
+}
+
+impl<E: Elem> LdsStage<E> {
+    /// The **prefetch** half (global→VGPR): issue the `epl/gvec` coalesced global `load_vec`s at the
+    /// K-column base `k_base`, no LDS write. Global-load width is **b128** (8 elems, `buffer_load_dwordx4`,
+    /// matching HK's `raw.buffer.load.i128`) when the lane run tiles it, else b64 — the wide load is
+    /// split back into VEC-wide b64 chunks (register-only; the b128 lands in adjacent VGPRs) so the
+    /// swizzle-safe [`Self::commit`] stores them independently. Returns the chunks in commit order (the
+    /// commit's `r`/`c` addressing hash-cons-shares this half's nodes).
+    pub(crate) fn prefetch(self, b: &mut Builder, k_base: Idx) -> Vec<Val<E>> {
+        const VEC: usize = 4; // b64 = 4 elems: the LDS-store / swizzle granularity
+        let gvec = if self.epl.is_multiple_of(8) { 8 } else { VEC };
+        assert!(
+            self.epl.is_multiple_of(VEC) && (self.cols as usize).is_multiple_of(gvec),
+            "vectorised fill needs VEC-aligned epl and gvec-aligned cols"
+        );
+        let epl_c = b.idx_const(self.epl as i64);
+        let lane_epl = b.idx_mul(self.lane, epl_c);
+        let cols_c = b.idx_const(self.cols);
+        let gstride = b.idx_const(self.grow_stride);
+        let mut out = Vec::with_capacity(self.epl / VEC);
+        for cg in 0..self.epl / gvec {
+            let ec = b.idx_const((cg * gvec) as i64);
+            let flat = b.idx_add(lane_epl, ec); // gvec-aligned chunk start (stays in one row)
+            let r = b.idx_div(flat, cols_c);
+            let c = b.idx_mod(flat, cols_c);
+            // Global: contiguous `gvec`-run at (origin + r)·stride + k_base + c.
+            let grow = b.idx_add(self.origin, r);
+            let goff = b.idx_mul(grow, gstride);
+            let goff = b.idx_add(goff, k_base);
+            let goff = b.idx_add(goff, c);
+            let wide = b.load_vec(self.src, goff, gvec); // ONE b128 (or b64) coalesced global load
+            for h in 0..gvec / VEC {
+                if gvec == VEC {
+                    out.push(wide);
+                } else {
+                    let half: Vec<Val<E>> = (0..VEC).map(|e| b.vec_extract(wide, h * VEC + e)).collect();
+                    out.push(b.vec_build(&half));
+                }
+            }
+        }
+        out
+    }
+
+    /// The **commit** half (VGPR→LDS): `ds_write_b64` each prefetched chunk into LDS at
+    /// `r·cols + LdsCol(r, c)` (swizzle-safe b64 granularity). `war` is the WAR barrier the writes must
+    /// observe — ridden onto the LDS handle ONCE via `lds_after` (empty on the prologue block-0 commit,
+    /// kept byte-identical). Returns the store effects the RAW barrier fences.
+    pub(crate) fn commit(self, b: &mut Builder, loaded: &[Val<E>], war: &[TileId]) -> Vec<Effect> {
+        const VEC: usize = 4;
+        let lds = if war.is_empty() { self.lds } else { b.lds_after(self.lds, war) };
+        let epl_c = b.idx_const(self.epl as i64);
+        let lane_epl = b.idx_mul(self.lane, epl_c);
+        let cols_c = b.idx_const(self.cols);
+        (0..self.epl / VEC)
+            .map(|cc| {
+                let ec = b.idx_const((cc * VEC) as i64);
+                let flat = b.idx_add(lane_epl, ec);
+                let r = b.idx_div(flat, cols_c);
+                let c = b.idx_mod(flat, cols_c);
+                let col = b.lds_col(r, c, self.cols as usize);
+                let rc = b.idx_mul(r, cols_c);
+                let dst_off = b.idx_add(rc, col);
+                b.store_lds_vec(lds, dst_off, loaded[cc])
+            })
+            .collect()
     }
 }
