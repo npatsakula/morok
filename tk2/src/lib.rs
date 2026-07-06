@@ -25,6 +25,7 @@ pub mod lower;
 pub(crate) mod movement;
 pub mod pass;
 pub mod passes;
+pub(crate) mod pipeline;
 
 pub use build::{Builder, Elem, F32};
 pub use error::{Error, Result};

@@ -160,7 +160,14 @@ impl<E: Elem> SharedTile<E> {
     }
 
     /// Mint the **read/gather** view (the operand-fragment handle). `inner`/swizzle come from the tile.
-    pub(crate) fn gather_view(self, map: FragMap, n_frags: usize, warp_off: Option<Idx>, lane: Idx, asm: bool) -> LdsView<E> {
+    pub(crate) fn gather_view(
+        self,
+        map: FragMap,
+        n_frags: usize,
+        warp_off: Option<Idx>,
+        lane: Idx,
+        asm: bool,
+    ) -> LdsView<E> {
         LdsView { lds: self.lds, map, n_frags, inner: self.cols, warp_off, run: 0, lane, asm }
     }
 

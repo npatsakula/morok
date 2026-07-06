@@ -295,6 +295,8 @@ fn resident_mfmautil_vs_streaming() {
     for (label, prog) in [
         ("resident (compute-resident)", crate::kernels::matmul_lds_kblock_mw_resident(m, n, k, 128, 64, 2, 4, 64)),
         ("streaming (clustered)", crate::kernels::matmul_lds_kblock_mw_clustered(m, n, k, 128, 64, 2, 4, 64)),
+        ("pipe 128² (double-buffer)", crate::kernels::matmul_lds_kblock_mw_pipe(m, n, k, 64, 64, 2, 2, 64)),
+        ("pipe HK-tile (double-buffer)", crate::kernels::matmul_lds_kblock_mw_pipe(m, n, k, 128, 64, 2, 4, 64)),
     ] {
         let prog = prog.apply(VectorizePass).apply(SwizzlePass);
         let out = Tensor::empty(&[m, n], DType::Float32);

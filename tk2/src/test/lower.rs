@@ -161,7 +161,11 @@ fn vectorize_pass_fuses_the_scalar_gathers() {
     let count = |pred: &dyn Fn(&N) -> bool| {
         reachable(&vec.ir, vec.sink).into_iter().filter(|&id| pred(vec.ir.node(id))).count()
     };
-    assert_eq!(count(&|n| matches!(n, N::LoadVecAt { .. })), 12, "8 fused gather + 4 fill vector loads (A-fill 2 + B-fill 2, both b128)");
+    assert_eq!(
+        count(&|n| matches!(n, N::LoadVecAt { .. })),
+        12,
+        "8 fused gather + 4 fill vector loads (A-fill 2 + B-fill 2, both b128)"
+    );
     lower::verify(&vec).expect("vectorised matmul must lower to spec-valid UOp");
 }
 
