@@ -1098,8 +1098,9 @@ fn kblock_impl(
                 let mut out = Vec::with_capacity(ri * cj);
                 for i in 0..ri {
                     for j in 0..cj {
-                        // Intrinsic MFMA — HK uses the intrinsic too; the asm is only the ds_read_b64 gather.
-                        out.push(b.mma(a_vecs[i], b_vecs[j], reads[i * cj + j], ept));
+                        // Asm-sideeffect MFMA (opaque to LLVM's scheduler → the 32-run cannot be
+                        // fractured; tk's `mma_abt_asm` pin, verified: the intrinsic path is unpinnable).
+                        out.push(b.mma_asm(a_vecs[i], b_vecs[j], reads[i * cj + j], ept));
                     }
                 }
                 out
