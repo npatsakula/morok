@@ -882,6 +882,47 @@ fn kloop_2stage<Op, Reg>(
     acc_loop.iter().zip(stores_e).map(|(a, s)| b.frag_after(*a, &[s.dep()])).collect()
 }
 
+/// **XCD / L2 grid swizzle** (HK `GEMM:50-65` / `util.cuh:90`, ported from `tk/src/grid.rs`): remap a
+/// flattened 1-D workgroup id to a `(tile_m, tile_n)` block coordinate so co-scheduled workgroups share
+/// an XCD/L2 slice — gfx942 has 8 XCDs with private L2, and naive row-major block ordering gets only
+/// ~36% L2 hit rate (the HK paper's ~19% chiplet win). Pure index arithmetic + a bijection over the
+/// grid, so the computed C is unchanged (bit-exact — just *which* workgroup computes *which* tile).
+///
+/// Caller gates on `grid_m % WGM == 0`, so `group_size_m == WGM` (drops tk's `imin`); the chiplet
+/// transform is applied only when `num_wgs` is a whole multiple of `NUM_XCDS·chunk` (drops tk's `where`
+/// guard — a sub-`block` grid already fits one XCD sweep, so identity there is fine).
+fn l2_swizzle(b: &mut Builder, wgid: Idx, grid_m: i64, grid_n: i64) -> (Idx, Idx) {
+    const NUM_XCDS: i64 = 8; // gfx942 chiplet count
+    const WGM: i64 = 4; // grouped-M L2 swizzle group width (HK `GEMM:48`)
+    let chunk = WGM * WGM; // 16
+    let block = NUM_XCDS * chunk; // 128
+    // ── chiplet transform: reorder so each run of `chunk` ids lands on one XCD (exact when the grid is
+    //    a whole multiple of `block`; else identity — the grid fits inside one XCD sweep). ──
+    let wgid = if (grid_m * grid_n) % block == 0 {
+        let (nx, ch, bl) = (b.idx_const(NUM_XCDS), b.idx_const(chunk), b.idx_const(block));
+        let xcd = b.idx_mod(wgid, nx);
+        let local = b.idx_div(wgid, nx);
+        let chunk_idx = b.idx_div(local, ch);
+        let pos = b.idx_mod(local, ch);
+        let hi = b.idx_mul(chunk_idx, bl);
+        let mid = b.idx_mul(xcd, ch);
+        let himid = b.idx_add(hi, mid);
+        b.idx_add(himid, pos)
+    } else {
+        wgid
+    };
+    // ── L2 super-group (Triton grouped-M); `group_size_m == WGM` by the caller's `grid_m % WGM == 0`. ──
+    let in_group = b.idx_const(WGM * grid_n);
+    let wgm_c = b.idx_const(WGM);
+    let group_id = b.idx_div(wgid, in_group);
+    let first_pid_m = b.idx_mul(group_id, wgm_c);
+    let local = b.idx_mod(wgid, in_group);
+    let local_m = b.idx_mod(local, wgm_c);
+    let tile_m = b.idx_add(first_pid_m, local_m);
+    let tile_n = b.idx_div(local, wgm_c);
+    (tile_m, tile_n)
+}
+
 /// **K-blocked, LDS-staged, block-tiled** matmul (DESIGN.md §5b step 1b-ii — the
 /// occupancy win). Like [`matmul_lds_tiled`] (bm×bn tile, `(bm/16)×(bn/16)` reused
 /// accumulators) but the A/B strips are re-staged **per K-fragment inside the K-loop**
@@ -956,8 +997,15 @@ fn kblock_impl(
     // family therefore computes `A·Bᵀ` (distinct from the pedagogical `matmul`/`matmul_lds*`, A·B).
     let bmat = b.global::<BF16>(n * k);
 
-    let tile_m = b.grid_axis(0, (m / big_m) as i64);
-    let tile_n = b.grid_axis(1, (n / big_n) as i64);
+    // XCD/L2 grid swizzle when the M-grid is WGM(4)-aligned (all square power-of-2 shapes): flatten to
+    // a 1-D grid and remap wgid→(tile_m,tile_n) for L2/chiplet locality (bit-exact). Else naive 2-D.
+    let (grid_m, grid_n) = ((m / big_m) as i64, (n / big_n) as i64);
+    let (tile_m, tile_n) = if grid_m % 4 == 0 {
+        let wgid = b.grid_axis(0, grid_m * grid_n);
+        l2_swizzle(&mut b, wgid, grid_m, grid_n)
+    } else {
+        (b.grid_axis(0, grid_m), b.grid_axis(1, grid_n))
+    };
     let tid = b.block_axis(nthreads as i64);
 
     // Warp split: the fill spans all `nthreads`; each warp computes one bm×bn sub-tile at
