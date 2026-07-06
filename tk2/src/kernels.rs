@@ -680,18 +680,27 @@ impl Hooks for MatmulHooks {
         tile: usize,
         prev: Option<FillRegs>,
         order: &[TileId],
-    ) -> FillRegs {
+    ) -> (FillRegs, Vec<TileId>) {
         // Two operand tiles: 0 = A, 1 = B. HK loads A@C0 and B@C4 so each global load hides under a
         // different compute cluster; the schedule names which cluster stages which tile, and the fill
         // accumulates across them (`prev`) for the single C6 commit that writes BOTH to LDS. `order`
         // (the cluster entry) pins each tile's load into its cluster so the split survives lowering.
         let mut reg = prev.unwrap_or(FillRegs { a: Vec::new(), b: Vec::new() });
-        match tile {
-            0 => reg.a = self.a_stage.prefetch(b, k_base, order),
-            1 => reg.b = self.b_stage.prefetch(b, k_base, order),
+        let loaded = match tile {
+            0 => {
+                reg.a = self.a_stage.prefetch(b, k_base, order);
+                &reg.a
+            }
+            1 => {
+                reg.b = self.b_stage.prefetch(b, k_base, order);
+                &reg.b
+            }
             _ => panic!("matmul prefetch: tile ∈ {{0=A, 1=B}}, got {tile}"),
-        }
-        reg
+        };
+        // The load result values — the `sched_fence(0)` load-pin anchors on these so LLVM cannot sink
+        // the global load down to its consumer (the commit), exposing the DRAM latency.
+        let anchors: Vec<TileId> = loaded.iter().map(|v| v.id).collect();
+        (reg, anchors)
     }
 
     fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &FillRegs, war: &[TileId]) -> Vec<Effect> {

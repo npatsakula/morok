@@ -63,7 +63,8 @@ pub(crate) trait Hooks {
     /// Prefetch operand-tile `tile` of block `k_base` global→VGPR (the latency hide), folding the
     /// staged registers into `prev` (the partial fill accumulated by earlier prefetch clusters this
     /// iteration; `None` = start fresh). `order` is the cluster entry: the load is ordered after it so
-    /// it lands in this cluster (the split pin) instead of floating to the loop top. Returns the fill.
+    /// it lands in this cluster (the split pin) instead of floating to the loop top. Returns the fill
+    /// AND the load result values — the `sched_fence(0)` load-pin anchors on them (see [`ClusterCx::prefetch`]).
     fn prefetch(
         &mut self,
         b: &mut Builder,
@@ -71,7 +72,7 @@ pub(crate) trait Hooks {
         tile: usize,
         prev: Option<Self::Reg>,
         order: &[TileId],
-    ) -> Self::Reg;
+    ) -> (Self::Reg, Vec<TileId>);
     /// Commit the staged registers VGPR→LDS behind `war`. Returns the store effects the RAW fences.
     fn commit(&mut self, b: &mut Builder, k_base: Idx, reg: &Self::Reg, war: &[TileId]) -> Vec<Effect>;
     /// Gather K-slice `slice` LDS→operand-frags after `raw`. Returns the operand bundle, its store-
@@ -125,9 +126,22 @@ impl<H: Hooks> ClusterCx<'_, H> {
             // Pin the loads to THIS cluster's entry (the preceding cluster's boundary barrier), so a
             // split B@C4 lands between the right MFMA clusters instead of hoisting to the loop top.
             let order = self.entry.clone();
+            let mut anchors: Vec<TileId> = Vec::new();
             for &t in tiles {
                 let prev = self.reg.take();
-                self.reg = Some(self.hooks.prefetch(self.b, kn, t, prev, &order));
+                let (reg, load_ids) = self.hooks.prefetch(self.b, kn, t, prev, &order);
+                self.reg = Some(reg);
+                anchors.extend(load_ids);
+            }
+            // The **load-pin** (HK's load→use separation): a `sched.barrier(0)` positioned right after
+            // the load results forbids LLVM's MachineScheduler sinking the load down to just before the
+            // commit's `s_waitcnt vmcnt(0)`. Without it the load issues ~1 MFMA before its wait (DRAM
+            // latency exposed); pinned here, the following compute cluster (32 MFMAs) wedges between the
+            // load and the commit, hiding the latency. Folded into `entry` so it is kept live and every
+            // downstream op (this cluster's gathers, the next compute cluster) orders after the wall.
+            if !anchors.is_empty() {
+                let pin = self.b.sched_fence(0, &anchors).dep();
+                self.entry.push(pin);
             }
         }
     }
@@ -490,7 +504,8 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         // is irrelevant — the split-across-clusters hide only matters in the steady body).
         let mut reg0 = None;
         for t in 0..H::PREFETCH_TILES {
-            reg0 = Some(hooks.prefetch(b, zero, t, reg0, &[]));
+            let (reg, _load_ids) = hooks.prefetch(b, zero, t, reg0, &[]);
+            reg0 = Some(reg);
         }
         let reg0 = reg0.expect("a pipeline has ≥1 prefetch tile");
         let fill0 = hooks.commit(b, zero, &reg0, &[]);
