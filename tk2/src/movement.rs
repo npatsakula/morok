@@ -175,9 +175,28 @@ impl<E: Elem> SharedTile<E> {
     /// source (K-contiguous `[M,K]`/`[N,K]`), `origin` the tile's M/N row base, `grow_stride` the
     /// global row stride (`K`); `epl` elements per lane. The K-column base is passed per iteration to
     /// [`LdsStage::prefetch`].
-    pub(crate) fn stage_view(self, src: Buf<E>, epl: usize, lane: Idx, origin: Idx, grow_stride: i64) -> LdsStage<E> {
-        LdsStage { src, lds: self.lds, epl, lane, cols: self.cols as i64, origin, grow_stride }
+    pub(crate) fn stage_view(
+        self,
+        src: Buf<E>,
+        epl: usize,
+        lane: Idx,
+        origin: Idx,
+        grow_stride: i64,
+        drain: Drain,
+    ) -> LdsStage<E> {
+        LdsStage { src, lds: self.lds, epl, lane, cols: self.cols as i64, origin, grow_stride, drain }
     }
+}
+
+/// The commit's **drain policy** (DESIGN §5c) — how the collaborative fill's LDS writes are made
+/// visible before the RAW barrier. [`Drain::Intrinsic`] is the compiler-visible `ds_write` (an
+/// `s_barrier` auto-drains its `lgkmcnt(0)`); [`Drain::Asm`] is HK's waitcnt-opaque `asm ds_write_b64`
+/// (the barrier can NOT auto-drain it, so the caller drains manually via `swait_lgkmcnt` — the safe
+/// foundation before a later step defers that drain to hide it).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Drain {
+    Intrinsic,
+    Asm,
 }
 
 /// A **rich view over the write/commit side** of a [`SharedTile`] — the movement handle symmetric to
@@ -199,6 +218,7 @@ pub(crate) struct LdsStage<E: Elem> {
     cols: i64,
     origin: Idx,
     grow_stride: i64,
+    drain: Drain,
 }
 
 impl<E: Elem> LdsStage<E> {
@@ -248,6 +268,15 @@ impl<E: Elem> LdsStage<E> {
     /// observe — ridden onto the LDS handle ONCE via `lds_after` (empty on the prologue block-0 commit,
     /// kept byte-identical). Returns the store effects the RAW barrier fences.
     pub(crate) fn commit(self, b: &mut Builder, loaded: &[Val<E>], war: &[TileId]) -> Vec<Effect> {
+        match self.drain {
+            Drain::Intrinsic => self.commit_intrinsic(b, loaded, war),
+            Drain::Asm => self.commit_asm(b, loaded, war, None),
+        }
+    }
+
+    /// The compiler-visible commit (`store_lds_vec` → `ds_write`): an `s_barrier` auto-drains its
+    /// `lgkmcnt(0)`. Returns the store effects the RAW barrier fences. Byte-identical to the original.
+    fn commit_intrinsic(self, b: &mut Builder, loaded: &[Val<E>], war: &[TileId]) -> Vec<Effect> {
         const VEC: usize = 4;
         let lds = if war.is_empty() { self.lds } else { b.lds_after(self.lds, war) };
         let epl_c = b.idx_const(self.epl as i64);
@@ -263,6 +292,42 @@ impl<E: Elem> LdsStage<E> {
                 let rc = b.idx_mul(r, cols_c);
                 let dst_off = b.idx_add(rc, col);
                 b.store_lds_vec(lds, dst_off, loaded[cc])
+            })
+            .collect()
+    }
+
+    /// The **asm commit** (§5c — HK's waitcnt-opaque `asm ds_write_b64`): SAME `epl/VEC` chunk loop and
+    /// SAME `flat`/`r`/`c`/`lds_col`/`dst_off` addressing as [`Self::commit_intrinsic`] (hash-cons-shared
+    /// with the intrinsic path's index nodes), but each store is an `asm ds_write_b64` from ONE base
+    /// pointer (`lds_ptr_as3`, `off_bytes=0`). The `sideeffect` writes chain in program order via `prev`
+    /// (seeded by `prev0` — the caller threads A's tail into B so BOTH survive one drain). The RAW
+    /// barrier can NOT auto-drain these — the caller emits ONE `swait_lgkmcnt` on the last write instead.
+    pub(crate) fn commit_asm(
+        self,
+        b: &mut Builder,
+        loaded: &[Val<E>],
+        war: &[TileId],
+        prev0: Option<TileId>,
+    ) -> Vec<Effect> {
+        const VEC: usize = 4;
+        let lds = if war.is_empty() { self.lds } else { b.lds_after(self.lds, war) };
+        let epl_c = b.idx_const(self.epl as i64);
+        let lane_epl = b.idx_mul(self.lane, epl_c);
+        let cols_c = b.idx_const(self.cols);
+        let mut prev = prev0;
+        (0..self.epl / VEC)
+            .map(|cc| {
+                let ec = b.idx_const((cc * VEC) as i64);
+                let flat = b.idx_add(lane_epl, ec);
+                let r = b.idx_div(flat, cols_c);
+                let c = b.idx_mod(flat, cols_c);
+                let col = b.lds_col(r, c, self.cols as usize);
+                let rc = b.idx_mul(r, cols_c);
+                let dst_off = b.idx_add(rc, col);
+                let base_ptr = b.lds_ptr_as3(lds, dst_off, &[]);
+                let w = b.ds_write_b64(base_ptr, 0, loaded[cc], prev);
+                prev = Some(w.dep());
+                w
             })
             .collect()
     }

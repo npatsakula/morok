@@ -241,6 +241,36 @@ fn matmul_lds_kblock_clustered_lowers_and_balances_the_wave_phase() {
 }
 
 #[test]
+fn clustered_asm_commit_emits_ds_write_b64_and_the_manual_drain() {
+    // Phase C-a: the clustered kernel's commit is HK's waitcnt-opaque `asm ds_write_b64` + an EXPOSED
+    // manual `s_waitcnt lgkmcnt(0)` drain (host render, no GPU). Contrast: the intrinsic `_pipe` kernel
+    // (asm_commit=false) carries NEITHER — its LDS fill is the compiler-visible vector store.
+    use svod_dtype::AmdArch;
+    let render = |prog: &crate::Program| -> String {
+        let linearized = lower::verify(prog).expect("kernel lowers spec-valid");
+        let Op::Program { linear: Some(lin), .. } = linearized.op() else { panic!("no linear stage") };
+        let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(AmdArch::Gfx942);
+        svod_codegen::traits::Renderer::render(&renderer, lin, Some(&prog.name)).expect("render").code
+    };
+
+    let clustered = crate::kernels::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64)
+        .apply(crate::passes::VectorizePass)
+        .apply(crate::passes::SwizzlePass);
+    let code = render(&clustered);
+    assert!(code.contains("ds_write_b64"), "clustered commit must emit the asm ds_write_b64");
+    assert!(code.contains("s_waitcnt lgkmcnt(0)"), "clustered commit must emit the exposed manual drain");
+
+    // The intrinsic path is untouched: `_pipe` renders neither the asm write nor the manual drain (its
+    // commit is `store … addrspace(3)`, which the compiler-visible waitcnt/barrier handles implicitly).
+    let pipe = crate::kernels::matmul_lds_kblock_mw_pipe(128, 128, 256, 64, 64, 2, 2, 64)
+        .apply(crate::passes::VectorizePass)
+        .apply(crate::passes::SwizzlePass);
+    let pipe_code = render(&pipe);
+    assert!(!pipe_code.contains("ds_write_b64"), "intrinsic commit must NOT emit the asm ds_write_b64");
+    assert!(!pipe_code.contains("s_waitcnt lgkmcnt(0)"), "intrinsic commit must NOT emit a manual drain");
+}
+
+#[test]
 fn matmul_lds_kblock_carries_two_barriers_per_kstep() {
     // Structural: the single-buffer WAR needs a RAW fence (after fill) AND a WAR fence
     // (after the LDS reads) — at least two Barriers in the K-loop body.

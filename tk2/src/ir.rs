@@ -262,6 +262,21 @@ pub enum Node {
     /// silent-stale-read class §2.1). Renders as `read.bitcast(<ept×bf16>)` of the `<ept×i16>`
     /// asm result.
     DsReadB64 { base_ptr: TileId, off_bytes: i64, ept: usize, dtype: DType, prev: Option<TileId> },
+    /// ONE inline-asm `ds_write_b64 $base, $val offset:N` LDS store (gfx942, DESIGN §5c — the
+    /// **commit** twin of [`Node::DsReadB64`]): writes the `ept`-element bf16 `value` to
+    /// `base_ptr + off_bytes`. Being `asm sideeffect` it is OPAQUE to LLVM's waitcnt pass, so unlike
+    /// [`Node::StoreVecAt`] an `s_barrier` does NOT auto-drain it — HK's escape from the barrier's
+    /// implicit `lgkmcnt(0)` (the writes stay in flight until a manual [`Node::SWaitLgkmcnt`] drains
+    /// them where the schedule wants). `prev` chains the `sideeffect` writes in program order (an
+    /// ordering-only operand — the prior fragment's write — keeping them from hoisting across the
+    /// barriers, the silent-stale class §2.1). An EFFECT (a side-effect store, like [`Node::Barrier`]).
+    DsWriteB64 { base_ptr: TileId, off_bytes: i64, value: TileId, ept: usize, prev: Option<TileId> },
+    /// The **manual LDS drain** (`s_waitcnt lgkmcnt(0)`, gfx942 §5c): a void `asm sideeffect` that
+    /// stalls until every outstanding LDS op completes — the EXPOSED drain the [`Node::DsWriteB64`]
+    /// commit needs (its writes are waitcnt-opaque, so the RAW `s_barrier` no longer fences them; this
+    /// re-establishes the store→barrier→load order). `prev` is the last commit write (an ordering-only
+    /// operand pinning the drain after the writes in program order). An EFFECT.
+    SWaitLgkmcnt { prev: TileId },
     /// A workgroup synchronization barrier (`s.barrier`): `body` (a store) passes
     /// through as the effect, and every write in `deps` is fenced — all must complete
     /// before any consumer routed [`Node::After`] this barrier proceeds. This is the
@@ -451,6 +466,10 @@ impl TileIr {
             Node::DsReadB64 { base_ptr, off_bytes, ept, dtype, prev } => {
                 Node::DsReadB64 { base_ptr: f(base_ptr), off_bytes, ept, dtype, prev: prev.map(&mut f) }
             }
+            Node::DsWriteB64 { base_ptr, off_bytes, value, ept, prev } => {
+                Node::DsWriteB64 { base_ptr: f(base_ptr), off_bytes, value: f(value), ept, prev: prev.map(&mut f) }
+            }
+            Node::SWaitLgkmcnt { prev } => Node::SWaitLgkmcnt { prev: f(prev) },
             Node::Barrier { body, deps } => {
                 Node::Barrier { body: f(body), deps: deps.into_iter().map(&mut f).collect() }
             }
@@ -525,6 +544,8 @@ impl TileIr {
             Node::StoreGlobal { .. }
             | Node::StoreRegVec { .. }
             | Node::StoreVecAt { .. }
+            | Node::DsWriteB64 { .. }
+            | Node::SWaitLgkmcnt { .. }
             | Node::Barrier { .. }
             | Node::SchedFence { .. }
             | Node::SetPrio { .. }

@@ -502,6 +502,31 @@ impl Builder {
         Val::wrap(self.ir.intern(Node::DsReadB64 { base_ptr: base_ptr.0, off_bytes, ept, dtype: E::dtype(), prev }))
     }
 
+    /// ONE inline-asm `ds_write_b64 $base, $val offset:N` LDS store (gfx942 §5c — HK's **commit**: the
+    /// waitcnt-opaque write twin of [`Self::ds_read_b64`]): stores the `ept`-element `value` to
+    /// `base_ptr + off_bytes`. Being `asm sideeffect` the `s_barrier` does NOT auto-drain it — pair it
+    /// with an EXPOSED [`Self::swait_lgkmcnt`] to re-establish store→barrier→load order. `off_bytes` is
+    /// a compile-time immediate (≤ 65535); `prev` chains the writes in program order (the prior write).
+    pub fn ds_write_b64<E: Elem>(
+        &mut self,
+        base_ptr: Idx,
+        off_bytes: i64,
+        value: Val<E>,
+        prev: Option<TileId>,
+    ) -> Effect {
+        assert!((0..=65535).contains(&off_bytes), "ds_write_b64 offset {off_bytes}B exceeds the 16-bit immediate");
+        // `ept` = the operand vector width, read off the value's derived shape (`<ept×E>`).
+        let ept = self.ir.meta(value.id).shape.iter().copied().product::<usize>().max(1);
+        Effect(self.ir.intern(Node::DsWriteB64 { base_ptr: base_ptr.0, off_bytes, value: value.id, ept, prev }))
+    }
+
+    /// The **manual LDS drain** (`s_waitcnt lgkmcnt(0)`, §5c): a void `asm sideeffect` ordered after
+    /// `prev` (the last commit write) that stalls until every outstanding LDS op completes — the
+    /// exposed drain the asm [`Self::ds_write_b64`] commit needs (its writes are waitcnt-opaque).
+    pub fn swait_lgkmcnt(&mut self, prev: TileId) -> Effect {
+        Effect(self.ir.intern(Node::SWaitLgkmcnt { prev }))
+    }
+
     /// One K-fragment MFMA `D = A·B + C` (gfx942 16×16×16 bf16→f32) via the **intrinsic**.
     /// `a`/`b` are the bf16 fragment operands, `c` the f32 accumulator; returns the f32 result.
     pub fn mma(&mut self, a: Val<BF16>, b: Val<BF16>, c: Val<F32>, ept: usize) -> Val<F32> {

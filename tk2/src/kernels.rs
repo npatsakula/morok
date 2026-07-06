@@ -12,7 +12,7 @@
 
 use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId, TileIr};
-use crate::movement::{LdsStage, LdsView, SharedTile};
+use crate::movement::{Drain, LdsStage, LdsView, SharedTile};
 use crate::pass::Pass;
 use crate::pipeline::{Compute, Hooks, Mem, pipeline};
 
@@ -653,15 +653,22 @@ struct FillRegs {
 /// `(A-vecs, B-vecs)` operand bundle of one K-slice; `Reg` is [`FillRegs`]. The bodies are the SAME
 /// emission the whole-block path uses (`prefetch_fn`/`commit_fn` + the per-slice gather/mma) — the
 /// clustered kernel is byte-identical to the pre-refactor interpreter under hash-consing.
+/// One K-slice's matmul operand bundle: the `ri` A-fragments + `cj` B-fragments the compute MFMAs.
+type MatmulOp = (Vec<Val<BF16>>, Vec<Val<BF16>>);
+
 struct MatmulHooks {
     a_view: LdsView<BF16>,
     b_view: LdsView<BF16>,
     a_stage: LdsStage<BF16>,
     b_stage: LdsStage<BF16>,
+    /// Phase C: HK's waitcnt-opaque `asm ds_write_b64` commit + an EXPOSED manual drain. When set, the
+    /// stages (built with `Drain::Asm`) emit asm writes chained A→B into ONE prev chain, and `commit`
+    /// appends ONE `s_waitcnt lgkmcnt(0)` on the last write (the RAW barrier can't auto-drain the asm).
+    asm_commit: bool,
 }
 
 impl Hooks for MatmulHooks {
-    type Op = (Vec<Val<BF16>>, Vec<Val<BF16>>);
+    type Op = MatmulOp;
     type Reg = FillRegs;
 
     fn prefetch(&mut self, b: &mut Builder, k_base: Idx) -> (FillRegs, Vec<TileId>) {
@@ -673,9 +680,21 @@ impl Hooks for MatmulHooks {
     }
 
     fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &FillRegs, war: &[TileId]) -> Vec<Effect> {
-        let fa = self.a_stage.commit(b, &reg.a, war);
-        let fb = self.b_stage.commit(b, &reg.b, war);
-        fa.into_iter().chain(fb).collect()
+        if self.asm_commit {
+            // Asm commit (§5c): chain A then B writes into ONE `prev` chain (thread A's tail into B) so a
+            // single drain keeps BOTH reachable, then emit ONE `s_waitcnt lgkmcnt(0)` on the last write —
+            // the exposed manual drain that replaces the `s_barrier`'s (now-absent) auto-drain of the
+            // waitcnt-opaque asm. The RAW barrier fences that one drained effect.
+            let fa = self.a_stage.commit_asm(b, &reg.a, war, None);
+            let a_last = fa.last().map(|e| e.dep());
+            let fb = self.b_stage.commit_asm(b, &reg.b, war, a_last);
+            let last = fb.last().expect("b commit emits at least one write").dep();
+            vec![b.swait_lgkmcnt(last)]
+        } else {
+            let fa = self.a_stage.commit(b, &reg.a, war);
+            let fb = self.b_stage.commit(b, &reg.b, war);
+            fa.into_iter().chain(fb).collect()
+        }
     }
 
     fn gather(&mut self, b: &mut Builder, slice: usize, raw: &[TileId]) -> (Self::Op, Vec<TileId>, TileId) {
@@ -885,6 +904,7 @@ fn kblock_impl(
     clustered: bool,
     asm_gather: bool,
     resident: bool,
+    asm_commit: bool,
 ) -> Program {
     assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
     assert!(k_step.is_multiple_of(EDGE) && k.is_multiple_of(k_step), "k_step multiple of 16, K multiple of k_step");
@@ -902,6 +922,10 @@ fn kblock_impl(
     // Compute-residency (stage the tile once, no steady-loop global load) only makes sense for the
     // clustered pipeline — it decomposes that body into the HK schedule with prefetch/commit dropped.
     let resident = resident && clustered;
+    // The asm `ds_write_b64` commit (§5c Phase C) is the clustered path's waitcnt-opaque write. Gated to
+    // clustered so the whole-block `commit_fn` (which does not drain) only ever sees `Drain::Intrinsic`.
+    let asm_commit = asm_commit && clustered;
+    let commit_drain = if asm_commit { Drain::Asm } else { Drain::Intrinsic };
     // Workgroup output tile = (bm·wm) × (bn·wn), computed by a wm×wn grid of 64-lane warps.
     let (big_m, big_n, nthreads) = (bm * wm, bn * wn, wm * wn * WARP);
     assert!(m.is_multiple_of(big_m) && n.is_multiple_of(big_n), "m/n must tile by (bm·wm)/(bn·wn)");
@@ -968,8 +992,8 @@ fn kblock_impl(
     let b_view = b_tile.gather_view(bc_map, cj, warp_col_off, wlane, asm_gather);
     // A[M,K] and B[N,K] are BOTH K-contiguous → the identical trivial coalesced fill: `origin` = the
     // M/N row base, `grow_stride` = K. No transpose, no `v_perm` — B's fill IS A's fill.
-    let a_stage = a_tile.stage_view(a, epl_a, tid, tm_bm, k as i64);
-    let b_stage = b_tile.stage_view(bmat, epl_b, tid, tn_bn, k as i64);
+    let a_stage = a_tile.stage_view(a, epl_a, tid, tm_bm, k as i64, commit_drain);
+    let b_stage = b_tile.stage_view(bmat, epl_b, tid, tn_bn, k as i64, commit_drain);
 
     // ── accumulators: one 16×16 f32 fragment per (i,j), zero-initialised. ──
     let acc: Vec<Frag<F32>> = (0..ri * cj).map(|_| b.define_frag::<F32>(bc_map)).collect();
@@ -1054,7 +1078,7 @@ fn kblock_impl(
         // at C1/C3/C5/C7). The pipeline combinator owns ALL placement (per-cluster barrier + set_prio
         // brackets, warp-phase ping-pong, End-fold, resident fork) and runs the completeness verifier
         // at `.build()`; the author declares only the schedule + the `MatmulHooks` (§5c cluster model).
-        let hooks = MatmulHooks { a_view, b_view, a_stage, b_stage };
+        let hooks = MatmulHooks { a_view, b_view, a_stage, b_stage, asm_commit };
         // The compute clusters carry the kernel math (the `ri×cj` MFMA loop) as an edge-free `body` —
         // the combinator brackets it with `set_prio` + the acc round-trip. This is what makes the
         // compute side pluggable: FA's softmax/PV clusters carry their own body, `Hooks` never grows a
@@ -1062,7 +1086,7 @@ fn kblock_impl(
         let mma = |s: usize| -> Compute<MatmulHooks> {
             Compute::new(
                 s,
-                move |b: &mut Builder, op: Option<&(Vec<Val<BF16>>, Vec<Val<BF16>>)>, reads: &[Val<F32>]| {
+                move |b: &mut Builder, op: Option<&MatmulOp>, reads: &[Val<F32>]| {
                     let (a_vecs, b_vecs) = op.expect("matmul compute consumes a gathered operand");
                     let mut out = Vec::with_capacity(ri * cj);
                     for i in 0..ri {
@@ -1115,7 +1139,7 @@ fn kblock_impl(
 /// K_STEP=16 — the first tk2 matmul to beat naive at scale. See [`kblock_impl`]. Compose
 /// `.apply(`[`SwizzlePass`](crate::passes::SwizzlePass)`)` for the bank-swizzled variant.
 pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, 1, 1, EDGE, 1, false, false, false)
+    kblock_impl(m, n, k, bm, bn, 1, 1, EDGE, 1, false, false, false, false)
 }
 
 /// **Multi-warp** K-blocked matmul (DESIGN.md §5b, the bigger-tile lever): a `wm×wn` grid
@@ -1135,7 +1159,7 @@ pub fn matmul_lds_kblock_mw(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 1, false, false, false)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 1, false, false, false, false)
 }
 
 /// **Register-staged pipelined** multi-warp K-blocked matmul (`stages=2`, DESIGN §5b): the
@@ -1154,7 +1178,7 @@ pub fn matmul_lds_kblock_mw_pipe(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, false, false, false)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, false, false, false, false)
 }
 
 /// The **clustered HK replica** (DESIGN §5c): [`matmul_lds_kblock_mw_pipe`]'s tile + stages=2
@@ -1174,7 +1198,7 @@ pub fn matmul_lds_kblock_mw_clustered(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, false)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, false, true)
 }
 
 /// The **compute-resident HK microkernel** (the apples-to-apples benchmark): identical to
@@ -1199,7 +1223,7 @@ pub fn matmul_lds_kblock_mw_resident(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, true)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, true, true)
 }
 
 /// The **vectorised** K-blocked kernel: the scalar-gather base with
@@ -1225,5 +1249,5 @@ pub fn matmul_lds_kblock_sw(m: usize, n: usize, k: usize, bm: usize, bn: usize, 
 /// swizzle. `k_step ∈ {16,32,64}` if swizzling; bigger `k_step` = fewer barriers, more LDS
 /// + operand VGPR (the occupancy trade the harness resolves).
 pub fn matmul_lds_kblock_ks(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, 1, 1, k_step, 1, false, false, false)
+    kblock_impl(m, n, k, bm, bn, 1, 1, k_step, 1, false, false, false, false)
 }

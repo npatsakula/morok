@@ -266,6 +266,35 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             );
             read.bitcast(dtype.vec(ept).expect("ds_read_b64: bf16 vec"))
         }
+        // ONE `ds_write_b64 $0, $1 offset:N` LDS store (gfx942 §5c — the commit twin of `DsReadB64`).
+        // The `sideeffect` asm writes the bf16 operand (bitcast to `<ept×i16>`) to `base_ptr + off_bytes`;
+        // `prev` (the prior fragment's write) rides as an ordering-only operand so the writes stay in
+        // program order and cannot hoist across the barriers. Waitcnt-opaque by construction — an
+        // `s_barrier` no longer auto-drains it (that is the point), so a `SWaitLgkmcnt` drains it manually.
+        Node::DsWriteB64 { base_ptr, off_bytes, value, ept, prev } => {
+            let base_ptr = get(low, base_ptr);
+            let val = get(low, value).bitcast(DType::Int16.vec(ept).expect("ds_write_b64: i16 vec"));
+            let mut deps: SmallVec<[Arc<UOp>; 4]> = smallvec![base_ptr, val];
+            if let Some(p) = prev {
+                deps.push(get(low, p));
+            }
+            UOp::custom(
+                deps,
+                format!(
+                    "call void asm sideeffect \"ds_write_b64 $0, $1 offset:{off_bytes}\", \"v,v\"\
+                     (ptr addrspace(3) {{0}}, <{ept} x i16> {{1}})"
+                ),
+                DType::Void,
+            )
+        }
+        // The manual LDS drain (`s_waitcnt lgkmcnt(0)`) — a void `asm sideeffect` ordered after the last
+        // commit write (`prev`), re-establishing the store→barrier→load order the waitcnt-opaque asm
+        // commit would otherwise lose.
+        Node::SWaitLgkmcnt { prev } => UOp::custom(
+            smallvec![get(low, prev)],
+            "call void asm sideeffect \"s_waitcnt lgkmcnt(0)\", \"\"()".to_string(),
+            DType::Void,
+        ),
         Node::Barrier { body, deps } => {
             let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();
             get(low, body).barrier(deps)
