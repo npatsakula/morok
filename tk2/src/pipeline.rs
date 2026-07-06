@@ -101,6 +101,16 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     k_next: Option<Idx>,
     n_acc: usize,
     commit_drain: CommitDrain,
+    /// The **HK bare-seal policy** (§5c): when set, cluster seals lower to a bare `s_barrier`
+    /// ([`Builder::bare_barrier`]) instead of the acq-rel-fenced [`Builder::barrier`], and the LDS
+    /// ordering the fence dropped is re-supplied by an explicit `s_waitcnt lgkmcnt(0)` before each
+    /// compute cluster with undrained gathers (mirroring HK's 3-drains-per-K-block vs the fence's 9).
+    bare_seals: bool,
+    /// The **MFMA-cluster pin** (§5c, the ISA-diff fix): when set, each compute cluster's MFMA run is
+    /// bracketed by a LEADING + trailing `sched.barrier(0)`, so LLVM cannot fracture the independent
+    /// 32-MFMA run nor sink an `s_barrier`/`s_waitcnt lgkmcnt(0)` into the middle of it (the measured
+    /// re-batch — `kernel_instr.md §2`: intrinsic MFMAs are NOT held by a single positional fence).
+    pin_mfma: bool,
     // ── carries (persist across clusters within one body) ──
     entry: Vec<TileId>,
     prev_store: Vec<TileId>,
@@ -110,6 +120,10 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     raw_next: Option<TileId>,
     tail_barrier: Option<TileId>,
     first_compute: bool,
+    /// Bare-seal drain bookkeeping: `true` once a gather has issued `ds_read`s not yet covered by an
+    /// `lgkmcnt(0)` drain. A compute cluster drains + clears it before its MFMAs; a commit's WAR drain
+    /// clears it too (so the following compute needs no drain — HK's C7). Reset false each body pass.
+    undrained: bool,
     // ── per-cluster (reset by the driver before each cluster) ──
     this_gathers: Vec<TileId>,
     sealed: bool,
@@ -119,6 +133,14 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
 }
 
 impl<H: Hooks> ClusterCx<'_, H> {
+    /// A **cluster seal** — the workgroup `s_barrier` closing a cluster. Under the bare-seal policy it
+    /// is a bare `s_barrier` (no acq-rel fence, so no forced `lgkmcnt(0)` and no MFMA-overlap throttle);
+    /// otherwise the acq-rel-fenced barrier. The LDS ordering a bare seal drops is re-supplied by the
+    /// explicit drains in [`Self::compute`]/[`Self::commit`], so callers pass the SAME `(body, deps)`.
+    fn seal(&mut self, body: Effect, deps: &[TileId]) -> Effect {
+        if self.bare_seals { self.b.bare_barrier(body, deps) } else { self.b.barrier(body, deps) }
+    }
+
     /// The **prefetch** safe op = the `if mc.prefetch && Some(kn)=k_next { reg = ... }` arm: stage
     /// block k+1 global→VGPR (steady only — a no-op when `k_next` is `None`, e.g. epilogue/resident).
     pub(crate) fn prefetch(&mut self, tiles: &[usize]) {
@@ -156,6 +178,8 @@ impl<H: Hooks> ClusterCx<'_, H> {
         self.this_gathers.extend(g.iter().copied());
         self.all_gathers.extend(g.iter().copied());
         self.operands[s] = Some((op, op_anchor));
+        // A bare seal will NOT drain these `ds_read`s — flag them for the next compute cluster's drain.
+        self.undrained = true;
     }
 
     /// The **commit** safe op = the commit arm: WAR-fence EVERY gather so far, `commit`, RAW-fence
@@ -176,9 +200,14 @@ impl<H: Hooks> ClusterCx<'_, H> {
                 // between the commit and the shadowing cluster → the C7-tail write-drain finally defers.
                 // This is HK's WAR-guard drain (hk.dis 0x2830), and it IS the read-before-overwrite WAR.
                 let rd = self.b.swait_lgkmcnt(self.all_gathers[last]);
-                self.b.barrier(rd, &self.all_gathers[..last])
+                // The WAR drain (`lgkmcnt(0)`) also clears the bare-seal pending drain — it covers every
+                // outstanding gather read, so the shadowing compute cluster (HK's C7) needs no drain.
+                self.undrained = false;
+                let deps: Vec<TileId> = self.all_gathers[..last].to_vec();
+                self.seal(rd, &deps)
             } else {
-                self.b.barrier(Effect(self.all_gathers[0]), &self.all_gathers[1..])
+                let deps: Vec<TileId> = self.all_gathers[1..].to_vec();
+                self.seal(Effect(self.all_gathers[0]), &deps)
             };
             // `fill` = the commit's write effects (intrinsic `ds_write` stores OR asm `ds_write_b64`
             // writes). The DRAIN is owned here now (not by the hook), dispatched on the policy.
@@ -187,7 +216,9 @@ impl<H: Hooks> ClusterCx<'_, H> {
             match self.commit_drain {
                 CommitDrain::IntrinsicAuto => {
                     // The compiler-visible stores: this RAW barrier auto-drains their `lgkmcnt(0)`.
-                    let rn = self.b.barrier(fill[0], &fill_deps).dep();
+                    // (IntrinsicAuto is never paired with `bare_seals`, so `seal` = the fenced barrier
+                    // whose acquire IS that auto-drain — the invariant is unchanged here.)
+                    let rn = self.seal(fill[0], &fill_deps).dep();
                     self.raw_next = Some(rn);
                     self.tail_barrier = Some(rn);
                     self.entry = vec![rn];
@@ -195,7 +226,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
                 CommitDrain::AsmExposed => {
                     // C-a: the opaque asm writes need an EXPOSED manual drain here at C6 (0-MFMA shadow).
                     let sw = self.b.swait_lgkmcnt(fill.last().expect("asm commit emits ≥1 write").dep());
-                    let rn = self.b.barrier(sw, &[]).dep();
+                    let rn = self.seal(sw, &[]).dep();
                     self.raw_next = Some(rn);
                     self.tail_barrier = Some(rn);
                     self.entry = vec![rn];
@@ -203,7 +234,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
                 CommitDrain::AsmDeferred => {
                     // C-b: leave the C6 RAW barrier BARE — the opaque asm writes are NOT drained by it.
                     // The drain is deferred to C7's tail (`pending_drain`); `raw_next` is set there.
-                    let rn = self.b.barrier(fill[0], &fill_deps).dep();
+                    let rn = self.seal(fill[0], &fill_deps).dep();
                     self.tail_barrier = Some(rn);
                     self.entry = vec![rn];
                     self.pending_drain = true;
@@ -235,10 +266,36 @@ impl<H: Hooks> ClusterCx<'_, H> {
             }
             None => (None, None),
         };
+        // Bare-seal LDS drain (HK's C1/C3 `s_waitcnt lgkmcnt(0)`): a bare seal did NOT drain the prior
+        // mem cluster's gather `ds_read`s, so before an operand-consuming compute emit ONE `lgkmcnt(0)`
+        // (it covers every outstanding read) and route it into the acc reads below, so the MFMAs order
+        // after the data has arrived. Skipped when a fenced seal already drained (`!bare_seals`) or no
+        // reads are outstanding (`!undrained` — HK's C5/C7, covered by an earlier drain or the commit).
+        if self.bare_seals
+            && self.undrained
+            && operand.is_some()
+            && let Some(&last) = self.all_gathers.last()
+        {
+            let drain = self.b.swait_lgkmcnt(last).dep();
+            self.entry.push(drain);
+            self.undrained = false;
+        }
         // `set_prio(1)` anchors on the operand VALUE, so it exists only when there IS an operand; an
         // operand-less compute skips it (nothing nameable before the reads) and relies on the closing
         // `set_prio(0)` + barrier.
         let prio1 = op_anchor.map(|a| self.b.set_prio(1, &[a]).dep());
+        // MFMA-cluster LEADING pin (§5c ISA fix): a `sched.barrier(0)` after the cluster entry (the
+        // mem-seal `s_barrier`) + the gathered operand `ds_read`s, but BEFORE the acc reads → the MFMAs
+        // order after it, so LLVM can neither sink the seal barrier / `lgkmcnt(0)` down into the 32-MFMA
+        // run nor hoist the run's first MFMA above the reads. Paired with the trailing pin, the run is
+        // indivisible (the measured re-batch cure — a single trailing fence did NOT hold it).
+        if self.pin_mfma {
+            let mut anchors: Vec<TileId> = self.entry.clone();
+            anchors.extend(op_anchor);
+            anchors.extend(prio1);
+            let lead = self.b.sched_fence(0, &anchors).dep();
+            self.entry.push(lead);
+        }
         let mut reads: Vec<Val<F32>> = Vec::with_capacity(self.n_acc);
         for ij in 0..self.n_acc {
             let mut deps = if self.first_compute { self.carry[ij].clone() } else { vec![self.prev_store[ij]] };
@@ -271,12 +328,21 @@ impl<H: Hooks> ClusterCx<'_, H> {
             // it, so the manual `lgkmcnt` lands past the 32 MFMAs: HK's [bare barrier → 32 mfma → drain].
             let fence = self.b.sched_fence(0, &new_ids);
             let sw = self.b.swait_lgkmcnt(fence.dep());
-            let bar = self.b.barrier(sw, &self.prev_store).dep();
+            let deps = self.prev_store.clone();
+            let bar = self.seal(sw, &deps).dep();
             self.raw_next = Some(bar);
             self.pending_drain = false;
             bar
         } else {
-            self.b.barrier(stores[self.n_acc - 1], &self.prev_store[..self.n_acc - 1]).dep()
+            // MFMA-cluster TRAILING pin (§5c ISA fix): a `sched.barrier(0)` on ALL 32 MFMA RESULTS, so
+            // the tail `s_barrier` cannot hoist up into the run. (The `pending_drain`/C7 branch already
+            // emits this fence for its deferred drain; this gives the other compute clusters the same.)
+            let body = stores[self.n_acc - 1];
+            let mut deps: Vec<TileId> = self.prev_store[..self.n_acc - 1].to_vec();
+            if self.pin_mfma {
+                deps.push(self.b.sched_fence(0, &new_ids).dep());
+            }
+            self.seal(body, &deps).dep()
         };
         self.tail_barrier = Some(bar);
         self.entry = vec![bar, prio0];
@@ -375,6 +441,8 @@ fn run_body<H: Hooks>(
     carry: &[Vec<TileId>],
     k_next: Option<Idx>,
     commit_drain: CommitDrain,
+    bare_seals: bool,
+    pin_mfma: bool,
 ) -> BodyOut {
     let mut cx = ClusterCx {
         b,
@@ -385,6 +453,8 @@ fn run_body<H: Hooks>(
         k_next,
         n_acc,
         commit_drain,
+        bare_seals,
+        pin_mfma,
         entry: Vec::new(),
         prev_store: Vec::new(),
         all_gathers: Vec::new(),
@@ -393,6 +463,7 @@ fn run_body<H: Hooks>(
         raw_next: None,
         tail_barrier: None,
         first_compute: true,
+        undrained: false,
         this_gathers: Vec::new(),
         sealed: false,
         pending_drain: false,
@@ -406,7 +477,9 @@ fn run_body<H: Hooks>(
         // cluster. A cluster that emitted nothing (epilogue commit) is skipped.
         if !cx.this_gathers.is_empty() && !cx.sealed {
             let n = cx.this_gathers.len();
-            let bar = cx.b.barrier(Effect(cx.this_gathers[n - 1]), &cx.this_gathers[..n - 1]).dep();
+            let body = Effect(cx.this_gathers[n - 1]);
+            let deps: Vec<TileId> = cx.this_gathers[..n - 1].to_vec();
+            let bar = cx.seal(body, &deps).dep();
             cx.tail_barrier = Some(bar);
             cx.entry = vec![bar];
         }
@@ -430,11 +503,14 @@ pub(crate) struct Pipeline<'a, H: Hooks> {
     asm_gather: bool,
     resident: bool,
     commit_drain: CommitDrain,
+    bare_seals: bool,
+    pin_mfma: bool,
     clusters: Vec<Box<dyn Cluster<H>>>,
 }
 
 /// Open a clustered pipeline over `hooks`. `nblocks = k/k_step ≥ 2`; `warp_row = Some` enables the
-/// wave-phase ping-pong; `resident` drops the steady prefetch/commit (compute-resident microkernel).
+/// wave-phase ping-pong; `resident` drops the steady prefetch/commit (compute-resident microkernel);
+/// `bare_seals` swaps the acq-rel-fenced cluster barriers for HK's bare `s_barrier` + explicit drains.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pipeline<'a, H: Hooks>(
     b: &'a mut Builder,
@@ -447,6 +523,8 @@ pub(crate) fn pipeline<'a, H: Hooks>(
     asm_gather: bool,
     resident: bool,
     commit_drain: CommitDrain,
+    bare_seals: bool,
+    pin_mfma: bool,
     hooks: H,
 ) -> Pipeline<'a, H> {
     Pipeline {
@@ -461,6 +539,8 @@ pub(crate) fn pipeline<'a, H: Hooks>(
         asm_gather,
         resident,
         commit_drain,
+        bare_seals,
+        pin_mfma,
         clusters: Vec::new(),
     }
 }
@@ -490,6 +570,8 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             asm_gather,
             resident,
             commit_drain,
+            bare_seals,
+            pin_mfma,
             clusters,
         } = self;
         assert!(nblocks >= 2, "pipeline needs nblocks ≥ 2");
@@ -551,6 +633,8 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             &carry,
             steady_k_next,
             commit_drain,
+            bare_seals,
+            pin_mfma,
         );
 
         // ── loop close: fold the last-slice stores, raw_next (LDS carry, streaming only), AND the
@@ -574,8 +658,20 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         // ── epilogue: the same schedule for the LAST block (via the End's carried RAW), no
         //    prefetch/commit; then the eq=0 wave-phase barrier rebalances warp-row 0. ──
         let ep_carry: Vec<Vec<TileId>> = (0..n_acc).map(|_| Vec::new()).collect();
-        let ep =
-            run_body(b, &clusters, &mut hooks, ksteps, n_acc, &acc_loop, &[ended.dep()], &ep_carry, None, commit_drain);
+        let ep = run_body(
+            b,
+            &clusters,
+            &mut hooks,
+            ksteps,
+            n_acc,
+            &acc_loop,
+            &[ended.dep()],
+            &ep_carry,
+            None,
+            commit_drain,
+            bare_seals,
+            pin_mfma,
+        );
         let scatter_seed = warp_row.map(|wr| {
             // The eq=0 rebalance barrier ordered after the epilogue's last cluster barrier — the barrier
             // rides as an ordering-only dep (Stage A), not laundered through `idx_after` into warp_row.

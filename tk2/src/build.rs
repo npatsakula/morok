@@ -378,6 +378,16 @@ impl Builder {
         Effect(self.ir.intern(Node::Barrier { body: body.0, deps }))
     }
 
+    /// A **bare workgroup barrier** (`s.barrier()` + a baked `sched.barrier(0)` wall, DESIGN §5c) —
+    /// [`Self::barrier`] *without* the acq-rel fence, so the seal is a pure ping-pong rendezvous and
+    /// does NOT force an `lgkmcnt(0)` LDS drain. The LDS ordering the fence dropped MUST be re-supplied
+    /// by an explicit [`Self::swait_lgkmcnt`] at the RAW/WAR/pre-MFMA points (caller's obligation — a
+    /// missing drain is a silent stale read). `body` + `deps` are pure happens-after anchors.
+    pub fn bare_barrier(&mut self, body: Effect, deps: &[TileId]) -> Effect {
+        let deps = deps.iter().copied().collect();
+        Effect(self.ir.intern(Node::BareBarrier { body: body.0, deps }))
+    }
+
     /// A **machine-scheduler fence** (`sched.barrier(mask)`, DESIGN §5c) positioned right after
     /// `anchors` — the load-pin that keeps the register-staged prefetch in flight: `anchors` are
     /// the prefetch load values, so the fence sits just past them and the AMDGPU scheduler may
@@ -480,6 +490,23 @@ impl Builder {
     /// (f32) or the vectorised gather's write into a bf16 operand fragment.
     pub fn store_frag_vec<E: Elem>(&mut self, f: Frag<E>, value: Val<E>) -> Effect {
         Effect(self.ir.intern(Node::StoreRegVec { buf: f.id, value: value.id }))
+    }
+
+    /// Zero-init an accumulator fragment with ONE **constant-index** `<ept×f32>` vector store
+    /// (`store_frag_vec` of a `vec_build` of `ept` zeros) — the SROA-promotable init.
+    ///
+    /// The prior init (`store_frag_elem` inside a `range(ept)`) wrote the accumulator at a **runtime**
+    /// index, and LLVM's SROA/mem2reg cannot promote an `alloca` accessed at a dynamic index — so the
+    /// whole accumulator stayed in memory and its per-iteration load→mfma→store round-trip never became
+    /// the loop-carried `phi` HipKittens relies on, which let LLVM fracture the 32-MFMA clusters
+    /// (mfmautil 0.39 vs HK 0.65; proven by an `opt -sroa` de-risk on the dumped IR). A single vector
+    /// store at offset 0 keeps every access constant-index + uniform-width ⇒ the fragment promotes to a
+    /// `phi <ept×f32>` and the MFMA runs stay clustered. Returns the store `Effect` (the loop-carry seed
+    /// threaded into the first `load_frag_vec_after`), replacing the old init `Range`/`End` entirely.
+    pub fn zero_init_frag(&mut self, f: Frag<F32>) -> Effect {
+        let zeros: Vec<Val<F32>> = (0..f.map.ept).map(|_| self.f32(0.0)).collect();
+        let zvec = self.vec_build(&zeros);
+        self.store_frag_vec(f, zvec)
     }
 
     /// ONE `<ept×E>` vector load of a contiguous LDS run at flat `base`, ordered after

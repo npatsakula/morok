@@ -21,7 +21,8 @@ use common::{bench_plan, rand_bf16, requirements_met};
 
 use svod_tk2::{
     Program, SwizzlePass, VectorizePass, graph_kernel, matmul, matmul_lds_kblock_mw, matmul_lds_kblock_mw_clustered,
-    matmul_lds_kblock_mw_pipe, matmul_lds_kblock_sw, matmul_lds_kblock_vec, optimize_addressing,
+    matmul_lds_kblock_mw_clustered_bare, matmul_lds_kblock_mw_clustered_pin, matmul_lds_kblock_mw_pipe,
+    matmul_lds_kblock_sw, matmul_lds_kblock_vec, optimize_addressing,
 };
 
 /// f32 ground truth `A·B` over the SAME bf16-rounded operands (both kernel and
@@ -135,6 +136,22 @@ fn bench_matmul(c: &mut Criterion) {
         let (yhk, phk) = plan_of(hk, n, n, &a, &b);
         assert_correct(&yhk, &phk, &expected_abt, n, "kblock_hk");
         group.bench_with_input(BenchmarkId::new("kblock_hk", n), &n, |bch, _| bench_plan(bch, &phk));
+        // §5c bare cluster seals: the SAME schedule with HK's bare `s_barrier` + explicit `lgkmcnt(0)`
+        // drains (3/K-block) replacing the acq-rel fence's implicit drain (9/K-block). The A/B twin —
+        // isolates the barrier-fence overhead (`tk/arch/gfx9.rs:55`: the fence throttles MFMA overlap).
+        let hkb =
+            matmul_lds_kblock_mw_clustered_bare(n, n, n, 128, 64, 2, 4, 64).apply(VectorizePass).apply(SwizzlePass);
+        let (yhkb, phkb) = plan_of(hkb, n, n, &a, &b);
+        assert_correct(&yhkb, &phkb, &expected_abt, n, "kblock_hk_bare");
+        group.bench_with_input(BenchmarkId::new("kblock_hk_bare", n), &n, |bch, _| bench_plan(bch, &phkb));
+        // §5c MFMA-cluster pin: leading + trailing sched.barrier(0) around each 32-MFMA run so LLVM
+        // cannot fracture it (the ISA-diff root cause: fenced replica re-batches into 1+31/1+31/1/63
+        // with an s_barrier sunk mid-cluster, serializing LDS-read vs compute). The direct fix.
+        let hkp =
+            matmul_lds_kblock_mw_clustered_pin(n, n, n, 128, 64, 2, 4, 64).apply(VectorizePass).apply(SwizzlePass);
+        let (yhkp, phkp) = plan_of(hkp, n, n, &a, &b);
+        assert_correct(&yhkp, &phkp, &expected_abt, n, "kblock_hk_pin");
+        group.bench_with_input(BenchmarkId::new("kblock_hk_pin", n), &n, |bch, _| bench_plan(bch, &phkp));
         // FINDING (4096): the complete HK replica REGRESSES — 317→475µs, mfmautil 0.40→0.23. Isolated:
         // the 2-warp-row tiling (VGPR 64→128, occupancy) costs ~14% and the cluster+ping-pong schedule
         // another ~31%. HK's compiler-visible transcription does NOT reach 0.65; the plain pipe wins.

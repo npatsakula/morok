@@ -98,6 +98,37 @@ fn matmul_carries_wmma_and_loop_edges() {
 }
 
 #[test]
+fn accumulator_init_is_a_constant_index_vector_zero_store() {
+    // The SROA-promotability fix (DESIGN §5b / plan curried-brewing-peacock): the accumulator
+    // zero-init must be ONE `StoreRegVec` of a `VecBuild` of f32 zeros (constant index 0), NOT a
+    // variable-index `store_frag_elem` inside a `range(ept)`. A dynamic-index write to the alloca
+    // blocks LLVM SROA/mem2reg from promoting the accumulator's load→mfma→store round-trip to the
+    // loop-carried `phi` HipKittens relies on — which is what let LLVM fracture the MFMA clusters.
+    use crate::ir::{Node, Scalar, TileId};
+    let p = crate::kernels::matmul(64, 64, 64);
+    let ir = &p.ir;
+    let ids = || (0..ir.len()).map(|i| TileId(i as u32));
+    // The single F32 accumulator fragment (operand frags are BF16).
+    let acc = ids()
+        .find(|&id| matches!(ir.node(id), Node::DefineFrag { dtype, .. } if *dtype == DType::Float32))
+        .expect("matmul has an F32 accumulator frag");
+    // Its init is a StoreRegVec of a VecBuild whose elements are all f32-zero consts.
+    let vector_zero_init = ids().any(|id| match ir.node(id) {
+        Node::StoreRegVec { buf, value } if *buf == acc => matches!(ir.node(*value),
+            Node::VecBuild { elements, .. }
+                if elements.iter().all(|&e| matches!(ir.node(e), Node::Const { scalar: Scalar::F32(bits), .. } if *bits == 0))),
+        _ => false,
+    });
+    assert!(vector_zero_init, "accumulator init must be a StoreRegVec of a VecBuild of f32 zeros");
+    // And NO variable-index StoreGlobal writes the accumulator (the promotion-blocking pattern).
+    let dynamic_index_init = ids().any(|id| {
+        matches!(ir.node(id),
+        Node::StoreGlobal { buf, offset, .. } if *buf == acc && !matches!(ir.node(*offset), Node::Const { .. }))
+    });
+    assert!(!dynamic_index_init, "accumulator must have no variable-index StoreGlobal init (SROA blocker)");
+}
+
+#[test]
 fn matmul_lds_kblock_sw_lowering_is_spec_valid() {
     // The bank-swizzled K-blocked kernel (XOR/shift index ops in the LDS addressing)
     // must lower to spec-valid UOp — the swizzle is a bijection, numerically transparent.
@@ -238,6 +269,76 @@ fn matmul_lds_kblock_clustered_lowers_and_balances_the_wave_phase() {
         .apply(crate::passes::VectorizePass)
         .apply(crate::passes::SwizzlePass);
     lower::verify(&sw).expect("clustered.apply(Vectorize).apply(Swizzle) must lower spec-valid");
+}
+
+#[test]
+fn bare_seals_drop_the_acqrel_fence_but_keep_the_barrier_and_drains() {
+    // §5c HK bare seals: the bare clustered kernel must (1) still lower spec-valid, (2) keep a
+    // `BareBarrier` node per cluster seal (the workgroup rendezvous survives — the ping-pong phase
+    // carrier), (3) drop the acq-rel `fence syncscope("workgroup")` the fenced replica emits at every
+    // seal, and (4) still carry explicit `s_waitcnt lgkmcnt(0)` drains (the LDS ordering the fence no
+    // longer provides). This isolates the one variable: the seal's fence, not its rendezvous.
+    use svod_dtype::AmdArch;
+    let render = |prog: &crate::Program| -> String {
+        let linearized = lower::verify(prog).expect("kernel lowers spec-valid");
+        let Op::Program { linear: Some(lin), .. } = linearized.op() else { panic!("no linear stage") };
+        let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(AmdArch::Gfx942);
+        svod_codegen::traits::Renderer::render(&renderer, lin, Some(&prog.name)).expect("render").code
+    };
+    let count = |p: &crate::Program, pred: &dyn Fn(&Node) -> bool| {
+        (0..p.ir.len()).filter(|&i| pred(p.ir.node(crate::ir::TileId(i as u32)))).count()
+    };
+    let cfg = (256usize, 256usize, 256usize, 128usize, 64usize, 2usize, 4usize, 64usize);
+    let (m, n, k, bm, bn, wm, wn, ks) = cfg;
+    let fenced = crate::kernels::matmul_lds_kblock_mw_clustered(m, n, k, bm, bn, wm, wn, ks)
+        .apply(crate::passes::VectorizePass)
+        .apply(crate::passes::SwizzlePass);
+    let bare = crate::kernels::matmul_lds_kblock_mw_clustered_bare(m, n, k, bm, bn, wm, wn, ks)
+        .apply(crate::passes::VectorizePass)
+        .apply(crate::passes::SwizzlePass);
+
+    // (1)+(2): the bare kernel has BareBarrier seals; the fenced kernel has none.
+    assert_eq!(count(&fenced, &|nn| matches!(nn, Node::BareBarrier { .. })), 0, "fenced replica has no BareBarrier");
+    assert!(count(&bare, &|nn| matches!(nn, Node::BareBarrier { .. })) > 0, "bare replica seals via BareBarrier");
+
+    let (fc, bc) = (render(&fenced), render(&bare));
+    let acq = |s: &str| s.matches("fence syncscope(\"workgroup\") acquire").count();
+    // (3): the bare kernel emits strictly fewer workgroup acquire fences (only the prologue/epilogue
+    // seed barriers stay fenced; every steady + epilogue cluster seal drops its fence).
+    assert!(acq(&bc) < acq(&fc), "bare seals must drop acq-rel fences: bare={} fenced={}", acq(&bc), acq(&fc));
+    // (4): the workgroup rendezvous survives, and the explicit LDS drains are still present.
+    assert!(bc.contains("@llvm.amdgcn.s.barrier()"), "bare seal keeps the s_barrier rendezvous");
+    assert!(bc.contains("s_waitcnt lgkmcnt(0)"), "bare seal re-supplies the explicit lgkmcnt(0) drains");
+}
+
+#[test]
+fn mfma_pin_brackets_each_cluster_with_more_sched_barriers() {
+    // §5c MFMA-cluster pin: the pinned clustered kernel adds a LEADING + trailing `sched.barrier(0)`
+    // around each 32-MFMA run (the fenced replica has only the wall after each s_barrier + the one C7
+    // trailing pin). So the pinned kernel must (1) lower spec-valid and (2) render strictly MORE
+    // `@llvm.amdgcn.sched.barrier(i32 0)` calls than the fenced replica — the indivisible-run bracket.
+    use svod_dtype::AmdArch;
+    let render = |prog: &crate::Program| -> String {
+        let linearized = lower::verify(prog).expect("kernel lowers spec-valid");
+        let Op::Program { linear: Some(lin), .. } = linearized.op() else { panic!("no linear stage") };
+        let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(AmdArch::Gfx942);
+        svod_codegen::traits::Renderer::render(&renderer, lin, Some(&prog.name)).expect("render").code
+    };
+    let (m, n, k, bm, bn, wm, wn, ks) = (256usize, 256, 256, 128, 64, 2, 4, 64);
+    let fenced = crate::kernels::matmul_lds_kblock_mw_clustered(m, n, k, bm, bn, wm, wn, ks)
+        .apply(crate::passes::VectorizePass)
+        .apply(crate::passes::SwizzlePass);
+    let pinned = crate::kernels::matmul_lds_kblock_mw_clustered_pin(m, n, k, bm, bn, wm, wn, ks)
+        .apply(crate::passes::VectorizePass)
+        .apply(crate::passes::SwizzlePass);
+    let sched = |s: &str| s.matches("@llvm.amdgcn.sched.barrier(i32 0)").count();
+    let (fc, pc) = (render(&fenced), render(&pinned));
+    assert!(
+        sched(&pc) > sched(&fc),
+        "MFMA pin must add sched.barrier(0) brackets: pinned={} fenced={}",
+        sched(&pc),
+        sched(&fc)
+    );
 }
 
 #[test]

@@ -305,13 +305,10 @@ pub fn matmul(m: usize, n: usize, k: usize) -> Program {
     let acc = b.define_frag::<F32>(bc_map);
     let ept = a_map.ept;
 
-    // ── init: acc[0..ept] = 0, scoped by an `ept`-trip range (the sum_reduce init
-    //    shape — a self-contained pre-loop store, not a loose entry write). ──
-    let init_r = b.range(ept as i64);
-    let init_c = b.counter(init_r);
-    let zero = b.f32(0.0);
-    let s_init = b.store_frag_elem(acc, init_c, zero);
-    let inited = b.end(s_init, &[init_r]);
+    // ── init: acc = 0 via ONE constant-index `<ept×f32>` vector store — SROA-promotable, so the
+    //    accumulator's load→mfma→store round-trip becomes the loop-carried phi (a variable-index
+    //    scalar init loop blocks promotion, fracturing the MFMA clusters). See `zero_init_frag`. ──
+    let inited = b.zero_init_frag(acc);
 
     // ── K-loop over `K/16` fragments (the loop-carried accumulator). ──
     let kr = b.range((k / EDGE) as i64);
@@ -478,12 +475,8 @@ pub fn matmul_lds(m: usize, n: usize, k: usize) -> Program {
     // Fence: both strips fully staged before any lane reads a fragment.
     let bar = b.barrier(fa, &[fb.dep()]);
 
-    // ── init: acc = 0 (the sum_reduce init shape). ──
-    let init_r = b.range(ept as i64);
-    let init_c = b.counter(init_r);
-    let zero_f = b.f32(0.0);
-    let s_init = b.store_frag_elem(acc, init_c, zero_f);
-    let inited = b.end(s_init, &[init_r]);
+    // ── init: acc = 0 via ONE constant-index vector store (SROA-promotable; see `zero_init_frag`). ──
+    let inited = b.zero_init_frag(acc);
 
     // ── K-loop: gather A/B fragments from LDS, one MFMA per K-fragment. ──
     let kr = b.range((k / EDGE) as i64);
@@ -560,16 +553,7 @@ pub fn matmul_lds_tiled(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> P
 
     // ── accumulators: one 16×16 f32 fragment per (i,j), each zero-initialised. ──
     let acc: Vec<Frag<F32>> = (0..ri * cj).map(|_| b.define_frag::<F32>(bc_map)).collect();
-    let inited: Vec<Effect> = acc
-        .iter()
-        .map(|&ac| {
-            let init_r = b.range(ept as i64);
-            let init_c = b.counter(init_r);
-            let zf = b.f32(0.0);
-            let s = b.store_frag_elem(ac, init_c, zf);
-            b.end(s, &[init_r])
-        })
-        .collect();
+    let inited: Vec<Effect> = acc.iter().map(|&ac| b.zero_init_frag(ac)).collect();
 
     // ── K-loop: gather A/B fragments from LDS (reused), one MFMA per (i,j,k-frag). ──
     let kr = b.range((k / EDGE) as i64);
@@ -928,6 +912,8 @@ fn kblock_impl(
     asm_gather: bool,
     resident: bool,
     commit_drain: CommitDrain,
+    bare_seals: bool,
+    pin_mfma: bool,
 ) -> Program {
     assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
     assert!(k_step.is_multiple_of(EDGE) && k.is_multiple_of(k_step), "k_step multiple of 16, K multiple of k_step");
@@ -950,6 +936,12 @@ fn kblock_impl(
     // The pipeline's `CommitDrain` (drain PLACEMENT) and the stage's `Drain` (asm-vs-intrinsic write) are
     // derived from ONE source so they cannot disagree: any asm policy ⟹ `Drain::Asm` + `asm_commit`.
     let commit_drain = if clustered { commit_drain } else { CommitDrain::IntrinsicAuto };
+    // HK bare cluster seals (§5c): a bare `s_barrier` + explicit `lgkmcnt(0)` drains vs the fenced
+    // barrier's implicit 9×/K-block drain. Only meaningful for the clustered per-cluster schedule.
+    let bare_seals = bare_seals && clustered;
+    // MFMA-cluster pin (§5c ISA fix): bracket each 32-MFMA run with a leading + trailing `sched.barrier(0)`
+    // so LLVM can't fracture it. Only meaningful for the clustered per-cluster schedule.
+    let pin_mfma = pin_mfma && clustered;
     let asm_commit = commit_drain != CommitDrain::IntrinsicAuto;
     let stage_drain = if asm_commit { Drain::Asm } else { Drain::Intrinsic };
     // Workgroup output tile = (bm·wm) × (bn·wn), computed by a wm×wn grid of 64-lane warps.
@@ -1023,16 +1015,7 @@ fn kblock_impl(
 
     // ── accumulators: one 16×16 f32 fragment per (i,j), zero-initialised. ──
     let acc: Vec<Frag<F32>> = (0..ri * cj).map(|_| b.define_frag::<F32>(bc_map)).collect();
-    let inited: Vec<Effect> = acc
-        .iter()
-        .map(|&ac| {
-            let init_r = b.range(ept as i64);
-            let init_c = b.counter(init_r);
-            let zf = b.f32(0.0);
-            let s = b.store_frag_elem(ac, init_c, zf);
-            b.end(s, &[init_r])
-        })
-        .collect();
+    let inited: Vec<Effect> = acc.iter().map(|&ac| b.zero_init_frag(ac)).collect();
 
     // ── the K-reduction, via the map-reduce combinator (DESIGN §5b/§5c). The prefetch/commit fills
     //    ride the `LdsStage` handle; `bracket=None` runs the whole-block gather/mma (byte-identical
@@ -1122,16 +1105,30 @@ fn kblock_impl(
                 out
             })
         };
-        pipeline(&mut b, k / k_step, k_step, ksteps, &acc, &inited, warp_row, asm_gather, resident, commit_drain, hooks)
-            .cluster(Mem::builder().prefetch([0]).gathers([0]).build()) // C0: load A, gather slice 0
-            .cluster(mma(0)) // C1
-            .cluster(Mem::builder().gathers([1]).build()) // C2
-            .cluster(mma(1)) // C3
-            .cluster(Mem::builder().prefetch([1]).gathers([2, 3]).build()) // C4: load B (HK split), gather 2,3
-            .cluster(mma(2)) // C5
-            .cluster(Mem::builder().commit(true).build()) // C6
-            .cluster(mma(3)) // C7
-            .build()
+        pipeline(
+            &mut b,
+            k / k_step,
+            k_step,
+            ksteps,
+            &acc,
+            &inited,
+            warp_row,
+            asm_gather,
+            resident,
+            commit_drain,
+            bare_seals,
+            pin_mfma,
+            hooks,
+        )
+        .cluster(Mem::builder().prefetch([0]).gathers([0]).build()) // C0: load A, gather slice 0
+        .cluster(mma(0)) // C1
+        .cluster(Mem::builder().gathers([1]).build()) // C2
+        .cluster(mma(1)) // C3
+        .cluster(Mem::builder().prefetch([1]).gathers([2, 3]).build()) // C4: load B (HK split), gather 2,3
+        .cluster(mma(2)) // C5
+        .cluster(Mem::builder().commit(true).build()) // C6
+        .cluster(mma(3)) // C7
+        .build()
     };
 
     // ── post-loop: each accumulator scatters its final value to C. ──
@@ -1162,7 +1159,7 @@ fn kblock_impl(
 /// K_STEP=16 — the first tk2 matmul to beat naive at scale. See [`kblock_impl`]. Compose
 /// `.apply(`[`SwizzlePass`](crate::passes::SwizzlePass)`)` for the bank-swizzled variant.
 pub fn matmul_lds_kblock(m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, 1, 1, EDGE, 1, false, false, false, CommitDrain::IntrinsicAuto)
+    kblock_impl(m, n, k, bm, bn, 1, 1, EDGE, 1, false, false, false, CommitDrain::IntrinsicAuto, false, false)
 }
 
 /// **Multi-warp** K-blocked matmul (DESIGN.md §5b, the bigger-tile lever): a `wm×wn` grid
@@ -1182,7 +1179,7 @@ pub fn matmul_lds_kblock_mw(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 1, false, false, false, CommitDrain::IntrinsicAuto)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 1, false, false, false, CommitDrain::IntrinsicAuto, false, false)
 }
 
 /// **Register-staged pipelined** multi-warp K-blocked matmul (`stages=2`, DESIGN §5b): the
@@ -1201,7 +1198,7 @@ pub fn matmul_lds_kblock_mw_pipe(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, false, false, false, CommitDrain::IntrinsicAuto)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, false, false, false, CommitDrain::IntrinsicAuto, false, false)
 }
 
 /// The **clustered HK replica** (DESIGN §5c): [`matmul_lds_kblock_mw_pipe`]'s tile + stages=2
@@ -1221,7 +1218,49 @@ pub fn matmul_lds_kblock_mw_clustered(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, false, CommitDrain::AsmDeferred)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, false, CommitDrain::AsmDeferred, false, false)
+}
+
+/// The **bare-seal clustered HK replica** (DESIGN §5c) — identical to [`matmul_lds_kblock_mw_clustered`]
+/// EXCEPT the per-cluster acq-rel-fenced `s_barrier`s are swapped for HK's bare `s_barrier` +
+/// baked `sched.barrier(0)` wall, and the LDS ordering the fences dropped is re-supplied by an explicit
+/// `s_waitcnt lgkmcnt(0)` before each compute cluster with undrained gathers. The fenced replica forces
+/// `lgkmcnt(0)` at all 9 seals/K-block (the acquire fence); HK drains only 3× and uses a bare seal for
+/// the rest — the fence is a machine-scheduler barrier that throttles MFMA overlap (`tk/arch/gfx9.rs:55`).
+/// The A/B twin isolating that one variable. Use HK's tiling `(bm=128, bn=64, wm=2, wn=4, k_step=64)`.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_lds_kblock_mw_clustered_bare(
+    m: usize,
+    n: usize,
+    k: usize,
+    bm: usize,
+    bn: usize,
+    wm: usize,
+    wn: usize,
+    k_step: usize,
+) -> Program {
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, false, CommitDrain::AsmDeferred, true, false)
+}
+
+/// The **MFMA-pinned clustered HK replica** (DESIGN §5c, the ISA-diff fix) — identical to
+/// [`matmul_lds_kblock_mw_clustered`] EXCEPT each 32-MFMA compute cluster is bracketed by a LEADING +
+/// trailing `sched.barrier(0)`. The ISA diff (2026-07-06) showed LLVM re-batches the fenced replica's
+/// independent MFMAs into `1+31 / 1+31 / 1 / 63` runs and sinks an `s_barrier` between mfma#1 and #2 —
+/// serializing LDS-read against compute (mfmautil 0.355 vs HK's 0.65). The double-sided pin makes each
+/// run indivisible so neither a barrier nor an `lgkmcnt(0)` can sink in (`kernel_instr.md §2`: a single
+/// positional fence did NOT hold intrinsic MFMAs). Use HK's tiling `(bm=128, bn=64, wm=2, wn=4, k_step=64)`.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_lds_kblock_mw_clustered_pin(
+    m: usize,
+    n: usize,
+    k: usize,
+    bm: usize,
+    bn: usize,
+    wm: usize,
+    wn: usize,
+    k_step: usize,
+) -> Program {
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, false, CommitDrain::AsmDeferred, false, true)
 }
 
 /// The **compute-resident HK microkernel** (the apples-to-apples benchmark): identical to
@@ -1246,7 +1285,7 @@ pub fn matmul_lds_kblock_mw_resident(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, true, CommitDrain::AsmDeferred)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, true, CommitDrain::AsmDeferred, false, false)
 }
 
 /// The **vectorised** K-blocked kernel: the scalar-gather base with
@@ -1272,5 +1311,5 @@ pub fn matmul_lds_kblock_sw(m: usize, n: usize, k: usize, bm: usize, bn: usize, 
 /// swizzle. `k_step ∈ {16,32,64}` if swizzling; bigger `k_step` = fewer barriers, more LDS
 /// + operand VGPR (the occupancy trade the harness resolves).
 pub fn matmul_lds_kblock_ks(m: usize, n: usize, k: usize, bm: usize, bn: usize, k_step: usize) -> Program {
-    kblock_impl(m, n, k, bm, bn, 1, 1, k_step, 1, false, false, false, CommitDrain::IntrinsicAuto)
+    kblock_impl(m, n, k, bm, bn, 1, 1, k_step, 1, false, false, false, CommitDrain::IntrinsicAuto, false, false)
 }

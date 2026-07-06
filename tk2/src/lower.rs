@@ -299,6 +299,22 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();
             get(low, body).barrier(deps)
         }
+        // A bare workgroup barrier (`s.barrier()`) → a void `Op::Custom` with NO `fence acq/rel`, so
+        // it neither drains `lgkmcnt` nor acts as a machine-scheduler barrier throttling MFMA overlap.
+        // `body` + `deps` are pure happens-after operands (no `{N}` refs). A positional `sched.barrier(0)`
+        // is baked in to reproduce the `wall_after_barriers` cluster wall (that codegen pass keys on
+        // `Op::Barrier` and would miss this Custom) — pinning the asm `ds_read`/`ds_write` in their cluster.
+        Node::BareBarrier { body, deps } => {
+            let mut ops: SmallVec<[Arc<UOp>; 4]> = smallvec![get(low, body)];
+            ops.extend(deps.iter().map(|d| get(low, *d)));
+            UOp::custom(
+                ops,
+                "declare void @llvm.amdgcn.s.barrier()\ndeclare void @llvm.amdgcn.sched.barrier(i32)\n\
+                 call void @llvm.amdgcn.s.barrier()\ncall void @llvm.amdgcn.sched.barrier(i32 0)"
+                    .to_string(),
+                DType::Void,
+            )
+        }
         // A machine-scheduler fence (`sched.barrier`) → a void `Op::Custom` whose `deps` are the
         // ordering anchors (the mask is Rust-substituted, so no `{N}` placeholders → deps are
         // pure happens-after). The AMDGPU backend hoists+dedups the `declare`.

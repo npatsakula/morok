@@ -263,6 +263,24 @@ fn dump_streaming_isa() {
     println!("streaming ISA dumped: {dir}/streaming.ll ({} B), {dir}/streaming.co ({} B)", src.len(), bytes.len());
 }
 
+/// Dump the **MFMA-pinned** clustered kernel's ISA (sibling of [`dump_streaming_isa`]) to verify the
+/// §5c pin restores 4 intact 32-MFMA clusters (no LLVM re-batch / mid-cluster `s_barrier`).
+/// `SVOD_DEVICE=AMD:0 SVOD_DUMP_DIR=/tmp/tk2_isa cargo test -p svod-tk2 --lib -- --ignored device::dump_pinned_isa --nocapture`
+#[test]
+#[ignore]
+fn dump_pinned_isa() {
+    let dir = std::env::var("SVOD_DUMP_DIR").unwrap_or_else(|_| "/tmp/tk2_isa".into());
+    std::fs::create_dir_all(&dir).expect("mkdir dump dir");
+    let device_spec = Tensor::empty(&[1], DType::Float32).device();
+    let prog = crate::kernels::matmul_lds_kblock_mw_clustered_pin(4096, 4096, 4096, 128, 64, 2, 4, 64)
+        .apply(VectorizePass)
+        .apply(SwizzlePass);
+    let (src, bytes) = crate::launch::compile_artifacts(&prog, &device_spec).expect("compile artifacts");
+    std::fs::write(format!("{dir}/pinned.ll"), &src).expect("write ll");
+    std::fs::write(format!("{dir}/pinned.co"), &bytes).expect("write co");
+    println!("pinned ISA dumped: {dir}/pinned.ll ({} B), {dir}/pinned.co ({} B)", src.len(), bytes.len());
+}
+
 /// The **apples-to-apples mfmautil measurement** (the whole point): profile the compute-resident
 /// microkernel's steady state and print the rocprofiler-compute gfx942 MfmaUtil, side by side with
 /// the DRAM-streaming clustered kernel (the 0.24 baseline) — both at HK's tiling, both vec+swizzle.

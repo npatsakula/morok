@@ -27,8 +27,9 @@ fn is_addr_muldivmod(n: &Node) -> bool {
 fn unroll_flattens_the_matmul_body() {
     let p = matmul(64, 64, 64);
     let mut ir = p.ir;
-    // Rolled: the init range + the K-loop range, each with its END (2 ranges, 2 ends).
-    assert_eq!(count_reachable(&ir, p.sink, is_range_or_end), 4, "rolled matmul has 2 RANGE + 2 END");
+    // Rolled: only the K-loop range + its END (the accumulator init is now ONE constant-index
+    // vector store — `zero_init_frag` — not a scoped `range(ept)`, so no init RANGE/END).
+    assert_eq!(count_reachable(&ir, p.sink, is_range_or_end), 2, "rolled matmul has 1 RANGE + 1 END");
     let root = UnrollPass.apply(&mut ir, p.sink).expect("unroll applies");
     // Flat: the ensures postcondition — no RANGE / END reachable.
     assert_eq!(count_reachable(&ir, root, is_range_or_end), 0, "unrolled matmul is flat");

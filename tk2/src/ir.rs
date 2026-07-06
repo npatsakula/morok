@@ -285,6 +285,19 @@ pub enum Node {
     /// exact class §2.1 targets), so the barrier is structural, not implicit. Mirrors
     /// tk's `store.barrier(deps)` idiom (`tk/src/kernel.rs`).
     Barrier { body: TileId, deps: Edges },
+    /// A **bare workgroup barrier** (`@llvm.amdgcn.s.barrier()` + a positional `sched.barrier(0)`
+    /// wall, DESIGN §5c) — the HK cluster-seal twin of [`Node::Barrier`] *without* the
+    /// `fence acquire`/`fence release` acq-rel pair. The fence is what forces an implicit
+    /// `s_waitcnt lgkmcnt(0)` at every seal AND acts as a machine-scheduler barrier that throttles
+    /// MFMA overlap (`tk/src/arch/gfx9.rs:55`); a per-cluster schedule (9 seals/K-block) pays that
+    /// 9× where HK drains only 3× and uses a bare `s_barrier` for the rest. Dropping the fence makes
+    /// the seal a pure workgroup rendezvous (the ping-pong phase carrier), so the LDS ordering it no
+    /// longer provides MUST be re-supplied explicitly by a [`Node::SWaitLgkmcnt`] at the RAW/WAR/
+    /// pre-MFMA points (the caller's obligation — a missing drain is the silent-stale class §2.1).
+    /// `body` + `deps` are pure happens-after anchors (no `{N}` refs). The baked-in `sched.barrier(0)`
+    /// reproduces the [`Node::SchedWallMarker`] wall locally (this lowers to `Op::Custom`, which the
+    /// codegen `wall_after_barriers` pass — keyed on `Op::Barrier` — would otherwise miss).
+    BareBarrier { body: TileId, deps: Edges },
     /// A **machine-scheduler fence** (`@llvm.amdgcn.sched.barrier(mask)`, DESIGN §5c): a
     /// void side-effect the AMDGPU scheduler may not move any instruction across (mask 0 =
     /// total). Positioned in the instruction stream *right after* `deps` (its ordering
@@ -473,6 +486,9 @@ impl TileIr {
             Node::Barrier { body, deps } => {
                 Node::Barrier { body: f(body), deps: deps.into_iter().map(&mut f).collect() }
             }
+            Node::BareBarrier { body, deps } => {
+                Node::BareBarrier { body: f(body), deps: deps.into_iter().map(&mut f).collect() }
+            }
             Node::SchedFence { mask, deps } => Node::SchedFence { mask, deps: deps.into_iter().map(&mut f).collect() },
             Node::SetPrio { level, deps } => Node::SetPrio { level, deps: deps.into_iter().map(&mut f).collect() },
             Node::WaveBarrier { eq, deps } => Node::WaveBarrier { eq, deps: deps.into_iter().map(&mut f).collect() },
@@ -547,6 +563,7 @@ impl TileIr {
             | Node::DsWriteB64 { .. }
             | Node::SWaitLgkmcnt { .. }
             | Node::Barrier { .. }
+            | Node::BareBarrier { .. }
             | Node::SchedFence { .. }
             | Node::SetPrio { .. }
             | Node::WaveBarrier { .. }

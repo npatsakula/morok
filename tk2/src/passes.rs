@@ -520,6 +520,10 @@ impl Fold for VecGather {
                 let deps = dedup(&deps).into_iter().filter(|&d| d != body).collect();
                 ir.intern(Node::Barrier { body, deps })
             }
+            Node::BareBarrier { body, deps } => {
+                let deps = dedup(&deps).into_iter().filter(|&d| d != body).collect();
+                ir.intern(Node::BareBarrier { body, deps })
+            }
             Node::Sink { roots } => ir.intern(Node::Sink { roots: dedup(&roots) }),
             // Schedule controls anchored on the collapsed scalar gather stores: dedup the now-
             // coincident fused ids (§5c cluster fences ride the same edges the gather stores did).
