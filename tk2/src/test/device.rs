@@ -299,6 +299,40 @@ fn dump_pipe_isa() {
     println!("pipe ISA dumped: {dir}/pipe.ll ({} B), {dir}/pipe.co ({} B)", src.len(), bytes.len());
 }
 
+/// **0-spill guard for the asm-gather clustered kernels** — the latent-fragility tripwire. The asm
+/// `ds_read_b64`/`ds_write_b64` gather+commit are waitcnt-opaque, so LLVM's spill logic cannot model
+/// their async LDS completion: a register spilled/reloaded around them can carry a value that has not
+/// yet arrived, silently corrupting the result (an occupancy hint that forced spills produced
+/// `max abs err ~2e2` on device, with the compiler-visible `mw256_pipe` staying bit-exact under the
+/// same spilling). These kernels are therefore correct **only** at zero spills; assert that here so a
+/// regression fails LOUDLY (a compile check) instead of as silent device numerics. `private_segment`
+/// (scratch) bytes == 0 ⟺ no spills. See memory `tk2-mfma-fracture-ir-shape`.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::asm_clustered_kernels_have_zero_spills --nocapture`
+#[test]
+#[ignore]
+fn asm_clustered_kernels_have_zero_spills() {
+    let device_spec = Tensor::empty(&[1], DType::Float32).device();
+    let variants = [
+        ("clustered", crate::kernels::matmul_lds_kblock_mw_clustered(4096, 4096, 4096, 128, 64, 2, 4, 64)),
+        ("clustered_bare", crate::kernels::matmul_lds_kblock_mw_clustered_bare(4096, 4096, 4096, 128, 64, 2, 4, 64)),
+        ("clustered_pin", crate::kernels::matmul_lds_kblock_mw_clustered_pin(4096, 4096, 4096, 128, 64, 2, 4, 64)),
+    ];
+    for (label, prog) in variants {
+        let prog = prog.apply(VectorizePass).apply(SwizzlePass);
+        let (_src, bytes) = launch::compile_artifacts(&prog, &device_spec).expect("compile clustered kernel");
+        let parsed =
+            svod_device::amd::program::parse_kernel(&bytes, "tk2_matmul_kblock").expect("parse compiled kernel");
+        let scratch = parsed.kd.private_segment_fixed_size;
+        assert_eq!(
+            scratch, 0,
+            "{label}: the asm-gather clustered kernel MUST compile with 0 spills — it has {scratch} scratch \
+             bytes/thread. The waitcnt-opaque asm ds_read/ds_write are unsafe to spill (a spilled async LDS \
+             value is stale → silent miscompile). Reduce register pressure or make the gather compiler-visible."
+        );
+        println!("{label}: 0 spills ✓ (private_segment = {scratch} B)");
+    }
+}
+
 /// The **apples-to-apples mfmautil measurement** (the whole point): profile the compute-resident
 /// microkernel's steady state and print the rocprofiler-compute gfx942 MfmaUtil, side by side with
 /// the DRAM-streaming clustered kernel (the 0.24 baseline) — both at HK's tiling, both vec+swizzle.
