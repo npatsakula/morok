@@ -26,6 +26,24 @@ use std::collections::HashSet;
 use crate::build::{Builder, Effect, F32, Frag, Idx, Val};
 use crate::ir::{Node, TileId, TileIr};
 
+/// The commit's **drain placement policy** (DESIGN §5c) — WHERE the collaborative fill's LDS writes
+/// are made visible before the next-iteration gather. [`CommitDrain::IntrinsicAuto`] is the
+/// compiler-visible `ds_write` whose `lgkmcnt(0)` the C6 RAW `s_barrier` auto-drains. The asm variants
+/// use the waitcnt-opaque `asm ds_write_b64` (the barrier can NOT auto-drain it): [`CommitDrain::AsmExposed`]
+/// (Phase C-a) drains at C6 with an EXPOSED manual `s_waitcnt lgkmcnt(0)` (0-MFMA shadow);
+/// [`CommitDrain::AsmDeferred`] (Phase C-b, HK's deferred drain) leaves the C6 barrier BARE and moves the
+/// manual drain to C7's tail — after the 32 MFMAs (hidden) and before C7's tail barrier (so the
+/// drain-before-barrier still gives every wave cross-wave visibility of its own writes).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CommitDrain {
+    IntrinsicAuto,
+    /// Phase C-a, retained as the A/B baseline for the deferred drain — no entry wires it (the clustered
+    /// entries jumped straight to `AsmDeferred`), so it is exercised only when comparing the two policies.
+    #[allow(dead_code)]
+    AsmExposed,
+    AsmDeferred,
+}
+
 /// The kernel-specific hooks the pipeline drives — the ONLY kernel-specific part of the schedule.
 /// For matmul: `Op` is the `(A-vecs, B-vecs)` operand bundle of one K-slice, `Reg` is the register-
 /// staged fill (`FillRegs`). Each hook is a pure emission: it interns nodes and returns handles; ALL
@@ -66,6 +84,7 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     carry: &'a [Vec<TileId>],
     k_next: Option<Idx>,
     n_acc: usize,
+    commit_drain: CommitDrain,
     // ── carries (persist across clusters within one body) ──
     entry: Vec<TileId>,
     prev_store: Vec<TileId>,
@@ -78,6 +97,9 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     // ── per-cluster (reset by the driver before each cluster) ──
     this_gathers: Vec<TileId>,
     sealed: bool,
+    /// A commit deferred its drain (AsmDeferred): the next compute cluster (C7) emits the manual
+    /// `lgkmcnt(0)` at its tail and populates `raw_next`. Reset false at the start of each body pass.
+    pending_drain: bool,
 }
 
 impl<H: Hooks> ClusterCx<'_, H> {
@@ -109,13 +131,50 @@ impl<H: Hooks> ClusterCx<'_, H> {
         if let Some(kn) = self.k_next
             && self.reg.is_some()
         {
-            let war = self.b.barrier(Effect(self.all_gathers[0]), &self.all_gathers[1..]);
+            let last = self.all_gathers.len() - 1;
+            let war = if self.commit_drain == CommitDrain::AsmDeferred {
+                // C-c: drain the outstanding asm gather READS (esp. the early-gathered slice the NEXT
+                // compute cluster consumes) HERE, before the commit writes. `lgkmcnt` is a UNIFIED
+                // read+write counter: if that operand read-drain instead landed AFTER the writes (to
+                // feed the shadowing cluster's first MFMA), it would drain the opaque writes with it at
+                // 0-MFMA shadow — killing the deferral. The reads have had the earlier compute clusters'
+                // MFMAs of latency, so this drain is ~free; draining them early leaves NO read-drain
+                // between the commit and the shadowing cluster → the C7-tail write-drain finally defers.
+                // This is HK's WAR-guard drain (hk.dis 0x2830), and it IS the read-before-overwrite WAR.
+                let rd = self.b.swait_lgkmcnt(self.all_gathers[last]);
+                self.b.barrier(rd, &self.all_gathers[..last])
+            } else {
+                self.b.barrier(Effect(self.all_gathers[0]), &self.all_gathers[1..])
+            };
+            // `fill` = the commit's write effects (intrinsic `ds_write` stores OR asm `ds_write_b64`
+            // writes). The DRAIN is owned here now (not by the hook), dispatched on the policy.
             let fill = self.hooks.commit(self.b, kn, self.reg.as_ref().unwrap(), &[war.dep()]);
             let fill_deps: Vec<TileId> = fill[1..].iter().map(|e| e.dep()).collect();
-            let rn = self.b.barrier(fill[0], &fill_deps).dep();
-            self.raw_next = Some(rn);
-            self.tail_barrier = Some(rn);
-            self.entry = vec![rn];
+            match self.commit_drain {
+                CommitDrain::IntrinsicAuto => {
+                    // The compiler-visible stores: this RAW barrier auto-drains their `lgkmcnt(0)`.
+                    let rn = self.b.barrier(fill[0], &fill_deps).dep();
+                    self.raw_next = Some(rn);
+                    self.tail_barrier = Some(rn);
+                    self.entry = vec![rn];
+                }
+                CommitDrain::AsmExposed => {
+                    // C-a: the opaque asm writes need an EXPOSED manual drain here at C6 (0-MFMA shadow).
+                    let sw = self.b.swait_lgkmcnt(fill.last().expect("asm commit emits ≥1 write").dep());
+                    let rn = self.b.barrier(sw, &[]).dep();
+                    self.raw_next = Some(rn);
+                    self.tail_barrier = Some(rn);
+                    self.entry = vec![rn];
+                }
+                CommitDrain::AsmDeferred => {
+                    // C-b: leave the C6 RAW barrier BARE — the opaque asm writes are NOT drained by it.
+                    // The drain is deferred to C7's tail (`pending_drain`); `raw_next` is set there.
+                    let rn = self.b.barrier(fill[0], &fill_deps).dep();
+                    self.tail_barrier = Some(rn);
+                    self.entry = vec![rn];
+                    self.pending_drain = true;
+                }
+            }
             self.sealed = true;
         }
     }
@@ -164,7 +223,27 @@ impl<H: Hooks> ClusterCx<'_, H> {
         self.prev_store = stores.iter().map(|e| e.dep()).collect();
         self.first_compute = false;
         let prio0 = self.b.set_prio(0, &new_ids).dep();
-        let bar = self.b.barrier(stores[self.n_acc - 1], &self.prev_store[..self.n_acc - 1]).dep();
+        // If a commit (C6) deferred its drain to this compute cluster (C7), emit the manual `lgkmcnt(0)`
+        // HERE — ordered after this cluster's last MFMA store, so it lands past the 32 MFMAs (hidden) and
+        // BEFORE the tail barrier. The tail barrier then fences the DRAIN, and its dep becomes the deferred
+        // LDS-RAW carry (`raw_next`): the next iteration's gather reads only after the drained barrier.
+        let bar = if self.pending_drain {
+            // Pin the deferred write-drain AFTER the whole 32-MFMA cluster — HK's `sched_barrier`-pinned
+            // drain, the one hint LLVM's machine scheduler actually honours. A compute cluster has no LDS
+            // stores in the loop body (its MFMAs write register accumulators), so `lgkmcnt` can take no
+            // dependency on them and the drain — a bare asm sideeffect — otherwise floats to the C6→C7
+            // boundary (0-MFMA shadow). A `sched.barrier(0)` anchored on ALL 32 MFMA RESULTS floats to
+            // just past the cluster (its data-deps) AND forbids the scheduler hoisting the drain across
+            // it, so the manual `lgkmcnt` lands past the 32 MFMAs: HK's [bare barrier → 32 mfma → drain].
+            let fence = self.b.sched_fence(0, &new_ids);
+            let sw = self.b.swait_lgkmcnt(fence.dep());
+            let bar = self.b.barrier(sw, &self.prev_store).dep();
+            self.raw_next = Some(bar);
+            self.pending_drain = false;
+            bar
+        } else {
+            self.b.barrier(stores[self.n_acc - 1], &self.prev_store[..self.n_acc - 1]).dep()
+        };
         self.tail_barrier = Some(bar);
         self.entry = vec![bar, prio0];
         self.sealed = true;
@@ -261,6 +340,7 @@ fn run_body<H: Hooks>(
     seed: &[TileId],
     carry: &[Vec<TileId>],
     k_next: Option<Idx>,
+    commit_drain: CommitDrain,
 ) -> BodyOut {
     let mut cx = ClusterCx {
         b,
@@ -270,6 +350,7 @@ fn run_body<H: Hooks>(
         carry,
         k_next,
         n_acc,
+        commit_drain,
         entry: Vec::new(),
         prev_store: Vec::new(),
         all_gathers: Vec::new(),
@@ -280,6 +361,7 @@ fn run_body<H: Hooks>(
         first_compute: true,
         this_gathers: Vec::new(),
         sealed: false,
+        pending_drain: false,
     };
     for cluster in clusters {
         cx.this_gathers.clear();
@@ -313,6 +395,7 @@ pub(crate) struct Pipeline<'a, H: Hooks> {
     warp_row: Option<Idx>,
     asm_gather: bool,
     resident: bool,
+    commit_drain: CommitDrain,
     clusters: Vec<Box<dyn Cluster<H>>>,
 }
 
@@ -329,9 +412,23 @@ pub(crate) fn pipeline<'a, H: Hooks>(
     warp_row: Option<Idx>,
     asm_gather: bool,
     resident: bool,
+    commit_drain: CommitDrain,
     hooks: H,
 ) -> Pipeline<'a, H> {
-    Pipeline { b, hooks, nblocks, k_step, ksteps, accs, inited, warp_row, asm_gather, resident, clusters: Vec::new() }
+    Pipeline {
+        b,
+        hooks,
+        nblocks,
+        k_step,
+        ksteps,
+        accs,
+        inited,
+        warp_row,
+        asm_gather,
+        resident,
+        commit_drain,
+        clusters: Vec::new(),
+    }
 }
 
 impl<'a, H: Hooks> Pipeline<'a, H> {
@@ -347,8 +444,20 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
     /// the post-loop accumulator frags (the scatter source). Byte-identical to the old
     /// `pipeline_clustered`.
     pub(crate) fn build(self) -> Vec<Frag<F32>> {
-        let Pipeline { b, mut hooks, nblocks, k_step, ksteps, accs, inited, warp_row, asm_gather, resident, clusters } =
-            self;
+        let Pipeline {
+            b,
+            mut hooks,
+            nblocks,
+            k_step,
+            ksteps,
+            accs,
+            inited,
+            warp_row,
+            asm_gather,
+            resident,
+            commit_drain,
+            clusters,
+        } = self;
         assert!(nblocks >= 2, "pipeline needs nblocks ≥ 2");
         let n_acc = accs.len();
         let ks_c = b.idx_const(k_step as i64);
@@ -359,8 +468,18 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         let zero = b.idx_const(0);
         let (reg0, _) = hooks.prefetch(b, zero);
         let fill0 = hooks.commit(b, zero, &reg0, &[]);
-        let fill0_deps: Vec<TileId> = fill0[1..].iter().map(|e| e.dep()).collect();
-        let raw_seed = b.barrier(fill0[0], &fill0_deps);
+        // The prologue's block-0 drain is one-time (outside the steady loop), so both asm policies drain
+        // it EXPOSED here — the deferral is specifically about hiding the hot-loop C6 drain, not this seed.
+        let raw_seed = match commit_drain {
+            CommitDrain::IntrinsicAuto => {
+                let fill0_deps: Vec<TileId> = fill0[1..].iter().map(|e| e.dep()).collect();
+                b.barrier(fill0[0], &fill0_deps)
+            }
+            CommitDrain::AsmExposed | CommitDrain::AsmDeferred => {
+                let sw = b.swait_lgkmcnt(fill0.last().expect("asm commit emits ≥1 write").dep());
+                b.barrier(sw, &[])
+            }
+        };
         let loop_seed = match warp_row {
             Some(wr) => {
                 let wr_seeded = b.idx_after(wr, &[raw_seed.dep()]);
@@ -379,8 +498,18 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         // BOTH prefetch and commit (`k_next=None`); the gathers still fire, re-reading the resident
         // block via `[loop_seed, kr]`.
         let steady_k_next = if resident { None } else { Some(k_next) };
-        let body =
-            run_body(b, &clusters, &mut hooks, ksteps, n_acc, accs, &[loop_seed, kr.dep()], &carry, steady_k_next);
+        let body = run_body(
+            b,
+            &clusters,
+            &mut hooks,
+            ksteps,
+            n_acc,
+            accs,
+            &[loop_seed, kr.dep()],
+            &carry,
+            steady_k_next,
+            commit_drain,
+        );
 
         // ── loop close: fold the last-slice stores, raw_next (LDS carry, streaming only), AND the
         //    final cluster's barrier (else DCE drops it → unbalanced count → deadlock) under one End. ──
@@ -403,7 +532,8 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         // ── epilogue: the same schedule for the LAST block (via the End's carried RAW), no
         //    prefetch/commit; then the eq=0 wave-phase barrier rebalances warp-row 0. ──
         let ep_carry: Vec<Vec<TileId>> = (0..n_acc).map(|_| Vec::new()).collect();
-        let ep = run_body(b, &clusters, &mut hooks, ksteps, n_acc, &acc_loop, &[ended.dep()], &ep_carry, None);
+        let ep =
+            run_body(b, &clusters, &mut hooks, ksteps, n_acc, &acc_loop, &[ended.dep()], &ep_carry, None, commit_drain);
         let scatter_seed = warp_row.map(|wr| {
             let anchor = ep.tail_barrier.expect("epilogue must end on a cluster barrier");
             let wr_seeded = b.idx_after(wr, &[anchor]);
