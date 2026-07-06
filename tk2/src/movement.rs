@@ -228,7 +228,7 @@ impl<E: Elem> LdsStage<E> {
     /// split back into VEC-wide b64 chunks (register-only; the b128 lands in adjacent VGPRs) so the
     /// swizzle-safe [`Self::commit`] stores them independently. Returns the chunks in commit order (the
     /// commit's `r`/`c` addressing hash-cons-shares this half's nodes).
-    pub(crate) fn prefetch(self, b: &mut Builder, k_base: Idx) -> Vec<Val<E>> {
+    pub(crate) fn prefetch(self, b: &mut Builder, k_base: Idx, order: &[TileId]) -> Vec<Val<E>> {
         const VEC: usize = 4; // b64 = 4 elems: the LDS-store / swizzle granularity
         let gvec = if self.epl.is_multiple_of(8) { 8 } else { VEC };
         assert!(
@@ -250,7 +250,10 @@ impl<E: Elem> LdsStage<E> {
             let goff = b.idx_mul(grow, gstride);
             let goff = b.idx_add(goff, k_base);
             let goff = b.idx_add(goff, c);
-            let wide = b.load_vec(self.src, goff, gvec); // ONE b128 (or b64) coalesced global load
+            // Ordered after `order` (the cluster entry): pins the load into its authoring cluster
+            // (HK's A@C0 / B@C4 split) instead of the linearizer floating it to the loop top. The
+            // `sched.barrier(0)` walls then keep the scheduler from hoisting it back up.
+            let wide = b.load_vec_after(self.src, goff, gvec, order); // ONE b128 (or b64) coalesced global load
             for h in 0..gvec / VEC {
                 if gvec == VEC {
                     out.push(wide);

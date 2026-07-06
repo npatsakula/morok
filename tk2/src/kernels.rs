@@ -671,12 +671,27 @@ impl Hooks for MatmulHooks {
     type Op = MatmulOp;
     type Reg = FillRegs;
 
-    fn prefetch(&mut self, b: &mut Builder, k_base: Idx) -> (FillRegs, Vec<TileId>) {
-        let a = self.a_stage.prefetch(b, k_base);
-        let bt = self.b_stage.prefetch(b, k_base);
-        let mut anchors: Vec<TileId> = a.iter().map(|v| v.id).collect();
-        anchors.extend(bt.iter().map(|v| v.id));
-        (FillRegs { a, b: bt }, anchors)
+    const PREFETCH_TILES: usize = 2;
+
+    fn prefetch(
+        &mut self,
+        b: &mut Builder,
+        k_base: Idx,
+        tile: usize,
+        prev: Option<FillRegs>,
+        order: &[TileId],
+    ) -> FillRegs {
+        // Two operand tiles: 0 = A, 1 = B. HK loads A@C0 and B@C4 so each global load hides under a
+        // different compute cluster; the schedule names which cluster stages which tile, and the fill
+        // accumulates across them (`prev`) for the single C6 commit that writes BOTH to LDS. `order`
+        // (the cluster entry) pins each tile's load into its cluster so the split survives lowering.
+        let mut reg = prev.unwrap_or(FillRegs { a: Vec::new(), b: Vec::new() });
+        match tile {
+            0 => reg.a = self.a_stage.prefetch(b, k_base, order),
+            1 => reg.b = self.b_stage.prefetch(b, k_base, order),
+            _ => panic!("matmul prefetch: tile ∈ {{0=A, 1=B}}, got {tile}"),
+        }
+        reg
     }
 
     fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &FillRegs, war: &[TileId]) -> Vec<Effect> {
@@ -1015,8 +1030,8 @@ fn kblock_impl(
     //    under hash-consing), the clustered schedule (§5c) drives the per-slice path. ──
     // prefetch (global→VGPR): the load-pin anchors returned for the sched fence.
     let mut prefetch_fn = |b: &mut Builder, k_base: Idx| {
-        let a = a_stage.prefetch(b, k_base);
-        let bt = b_stage.prefetch(b, k_base);
+        let a = a_stage.prefetch(b, k_base, &[]);
+        let bt = b_stage.prefetch(b, k_base, &[]);
         let mut anchors: Vec<TileId> = a.iter().map(|v| v.id).collect();
         anchors.extend(bt.iter().map(|v| v.id));
         (FillRegs { a, b: bt }, anchors)
@@ -1099,11 +1114,11 @@ fn kblock_impl(
             })
         };
         pipeline(&mut b, k / k_step, k_step, ksteps, &acc, &inited, warp_row, asm_gather, resident, commit_drain, hooks)
-            .cluster(Mem::builder().prefetch(true).gathers([0]).build()) // C0
+            .cluster(Mem::builder().prefetch([0]).gathers([0]).build()) // C0: load A, gather slice 0
             .cluster(mma(0)) // C1
             .cluster(Mem::builder().gathers([1]).build()) // C2
             .cluster(mma(1)) // C3
-            .cluster(Mem::builder().gathers([2, 3]).build()) // C4
+            .cluster(Mem::builder().prefetch([1]).gathers([2, 3]).build()) // C4: load B (HK split), gather 2,3
             .cluster(mma(2)) // C5
             .cluster(Mem::builder().commit(true).build()) // C6
             .cluster(mma(3)) // C7

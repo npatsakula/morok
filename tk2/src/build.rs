@@ -331,6 +331,15 @@ impl Builder {
         Val::wrap(self.ir.intern(Node::LoadVecAt { buf: buf.id, base: base.0, ept, dtype: E::dtype() }))
     }
 
+    /// A global `load_vec` ordered after `deps` — the ordering rides on the buffer via `After` (as the
+    /// LDS reads carry their RAW ordering), so the linearizer emits the load in `deps`' cluster instead
+    /// of floating it to the loop top. Used to PIN the split prefetch (HK's A@C0 / B@C4): the load nodes
+    /// hash-cons identically regardless of authoring cluster, so without this edge the split is a no-op.
+    pub fn load_vec_after<E: Elem>(&mut self, buf: Buf<E>, base: Idx, ept: usize, deps: &[TileId]) -> Val<E> {
+        let buf = if deps.is_empty() { buf.id } else { self.after_buf(buf.id, deps) };
+        Val::wrap(self.ir.intern(Node::LoadVecAt { buf, base: base.0, ept, dtype: E::dtype() }))
+    }
+
     /// ONE `<ept×E>` vector store of a contiguous LDS run at flat `base` ([`Node::StoreVecAt`]
     /// → `ds_write_b64`/`b128`) — the store mirror of [`Self::load_lds_vec_after`], replacing
     /// `ept` scalar `store_lds` for a contiguous, aligned run (the vectorised fill).

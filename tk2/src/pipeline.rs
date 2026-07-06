@@ -54,9 +54,24 @@ pub(crate) trait Hooks {
     /// The register-staged fill carried prefetch→commit (matmul: `FillRegs`).
     type Reg;
 
-    /// Prefetch block `k_base` global→VGPR (the latency hide). Returns the staged registers and the
-    /// load-pin anchors (unused by the compiler-visible schedule; kept for the API symmetry).
-    fn prefetch(&mut self, b: &mut Builder, k_base: Idx) -> (Self::Reg, Vec<TileId>);
+    /// The number of independently-prefetchable operand tiles (matmul: 2 = A, B). The prologue stages
+    /// all; the steady schedule may SPLIT them across separate `Mem` clusters (HK loads A@C0, B@C4) so
+    /// each load hides under a different compute cluster instead of bunching at the loop top — the
+    /// `sched.barrier(0)` walls already emitted at each cluster boundary pin the split placement.
+    const PREFETCH_TILES: usize;
+
+    /// Prefetch operand-tile `tile` of block `k_base` global→VGPR (the latency hide), folding the
+    /// staged registers into `prev` (the partial fill accumulated by earlier prefetch clusters this
+    /// iteration; `None` = start fresh). `order` is the cluster entry: the load is ordered after it so
+    /// it lands in this cluster (the split pin) instead of floating to the loop top. Returns the fill.
+    fn prefetch(
+        &mut self,
+        b: &mut Builder,
+        k_base: Idx,
+        tile: usize,
+        prev: Option<Self::Reg>,
+        order: &[TileId],
+    ) -> Self::Reg;
     /// Commit the staged registers VGPR→LDS behind `war`. Returns the store effects the RAW fences.
     fn commit(&mut self, b: &mut Builder, k_base: Idx, reg: &Self::Reg, war: &[TileId]) -> Vec<Effect>;
     /// Gather K-slice `slice` LDS→operand-frags after `raw`. Returns the operand bundle, its store-
@@ -105,10 +120,15 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
 impl<H: Hooks> ClusterCx<'_, H> {
     /// The **prefetch** safe op = the `if mc.prefetch && Some(kn)=k_next { reg = ... }` arm: stage
     /// block k+1 global→VGPR (steady only — a no-op when `k_next` is `None`, e.g. epilogue/resident).
-    pub(crate) fn prefetch(&mut self) {
+    pub(crate) fn prefetch(&mut self, tiles: &[usize]) {
         if let Some(kn) = self.k_next {
-            let (r, _) = self.hooks.prefetch(self.b, kn);
-            self.reg = Some(r);
+            // Pin the loads to THIS cluster's entry (the preceding cluster's boundary barrier), so a
+            // split B@C4 lands between the right MFMA clusters instead of hoisting to the loop top.
+            let order = self.entry.clone();
+            for &t in tiles {
+                let prev = self.reg.take();
+                self.reg = Some(self.hooks.prefetch(self.b, kn, t, prev, &order));
+            }
         }
     }
 
@@ -269,8 +289,8 @@ impl<H: Hooks> Cluster<H> for Box<dyn Cluster<H>> {
 /// site names only what it sets: `Mem::builder().prefetch(true).gathers(vec![0]).build()`.
 #[derive(bon::Builder)]
 pub(crate) struct Mem {
-    #[builder(default)]
-    prefetch: bool,
+    #[builder(default, into)]
+    prefetch: Vec<usize>,
     #[builder(default, into)]
     gathers: Vec<usize>,
     #[builder(default)]
@@ -279,8 +299,8 @@ pub(crate) struct Mem {
 
 impl<H: Hooks> Cluster<H> for Mem {
     fn build(&self, cx: &mut ClusterCx<H>) {
-        if self.prefetch {
-            cx.prefetch();
+        if !self.prefetch.is_empty() {
+            cx.prefetch(&self.prefetch);
         }
         for &s in &self.gathers {
             cx.gather(s);
@@ -466,7 +486,13 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         // ── prologue: commit block 0; the eq=1 wave-phase barrier (ordered after the commit via the
         //    warp_row operand carrying the raw_seed edge) offsets warp-row 1 one cluster. ──
         let zero = b.idx_const(0);
-        let (reg0, _) = hooks.prefetch(b, zero);
+        // Stage ALL operand tiles of block 0 (the prologue is off the hot loop, so load placement here
+        // is irrelevant — the split-across-clusters hide only matters in the steady body).
+        let mut reg0 = None;
+        for t in 0..H::PREFETCH_TILES {
+            reg0 = Some(hooks.prefetch(b, zero, t, reg0, &[]));
+        }
+        let reg0 = reg0.expect("a pipeline has ≥1 prefetch tile");
         let fill0 = hooks.commit(b, zero, &reg0, &[]);
         // The prologue's block-0 drain is one-time (outside the steady loop), so both asm policies drain
         // it EXPOSED here — the deferral is specifically about hiding the hot-loop C6 drain, not this seed.
