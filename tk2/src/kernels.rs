@@ -1072,6 +1072,10 @@ fn kblock_impl(
                     for j in 0..cj {
                         let mut c_acc = acc_reads[i * cj + j];
                         for kf in 0..ksteps {
+                            // Intrinsic MFMA — the pipe path's chained accumulators + interleaved gather
+                            // let LLVM scatter the MFMAs among the memory ops, which HIDES latency (the
+                            // scatter is load-bearing here: asm-pinning it measured 4.8× SLOWER, mfmautil
+                            // 0.51→0.08). Asm MFMA helps only the rigid clustered schedule, not this one.
                             c_acc = b.mma(a_slices[kf][i], b_slices[kf][j], c_acc, ept);
                         }
                         out.push(c_acc);

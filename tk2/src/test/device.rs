@@ -281,6 +281,24 @@ fn dump_pinned_isa() {
     println!("pinned ISA dumped: {dir}/pinned.ll ({} B), {dir}/pinned.co ({} B)", src.len(), bytes.len());
 }
 
+/// Dump the **`mw256_pipe`** (non-clustered register-staged) kernel's ISA — the current best variant —
+/// to check whether its chained MFMAs fracture like the clustered path or already cluster.
+/// `SVOD_DEVICE=AMD:0 SVOD_DUMP_DIR=/tmp/tk2_isa cargo test -p svod-tk2 --lib -- --ignored device::dump_pipe_isa --nocapture`
+#[test]
+#[ignore]
+fn dump_pipe_isa() {
+    let dir = std::env::var("SVOD_DUMP_DIR").unwrap_or_else(|_| "/tmp/tk2_isa".into());
+    std::fs::create_dir_all(&dir).expect("mkdir dump dir");
+    let device_spec = Tensor::empty(&[1], DType::Float32).device();
+    let prog = crate::kernels::matmul_lds_kblock_mw_pipe(4096, 4096, 4096, 64, 64, 4, 4, 64)
+        .apply(VectorizePass)
+        .apply(SwizzlePass);
+    let (src, bytes) = crate::launch::compile_artifacts(&prog, &device_spec).expect("compile artifacts");
+    std::fs::write(format!("{dir}/pipe.ll"), &src).expect("write ll");
+    std::fs::write(format!("{dir}/pipe.co"), &bytes).expect("write co");
+    println!("pipe ISA dumped: {dir}/pipe.ll ({} B), {dir}/pipe.co ({} B)", src.len(), bytes.len());
+}
+
 /// The **apples-to-apples mfmautil measurement** (the whole point): profile the compute-resident
 /// microkernel's steady state and print the rocprofiler-compute gfx942 MfmaUtil, side by side with
 /// the DRAM-streaming clustered kernel (the 0.24 baseline) — both at HK's tiling, both vec+swizzle.
