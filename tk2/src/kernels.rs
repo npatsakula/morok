@@ -562,7 +562,11 @@ pub fn matmul_lds_kblock_mw_pipe2(
             let body = stores[ri * cj - 1];
             let mut rest: Vec<TileId> = stores[..ri * cj - 1].iter().map(|e| e.dep()).collect();
             rest.push(prio0); // set_prio(0) BEFORE the seal (HK: mma·setprio0·s_barrier), so it can't straddle it
-            let bar = c.seal(body, &rest).dep();
+            // BARE workgroup barrier (HK's bare `s_barrier`, not the acq/rel-fenced seal): a compute
+            // cluster's seal is a pure ping-pong phase carrier — no LDS WAR/RAW crosses it (the MFMAs
+            // write registers; the next gather reads the still-valid current block) — so the fence's
+            // machine-scheduler serialization is pure overhead. Only the commit's seals keep the fence.
+            let bar = c.bare_barrier(body, &rest).dep();
             (stores, vec![bar])
         })
     };
@@ -632,7 +636,10 @@ pub fn matmul_lds_kblock_mw_pipe2(
                         let (bv, bg) = b_view.slice(s).gather(&mut *m, &gdeps);
                         let mut ge = ag;
                         ge.extend(bg);
-                        let bar = m.seal(Effect(ge[0]), &ge[1..]).dep();
+                        // BARE barrier (HK): a gather cluster's seal is a ping-pong phase carrier — the
+                        // reads land in registers (drained by the MFMA's own lgkmcnt) and the LDS is not
+                        // overwritten until the fenced commit, so no WAR/RAW crosses this seal.
+                        let bar = m.bare_barrier(Effect(ge[0]), &ge[1..]).dep();
                         (av, bv, ge, bar)
                     });
                     all_gathers.extend(&ge);
