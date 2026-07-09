@@ -22,7 +22,7 @@ use common::{bench_plan, rand_bf16, requirements_met};
 use svod_tk2::{
     Program, SwizzlePass, VectorizePass, graph_kernel, matmul, matmul_lds_kblock_mw, matmul_lds_kblock_mw_clustered,
     matmul_lds_kblock_mw_clustered_bare, matmul_lds_kblock_mw_clustered_pin, matmul_lds_kblock_mw_pipe,
-    matmul_lds_kblock_sw, matmul_lds_kblock_vec, optimize_addressing,
+    matmul_lds_kblock_mw_pipe2, matmul_lds_kblock_sw, matmul_lds_kblock_vec, optimize_addressing,
 };
 
 /// f32 ground truth `A·B` over the SAME bf16-rounded operands (both kernel and
@@ -129,6 +129,13 @@ fn bench_matmul(c: &mut Criterion) {
         let (ymw2p, pmw2p) = plan_of(mw256p, n, n, &a, &b);
         assert_correct(&ymw2p, &pmw2p, &expected_abt, n, "kblock_mw256_pipe");
         group.bench_with_input(BenchmarkId::new("kblock_mw256_pipe", n), &n, |bch, _| bench_plan(bch, &pmw2p));
+        // slice-1 explicit-schedule pipeline (DESIGN.md 2026-07-08): same stages=2 schedule as
+        // kblock_mw256_pipe, authored via schedule::pipeline (named Carry channels). Validated
+        // byte-identical IR to the implicit kloop_2stage path — so this MUST match its perf.
+        let mw256p2 = matmul_lds_kblock_mw_pipe2(n, n, n, 64, 64, 4, 4, 64).apply(VectorizePass).apply(SwizzlePass);
+        let (ymw2p2, pmw2p2) = plan_of(mw256p2, n, n, &a, &b);
+        assert_correct(&ymw2p2, &pmw2p2, &expected_abt, n, "kblock_mw256_pipe2");
+        group.bench_with_input(BenchmarkId::new("kblock_mw256_pipe2", n), &n, |bch, _| bench_plan(bch, &pmw2p2));
         // §5c clustered HK replica (256² tile, HK tiling bm=128/bn=64/wm=2/wn=4): the COMPLETE
         // schedule — 8 clusters + per-cluster s_barrier + set_prio + sched_fence + the warp-phase
         // ping-pong. Now bit-exact, so measured: does the full co-designed schedule reach HK's 0.65?

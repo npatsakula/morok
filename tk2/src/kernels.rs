@@ -1260,6 +1260,266 @@ pub fn matmul_lds_kblock_mw_pipe(
     kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, false, false, false, CommitDrain::IntrinsicAuto, false, false)
 }
 
+/// **The explicit-schedule slice-1 kernel** (DESIGN.md conversation 2026-07-08): identical to
+/// [`matmul_lds_kblock_mw_pipe`] in tile shape and stages=2 register-staging, but authored via
+/// [`crate::schedule::pipeline`] with [`crate::schedule::cluster`] scopes and value-flow tokens.
+///
+/// The steady body is authored as a sequence of clusters — each a closure scope carrying its
+/// scheduling primitives and returning move-only tokens to the next cluster. The carries
+/// (`raw`, `acc`) are named channels read from the [`crate::schedule::PipelineCx`]. This is the
+/// abstraction the DESIGN conversation converged on: the cluster is a unit, the dependency is a
+/// value the cluster returns, the state is a type on the token.
+///
+/// Compose `.apply(VectorizePass).apply(SwizzlePass)` for the production variant.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_lds_kblock_mw_pipe2(
+    m: usize,
+    n: usize,
+    k: usize,
+    bm: usize,
+    bn: usize,
+    wm: usize,
+    wn: usize,
+    k_step: usize,
+) -> Program {
+    use crate::schedule::{
+        Committed, Gathered, InFlight, PipelineCx, SteadyOut, compute_cluster, mem_cluster, pipeline,
+    };
+
+    assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
+    assert!(k_step.is_multiple_of(EDGE) && k.is_multiple_of(k_step), "k_step multiple of 16, K multiple of k_step");
+    assert!(k / k_step >= 2, "pipe2 needs ≥2 K-blocks (stages=2 overlap); single-block K is stages=1");
+    assert!(wm >= 1 && wn >= 1, "at least one warp per axis");
+    let (big_m, big_n, nthreads) = (bm * wm, bn * wn, wm * wn * WARP);
+    assert!(m.is_multiple_of(big_m) && n.is_multiple_of(big_n), "m/n must tile by (bm·wm)/(bn·wn)");
+    let mut b = Builder::new("tk2_matmul_kblock");
+
+    let c = b.global::<F32>(m * n);
+    let a = b.global::<BF16>(m * k);
+    let bmat = b.global::<BF16>(n * k); // B is [N,K] (pre-transposed) — same as kblock_impl
+
+    // ── grid + warp split (identical to kblock_impl's setup) ──
+    let (grid_m, grid_n) = ((m / big_m) as i64, (n / big_n) as i64);
+    let (tile_m, tile_n) = if grid_m % 4 == 0 {
+        let wgid = b.grid_axis(0, grid_m * grid_n);
+        l2_swizzle(&mut b, wgid, grid_m, grid_n)
+    } else {
+        (b.grid_axis(0, grid_m), b.grid_axis(1, grid_n))
+    };
+    let tid = b.block_axis(nthreads as i64);
+    let (wlane, warp_row_off, warp_col_off) = if wm * wn == 1 {
+        (tid, None, None)
+    } else {
+        let warp_c = b.idx_const(WARP as i64);
+        let wn_c = b.idx_const(wn as i64);
+        let bm_c = b.idx_const(bm as i64);
+        let bn_c = b.idx_const(bn as i64);
+        let warp = b.idx_div(tid, warp_c);
+        let wlane = b.idx_mod(tid, warp_c);
+        let warp_row = b.idx_div(warp, wn_c);
+        let warp_col = b.idx_mod(warp, wn_c);
+        (wlane, Some(b.idx_mul(warp_row, bm_c)), Some(b.idx_mul(warp_col, bn_c)))
+    };
+
+    let a_map = FragMap::gfx942_16x16(false);
+    let bc_map = FragMap::gfx942_16x16(true);
+    let ept = a_map.ept;
+    let (ri, cj) = (bm / EDGE, bn / EDGE);
+    let ksteps = k_step / EDGE;
+
+    let a_smem = b.define_local::<BF16>(big_m * k_step);
+    let b_smem = b.define_local::<BF16>(k_step * big_n);
+    let epl_a = big_m * k_step / nthreads;
+    let epl_b = k_step * big_n / nthreads;
+
+    let big_m_c = b.idx_const(big_m as i64);
+    let big_n_c = b.idx_const(big_n as i64);
+    let tm_bm = b.idx_mul(tile_m, big_m_c);
+    let tn_bn = b.idx_mul(tile_n, big_n_c);
+
+    let a_tile = SharedTile::new(a_smem, k_step);
+    let b_tile = SharedTile::new(b_smem, k_step);
+    let a_view = a_tile.gather_view(a_map, ri, warp_row_off, wlane, false);
+    let b_view = b_tile.gather_view(bc_map, cj, warp_col_off, wlane, false);
+    let a_stage = a_tile.stage_view(a, epl_a, tid, tm_bm, k as i64, Drain::Intrinsic);
+    let b_stage = b_tile.stage_view(bmat, epl_b, tid, tn_bn, k as i64, Drain::Intrinsic);
+
+    let acc: Vec<Frag<F32>> = (0..ri * cj).map(|_| b.define_frag::<F32>(bc_map)).collect();
+    let inited: Vec<Effect> = acc.iter().map(|&ac| b.zero_init_frag(ac)).collect();
+
+    // ── the K-reduction via the explicit-schedule pipeline (clusters + tokens + carries) ──
+    let acc_final = pipeline(
+        &mut b,
+        k / k_step,
+        k_step,
+        &acc,
+        &inited,
+        // ── prologue: commit block 0 into LDS → raw_seed. Returns the block-0 RAW barrier token. ──
+        |b| {
+            let zero = b.idx_const(0);
+            let av = a_stage.prefetch(b, zero, &[]);
+            let bv = b_stage.prefetch(b, zero, &[]);
+            let reg0 = FillRegs { a: av, b: bv };
+            let fill0: Vec<Effect> = {
+                let fa = a_stage.commit(b, &reg0.a, &[]);
+                let fb = b_stage.commit(b, &reg0.b, &[]);
+                fa.into_iter().chain(fb).collect()
+            };
+            let fill0_deps: Vec<TileId> = fill0[1..].iter().map(|e| e.dep()).collect();
+            b.barrier(fill0[0], &fill0_deps).dep()
+        },
+        // ── steady body: one iteration, authored as clusters over the named carries. ──
+        |b, cx: &PipelineCx| {
+            // ── cluster: prefetch k+1 + gather block k + WAR. Returns (InFlight, Gathered×2). ──
+            // The prefetch's global load is issued EARLY so it flies in-flight across the MFMAs.
+            // The gather reads block k via the named `raw` carry (the previous iteration's commit).
+            let a_next = InFlight(a_stage.prefetch(b, cx.next_base, &[]));
+            let b_next = InFlight(b_stage.prefetch(b, cx.next_base, &[]));
+
+            // ── cluster: gather block k + WAR. Returns the gathered operands + the WAR edge. ──
+            let ((a_slices, b_slices), war_edge) = mem_cluster(b, |m| {
+                // Each `gather` yields a move-only `Gathered` token: its operand values + the
+                // `ds_read` completion edges. The tokens carry the edges (the WAR seal consumes
+                // them via `.edges()`); the compute then consumes the operands via `.operands()`.
+                let a_gathered: Vec<Gathered<BF16>> = (0..ksteps)
+                    .map(|kf| {
+                        let (v, g) = a_view.slice(kf).gather(&mut *m, cx.raw.deps());
+                        Gathered::new(v, g)
+                    })
+                    .collect();
+                let b_gathered: Vec<Gathered<BF16>> = (0..ksteps)
+                    .map(|kf| {
+                        let (v, g) = b_view.slice(kf).gather(&mut *m, cx.raw.deps());
+                        Gathered::new(v, g)
+                    })
+                    .collect();
+                // WAR fence: every lane's gather read completes before the next block's commit.
+                let gathers: Vec<TileId> =
+                    a_gathered.iter().chain(&b_gathered).flat_map(|gd| gd.edges().iter().copied()).collect();
+                let war = m.seal(Effect(gathers[0]), &gathers[1..]);
+                // Consume the operands for the MMA — moves each token exactly once.
+                let a_slices: Vec<Vec<Val<BF16>>> = a_gathered.into_iter().map(|gd| gd.operands()).collect();
+                let b_slices: Vec<Vec<Val<BF16>>> = b_gathered.into_iter().map(|gd| gd.operands()).collect();
+                ((a_slices, b_slices), war.dep())
+            });
+
+            // ── compute cluster: the ri×cj MFMA grid, bracketed by `set_prio(1)`/`set_prio(0)` so ──
+            //    the compute wave wins SIMD issue over the co-resident loading wave (HK's steering).
+            //    The `set_prio` nodes are ordering-only hints — the MFMA data flow is unchanged, so
+            //    results are bit-identical; only the machine schedule moves. NOT barrier-sealed: the
+            //    stores feed the commit's deps directly (the pipe path defers the `ds_write`).
+            let acc_stores: Vec<Effect> = compute_cluster(b, |c| {
+                // `set_prio(1)` anchored on the operand VALUE (the gathered A slice) — the bracket
+                // exists only because there is an operand; routed into the acc reads below.
+                let op_anchor = a_slices[0][0].id;
+                let prio1 = c.set_prio(1, &[op_anchor]).dep();
+                let acc_reads: Vec<Val<F32>> = (0..cx.n_acc())
+                    .map(|i| {
+                        let mut deps = cx.accs[i].deps().to_vec();
+                        deps.push(war_edge);
+                        deps.push(prio1);
+                        c.load_frag_vec_after(acc[i], &deps)
+                    })
+                    .collect();
+                let new: Vec<Val<F32>> = {
+                    let mut out = Vec::with_capacity(ri * cj);
+                    for i in 0..ri {
+                        for j in 0..cj {
+                            let mut acc_v = acc_reads[i * cj + j];
+                            for kf in 0..ksteps {
+                                acc_v = c.mma(a_slices[kf][i], b_slices[kf][j], acc_v, ept);
+                            }
+                            out.push(acc_v);
+                        }
+                    }
+                    out
+                };
+                let new_ids: Vec<TileId> = new.iter().map(|v| v.id).collect();
+                let stores: Vec<Effect> = acc.iter().zip(new).map(|(a, v)| c.store_frag_vec(*a, v)).collect();
+                // `set_prio(0)` on the MFMA results — closes the high-priority window.
+                c.set_prio(0, &new_ids);
+                stores
+            });
+
+            // ── cluster: commit k+1 behind the WAR + MFMA stores, then RAW-fence. The cluster's ──
+            //    seal IS the RAW barrier (the LDS carry-out that feeds the next iteration's gather).
+            let (_committed, raw_next) = mem_cluster(b, |m| {
+                let mut commit_after: Vec<TileId> = vec![war_edge];
+                commit_after.extend(acc_stores.iter().map(|e| e.dep()));
+                let fa = a_stage.commit(&mut *m, a_next.chunks(), &commit_after);
+                let fb = b_stage.commit(&mut *m, b_next.chunks(), &commit_after);
+                // The committed fill's store edges feed the RAW seal (the LDS carry-out).
+                let committed = Committed::new(fa.into_iter().chain(fb).collect());
+                let (body, deps) = committed.barrier_parts();
+                let raw = m.seal(body, &deps);
+                (committed, raw.dep())
+            });
+
+            SteadyOut { acc_stores, raw_next }
+        },
+        // ── epilogue: gather + MFMA the last block via the loop End's carried RAW. ──
+        |b, ended, acc_loop| {
+            // The last block was committed by the steady loop's final iteration; read it via the
+            // End-carried RAW (`ended`), gather+WAR, acc-read+mma, store, then rebind the
+            // accumulators past their epilogue store (the loop's final result).
+            let mut gathers_e: Vec<TileId> = Vec::new();
+            let a_slices: Vec<Vec<Val<BF16>>> = (0..ksteps)
+                .map(|kf| {
+                    let (v, g) = a_view.slice(kf).gather(b, &[ended]);
+                    gathers_e.extend(g);
+                    v
+                })
+                .collect();
+            let b_slices: Vec<Vec<Val<BF16>>> = (0..ksteps)
+                .map(|kf| {
+                    let (v, g) = b_view.slice(kf).gather(b, &[ended]);
+                    gathers_e.extend(g);
+                    v
+                })
+                .collect();
+            let war_e = b.barrier(Effect(gathers_e[0]), &gathers_e[1..]);
+            let acc_reads_e: Vec<Val<F32>> =
+                acc_loop.iter().map(|a| b.load_frag_vec_after(*a, &[war_e.dep()])).collect();
+            let new_e: Vec<Val<F32>> = {
+                let mut out = Vec::with_capacity(ri * cj);
+                for i in 0..ri {
+                    for j in 0..cj {
+                        let mut acc_v = acc_reads_e[i * cj + j];
+                        for kf in 0..ksteps {
+                            acc_v = b.mma(a_slices[kf][i], b_slices[kf][j], acc_v, ept);
+                        }
+                        out.push(acc_v);
+                    }
+                }
+                out
+            };
+            let stores_e: Vec<Effect> = acc_loop.iter().zip(new_e).map(|(a, v)| b.store_frag_vec(*a, v)).collect();
+            acc_loop.iter().zip(stores_e).map(|(a, s)| b.frag_after(*a, &[s.dep()])).collect()
+        },
+    );
+
+    // ── post-loop: scatter accumulators to C (identical to kblock_impl) ──
+    let n_c = b.idx_const(n as i64);
+    let mut roots = Vec::new();
+    for i in 0..ri {
+        for j in 0..cj {
+            let idx = i * cj + j;
+            let i16 = b.idx_const((i * EDGE) as i64);
+            let row = b.idx_add(tm_bm, i16);
+            let row = add_opt(&mut b, row, warp_row_off);
+            let row_n = b.idx_mul(row, n_c);
+            let j16 = b.idx_const((j * EDGE) as i64);
+            let col = b.idx_add(tn_bn, j16);
+            let col = add_opt(&mut b, col, warp_col_off);
+            let base_c = b.idx_add(row_n, col);
+            roots.extend(scatter_frag(&mut b, acc_final[idx], c, base_c, n as i64, wlane));
+        }
+    }
+
+    let (ir, sink) = b.finish(&roots);
+    Program { ir, sink, name: "tk2_matmul_kblock".into() }
+}
+
 /// The **clustered HK replica** (DESIGN §5c): [`matmul_lds_kblock_mw_pipe`]'s tile + stages=2
 /// overlap, but the steady body is decomposed into the [`hk_schedule`] 8-cluster memory/compute
 /// sequence with ALL scheduling placed by one interpreter — the per-cluster `sched_fence(0)` then

@@ -46,6 +46,10 @@ pub enum Error {
         source: Box<svod_device::Error>,
     },
 
+    /// Headless IR rendering (no device) failed — the codegen `Renderer::render` error as text.
+    #[snafu(display("render {name:?}: {reason}"))]
+    Render { name: String, reason: String },
+
     /// A buffer required by the compiled ABI was not supplied.
     #[snafu(display("buffer slot {slot} not supplied (of {supplied})"))]
     BufferMissing { slot: usize, supplied: usize },

@@ -26,6 +26,7 @@ pub(crate) mod movement;
 pub mod pass;
 pub mod passes;
 pub(crate) mod pipeline;
+pub mod schedule;
 
 pub use build::{Builder, Elem, F32};
 pub use error::{Error, Result};
@@ -34,11 +35,15 @@ pub use ir::{Node, TileId, TileIr};
 pub use kernels::{
     Program, elementwise_add, lds_carry_loop, lds_roundtrip, matmul, matmul_lds, matmul_lds_kblock,
     matmul_lds_kblock_ks, matmul_lds_kblock_mw, matmul_lds_kblock_mw_clustered, matmul_lds_kblock_mw_clustered_bare,
-    matmul_lds_kblock_mw_clustered_pin, matmul_lds_kblock_mw_pipe, matmul_lds_kblock_mw_resident, matmul_lds_kblock_sw,
-    matmul_lds_kblock_vec, matmul_lds_tiled, sum_reduce,
+    matmul_lds_kblock_mw_clustered_pin, matmul_lds_kblock_mw_pipe, matmul_lds_kblock_mw_pipe2,
+    matmul_lds_kblock_mw_resident, matmul_lds_kblock_sw, matmul_lds_kblock_vec, matmul_lds_tiled, sum_reduce,
 };
 pub use pass::{Band, Fold, Pass, Pipeline, Strategy};
 pub use passes::{ConstFoldPass, SwizzlePass, UnrollPass, VectorizePass, optimize_addressing};
+pub use schedule::{
+    Carry, Committed, ComputeScope, Gathered, InFlight, MemScope, PipelineCx, SteadyOut, compute_cluster, mem_cluster,
+    pipeline,
+};
 
 #[cfg(test)]
 mod test;

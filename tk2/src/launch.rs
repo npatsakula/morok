@@ -106,3 +106,43 @@ pub fn compile_artifacts(program: &Program, device_spec: &svod_dtype::DeviceSpec
         program_pipeline::do_compile(&rendered, device.compiler.as_ref()).context(error::CompileSnafu { name })?;
     Ok((src, compiled.bytes))
 }
+
+/// **Headless render** (no device, no clang, no KFD): lower + decompose + linearize + render the
+/// program's amdgcn LLVM IR text for `arch`, the same IR [`compile_artifacts`] would hand to
+/// clang — but stopping before the clang compile. This is the no-hardware ISA-comparison route:
+/// render the `.ll`, then `clang -O3 --target=amdgcn -mcpu=gfx942` it offline (or compare the IR).
+///
+/// Mirrors the real pipeline exactly (`lower_and_prepare` → decompose → `program_from_sink` →
+/// `do_linearize` → `LlvmTextRenderer::render`), just without the device/clang/KFD. The
+/// decompositor is reconstructed from the arch directly (the only device-sourced piece), so the
+/// rendered IR is byte-identical to what a real AMD device's renderer would produce.
+pub fn render_amd_ir(program: &Program, arch: svod_dtype::AmdArch) -> Result<String> {
+    use svod_codegen::program_pipeline;
+    use svod_dtype::DeviceSpec;
+
+    let sink = lower::lower_and_prepare(program);
+    let matcher = svod_ir::decompositions::amd_decomposition_patterns();
+    let sink = svod_ir::decompositions::decompose_with(&sink, &matcher);
+
+    // Wrap in a PROGRAM envelope + linearize (CFG + toposort + control-flow). The renderer
+    // requires `Op::Linear` input (it rejects a raw `Op::Sink`), and its error path `{:?}`s the
+    // full op — which exponentially expands the shared DAG → OOM. So we MUST linearize first.
+    let uop_program = program_pipeline::program_from_sink(sink, DeviceSpec::Amd { device_id: 0 });
+    let linearized = program_pipeline::do_linearize(&uop_program)
+        .map_err(|e| error::Error::Render { name: program.name.clone(), reason: e.to_string() })?;
+
+    // Extract the Op::Linear out of the PROGRAM envelope (the renderer matches on Linear, not
+    // Program). The real `do_render` does this at program_pipeline.rs:152.
+    let svod_ir::Op::Program { linear: Some(lin), .. } = linearized.op() else {
+        return Err(error::Error::Render {
+            name: program.name.clone(),
+            reason: "do_linearize did not produce a Linear stage".into(),
+        });
+    };
+    let linear_uop = lin.clone();
+
+    let renderer = svod_codegen::llvm::text::LlvmTextRenderer::amd(arch);
+    let rendered = svod_codegen::Renderer::render(&renderer, &linear_uop, Some(&program.name))
+        .map_err(|e| error::Error::Render { name: program.name.clone(), reason: e.to_string() })?;
+    Ok(rendered.code)
+}
