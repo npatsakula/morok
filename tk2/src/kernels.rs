@@ -560,9 +560,10 @@ pub fn matmul_lds_kblock_mw_pipe2(
             let stores: Vec<Effect> = acc.iter().zip(&new).map(|(a, v)| c.store_frag_vec(*a, *v)).collect();
             let prio0 = c.set_prio(0, &new_ids).dep();
             let body = stores[ri * cj - 1];
-            let rest: Vec<TileId> = stores[..ri * cj - 1].iter().map(|e| e.dep()).collect();
+            let mut rest: Vec<TileId> = stores[..ri * cj - 1].iter().map(|e| e.dep()).collect();
+            rest.push(prio0); // set_prio(0) BEFORE the seal (HK: mma·setprio0·s_barrier), so it can't straddle it
             let bar = c.seal(body, &rest).dep();
-            (stores, vec![bar, prio0])
+            (stores, vec![bar])
         })
     };
 
@@ -641,6 +642,9 @@ pub fn matmul_lds_kblock_mw_pipe2(
                 // before the LAST compute: commit block k+1 into the single LDS buffer (HK's C6),
                 // behind the WAR barrier over EVERY gather read (all slices), ordered after the prior
                 // cluster. Its RAW seal is the LDS carry the next iteration's gather reads through.
+                // NB: the WAR needs its OWN barrier — reusing the slice-(ksteps-1) gather seal instead
+                // was tried and races cross-warp (allclose failed), because a single fenced barrier
+                // drains only each warp's OWN reads, not all warps' reads before any warp's commit write.
                 if s == ksteps - 1 {
                     let af = a_next.as_ref().expect("A prefetched at slice 0");
                     let bf = b_next.as_ref().expect("B prefetched at the midpoint");
