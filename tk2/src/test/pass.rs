@@ -2,11 +2,17 @@
 //! banded/contract-checked pipeline, and the Elevate strategy combinators.
 
 use crate::ir::{TileId, TileIr};
-use crate::kernels::elementwise_add;
+use crate::kernels::{Program, matmul_lds_kblock_mw_pipe2};
 use crate::pass::{
     AsStrategy, Band, Fail, Id, IdentityFold, IdentityPass, Pass, PassError, Pipeline, Strategy, fold, or_else,
     repeat_fixpoint, seq, top_down, try_,
 };
+
+/// A small kept-kernel program — a generic `Program` fixture for the pass-runner scaffold tests
+/// (which assert only pass-runner behaviour, not kernel semantics).
+fn fixture() -> Program {
+    matmul_lds_kblock_mw_pipe2(64, 64, 128, 64, 64, 1, 1, 64)
+}
 
 /// A no-op pass in a chosen band (for band-ordering tests).
 struct BandPass(Band);
@@ -43,7 +49,7 @@ impl Pass for BadEnsures {
 
 #[test]
 fn identity_fold_is_a_no_op() {
-    let p = elementwise_add(32, 2);
+    let p = fixture();
     let mut ir = p.ir;
     let out = fold(&mut IdentityFold, &mut ir, p.sink);
     assert_eq!(out, p.sink, "re-interning identical nodes must return the same root");
@@ -53,7 +59,7 @@ fn identity_fold_is_a_no_op() {
 
 #[test]
 fn identity_pipeline_runs_and_preserves_the_root() {
-    let p = elementwise_add(32, 2);
+    let p = fixture();
     let mut ir = p.ir;
     let out = Pipeline::new().then(IdentityPass).run(&mut ir, p.sink).expect("identity pipeline runs");
     assert_eq!(out, p.sink);
@@ -61,7 +67,7 @@ fn identity_pipeline_runs_and_preserves_the_root() {
 
 #[test]
 fn band_must_not_decrease() {
-    let p = elementwise_add(16, 1);
+    let p = fixture();
     let mut ir = p.ir;
     // RegAlloc (late) then Tiling (early) — an illegal decrease.
     let err = Pipeline::new()
@@ -74,7 +80,7 @@ fn band_must_not_decrease() {
 
 #[test]
 fn ensures_contract_is_enforced() {
-    let p = elementwise_add(16, 1);
+    let p = fixture();
     let mut ir = p.ir;
     let err = Pipeline::new().then(BadEnsures).run(&mut ir, p.sink).expect_err("a violated ensures must fail the run");
     assert!(matches!(err, PassError::Ensures { .. }), "got {err:?}");
@@ -83,7 +89,7 @@ fn ensures_contract_is_enforced() {
 // ── the Elevate strategy combinators ─────────────────────────────────────────
 
 fn fresh() -> (TileIr, TileId) {
-    let p = elementwise_add(16, 1);
+    let p = fixture();
     (p.ir, p.sink)
 }
 

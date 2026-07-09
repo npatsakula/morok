@@ -1,19 +1,20 @@
-//! `svod-tk2` — a from-scratch Rust tile-IR DSL (the replacement for the svod-tk
-//! layer). **Step 1: the minimal end-to-end skeleton** — the architecture spine
-//! "naive tile-IR → verified lowering → correct (slow) device-UOp → runs on
-//! device", with NO optimizations yet. The settled design lives in `tk2/DESIGN.md`.
+//! `svod-tk2` — a from-scratch Rust tile-IR DSL for AMD (gfx942) matmul kernels: a typed builder
+//! emits an interned, hash-consed tile-IR carrying both the algorithm and the schedule as data;
+//! composable combinators/passes rewrite it; a verified lowering emits device-UOp → linearizer →
+//! codegen → LLVM. The target is HipKittens' compiler-visible matmul perf. Design: `tk2/DESIGN.md`.
 //!
-//! The four pieces (each a module):
-//! - [`ir`] — the interned, hash-consed tile-IR ADT (§1-§2): ONE DAG carrying
-//!   algorithm + (eventually) schedule as data, with ordering as first-class edges.
-//! - [`build`] — the typed builder emitting `Copy` [`ir::TileId`] handles, gently
-//!   typed (sealed dtype trait) per §OPEN-2.
-//! - [`lower`] — the verified lowering to a device-UOp SINK, then through svod's
-//!   existing `program_from_sink → do_linearize → type_verify → render` path (§D).
-//! - [`pass`] — the strategy-combinator pass runner with bands + contracts + a
-//!   nanopass identity-default folder (§2.6). No real passes yet — scaffolding.
+//! The modules:
+//! - [`ir`] — the interned, hash-consed tile-IR ADT (§1-§2): ONE DAG carrying algorithm + schedule
+//!   as data, with ordering as first-class edges. [`build`] is the typed builder over it.
+//! - [`movement`] — the `LdsView`/`LdsStage`/`SharedTile` handles carrying LDS addressing as data.
+//! - [`schedule`] — the typestate cluster-pipeline DSL (`MemScope`/`ComputeScope` + the 8-wave
+//!   ping-pong [`schedule::pipeline`]); [`pipeline`] is the driver form backing the asm clustered kernel.
+//! - [`pass`]/[`passes`] — the strategy-combinator runner + the `.apply`-able [`SwizzlePass`]/
+//!   [`VectorizePass`] refinements.
+//! - [`lower`] — the verified lowering to a device-UOp SINK → svod's `do_linearize → type_verify →
+//!   render` path (§D); [`launch`] dispatches on device.
 //!
-//! [`kernels`] authors the two proof kernels; [`launch`] dispatches on device.
+//! [`kernels`] keeps two matmul kernels: the compiler-visible `pipe2` and the asm `clustered` HK copies.
 
 pub mod build;
 pub mod error;
@@ -32,14 +33,9 @@ pub use build::{Builder, Elem, F32};
 pub use error::{Error, Result};
 pub use graph::graph_kernel;
 pub use ir::{Node, TileId, TileIr};
-pub use kernels::{
-    Program, elementwise_add, lds_carry_loop, lds_roundtrip, matmul, matmul_lds, matmul_lds_kblock,
-    matmul_lds_kblock_ks, matmul_lds_kblock_mw, matmul_lds_kblock_mw_clustered, matmul_lds_kblock_mw_clustered_bare,
-    matmul_lds_kblock_mw_clustered_pin, matmul_lds_kblock_mw_pipe, matmul_lds_kblock_mw_pipe2,
-    matmul_lds_kblock_mw_resident, matmul_lds_kblock_sw, matmul_lds_kblock_vec, matmul_lds_tiled, sum_reduce,
-};
+pub use kernels::{Program, matmul_lds_kblock_mw_clustered, matmul_lds_kblock_mw_pipe2};
 pub use pass::{Band, Fold, Pass, Pipeline, Strategy};
-pub use passes::{ConstFoldPass, SwizzlePass, UnrollPass, VectorizePass, optimize_addressing};
+pub use passes::{SwizzlePass, VectorizePass};
 pub use schedule::{
     Carry, Committed, ComputeScope, Gathered, InFlight, MemScope, PipelineCx, SteadyOut, compute_cluster, mem_cluster,
     pipeline,

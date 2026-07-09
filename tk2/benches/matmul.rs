@@ -20,9 +20,7 @@ mod common;
 use common::{bench_plan, rand_bf16, requirements_met};
 
 use svod_tk2::{
-    Program, SwizzlePass, VectorizePass, graph_kernel, matmul, matmul_lds_kblock_mw, matmul_lds_kblock_mw_clustered,
-    matmul_lds_kblock_mw_clustered_bare, matmul_lds_kblock_mw_clustered_pin, matmul_lds_kblock_mw_pipe,
-    matmul_lds_kblock_mw_pipe2, matmul_lds_kblock_sw, matmul_lds_kblock_vec, optimize_addressing,
+    Program, SwizzlePass, VectorizePass, graph_kernel, matmul_lds_kblock_mw_clustered, matmul_lds_kblock_mw_pipe2,
 };
 
 /// f32 ground truth `A·B` over the SAME bf16-rounded operands (both kernel and
@@ -69,70 +67,14 @@ fn bench_matmul(c: &mut Criterion) {
         group.throughput(Throughput::Elements((2.0 * (n as f64).powi(3)) as u64)); // 2·M·N·K
         let a = rand_bf16(&[n, n]);
         let b = rand_bf16(&[n, n]);
-        let expected = reference(&a, &b); // A·B — the standalone `matmul` arms
         // The `matmul_lds_kblock*` family takes B as [N,K] and computes A·Bᵀ (HK's contract), so its
         // reference transposes B (fast GPU matmul, not a host loop — this runs at N=4096).
         let expected_abt = reference(&a, &b.try_transpose(0, 1).expect("Bᵀ for A·Bᵀ reference"));
-
-        // Slow single-warp / naive variants — only up to 4096 (they take minutes at 8192, and 8192
-        // exists only for the grid-full big-tile comparison).
-        if n <= 4096 {
-            // Rolled: the naive K-loop with per-step div/mod gather addressing.
-            let (y0, p0) = plan_of(matmul(n, n, n), n, n, &a, &b);
-            assert_correct(&y0, &p0, &expected, n, "rolled");
-            group.bench_with_input(BenchmarkId::new("rolled", n), &n, |bch, _| bench_plan(bch, &p0));
-
-            // Unroll + const-fold: the two addressing passes, applied to the tile-IR.
-            let mut opt = matmul(n, n, n);
-            let root = optimize_addressing(&mut opt.ir, opt.sink).expect("addressing pipeline");
-            let opt = Program { ir: opt.ir, sink: root, name: opt.name };
-            let (y1, p1) = plan_of(opt, n, n, &a, &b);
-            assert_correct(&y1, &p1, &expected, n, "unroll+fold");
-            group.bench_with_input(BenchmarkId::new("unroll+fold", n), &n, |bch, _| bench_plan(bch, &p1));
-
-            // K-blocked LDS reuse (step 1b-ii): 64×64 tile, flat vs `.apply(SwizzlePass)`.
-            let flat = matmul_lds_kblock_vec(n, n, n, 64, 64, 64);
-            let (yb, pb) = plan_of(flat, n, n, &a, &b);
-            assert_correct(&yb, &pb, &expected_abt, n, "kblock_ks64");
-            group.bench_with_input(BenchmarkId::new("kblock_ks64", n), &n, |bch, _| bench_plan(bch, &pb));
-
-            let swizzled = matmul_lds_kblock_sw(n, n, n, 64, 64, 64);
-            let (ysw, psw) = plan_of(swizzled, n, n, &a, &b);
-            assert_correct(&ysw, &psw, &expected_abt, n, "kblock_sw64");
-            group.bench_with_input(BenchmarkId::new("kblock_sw64", n), &n, |bch, _| bench_plan(bch, &psw));
-        }
-
-        // Multi-warp bigger tiles (vectorised + swizzled), the barrier-amortisation lever:
-        // a 2×2 warp grid → 128×128, a 4×4 grid → 256×256. Each wins in its own N regime
-        // (enough workgroups to fill 304 CUs): 128² at mid-N, 256² at large-N (385 TF@4096 —
-        // tk's ceiling). The crossover is why production needs shape dispatch.
-        let mw128 = matmul_lds_kblock_mw(n, n, n, 64, 64, 2, 2, 64).apply(VectorizePass).apply(SwizzlePass);
-        let (ymw, pmw) = plan_of(mw128, n, n, &a, &b);
-        assert_correct(&ymw, &pmw, &expected_abt, n, "kblock_mw128");
-        group.bench_with_input(BenchmarkId::new("kblock_mw128", n), &n, |bch, _| bench_plan(bch, &pmw));
-
-        let mw256 = matmul_lds_kblock_mw(n, n, n, 64, 64, 4, 4, 64).apply(VectorizePass).apply(SwizzlePass);
-        let (ymw2, pmw2) = plan_of(mw256, n, n, &a, &b);
-        assert_correct(&ymw2, &pmw2, &expected_abt, n, "kblock_mw256");
-        group.bench_with_input(BenchmarkId::new("kblock_mw256", n), &n, |bch, _| bench_plan(bch, &pmw2));
-
-        // stages=2 register-staged pipeline (DESIGN §5b phase 2b): the same 128²/256² tiles, but
-        // block k+1's global load flies in-flight across block k's MFMAs (deferred ds_write behind
-        // the WAR). The latency-hide lever that should move MfmaUtil off the single-buffer 0.33 —
-        // gated here bit-exact vs the reference, and profiled via `--profile-time` for the counter.
-        let mw128p = matmul_lds_kblock_mw_pipe(n, n, n, 64, 64, 2, 2, 64).apply(VectorizePass).apply(SwizzlePass);
-        let (ymwp, pmwp) = plan_of(mw128p, n, n, &a, &b);
-        assert_correct(&ymwp, &pmwp, &expected_abt, n, "kblock_mw128_pipe");
-        group.bench_with_input(BenchmarkId::new("kblock_mw128_pipe", n), &n, |bch, _| bench_plan(bch, &pmwp));
-
-        let mw256p = matmul_lds_kblock_mw_pipe(n, n, n, 64, 64, 4, 4, 64).apply(VectorizePass).apply(SwizzlePass);
-        let (ymw2p, pmw2p) = plan_of(mw256p, n, n, &a, &b);
-        assert_correct(&ymw2p, &pmw2p, &expected_abt, n, "kblock_mw256_pipe");
-        group.bench_with_input(BenchmarkId::new("kblock_mw256_pipe", n), &n, |bch, _| bench_plan(bch, &pmw2p));
-        // slice-1 explicit-schedule pipeline (DESIGN.md 2026-07-08): same stages=2 schedule as
-        // kblock_mw256_pipe, authored via schedule::pipeline (named Carry channels). Validated
-        // byte-identical IR to the implicit kloop_2stage path — so this MUST match its perf.
-        let mw256p2 = matmul_lds_kblock_mw_pipe2(n, n, n, 64, 64, 4, 4, 64).apply(VectorizePass).apply(SwizzlePass);
+        // Compiler-visible HK copy (DESIGN.md 2026-07-09): pipe2 now authors HK's full 8-cluster
+        // dot-slice pipeline + 8-wave ping-pong via schedule::pipeline, with INTRINSIC MFMAs (the
+        // asm-free bet). HK's own tiling (bm=128/bn=64/wm=2/wn=4 → 256² tile, 2 warp-rows) so the
+        // warp-phase ping-pong is valid. Measured: does compiler-visible beat the asm clustered (500)?
+        let mw256p2 = matmul_lds_kblock_mw_pipe2(n, n, n, 128, 64, 2, 4, 64).apply(VectorizePass).apply(SwizzlePass);
         let (ymw2p2, pmw2p2) = plan_of(mw256p2, n, n, &a, &b);
         assert_correct(&ymw2p2, &pmw2p2, &expected_abt, n, "kblock_mw256_pipe2");
         group.bench_with_input(BenchmarkId::new("kblock_mw256_pipe2", n), &n, |bch, _| bench_plan(bch, &pmw2p2));
@@ -143,25 +85,6 @@ fn bench_matmul(c: &mut Criterion) {
         let (yhk, phk) = plan_of(hk, n, n, &a, &b);
         assert_correct(&yhk, &phk, &expected_abt, n, "kblock_hk");
         group.bench_with_input(BenchmarkId::new("kblock_hk", n), &n, |bch, _| bench_plan(bch, &phk));
-        // §5c bare cluster seals: the SAME schedule with HK's bare `s_barrier` + explicit `lgkmcnt(0)`
-        // drains (3/K-block) replacing the acq-rel fence's implicit drain (9/K-block). The A/B twin —
-        // isolates the barrier-fence overhead (`tk/arch/gfx9.rs:55`: the fence throttles MFMA overlap).
-        let hkb =
-            matmul_lds_kblock_mw_clustered_bare(n, n, n, 128, 64, 2, 4, 64).apply(VectorizePass).apply(SwizzlePass);
-        let (yhkb, phkb) = plan_of(hkb, n, n, &a, &b);
-        assert_correct(&yhkb, &phkb, &expected_abt, n, "kblock_hk_bare");
-        group.bench_with_input(BenchmarkId::new("kblock_hk_bare", n), &n, |bch, _| bench_plan(bch, &phkb));
-        // §5c MFMA-cluster pin: leading + trailing sched.barrier(0) around each 32-MFMA run so LLVM
-        // cannot fracture it (the ISA-diff root cause: fenced replica re-batches into 1+31/1+31/1/63
-        // with an s_barrier sunk mid-cluster, serializing LDS-read vs compute). The direct fix.
-        let hkp =
-            matmul_lds_kblock_mw_clustered_pin(n, n, n, 128, 64, 2, 4, 64).apply(VectorizePass).apply(SwizzlePass);
-        let (yhkp, phkp) = plan_of(hkp, n, n, &a, &b);
-        assert_correct(&yhkp, &phkp, &expected_abt, n, "kblock_hk_pin");
-        group.bench_with_input(BenchmarkId::new("kblock_hk_pin", n), &n, |bch, _| bench_plan(bch, &phkp));
-        // FINDING (4096): the complete HK replica REGRESSES — 317→475µs, mfmautil 0.40→0.23. Isolated:
-        // the 2-warp-row tiling (VGPR 64→128, occupancy) costs ~14% and the cluster+ping-pong schedule
-        // another ~31%. HK's compiler-visible transcription does NOT reach 0.65; the plain pipe wins.
     }
     group.finish();
 }

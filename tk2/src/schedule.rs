@@ -2,17 +2,17 @@
 //! closure scopes, dependencies as value-flow tokens, cross-iteration edges as named carries.
 //!
 //! The three pieces:
-//! - [`cluster`] — a lexical scope a cluster body authors inside `|c| { ... }`. Scheduling
-//!   primitives (`fence`/`setprio`/`drain_lgkm`/`seal`) live on [`Cluster`], which derefs to
-//!   [`Builder`] so the movement handles (`LdsView`/`LdsStage`) work unchanged. A cluster ends
-//!   with a seal (a barrier) that returns its boundary token.
+//! - **cluster scopes** ([`mem_cluster`]/[`compute_cluster`] → [`MemScope`]/[`ComputeScope`]) — a
+//!   lexical scope a cluster body authors inside `|m|`/`|c| { ... }`. The scheduling surface is gated
+//!   by KIND (mem: `fence`/`drain_lgkm`; compute: `set_prio`), and both deref to [`Builder`] so the
+//!   movement handles (`LdsView`/`LdsStage`) work unchanged. A cluster ends with a `seal` (a barrier).
 //! - **Tokens** ([`Gathered`]/[`InFlight`]/[`Committed`]) — move-only wrappers carrying both
 //!   the values and the dependency edges. A `Gathered` produced in one cluster is consumed by
 //!   exactly one later cluster; Rust's move semantics make double-use a compile error.
-//! - [`pipeline`] — owns the loop skeleton (Range/End + prologue/epilogue + carry-fold); the
-//!   body authors the steady iteration as a sequence of clusters over the named carries.
+//! - [`pipeline`] — owns the loop skeleton (Range/End + prologue/epilogue + carry-fold + the 8-wave
+//!   ping-pong wave barriers); the body authors the steady iteration as a sequence of clusters.
 //!
-//! Slice 1: the `stages=2` register-staged pipe path, byte-identical to `kloop_2stage`.
+//! `matmul_lds_kblock_mw_pipe2` authors HipKittens' 8-cluster dot-slice pipeline over this DSL.
 
 use crate::build::{Builder, Effect, F32, Frag, Idx, Val};
 use crate::ir::TileId;
@@ -228,12 +228,12 @@ pub struct SteadyOut {
 /// The **register-staged pipeline** (`stages=2`). Owns the loop skeleton; the body authors the
 /// steady iteration as clusters. The prologue and epilogue are kernel-specific, so they're
 /// closures the caller supplies — `prologue` returns the `raw_seed` (the block-0 commit barrier);
-/// `epilogue` gathers+MFMAs the last block via the loop `End`'s carried RAW.
-///
-/// **Byte-identical to `kloop_2stage`**: the structural calls (Range/End/combine/frag_after +
-/// the prologue/steady/epilogue barrier emission) are in the same order.
-///
-/// Requires `nblocks ≥ 2`.
+/// `epilogue` gathers+MFMAs the last block via the loop `End`'s carried RAW. Requires `nblocks ≥ 2`.
+/// `warp_row` (`Some` only for HK's 2-warp-row config) enables the **8-wave ping-pong**: an `eq=1`
+/// wave-phase barrier after the prologue offsets warp-row 1 by one cluster (only it executes the
+/// barrier — the counter-based `s_barrier` then pairs the two groups offset-by-one, so one warp-row
+/// runs a compute cluster while its SIMD-partner runs the paired memory cluster), rebalanced by an
+/// `eq=0` barrier the epilogue emits. The pair is balanced (verified) so the workgroup can't deadlock.
 #[allow(clippy::too_many_arguments)]
 pub fn pipeline(
     b: &mut Builder,
@@ -241,9 +241,10 @@ pub fn pipeline(
     k_step: usize,
     accs: &[Frag<F32>],
     inited: &[Effect],
+    warp_row: Option<Idx>,
     prologue: impl FnOnce(&mut Builder) -> TileId,
     steady: impl FnOnce(&mut Builder, &PipelineCx) -> SteadyOut,
-    epilogue: impl FnOnce(&mut Builder, TileId, &[Frag<F32>]) -> Vec<Frag<F32>>,
+    epilogue: impl FnOnce(&mut Builder, TileId, &[Frag<F32>], Option<Idx>) -> Vec<Frag<F32>>,
 ) -> Vec<Frag<F32>> {
     assert!(nblocks >= 2, "pipeline needs nblocks ≥ 2");
 
@@ -252,6 +253,12 @@ pub fn pipeline(
 
     // ── prologue (kernel-specific): returns the block-0 raw_seed. ──
     let raw_seed = prologue(b);
+    // ── ping-pong seed: eq=1 wave-phase barrier offsets warp-row 1 one cluster (balanced by the
+    //    epilogue's eq=0). Ordered after the prologue commit; rides as the steady RAW carry seed. ──
+    let loop_seed = match warp_row {
+        Some(wr) => b.wave_barrier(wr, 1, &[raw_seed]).dep(),
+        None => raw_seed,
+    };
 
     // ── steady loop ──
     let kr = b.range((nblocks - 1) as i64);
@@ -262,7 +269,7 @@ pub fn pipeline(
     let cx = PipelineCx {
         counter: tk,
         next_base: k_next,
-        raw: Carry::<Raw>::wrap(vec![raw_seed, kr.dep()]),
+        raw: Carry::<Raw>::wrap(vec![loop_seed, kr.dep()]),
         accs: (0..accs.len()).map(|i| Carry::<Acc>::wrap(vec![inited[i].dep(), kr.dep()])).collect(),
     };
 
@@ -277,9 +284,26 @@ pub fn pipeline(
     let ended = b.end(combined, &[kr]);
     let acc_loop: Vec<Frag<F32>> = accs.iter().map(|a| b.frag_after(*a, &[ended.dep()])).collect();
 
-    // ── epilogue (kernel-specific): gather+MFMA the last block via the End-carried RAW,
-    //    returning the accumulators rebound past its store (the loop's final result). ──
-    epilogue(b, ended.dep(), &acc_loop)
+    // ── epilogue (kernel-specific): gather+MFMA the last block via the End-carried RAW + emit the
+    //    eq=0 rebalance barrier (if ping-pong), returning the accumulators rebound past its store. ──
+    let out = epilogue(b, ended.dep(), &acc_loop, warp_row);
+
+    // ── wave-phase balance (deadlock guard): equal eq=0/eq=1 wave barriers reachable from the output. ──
+    if warp_row.is_some() {
+        let mut reach: std::collections::HashSet<TileId> = std::collections::HashSet::new();
+        for f in &out {
+            reach.extend(crate::passes::reachable(&b.ir, f.id));
+        }
+        let count = |want: i64| {
+            reach
+                .iter()
+                .filter(|&&id| matches!(b.ir.node(id), crate::ir::Node::WaveBarrier { eq, .. } if *eq == want))
+                .count()
+        };
+        let (n0, n1) = (count(0), count(1));
+        assert_eq!(n0, n1, "wave-phase barriers unbalanced (eq=0: {n0}, eq=1: {n1}) — would deadlock the workgroup");
+    }
+    out
 }
 
 #[cfg(test)]
