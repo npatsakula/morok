@@ -340,6 +340,34 @@ impl Builder {
         Val::wrap(self.ir.intern(Node::LoadVecAt { buf, base: base.0, ept, dtype: E::dtype() }))
     }
 
+    /// The **buffer-resource descriptor** (`srsrc`) of a global `buf`, based at element `base_off`
+    /// ([`Node::MakeBufferRsrc`] → `make.buffer.rsrc.p0` of `&buf[base_off]`). `base_off` is the
+    /// workgroup-uniform tile origin (`origin·K + k_base`), so the descriptor base advances per tile in
+    /// SCALAR — the escape from FLAT `global_load`'s per-iteration 64-bit VGPR address. Feeds
+    /// [`Self::buffer_load_raw`] with `soffset = 0` (HK's scheme; a non-zero soffset is mishandled by the
+    /// raw config `0x110000`). `num_bytes` = the whole-buffer extent (the SRD bound is base-relative;
+    /// in-tile voffsets never exceed it, and valid tiling keeps every access in-buffer).
+    pub fn make_buffer_rsrc<E: Elem>(&mut self, buf: Buf<E>, base_off: Idx) -> Idx {
+        let num_bytes = (buf.len * E::dtype().bytes()) as i64;
+        Idx(self.ir.intern(Node::MakeBufferRsrc { buf: buf.id, base_off: base_off.0, num_bytes }))
+    }
+
+    /// ONE MUBUF `raw.buffer.load` ([`Node::BufferLoadRaw`]) reading the `ept`-element run at
+    /// `rsrc[voffset]` bytes (`soffset = 0`), the SGPR-descriptor DRAM prefetch over FLAT `global_load`. The
+    /// descriptor base (from [`Self::make_buffer_rsrc`]) advances per K-tile in scalar; `voffset` is the
+    /// per-lane within-tile byte offset (loop-invariant). `order` pins the load into its authoring cluster
+    /// (ordering-only, as [`Self::load_vec_after`]'s `deps`).
+    pub fn buffer_load_raw<E: Elem>(&mut self, rsrc: Idx, voffset: Idx, ept: usize, order: &[TileId]) -> Val<E> {
+        let order = order.iter().copied().collect();
+        Val::wrap(self.ir.intern(Node::BufferLoadRaw {
+            rsrc: rsrc.0,
+            voffset: voffset.0,
+            ept,
+            dtype: E::dtype(),
+            order,
+        }))
+    }
+
     /// ONE `<ept×E>` vector store of a contiguous LDS run at flat `base` ([`Node::StoreVecAt`]
     /// → `ds_write_b64`/`b128`) — the store mirror of [`Self::load_lds_vec_after`], replacing
     /// `ept` scalar `store_lds` for a contiguous, aligned run (the vectorised fill).

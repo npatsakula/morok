@@ -14,8 +14,9 @@
 //!
 //! `matmul_lds_kblock_mw_pipe2` authors HipKittens' 8-cluster dot-slice pipeline over this DSL.
 
-use crate::build::{Builder, Effect, F32, Frag, Idx, Val};
-use crate::ir::TileId;
+use crate::build::{Builder, Effect, Elem, F32, Frag, Idx, Val};
+use crate::ir::{FragMap, TileId};
+use crate::movement::LdsView;
 
 // ══════════════════════════ tokens (move-only value-flow) ══════════════════════════
 
@@ -78,6 +79,87 @@ impl Committed {
     /// The first store (barrier body) + the rest (barrier deps) — for the RAW fence.
     pub fn barrier_parts(&self) -> (Effect, Vec<TileId>) {
         (self.stores[0], self.stores[1..].iter().map(|e| e.dep()).collect())
+    }
+}
+
+// ══════════════════════════ register-tile pool (residency) ══════════════════════════
+//
+// The THIRD schedule dimension, alongside ordering (barriers/fences) and value-flow (the tokens
+// above): register RESIDENCY. `TilePool` makes the operand working set an explicit object — a fixed
+// set of register-tile slots minted ONCE and reused across dot-slices — so the read-ahead DEPTH is a
+// single number whose live VGPR cost (`vgprs()`) is computable and build-checkable, instead of an
+// emergent property of the register allocator. svod's analog of HipKittens' `rt tiles[8]` pool.
+
+/// A fixed-capacity pool of operand register tiles — the explicit read-ahead working set. `depth`
+/// dot-slices are resident at once (`depth · n_frags` slots), so its live VGPR cost is bounded and
+/// asserted against the hardware ceiling at build. Slots are reused across slices (phase `s % depth`);
+/// the caller threads each stage's ordering-in edges (the LDS-RAW carry + the slot's recycle edge).
+pub(crate) struct TilePool<E: Elem> {
+    slots: Vec<Vec<Frag<E>>>,     // [phase][fragment] — `depth` phases × `n_frags` reused slots
+    recycle: Vec<Vec<TileId>>,    // [phase] — the resident slice's consuming-MMA edges (the WAR source)
+    occupant: Vec<Option<usize>>, // [phase] — the slice holding the slots, until `consumed` frees it
+    depth: usize,
+    frag_vgprs: usize,
+}
+
+impl<E: Elem> TilePool<E> {
+    /// Mint a `depth`-deep pool of `n_frags` slots per phase over MFMA lane-map `map`. `frag_vgprs`
+    /// is one fragment's hardware VGPR width (bf16 `<4×bf16>` = 2), for the budget check.
+    pub(crate) fn new(b: &mut Builder, map: FragMap, depth: usize, n_frags: usize, frag_vgprs: usize) -> Self {
+        assert!(depth >= 1, "pool depth ≥ 1");
+        let slots = (0..depth).map(|_| (0..n_frags).map(|_| b.define_frag::<E>(map)).collect()).collect();
+        TilePool { slots, recycle: vec![Vec::new(); depth], occupant: vec![None; depth], depth, frag_vgprs }
+    }
+
+    /// Gather dot-slice `s` into its phase (`s % depth`) slots, ordering the `ds_read`s after `deps`
+    /// (the LDS-RAW carry) AND — when the phase is being REUSED — the previous occupant's recycle edge.
+    /// That recycle edge is the register WAR: sequencing this gather's READS after the prior slice's
+    /// consuming MMA means its stores (value-dependent on those reads) cannot clobber an operand the
+    /// MMA has not yet read, and the prior operands are dead so their VGPRs are free to reuse. The
+    /// ordering rides the READ path — the same one the LDS-RAW carry uses — not a store re-bind: an
+    /// `After` on a store buffer is not an honored scheduling edge, whereas read-after is. **Panics**
+    /// if the phase is still OCCUPIED — reading `depth` slices ahead without consuming exhausts the
+    /// pool, a schedule bug we surface LOUDLY at build rather than let a stale slot corrupt numerics.
+    /// Returns the operand `Val`s + the store-fence tokens the seal consumes.
+    pub(crate) fn stage(
+        &mut self,
+        b: &mut Builder,
+        view: LdsView<E>,
+        s: usize,
+        deps: &[TileId],
+    ) -> (Vec<Val<E>>, Vec<TileId>) {
+        let phase = s % self.depth;
+        assert!(
+            self.occupant[phase].is_none(),
+            "TilePool depth {} exhausted: slice {s} needs phase {phase}, still held by slice {} \
+             (read-ahead exceeds pool depth — raise depth or consume() the resident slice first)",
+            self.depth,
+            self.occupant[phase].expect("occupied"),
+        );
+        let mut raw = deps.to_vec();
+        raw.extend_from_slice(&self.recycle[phase]);
+        self.occupant[phase] = Some(s);
+        view.slice(s).gather_into(b, &raw, &self.slots[phase])
+    }
+
+    /// Mark slice `s`'s operands drained by its MMA: free the phase and arm its recycle edge (`edges`,
+    /// the consuming accumulator stores) for the next slice that reuses the slots. **Panics** if the
+    /// phase does not currently hold slice `s` — `consumed` must pair with the matching `stage`.
+    pub(crate) fn consumed(&mut self, s: usize, edges: &[TileId]) {
+        let phase = s % self.depth;
+        assert_eq!(
+            self.occupant[phase],
+            Some(s),
+            "TilePool.consumed({s}) but phase {phase} holds {:?} — stage/consume order mismatch",
+            self.occupant[phase],
+        );
+        self.occupant[phase] = None;
+        self.recycle[phase] = edges.to_vec();
+    }
+
+    /// The pool's live VGPR cost — `depth · n_frags · frag_vgprs`. For the register-budget assert.
+    pub(crate) fn vgprs(&self) -> usize {
+        self.depth * self.slots.first().map_or(0, Vec::len) * self.frag_vgprs
     }
 }
 

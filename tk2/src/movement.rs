@@ -65,17 +65,89 @@ impl<E: Elem> LdsView<E> {
         if self.asm { self.gather_asm(b, raw) } else { self.gather_scalar(b, raw) }
     }
 
+    /// Gather into caller-owned `slots` (a [`crate::schedule::TilePool`] phase), dispatching on the
+    /// view's `asm` exactly as [`Self::gather`] does — so a pooled gather takes the SAME path (asm vs
+    /// compiler-visible) the kernel is built for. Returns operands + store-fence tokens.
+    pub(crate) fn gather_into(self, b: &mut Builder, raw: &[TileId], slots: &[Frag<E>]) -> (Vec<Val<E>>, Vec<TileId>) {
+        if self.asm { self.gather_asm_into(b, raw, slots) } else { self.gather_vec_into(b, raw, slots) }
+    }
+
+    /// The **pooled vector gather** (compiler-visible): emits directly what `gather_scalar` +
+    /// [`crate::VectorizePass`] would fuse to — ONE `LoadVecAt` (intrinsic `ds_read_b64`) per fragment
+    /// from the e=0 element's swizzled base, into a caller-owned REUSED slot. The pool MUST emit the
+    /// vector form up front because `VectorizePass`'s fusion needs exactly `ept` stores per fragment
+    /// buffer, which a reused slot (written by several dot-slices) violates — so the fuse-later path
+    /// silently declines and falls back to scalar. `slots.len()` must equal the view's `n_frags`.
+    pub(crate) fn gather_vec_into(
+        self,
+        b: &mut Builder,
+        raw: &[TileId],
+        slots: &[Frag<E>],
+    ) -> (Vec<Val<E>>, Vec<TileId>) {
+        assert_eq!(slots.len(), self.n_frags, "TilePool slots must match the view's fragment count");
+        // Fragment 0's swizzled LDS base. Every fragment sits `f·EDGE` rows further down the SAME
+        // column, and the swizzle delta (a function of `row % 16`) is identical for all of them (they
+        // are EDGE=16 rows apart), so fragment f's base is `base0 + f·EDGE·inner` — a COMPILE-TIME
+        // offset LLVM folds into the `ds_read offset:` immediate. That collapses the per-fragment
+        // address to ONE base VGPR (HK's asm-gather addressing, but compiler-visible), the spill cure
+        // the over-read needs, instead of a live base register per fragment.
+        let zero = b.idx_const(0);
+        let (frag_row, frag_col) = b.lane_rc(self.map, self.lane, zero);
+        let (outer_frag, run_frag) = if self.map.transpose { (frag_col, frag_row) } else { (frag_row, frag_col) };
+        let outer0 = add_opt(b, outer_frag, self.warp_off);
+        let run0 = offset_by(b, run_frag, self.run);
+        let inner_c = b.idx_const(self.inner as i64);
+        let col_part = b.lds_col(outer0, run0, self.inner);
+        let row_off = b.idx_mul(outer0, inner_c);
+        let base0 = b.idx_add(row_off, col_part);
+        let step = EDGE as i64 * self.inner as i64; // fragment row stride (elements)
+        let mut stores = Vec::with_capacity(slots.len());
+        let vecs = (0..self.n_frags)
+            .map(|f| {
+                let frag = slots[f];
+                let base = if f == 0 {
+                    base0
+                } else {
+                    let off = b.idx_const(f as i64 * step);
+                    b.idx_add(base0, off)
+                };
+                let vec = b.load_lds_vec_after(self.lds, base, self.map.ept, raw);
+                let st = b.store_frag_vec(frag, vec);
+                stores.push(st.dep());
+                b.load_frag_vec_after(frag, &[st.dep()])
+            })
+            .collect();
+        (vecs, stores)
+    }
+
     /// The **scalar** (intrinsic/fallback) gather: per fragment, `ept` per-element
     /// `load_lds_after` then `store_frag_elem` at `outer·inner + LdsCol(outer, run+e)`, then one
     /// `load_frag_vec_after`. The per-element `LdsCol` is the composable hole `SwizzlePass` and
     /// `VectorizePass` refine (§5b).
     /// Subsumes `gather_frag_lds_run` (bit-for-bit — same nodes, same edges).
     fn gather_scalar(self, b: &mut Builder, raw: &[TileId]) -> (Vec<Val<E>>, Vec<TileId>) {
+        let frags: Vec<Frag<E>> = (0..self.n_frags).map(|_| b.define_frag::<E>(self.map)).collect();
+        self.gather_scalar_into(b, raw, &frags)
+    }
+
+    /// The **pooled** scalar gather: identical to [`Self::gather_scalar`] but stores into caller-owned,
+    /// REUSED `slots` (a [`crate::schedule::TilePool`] phase) instead of minting a fresh fragment per
+    /// slice — the compiler-visible counterpart to [`Self::gather_asm_into`]. This is the path a
+    /// compiler-visible kernel (asm=false) MUST use for pooling: its `ds_read` is an intrinsic whose
+    /// `lgkmcnt` the `s_barrier` auto-drains, unlike the waitcnt-opaque asm gather. `slots.len()` must
+    /// equal the view's `n_frags`.
+    pub(crate) fn gather_scalar_into(
+        self,
+        b: &mut Builder,
+        raw: &[TileId],
+        slots: &[Frag<E>],
+    ) -> (Vec<Val<E>>, Vec<TileId>) {
+        assert_eq!(slots.len(), self.n_frags, "TilePool slots must match the view's fragment count");
         let inner_c = b.idx_const(self.inner as i64);
         let mut gathers = Vec::new();
         let vecs = (0..self.n_frags)
             .map(|f| {
-                let frag = b.define_frag::<E>(self.map);
+                let frag = slots[f];
                 let stores: Vec<TileId> = (0..self.map.ept)
                     .map(|e| {
                         let e_idx = b.idx_const(e as i64);
@@ -113,6 +185,22 @@ impl<E: Elem> LdsView<E> {
     /// Subsumes `gather_frags_asm`.
     fn gather_asm(self, b: &mut Builder, raw: &[TileId]) -> (Vec<Val<E>>, Vec<TileId>) {
         let frags: Vec<Frag<E>> = (0..self.n_frags).map(|_| b.define_frag::<E>(self.map)).collect();
+        self.gather_asm_into(b, raw, &frags)
+    }
+
+    /// The **pooled** asm gather: identical addressing/reads to [`Self::gather_asm`] but stores into
+    /// caller-owned, REUSED `slots` (a [`crate::schedule::TilePool`] phase) instead of minting a fresh
+    /// fragment per slice. Reusing fixed slots is what makes the read-ahead register working-set
+    /// explicit and bounded: `raw` carries both the LDS-RAW carry AND the slot's recycle edge (the
+    /// previous occupant's consuming MMA), so the base pointer — hence every `ds_read` — lands after
+    /// the live operand it overwrites is drained. `slots.len()` must equal the view's `n_frags`.
+    pub(crate) fn gather_asm_into(
+        self,
+        b: &mut Builder,
+        raw: &[TileId],
+        slots: &[Frag<E>],
+    ) -> (Vec<Val<E>>, Vec<TileId>) {
+        assert_eq!(slots.len(), self.n_frags, "TilePool slots must match the view's fragment count");
         // base LDS element offset at fragment 0, element 0: the lane's slot + the wave/run offset,
         // with the swizzle hole at `lds_col` (flat = `run`; SwizzlePass = `run ^ delta`).
         let zero = b.idx_const(0);
@@ -129,10 +217,10 @@ impl<E: Elem> LdsView<E> {
 
         let itemsize = E::dtype().bytes() as i64;
         let step_bytes = EDGE as i64 * self.inner as i64 * itemsize; // fragment-row `offset:` step
-        let mut vecs = Vec::with_capacity(frags.len());
-        let mut stores = Vec::with_capacity(frags.len());
+        let mut vecs = Vec::with_capacity(slots.len());
+        let mut stores = Vec::with_capacity(slots.len());
         let mut prev: Option<TileId> = None;
-        for (i, &f) in frags.iter().enumerate() {
+        for (i, &f) in slots.iter().enumerate() {
             let off_bytes = i as i64 * step_bytes;
             let v: Val<E> = b.ds_read_b64(base_ptr, off_bytes, self.map.ept, prev);
             let st = b.store_frag_vec(f, v);
@@ -239,21 +327,33 @@ impl<E: Elem> LdsStage<E> {
         let lane_epl = b.idx_mul(self.lane, epl_c);
         let cols_c = b.idx_const(self.cols);
         let gstride = b.idx_const(self.grow_stride);
+        // The MUBUF split (§DRAM-prefetch — HK's `buffer_load` over FLAT `global_load`): the buffer
+        // descriptor + the workgroup-uniform byte soffset are hoisted/uniform (SGPR base, advanced by a
+        // scalar `s_add` = the K-tile stride); each chunk's per-lane byte voffset is K-invariant (hoisted
+        // VGPR). soffset + voffset reproduce the FLAT `goff = (origin+r)·K + k_base + c` (in bytes), but
+        // with NO per-iteration 64-bit VGPR address — the load no longer parks on a `v_add` dependency.
+        let item_c = b.idx_const(E::dtype().bytes() as i64);
+        // MUBUF prefetch (HK's `buffer_load` over FLAT `global_load`): the buffer base lives in the SGPR
+        // `srsrc` descriptor (fixed at the tensor start), and the whole per-element byte offset rides in
+        // `voffset` (`soffset = 0`). The bit-exact-safe form: a FIXED descriptor base — an advancing base
+        // (HK's exact scheme) is faster but flaky here (a timing race with the kernel's async-LDS ping-pong,
+        // independent of descriptor ordering/addressing/range/spills — see the movement notes), and we do
+        // not ship a flaky kernel. Retains a per-iteration VGPR `voffset`, so no net stall win yet.
+        let base0 = b.idx_const(0);
+        let rsrc = b.make_buffer_rsrc(self.src, base0);
         let mut out = Vec::with_capacity(self.epl / VEC);
         for cg in 0..self.epl / gvec {
             let ec = b.idx_const((cg * gvec) as i64);
             let flat = b.idx_add(lane_epl, ec); // gvec-aligned chunk start (stays in one row)
             let r = b.idx_div(flat, cols_c);
             let c = b.idx_mod(flat, cols_c);
-            // Global: contiguous `gvec`-run at (origin + r)·stride + k_base + c.
+            // Full per-lane byte voffset = ((origin+r)·K + k_base + c)·itemsize.
             let grow = b.idx_add(self.origin, r);
             let goff = b.idx_mul(grow, gstride);
             let goff = b.idx_add(goff, k_base);
             let goff = b.idx_add(goff, c);
-            // Ordered after `order` (the cluster entry): pins the load into its authoring cluster
-            // (HK's A@C0 / B@C4 split) instead of the linearizer floating it to the loop top. The
-            // `sched.barrier(0)` walls then keep the scheduler from hoisting it back up.
-            let wide = b.load_vec_after(self.src, goff, gvec, order); // ONE b128 (or b64) coalesced global load
+            let voff = b.idx_mul(goff, item_c);
+            let wide = b.buffer_load_raw(rsrc, voff, gvec, order); // ONE b128 (or b64) MUBUF load
             for h in 0..gvec / VEC {
                 if gvec == VEC {
                     out.push(wide);

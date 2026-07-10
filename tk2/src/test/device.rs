@@ -90,6 +90,25 @@ fn dump_streaming_isa() {
     println!("streaming ISA dumped: {dir}/streaming.ll ({} B), {dir}/streaming.co ({} B)", src.len(), bytes.len());
 }
 
+/// Dump the **pipe2** kernel's LLVM IR to `$SVOD_DUMP_DIR/$SVOD_DUMP_NAME.ll` for diffing the
+/// operand-gather region (TilePool investigation). Small config so the loop body is readable.
+/// `SVOD_DEVICE=AMD:0 SVOD_DUMP_NAME=pipe2_x cargo test -p svod-tk2 --lib -- --ignored device::dump_pipe2_isa --nocapture`
+#[test]
+#[ignore]
+fn dump_pipe2_isa() {
+    let dir = std::env::var("SVOD_DUMP_DIR").unwrap_or_else(|_| "/tmp/tk2_isa".into());
+    let name = std::env::var("SVOD_DUMP_NAME").unwrap_or_else(|_| "pipe2".into());
+    std::fs::create_dir_all(&dir).expect("mkdir dump dir");
+    let device_spec = Tensor::empty(&[1], DType::Float32).device();
+    let prog = crate::kernels::matmul_lds_kblock_mw_pipe2(256, 256, 256, 128, 64, 2, 4, 64)
+        .apply(VectorizePass)
+        .apply(SwizzlePass);
+    let (src, bytes) = crate::launch::compile_artifacts(&prog, &device_spec).expect("compile pipe2");
+    std::fs::write(format!("{dir}/{name}.ll"), &src).expect("write ll");
+    std::fs::write(format!("{dir}/{name}.co"), &bytes).expect("write co");
+    println!("pipe2 IR dumped: {dir}/{name}.ll ({} B), {dir}/{name}.co ({} B)", src.len(), bytes.len());
+}
+
 /// **0-spill guard for the asm-gather clustered kernels** — the latent-fragility tripwire. The asm
 /// `ds_read_b64`/`ds_write_b64` gather+commit are waitcnt-opaque, so LLVM's spill logic cannot model
 /// their async LDS completion: a register spilled/reloaded around them can carry a value that has not

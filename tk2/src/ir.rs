@@ -262,6 +262,20 @@ pub enum Node {
     /// silent-stale-read class §2.1). Renders as `read.bitcast(<ept×bf16>)` of the `<ept×i16>`
     /// asm result.
     DsReadB64 { base_ptr: TileId, off_bytes: i64, ept: usize, dtype: DType, prev: Option<TileId> },
+    /// The **buffer-resource descriptor** (`ptr addrspace(8)`) of a global buffer — `make.buffer.rsrc.p0`
+    /// of `&buf[base_off]`; `num_bytes` = the buffer byte-extent (the SRD bound), config `0x110000` (HK's
+    /// `make_srsrc`, row_stride 0). Shipped with `base_off = 0` (fixed base, loop-invariant → hoisted);
+    /// an advancing base (`origin·K + k_base`) is HK's perf scheme but flaky here. Feeds
+    /// [`Node::BufferLoadRaw`]. Lowers to a pointer-typed `Op::Custom`.
+    MakeBufferRsrc { buf: TileId, base_off: TileId, num_bytes: i64 },
+    /// ONE `llvm.amdgcn.raw.buffer.load.v{dwords}i32` **MUBUF** load (gfx942 — HK's DRAM prefetch, the
+    /// escape from FLAT `global_load`): reads the `ept`-element run at `rsrc[voffset]` bytes, `soffset = 0`.
+    /// The address split rides in the DESCRIPTOR: `rsrc`'s base advances per K-tile in SCALAR (see
+    /// [`Node::MakeBufferRsrc`]), and `voffset` is the per-lane, K-invariant within-tile byte offset
+    /// (hoisted VGPR) — so the load issues WITHOUT a per-iteration VGPR-address `v_add` on its critical
+    /// path, and without a non-zero `soffset` (mishandled by the config). `order` are ordering-only anchors
+    /// (the authoring cluster A@C0 / B@C4). Renders as `load.bitcast(<ept×elem>)` of the `<dwords×i32>`.
+    BufferLoadRaw { rsrc: TileId, voffset: TileId, ept: usize, dtype: DType, order: Edges },
     /// ONE inline-asm `ds_write_b64 $base, $val offset:N` LDS store (gfx942, DESIGN §5c — the
     /// **commit** twin of [`Node::DsReadB64`]): writes the `ept`-element bf16 `value` to
     /// `base_ptr + off_bytes`. Being `asm sideeffect` it is OPAQUE to LLVM's waitcnt pass, so unlike
@@ -479,6 +493,16 @@ impl TileIr {
             Node::DsReadB64 { base_ptr, off_bytes, ept, dtype, prev } => {
                 Node::DsReadB64 { base_ptr: f(base_ptr), off_bytes, ept, dtype, prev: prev.map(&mut f) }
             }
+            Node::MakeBufferRsrc { buf, base_off, num_bytes } => {
+                Node::MakeBufferRsrc { buf: f(buf), base_off: f(base_off), num_bytes }
+            }
+            Node::BufferLoadRaw { rsrc, voffset, ept, dtype, order } => Node::BufferLoadRaw {
+                rsrc: f(rsrc),
+                voffset: f(voffset),
+                ept,
+                dtype,
+                order: order.into_iter().map(&mut f).collect(),
+            },
             Node::DsWriteB64 { base_ptr, off_bytes, value, ept, prev } => {
                 Node::DsWriteB64 { base_ptr: f(base_ptr), off_bytes, value: f(value), ept, prev: prev.map(&mut f) }
             }
@@ -547,6 +571,12 @@ impl TileIr {
             Node::LdsPtrAs3 { .. } => TileMeta::value(SmallVec::new(), DType::Int32, Residency::Reg),
             // The asm gather's `<ept×bf16>` operand value.
             Node::DsReadB64 { dtype, ept, .. } => {
+                TileMeta::value(SmallVec::from_slice(&[*ept]), dtype.clone(), Residency::Reg)
+            }
+            // The `ptr addrspace(8)` buffer descriptor (pointer-like; the lowered custom names its type).
+            Node::MakeBufferRsrc { .. } => TileMeta::value(SmallVec::new(), DType::Int64, Residency::Reg),
+            // The MUBUF prefetch's `<ept×bf16>` value.
+            Node::BufferLoadRaw { dtype, ept, .. } => {
                 TileMeta::value(SmallVec::from_slice(&[*ept]), dtype.clone(), Residency::Reg)
             }
             // A scalar extracted from a vector; a `len`-vector built from scalars.

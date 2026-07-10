@@ -266,6 +266,63 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             );
             read.bitcast(dtype.vec(ept).expect("ds_read_b64: bf16 vec"))
         }
+        // The `srsrc` buffer descriptor: `make.buffer.rsrc.p0` from the buffer's base pointer (element 0).
+        // `num_bytes` is the SRD extent (bounds); `1114112` = 0x110000 is HK's `make_srsrc` config word.
+        // The buffer-resource descriptor via `make.buffer.rsrc.p0` of `&buf[base_off]`; `num_bytes` = the
+        // SRD byte extent, `1114112` = 0x110000 (HK's `make_srsrc` config, row_stride 0). base_off = 0 in the
+        // shipped fixed-base form (the base is loop-invariant, hoisted, materialised once — no advancing
+        // base-high to sink below its loads). Lowers to a pointer-typed `Op::Custom`.
+        Node::MakeBufferRsrc { buf, base_off, num_bytes } => {
+            let (buf, base_off) = (get(low, buf), get(low, base_off));
+            let base = UOp::index()
+                .buffer(buf)
+                .indices(vec![base_off])
+                .ptr(true)
+                .call()
+                .expect("MakeBufferRsrc base-ptr construction");
+            UOp::custom(
+                smallvec![base],
+                format!(
+                    "declare ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p0(ptr, i16, i32, i32)\n\
+                     call ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p0(ptr {{0}}, i16 0, i32 {num_bytes}, i32 1114112)"
+                ),
+                DType::Int64,
+            )
+        }
+        // ONE MUBUF `raw.ptr.buffer.load` (HK's DRAM prefetch): reads the `ept`-element run at
+        // `rsrc[voffset]` (bytes), `soffset = 0` (a non-zero soffset is mishandled by config `0x110000`).
+        // `rsrc`/`voffset` are the referenced `{0}/{1}` operands; `order` rides as ordering-only operands
+        // (the authoring cluster) exactly as `DsReadB64`'s `prev`. The result is `<dwords × i32>` (the
+        // canonical `buffer_load_dwordx{dwords}` type; LLVM 18 cannot select `v{ept}i16`), bitcast to the
+        // `<ept × elem>` fill chunk. `dwords = ept · sizeof(elem)/4B` from the node's OWN dtype (f16/bf16/f32
+        // all size correctly — never a hard-coded width).
+        Node::BufferLoadRaw { rsrc, voffset, ept, dtype, order } => {
+            let rsrc = get(low, rsrc);
+            // Offsets are `i32`; `Index` narrows to i32 OR i64 (data-dependent), so a width-adaptive `cast`
+            // to Int32 renders as a noop alias (already i32) or a `trunc` (from i64).
+            let vo = get(low, voffset).cast(DType::Int32);
+            let mut deps: SmallVec<[Arc<UOp>; 4]> = smallvec![rsrc, vo];
+            for o in order {
+                deps.push(get(low, o));
+            }
+            let chunk_bytes = ept * dtype.bytes();
+            assert_eq!(
+                chunk_bytes % DType::Int32.bytes(),
+                0,
+                "buffer_load chunk ({chunk_bytes}B) must be dword-aligned"
+            );
+            let dwords = chunk_bytes / DType::Int32.bytes();
+            let i32v = DType::Int32.vec(dwords).expect("buffer_load: i32 vec");
+            let load = UOp::custom(
+                deps,
+                format!(
+                    "declare <{dwords} x i32> @llvm.amdgcn.raw.ptr.buffer.load.v{dwords}i32(ptr addrspace(8), i32, i32, i32)\n\
+                     call <{dwords} x i32> @llvm.amdgcn.raw.ptr.buffer.load.v{dwords}i32(ptr addrspace(8) {{0}}, i32 {{1}}, i32 0, i32 0)"
+                ),
+                i32v,
+            );
+            load.bitcast(dtype.vec(ept).expect("buffer_load: element vec"))
+        }
         // ONE `ds_write_b64 $0, $1 offset:N` LDS store (gfx942 §5c — the commit twin of `DsReadB64`).
         // The `sideeffect` asm writes the bf16 operand (bitcast to `<ept×i16>`) to `base_ptr + off_bytes`;
         // `prev` (the prior fragment's write) rides as an ordering-only operand so the writes stay in

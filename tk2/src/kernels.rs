@@ -463,11 +463,12 @@ pub fn matmul_lds_kblock_mw_pipe2(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    use crate::schedule::{InFlight, PipelineCx, SteadyOut, compute_cluster, mem_cluster, pipeline};
+    use crate::schedule::{InFlight, PipelineCx, SteadyOut, TilePool, compute_cluster, mem_cluster, pipeline};
 
     assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
     assert!(k_step.is_multiple_of(EDGE) && k.is_multiple_of(k_step), "k_step multiple of 16, K multiple of k_step");
     assert!(k / k_step >= 2, "pipe2 needs ≥2 K-blocks (stages=2 overlap); single-block K is stages=1");
+    assert!(k_step >= 2 * EDGE, "pipe2 over-read needs ≥2 dot-slices per block (k_step ≥ 32)");
     assert!(wm >= 1 && wn >= 1, "at least one warp per axis");
     let (big_m, big_n, nthreads) = (bm * wm, bn * wn, wm * wn * WARP);
     assert!(m.is_multiple_of(big_m) && n.is_multiple_of(big_n), "m/n must tile by (bm·wm)/(bn·wn)");
@@ -603,18 +604,72 @@ pub fn matmul_lds_kblock_mw_pipe2(
         |b, cx: &PipelineCx| {
             let seed: Vec<TileId> = cx.raw.deps().to_vec();
             let carry: Vec<Vec<TileId>> = (0..ri * cj).map(|ij| cx.accs[ij].deps().to_vec()).collect();
-            let mut entry: Vec<TileId> = Vec::new();
+
+            // operand read-ahead pools (register residency §5c) — minted INSIDE the loop body so the
+            // slots are loop-body-local (like the fresh-per-slice gather), not an outside-defined buffer
+            // the linearizer reads uninitialised. depth = ksteps: each slice its own slot-set (the
+            // register-neutral form); reduce below ksteps to over-read. Budget-checked vs the 256 ceiling.
+            let pool_depth = 2.min(ksteps - 1); // over-read depth (target 2), capped below ksteps
+            let mut a_pool = TilePool::<BF16>::new(b, a_map, pool_depth, ri, 2);
+            let mut b_pool = TilePool::<BF16>::new(b, bc_map, pool_depth, cj, 2);
+            let acc_vgprs = ri * cj * 4; // 32 accumulators × <4×f32> = 4 VGPR each
+            let prefetch_vgprs = (epl_a + epl_b) / 2; // bf16 packed 2/VGPR, held A@slice0 + B@midpoint
+            assert!(
+                acc_vgprs + a_pool.vgprs() + b_pool.vgprs() + prefetch_vgprs <= 256,
+                "pipe2 register budget exceeded: {acc_vgprs} acc + {}+{} operand pools + {prefetch_vgprs} prefetch > 256 VGPR (depth {pool_depth})",
+                a_pool.vgprs(),
+                b_pool.vgprs(),
+            );
+
+            // Straight dot-slice pipeline: gather slice s into the pool (the operand read-ahead ring),
+            // then MFMA slice s. The pool bounds the resident operand set to `pool_depth` slices (its
+            // recycle edge WAR-safe) and collapses the per-fragment gather address to one base VGPR.
+            // NB: an explicit software-pipelined over-read (gather s+d ahead of compute s) was tried and
+            // REGRESSED — it fractured the 32-MFMA clusters and broke the mem/compute ping-pong
+            // alternation, and hiding the (already cheap, between-cluster) `lgkmcnt` bought nothing:
+            // read latency is not this kernel's bottleneck. Kept straight; the pool + address collapse
+            // are the wins.
             let mut all_gathers: Vec<TileId> = Vec::new();
-            let mut prev: Vec<Vec<TileId>> = carry;
-            let mut a_next: Option<InFlight<BF16>> = None;
-            let mut b_next: Option<InFlight<BF16>> = None;
             let mut raw_next: Option<TileId> = None;
             let mut acc_stores: Vec<Effect> = Vec::new();
 
+            // ONE batched gather cluster: stage each slice in `slices` into the pool (over-reading when
+            // `slices.len() > 1`), sealed by ONE bare workgroup barrier. `all_gathers` accumulates the
+            // store-fence tokens the commit's WAR consumes. Returns each slice's `(aop, bop)` + the seal.
+            #[allow(clippy::type_complexity)]
+            let do_gather = |b: &mut Builder,
+                             ap: &mut TilePool<BF16>,
+                             bp: &mut TilePool<BF16>,
+                             slices: &[usize],
+                             deps: &[TileId],
+                             all_gathers: &mut Vec<TileId>|
+             -> (Vec<(Vec<Val<BF16>>, Vec<Val<BF16>>)>, TileId) {
+                let (ops, bar, ge) = mem_cluster(b, |m| {
+                    let mut ops = Vec::new();
+                    let mut ge: Vec<TileId> = Vec::new();
+                    for &s in slices {
+                        let (av, ag) = ap.stage(&mut *m, a_view, s, deps);
+                        let (bv, bg) = bp.stage(&mut *m, b_view, s, deps);
+                        ge.extend(ag);
+                        ge.extend(bg);
+                        ops.push((av, bv));
+                    }
+                    let bar = m.bare_barrier(Effect(ge[0]), &ge[1..]).dep();
+                    (ops, bar, ge)
+                });
+                all_gathers.extend(&ge);
+                (ops, bar)
+            };
+
+            // Straight dot-slice pipeline (non-HK-tiling / test configs, ksteps ≠ 4): gather slice s
+            // then MFMA slice s. NB the commit stays adjacent to the last gather, so it is NOT
+            // ping-pong-race-hardened — only the ksteps==4 HK path is. Used by the k_step=32 host
+            // structural test (which has no device correctness gate).
+            let mut entry: Vec<TileId> = Vec::new();
+            let mut prev: Vec<Vec<TileId>> = carry;
+            let mut a_next: Option<InFlight<BF16>> = None;
+            let mut b_next: Option<InFlight<BF16>> = None;
             for s in 0..ksteps {
-                // register-staged prefetch of block k+1: A at the first slice, B at the midpoint (HK's
-                // A@C0 / B@C4). Each is load-pinned by a `sched.barrier(0)` on its load results so LLVM
-                // can't sink it to the commit's wait — it flies in-flight across the MFMA clusters.
                 if s == 0 {
                     let chunks = a_stage.prefetch(b, cx.next_base, &entry);
                     let anchors: Vec<TileId> = chunks.iter().map(|v| v.id).collect();
@@ -627,34 +682,14 @@ pub fn matmul_lds_kblock_mw_pipe2(
                     entry.push(b.sched_fence(0, &anchors).dep());
                     b_next = Some(InFlight(chunks));
                 }
-                // gather dot-slice s (mem cluster), sealed by a workgroup barrier over its reads.
                 let mut gdeps = seed.clone();
                 gdeps.extend(&entry);
-                let (aop, bop) = {
-                    let (av, bv, ge, bar) = mem_cluster(b, |m| {
-                        let (av, ag) = a_view.slice(s).gather(&mut *m, &gdeps);
-                        let (bv, bg) = b_view.slice(s).gather(&mut *m, &gdeps);
-                        let mut ge = ag;
-                        ge.extend(bg);
-                        // BARE barrier (HK): a gather cluster's seal is a ping-pong phase carrier — the
-                        // reads land in registers (drained by the MFMA's own lgkmcnt) and the LDS is not
-                        // overwritten until the fenced commit, so no WAR/RAW crosses this seal.
-                        let bar = m.bare_barrier(Effect(ge[0]), &ge[1..]).dep();
-                        (av, bv, ge, bar)
-                    });
-                    all_gathers.extend(&ge);
-                    entry = vec![bar];
-                    (av, bv)
-                };
-                // before the LAST compute: commit block k+1 into the single LDS buffer (HK's C6),
-                // behind the WAR barrier over EVERY gather read (all slices), ordered after the prior
-                // cluster. Its RAW seal is the LDS carry the next iteration's gather reads through.
-                // NB: the WAR needs its OWN barrier — reusing the slice-(ksteps-1) gather seal instead
-                // was tried and races cross-warp (allclose failed), because a single fenced barrier
-                // drains only each warp's OWN reads, not all warps' reads before any warp's commit write.
+                let (op, bar) = do_gather(b, &mut a_pool, &mut b_pool, &[s], &gdeps, &mut all_gathers);
+                let (aop, bop) = op.into_iter().next().expect("slice s");
+                entry = vec![bar];
                 if s == ksteps - 1 {
-                    let af = a_next.as_ref().expect("A prefetched at slice 0");
-                    let bf = b_next.as_ref().expect("B prefetched at the midpoint");
+                    let af = a_next.as_ref().expect("A prefetched");
+                    let bf = b_next.as_ref().expect("B prefetched");
                     let mut war_deps: Vec<TileId> = all_gathers[1..].to_vec();
                     war_deps.extend(&entry);
                     let rn = mem_cluster(b, |m| {
@@ -668,10 +703,12 @@ pub fn matmul_lds_kblock_mw_pipe2(
                     raw_next = Some(rn);
                     entry = vec![rn];
                 }
-                // MFMA dot-slice s (compute cluster), chaining the accumulators.
                 let (stores, next_entry) = compute_slice(b, &aop, &bop, &prev, &entry);
                 entry = next_entry;
                 prev = stores.iter().map(|e| vec![e.dep()]).collect();
+                let consumed: Vec<TileId> = stores.iter().map(|e| e.dep()).collect();
+                a_pool.consumed(s, &consumed);
+                b_pool.consumed(s, &consumed);
                 if s == ksteps - 1 {
                     acc_stores = stores;
                 }
