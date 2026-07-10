@@ -69,6 +69,49 @@ fn matmul_clustered_hk_replica_is_bit_exact_on_gfx942() {
     }
 }
 
+/// The **`hk::micro_tk` 1:1 port** correctness gate: HK's assembled 8-cluster BF16→FP32 GEMM
+/// (`hk/gemm.rs`) — the rolled K-loop with the legacy `raw.buffer.load.i128` prefetch, HK-form
+/// `ds_read_b64`/`ds_write_b64`, the `mfma.1k` accumulation, and the **truncating** fp32→bf16 C store
+/// — must match the f32 reference within the bf16-output tolerance. C is bf16 (HK's `_gl_C`), read back
+/// cast to f32; base (flat LDS) AND SwizzlePass forms (bit-identical — the swizzle is a bijection).
+///
+/// Runs under `SVOD_NO_PINGPONG` to isolate the port's numerics (addressing / accumulation / swizzle /
+/// truncating store) from HK's single-buffer 8-wave ping-pong async-LDS race — the ping-pong is a
+/// faithful, deliberate HK behavior (HK ships the race; verified structurally by the headless CFG test),
+/// NOT a port bug and NOT fixed here.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::micro_tk --nocapture`
+#[test]
+#[ignore]
+fn micro_tk_hk_port_is_correct_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    // SAFETY: device tests run serially (`--ignored`); scoped to this kernel build, restored below.
+    unsafe { std::env::set_var("SVOD_NO_PINGPONG", "1") };
+    let (m, n, k) = (256usize, 256, 256);
+    let dev = svod_dtype::default_device::default_device();
+    let mut a = Tensor::rand_with(&[m, k], DType::BFloat16, dev.clone()).expect("rand a");
+    let mut b = Tensor::rand_with(&[n, k], DType::BFloat16, dev).expect("rand b"); // B is [N,K] (A·Bᵀ)
+    a.realize().expect("realize a");
+    b.realize().expect("realize b");
+    let expected = ab_t_ref(&as_f32_vec(&a), &as_f32_vec(&b), m, n, k);
+    let atol = 0.02 * (k as f32).sqrt();
+
+    for (suffix, swizzle) in [("base", false), ("sw", true)] {
+        let mut prog = crate::hk::micro_tk(m, n, k);
+        if swizzle {
+            prog = prog.apply(SwizzlePass);
+        }
+        let out = Tensor::empty(&[m, n], DType::BFloat16); // HK's C is bf16
+        let mut y = graph_kernel(prog, out, &[&a, &b]).expect("wrap");
+        let plan = y.prepare().expect("prepare");
+        plan.execute().expect("execute");
+        let got = as_f32_vec(&y); // bf16 output → f32 for comparison
+        let report = allclose_f32(&got, &expected, atol, 2e-2);
+        println!("micro_tk hk port/{suffix} {m}×{n}×{k}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+        assert!(report.ok, "micro_tk hk port/{suffix} must match reference: {}", report.message);
+    }
+    unsafe { std::env::remove_var("SVOD_NO_PINGPONG") };
+}
+
 /// Dump the **DRAM-streaming clustered** kernel's amdgcn LLVM IR + compiled code object to the
 /// scratchpad for ISA validation (sibling of [`dump_resident_isa`]). Same shape/tiling; this one
 /// keeps the streaming global-prefetch + LDS-commit path so its steady loop shows the

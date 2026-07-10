@@ -563,7 +563,42 @@ impl Builder {
     /// fragment with [`Self::store_frag_vec`]; the WMMA reads it via [`Self::load_frag_vec_after`].
     pub fn ds_read_b64<E: Elem>(&mut self, base_ptr: Idx, off_bytes: i64, ept: usize, prev: Option<TileId>) -> Val<E> {
         assert!((0..=65535).contains(&off_bytes), "ds_read_b64 offset {off_bytes}B exceeds the 16-bit immediate");
-        Val::wrap(self.ir.intern(Node::DsReadB64 { base_ptr: base_ptr.0, off_bytes, ept, dtype: E::dtype(), prev }))
+        Val::wrap(self.ir.intern(Node::DsReadB64 {
+            base_ptr: base_ptr.0,
+            off_bytes,
+            ept,
+            dtype: E::dtype(),
+            prev,
+            hk_form: false,
+        }))
+    }
+
+    /// HipKittens' **literal** `ds_read_b64` (the [`crate::hk`] port, GAP/Tier-B): same gather as
+    /// [`Self::ds_read_b64`] but rendered in HK's exact IR form — an `i32` raw-address operand
+    /// (`base_i32`, from [`Self::ptr_to_i32`]), the offset as an `i` immediate operand, a `~{memory}`
+    /// clobber, and an `i64` result bitcast to `<ept×E>` (matches `hk-micro_tk.ll`).
+    pub fn ds_read_b64_hk<E: Elem>(
+        &mut self,
+        base_i32: Idx,
+        off_bytes: i64,
+        ept: usize,
+        prev: Option<TileId>,
+    ) -> Val<E> {
+        assert!((0..=65535).contains(&off_bytes), "ds_read_b64 offset {off_bytes}B exceeds the 16-bit immediate");
+        Val::wrap(self.ir.intern(Node::DsReadB64 {
+            base_ptr: base_i32.0,
+            off_bytes,
+            ept,
+            dtype: E::dtype(),
+            prev,
+            hk_form: true,
+        }))
+    }
+
+    /// **`ptrtoint ptr addrspace(3) → i32`** of an LDS base ([`Self::lds_ptr_as3`]) — the raw i32
+    /// LDS address HK's `ds_read_b64`/`ds_write_b64` asm takes ([`crate::hk`] port).
+    pub fn ptr_to_i32(&mut self, ptr: Idx) -> Idx {
+        Idx(self.ir.intern(Node::PtrToI32 { ptr: ptr.0 }))
     }
 
     /// ONE inline-asm `ds_write_b64 $base, $val offset:N` LDS store (gfx942 §5c — HK's **commit**: the
@@ -581,7 +616,66 @@ impl Builder {
         assert!((0..=65535).contains(&off_bytes), "ds_write_b64 offset {off_bytes}B exceeds the 16-bit immediate");
         // `ept` = the operand vector width, read off the value's derived shape (`<ept×E>`).
         let ept = self.ir.meta(value.id).shape.iter().copied().product::<usize>().max(1);
-        Effect(self.ir.intern(Node::DsWriteB64 { base_ptr: base_ptr.0, off_bytes, value: value.id, ept, prev }))
+        Effect(self.ir.intern(Node::DsWriteB64 {
+            base_ptr: base_ptr.0,
+            off_bytes,
+            value: value.id,
+            ept,
+            prev,
+            hk_form: false,
+        }))
+    }
+
+    /// HipKittens' **literal** `ds_write_b64` commit (the [`crate::hk`] port, GAP/Tier-B): same store
+    /// as [`Self::ds_write_b64`] but rendered in HK's exact IR form — an `i32` raw-address operand
+    /// (`base_i32`, with the offset folded into the address, so NO `offset:` immediate), an `i64`
+    /// value (the `<4×bf16>` half bitcast to i64), and a `~{memory}` clobber (matches `hk-micro_tk.ll`).
+    pub fn ds_write_b64_hk<E: Elem>(&mut self, base_i32: Idx, value: Val<E>, prev: Option<TileId>) -> Effect {
+        let ept = self.ir.meta(value.id).shape.iter().copied().product::<usize>().max(1);
+        Effect(self.ir.intern(Node::DsWriteB64 {
+            base_ptr: base_i32.0,
+            off_bytes: 0,
+            value: value.id,
+            ept,
+            prev,
+            hk_form: true,
+        }))
+    }
+
+    /// The **VMEM drain** (`s_waitcnt vmcnt(0)`) — the [`Self::swait_lgkmcnt`] twin for HK's
+    /// cooperative `G::load` global-load half ([`crate::hk`] port). `prev` = the last load.
+    pub fn swait_vmcnt(&mut self, prev: TileId) -> Effect {
+        Effect(self.ir.intern(Node::SWaitVmcnt { prev }))
+    }
+
+    /// The **legacy `<4 x i32>` SRD** (HK's `make_srsrc`, config `0x110000`) of a global `buf` based
+    /// at element `base_off` ([`crate::hk`] port, GAP-1). Feeds [`Self::buffer_load_i128`]. `num_bytes`
+    /// = the whole-buffer byte extent (the SRD range/bound).
+    pub fn make_srsrc<E: Elem>(&mut self, buf: Buf<E>, base_off: Idx) -> Idx {
+        let num_bytes = (buf.len * E::dtype().bytes()) as i64;
+        Idx(self.ir.intern(Node::MakeSrsrc { buf: buf.id, base_off: base_off.0, num_bytes }))
+    }
+
+    /// ONE **`raw.buffer.load.i128`** MUBUF load over a legacy [`Self::make_srsrc`] SRD (HK's
+    /// `load_global_to_register_buffer`, [`crate::hk`] port, GAP-1): reads a 128-bit chunk (`ept`
+    /// `E`-elements) at `rsrc[voffset]` bytes (`soffset = 0`). `order` pins the load into its
+    /// authoring cluster (ordering-only). `ept · sizeof(E)` must be 128 bits.
+    pub fn buffer_load_i128<E: Elem>(&mut self, rsrc: Idx, voffset: Idx, ept: usize, order: &[TileId]) -> Val<E> {
+        assert_eq!(ept * E::dtype().bytes(), 16, "raw.buffer.load.i128 chunk must be 128 bits (16 bytes)");
+        let order = order.iter().copied().collect();
+        Val::wrap(self.ir.intern(Node::BufferLoadI128 {
+            rsrc: rsrc.0,
+            voffset: voffset.0,
+            ept,
+            dtype: E::dtype(),
+            order,
+        }))
+    }
+
+    /// **fp32 → bf16 truncation** (`(uint16_t)(bits(f) >> 16)`) — HK's `convertor<bf16,float>`, the
+    /// truncating (not RNE) C store ([`crate::hk`] port). Store the result to a bf16 global.
+    pub fn bf16_trunc(&mut self, val: Val<F32>) -> Val<BF16> {
+        Val::wrap(self.ir.intern(Node::Bf16Trunc { val: val.id }))
     }
 
     /// The **manual LDS drain** (`s_waitcnt lgkmcnt(0)`, §5c): a void `asm sideeffect` ordered after

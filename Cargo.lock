@@ -3738,6 +3738,7 @@ version = "0.1.0-alpha.3"
 dependencies = [
  "bon",
  "criterion",
+ "proptest",
  "smallvec",
  "snafu 0.8.9",
  "svod-codegen",
@@ -3747,6 +3748,7 @@ dependencies = [
  "svod-runtime",
  "svod-schedule",
  "svod-tensor",
+ "test-case",
 ]
 
 [[package]]

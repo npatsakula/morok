@@ -19,6 +19,7 @@ use svod_tensor::testing::allclose_f32;
 mod common;
 use common::{bench_plan, rand_bf16, requirements_met};
 
+use svod_tk2::hk::micro_tk;
 use svod_tk2::{
     Program, SwizzlePass, VectorizePass, graph_kernel, matmul_lds_kblock_mw_clustered, matmul_lds_kblock_mw_pipe2,
 };
@@ -47,6 +48,27 @@ fn plan_of(program: Program, m: usize, n: usize, a: &Tensor, b: &Tensor) -> (Ten
 fn assert_correct(y: &Tensor, plan: &ExecutionPlan, expected: &[f32], k: usize, label: &str) {
     plan.execute().expect("execute for correctness");
     let got = y.as_vec::<f32>().expect("read output");
+    let atol = 0.02 * (k as f32).sqrt();
+    let report = allclose_f32(&got, expected, atol, 2e-2);
+    assert!(report.ok, "{label} matmul must match reference: {}", report.message);
+}
+
+/// bf16 sibling of [`plan_of`] for HK's truncating fp32→bf16 C store: the output template is bf16
+/// (`hk::micro_tk` writes bf16), otherwise identical wiring.
+fn plan_of_bf16(program: Program, m: usize, n: usize, a: &Tensor, b: &Tensor) -> (Tensor, ExecutionPlan) {
+    let out = Tensor::empty(&[m, n], DType::BFloat16);
+    let mut y = graph_kernel(program, out, &[a, b]).expect("wrap matmul as graph node");
+    let plan = y.prepare().expect("prepare execution plan");
+    (y, plan)
+}
+
+/// bf16 sibling of [`assert_correct`]: read the bf16 output back widened to f32 (bf16→f32 is exact)
+/// before the SAME allclose vs the f32 reference (identical tolerance).
+fn assert_correct_bf16(y: &Tensor, plan: &ExecutionPlan, expected: &[f32], k: usize, label: &str) {
+    plan.execute().expect("execute for correctness");
+    let mut f = y.cast(DType::Float32).expect("bf16→f32 widen");
+    f.realize().expect("realize widened output");
+    let got = f.as_vec::<f32>().expect("read output");
     let atol = 0.02 * (k as f32).sqrt();
     let report = allclose_f32(&got, expected, atol, 2e-2);
     assert!(report.ok, "{label} matmul must match reference: {}", report.message);
@@ -87,6 +109,15 @@ fn bench_matmul(c: &mut Criterion) {
             assert_correct(&yhk, &phk, &expected_abt, n, "kblock_hk");
             group.bench_with_input(BenchmarkId::new("kblock_hk", n), &n, |bch, _| bench_plan(bch, &phk));
         }
+        // `hk::micro_tk`: the name-faithful HipKittens port — BF16→FP32 accumulate, HK's TRUNCATING
+        // fp32→bf16 C store (so the bf16-aware plan/gate). SwizzlePass ONLY (its asm gathers are already
+        // vectorized; SwizzlePass-only is bit-exact per `test::device::micro_tk_hk_port_is_correct`).
+        // Ping-pong is left ON (default) — the fair comparison vs the 763 (HK) / 455 (pipe2) landmarks;
+        // it carries HK's known small-delta async-LDS race, which passes this loose tolerance.
+        let hk_tk = micro_tk(n, n, n).apply(SwizzlePass);
+        let (yhk_tk, phk_tk) = plan_of_bf16(hk_tk, n, n, &a, &b);
+        assert_correct_bf16(&yhk_tk, &phk_tk, &expected_abt, n, "hk_micro_tk");
+        group.bench_with_input(BenchmarkId::new("hk_micro_tk", n), &n, |bch, _| bench_plan(bch, &phk_tk));
     }
     group.finish();
 }

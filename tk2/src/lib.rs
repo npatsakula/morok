@@ -19,6 +19,7 @@
 pub mod build;
 pub mod error;
 pub mod graph;
+pub mod hk;
 pub mod ir;
 pub mod kernels;
 pub mod launch;

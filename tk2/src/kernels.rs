@@ -190,7 +190,7 @@ impl Hooks for MatmulHooks {
 /// Caller gates on `grid_m % WGM == 0`, so `group_size_m == WGM` (drops tk's `imin`); the chiplet
 /// transform is applied only when `num_wgs` is a whole multiple of `NUM_XCDS·chunk` (drops tk's `where`
 /// guard — a sub-`block` grid already fits one XCD sweep, so identity there is fine).
-fn l2_swizzle(b: &mut Builder, wgid: Idx, grid_m: i64, grid_n: i64) -> (Idx, Idx) {
+pub(crate) fn l2_swizzle(b: &mut Builder, wgid: Idx, grid_m: i64, grid_n: i64) -> (Idx, Idx) {
     const NUM_XCDS: i64 = 8; // gfx942 chiplet count
     const WGM: i64 = 4; // grouped-M L2 swizzle group width (HK `GEMM:48`)
     let chunk = WGM * WGM; // 16

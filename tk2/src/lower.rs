@@ -249,22 +249,37 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
         // `<ept×i16>` from `base_ptr + off_bytes`; `prev` (the prior fragment's store) rides as an
         // ordering-only operand so the reads stay in program order under one loop `END` and cannot
         // hoist across the `s_barrier`s. Bitcast the `<ept×i16>` result to the `<ept×bf16>` operand.
-        Node::DsReadB64 { base_ptr, off_bytes, ept, dtype, prev } => {
+        Node::DsReadB64 { base_ptr, off_bytes, ept, dtype, prev, hk_form } => {
             let base_ptr = get(low, base_ptr);
             let mut deps: SmallVec<[Arc<UOp>; 4]> = smallvec![base_ptr];
             if let Some(p) = prev {
                 deps.push(get(low, p));
             }
-            let i16v = DType::Int16.vec(ept).expect("ds_read_b64: i16 vec");
-            let read = UOp::custom(
-                deps,
-                format!(
-                    "call <{ept} x i16> asm sideeffect \"ds_read_b64 $0, $1 offset:{off_bytes}\", \"=v,v\"\
-                     (ptr addrspace(3) {{0}})"
-                ),
-                i16v,
-            );
-            read.bitcast(dtype.vec(ept).expect("ds_read_b64: bf16 vec"))
+            if hk_form {
+                // HK's literal IR: i32 raw-address operand, offset as an `i` immediate operand, a
+                // `~{memory}` clobber, `i64` result (bitcast to the `<ept×bf16>` operand). `\0A`, `{{...}}`
+                // escape to `{...}` and `{{{{memory}}}}`→`~{memory}` under Rust format! then codegen.
+                let read = UOp::custom(
+                    deps,
+                    format!(
+                        "call i64 asm sideeffect \"ds_read_b64 $0, $1 offset:$2\\0A\", \
+                         \"=v,v,i,~{{{{memory}}}}\"(i32 {{0}}, i64 {off_bytes})"
+                    ),
+                    DType::Int64,
+                );
+                read.bitcast(dtype.vec(ept).expect("ds_read_b64: bf16 vec"))
+            } else {
+                let i16v = DType::Int16.vec(ept).expect("ds_read_b64: i16 vec");
+                let read = UOp::custom(
+                    deps,
+                    format!(
+                        "call <{ept} x i16> asm sideeffect \"ds_read_b64 $0, $1 offset:{off_bytes}\", \"=v,v\"\
+                         (ptr addrspace(3) {{0}})"
+                    ),
+                    i16v,
+                );
+                read.bitcast(dtype.vec(ept).expect("ds_read_b64: bf16 vec"))
+            }
         }
         // The `srsrc` buffer descriptor: `make.buffer.rsrc.p0` from the buffer's base pointer (element 0).
         // `num_bytes` is the SRD extent (bounds); `1114112` = 0x110000 is HK's `make_srsrc` config word.
@@ -328,21 +343,39 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
         // `prev` (the prior fragment's write) rides as an ordering-only operand so the writes stay in
         // program order and cannot hoist across the barriers. Waitcnt-opaque by construction — an
         // `s_barrier` no longer auto-drains it (that is the point), so a `SWaitLgkmcnt` drains it manually.
-        Node::DsWriteB64 { base_ptr, off_bytes, value, ept, prev } => {
+        Node::DsWriteB64 { base_ptr, off_bytes, value, ept, prev, hk_form } => {
             let base_ptr = get(low, base_ptr);
-            let val = get(low, value).bitcast(DType::Int16.vec(ept).expect("ds_write_b64: i16 vec"));
-            let mut deps: SmallVec<[Arc<UOp>; 4]> = smallvec![base_ptr, val];
-            if let Some(p) = prev {
-                deps.push(get(low, p));
+            if hk_form {
+                // HK's literal IR: i32 raw-address (offset folded into the address, NO `offset:`), an
+                // `i64` value (the `<4×bf16>` half bitcast to i64), a `~{memory}` clobber. The `{{...}}`
+                // are plain-string codegen placeholders/escapes (no Rust format!): `{0}`/`{1}` → operands,
+                // `{{memory}}` → `~{memory}`.
+                let val = get(low, value).bitcast(DType::Int64);
+                let mut deps: SmallVec<[Arc<UOp>; 4]> = smallvec![base_ptr, val];
+                if let Some(p) = prev {
+                    deps.push(get(low, p));
+                }
+                UOp::custom(
+                    deps,
+                    "call void asm sideeffect \"ds_write_b64 $0, $1\\0A\", \"v,v,~{{memory}}\"(i32 {0}, i64 {1})"
+                        .to_string(),
+                    DType::Void,
+                )
+            } else {
+                let val = get(low, value).bitcast(DType::Int16.vec(ept).expect("ds_write_b64: i16 vec"));
+                let mut deps: SmallVec<[Arc<UOp>; 4]> = smallvec![base_ptr, val];
+                if let Some(p) = prev {
+                    deps.push(get(low, p));
+                }
+                UOp::custom(
+                    deps,
+                    format!(
+                        "call void asm sideeffect \"ds_write_b64 $0, $1 offset:{off_bytes}\", \"v,v\"\
+                         (ptr addrspace(3) {{0}}, <{ept} x i16> {{1}})"
+                    ),
+                    DType::Void,
+                )
             }
-            UOp::custom(
-                deps,
-                format!(
-                    "call void asm sideeffect \"ds_write_b64 $0, $1 offset:{off_bytes}\", \"v,v\"\
-                     (ptr addrspace(3) {{0}}, <{ept} x i16> {{1}})"
-                ),
-                DType::Void,
-            )
         }
         // The manual LDS drain (`s_waitcnt lgkmcnt(0)`) — a void `asm sideeffect` ordered after the last
         // commit write (`prev`), re-establishing the store→barrier→load order the waitcnt-opaque asm
@@ -352,6 +385,77 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             "call void asm sideeffect \"s_waitcnt lgkmcnt(0)\", \"\"()".to_string(),
             DType::Void,
         ),
+        // The VMEM drain (`s_waitcnt vmcnt(0)`) — the lgkmcnt twin for HK's cooperative G::load.
+        Node::SWaitVmcnt { prev } => UOp::custom(
+            smallvec![get(low, prev)],
+            "call void asm sideeffect \"s_waitcnt vmcnt(0)\", \"\"()".to_string(),
+            DType::Void,
+        ),
+        // `ptrtoint ptr addrspace(3) → i32`: the raw i32 LDS address HK's ds_read/ds_write asm takes.
+        // The `ptr` operand is an `LdsPtrAs3` (its RHS is a `ptr addrspace(3)`, so the source type is
+        // named literally here — the node's Int32 meta is bookkeeping and never type-annotated).
+        Node::PtrToI32 { ptr } => {
+            UOp::custom(smallvec![get(low, ptr)], "ptrtoint ptr addrspace(3) {0} to i32".to_string(), DType::Int32)
+        }
+        // HK's legacy `<4 x i32>` SRD (`make_srsrc`): the ptrtoint→bitcast→shuffle→insertelement chain
+        // building `{ptr_lo, ptr_hi, range=num_bytes, config=0x110000}`. Each step is ONE typed custom
+        // instruction (the typed-CUSTOM single-instruction rule); the `<4 x i32>` result feeds
+        // `raw.buffer.load.i128`. HK inserts config (w3) then range (w2) — mirrored for IR fidelity.
+        Node::MakeSrsrc { buf, base_off, num_bytes } => {
+            let (buf, base_off) = (get(low, buf), get(low, base_off));
+            let base = UOp::index()
+                .buffer(buf)
+                .indices(vec![base_off])
+                .ptr(true)
+                .call()
+                .expect("MakeSrsrc base-ptr construction");
+            let p = UOp::custom(smallvec![base], "ptrtoint ptr {0} to i64".to_string(), DType::Int64);
+            let i32x2 = DType::Int32.vec(2).expect("make_srsrc: <2 x i32>");
+            let i32x4 = DType::Int32.vec(4).expect("make_srsrc: <4 x i32>");
+            let v2 = UOp::custom(smallvec![p], "bitcast i64 {0} to <2 x i32>".to_string(), i32x2);
+            let v4 = UOp::custom(
+                smallvec![v2],
+                "shufflevector <2 x i32> {0}, <2 x i32> poison, <4 x i32> <i32 0, i32 1, i32 poison, i32 poison>"
+                    .to_string(),
+                i32x4.clone(),
+            );
+            let cfg = UOp::custom(
+                smallvec![v4],
+                "insertelement <4 x i32> {0}, i32 1114112, i64 3".to_string(),
+                i32x4.clone(),
+            );
+            UOp::custom(smallvec![cfg], format!("insertelement <4 x i32> {{0}}, i32 {num_bytes}, i64 2"), i32x4)
+        }
+        // ONE `raw.buffer.load.i128` over the legacy `<4 x i32>` SRD (HK's load_global_to_register_buffer).
+        // The i128 call result is bookkept as Int64 (never type-annotated — only the following bitcast
+        // custom references it, naming `i128` literally); bitcast `i128 → <ept×bf16>` is the fill chunk.
+        Node::BufferLoadI128 { rsrc, voffset, ept, dtype, order } => {
+            let rsrc = get(low, rsrc);
+            let vo = get(low, voffset).cast(DType::Int32);
+            let mut deps: SmallVec<[Arc<UOp>; 4]> = smallvec![rsrc, vo];
+            for o in order {
+                deps.push(get(low, o));
+            }
+            let raw = UOp::custom(
+                deps,
+                "declare i128 @llvm.amdgcn.raw.buffer.load.i128(<4 x i32>, i32, i32, i32)\n\
+                 call i128 @llvm.amdgcn.raw.buffer.load.i128(<4 x i32> {0}, i32 {1}, i32 0, i32 0)"
+                    .to_string(),
+                DType::Int64,
+            );
+            let chunk = dtype.vec(ept).expect("buffer_load_i128: element vec");
+            UOp::custom(smallvec![raw], format!("bitcast i128 {{0}} to <{ept} x bfloat>"), chunk)
+        }
+        // HK's fp32→bf16 truncation `(uint16_t)(bits(f) >> 16)`: bitcast float→i32; lshr 16; trunc i16;
+        // bitcast bfloat — each ONE typed custom instruction (matches HK's IR + truncating numerics,
+        // distinct from svod's default RNE f32→bf16 cast).
+        Node::Bf16Trunc { val } => {
+            let v = get(low, val);
+            let iv = UOp::custom(smallvec![v], "bitcast float {0} to i32".to_string(), DType::Int32);
+            let sh = UOp::custom(smallvec![iv], "lshr i32 {0}, 16".to_string(), DType::Int32);
+            let tr = UOp::custom(smallvec![sh], "trunc i32 {0} to i16".to_string(), DType::Int16);
+            UOp::custom(smallvec![tr], "bitcast i16 {0} to bfloat".to_string(), DType::BFloat16)
+        }
         Node::Barrier { body, deps } => {
             let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();
             get(low, body).barrier(deps)
