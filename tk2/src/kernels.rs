@@ -502,7 +502,9 @@ pub fn matmul_lds_kblock_mw_pipe2(
     };
     // The 8-wave ping-pong is only valid for HK's 2-warp-row split (warp_row ∈ {0,1}), i.e. wm==2:
     // one warp per SIMD in each of two groups, phase-offset by the asymmetric wave barriers.
-    let pingpong_wr = if wm == 2 { warp_row_id } else { None };
+    // `SVOD_NO_PINGPONG` (diagnostic): drop the 8-wave phase offset to isolate whether the async-LDS
+    // non-determinism comes from the ping-pong (single-buffer commit-vs-gather overtaken by the offset).
+    let pingpong_wr = if wm == 2 && std::env::var("SVOD_NO_PINGPONG").is_err() { warp_row_id } else { None };
 
     let a_map = FragMap::gfx942_16x16(false);
     let bc_map = FragMap::gfx942_16x16(true);

@@ -81,10 +81,12 @@ fn bench_matmul(c: &mut Criterion) {
         // §5c clustered HK replica (256² tile, HK tiling bm=128/bn=64/wm=2/wn=4): the COMPLETE
         // schedule — 8 clusters + per-cluster s_barrier + set_prio + sched_fence + the warp-phase
         // ping-pong. Now bit-exact, so measured: does the full co-designed schedule reach HK's 0.65?
-        let hk = matmul_lds_kblock_mw_clustered(n, n, n, 128, 64, 2, 4, 64).apply(VectorizePass).apply(SwizzlePass);
-        let (yhk, phk) = plan_of(hk, n, n, &a, &b);
-        assert_correct(&yhk, &phk, &expected_abt, n, "kblock_hk");
-        group.bench_with_input(BenchmarkId::new("kblock_hk", n), &n, |bch, _| bench_plan(bch, &phk));
+        if std::env::var("SVOD_SKIP_CLUSTERED").is_err() {
+            let hk = matmul_lds_kblock_mw_clustered(n, n, n, 128, 64, 2, 4, 64).apply(VectorizePass).apply(SwizzlePass);
+            let (yhk, phk) = plan_of(hk, n, n, &a, &b);
+            assert_correct(&yhk, &phk, &expected_abt, n, "kblock_hk");
+            group.bench_with_input(BenchmarkId::new("kblock_hk", n), &n, |bch, _| bench_plan(bch, &phk));
+        }
     }
     group.finish();
 }
