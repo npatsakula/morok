@@ -8,8 +8,8 @@
 // The buffers are allocated here (hipMalloc), NOT passed in: svod's AMD backend
 // is KFD-direct and HIP cannot enumerate the GPU in the same process, and
 // svod's device VAs are not valid in HIP's context. So the vendor bench runs
-// svod-free and the shim is fully HIP-world. Buffer contents are irrelevant to
-// GEMM timing (zero-filled).
+// svod-free and the shim is fully HIP-world. A/B are random-filled (uniform data
+// would DCC-compress the C output and inflate throughput); C is zeroed.
 //
 // Layout: svod tensors are row-major, so every matrix layout is HIPBLASLT_ORDER_
 // ROW with its natural (rows, cols, ld=cols); the op flags (transA/transB)
@@ -70,22 +70,29 @@ struct GemmPlan {
     hipStream_t stream = nullptr;
     hipEvent_t start = nullptr, stop = nullptr;
     float alpha = 1.0f, beta = 0.0f;
-    int num_tiles = 1; // output-n tiling to dodge the gfx1151 large-N fault (see create)
+    int num_ntiles = 1, num_ktiles = 1; // output-N + split-K tiling to dodge the VF fault (see create)
 };
 
 inline bool ok(hipblasStatus_t s) { return s == HIPBLAS_STATUS_SUCCESS; }
 inline bool ok(hipError_t s) { return s == hipSuccess; }
 
-// Output-tiling cap (dodges a large-output GEMM fault by splitting output-n into
-// ≤2048 chunks): 2048 on gfx1151 AND on the MI300X-VF, 0 (no tiling — single GEMM)
-// elsewhere. Two distinct faults, same mitigation:
-//   • gfx1151: hipBLASLt illegal-access on large-N small-K GEMMs.
-//   • MI300X-VF (gfx942, virtualized): hipBLASLt/Tensile host-init SIGSEGVs at
-//     `create` (heuristic get) once any GEMM dim exceeds ~2048 — so knn (M=16384)
-//     and kmeans (K=4096), whose only large dim is the output n, previously
-//     crashed here untiled. Bare-metal MI300X has neither fault → single GEMM (the
-//     truest floor). Detected via the marketing name ("AMD Instinct MI300X VF");
-//     `gcnArchName` is plain "gfx942" for both bare-metal and VF. Cached device-0 probe.
+// Tiling cap (dodges a hipBLASLt fault by splitting GEMM dims into ≤2048 chunks):
+// 2048 on gfx1151 AND on the MI300X-VF, 0 (no tiling — single GEMM) elsewhere.
+// Two distinct faults, same cap value:
+//   • gfx1151: hipBLASLt illegal-access on large-N small-K GEMMs → tile output-N.
+//   • MI300X-VF (gfx942, virtualized): for a contraction dim K>~2048, hipBLASLt's
+//     heuristic selects a Tensile solution whose code object is absent from the
+//     lazy-load map; `unordered_map::at` throws UNCAUGHT and aborts the process
+//     (verified: m=n=8192 at K=2048 runs fine; only K>2048 crashes). So the GEMM
+//     path splits K into ≤2048 tiles and accumulates (see gemm_tiles/create); N is
+//     tiled too (knn/kmeans hit this via their large output-N). The SAME GSU fault
+//     also fires for skinny-M (small M underfills the GPU, so the heuristic picks a
+//     split-K solution even at K≤2048) — that one is NOT tileable and the abort is
+//     uncatchable (thrown inside the library, past any try/catch at the C ABI), so
+//     decode-shaped GEMMs (M≲512) simply cannot run on this VF. Bare-metal MI300X
+//     has neither fault → single GEMM (the truest floor). Detected via the marketing
+//     name ("AMD Instinct MI300X VF"); `gcnArchName` is plain "gfx942" for both
+//     bare-metal and VF. Cached device-0 probe.
 inline int64_t arch_tile_cap() {
     static const int64_t cap = [] {
         hipDeviceProp_t p{};
@@ -102,10 +109,15 @@ inline bool matmul(GemmPlan* g) {
                               g->ld, &g->heur.algo, g->workspace, g->ws_size, g->stream));
 }
 
-// One full (tiled) GEMM = num_tiles tile-matmuls on the shared buffers.
+// One full (tiled) GEMM = num_ntiles·num_ktiles tile-matmuls on the shared buffers.
+// K is split into ≤KCAP tiles (K>~2048 is the MI300X-VF fault trigger); the K-tiles
+// of each N-tile accumulate (β=1 after the first) — the realistic split-K path, the
+// only way large-K runs on the VF. Buffers are reused (data irrelevant to timing).
 inline bool gemm_tiles(GemmPlan* g) {
-    for (int t = 0; t < g->num_tiles; ++t)
+    for (int t = 0; t < g->num_ntiles * g->num_ktiles; ++t) {
+        g->beta = (t % g->num_ktiles == 0) ? 0.0f : 1.0f;
         if (!matmul(g)) return false;
+    }
     return true;
 }
 
@@ -192,18 +204,22 @@ int hbl_device_ok(void) {
 void* hbl_gemm_create(int64_t m, int64_t n, int64_t k, int transA, int transB, uint64_t max_ws) {
     auto* g = new GemmPlan();
 
-    // hipBLASLt on gfx1151 faults (illegal memory access) on large-output (n ≳
-    // 3072) small-K GEMMs, so there the output n is tiled into ≤2048 chunks — each
-    // a valid GEMM that run_ns issues num_tiles times per timed iteration (the plan
-    // and buffers are sized to one tile; tiles reuse them, data is irrelevant to
-    // timing). Other arches (gfx942/MI300X) have no such fault → a single GEMM.
+    // Both output-N and contraction-K are tiled into ≤cap chunks (cap=2048 on
+    // gfx1151/MI300X-VF, else 0=untiled): N-tiling dodges the gfx1151 large-N fault,
+    // K-tiling dodges the MI300X-VF K>2048 Tensile abort. Each sub-GEMM is a valid
+    // [m, nt, kt] matmul that run_ns issues num_ntiles·num_ktiles times per timed
+    // iteration (buffers are sized to one tile and reused; data irrelevant to timing;
+    // K-tiles accumulate). Bare-metal MI300X has no fault → a single GEMM.
     const int64_t cap = arch_tile_cap();
-    const int64_t TILE = cap > 0 ? cap : n;
-    g->num_tiles = static_cast<int>((n + TILE - 1) / TILE);
-    const int64_t nt = (n + g->num_tiles - 1) / g->num_tiles; // per-tile n (≤ TILE)
+    const int64_t NCAP = cap > 0 ? cap : n;
+    const int64_t KCAP = cap > 0 ? cap : k;
+    g->num_ntiles = static_cast<int>((n + NCAP - 1) / NCAP);
+    g->num_ktiles = static_cast<int>((k + KCAP - 1) / KCAP);
+    const int64_t nt = (n + g->num_ntiles - 1) / g->num_ntiles; // per-tile n (≤ NCAP)
+    const int64_t kt = (k + g->num_ktiles - 1) / g->num_ktiles; // per-tile k (≤ KCAP)
 
-    const int64_t ar = transA ? k : m, ac = transA ? m : k;  // physical A dims
-    const int64_t br = transB ? nt : k, bc = transB ? k : nt; // physical B dims (per tile)
+    const int64_t ar = transA ? kt : m, ac = transA ? m : kt;  // physical A tile dims
+    const int64_t br = transB ? nt : kt, bc = transB ? kt : nt; // physical B tile dims
     const hipblasOperation_t opA = transA ? HIPBLAS_OP_T : HIPBLAS_OP_N;
     const hipblasOperation_t opB = transB ? HIPBLAS_OP_T : HIPBLAS_OP_N;
     const hipblasLtOrder_t order = HIPBLASLT_ORDER_ROW;
@@ -238,7 +254,24 @@ void* hbl_gemm_create(int64_t m, int64_t n, int64_t k, int transA, int transB, u
         const size_t c_bytes = static_cast<size_t>(m) * static_cast<size_t>(nt) * sizeof(float);
         good = ok(hipMalloc(&g->dA, a_bytes)) && ok(hipMalloc(&g->dB, b_bytes)) && ok(hipMalloc(&g->dC, c_bytes));
         if (good) {
-            good = ok(hipMemset(g->dA, 0, a_bytes)) && ok(hipMemset(g->dB, 0, b_bytes))
+            // Random-fill A/B (not zeros): uniform operands make the C output DCC-
+            // compressible, inflating sustained clock/throughput. Real data is the fair
+            // floor. Local LCG → bf16 in [-1,1]; C stays zeroed (β=0 first K-tile).
+            std::vector<uint16_t> hA(a_bytes / 2), hB(b_bytes / 2);
+            auto lcg = [](std::vector<uint16_t>& v, uint64_t s) {
+                s |= 1;
+                for (auto& e : v) {
+                    s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+                    float f = static_cast<float>(static_cast<uint32_t>(s >> 32)) / 4294967295.0f * 2.0f - 1.0f;
+                    uint32_t b;
+                    __builtin_memcpy(&b, &f, 4);
+                    e = static_cast<uint16_t>(b >> 16);
+                }
+            };
+            lcg(hA, 0x1234567ULL);
+            lcg(hB, 0x89abcdeULL);
+            good = ok(hipMemcpy(g->dA, hA.data(), a_bytes, hipMemcpyHostToDevice))
+                   && ok(hipMemcpy(g->dB, hB.data(), b_bytes, hipMemcpyHostToDevice))
                    && ok(hipMemset(g->dC, 0, c_bytes));
         }
     }
@@ -258,8 +291,8 @@ void* hbl_gemm_create(int64_t m, int64_t n, int64_t k, int transA, int transB, u
 // median device time in nanoseconds (-1 on any HIP/hipBLASLt error).
 double hbl_gemm_run_ns(void* plan, int warmup, int iters) {
     auto* g = static_cast<GemmPlan*>(plan);
-    // One "run" = the full (tiled) GEMM: num_tiles tile-matmuls on the shared
-    // buffers. The HIP-event region brackets the whole sequence.
+    // One "run" = the full (tiled) GEMM: num_ntiles·num_ktiles tile-matmuls on the
+    // shared buffers. The HIP-event region brackets the whole sequence.
     auto run_full = [&]() { return gemm_tiles(g); };
     for (int i = 0; i < warmup; ++i) {
         if (!run_full()) return -1.0;
