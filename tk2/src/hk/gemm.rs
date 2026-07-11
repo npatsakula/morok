@@ -222,9 +222,15 @@ pub fn micro_tk(m: usize, n: usize, k: usize) -> Program {
             // C0: prefetch A(k+1) → a_buffer_next; gather slice 0 (t1,t2 = A rows; t0 = B cols).
             let (base_a, voffs_a) = buffer_load_addr(b, tid, origin_a, k_next, k_i);
             let a_buf = load_global_to_register_buffer(b, g.a, base_a, &voffs_a, &raw);
-            let t1 = gather_tile(b, As, warp_row, 0, wlane, &raw);
-            let t2 = gather_tile(b, As, wr2, 0, wlane, &raw);
-            let t0 = gather_tile(b, Bs, warp_col, 0, wlane, &raw);
+            // Order the gathers happens-AFTER the prefetch load so the linearizer emits the
+            // buffer_load at the TOP of the cluster (HK's load-first order, cpp:91), not sunk below
+            // the ds_reads — an ordering edge on the gather ADDRESS only (no data/vmcnt dep), so the
+            // load lands earlier and the C6 vmcnt(0) commit-drain (a no-MFMA dead region) shortens.
+            let mut raw_ld = raw.clone();
+            raw_ld.extend(a_buf.iter().map(|v| v.id));
+            let t1 = gather_tile(b, As, warp_row, 0, wlane, &raw_ld);
+            let t2 = gather_tile(b, As, wr2, 0, wlane, &raw_ld);
+            let t0 = gather_tile(b, Bs, warp_col, 0, wlane, &raw_ld);
             // Seal `a_buf` (the A prefetch) into C0's barrier too — HK pins its C0 load with
             // `sched_barrier(0)` (cpp:96) so it issues here and overlaps C1–C5, instead of the tk2
             // scheduler sinking it to its C6 consumer. Keeps the 4 A-chunks live C0→C6 (HK's live range).
@@ -247,12 +253,20 @@ pub fn micro_tk(m: usize, n: usize, k: usize) -> Program {
             prev = st.iter().map(|e| vec![e.dep()]).collect();
 
             // C4: prefetch B(k+1) → b_buffer_next; gather slice 2 tail (t2) + slice 3 (t6,t7,t5).
-            let (base_b, voffs_b) = buffer_load_addr(b, tid, origin_b, k_next, k_i);
+            let (base_b0, voffs_b) = buffer_load_addr(b, tid, origin_b, k_next, k_i);
+            // Pin the B advancing-base `s_add`/`s_addc` happens-after C3's barrier so it schedules in
+            // C4's memory cluster (HK cpp:120), not sunk into C3's 32-MFMA burst where it steals an
+            // issue slot. Ordering-only on the SRD base index — address value unchanged (bit-exact).
+            let base_b = b.idx_after(base_b0, &[bar3]);
             let b_buf = load_global_to_register_buffer(b, g.b, base_b, &voffs_b, &[bar3]);
-            let t2 = gather_tile(b, As, wr2, 2, wlane, &[bar3]);
-            let t6 = gather_tile(b, Bs, warp_col, 3, wlane, &[bar3]);
-            let t7 = gather_tile(b, As, warp_row, 3, wlane, &[bar3]);
-            let t5 = gather_tile(b, As, wr2, 3, wlane, &[bar3]);
+            // Same load-first ordering as C0 (HK cpp:126): gathers happen-after b_buf's load — the
+            // tight one, consumed ~1.5 clusters downstream at the C6 commit.
+            let mut ord_b = vec![bar3];
+            ord_b.extend(b_buf.iter().map(|v| v.id));
+            let t2 = gather_tile(b, As, wr2, 2, wlane, &ord_b);
+            let t6 = gather_tile(b, Bs, warp_col, 3, wlane, &ord_b);
+            let t7 = gather_tile(b, As, warp_row, 3, wlane, &ord_b);
+            let t5 = gather_tile(b, As, wr2, 3, wlane, &ord_b);
             // Seal `b_buf` (the B prefetch) into C4's barrier — HK pins its C4 load with `sched_barrier(0)`
             // (cpp:132) so it issues here and overlaps C5–C6, not sunk to C6. Keeps 4 B-chunks live C4→C6.
             let bar4 = seal_gathers(b, &[t2.as_slice(), t6.as_slice(), t7.as_slice(), t5.as_slice(), b_buf.as_slice()]);
