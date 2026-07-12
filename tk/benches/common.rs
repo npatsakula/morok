@@ -8,6 +8,10 @@
 //! Run one kernel: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench knn`
 //! GPU benches self-skip (record no samples) when no supported AMD GPU is present.
 
+// Shared harness: each bench binary re-compiles this module and uses only a subset of it
+// (e.g. the DCC benches don't call `rand_bf16`), so per-binary dead-code is expected.
+#![allow(dead_code)]
+
 use std::hint::black_box;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,12 +24,18 @@ use svod_dtype::DType;
 use svod_runtime::{ExecutionPlan, ProfileOptions, RunProfile};
 use svod_tensor::Tensor;
 
-/// A realized random bf16 tensor on the env-selected device — generated NATIVELY in
-/// bf16 (no f32 round-trip / `cast`), via [`Tensor::rand_with`]. Uniform `[0,1)`; these
-/// are perf benches (device-time timing only), so the distribution is immaterial.
+/// A realized random bf16 tensor on the env-selected device, centered in `[-1, 1)` —
+/// `2·x − 1` over a native-bf16 [`Tensor::rand_with`] `[0,1)` draw. Centered (signed) data
+/// is MANDATORY, not cosmetic: all-positive operands make the GEMM's C output concentrate
+/// near `N/4`, which the GPU's delta-color compression (DCC) shrinks on write — inflating
+/// throughput ~4–10% (worse at small N; ~+30% at all-ones). Measured effect + the fills:
+/// the `matmul_dcc` bench. (The old "distribution is immaterial" claim was false.)
 pub fn rand_bf16(shape: &[usize]) -> Tensor {
     let dev = svod_dtype::default_device::default_device();
-    let mut t = Tensor::rand_with(shape, DType::BFloat16, dev).expect("rand bf16");
+    let x = Tensor::rand_with(shape, DType::BFloat16, dev).expect("rand bf16");
+    let two = Tensor::full(shape, 2.0f32, DType::BFloat16).expect("const 2");
+    let one = Tensor::full(shape, 1.0f32, DType::BFloat16).expect("const 1");
+    let mut t = x.try_mul(&two).expect("2*x").try_sub(&one).expect("2*x-1");
     t.realize().expect("realize");
     t
 }

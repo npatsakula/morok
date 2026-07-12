@@ -45,6 +45,11 @@ harness = false
 name = "matmul"
 harness = false
 
+# SCRATCH: DCC/compression inflation of the hand asm GEMM under u01/sym/ones fills. Not committed.
+[[bench]]
+name = "matmul_dcc"
+harness = false
+
 # Vendor-floor comparison (hipBLASLt GEMM via the Nix-built shim). Standalone and
 # svod-free — HIP can't share a process with svod's KFD backend; run it on its own
 # with the shim on LD_LIBRARY_PATH (the flake `bench` dev shell).
