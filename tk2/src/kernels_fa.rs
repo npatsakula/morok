@@ -19,7 +19,7 @@ use crate::build::{BF16, Builder, Effect, F32, Frag, Idx, Val};
 use crate::ir::{FragMap, TileId};
 use crate::kernels::{EDGE, Program};
 use crate::movement::{Drain, LdsStage, LdsView, SharedTile};
-use crate::pipeline::{CommitDrain, Compute, Hooks, Mem, pipeline};
+use crate::pipeline::{AccSlot, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
 
 const WARP: usize = 64;
 
@@ -253,17 +253,30 @@ pub fn flash_attention_fwd(n: usize, d: usize) -> Program {
         })
         .collect();
 
-    // ── accumulators carried across the KV loop: [o_0..o_{dfrags-1}, att, max, norm] (all Col-map). ──
-    let o_accs: Vec<Frag<F32>> = (0..dfrags).map(|_| b.define_frag::<F32>(col_map)).collect();
-    let att_acc = b.define_frag::<F32>(col_map);
-    let max_acc = b.define_frag::<F32>(col_map);
-    let norm_acc = b.define_frag::<F32>(col_map);
-    let mut accs: Vec<Frag<F32>> = o_accs.clone();
-    accs.extend([att_acc, max_acc, norm_acc]);
-    let mut inited: Vec<Effect> = o_accs.iter().map(|&a| b.zero_init_frag(a)).collect();
-    inited.push(b.zero_init_frag(att_acc));
-    inited.push(b.const_init_frag(max_acc, f32::NEG_INFINITY)); // online-softmax running max seed
-    inited.push(b.zero_init_frag(norm_acc));
+    // ── the heterogeneous slot set (DESIGN §3.2). CARRIED (seeded, loop-carried): `o_0..o_{dfrags-1}`
+    //    (f32), `m` (f32 running max), `l` (f32 running norm). TEMPORARIES (no seed, produced+consumed
+    //    within one KV block): `s` (f32 QKᵀ scores), `p` (BF16 softmax weights — flows through the
+    //    channel natively, no cast-in-PV). Only the clusters that touch a slot round-trip it. ──
+    let o_frags: Vec<Frag<F32>> = (0..dfrags).map(|_| b.define_frag::<F32>(col_map)).collect();
+    let (m_frag, l_frag, s_frag) =
+        (b.define_frag::<F32>(col_map), b.define_frag::<F32>(col_map), b.define_frag::<F32>(col_map));
+    let p_frag = b.define_frag::<BF16>(col_map);
+    let (slot_m, slot_l, slot_s, slot_p) = (dfrags, dfrags + 1, dfrags + 2, dfrags + 3);
+    let mut accs: Vec<AccSlot> = o_frags.iter().map(|&f| AccSlot::F32(f)).collect();
+    accs.extend([AccSlot::F32(m_frag), AccSlot::F32(l_frag), AccSlot::F32(s_frag), AccSlot::BF16(p_frag)]);
+    let mut inited: Vec<Option<Effect>> = o_frags.iter().map(|&f| Some(b.zero_init_frag(f))).collect();
+    inited.push(Some(b.const_init_frag(m_frag, f32::NEG_INFINITY))); // running max seed = −∞
+    inited.push(Some(b.zero_init_frag(l_frag))); // running norm seed = 0
+    inited.push(None); // s: temporary (QKᵀ produces it fresh each block)
+    inited.push(None); // p: temporary (softmax produces it fresh each block)
+
+    // Per-cluster read/write slot sets (asymmetric — the point of §3.2): QKᵀ writes only `s`; softmax
+    // reads {s,m,l,o} writes {m,l,p,o}; PV reads {p,o} writes {o}. `m`/`l` are untouched by QKᵀ+PV and
+    // `s`/`p` never round-trip through a cluster that doesn't use them.
+    let o_idx: Vec<usize> = (0..dfrags).collect();
+    let sm_reads: Vec<usize> = [slot_s, slot_m, slot_l].into_iter().chain(0..dfrags).collect();
+    let sm_writes: Vec<usize> = [slot_m, slot_l, slot_p].into_iter().chain(0..dfrags).collect();
+    let pv_reads: Vec<usize> = std::iter::once(slot_p).chain(0..dfrags).collect();
 
     // Softmax scale folded into the QKᵀ scores: exp2(score·log2(e)/√d) == exp(score/√d).
     let scale = std::f32::consts::LOG2_E / (d as f32).sqrt();
@@ -273,61 +286,67 @@ pub fn flash_attention_fwd(n: usize, d: usize) -> Program {
         b.vec_build(&cs)
     };
     let zero_c = {
-        // QKᵀ's C = 0 (re-zero att every KV block; the carried att read is ignored).
+        // QKᵀ's C = 0 (att re-zeroed every KV block — `s` is a temporary, not read from the carry).
         let zs: Vec<Val<F32>> = (0..EPT).map(|_| b.f32(0.0)).collect();
         b.vec_build(&zs)
     };
-    // Acc-index landmarks in the carry vector.
-    let (i_att, i_max, i_norm) = (dfrags, dfrags + 1, dfrags + 2);
 
-    // ── the three compute bodies ──
-    // QKᵀ: att = K·Qᵀ (contraction over `d` = Σ over `dfrags` `mma` K-steps). Operand = gathered K.
-    let qk = Compute::<FaHooks>::new(0, move |b: &mut Builder, op: Option<&FaOp>, reads: &[Val<F32>]| {
-        let k_frags = op.expect("QKᵀ consumes gathered K");
-        let mut att = zero_c; // re-zero the per-block QKᵀ temporary
-        for s in 0..dfrags {
-            att = b.mma(k_frags[s], q_frags[s], att, EPT); // accumulate the d-slice K·Qᵀ
-        }
-        let mut out: Vec<Val<F32>> = reads[..dfrags].to_vec(); // o_* unchanged
-        out.push(att);
-        out.push(reads[i_max]);
-        out.push(reads[i_norm]);
-        out
-    });
+    // ── the three compute bodies, each declaring ONLY the slots it touches ──
+    // QKᵀ: att = K·Qᵀ (contraction over `d` = Σ over `dfrags` `mma` K-steps). reads nothing (re-zeros
+    // its output); writes only `s`. Operand = gathered K.
+    let qk = Compute::<FaHooks>::new(
+        0,
+        vec![],
+        vec![slot_s],
+        move |b: &mut Builder, op: Option<&FaOp>, _reads: &[SlotVal]| {
+            let k_frags = op.expect("QKᵀ consumes gathered K");
+            let mut att = zero_c;
+            for s in 0..dfrags {
+                att = b.mma(k_frags[s], q_frags[s], att, EPT); // accumulate the d-slice K·Qᵀ
+            }
+            vec![SlotVal::F32(att)]
+        },
+    );
 
-    // Online softmax (operand = None): the running-max rescale + exp2 + the two `ds_bpermute` column
-    // reductions — barrier-free, so the compute body stays edge-free. Overwrites `att` with the
-    // softmax weights `P` (still f32) for PV, and rescales every `o_df` by exp2(max_old − max_new).
-    let softmax = Compute::<FaHooks>::new(None, move |b: &mut Builder, _op: Option<&FaOp>, reads: &[Val<F32>]| {
-        let (att, max_old, norm_old) = (reads[i_att], reads[i_max], reads[i_norm]);
-        let s = b.mul(att, scale_bcast); // scaled scores
-        let m = b.frag_col_reduce(s, lane, max_old, false); // running max (per q, broadcast)
-        let corr = b.sub(max_old, m);
-        let scale_f = b.exp2(corr); // exp2(max_old − max_new)
-        let norm2 = b.mul(norm_old, scale_f); // rescale running norm
-        let sm = b.sub(s, m);
-        let p = b.exp2(sm); // softmax weights P (still f32)
-        let norm3 = b.frag_col_reduce(p, lane, norm2, true); // norm += Σ_kv P
-        let mut out: Vec<Val<F32>> = (0..dfrags).map(|df| b.mul(reads[df], scale_f)).collect(); // O *= corr
-        out.push(p); // att := P
-        out.push(m);
-        out.push(norm3);
-        out
-    });
+    // Online softmax (operand = None): reads {s, m, l, o_*}, writes {m, l, p, o_*}. The running-max
+    // rescale + exp2 + the two `ds_bpermute` column reductions — barrier-free. Produces `p` as BF16
+    // (the cast lives HERE now, so PV reads a native bf16 operand) and rescales every `o_df` by corr.
+    let softmax = Compute::<FaHooks>::new(
+        None,
+        sm_reads,
+        sm_writes,
+        move |b: &mut Builder, _op: Option<&FaOp>, reads: &[SlotVal]| {
+            let (s_raw, max_old, norm_old) = (reads[0].f32(), reads[1].f32(), reads[2].f32());
+            let s = b.mul(s_raw, scale_bcast); // scaled scores
+            let m = b.frag_col_reduce(s, lane, max_old, false); // running max (per q, broadcast)
+            let corr = b.sub(max_old, m);
+            let scale_f = b.exp2(corr); // exp2(max_old − max_new)
+            let norm2 = b.mul(norm_old, scale_f); // rescale running norm
+            let sm = b.sub(s, m);
+            let p = b.exp2(sm); // softmax weights P (f32)
+            let norm3 = b.frag_col_reduce(p, lane, norm2, true); // norm += Σ_kv P
+            let p_bf16 = b.cast_vec_bf16(p); // cast into the channel (PV reads bf16)
+            let mut out = vec![SlotVal::F32(m), SlotVal::F32(norm3), SlotVal::BF16(p_bf16)];
+            for i in 0..dfrags {
+                out.push(SlotVal::F32(b.mul(reads[3 + i].f32(), scale_f))); // O *= corr
+            }
+            out
+        },
+    );
 
-    // P·V accumulate (`mma_atb` over `kv`). Operand = the `dfrags` transposed V fragments (`kv` on
-    // spread). `P` (the softmaxed f32 `att`) feeds PV's B operand with ONLY a bf16 cast — no transpose,
-    // as the QKᵀ accumulator's lane distribution already equals the required operand layout (§5). Each
-    // `o_df` gets O[d in df, q] += Σ_kv V[kv, d]·P[kv, q].
-    let pv = Compute::<FaHooks>::new(1, move |b: &mut Builder, op: Option<&FaOp>, reads: &[Val<F32>]| {
-        let v_frags = op.expect("PV consumes gathered V");
-        let p = b.cast_vec_bf16(reads[i_att]);
-        let mut out: Vec<Val<F32>> = (0..dfrags).map(|df| b.mma(v_frags[df], p, reads[df], EPT)).collect();
-        out.push(reads[i_att]); // att unchanged
-        out.push(reads[i_max]);
-        out.push(reads[i_norm]);
-        out
-    });
+    // P·V accumulate (`mma_atb` over `kv`): reads {p, o_*}, writes {o_*}. Operand = the `dfrags`
+    // transposed V fragments (`kv` on spread). `P` arrives as a native bf16 channel value (no local
+    // cast); V feeds PV's A operand transposed. Each `o_df` gets O[d in df, q] += Σ_kv V[kv,d]·P[kv,q].
+    let pv = Compute::<FaHooks>::new(
+        1,
+        pv_reads,
+        o_idx.clone(),
+        move |b: &mut Builder, op: Option<&FaOp>, reads: &[SlotVal]| {
+            let v_frags = op.expect("PV consumes gathered V");
+            let p = reads[0].bf16(); // native bf16 P from the channel
+            (0..dfrags).map(|df| SlotVal::F32(b.mma(v_frags[df], p, reads[1 + df].f32(), EPT))).collect()
+        },
+    );
 
     let hooks = FaHooks { k_view, v_view, k_stage, v_stage, dfrags };
     let acc_final = pipeline(
@@ -352,12 +371,12 @@ pub fn flash_attention_fwd(n: usize, d: usize) -> Program {
     .build();
 
     // ── post-loop: normalize O = o / norm (per q, broadcast across d) and transpose-scatter to O. ──
-    let norm_vec = b.load_frag_vec(acc_final[i_norm]);
+    let norm_vec = b.load_frag_vec(acc_final[slot_l].f32());
     let recip_norm = b.recip(norm_vec);
     let d_c = b.idx_const(d as i64);
     let mut roots = Vec::new();
     for df in 0..dfrags {
-        let o_vec = b.load_frag_vec(acc_final[df]);
+        let o_vec = b.load_frag_vec(acc_final[df].f32());
         let o_norm = b.mul(o_vec, recip_norm);
         for inner in 0..EPT {
             let inner_c = b.idx_const(inner as i64);

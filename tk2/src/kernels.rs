@@ -14,7 +14,7 @@ use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Val};
 use crate::ir::{FragMap, TileId, TileIr};
 use crate::movement::{Drain, LdsStage, LdsView, SharedTile};
 use crate::pass::Pass;
-use crate::pipeline::{CommitDrain, Compute, Hooks, Mem, pipeline};
+use crate::pipeline::{AccSlot, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
 
 /// A finished tile-IR program: the arena, its sink root, and the kernel name.
 pub struct Program {
@@ -363,9 +363,13 @@ fn kblock_impl(
     let a_stage = a_tile.stage_view(a, epl_a, tid, tm_bm, k as i64, stage_drain);
     let b_stage = b_tile.stage_view(bmat, epl_b, tid, tn_bn, k as i64, stage_drain);
 
-    // ── accumulators: one 16×16 f32 fragment per (i,j), zero-initialised. ──
+    // ── accumulators: one 16×16 f32 fragment per (i,j), zero-initialised. ALL carried, and every
+    //    compute cluster reads+writes the full set — GEMM is the UNIFORM special case of the §3.2
+    //    per-cluster read/write contract (`reads = writes = 0..ri·cj`), so it emits byte-identically. ──
     let acc: Vec<Frag<F32>> = (0..ri * cj).map(|_| b.define_frag::<F32>(bc_map)).collect();
-    let inited: Vec<Effect> = acc.iter().map(|&ac| b.zero_init_frag(ac)).collect();
+    let accs: Vec<AccSlot> = acc.iter().map(|&f| AccSlot::F32(f)).collect();
+    let inited: Vec<Option<Effect>> = acc.iter().map(|&ac| Some(b.zero_init_frag(ac))).collect();
+    let all_slots: Vec<usize> = (0..ri * cj).collect();
 
     let acc_final = {
         // The §5c clustered HK replica: the movement handles + fills feed the 8-cluster HK schedule
@@ -380,25 +384,30 @@ fn kblock_impl(
         // compute side pluggable: FA's softmax/PV clusters carry their own body, `Hooks` never grows a
         // compute method. `mma(s)` mints a compute cluster over gathered slice `s` (always `Some`).
         let mma = |s: usize| -> Compute<MatmulHooks> {
-            Compute::new(s, move |b: &mut Builder, op: Option<&MatmulOp>, reads: &[Val<F32>]| {
-                let (a_vecs, b_vecs) = op.expect("matmul compute consumes a gathered operand");
-                let mut out = Vec::with_capacity(ri * cj);
-                for i in 0..ri {
-                    for j in 0..cj {
-                        // Asm-sideeffect MFMA (opaque to LLVM's scheduler → the 32-run cannot be
-                        // fractured; tk's `mma_abt_asm` pin, verified: the intrinsic path is unpinnable).
-                        out.push(b.mma_asm(a_vecs[i], b_vecs[j], reads[i * cj + j], ept));
+            Compute::new(
+                s,
+                all_slots.clone(),
+                all_slots.clone(),
+                move |b: &mut Builder, op: Option<&MatmulOp>, reads: &[SlotVal]| {
+                    let (a_vecs, b_vecs) = op.expect("matmul compute consumes a gathered operand");
+                    let mut out = Vec::with_capacity(ri * cj);
+                    for i in 0..ri {
+                        for j in 0..cj {
+                            // Asm-sideeffect MFMA (opaque to LLVM's scheduler → the 32-run cannot be
+                            // fractured; tk's `mma_abt_asm` pin, verified: the intrinsic path is unpinnable).
+                            out.push(SlotVal::F32(b.mma_asm(a_vecs[i], b_vecs[j], reads[i * cj + j].f32(), ept)));
+                        }
                     }
-                }
-                out
-            })
+                    out
+                },
+            )
         };
         pipeline(
             &mut b,
             k / k_step,
             k_step,
             ksteps,
-            &acc,
+            &accs,
             &inited,
             warp_row,
             asm_gather,
@@ -434,7 +443,7 @@ fn kblock_impl(
             let col = b.idx_add(tn_bn, j16);
             let col = add_opt(&mut b, col, warp_col_off);
             let base_c = b.idx_add(row_n, col);
-            roots.extend(scatter_frag(&mut b, acc_final[idx], c, base_c, n as i64, wlane));
+            roots.extend(scatter_frag(&mut b, acc_final[idx].f32(), c, base_c, n as i64, wlane));
         }
     }
 

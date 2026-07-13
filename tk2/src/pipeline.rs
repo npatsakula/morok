@@ -23,7 +23,7 @@
 
 use std::collections::HashSet;
 
-use crate::build::{Builder, Effect, F32, Frag, Idx, Val};
+use crate::build::{BF16, Builder, Effect, F32, Frag, Idx, Val};
 use crate::ir::{Node, TileId, TileIr};
 
 /// The commit's **drain placement policy** (DESIGN §5c) — WHERE the collaborative fill's LDS writes
@@ -80,12 +80,91 @@ pub(crate) trait Hooks {
     fn gather(&mut self, b: &mut Builder, slice: usize, raw: &[TileId]) -> (Self::Op, Vec<TileId>, TileId);
 }
 
-/// A **compute body**: the kernel's per-cluster math, given the gathered operand bundle and the
-/// carried accumulator reads → the new accumulator values. Edge-free (no barrier/dep) — the
-/// [`ClusterCx::compute`] wrapper owns the `set_prio` bracket + the acc round-trip. This is what
-/// makes the *compute* side pluggable: matmul's `Compute` carries the MFMA loop, FA's `Softmax`/`PV`
-/// carry theirs, and `Hooks` never grows a per-kernel compute method.
-pub(crate) type ComputeBody<H> = dyn Fn(&mut Builder, Option<&<H as Hooks>::Op>, &[Val<F32>]) -> Vec<Val<F32>>;
+/// A **heterogeneous compute-channel value** (DESIGN §3.2 — gentle typing: the dtype rides as DATA, not
+/// a phantom type param) so the channel can carry bf16 `P` beside f32 `o`/`m`/`l`. A cluster body reads
+/// its declared slots as these and returns its declared writes as these; the wrong-dtype accessor
+/// panics at BUILD time (a kernel-authoring error, not a device fault).
+#[derive(Copy, Clone)]
+pub(crate) enum SlotVal {
+    F32(Val<F32>),
+    BF16(Val<BF16>),
+}
+
+impl SlotVal {
+    /// Read this channel value as f32 (panics if it is bf16 — an author dtype mismatch).
+    pub(crate) fn f32(self) -> Val<F32> {
+        match self {
+            SlotVal::F32(v) => v,
+            SlotVal::BF16(_) => panic!("compute slot value is bf16 but was read as f32"),
+        }
+    }
+    /// Read this channel value as bf16 (panics if it is f32).
+    pub(crate) fn bf16(self) -> Val<BF16> {
+        match self {
+            SlotVal::BF16(v) => v,
+            SlotVal::F32(_) => panic!("compute slot value is f32 but was read as bf16"),
+        }
+    }
+    fn id(self) -> TileId {
+        match self {
+            SlotVal::F32(v) => v.id,
+            SlotVal::BF16(v) => v.id,
+        }
+    }
+}
+
+/// A pipeline **accumulator/temporary slot** — its register fragment, dtype+map riding as DATA (the
+/// heterogeneous carry of DESIGN §3.2). Whether a slot is CARRIED (seeded + loop-carried + End-folded,
+/// e.g. GEMM's C, FA's `o`/`m`/`l`) or a per-iteration TEMPORARY (no seed, not carried — produced and
+/// consumed within one iteration, e.g. FA's `s`=QKᵀ scores, `p`=softmax weights) is set by the
+/// pipeline's `inited` (`Some` seed ⇒ carried, `None` ⇒ temporary), NOT by the slot itself.
+#[derive(Copy, Clone)]
+pub(crate) enum AccSlot {
+    F32(Frag<F32>),
+    BF16(Frag<BF16>),
+}
+
+impl AccSlot {
+    /// Unwrap the f32 fragment (panics if bf16) — the post-loop scatter source.
+    pub(crate) fn f32(self) -> Frag<F32> {
+        match self {
+            AccSlot::F32(f) => f,
+            AccSlot::BF16(_) => panic!("acc slot is bf16 but was used as f32"),
+        }
+    }
+    fn load_after(self, b: &mut Builder, deps: &[TileId]) -> SlotVal {
+        match self {
+            AccSlot::F32(f) => SlotVal::F32(b.load_frag_vec_after(f, deps)),
+            AccSlot::BF16(f) => SlotVal::BF16(b.load_frag_vec_after(f, deps)),
+        }
+    }
+    fn store(self, b: &mut Builder, v: SlotVal) -> Effect {
+        match (self, v) {
+            (AccSlot::F32(f), SlotVal::F32(x)) => b.store_frag_vec(f, x),
+            (AccSlot::BF16(f), SlotVal::BF16(x)) => b.store_frag_vec(f, x),
+            _ => panic!("acc slot / channel value dtype mismatch on store"),
+        }
+    }
+    fn after(self, b: &mut Builder, deps: &[TileId]) -> AccSlot {
+        match self {
+            AccSlot::F32(f) => AccSlot::F32(b.frag_after(f, deps)),
+            AccSlot::BF16(f) => AccSlot::BF16(b.frag_after(f, deps)),
+        }
+    }
+    fn id(self) -> TileId {
+        match self {
+            AccSlot::F32(f) => f.id,
+            AccSlot::BF16(f) => f.id,
+        }
+    }
+}
+
+/// A **compute body**: the kernel's per-cluster math, given the gathered operand bundle and the values
+/// of the slots the cluster DECLARED it reads (in `reads` order) → the new values for the slots it
+/// DECLARED it writes (in `writes` order). Edge-free (no barrier/dep) — the [`ClusterCx::compute`]
+/// wrapper owns the `set_prio` bracket + the per-slot round-trip. The declared read/write SUBSETS are
+/// what let a cluster touch only the state it uses (no dead round-trip) over a heterogeneous slot set.
+pub(crate) type ComputeBody<H> = dyn Fn(&mut Builder, Option<&<H as Hooks>::Op>, &[SlotVal]) -> Vec<SlotVal>;
 
 /// The **safe-op context** — holds the `Builder`, the `Hooks`, and the per-body carry state, and
 /// exposes ONLY the four safe ops. Each op reproduces the corresponding `run_clustered_body` match-
@@ -95,11 +174,15 @@ pub(crate) type ComputeBody<H> = dyn Fn(&mut Builder, Option<&<H as Hooks>::Op>,
 pub(crate) struct ClusterCx<'a, H: Hooks> {
     b: &'a mut Builder,
     hooks: &'a mut H,
-    accs: &'a [Frag<F32>],
-    seed: &'a [TileId],
+    accs: &'a [AccSlot],
+    /// Per-slot carry-in edge: `[inited, range]` (steady) / `[]` (epilogue, the `acc_loop` frag observes
+    /// the loop `End`) for a CARRIED slot; `[]` for a TEMPORARY (which must be written before it is read).
     carry: &'a [Vec<TileId>],
+    /// Per-slot carried flag (`inited[s].is_some()`) — a read of a not-yet-written slot is a carry-in
+    /// (carried) or an authoring bug (temporary read before produced).
+    is_carried: &'a [bool],
+    seed: &'a [TileId],
     k_next: Option<Idx>,
-    n_acc: usize,
     commit_drain: CommitDrain,
     /// The **HK bare-seal policy** (§5c): when set, cluster seals lower to a bare `s_barrier`
     /// ([`Builder::bare_barrier`]) instead of the acq-rel-fenced [`Builder::barrier`], and the LDS
@@ -113,13 +196,17 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     pin_mfma: bool,
     // ── carries (persist across clusters within one body) ──
     entry: Vec<TileId>,
-    prev_store: Vec<TileId>,
+    /// Per-slot source of the NEXT read this body pass: `Some(store)` = the last cluster that wrote the
+    /// slot (its store is the intra-iteration RAW), `None` = not yet written (read from the slot's
+    /// carry-in). Replaces the old `first_compute` bool + full `prev_store`: with per-cluster write
+    /// subsets each slot is threaded independently, so a cluster that skips a slot leaves its source
+    /// intact (no dead round-trip). The first read of a carried slot (`None`) uses `carry[s]`.
+    slot_src: Vec<Option<TileId>>,
     all_gathers: Vec<TileId>,
     operands: Vec<Option<(H::Op, TileId)>>,
     reg: Option<H::Reg>,
     raw_next: Option<TileId>,
     tail_barrier: Option<TileId>,
-    first_compute: bool,
     /// Bare-seal drain bookkeeping: the set of gathered slices whose `ds_read`s are not yet covered by
     /// an `lgkmcnt(0)` drain. A compute over slice `s` drains ONLY if `s` is outstanding (its own
     /// operand), then clears ALL (the unified `lgkmcnt(0)` completes every read); a commit's read-drain
@@ -288,7 +375,8 @@ impl<H: Hooks> ClusterCx<'_, H> {
     /// operand + acc reads; store back; `set_prio(0)` on the results; the closing `s_barrier` on the
     /// LAST store. Boundary token = `[bar, prio0]`. SEALED. The `body` is edge-free — this wrapper
     /// owns the bracket + round-trip, so the compute is pluggable without a per-kernel `Hooks` method.
-    pub(crate) fn compute(&mut self, operand: Option<usize>, body: &ComputeBody<H>) {
+    pub(crate) fn compute(&mut self, operand: Option<usize>, reads: &[usize], writes: &[usize], body: &ComputeBody<H>) {
+        assert!(!writes.is_empty(), "a compute cluster must write ≥1 slot (its seal anchors on the last store)");
         // Resolve the gathered operand (if any). `operand = Some(s)` for a compute that consumes a
         // gathered K-slice (matmul MFMA, FA QKᵀ/PV); `None` for one that consumes only the accumulator
         // carry (FA softmax). The `unwrap_or_else` is the BUILD-TIME coupling check: it panics during
@@ -343,37 +431,69 @@ impl<H: Hooks> ClusterCx<'_, H> {
             let lead = self.b.sched_fence(0, &anchors).dep();
             self.entry.push(lead);
         }
-        let mut reads: Vec<Val<F32>> = Vec::with_capacity(self.n_acc);
-        for ij in 0..self.n_acc {
-            let mut deps = if self.first_compute { self.carry[ij].clone() } else { vec![self.prev_store[ij]] };
-            deps.extend(&self.entry);
-            if let Some(p) = prio1 {
-                deps.push(p);
-            }
-            reads.push(self.b.load_frag_vec_after(self.accs[ij], &deps));
-        }
-        let new = body(self.b, op_ref, &reads);
-        let new_ids: Vec<TileId> = new.iter().map(|v| v.id).collect();
-        let mut stores: Vec<Effect> = Vec::with_capacity(self.n_acc);
-        for (a, v) in self.accs.iter().zip(&new) {
-            stores.push(self.b.store_frag_vec(*a, *v));
-        }
-        self.prev_store = stores.iter().map(|e| e.dep()).collect();
-        self.first_compute = false;
+        // Load ONLY the DECLARED read slots (the subset — a cluster that skips a slot leaves it out of
+        // its round-trip entirely, the dead-round-trip cure §3.2). Each read's source is the slot's
+        // last writer this iteration (`slot_src`) or, on its first touch, its carry-in (`carry[s]`);
+        // a temporary read before it is produced is an authoring bug.
+        let read_vals: Vec<SlotVal> = reads
+            .iter()
+            .map(|&s| {
+                let mut deps = match self.slot_src[s] {
+                    Some(t) => vec![t],
+                    None => {
+                        assert!(
+                            self.is_carried[s],
+                            "compute reads temporary slot {s} before it is written this iteration"
+                        );
+                        self.carry[s].clone() // carried: [inited, range]; epilogue: [] (frag observes End)
+                    }
+                };
+                deps.extend(&self.entry);
+                if let Some(p) = prio1 {
+                    deps.push(p);
+                }
+                self.accs[s].load_after(self.b, &deps)
+            })
+            .collect();
+        let new = body(self.b, op_ref, &read_vals);
+        assert_eq!(
+            new.len(),
+            writes.len(),
+            "compute body returned {} values for {} declared writes",
+            new.len(),
+            writes.len()
+        );
+        let new_ids: Vec<TileId> = new.iter().map(|v| v.id()).collect();
+        // Store ONLY the DECLARED write slots, threading each as the next reader's RAW (`slot_src`).
+        let stores: Vec<Effect> = writes
+            .iter()
+            .zip(&new)
+            .map(|(&s, &v)| {
+                let e = self.accs[s].store(self.b, v);
+                self.slot_src[s] = Some(e.dep());
+                e
+            })
+            .collect();
         let prio0 = self.b.set_prio(0, &new_ids).dep();
-        // MFMA-cluster TRAILING pin (§5c ISA fix): a `sched.barrier(0)` on ALL 32 MFMA RESULTS, so the
+        // MFMA-cluster TRAILING pin (§5c ISA fix): a `sched.barrier(0)` on ALL MFMA RESULTS, so the
         // tail `s_barrier` cannot hoist up into the run.
-        let body = stores[self.n_acc - 1];
-        let mut deps: Vec<TileId> = self.prev_store[..self.n_acc - 1].to_vec();
+        let body_eff = stores[writes.len() - 1];
+        let mut deps: Vec<TileId> = stores[..writes.len() - 1].iter().map(|e| e.dep()).collect();
         // Route `set_prio(0)` INTO the cluster's seal (clone `gemm.rs:134-136`): the barrier then
         // happens-after the prio-drop, so on the LAST compute cluster (C7 — whose `entry` no later
         // cluster consumes) the `s_setprio 0` is kept live by the carried tail barrier instead of
         // being DCE'd. Without this the loop-back memory phase stays at prio 1 (steering lost).
         deps.push(prio0);
+        // A READ-FREE compute (FA's QKᵀ re-zeros its output, reading no slot) never threaded `entry`
+        // (the prior cluster's seal) through an acc read — so fold it into THIS seal explicitly to keep
+        // the cluster-boundary barrier chain ordered. (A cluster with reads carries `entry` via them.)
+        if reads.is_empty() {
+            deps.extend(&self.entry);
+        }
         if self.pin_mfma {
             deps.push(self.b.sched_fence(0, &new_ids).dep());
         }
-        let bar = self.seal(body, &deps).dep();
+        let bar = self.seal(body_eff, &deps).dep();
         self.tail_barrier = Some(bar);
         self.entry = vec![bar, prio0];
         self.sealed = true;
@@ -430,27 +550,38 @@ impl<H: Hooks> Cluster<H> for Mem {
 /// `Option<&Op>` accordingly.
 pub(crate) struct Compute<H: Hooks> {
     operand: Option<usize>,
+    reads: Vec<usize>,
+    writes: Vec<usize>,
     body: Box<ComputeBody<H>>,
 }
 
 impl<H: Hooks> Compute<H> {
+    /// A compute cluster over gathered `operand` (or `None`), declaring the accumulator/temporary slots
+    /// it `reads` and `writes` (by index into the pipeline's slot set). The `body` receives the read
+    /// slots' values (in `reads` order) and returns the write slots' new values (in `writes` order) —
+    /// so it touches ONLY its declared state, over a heterogeneous ([`SlotVal`]) channel. GEMM passes
+    /// `reads = writes = 0..n` (the uniform full-acc special case); FA passes asymmetric subsets.
     pub(crate) fn new(
         operand: impl Into<Option<usize>>,
-        body: impl Fn(&mut Builder, Option<&H::Op>, &[Val<F32>]) -> Vec<Val<F32>> + 'static,
+        reads: impl Into<Vec<usize>>,
+        writes: impl Into<Vec<usize>>,
+        body: impl Fn(&mut Builder, Option<&H::Op>, &[SlotVal]) -> Vec<SlotVal> + 'static,
     ) -> Self {
-        Compute { operand: operand.into(), body: Box::new(body) }
+        Compute { operand: operand.into(), reads: reads.into(), writes: writes.into(), body: Box::new(body) }
     }
 }
 
 impl<H: Hooks> Cluster<H> for Compute<H> {
     fn build(&self, cx: &mut ClusterCx<H>) {
-        cx.compute(self.operand, self.body.as_ref());
+        cx.compute(self.operand, &self.reads, &self.writes, self.body.as_ref());
     }
 }
 
 /// The threaded result of one body pass (steady / epilogue).
 struct BodyOut {
-    prev_store: Vec<TileId>,
+    /// Per-slot last store this pass (`None` = never written — only valid for a temporary the epilogue
+    /// happens not to touch). The End-fold reads each CARRIED slot's last store from here.
+    slot_src: Vec<Option<TileId>>,
     raw_next: Option<TileId>,
     tail_barrier: Option<TileId>,
 }
@@ -466,8 +597,8 @@ fn run_body<H: Hooks>(
     clusters: &[Box<dyn Cluster<H>>],
     hooks: &mut H,
     ksteps: usize,
-    n_acc: usize,
-    accs: &[Frag<F32>],
+    accs: &[AccSlot],
+    is_carried: &[bool],
     seed: &[TileId],
     carry: &[Vec<TileId>],
     k_next: Option<Idx>,
@@ -479,21 +610,20 @@ fn run_body<H: Hooks>(
         b,
         hooks,
         accs,
-        seed,
         carry,
+        is_carried,
+        seed,
         k_next,
-        n_acc,
         commit_drain,
         bare_seals,
         pin_mfma,
         entry: Vec::new(),
-        prev_store: Vec::new(),
+        slot_src: vec![None; accs.len()],
         all_gathers: Vec::new(),
         operands: (0..ksteps).map(|_| None).collect(),
         reg: None,
         raw_next: None,
         tail_barrier: None,
-        first_compute: true,
         undrained: Vec::new(),
         this_gathers: Vec::new(),
         sealed: false,
@@ -514,7 +644,7 @@ fn run_body<H: Hooks>(
             cx.entry = vec![bar];
         }
     }
-    BodyOut { prev_store: cx.prev_store, raw_next: cx.raw_next, tail_barrier: cx.tail_barrier }
+    BodyOut { slot_src: cx.slot_src, raw_next: cx.raw_next, tail_barrier: cx.tail_barrier }
 }
 
 /// The **clustered pipeline combinator** — construct with [`pipeline`], push clusters with
@@ -527,8 +657,8 @@ pub(crate) struct Pipeline<'a, H: Hooks> {
     nblocks: usize,
     k_step: usize,
     ksteps: usize,
-    accs: &'a [Frag<F32>],
-    inited: &'a [Effect],
+    accs: &'a [AccSlot],
+    inited: &'a [Option<Effect>],
     warp_row: Option<Idx>,
     asm_gather: bool,
     resident: bool,
@@ -541,14 +671,16 @@ pub(crate) struct Pipeline<'a, H: Hooks> {
 /// Open a clustered pipeline over `hooks`. `nblocks = k/k_step ≥ 2`; `warp_row = Some` enables the
 /// wave-phase ping-pong; `resident` drops the steady prefetch/commit (compute-resident microkernel);
 /// `bare_seals` swaps the acq-rel-fenced cluster barriers for HK's bare `s_barrier` + explicit drains.
+/// `inited[s] = Some(seed)` marks slot `s` CARRIED (loop-carried + End-folded); `None` a per-iteration
+/// TEMPORARY (not carried — produced and consumed within one pass, e.g. FA's QKᵀ scores / softmax `P`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pipeline<'a, H: Hooks>(
     b: &'a mut Builder,
     nblocks: usize,
     k_step: usize,
     ksteps: usize,
-    accs: &'a [Frag<F32>],
-    inited: &'a [Effect],
+    accs: &'a [AccSlot],
+    inited: &'a [Option<Effect>],
     warp_row: Option<Idx>,
     asm_gather: bool,
     resident: bool,
@@ -584,10 +716,11 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
     }
 
     /// Emit the pipeline: prologue commit + wave-phase seed, the steady body over the schedule, the
-    /// End-fold of the carries, the epilogue body + rebalance, then the completeness check. Returns
-    /// the post-loop accumulator frags (the scatter source). Byte-identical to the old
-    /// `pipeline_clustered`.
-    pub(crate) fn build(self) -> Vec<Frag<F32>> {
+    /// End-fold of the CARRIED slots + the epilogue body + rebalance, then the completeness check.
+    /// Returns the post-loop slot set ([`AccSlot`], the scatter source — the caller unwraps the carried
+    /// slots it needs). GEMM's uniform full-acc schedule emits byte-identically to the pre-refactor
+    /// `pipeline_clustered`; FA's asymmetric read/write subsets drop the dead round-trips.
+    pub(crate) fn build(self) -> Vec<AccSlot> {
         let Pipeline {
             b,
             mut hooks,
@@ -605,7 +738,12 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             clusters,
         } = self;
         assert!(nblocks >= 2, "pipeline needs nblocks ≥ 2");
-        let n_acc = accs.len();
+        let n_slots = accs.len();
+        assert_eq!(inited.len(), n_slots, "one `inited` entry per slot (Some = carried, None = temporary)");
+        // A slot is CARRIED (loop-carried + End-folded) iff it was given a seed; else a TEMPORARY.
+        let is_carried: Vec<bool> = inited.iter().map(|e| e.is_some()).collect();
+        let carried_slots: Vec<usize> = (0..n_slots).filter(|&s| is_carried[s]).collect();
+        assert!(!carried_slots.is_empty(), "a pipeline must carry ≥1 accumulator across the loop");
         let ks_c = b.idx_const(k_step as i64);
         let one = b.idx_const(1);
 
@@ -647,7 +785,10 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         let tk = b.counter(kr);
         let k_next_idx = b.idx_add(tk, one);
         let k_next = b.idx_mul(k_next_idx, ks_c);
-        let carry: Vec<Vec<TileId>> = (0..n_acc).map(|ij| vec![inited[ij].dep(), kr.dep()]).collect();
+        // Per-slot carry-in: a CARRIED slot's first read routes `[seed, range]`; a TEMPORARY has none
+        // (it must be produced before it is read — enforced in `compute`).
+        let carry: Vec<Vec<TileId>> =
+            (0..n_slots).map(|s| inited[s].map(|e| vec![e.dep(), kr.dep()]).unwrap_or_default()).collect();
         // Compute-resident: the whole tile is staged ONCE in the prologue, so the steady loop drops
         // BOTH prefetch and commit (`k_next=None`); the gathers still fire, re-reading the resident
         // block via `[loop_seed, kr]`.
@@ -657,8 +798,8 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             &clusters,
             &mut hooks,
             ksteps,
-            n_acc,
             accs,
+            &is_carried,
             &[loop_seed, kr.dep()],
             &carry,
             steady_k_next,
@@ -667,34 +808,44 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             pin_mfma,
         );
 
-        // ── loop close: fold the last-slice stores, raw_next (LDS carry, streaming only), AND the
-        //    final cluster's barrier (else DCE drops it → unbalanced count → deadlock) under one End. ──
-        let last = Effect(body.prev_store[n_acc - 1]);
-        let mut carried: Vec<TileId> = body.prev_store[..n_acc - 1].to_vec();
+        // ── loop close: fold every CARRIED slot's last store (its carry-out — the writers may differ per
+        //    slot now, so read them from `slot_src`, not one uniform last-cluster store), raw_next (LDS
+        //    carry, streaming only), AND the final cluster's barrier (else DCE drops it → unbalanced
+        //    count → deadlock) under one End. Temporaries are NOT folded — each is reached transitively
+        //    through the carried slot its consumer writes, so it stays live + loop-scoped. ──
+        let carried_stores: Vec<TileId> = carried_slots
+            .iter()
+            .map(|&s| body.slot_src[s].expect("carried slot must be written every iteration (the loop carry)"))
+            .collect();
+        let last = Effect(carried_stores[carried_stores.len() - 1]);
+        let mut fold: Vec<TileId> = carried_stores[..carried_stores.len() - 1].to_vec();
         match body.raw_next {
-            Some(rn) => carried.push(rn),
+            Some(rn) => fold.push(rn),
             None => assert!(resident, "streaming schedule must contain a commit cluster (raw_next carry)"),
         }
-        carried.push(body.tail_barrier.expect("steady body must end on a cluster barrier"));
+        fold.push(body.tail_barrier.expect("steady body must end on a cluster barrier"));
         // HK positional wall lattice: the `sched.barrier(0)` paired with every `s_barrier` pins the
         // opaque asm `ds_read_b64`s inside their cluster (load-bearing for the asm gather's correctness).
         if asm_gather {
-            carried.push(b.wall_marker().dep());
+            fold.push(b.wall_marker().dep());
         }
-        let combined = b.combine(last, &carried);
+        let combined = b.combine(last, &fold);
         let ended = b.end(combined, &[kr]);
-        let acc_loop: Vec<Frag<F32>> = accs.iter().map(|a| b.frag_after(*a, &[ended.dep()])).collect();
+        // Every slot's post-loop handle observes the `End`; for carried slots this is the carry-in the
+        // epilogue reads, for temporaries a fresh handle the epilogue re-writes (no collision with the
+        // in-loop stores).
+        let acc_loop: Vec<AccSlot> = accs.iter().map(|a| a.after(b, &[ended.dep()])).collect();
 
         // ── epilogue: the same schedule for the LAST block (via the End's carried RAW), no
         //    prefetch/commit; then the eq=0 wave-phase barrier rebalances warp-row 0. ──
-        let ep_carry: Vec<Vec<TileId>> = (0..n_acc).map(|_| Vec::new()).collect();
+        let ep_carry: Vec<Vec<TileId>> = (0..n_slots).map(|_| Vec::new()).collect();
         let ep = run_body(
             b,
             &clusters,
             &mut hooks,
             ksteps,
-            n_acc,
             &acc_loop,
+            &is_carried,
             &[ended.dep()],
             &ep_carry,
             None,
@@ -708,19 +859,19 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             let anchor = ep.tail_barrier.expect("epilogue must end on a cluster barrier");
             b.wave_barrier(wr, 0, &[anchor]).dep()
         });
-        let out: Vec<Frag<F32>> = acc_loop
+        let out: Vec<AccSlot> = acc_loop
             .iter()
             .enumerate()
-            .map(|(ij, a)| {
-                let mut deps = vec![ep.prev_store[ij]];
+            .map(|(s, a)| {
+                let mut deps: Vec<TileId> = ep.slot_src[s].into_iter().collect();
                 deps.extend(scatter_seed);
-                b.frag_after(*a, &deps)
+                a.after(b, &deps)
             })
             .collect();
 
-        // ── completeness check: carry-completeness (checked inline above via the End-fold) + the
-        //    wave-phase balance over the emitted output cone. A build-time panic. ──
-        let roots: Vec<TileId> = out.iter().map(|f| f.id).collect();
+        // ── completeness check: carry-completeness (a carried slot unwritten in a pass panics the
+        //    End-fold above) + the wave-phase balance over the emitted output cone. A build-time panic. ──
+        let roots: Vec<TileId> = out.iter().map(|a| a.id()).collect();
         verify(&b.ir, &roots, body.raw_next, body.tail_barrier, resident);
         out
     }

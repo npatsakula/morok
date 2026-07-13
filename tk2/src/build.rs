@@ -758,12 +758,14 @@ impl Builder {
         Val::wrap(self.ir.intern(Node::Bf16Trunc { val: val.id }))
     }
 
-    /// **Vector fp32 → bf16 truncation**: per-element [`Self::bf16_trunc`] then re-pack — the f32→bf16
-    /// relayout FA needs between the softmax weights `P` (still f32) and the PV MMA operand. Promoted
-    /// from the naive FA's `cast_f32_vec_to_bf16` leaf.
+    /// **Vector fp32 → bf16 truncation** of a gfx942 16×16 fragment vector (`ept = 4`): per-element
+    /// [`Self::bf16_trunc`] then re-pack — the f32→bf16 relayout FA needs between the softmax weights
+    /// `P` (f32) and the PV MMA operand. `ept` is the fixed fragment width, NOT meta-derived: `v`
+    /// typically arrives through an `EltwiseBinary`/`Unary` (`exp2`) whose meta shape is bookkeeping-
+    /// scalar, which would collapse a meta-derived width to 1 and cast only the first element.
     pub fn cast_vec_bf16(&mut self, v: Val<F32>) -> Val<BF16> {
-        let ept = self.ir.meta(v.id).shape.iter().copied().product::<usize>().max(1);
-        let els: Vec<Val<BF16>> = (0..ept)
+        const EPT: usize = 4;
+        let els: Vec<Val<BF16>> = (0..EPT)
             .map(|e| {
                 let s = self.vec_extract(v, e);
                 self.bf16_trunc(s)
