@@ -120,10 +120,13 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     raw_next: Option<TileId>,
     tail_barrier: Option<TileId>,
     first_compute: bool,
-    /// Bare-seal drain bookkeeping: `true` once a gather has issued `ds_read`s not yet covered by an
-    /// `lgkmcnt(0)` drain. A compute cluster drains + clears it before its MFMAs; a commit's WAR drain
-    /// clears it too (so the following compute needs no drain — HK's C7). Reset false each body pass.
-    undrained: bool,
+    /// Bare-seal drain bookkeeping: the set of gathered slices whose `ds_read`s are not yet covered by
+    /// an `lgkmcnt(0)` drain. A compute over slice `s` drains ONLY if `s` is outstanding (its own
+    /// operand), then clears ALL (the unified `lgkmcnt(0)` completes every read); a commit's read-drain
+    /// clears it too. Per-slice (not a bool) so C5 — whose slice 2 was already drained at C3 while a
+    /// later-gathered slice 3 is still outstanding — does NOT stall on a spurious drain (HK's C5 has
+    /// none: it drains at C1/C3/C6 only). Cleared each body pass.
+    undrained: Vec<usize>,
     // ── per-cluster (reset by the driver before each cluster) ──
     this_gathers: Vec<TileId>,
     sealed: bool,
@@ -152,7 +155,12 @@ impl<H: Hooks> ClusterCx<'_, H> {
     /// the mem ops depending on it keep it live (no DCE). Skipped at the loop-top mem cluster (empty
     /// `entry`, no raised priority yet). Pure issue-priority hint: bit-exact.
     pub(crate) fn mem_prio0(&mut self) {
-        if self.entry.is_empty() {
+        // Under the HK bare-seal chain the steering is carried by the COMPUTE clusters' own
+        // `set_prio(0)` (each now survives — routed into its bare tail barrier, [`Self::compute`]), so
+        // the loop-back memory phase already runs at prio 0. The clone (`hk/gemm.rs`) emits NO
+        // per-memory-cluster `set_prio(0)`; a redundant one here is a wasted issue slot in the memory
+        // phase AND breaks the exact 8-`setprio 0` census. Skip it on the bare-seal path.
+        if self.bare_seals || self.entry.is_empty() {
             return;
         }
         let p0 = self.b.set_prio(0, &self.entry).dep();
@@ -196,8 +204,8 @@ impl<H: Hooks> ClusterCx<'_, H> {
         self.this_gathers.extend(g.iter().copied());
         self.all_gathers.extend(g.iter().copied());
         self.operands[s] = Some((op, op_anchor));
-        // A bare seal will NOT drain these `ds_read`s — flag them for the next compute cluster's drain.
-        self.undrained = true;
+        // A bare seal will NOT drain these `ds_read`s — flag slice `s` for the compute that consumes it.
+        self.undrained.push(s);
     }
 
     /// The **commit** safe op = the commit arm: WAR-fence EVERY gather so far, `commit`, RAW-fence
@@ -221,22 +229,18 @@ impl<H: Hooks> ClusterCx<'_, H> {
                 // gathers — so `lgkmcnt(0)` (which drains ALL outstanding reads regardless of anchor)
                 // is POSITIONED after C5's 32-MFMA run, exactly as the clone (hk/gemm.rs:279
                 // `s_waitcnt_lgkmcnt(bar5)`). Anchored on the gathers it could float up before C5's run.
+                // The read-drain `lgkmcnt(0)` IS the WAR token (HK `gemm.rs:279-280`): it drains every
+                // outstanding gather read before the commit overwrites LDS — no SEPARATE WAR `s_barrier`.
+                // The clone's C6 is a SINGLE barrier (`bar6`, after the writes); the combinator used to
+                // emit two (a WAR seal + the C6 seal), an extra workgroup barrier per iteration. Anchor
+                // the drain on the PRIOR COMPUTE cluster's barrier (C5's `bar5` = `tail_barrier`) so the
+                // `lgkmcnt(0)` is POSITIONED after C5's 32-MFMA run (the C5→C6 wall) exactly as the clone,
+                // NOT on the gathers (where it could float up before C5's run). It also covers the whole
+                // bare-seal read set, so the shadowing C7 needs no drain (`undrained = false`).
                 let rd_anchor = self.tail_barrier.unwrap_or(self.all_gathers[last]);
                 let rd = self.b.swait_lgkmcnt(rd_anchor);
-                // The WAR drain (`lgkmcnt(0)`) also clears the bare-seal pending drain — it covers every
-                // outstanding gather read, so the shadowing compute cluster (HK's C7) needs no drain.
-                self.undrained = false;
-                let mut deps: Vec<TileId> = self.all_gathers[..last].to_vec();
-                // **C5→C6 WALL** (the ~55 TF fix): order the commit's WAR seal AFTER the prior compute
-                // cluster's barrier (`self.entry`, C5's tail). Without this edge the commit depends ONLY on
-                // the gathers, so LLVM slides C5's 32-MFMA run across the independent commit — dragging
-                // C5's `set_prio(0)` (anchored on the MFMA results) adjacent to C7's `set_prio(1)`, where
-                // the AMDGPU merge pass deletes BOTH, leaving the memory phase stuck at prio 1 (the loading
-                // wave then steals SIMD issue from the compute wave = the misdiagnosed "barrier-bound"). The
-                // clone anchors its C6 drain on `bar5` for exactly this (hk/gemm.rs:279). Also makes the
-                // mem-cluster `set_prio(0)` (`mem_prio0`) live — the seal now consumes it, so it can't DCE.
-                deps.extend_from_slice(&self.entry);
-                self.seal(rd, &deps)
+                self.undrained.clear();
+                rd
             } else {
                 let deps: Vec<TileId> = self.all_gathers[1..].to_vec();
                 self.seal(Effect(self.all_gathers[0]), &deps)
@@ -264,12 +268,17 @@ impl<H: Hooks> ClusterCx<'_, H> {
                     self.entry = vec![rn];
                 }
                 CommitDrain::AsmDeferred => {
-                    // C-b: leave the C6 RAW barrier BARE — the opaque asm writes are NOT drained by it.
-                    // The drain is deferred to C7's tail (`pending_drain`); `raw_next` is set there.
+                    // C-c (HK clone chain): the C6 RAW barrier is BARE and the C6 read-drain (`rd`,
+                    // anchored on C5's `bar5`) already drained every outstanding gather read via the
+                    // unified `lgkmcnt` counter (which also sweeps the prior iter's opaque writes). So
+                    // the opaque asm writes need NO extra drain in the loop (HK `gemm.rs:284-289`): the
+                    // C6 bare seal IS the LDS-RAW carry, kept live alongside C7's tail barrier by the
+                    // End-fold's `combine` — exactly HK's `raw_next = combine(bar6, [bar7])`. No deferred
+                    // C7-tail drain (that extra `lgkmcnt(0)` after C7's MFMAs is what the clone omits).
                     let rn = self.seal(fill[0], &fill_deps).dep();
+                    self.raw_next = Some(rn);
                     self.tail_barrier = Some(rn);
                     self.entry = vec![rn];
-                    self.pending_drain = true;
                 }
             }
             self.sealed = true;
@@ -299,23 +308,32 @@ impl<H: Hooks> ClusterCx<'_, H> {
             None => (None, None),
         };
         // Bare-seal LDS drain (HK's C1/C3 `s_waitcnt lgkmcnt(0)`): a bare seal did NOT drain the prior
-        // mem cluster's gather `ds_read`s, so before an operand-consuming compute emit ONE `lgkmcnt(0)`
-        // (it covers every outstanding read) and route it into the acc reads below, so the MFMAs order
-        // after the data has arrived. Skipped when a fenced seal already drained (`!bare_seals`) or no
-        // reads are outstanding (`!undrained` — HK's C5/C7, covered by an earlier drain or the commit).
+        // mem cluster's gather `ds_read`s, so before a compute consuming an UNDRAINED slice emit ONE
+        // `lgkmcnt(0)` (it covers every outstanding read) and route it into the acc reads below, so the
+        // MFMAs order after the data has arrived — then clear ALL (the unified counter drained them).
+        // Drain ONLY when THIS compute's operand slice is still outstanding: HK's C5 consumes slice 2
+        // (already drained at C3) so it must NOT stall on slice 3's still-in-flight reads (`gemm.rs`
+        // drains at C1/C3/C6 only). Skipped when a fenced seal already drained (`!bare_seals`).
         if self.bare_seals
-            && self.undrained
-            && operand.is_some()
+            && let Some(s) = operand
+            && self.undrained.contains(&s)
             && let Some(&last) = self.all_gathers.last()
         {
             let drain = self.b.swait_lgkmcnt(last).dep();
             self.entry.push(drain);
-            self.undrained = false;
+            self.undrained.clear();
         }
-        // `set_prio(1)` anchors on the operand VALUE, so it exists only when there IS an operand; an
-        // operand-less compute skips it (nothing nameable before the reads) and relies on the closing
-        // `set_prio(0)` + barrier.
-        let prio1 = op_anchor.map(|a| self.b.set_prio(1, &[a]).dep());
+        // `set_prio(1)` brackets ONLY the MFMA burst: anchor it on the cluster `entry` (the mem-seal
+        // `s_barrier` + this cluster's `lgkmcnt(0)` drain), NOT on the operand VALUE. Anchored on the
+        // operand value it floats up to the gather — right through the barrier wait and (for C7) the C6
+        // commit — so the wave holds raised priority during its memory phase, starving the co-resident
+        // loading wave's ping-pong partner (the priority inversion HK's `gemm.rs:114-119` fixes by
+        // anchoring on `pre = [entry barrier, lgkmcnt]`). Still gated on `operand.is_some()` (an
+        // operand-less compute has no MFMA burst to bracket and relies on the closing `set_prio(0)`).
+        let prio1 = operand.map(|_| {
+            let pre = self.entry.clone();
+            self.b.set_prio(1, &pre).dep()
+        });
         // MFMA-cluster LEADING pin (§5c ISA fix): a `sched.barrier(0)` after the cluster entry (the
         // mem-seal `s_barrier`) + the gathered operand `ds_read`s, but BEFORE the acc reads → the MFMAs
         // order after it, so LLVM can neither sink the seal barrier / `lgkmcnt(0)` down into the 32-MFMA
@@ -360,7 +378,8 @@ impl<H: Hooks> ClusterCx<'_, H> {
             // it, so the manual `lgkmcnt` lands past the 32 MFMAs: HK's [bare barrier → 32 mfma → drain].
             let fence = self.b.sched_fence(0, &new_ids);
             let sw = self.b.swait_lgkmcnt(fence.dep());
-            let deps = self.prev_store.clone();
+            let mut deps = self.prev_store.clone();
+            deps.push(prio0);
             let bar = self.seal(sw, &deps).dep();
             self.raw_next = Some(bar);
             self.pending_drain = false;
@@ -371,6 +390,11 @@ impl<H: Hooks> ClusterCx<'_, H> {
             // emits this fence for its deferred drain; this gives the other compute clusters the same.)
             let body = stores[self.n_acc - 1];
             let mut deps: Vec<TileId> = self.prev_store[..self.n_acc - 1].to_vec();
+            // Route `set_prio(0)` INTO the cluster's seal (clone `gemm.rs:134-136`): the barrier then
+            // happens-after the prio-drop, so on the LAST compute cluster (C7 — whose `entry` no later
+            // cluster consumes) the `s_setprio 0` is kept live by the carried tail barrier instead of
+            // being DCE'd. Without this the loop-back memory phase stays at prio 1 (steering lost).
+            deps.push(prio0);
             if self.pin_mfma {
                 deps.push(self.b.sched_fence(0, &new_ids).dep());
             }
@@ -496,7 +520,7 @@ fn run_body<H: Hooks>(
         raw_next: None,
         tail_barrier: None,
         first_compute: true,
-        undrained: false,
+        undrained: Vec::new(),
         this_gathers: Vec::new(),
         sealed: false,
         pending_drain: false,

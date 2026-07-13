@@ -814,5 +814,5 @@ pub fn matmul_lds_kblock_mw_clustered(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, false, CommitDrain::AsmDeferred, false, false)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, false, CommitDrain::AsmDeferred, true, false)
 }
