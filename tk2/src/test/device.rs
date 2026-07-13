@@ -190,11 +190,11 @@ fn fa_ref(qf: &[f32], kf: &[f32], vf: &[f32], n: usize, d: usize) -> Vec<f32> {
     o
 }
 
-/// **FA-forward correctness GATE** (the Phase-A deliverable): the streaming, single-warp, online-
-/// softmax FA on the ClusterCx pipeline ([`crate::kernels_fa::flash_attention_fwd`]) must match the
-/// f32 reference (non-causal, same bf16-rounded operands) at d=64 AND d=128 — the QKᵀ inner-d loop,
-/// the two `ds_bpermute` softmax reductions, the online rescale, and the `mma_atb` P·V (transposed-V
-/// gather + free-relayout P) all correct end-to-end. `atol = 0.02·√d`, `rtol = 2e-2` (matmul style).
+/// **FA-forward correctness GATE**: the multi-warp (8-warp split-Q), online-softmax FA on the ClusterCx
+/// pipeline ([`crate::kernels_fa::flash_attention_fwd`]) must match the f32 reference (non-causal, same
+/// bf16-rounded operands) at d=64 AND d=128, over `bh > 1` INDEPENDENT attentions (`[bh,n,d]` layout —
+/// this validates the per-(b,h) base addressing on top of the QKᵀ inner-d loop, the two `ds_bpermute`
+/// softmax reductions, the online rescale, and the `mma_atb` P·V). `atol = 0.02·√d`, `rtol = 2e-2`.
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::flash_attention_matches --nocapture`
 #[test]
 #[ignore]
@@ -202,25 +202,33 @@ fn flash_attention_matches_reference_on_gfx942() {
     use svod_tensor::testing::allclose_f32;
     let dev = svod_dtype::default_device::default_device();
     let n = 128usize;
-    for d in [64usize, 128usize] {
-        let mut q = Tensor::rand_with(&[n, d], DType::BFloat16, dev.clone()).expect("rand q");
-        let mut k = Tensor::rand_with(&[n, d], DType::BFloat16, dev.clone()).expect("rand k");
-        let mut v = Tensor::rand_with(&[n, d], DType::BFloat16, dev.clone()).expect("rand v");
+    for (bh, d) in [(3usize, 64usize), (2usize, 128usize)] {
+        // Q/K/V are `[bh·n, d]` (= `[bh, n, d]` flat) — bh stacked independent attentions.
+        let mut q = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand q");
+        let mut k = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand k");
+        let mut v = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand v");
         q.realize().expect("realize q");
         k.realize().expect("realize k");
         v.realize().expect("realize v");
-        let expected = fa_ref(&as_f32_vec(&q), &as_f32_vec(&k), &as_f32_vec(&v), n, d);
+        let (qf, kf, vf) = (as_f32_vec(&q), as_f32_vec(&k), as_f32_vec(&v));
+        // Reference: `bh` independent `[n,d]` attentions, each at global row base `s·n`.
+        let mut expected = vec![0f32; bh * n * d];
+        for s in 0..bh {
+            let z = s * n * d;
+            let o_s = fa_ref(&qf[z..z + n * d], &kf[z..z + n * d], &vf[z..z + n * d], n, d);
+            expected[z..z + n * d].copy_from_slice(&o_s);
+        }
         let atol = 0.02 * (d as f32).sqrt();
 
-        let prog = crate::kernels_fa::flash_attention_fwd(n, d);
-        let out = Tensor::empty(&[n, d], DType::Float32);
+        let prog = crate::kernels_fa::flash_attention_fwd(bh, n, d);
+        let out = Tensor::empty(&[bh * n, d], DType::Float32);
         let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA program");
         let plan = y.prepare().expect("prepare FA");
         plan.execute().expect("execute FA");
         let got = y.as_vec::<f32>().expect("read FA output");
         let report = allclose_f32(&got, &expected, atol, 2e-2);
-        println!("FA-forward n={n} d={d}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
-        assert!(report.ok, "FA-forward n={n} d={d} must match the f32 reference: {}", report.message);
+        println!("FA-forward bh={bh} n={n} d={d}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+        assert!(report.ok, "FA-forward bh={bh} n={n} d={d} must match the f32 reference: {}", report.message);
     }
 }
 
@@ -233,24 +241,24 @@ fn flash_attention_matches_reference_on_gfx942() {
 #[test]
 #[ignore]
 fn fa_forward_launches_on_gfx942() {
-    let (n, d) = (256usize, 16);
+    let (bh, n, d) = (1usize, 256usize, 16);
     let dev = svod_dtype::default_device::default_device();
-    let mut q = Tensor::rand_with(&[n, d], DType::BFloat16, dev.clone()).expect("rand q");
-    let mut k = Tensor::rand_with(&[n, d], DType::BFloat16, dev.clone()).expect("rand k");
-    let mut v = Tensor::rand_with(&[n, d], DType::BFloat16, dev).expect("rand v");
+    let mut q = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand q");
+    let mut k = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand k");
+    let mut v = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev).expect("rand v");
     q.realize().expect("realize q");
     k.realize().expect("realize k");
     v.realize().expect("realize v");
 
-    let prog = crate::kernels_fa::flash_attention_fwd(n, d);
-    let out = Tensor::empty(&[n, d], DType::Float32);
+    let prog = crate::kernels_fa::flash_attention_fwd(bh, n, d);
+    let out = Tensor::empty(&[bh * n, d], DType::Float32);
     let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA program");
     let plan = y.prepare().expect("prepare FA");
     plan.execute().expect("execute FA on device");
     let got = y.as_vec::<f32>().expect("read FA output");
     let finite = got.iter().filter(|x| x.is_finite()).count();
     let sample = &got[..d.min(8)];
-    println!("FA-forward n={n} d={d}: launched OK, {}/{} finite outputs, sample={sample:?}", finite, got.len());
+    println!("FA-forward bh={bh} n={n} d={d}: launched OK, {}/{} finite outputs, sample={sample:?}", finite, got.len());
     assert!(finite > 0, "FA-forward must produce at least some finite output (launch/exec sanity)");
 }
 

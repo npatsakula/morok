@@ -1,7 +1,8 @@
 //! **Flash-Attention forward on the ClusterCx declarative pipeline** — a NUMERICALLY CORRECT,
 //! MULTI-WARP (8-warp split-Q) FA-forward proving [`crate::pipeline`] (built for the HK GEMM)
 //! generalises to a second, differently-shaped kernel. Streams K/V blocks: QKᵀ → online-softmax → P·V
-//! accumulate → normalize → write O. Non-causal, `b = h = 1`, head dim `d` any multiple of 16.
+//! accumulate → normalize → write O. Non-causal, `bh = batch·heads` independent attentions (`[bh,n,d]`
+//! layout), head dim `d` any multiple of 16.
 //!
 //! ## The two matmuls (both `mma_atb` — contraction over the shared row)
 //! - **QKᵀ** contracts over `d`: `K` (row map) and `Q` (col map) are gathered with `d` on the MFMA
@@ -208,13 +209,14 @@ pub fn atb_probe(kv: usize, d: usize, q: usize) -> Program {
     Program { ir, sink, name: "tk2_atb_probe".into() }
 }
 
-/// **Streaming FA-forward** (non-causal, `b = h = 1`, one warp, `q_blk = kv_blk = 16`, head-dim `d` a
-/// multiple of 16) authored on the [`crate::pipeline`] ClusterCx combinator. `n` = sequence length
-/// (KV blocks = `n/16 ≥ 2`). NUMERICALLY CORRECT: streams K/V blocks, computing QKᵀ (Σ over `d/16`
-/// `mma` K-steps), the online-softmax running max/rescale/norm, and the PV accumulate as `mma_atb`
-/// (the QKᵀ f32 accumulator `P` feeds PV's operand with only a bf16 cast — no data transpose — while
-/// `V` is gathered transposed so `kv` lands on the MFMA contraction axis). Device-gated by
-/// `flash_attention_matches_reference_on_gfx942`. Returns a lowerable [`Program`].
+/// **Streaming FA-forward** (non-causal, 8-warp split-Q, head-dim `d` a multiple of 16) authored on the
+/// [`crate::pipeline`] ClusterCx combinator. `bh = batch·heads` independent attentions over Q/K/V/O
+/// laid out `[bh, n, d]` row-major; `n` = sequence length. Grid = `bh × (n/q_blk)` workgroups, each
+/// owning one `q_blk=128`-row Q block within its (b,h) slice. NUMERICALLY CORRECT: streams K/V blocks,
+/// computing QKᵀ (Σ over `d/16` `mma` K-steps), the online-softmax running max/rescale/norm, and the PV
+/// accumulate as `mma_atb` (the QKᵀ f32 accumulator `P` feeds PV's operand with only a bf16 cast — no
+/// data transpose — while `V` is gathered transposed so `kv` lands on the MFMA contraction axis).
+/// Device-gated by `flash_attention_matches_reference_on_gfx942`. Returns a lowerable [`Program`].
 ///
 /// Accumulator carry (all `Frag<F32>`, Col map): `[o_0 .. o_{d/16−1}, att, max, norm]`. `o_df` is the
 /// `[d, q]`-layout PV accumulator for output d-fragment `df` (`q` on the flat lane-axis, matching `att`
@@ -222,8 +224,9 @@ pub fn atb_probe(kv: usize, d: usize, q: usize) -> Program {
 /// with the softmax weights `P` for PV to consume); `max`/`norm` are the per-Q online-softmax stats
 /// (broadcast across the fragment). O is normalised (`o/norm`) and transpose-scattered in the epilogue.
 #[allow(clippy::needless_range_loop)] // the d-fragment index also drives the output-d tile base
-pub fn flash_attention_fwd(n: usize, d: usize) -> Program {
+pub fn flash_attention_fwd(bh: usize, n: usize, d: usize) -> Program {
     assert!(d.is_multiple_of(EDGE), "head dim d must be a multiple of 16");
+    assert!(bh >= 1, "bh (batch·heads) must be ≥ 1");
     let nthreads = NUM_WARPS * WARP; // 512
     let q_blk = NUM_WARPS * EDGE; // 128 — the workgroup Q block (8 warps × 16 rows)
     // The collaborative 512-thread K/V fill must be VEC4-aligned: `kv_blk·d % (nthreads·4) == 0`. Pick
@@ -241,15 +244,25 @@ pub fn flash_attention_fwd(n: usize, d: usize) -> Program {
     assert!(n / kv_blk >= 2, "N must give ≥2 KV blocks (n / kv_blk ≥ 2)");
 
     let mut b = Builder::new("tk2_fa_fwd");
-    // ABI: output O first, then inputs Q, K, V (all flat [n, d]).
-    let o = b.global::<F32>(n * d);
-    let q = b.global::<BF16>(n * d);
-    let k = b.global::<BF16>(n * d);
-    let v = b.global::<BF16>(n * d);
+    // ABI: output O first, then inputs Q, K, V — each `[bh, n, d]` row-major (bh stacked `[n,d]` slices).
+    let o = b.global::<F32>(bh * n * d);
+    let q = b.global::<BF16>(bh * n * d);
+    let k = b.global::<BF16>(bh * n * d);
+    let v = b.global::<BF16>(bh * n * d);
 
-    // One workgroup per `q_blk`-row Q block; 8 warps (512 threads). `tid → (warp, wlane)`: warp `w`
-    // owns Q rows `[w·16, w·16+16)` (offset `warp_qoff`), and reduces/scatters over its own 64 lanes.
-    let qwg = b.grid_axis(0, (n / q_blk) as i64);
+    // Grid = `bh × (n/q_blk)` workgroups over ONE flat axis, decoded into `(bh_idx, qwg)` — each (b,h)
+    // owns `n/q_blk` consecutive workgroups. `bh_idx·n` is this slice's global ROW base (folded into the
+    // Q origin + K/V stage origin, so the O scatter — expressed off `q_origin` — inherits it for free).
+    let nqb = n / q_blk;
+    let wgid = b.grid_axis(0, (bh * nqb) as i64);
+    let nqb_c = b.idx_const(nqb as i64);
+    let bh_idx = b.idx_div(wgid, nqb_c);
+    let qwg = b.idx_mod(wgid, nqb_c);
+    let n_c = b.idx_const(n as i64);
+    let bh_row = b.idx_mul(bh_idx, n_c); // this (b,h) slice's row base = bh_idx·n
+
+    // 8 warps (512 threads). `tid → (warp, wlane)`: warp `w` owns Q rows `[w·16, w·16+16)` (offset
+    // `warp_qoff`) within its Q block, and reduces/scatters over its own 64 lanes.
     let tid = b.block_axis(nthreads as i64);
     let warp_c = b.idx_const(WARP as i64);
     let edge_c = b.idx_const(EDGE as i64);
@@ -277,12 +290,14 @@ pub fn flash_attention_fwd(n: usize, d: usize) -> Program {
 
     let (epl_kv, epl_q) = (kv_blk * d / nthreads, q_blk * d / nthreads); // 512-thread collaborative fill
     let zero = b.idx_const(0);
-    // K/V stream: staged by ALL 512 threads (`tid`); origin row 0, the per-block advance rides `k_base`.
-    let k_stage = k_tile.stage_view(k, epl_kv, tid, zero, d as i64, Drain::Intrinsic);
-    let v_stage = v_tile.stage_view(v, epl_kv, tid, zero, d as i64, Drain::Intrinsic);
-    // Q: the whole [q_blk, d] block staged ONCE by all 512 threads from Q[qwg·q_blk .., :].
+    // K/V stream: staged by ALL 512 threads (`tid`); origin = this (b,h)'s row base `bh_row`, the
+    // per-block advance rides `k_base` (so block k reads rows `[bh_idx·n + k·kv_blk, ...]`).
+    let k_stage = k_tile.stage_view(k, epl_kv, tid, bh_row, d as i64, Drain::Intrinsic);
+    let v_stage = v_tile.stage_view(v, epl_kv, tid, bh_row, d as i64, Drain::Intrinsic);
+    // Q: the whole [q_blk, d] block staged ONCE by all 512 threads from Q[bh_idx·n + qwg·q_blk .., :].
     let qblk_c = b.idx_const(q_blk as i64);
-    let q_origin = b.idx_mul(qwg, qblk_c); // workgroup Q-row origin (in rows)
+    let q_off = b.idx_mul(qwg, qblk_c);
+    let q_origin = b.idx_add(bh_row, q_off); // global Q-row origin = bh_idx·n + qwg·q_blk (in rows)
     let q_stage = q_tile.stage_view(q, epl_q, tid, q_origin, d as i64, Drain::Intrinsic);
 
     // ── prologue: stage + commit Q once, then EACH warp gathers its own 16-row sub-block's `dfrags`
