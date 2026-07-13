@@ -105,10 +105,13 @@ fn bench_fa(c: &mut Criterion) {
         eprintln!("svod-tk2 FA-forward bench: skipped (device is not a supported gfx942 GPU)");
         return;
     }
-    let seqlens = [512usize, 1024, 2048, 4096];
+    let seqlens = [512usize, 4096, 16384, 32768];
     eprintln!(
-        "\n=== tk2 FA-forward: VALIDATED attention (allclose-gated), HONEST single-warp TF ===\n    \
-         B=H=1, 1 warp, non-causal — the Phase-A correctness base (no ping-pong / multi-warp / swizzle)\n"
+        "\n=== tk2 FA-forward: VALIDATED attention (allclose-gated), 8-warp split-Q, REAL TF ===\n    \
+         B=H=1, non-causal, single-buffer. Grid = (n/128) workgroups (× heads × batch in real attention).\n    \
+         At B=H=1 the machine (304 CUs, MI300X) only fills near n≳39k, so the 8-warp win (it removes the\n    \
+         single-warp K/V-bandwidth ceiling, ~67 TF → ~80 TF) shows at large n; below the crossover the\n    \
+         coarse grid under-fills and single-warp's finer grid is faster. Full lift is gated on #10.\n"
     );
     let mut group = c.benchmark_group("tk2_fa");
     for &d in &[64usize, 128] {

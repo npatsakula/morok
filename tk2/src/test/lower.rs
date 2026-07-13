@@ -89,7 +89,7 @@ fn fa_forward_on_clustercx_lowers_spec_valid() {
     let count = |p: &crate::Program, pred: &dyn Fn(&Node) -> bool| {
         (0..p.ir.len()).filter(|&i| pred(p.ir.node(crate::ir::TileId(i as u32)))).count()
     };
-    let p = crate::kernels_fa::flash_attention_fwd(64, 16);
+    let p = crate::kernels_fa::flash_attention_fwd(128, 64); // 8-warp split-Q, kv_blk=32 (2 KV-fragments)
     lower::verify(&p).expect("FA-forward on ClusterCx must lower to spec-valid UOp");
     // The novel FA vocabulary is present: exp2 (2×/iter), recip (normalize), and the ds_bpermute
     // cross-lane reduction tree (3 shuffles × 2 reductions/iter).

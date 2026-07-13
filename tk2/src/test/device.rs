@@ -224,16 +224,16 @@ fn flash_attention_matches_reference_on_gfx942() {
     }
 }
 
-/// **FA-forward `d=16` launch smoke test** on gfx942 — the smallest streaming Flash-Attention forward
-/// ([`crate::kernels_fa::flash_attention_fwd`]) at a single head-dim fragment. Complements the full
-/// `flash_attention_matches_reference_on_gfx942` gate (which validates numerics at d=64/128): this one
-/// just confirms the minimal `d=16` shape compiles + executes without a GPU fault and produces finite
-/// output (the degenerate single-d-fragment path — QKᵀ is one `mma`, one PV output fragment).
+/// **FA-forward `d=16` launch smoke test** on gfx942 — the multi-warp FA at a single head-dim fragment,
+/// where the VEC4-aligned fill forces `kv_blk = 128` (8 KV-fragments, the degenerate `kvf` stress).
+/// Complements the full `flash_attention_matches_reference_on_gfx942` gate (numerics at d=64/128): this
+/// one confirms the `d=16 / kvf=8` shape compiles + executes without a GPU fault and produces finite
+/// output. `n = 256` (2 KV blocks × 2 workgroups over the 128-row Q block).
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::fa_forward_launches --nocapture`
 #[test]
 #[ignore]
 fn fa_forward_launches_on_gfx942() {
-    let (n, d) = (64usize, 16);
+    let (n, d) = (256usize, 16);
     let dev = svod_dtype::default_device::default_device();
     let mut q = Tensor::rand_with(&[n, d], DType::BFloat16, dev.clone()).expect("rand q");
     let mut k = Tensor::rand_with(&[n, d], DType::BFloat16, dev.clone()).expect("rand k");
