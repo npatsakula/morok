@@ -27,8 +27,8 @@ use svod_tensor::Tensor;
 mod common;
 use common::{bench_plan, plan_gpu_ns, rand_bf16, requirements_met};
 
-use svod_tk2::graph_kernel;
 use svod_tk2::kernels_fa::flash_attention_fwd;
+use svod_tk2::{SwizzlePass, graph_kernel};
 
 /// FA-forward FLOPs, **non-causal**: `4·B·H·S²·d`. Two matmuls each cost `2·B·H·S²·d` FLOPs
 /// (QKᵀ: `S×S` scores over `d` MACs; P·V: `S×d` outputs over `S` MACs) → `2 MACs/FLOP`. Causal
@@ -78,7 +78,9 @@ fn fa_ref(qf: &[f32], kf: &[f32], vf: &[f32], s: usize, d: usize) -> Vec<f32> {
 /// Wrap the FA `Program` for `bh` stacked `[s,d]` attentions as a graph-node Tensor over `(q,k,v)`
 /// (each bf16 `[bh·s, d]`) with an f32 `[bh·s, d]` output, and prepare its execution plan.
 fn plan_of_fa(bh: usize, s: usize, d: usize, q: &Tensor, k: &Tensor, v: &Tensor) -> (Tensor, ExecutionPlan) {
-    let prog = flash_attention_fwd(bh, s, d);
+    // SwizzlePass ONLY (never VectorizePass — it mis-fuses FA's column-strided transposed V gather,
+    // corrupting numerics to ~0.1 error; SwizzlePass folds the LDS bank-conflict swizzle → +82% TF).
+    let prog = flash_attention_fwd(bh, s, d).apply(SwizzlePass);
     let out = Tensor::empty(&[bh * s, d], DType::Float32);
     let mut y = graph_kernel(prog, out, &[q, k, v]).expect("wrap FA as graph node");
     let plan = y.prepare().expect("prepare FA execution plan");
@@ -101,7 +103,9 @@ fn gate_small(bh: usize, s: usize, d: usize) {
         let o = z * s * d;
         expected[o..o + s * d].copy_from_slice(&fa_ref(&qf[o..o + s * d], &kf[o..o + s * d], &vf[o..o + s * d], s, d));
     }
-    let report = allclose_f32(&got, &expected, 0.02 * (d as f32).sqrt(), 2e-2);
+    // TIGHT atol (1e-2): the honest bf16 error is ~2e-3, so this rejects a corrupted-but-plausible
+    // result (VectorizePass on FA → ~1e-1) that the old `0.02·√d`≈0.23 would have wrongly passed.
+    let report = allclose_f32(&got, &expected, 1e-2, 2e-2);
     assert!(report.ok, "FA gate bh={bh} S={s} d={d} FAILED before timing: {}", report.message);
     eprintln!("  gate bh={bh} S={s} d={d}: allclose ✓ (max_abs_err {:e})", report.max_abs_err);
 }

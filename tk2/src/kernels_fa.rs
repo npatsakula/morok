@@ -218,6 +218,11 @@ pub fn atb_probe(kv: usize, d: usize, q: usize) -> Program {
 /// data transpose — while `V` is gathered transposed so `kv` lands on the MFMA contraction axis).
 /// Device-gated by `flash_attention_matches_reference_on_gfx942`. Returns a lowerable [`Program`].
 ///
+/// **PASS REQUIREMENT**: apply `.apply(SwizzlePass)` — it folds the LDS bank-conflict swizzle (~81% →
+/// ~29% conflicts, +82% TF; the free lunch matmul takes and this omitted). Do **NOT** apply
+/// `VectorizePass`: it mis-fuses the column-strided transposed V gather and corrupts numerics
+/// (verified: max_abs_err 3.9e-4 → ~1e-1). SwizzlePass ALONE, unlike matmul's `Vectorize.then(Swizzle)`.
+///
 /// Accumulator carry (all `Frag<F32>`, Col map): `[o_0 .. o_{d/16−1}, att, max, norm]`. `o_df` is the
 /// `[d, q]`-layout PV accumulator for output d-fragment `df` (`q` on the flat lane-axis, matching `att`
 /// / `max` / `norm`); `att` is the per-KV-block QKᵀ temporary (re-zeroed each block, then overwritten

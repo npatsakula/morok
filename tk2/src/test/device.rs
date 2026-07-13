@@ -218,9 +218,14 @@ fn flash_attention_matches_reference_on_gfx942() {
             let o_s = fa_ref(&qf[z..z + n * d], &kf[z..z + n * d], &vf[z..z + n * d], n, d);
             expected[z..z + n * d].copy_from_slice(&o_s);
         }
-        let atol = 0.02 * (d as f32).sqrt();
+        // TIGHT atol: the honest bf16-P-cast error is ~2e-3, so a fixed 1e-2 passes correct FA with
+        // margin while REJECTING a corrupted-but-plausible result (e.g. adding VectorizePass mis-fuses
+        // the transposed V gather → ~1e-1 error, which the old `0.02·√d`≈0.23 tolerance wrongly passed).
+        let atol = 1e-2;
 
-        let prog = crate::kernels_fa::flash_attention_fwd(bh, n, d);
+        // SwizzlePass ONLY: folds the LDS bank-conflict swizzle (+82% TF); NEVER VectorizePass (it
+        // corrupts the column-strided transposed V gather — verified: error 3.9e-4 → ~1e-1).
+        let prog = crate::kernels_fa::flash_attention_fwd(bh, n, d).apply(SwizzlePass);
         let out = Tensor::empty(&[bh * n, d], DType::Float32);
         let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA program");
         let plan = y.prepare().expect("prepare FA");
@@ -250,7 +255,7 @@ fn fa_forward_launches_on_gfx942() {
     k.realize().expect("realize k");
     v.realize().expect("realize v");
 
-    let prog = crate::kernels_fa::flash_attention_fwd(bh, n, d);
+    let prog = crate::kernels_fa::flash_attention_fwd(bh, n, d).apply(SwizzlePass);
     let out = Tensor::empty(&[bh * n, d], DType::Float32);
     let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA program");
     let plan = y.prepare().expect("prepare FA");
