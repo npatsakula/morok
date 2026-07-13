@@ -480,6 +480,35 @@ impl Builder {
         Val::wrap(self.ir.intern(Node::EltwiseBinary { op, a: a.id, b: b.id }))
     }
 
+    // ── elementwise unary math (the FA-forward additions — GEMM needed none) ──
+    // The whole transcendental table already exists below the boundary (svod-ir's
+    // `Op::Unary`); tk2 simply never surfaced it because matmul is transcendental-free.
+    // FA's softmax is the first consumer: `exp2` for the online exp, `recip` for `1/norm`.
+
+    /// Base-2 exponential (`2^x`) — the hardware `v_exp_f32` on gfx942. The softmax core.
+    /// Lowers to `Op::Unary(UnaryOp::Exp2, x)` (see [`crate::lower`]).
+    pub fn exp2(&mut self, x: Val<F32>) -> Val<F32> {
+        Val::wrap(self.ir.intern(Node::Unary { op: crate::ir::UnOp::Exp2, x: x.id }))
+    }
+
+    /// Reciprocal (`1/x`) — the FA normalize `O / norm`. Lowers to `Op::Unary(UnaryOp::Reciprocal, x)`.
+    pub fn recip(&mut self, x: Val<F32>) -> Val<F32> {
+        Val::wrap(self.ir.intern(Node::Unary { op: crate::ir::UnOp::Recip, x: x.id }))
+    }
+
+    /// **Cross-lane lane-gather** (`llvm.amdgcn.ds.bpermute`, gfx942 — the ONLY way to
+    /// exchange data between SIMD lanes without an LDS round-trip; svod-ir has NO
+    /// cross-lane / DPP / shuffle op, so this is a hand-rolled inline-LLVM `Op::Custom`,
+    /// mirroring tk1's `Group::shuffle_lane`). Returns `data` as computed by lane
+    /// `src_lane`. Barrier-FREE (uses the LDS permute hardware, not a workgroup barrier),
+    /// so a fragment reduction built on it keeps a [`crate::pipeline`] compute body
+    /// edge-free. f32 is transported bitcast through i32 (bpermute is i32-only).
+    pub fn shuffle_lane(&mut self, data: Val<F32>, src_lane: Idx) -> Val<F32> {
+        let four = self.idx_const(4); // dword byte-stride: bpermute addr = lane·4
+        let addr = self.idx_mul(src_lane, four);
+        Val::wrap(self.ir.intern(Node::DsBpermute { addr: addr.0, data: data.id }))
+    }
+
     // ── register fragments + MMA (the naive matmul vocabulary) ───────────────
 
     /// Allocate a per-lane register fragment carrying its [`FragMap`] MFMA lane-map.

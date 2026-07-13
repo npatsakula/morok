@@ -75,3 +75,26 @@ fn matmul_lds_kblock_clustered_lowers_and_balances_the_wave_phase() {
         .apply(crate::passes::SwizzlePass);
     lower::verify(&sw).expect("clustered.apply(Vectorize).apply(Swizzle) must lower spec-valid");
 }
+
+// ── the FA-forward experiment: the ClusterCx pipeline generalised to a second kernel shape ─────
+
+/// The minimal streaming Flash-Attention forward ([`crate::kernels_fa::flash_attention_fwd`])
+/// authored on the SAME `pipeline` combinator as the GEMM: `Mem`(gather K,V + prefetch/commit) →
+/// `Compute`(QKᵀ) → `Compute`(online softmax, operand-less) → `Compute`(PV). It must lower to
+/// spec-valid device-UOp — proving the new vocabulary (`exp2`/`recip`/`ds_bpermute` row reductions)
+/// and the operand-less softmax cluster survive lowering + `type_verify`. (Device NUMERICS are a
+/// separate, partly-stubbed matter — see the module docs; this asserts the STRUCTURE compiles.)
+#[test]
+fn fa_forward_on_clustercx_lowers_spec_valid() {
+    let count = |p: &crate::Program, pred: &dyn Fn(&Node) -> bool| {
+        (0..p.ir.len()).filter(|&i| pred(p.ir.node(crate::ir::TileId(i as u32)))).count()
+    };
+    let p = crate::kernels_fa::flash_attention_fwd(64, 16);
+    lower::verify(&p).expect("FA-forward on ClusterCx must lower to spec-valid UOp");
+    // The novel FA vocabulary is present: exp2 (2×/iter), recip (normalize), and the ds_bpermute
+    // cross-lane reduction tree (3 shuffles × 2 reductions/iter).
+    assert!(count(&p, &|n| matches!(n, Node::Unary { .. })) >= 3, "softmax ⇒ exp2/recip Unary nodes");
+    assert!(count(&p, &|n| matches!(n, Node::DsBpermute { .. })) >= 6, "row reductions ⇒ ds_bpermute nodes");
+    // The operand-less softmax cluster + the two matmul clusters ⇒ SetPrio brackets, one commit RAW.
+    assert!(count(&p, &|n| matches!(n, Node::Mma { .. })) >= 2, "QKᵀ + PV ⇒ ≥2 MMAs");
+}

@@ -112,6 +112,38 @@ fn micro_tk_hk_port_is_correct_on_gfx942() {
     unsafe { std::env::remove_var("SVOD_NO_PINGPONG") };
 }
 
+/// **FA-forward experiment — does it LAUNCH on gfx942?** The minimal streaming Flash-Attention
+/// forward built on the ClusterCx pipeline ([`crate::kernels_fa::flash_attention_fwd`]). This is the
+/// device stretch goal: it validates the whole lowered kernel (the `exp2`/`recip`/`ds_bpermute`
+/// additions, the operand-less softmax cluster, the End-fold + epilogue) actually COMPILES to a code
+/// object and EXECUTES without a GPU fault, producing finite output. It does NOT assert attention
+/// numerics — the P·V matmul is knowingly the wrong contraction orientation (tk2 lacks `mma_atb`), so
+/// a reference compare would (correctly) fail; that is a catalogued vocabulary gap, not a launch bug.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::fa_forward_launches --nocapture`
+#[test]
+#[ignore]
+fn fa_forward_launches_on_gfx942() {
+    let (n, d) = (64usize, 16);
+    let dev = svod_dtype::default_device::default_device();
+    let mut q = Tensor::rand_with(&[n, d], DType::BFloat16, dev.clone()).expect("rand q");
+    let mut k = Tensor::rand_with(&[n, d], DType::BFloat16, dev.clone()).expect("rand k");
+    let mut v = Tensor::rand_with(&[n, d], DType::BFloat16, dev).expect("rand v");
+    q.realize().expect("realize q");
+    k.realize().expect("realize k");
+    v.realize().expect("realize v");
+
+    let prog = crate::kernels_fa::flash_attention_fwd(n, d);
+    let out = Tensor::empty(&[n, d], DType::Float32);
+    let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA program");
+    let plan = y.prepare().expect("prepare FA");
+    plan.execute().expect("execute FA on device");
+    let got = y.as_vec::<f32>().expect("read FA output");
+    let finite = got.iter().filter(|x| x.is_finite()).count();
+    let sample = &got[..d.min(8)];
+    println!("FA-forward n={n} d={d}: launched OK, {}/{} finite outputs, sample={sample:?}", finite, got.len());
+    assert!(finite > 0, "FA-forward must produce at least some finite output (launch/exec sanity)");
+}
+
 /// Dump the **DRAM-streaming clustered** kernel's amdgcn LLVM IR + compiled code object to the
 /// scratchpad for ISA validation (sibling of [`dump_resident_isa`]). Same shape/tiling; this one
 /// keeps the streaming global-prefetch + LDS-commit path so its steady loop shows the

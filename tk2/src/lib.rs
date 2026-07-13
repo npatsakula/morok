@@ -23,6 +23,7 @@ pub mod graph;
 pub mod hk;
 pub mod ir;
 pub mod kernels;
+pub mod kernels_fa;
 pub mod launch;
 pub mod lower;
 pub(crate) mod movement;

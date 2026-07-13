@@ -19,7 +19,7 @@ use svod_ir::{AxisId, AxisType, ConstValue, KernelInfo, Op, UOp, WmmaMetadata, W
 use svod_schedule::optimizer::Renderer;
 
 use crate::error::{self, Result};
-use crate::ir::{BinOp, IndexOp, Node, Scalar, ScopeAxis, TileId, TileIr};
+use crate::ir::{BinOp, IndexOp, Node, Scalar, ScopeAxis, TileId, TileIr, UnOp};
 use crate::kernels::Program;
 
 /// The gfx942 16×16×16 bf16→f32 MFMA descriptor, reproduced verbatim from tk's
@@ -176,6 +176,32 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             let (buf, off, val) = (get(low, buf), get(low, offset), get(low, value));
             let idx = UOp::index().buffer(buf).indices(vec![off]).ptr(true).call().expect("STORE index construction");
             idx.store(val)
+        }
+        // Elementwise unary math → `Op::Unary` (the whole transcendental table is native
+        // below the boundary; FA's softmax is tk2's first consumer). `try_*` is fallible only
+        // on a non-float dtype — a kernel-authoring bug here, so `.expect`.
+        Node::Unary { op, x } => {
+            let x = get(low, x);
+            match op {
+                UnOp::Exp2 => x.try_exp2().expect("exp2: float operand"),
+                UnOp::Recip => UOp::try_reciprocal(&x).expect("reciprocal: float operand"),
+            }
+        }
+        // Cross-lane gather (`ds_bpermute`): the ONLY inter-lane primitive svod-ir can't
+        // express natively, so it is a hand-written inline-LLVM `Op::Custom` (verbatim tk1's
+        // `shuffle_lane`). `addr` is the byte lane-address (`src_lane·4`), cast to i32; `data`
+        // is bitcast f32→i32 for transport, and the i32 result bitcast back to f32.
+        Node::DsBpermute { addr, data } => {
+            let addr = get(low, addr).cast(DType::Int32);
+            let data = get(low, data).bitcast(DType::Int32);
+            let sh = UOp::custom(
+                smallvec![addr, data],
+                "declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)\n\
+                 call i32 @llvm.amdgcn.ds.bpermute(i32 {0}, i32 {1})"
+                    .to_string(),
+                DType::Int32,
+            );
+            sh.bitcast(DType::Float32)
         }
         // ONE `<ept × dtype>` vector load of the whole per-lane fragment run (offset 0)
         // — the WMMA operand (mirrors tk's `load_vec_at`).

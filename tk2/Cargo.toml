@@ -30,6 +30,11 @@ test-case = "3.3.1"
 name = "matmul"
 harness = false
 
+# GPU device-time bench for the FA-forward schedule (criterion) sharing `benches/common.rs`.
+[[bench]]
+name = "fa"
+harness = false
+
 # SCRATCH DCC-inflation bench (NOT committed) — sharing `benches/common.rs`.
 [[bench]]
 name = "matmul_dsl_dcc"

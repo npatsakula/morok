@@ -93,6 +93,16 @@ pub enum BinOp {
     Max,
 }
 
+/// Elementwise **unary** op vocabulary (FA-forward addition — the GEMM path needed none).
+/// The softmax core: `Exp2` is the hardware `v_exp_f32` (the AMD decomposition leaves f32
+/// `Exp2` native), `Recip` the final `1/norm` normalize. Both lower to `Op::Unary` (svod-ir
+/// has the whole transcendental table; tk2 just never surfaced it — see [`crate::build::Builder::exp2`]).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum UnOp {
+    Exp2,
+    Recip,
+}
+
 /// Integer addressing arithmetic (the const-foldable index band, §2.4). `Mod`/`Div`
 /// carry the per-lane fragment `lane_rc` map (row = lane % rows, col = lane / rows …);
 /// they are the div/mod the const-fold pass will later collapse for aligned shapes.
@@ -206,6 +216,17 @@ pub enum Node {
     LoadGlobal { buf: TileId, offset: TileId, dtype: DType },
     /// An elementwise binary op on two loaded values.
     EltwiseBinary { op: BinOp, a: TileId, b: TileId },
+    /// An elementwise **unary** math op (FA-forward addition — the softmax `exp2` / the
+    /// normalize `recip`). Lowers to `Op::Unary(UnaryOp::{Exp2,Reciprocal}, x)` — svod-ir
+    /// already carries the whole transcendental table; tk2's GEMM path just never used it.
+    Unary { op: UnOp, x: TileId },
+    /// A **cross-lane lane-gather** (`llvm.amdgcn.ds.bpermute`) — `data` as computed by
+    /// lane `addr/4` (`addr` = the byte lane-address `src_lane·4`). The ONLY inter-lane
+    /// exchange primitive on gfx942 that needs no LDS round-trip; svod-ir has no cross-lane
+    /// op at all, so this lowers to a hand-written inline-LLVM `Op::Custom` (mirroring tk1's
+    /// `shuffle_lane`). Barrier-free — the building block of FA's `exp2`-free-of-barrier
+    /// online-softmax row reductions. Renders `bitcast f32→i32`, bpermute, `bitcast i32→f32`.
+    DsBpermute { addr: TileId, data: TileId },
     /// Store `value` into `buf` at flat `offset` (an effect).
     StoreGlobal { buf: TileId, offset: TileId, value: TileId },
     /// Vector LOAD of a whole `ept`-element per-lane fragment run from register `buf`
@@ -518,6 +539,8 @@ impl TileIr {
             Node::LdsCol { row, col, cols } => Node::LdsCol { row: f(row), col: f(col), cols },
             Node::LoadGlobal { buf, offset, dtype } => Node::LoadGlobal { buf: f(buf), offset: f(offset), dtype },
             Node::EltwiseBinary { op, a, b } => Node::EltwiseBinary { op, a: f(a), b: f(b) },
+            Node::Unary { op, x } => Node::Unary { op, x: f(x) },
+            Node::DsBpermute { addr, data } => Node::DsBpermute { addr: f(addr), data: f(data) },
             Node::StoreGlobal { buf, offset, value } => {
                 Node::StoreGlobal { buf: f(buf), offset: f(offset), value: f(value) }
             }
@@ -620,6 +643,15 @@ impl TileIr {
                 let dt = self.meta(*a).dtype.clone().unwrap_or(DType::Float32);
                 TileMeta::value(SmallVec::new(), dt, Residency::Reg)
             }
+            // Unary preserves its operand's dtype+shape (an `ept`-vec stays an `ept`-vec, so
+            // a fused `exp2` over a fragment vector keeps its width for the downstream reduce).
+            Node::Unary { x, .. } => {
+                let m = self.meta(*x);
+                let dt = m.dtype.clone().unwrap_or(DType::Float32);
+                TileMeta::value(m.shape.clone(), dt, Residency::Reg)
+            }
+            // The bpermute'd lane value — a Float32 scalar (transported bitcast through i32).
+            Node::DsBpermute { .. } => TileMeta::value(SmallVec::new(), DType::Float32, Residency::Reg),
             // A fragment vector value: an `ept`-lane register vector (bookkeeping only;
             // the lowered UOp carries the true `dtype.vec(ept)`).
             Node::LoadRegVec { dtype, ept, .. } | Node::LoadVecAt { dtype, ept, .. } => {
