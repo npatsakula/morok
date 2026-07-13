@@ -194,6 +194,15 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     /// 32-MFMA run nor sink an `s_barrier`/`s_waitcnt lgkmcnt(0)` into the middle of it (the measured
     /// re-batch — `kernel_instr.md §2`: intrinsic MFMAs are NOT held by a single positional fence).
     pin_mfma: bool,
+    /// **Ping-pong on** (`warp_row.is_some()`, the GEMM path): the compute-cluster seals ARE the
+    /// wave-phase carriers — the eq-offset warp-row pair rendezvous at each `s_barrier`, so the seal
+    /// MUST stay a real workgroup barrier. Ping-pong OFF (FA: disjoint-Q warps, `warp_row.is_none()`):
+    /// the compute clusters exchange ONLY per-warp registers (V is gathered to VGPRs in the Mem cluster;
+    /// the softmax reduce is a per-warp `ds_bpermute`; PV never touches LDS), so a workgroup barrier at
+    /// a compute seal guards no cross-warp state AND walls the 0-MFMA softmax shadow — its seal drops to
+    /// a pure ordering combine (no `s_barrier`). See [`Self::compute`]. The load-bearing Mem-cluster
+    /// WAR/RAW seals ([`Self::commit`]) are UNCHANGED either way — they guard real shared-LDS traffic.
+    ping_pong: bool,
     // ── carries (persist across clusters within one body) ──
     entry: Vec<TileId>,
     /// Per-slot source of the NEXT read this body pass: `Some(store)` = the last cluster that wrote the
@@ -493,7 +502,17 @@ impl<H: Hooks> ClusterCx<'_, H> {
         if self.pin_mfma {
             deps.push(self.b.sched_fence(0, &new_ids).dep());
         }
-        let bar = self.seal(body_eff, &deps).dep();
+        // The **compute seal**, gated on ping-pong (`self.ping_pong`, see the field doc). With ping-pong
+        // ON (GEMM) it is the workgroup `s_barrier` that doubles as the wave-phase carrier — kept exactly
+        // as before (byte-identical emission). With ping-pong OFF (FA) the compute clusters share no
+        // cross-warp LDS state, so the `s_barrier` guards nothing and only walls the softmax-under-MFMA
+        // interleave: emit a pure ordering combine (`Node::After` → `val.after(deps)`, NO instruction)
+        // instead. It folds `body_eff` (the last store) + `deps` (the other stores + `set_prio(0)`) into
+        // ONE token — same shape as the barrier — so `entry`/`tail_barrier` thread on unchanged and the
+        // accumulator carry stays live, but LLVM is free to interleave the softmax VALU under the MFMAs.
+        // The real accumulator RAW is threaded per-slot via `slot_src` (the store effect directly), NOT
+        // this seal, so dropping the barrier cannot break the cross-cluster data dependency.
+        let bar = if self.ping_pong { self.seal(body_eff, &deps).dep() } else { self.b.combine(body_eff, &deps).dep() };
         self.tail_barrier = Some(bar);
         self.entry = vec![bar, prio0];
         self.sealed = true;
@@ -605,6 +624,7 @@ fn run_body<H: Hooks>(
     commit_drain: CommitDrain,
     bare_seals: bool,
     pin_mfma: bool,
+    ping_pong: bool,
 ) -> BodyOut {
     let mut cx = ClusterCx {
         b,
@@ -617,6 +637,7 @@ fn run_body<H: Hooks>(
         commit_drain,
         bare_seals,
         pin_mfma,
+        ping_pong,
         entry: Vec::new(),
         slot_src: vec![None; accs.len()],
         all_gathers: Vec::new(),
@@ -744,6 +765,9 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         let is_carried: Vec<bool> = inited.iter().map(|e| e.is_some()).collect();
         let carried_slots: Vec<usize> = (0..n_slots).filter(|&s| is_carried[s]).collect();
         assert!(!carried_slots.is_empty(), "a pipeline must carry ≥1 accumulator across the loop");
+        // Ping-pong ON ⇔ a wave-phase (`warp_row`) is supplied — the signal that the compute-cluster
+        // seals must stay real workgroup `s_barrier`s (the phase carriers). See `ClusterCx::ping_pong`.
+        let ping_pong = warp_row.is_some();
         let ks_c = b.idx_const(k_step as i64);
         let one = b.idx_const(1);
 
@@ -806,6 +830,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             commit_drain,
             bare_seals,
             pin_mfma,
+            ping_pong,
         );
 
         // ── loop close: fold every CARRIED slot's last store (its carry-out — the writers may differ per
@@ -852,6 +877,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             commit_drain,
             bare_seals,
             pin_mfma,
+            ping_pong,
         );
         let scatter_seed = warp_row.map(|wr| {
             // The eq=0 rebalance barrier ordered after the epilogue's last cluster barrier — the barrier

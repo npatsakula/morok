@@ -98,4 +98,19 @@ fn fa_forward_on_clustercx_lowers_spec_valid() {
     assert!(count(&p, &|n| matches!(n, Node::DsBpermute { .. })) >= 6, "row reductions ⇒ ds_bpermute nodes");
     // The operand-less softmax cluster + the two matmul clusters ⇒ SetPrio brackets, one commit RAW.
     assert!(count(&p, &|n| matches!(n, Node::Mma { .. })) >= 2, "QKᵀ + PV ⇒ ≥2 MMAs");
+    // Ping-pong-gated compute seals: FA's disjoint-Q warps (`warp_row = None`) exchange only per-warp
+    // registers between QKᵀ/softmax/PV, so those steady compute-cluster seals emit NO workgroup
+    // `s_barrier` (a pure `Node::After` ordering combine instead) — only the load-bearing Mem WAR/RAW
+    // pair survives in the hot loop. Count only barriers REACHABLE from the sink (`count` over the raw
+    // arena double-counts the dead pre-swizzle offset nodes SwizzlePass supersedes). The reachable
+    // `Node::Barrier`s are exactly: prologue (Q commit + block-0 K/V commit = 2) + steady (WAR + RAW
+    // = 2) + epilogue (Mem gather seal = 1) = 5. Pre-fix (always-barrier) this was 10 — the drop of the
+    // steady loop from 5→2 `s_barrier`/iter is what unwalls the 0-MFMA softmax shadow (device: +6..18% TF).
+    let live: std::collections::HashSet<crate::ir::TileId> =
+        crate::passes::reachable(&p.ir, p.sink).into_iter().collect();
+    let nbar = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::Barrier { .. })).count();
+    assert_eq!(
+        nbar, 5,
+        "FA keeps ONLY the Mem WAR/RAW + prologue/epilogue barriers (compute seals ping-pong-gated off)"
+    );
 }
