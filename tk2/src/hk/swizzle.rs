@@ -19,9 +19,12 @@ pub fn idx(ptr: u32, r: u32, c: u32, rows: u32, subtile_cols: u32) -> u32 {
 }
 
 /// tk2's [`SwizzlePass`](crate::passes::SwizzlePass) element-space delta:
-/// `delta = (((row % 16) · cols · 2) >> 7 << 3) >> 1`. XORed with the element column.
+/// `delta = (((row % 16) · swizzle_bytes) >> 7 << 3) >> 1`, `swizzle_bytes = min(cols·2, 128)` (the
+/// subtile cap — a no-op for `cols ≤ 64`, so this is bit-identical to the prior formula there). XORed
+/// with the element column.
 pub fn tk2_delta(row: u32, cols: u32) -> u32 {
-    (((row % 16) * cols * 2) >> 7 << 3) >> 1
+    let swizzle_bytes = (cols * 2).min(128);
+    (((row % 16) * swizzle_bytes) >> 7 << 3) >> 1
 }
 
 /// tk2's swizzled **element** offset of `(r, c)` in a `cols`-wide tile: `r·cols + (c ^ delta(r, cols))`

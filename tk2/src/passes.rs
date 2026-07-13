@@ -53,8 +53,9 @@ fn int_const(ir: &TileIr, id: TileId) -> Option<i64> {
 /// `col ^ delta(row)`, turning the flat LDS layout into the swizzled one. The base
 /// kernel emits `LdsCol` as the identity (a composable hole); `.apply(SwizzlePass)`
 /// fills it — so the swizzle is a **layout refinement pass**, not hand-woven addressing.
-/// Single-subtile bf16 formula (`cols ∈ {16,32,64}`), verified bit-exact + cross-checked
-/// against HK `st.cuh` / CK `make_xor_transform` (§5b).
+/// Subtile-capped bf16 formula (`swizzle_bytes = min(cols·2, 128)`), verified bit-exact + cross-checked
+/// against HK `st.cuh` / CK `make_xor_transform` (§5b). The cap is a no-op for `cols ≤ 64` (matmul's
+/// operands) and restores the subtile-major bank spread for `cols = 128` (FA's wide `[kv, d]` tile).
 pub struct SwizzlePass;
 
 impl Pass for SwizzlePass {
@@ -73,7 +74,15 @@ impl Pass for SwizzlePass {
     }
 }
 
-/// The nanopass folder: `LdsCol{row,col,cols}` → `col ^ (((row%16)·cols·2 >> 7 << 3) >> 1)`.
+/// The nanopass folder: `LdsCol{row,col,cols}` → `col ^ (((row%16)·swizzle_bytes >> 7 << 3) >> 1)`,
+/// where `swizzle_bytes = min(cols·2, 128)` for bf16 — the tk/HK `swizzle_bytes` (`st.cuh:74-86`)
+/// **subtile CAP**. Below the cap (`cols ∈ {16,32,64}`, all matmul operands) this equals `cols·2`, so
+/// matmul is BYTE-IDENTICAL; at/above it (`cols = 128`, FA's wide `[kv, d]` tile) the prior uncapped
+/// `cols·2` over-scaled `delta` to `(row%16)·8` — out of the single-subtile spec the formula was
+/// verified for — instead of the subtile-major `(row%16)·4`. The cap restores the tk1/HK subtile-major
+/// swizzle (`subtile = 64`) for wide tiles; it is a correctness-of-layout fix (a bijection either way,
+/// so numerics are unchanged), NOT a measured FA speedup — FA's residual bank conflict is the inherent
+/// 2-way of the `ds_read_u16` column-strided transposed-V gather, which no XOR swizzle removes.
 struct Swizzle;
 
 impl Fold for Swizzle {
@@ -85,7 +94,8 @@ impl Fold for Swizzle {
         let alu = |ir: &mut TileIr, op, a, b| ir.intern(Node::IndexAlu { op, a, b });
         let c16 = konst(ir, 16);
         let r16 = alu(ir, IndexOp::Mod, row, c16);
-        let sb2 = konst(ir, (cols * 2) as i64); // swizzle_bytes = cols · itemsize (bf16)
+        let swizzle_bytes = (cols * 2).min(128) as i64; // = min(cols·itemsize, 128) — the tk/HK subtile cap
+        let sb2 = konst(ir, swizzle_bytes);
         let t = alu(ir, IndexOp::Mul, r16, sb2);
         let c7 = konst(ir, 7);
         let t = alu(ir, IndexOp::Shr, t, c7);
