@@ -176,6 +176,47 @@ impl<E: Elem> LdsView<E> {
         (vecs, gathers)
     }
 
+    /// The **transposed scalar gather** (FA's PV `V` operand — the "register transpose" the naive
+    /// FA lacked): gather `n_frags` fragments whose CONTRACTION axis is the tile's LEADING (row) axis,
+    /// stacking the output fragments along the tile's INNER (column) axis. For a `[kv, d]` V tile the
+    /// gather reads `reg(lane, e) = tile[row = spread = (lane/16)·stride + e, col = f·EDGE + flat = lane%16]`,
+    /// i.e. contraction `kv` lands on the MFMA spread (contraction) lane-axis and the output `d` on the
+    /// flat lane-axis — exactly the layout an mma A/B operand needs to contract over the tile's row.
+    ///
+    /// This is the mirror of [`Self::gather_scalar`] with the tile `(row, col)` roles SWAPPED: there the
+    /// contraction is the tile's trailing axis (`QKᵀ` over `d`); here it is the leading axis (`PV` over
+    /// `kv`). The `ept` run is column-STRIDED (4 consecutive rows, `inner` elements apart), so it is a
+    /// scalar 4-load gather — a `ds_read_b64` reads a contiguous run and cannot serve it (a perf, not a
+    /// correctness, concern; Phase A is single-warp correctness). `self.map` must be the Col map so
+    /// `lane_rc` yields `(spread, flat)`; `run` offsets the contraction (a kv-slice, 0 for a 16-row block).
+    pub(crate) fn gather_transposed(self, b: &mut Builder, raw: &[TileId]) -> (Vec<Val<E>>, Vec<TileId>) {
+        let inner_c = b.idx_const(self.inner as i64);
+        let mut gathers = Vec::new();
+        let vecs = (0..self.n_frags)
+            .map(|f| {
+                let frag = b.define_frag::<E>(self.map);
+                let stores: Vec<TileId> = (0..self.map.ept)
+                    .map(|e| {
+                        let e_idx = b.idx_const(e as i64);
+                        // Col map ⇒ (frag_row = spread = contraction, frag_col = flat = output).
+                        let (row, flat) = b.lane_rc(self.map, self.lane, e_idx);
+                        let row = offset_by(b, row, self.run); // contraction-slice base (kv-slice; 0 here)
+                        let col = offset_by(b, flat, f * EDGE); // output-fragment `f` on the column axis
+                        let col = add_opt(b, col, self.warp_off);
+                        let col_part = b.lds_col(row, col, self.inner); // swizzle hole (flat = col at base)
+                        let row_off = b.idx_mul(row, inner_c);
+                        let off = b.idx_add(row_off, col_part);
+                        let v = b.load_lds_after(self.lds, off, raw);
+                        b.store_frag_elem(frag, e_idx, v).dep()
+                    })
+                    .collect();
+                gathers.extend(stores.iter().copied());
+                b.load_frag_vec_after(frag, &stores)
+            })
+            .collect();
+        (vecs, gathers)
+    }
+
     /// The **asm `ds_read_b64` gather** (gfx942 §5c — HK's only asm): all `n_frags` fragments differ
     /// by a COMPILE-TIME outer offset (fragment `i` at LDS row `i·EDGE`), so the lane's base LDS
     /// address is materialised **once** (`lane_rc(elem 0) + warp/run`, through [`Builder::lds_col`]

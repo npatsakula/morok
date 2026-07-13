@@ -509,6 +509,47 @@ impl Builder {
         Val::wrap(self.ir.intern(Node::DsBpermute { addr: addr.0, data: data.id }))
     }
 
+    /// **Cross-lane column reduction** of a Col-map fragment `val` (rows = the SPREAD/contraction
+    /// axis, cols = the FLAT axis): fold every one of the `map.rows` spread-rows per flat-column,
+    /// combine with the running `init`, and broadcast the per-column result to every `ept` slot (so a
+    /// caller can subtract it row-wise). Barrier-FREE (`ds_bpermute`), so a softmax reduction built on
+    /// it keeps a [`crate::pipeline`] compute body edge-free — the FA softmax row-max / row-sum.
+    ///
+    /// `add = false` ⇒ `max` (the online-softmax running max); `add = true` ⇒ `sum` (the norm). The
+    /// fold is `(a) the `ept` slots (4 consecutive spread-rows in one lane-group) then (b) the lane
+    /// tree {L+cols, L+2·cols, L+3·cols} mod WARP (the other lane-groups holding the same flat column).
+    /// Promoted from the naive FA's hand-rolled helper (tk1's first-class `Group::col_reduce`).
+    pub fn frag_col_reduce(&mut self, val: Val<F32>, lane: Idx, init: Val<F32>, add: bool) -> Val<F32> {
+        const WARP: i64 = 64; // gfx942 wave64
+        const EPT: usize = 4; // gfx942 16×16 fragment — a const, NOT meta-derived: `val` typically comes
+        // through an `EltwiseBinary` (`mul`/`sub`) whose meta shape is bookkeeping-scalar, which would
+        // collapse a meta-derived width to 1 and fold only one of the four spread-rows (a silent bug).
+        let comb = |b: &mut Self, a: Val<F32>, c: Val<F32>| if add { b.add(a, c) } else { b.max(a, c) };
+        let ept = EPT;
+        let cols = 16i64; // Col-map flat-axis width (lanes per column-group)
+        // (a) in-register fold of this lane's `ept` spread-rows.
+        let mut partial = self.vec_extract(val, 0);
+        for e in 1..ept {
+            let x = self.vec_extract(val, e);
+            partial = comb(self, partial, x);
+        }
+        // (b) the wave64 lane tree {L, L+cols, L+2·cols, L+3·cols} — every lane in a column ends equal.
+        let mut acc = partial;
+        let g = self.idx_const(WARP);
+        for d in [cols, 2 * cols, 3 * cols] {
+            let dc = self.idx_const(d);
+            let sl = self.idx_add(lane, dc);
+            let sl = self.idx_mod(sl, g);
+            let sh = self.shuffle_lane(partial, sl);
+            acc = comb(self, acc, sh);
+        }
+        // (c) fold the running accumulator, then broadcast to every `ept` slot.
+        let init0 = self.vec_extract(init, 0);
+        acc = comb(self, acc, init0);
+        let copies: Vec<Val<F32>> = (0..ept).map(|_| acc).collect();
+        self.vec_build(&copies)
+    }
+
     // ── register fragments + MMA (the naive matmul vocabulary) ───────────────
 
     /// Allocate a per-lane register fragment carrying its [`FragMap`] MFMA lane-map.
@@ -564,6 +605,16 @@ impl Builder {
         let zeros: Vec<Val<F32>> = (0..f.map.ept).map(|_| self.f32(0.0)).collect();
         let zvec = self.vec_build(&zeros);
         self.store_frag_vec(f, zvec)
+    }
+
+    /// Init an accumulator fragment to a **constant** with ONE constant-index `<ept×f32>` vector store
+    /// (the [`Self::zero_init_frag`] generalisation) — the online-softmax `max = −∞` seed. Same
+    /// SROA-promotable single-vector-store shape, so the fragment stays a loop-carried `phi`.
+    pub fn const_init_frag(&mut self, f: Frag<F32>, v: f32) -> Effect {
+        let c = self.f32(v);
+        let cs: Vec<Val<F32>> = (0..f.map.ept).map(|_| c).collect();
+        let cvec = self.vec_build(&cs);
+        self.store_frag_vec(f, cvec)
     }
 
     /// ONE `<ept×E>` vector load of a contiguous LDS run at flat `base`, ordered after
@@ -705,6 +756,20 @@ impl Builder {
     /// truncating (not RNE) C store ([`crate::hk`] port). Store the result to a bf16 global.
     pub fn bf16_trunc(&mut self, val: Val<F32>) -> Val<BF16> {
         Val::wrap(self.ir.intern(Node::Bf16Trunc { val: val.id }))
+    }
+
+    /// **Vector fp32 → bf16 truncation**: per-element [`Self::bf16_trunc`] then re-pack — the f32→bf16
+    /// relayout FA needs between the softmax weights `P` (still f32) and the PV MMA operand. Promoted
+    /// from the naive FA's `cast_f32_vec_to_bf16` leaf.
+    pub fn cast_vec_bf16(&mut self, v: Val<F32>) -> Val<BF16> {
+        let ept = self.ir.meta(v.id).shape.iter().copied().product::<usize>().max(1);
+        let els: Vec<Val<BF16>> = (0..ept)
+            .map(|e| {
+                let s = self.vec_extract(v, e);
+                self.bf16_trunc(s)
+            })
+            .collect();
+        self.vec_build(&els)
     }
 
     /// The **manual LDS drain** (`s_waitcnt lgkmcnt(0)`, §5c): a void `asm sideeffect` ordered after

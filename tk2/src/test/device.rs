@@ -112,13 +112,123 @@ fn micro_tk_hk_port_is_correct_on_gfx942() {
     unsafe { std::env::remove_var("SVOD_NO_PINGPONG") };
 }
 
-/// **FA-forward experiment — does it LAUNCH on gfx942?** The minimal streaming Flash-Attention
-/// forward built on the ClusterCx pipeline ([`crate::kernels_fa::flash_attention_fwd`]). This is the
-/// device stretch goal: it validates the whole lowered kernel (the `exp2`/`recip`/`ds_bpermute`
-/// additions, the operand-less softmax cluster, the End-fold + epilogue) actually COMPILES to a code
-/// object and EXECUTES without a GPU fault, producing finite output. It does NOT assert attention
-/// numerics — the P·V matmul is knowingly the wrong contraction orientation (tk2 lacks `mma_atb`), so
-/// a reference compare would (correctly) fail; that is a catalogued vocabulary gap, not a launch bug.
+/// Host f32 reference for the `mma_atb` probe: `O[d,q] = Σ_kv V[kv,d]·P[kv,q]` (V`[kv,d]`, P`[kv,q]`,
+/// both row-major) — the FA `P·V` contraction over the shared `kv` row.
+fn atb_ref(vf: &[f32], pf: &[f32], kv: usize, d: usize, q: usize) -> Vec<f32> {
+    let mut e = vec![0f32; d * q];
+    for di in 0..d {
+        for qi in 0..q {
+            let mut acc = 0f32;
+            for k in 0..kv {
+                acc += vf[k * d + di] * pf[k * q + qi];
+            }
+            e[di * q + qi] = acc;
+        }
+    }
+    e
+}
+
+/// **`mma_atb` isolation gate** (Phase-A de-risk): the transposed-gather + `v_mfma` compute
+/// `O[d,q] = Σ_kv V[kv,d]·P[kv,q]` (the FA `P·V` contraction over the shared `kv` row) must match the
+/// f32 reference over the SAME bf16-rounded operands. Covers the base fragment (16×16×16), a wide
+/// output-`d` tile (16×64×16 = 4 d-frags), and a wide output-`q` tile (16×16×64 = 4 q-frags), so both
+/// output-fragment axes of the transposed gather are exercised BEFORE the layout is trusted in FA.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::mma_atb_probe --nocapture`
+#[test]
+#[ignore]
+fn mma_atb_probe_is_correct_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    let dev = svod_dtype::default_device::default_device();
+    for (kv, d, q) in [(16usize, 16usize, 16usize), (16, 64, 16), (16, 16, 64), (16, 64, 64)] {
+        let mut v = Tensor::rand_with(&[kv, d], DType::BFloat16, dev.clone()).expect("rand v");
+        let mut p = Tensor::rand_with(&[kv, q], DType::BFloat16, dev.clone()).expect("rand p");
+        v.realize().expect("realize v");
+        p.realize().expect("realize p");
+        let expected = atb_ref(&as_f32_vec(&v), &as_f32_vec(&p), kv, d, q);
+        let atol = 0.02 * (kv as f32).sqrt();
+
+        let prog = crate::kernels_fa::atb_probe(kv, d, q);
+        let out = Tensor::empty(&[d, q], DType::Float32);
+        let mut y = graph_kernel(prog, out, &[&v, &p]).expect("wrap atb probe");
+        let plan = y.prepare().expect("prepare");
+        plan.execute().expect("execute");
+        let got = y.as_vec::<f32>().expect("read output");
+        let report = allclose_f32(&got, &expected, atol, 2e-2);
+        println!("mma_atb probe kv={kv} d={d} q={q}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+        assert!(report.ok, "mma_atb probe {kv}×{d}×{q} must match Aᵀ·B reference: {}", report.message);
+    }
+}
+
+/// Host f32 reference for non-causal FA-forward: `O[q,dd] = Σ_k softmax_k(Q[q]·K[k]/√d)·V[k,dd]`
+/// over the SAME bf16-rounded operands (`q`/`k`/`v` are `[n,d]` row-major, cast to f32 first).
+fn fa_ref(qf: &[f32], kf: &[f32], vf: &[f32], n: usize, d: usize) -> Vec<f32> {
+    let scale = 1.0 / (d as f32).sqrt();
+    let mut o = vec![0f32; n * d];
+    for qi in 0..n {
+        let mut s = vec![0f32; n];
+        for ki in 0..n {
+            let mut acc = 0f32;
+            for di in 0..d {
+                acc += qf[qi * d + di] * kf[ki * d + di];
+            }
+            s[ki] = acc * scale;
+        }
+        let m = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0f32;
+        for x in &mut s {
+            *x = (*x - m).exp();
+            sum += *x;
+        }
+        for di in 0..d {
+            let mut acc = 0f32;
+            for ki in 0..n {
+                acc += s[ki] * vf[ki * d + di];
+            }
+            o[qi * d + di] = acc / sum;
+        }
+    }
+    o
+}
+
+/// **FA-forward correctness GATE** (the Phase-A deliverable): the streaming, single-warp, online-
+/// softmax FA on the ClusterCx pipeline ([`crate::kernels_fa::flash_attention_fwd`]) must match the
+/// f32 reference (non-causal, same bf16-rounded operands) at d=64 AND d=128 — the QKᵀ inner-d loop,
+/// the two `ds_bpermute` softmax reductions, the online rescale, and the `mma_atb` P·V (transposed-V
+/// gather + free-relayout P) all correct end-to-end. `atol = 0.02·√d`, `rtol = 2e-2` (matmul style).
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::flash_attention_matches --nocapture`
+#[test]
+#[ignore]
+fn flash_attention_matches_reference_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    let dev = svod_dtype::default_device::default_device();
+    let n = 128usize;
+    for d in [64usize, 128usize] {
+        let mut q = Tensor::rand_with(&[n, d], DType::BFloat16, dev.clone()).expect("rand q");
+        let mut k = Tensor::rand_with(&[n, d], DType::BFloat16, dev.clone()).expect("rand k");
+        let mut v = Tensor::rand_with(&[n, d], DType::BFloat16, dev.clone()).expect("rand v");
+        q.realize().expect("realize q");
+        k.realize().expect("realize k");
+        v.realize().expect("realize v");
+        let expected = fa_ref(&as_f32_vec(&q), &as_f32_vec(&k), &as_f32_vec(&v), n, d);
+        let atol = 0.02 * (d as f32).sqrt();
+
+        let prog = crate::kernels_fa::flash_attention_fwd(n, d);
+        let out = Tensor::empty(&[n, d], DType::Float32);
+        let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA program");
+        let plan = y.prepare().expect("prepare FA");
+        plan.execute().expect("execute FA");
+        let got = y.as_vec::<f32>().expect("read FA output");
+        let report = allclose_f32(&got, &expected, atol, 2e-2);
+        println!("FA-forward n={n} d={d}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+        assert!(report.ok, "FA-forward n={n} d={d} must match the f32 reference: {}", report.message);
+    }
+}
+
+/// **FA-forward `d=16` launch smoke test** on gfx942 — the smallest streaming Flash-Attention forward
+/// ([`crate::kernels_fa::flash_attention_fwd`]) at a single head-dim fragment. Complements the full
+/// `flash_attention_matches_reference_on_gfx942` gate (which validates numerics at d=64/128): this one
+/// just confirms the minimal `d=16` shape compiles + executes without a GPU fault and produces finite
+/// output (the degenerate single-d-fragment path — QKᵀ is one `mma`, one PV output fragment).
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::fa_forward_launches --nocapture`
 #[test]
 #[ignore]

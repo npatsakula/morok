@@ -1,20 +1,19 @@
-//! **Flash-Attention forward on the ClusterCx declarative pipeline** — an EXPERIMENT probing
-//! whether [`crate::pipeline`] (built for the HK GEMM) generalises to a second, differently-shaped
-//! kernel. Streams K/V blocks: QKᵀ → online-softmax → P·V accumulate → normalize → write O.
+//! **Flash-Attention forward on the ClusterCx declarative pipeline** — a NUMERICALLY CORRECT,
+//! single-warp FA-forward proving [`crate::pipeline`] (built for the HK GEMM) generalises to a second,
+//! differently-shaped kernel. Streams K/V blocks: QKᵀ → online-softmax → P·V accumulate → normalize →
+//! write O. Non-causal, `b = h = 1`, `q_blk = kv_blk = 16`, head dim `d` any multiple of 16.
 //!
-//! ## What is real vs stubbed (read before trusting this)
-//! - **Compiles + lowers spec-valid** (`lower::verify`): the whole streaming skeleton — prologue
-//!   stage/commit, the KV loop as `Mem`(gather K,V + prefetch/commit next) → `Compute`(QKᵀ) →
-//!   `Compute`(softmax) → `Compute`(PV), the End-fold, epilogue, normalize, scatter.
-//! - **Genuinely correct primitives**: `exp2`, `recip`, the `ds_bpermute` cross-lane row reductions
-//!   (running max + norm sum), the online rescale, QKᵀ (= K·Qᵀ, a native tk2 `A·Bᵀ`).
-//! - **KNOWN-WRONG numerics (documented gaps, device-correctness was the stretch goal)**: the P·V
-//!   matmul. FA's PV is `Vᵀ·att` (contraction over kv), which needs `mma_atb` / a register transpose;
-//!   tk2 has ONLY `mma` = `A·Bᵀ` (both operands K-inner), so PV is wired as a plain `mma(att,V)` — the
-//!   wrong contraction orientation. See the finding catalogue. The minimal shape is single-fragment
-//!   (`q_blk=kv_blk=d=16`, one warp, b=h=1): enough to exercise every DSL seam, not a production tile.
+//! ## The two matmuls (both `mma_atb` — contraction over the shared row)
+//! - **QKᵀ** contracts over `d`: `K` (row map) and `Q` (col map) are gathered with `d` on the MFMA
+//!   spread (contraction) lane-axis, summed over `d/16` `mma` K-steps → `att[kv, q]` (`q` on flat).
+//! - **P·V** contracts over `kv`: the QKᵀ f32 accumulator `P` feeds PV's operand with ONLY a bf16
+//!   cast — its lane distribution already equals the required operand layout (the CK "free relayout",
+//!   DESIGN §5) — while `V` is gathered TRANSPOSED ([`LdsView::gather_transposed`]) so `kv` lands on
+//!   the spread axis. Both use the SAME `v_mfma_f32_16x16x16`; the orientation is purely the operand
+//!   lane layout, NOT a new hardware op (proven in isolation by `atb_probe` + its device gate).
 //!
-//! The point of this module is the **friction it exposed**, catalogued in the experiment report.
+//! Device-gated by `flash_attention_matches_reference_on_gfx942` (allclose vs an f32 reference at
+//! d=64 and d=128). Perf / multi-warp / ping-pong / swizzle are Phase B — this is the correctness base.
 
 use crate::build::{BF16, Builder, Effect, F32, Frag, Idx, Val};
 use crate::ir::{FragMap, TileId};
@@ -44,6 +43,9 @@ struct FaHooks {
     v_view: LdsView<BF16>,
     k_stage: LdsStage<BF16>,
     v_stage: LdsStage<BF16>,
+    /// `d / 16` — the head-dim fragment count. QKᵀ contracts over `d` as this many `mma` K-steps
+    /// (K row-map slices); PV's `V` is gathered as this many transposed output-`d` fragments.
+    dfrags: usize,
 }
 
 impl Hooks for FaHooks {
@@ -85,8 +87,21 @@ impl Hooks for FaHooks {
 
     fn gather(&mut self, b: &mut Builder, slice: usize, raw: &[TileId]) -> (FaOp, Vec<TileId>, TileId) {
         let (vecs, g) = match slice {
-            0 => self.k_view.slice(0).gather(b, raw),
-            1 => self.v_view.slice(0).gather(b, raw),
+            // K: the `dfrags` d-fragments of QKᵀ's A operand (row map, contraction `d` on the spread
+            // lane-axis; each `slice(s)` selects d-columns `[s·16, s·16+16)`). QKᵀ = Σ_s mma(K_s, Q_s).
+            0 => {
+                let mut vecs = Vec::new();
+                let mut g = Vec::new();
+                for s in 0..self.dfrags {
+                    let (v, gg) = self.k_view.slice(s).gather(b, raw);
+                    vecs.extend(v);
+                    g.extend(gg);
+                }
+                (vecs, g)
+            }
+            // V: the `dfrags` output-d fragments of PV's A operand, gathered TRANSPOSED (contraction
+            // `kv` on the spread lane-axis — the `mma_atb` orientation the isolation gate proved).
+            1 => self.v_view.gather_transposed(b, raw),
             _ => panic!("FA gather: slice ∈ {{0=K, 1=V}}, got {slice}"),
         };
         let anchor = vecs[0].id;
@@ -94,70 +109,98 @@ impl Hooks for FaHooks {
     }
 }
 
-/// Init an accumulator fragment to a constant (the online-softmax `max = −∞` seed — the pipeline's
-/// `inited` hook only had `zero_init_frag`, so a non-zero init needed adding; a MINOR gap).
-fn const_init_frag(b: &mut Builder, f: Frag<F32>, v: f32) -> Effect {
-    let cs: Vec<Val<F32>> = (0..f.map.ept).map(|_| b.f32(v)).collect();
-    let cv = b.vec_build(&cs);
-    b.store_frag_vec(f, cv)
-}
-
-/// **Cross-lane column reduction** of a `col`-map att-shaped fragment vector `val` (kv = rows,
-/// q = cols): fold all 16 kv-rows per q-column, combining with the running `init`, and broadcast
-/// the per-column result back to every `ept` slot (so the caller can subtract it row-wise). Barrier-
-/// FREE via [`Builder::shuffle_lane`] (`ds_bpermute`), so the softmax compute body stays edge-free.
-///
-/// This entire function is vocabulary tk2 lacked: there is NO reduction primitive, so the in-register
-/// partial fold AND the stride-{16,32,48} lane tree are hand-rolled here (verbatim tk1's `reduce.rs`
-/// structure, but tk1 has it as a first-class `Group::col_reduce`). See the report — #1 missing op.
-fn frag_col_reduce(b: &mut Builder, val: Val<F32>, lane: Idx, init: Val<F32>, is_max: bool) -> Val<F32> {
-    let comb = |b: &mut Builder, a: Val<F32>, c: Val<F32>| if is_max { b.max(a, c) } else { b.add(a, c) };
-    // (a) in-register fold of this lane's `ept` rows of its column.
-    let mut partial = b.vec_extract(val, 0);
-    for e in 1..EPT {
-        let x = b.vec_extract(val, e);
-        partial = comb(b, partial, x);
-    }
-    // (b) the wave64 lane tree {L, L+16, L+32, L+48} — every lane in a column-group ends identical.
-    let mut acc = partial;
-    let g = b.idx_const(WARP as i64);
-    for d in [EDGE as i64, 2 * EDGE as i64, 3 * EDGE as i64] {
-        let dc = b.idx_const(d);
-        let sl = b.idx_add(lane, dc);
-        let sl = b.idx_mod(sl, g);
-        let sh = b.shuffle_lane(partial, sl);
-        acc = comb(b, acc, sh);
-    }
-    // (c) fold the running accumulator, then broadcast to every `ept` slot.
-    let init0 = b.vec_extract(init, 0);
-    acc = comb(b, acc, init0);
-    let copies: Vec<Val<F32>> = (0..EPT).map(|_| acc).collect();
-    b.vec_build(&copies)
-}
-
-/// Cast an `ept`-wide f32 softmax-weight vector to a bf16 MMA operand (per-element `bf16_trunc`
-/// then re-pack). The f32→bf16 relayout FA needs between softmax and PV; tk2 had `bf16_trunc`
-/// (an HK-port leaf) but no vector cast helper — a MINOR gap.
-fn cast_f32_vec_to_bf16(b: &mut Builder, v: Val<F32>, ept: usize) -> Val<BF16> {
-    let els: Vec<Val<BF16>> = (0..ept)
-        .map(|e| {
-            let s = b.vec_extract(v, e);
-            b.bf16_trunc(s)
-        })
-        .collect();
-    b.vec_build(&els)
-}
-
 /// gfx942 elements-per-thread for the 16×16 fragment.
 const EPT: usize = 4;
 
-/// **Minimal streaming FA-forward** (`b = h = 1`, one warp, `q_blk = kv_blk = d = 16`) authored on
-/// the [`crate::pipeline`] ClusterCx combinator. `n` = sequence length (KV blocks = `n/16 ≥ 2`).
-/// Returns a lowerable [`Program`]; see the module docs for what is device-correct vs structural.
+/// **`mma_atb` isolation probe** (DE-RISK, per the Phase-A brief): a standalone single-warp kernel that
+/// computes `O[d,q] = Σ_kv V[kv,d]·P[kv,q]` — EXACTLY the FA `P·V` contraction (over the shared `kv`
+/// row) — via the transposed operand gather ([`LdsView::gather_transposed`]) + the SAME
+/// `v_mfma_f32_16x16x16` [`Builder::mma`]. It proves, against an f32 host reference, that landing the
+/// contraction axis on the MFMA spread lane-axis (the "register transpose" done as a transposed LDS
+/// read) computes `Aᵀ·B` correctly, BEFORE the layout is trusted inside FA. `kv = 16` (one contraction
+/// fragment); `d`/`q` are the output extents (multiples of 16), tiled as `d/16 × q/16` output fragments.
+#[allow(clippy::needless_range_loop)] // the fragment index also drives the d·16 / q·16 tile base
+pub fn atb_probe(kv: usize, d: usize, q: usize) -> Program {
+    assert!(kv == EDGE, "atb_probe: single kv contraction fragment (kv = 16)");
+    assert!(d.is_multiple_of(EDGE) && q.is_multiple_of(EDGE), "d, q must be multiples of 16");
+    let mut b = Builder::new("tk2_atb_probe");
+    // ABI: output O[d,q] first, then inputs V[kv,d], P[kv,q].
+    let o = b.global::<F32>(d * q);
+    let v = b.global::<BF16>(kv * d);
+    let p = b.global::<BF16>(kv * q);
+    let _wg = b.grid_axis(0, 1);
+    let lane = b.block_axis(WARP as i64);
+    let zero = b.idx_const(0);
+
+    let col = FragMap::gfx942_16x16(true);
+    let v_smem = b.define_local::<BF16>(kv * d);
+    let p_smem = b.define_local::<BF16>(kv * q);
+    let v_tile = SharedTile::new(v_smem, d);
+    let p_tile = SharedTile::new(p_smem, q);
+
+    // ── fill V[kv,d] and P[kv,q] into LDS (single warp, whole tile) via the collaborative stage. ──
+    let v_stage = v_tile.stage_view(v, kv * d / WARP, lane, zero, d as i64, Drain::Intrinsic);
+    let p_stage = p_tile.stage_view(p, kv * q / WARP, lane, zero, q as i64, Drain::Intrinsic);
+    let vl = v_stage.prefetch(&mut b, zero, &[]);
+    let pl = p_stage.prefetch(&mut b, zero, &[]);
+    let vf = v_stage.commit(&mut b, &vl, &[]);
+    let pf = p_stage.commit(&mut b, &pl, &[]);
+    let fill: Vec<TileId> = vf.iter().chain(pf.iter()).map(|e| e.dep()).collect();
+    let bar = b.barrier(Effect(fill[0]), &fill[1..]);
+
+    // ── transposed gather: kv (contraction) → spread; d/q (output) → flat, stacked as fragments. ──
+    let v_view = v_tile.gather_view(col, d / EDGE, None, lane, false);
+    let p_view = p_tile.gather_view(col, q / EDGE, None, lane, false);
+    let (v_frags, _gv) = v_view.gather_transposed(&mut b, &[bar.dep()]);
+    let (p_frags, _gp) = p_view.gather_transposed(&mut b, &[bar.dep()]);
+
+    // ── O[d,q] = Σ_kv V·P: one MFMA per (d-frag, q-frag) output tile (single kv contraction). ──
+    let zero_c = {
+        let zs: Vec<Val<F32>> = (0..EPT).map(|_| b.f32(0.0)).collect();
+        b.vec_build(&zs)
+    };
+    let q_c = b.idx_const(q as i64);
+    let mut roots = Vec::new();
+    for df in 0..d / EDGE {
+        for qf in 0..q / EDGE {
+            let res = b.mma(v_frags[df], p_frags[qf], zero_c, EPT); // Col-out [d=spread, q=flat]
+            let d_base = b.idx_const((df * EDGE) as i64);
+            let q_base = b.idx_const((qf * EDGE) as i64);
+            for inner in 0..EPT {
+                let inner_c = b.idx_const(inner as i64);
+                let (row, ccol) = b.lane_rc(col, lane, inner_c); // (d in-frag = spread, q in-frag = flat)
+                let d_idx = b.idx_add(d_base, row);
+                let q_idx = b.idx_add(q_base, ccol);
+                let off = b.idx_mul(d_idx, q_c);
+                let off = b.idx_add(off, q_idx);
+                let val = b.vec_extract(res, inner);
+                roots.push(b.store(o, off, val));
+            }
+        }
+    }
+    let (ir, sink) = b.finish(&roots);
+    Program { ir, sink, name: "tk2_atb_probe".into() }
+}
+
+/// **Streaming FA-forward** (non-causal, `b = h = 1`, one warp, `q_blk = kv_blk = 16`, head-dim `d` a
+/// multiple of 16) authored on the [`crate::pipeline`] ClusterCx combinator. `n` = sequence length
+/// (KV blocks = `n/16 ≥ 2`). NUMERICALLY CORRECT: streams K/V blocks, computing QKᵀ (Σ over `d/16`
+/// `mma` K-steps), the online-softmax running max/rescale/norm, and the PV accumulate as `mma_atb`
+/// (the QKᵀ f32 accumulator `P` feeds PV's operand with only a bf16 cast — no data transpose — while
+/// `V` is gathered transposed so `kv` lands on the MFMA contraction axis). Device-gated by
+/// `flash_attention_matches_reference_on_gfx942`. Returns a lowerable [`Program`].
+///
+/// Accumulator carry (all `Frag<F32>`, Col map): `[o_0 .. o_{d/16−1}, att, max, norm]`. `o_df` is the
+/// `[d, q]`-layout PV accumulator for output d-fragment `df` (`q` on the flat lane-axis, matching `att`
+/// / `max` / `norm`); `att` is the per-KV-block QKᵀ temporary (re-zeroed each block, then overwritten
+/// with the softmax weights `P` for PV to consume); `max`/`norm` are the per-Q online-softmax stats
+/// (broadcast across the fragment). O is normalised (`o/norm`) and transpose-scattered in the epilogue.
+#[allow(clippy::needless_range_loop)] // the d-fragment index also drives the output-d tile base
 pub fn flash_attention_fwd(n: usize, d: usize) -> Program {
-    assert!(d == EDGE, "minimal FA supports a single d-fragment (d = 16); multi-d is a documented gap");
+    assert!(d.is_multiple_of(EDGE), "head dim d must be a multiple of 16");
     assert!(n.is_multiple_of(EDGE) && n / EDGE >= 2, "N must be a multiple of 16 with ≥2 KV blocks");
     let (q_blk, kv_blk) = (EDGE, EDGE);
+    let dfrags = d / EDGE; // head-dim fragment count (QKᵀ K-steps / PV output-d fragments)
 
     let mut b = Builder::new("tk2_fa_fwd");
     // ABI: output O first, then inputs Q, K, V (all flat [n, d]).
@@ -170,24 +213,25 @@ pub fn flash_attention_fwd(n: usize, d: usize) -> Program {
     let qwg = b.grid_axis(0, (n / q_blk) as i64);
     let lane = b.block_axis(WARP as i64);
 
-    // ── LDS tiles (single-buffered [16,16] each) ──
+    // ── LDS tiles ([16, d] each) ──
     let k_smem = b.define_local::<BF16>(kv_blk * d);
     let v_smem = b.define_local::<BF16>(kv_blk * d);
     let q_smem = b.define_local::<BF16>(q_blk * d);
 
-    let row_map = FragMap::gfx942_16x16(false); // A operand (contraction on the inner axis)
-    let col_map = FragMap::gfx942_16x16(true); // B / C operands
+    let row_map = FragMap::gfx942_16x16(false); // A operand (contraction on the spread lane-axis)
+    let col_map = FragMap::gfx942_16x16(true); // B / C / accumulator operands
 
-    // Movement handles — the SAME `SharedTile`→view/stage machinery matmul uses. K is QKᵀ's A
-    // (row map, contraction over d); Q is QKᵀ's B (col map, contraction over d); V is PV's operand.
+    // Movement handles — the SAME `SharedTile`→view/stage machinery matmul uses. K is QKᵀ's A (row
+    // map, `d` on spread; gathered per d-slice); Q is QKᵀ's B (col map, `d` on spread; loop-invariant);
+    // V is PV's A (col map, gathered TRANSPOSED so `kv` lands on spread — the `mma_atb` relayout).
     let k_tile = SharedTile::new(k_smem, d);
     let v_tile = SharedTile::new(v_smem, d);
     let q_tile = SharedTile::new(q_smem, d);
-    let k_view = k_tile.gather_view(row_map, kv_blk / EDGE, None, lane, false);
-    let v_view = v_tile.gather_view(col_map, kv_blk / EDGE, None, lane, false);
-    let q_view = q_tile.gather_view(col_map, q_blk / EDGE, None, lane, false);
+    let k_view = k_tile.gather_view(row_map, kv_blk / EDGE, None, lane, false); // 1 kv-frag / d-slice
+    let v_view = v_tile.gather_view(col_map, dfrags, None, lane, false); // d/16 transposed output frags
+    let q_view = q_tile.gather_view(col_map, q_blk / EDGE, None, lane, false); // 1 q-frag / d-slice
 
-    let epl = kv_blk * d / WARP; // 4 — vectorised fill elements per lane
+    let epl = kv_blk * d / WARP; // vectorised fill elements per lane
     let zero = b.idx_const(0);
     // K/V stream: origin row 0 (single head/batch); the per-block row advance rides `k_base` (below).
     let k_stage = k_tile.stage_view(k, epl, lane, zero, d as i64, Drain::Intrinsic);
@@ -197,29 +241,29 @@ pub fn flash_attention_fwd(n: usize, d: usize) -> Program {
     let q_origin = b.idx_mul(qwg, qblk_c);
     let q_stage = q_tile.stage_view(q, epl, lane, q_origin, d as i64, Drain::Intrinsic);
 
-    // ── prologue: stage + commit Q once, gather it as the loop-invariant QKᵀ operand ──
+    // ── prologue: stage + commit Q once, gather its `dfrags` d-slices (the loop-invariant QKᵀ B). ──
     let q_loaded = q_stage.prefetch(&mut b, zero, &[]);
     let q_fill = q_stage.commit(&mut b, &q_loaded, &[]);
     let q_fill_deps: Vec<TileId> = q_fill[1..].iter().map(|e| e.dep()).collect();
     let q_bar = b.barrier(q_fill[0], &q_fill_deps);
-    let (q_vecs, _q_g) = q_view.slice(0).gather(&mut b, &[q_bar.dep()]);
-    let q0 = q_vecs[0]; // Val<BF16>, loop-invariant — captured by the QKᵀ body
+    let q_frags: Vec<Val<BF16>> = (0..dfrags)
+        .map(|s| {
+            let (qv, _g) = q_view.slice(s).gather(&mut b, &[q_bar.dep()]);
+            qv[0]
+        })
+        .collect();
 
-    // ── accumulators carried across the KV loop: o, att, max, norm (all Frag<F32>, col map) ──
-    // GEMM-shape leak: the pipeline carries a FIXED `Frag<F32>` accumulator set round-tripped by EVERY
-    // compute cluster. FA's `att` is a per-iteration TEMPORARY (QKᵀ re-zeros it, the carry is wasted)
-    // and `max`/`norm` are logically per-Q VECTORS, not q×kv tiles — both are shoehorned as Frag<F32>.
-    let o_acc = b.define_frag::<F32>(col_map);
+    // ── accumulators carried across the KV loop: [o_0..o_{dfrags-1}, att, max, norm] (all Col-map). ──
+    let o_accs: Vec<Frag<F32>> = (0..dfrags).map(|_| b.define_frag::<F32>(col_map)).collect();
     let att_acc = b.define_frag::<F32>(col_map);
     let max_acc = b.define_frag::<F32>(col_map);
     let norm_acc = b.define_frag::<F32>(col_map);
-    let accs = [o_acc, att_acc, max_acc, norm_acc];
-    let inited = [
-        b.zero_init_frag(o_acc),
-        b.zero_init_frag(att_acc),
-        const_init_frag(&mut b, max_acc, f32::NEG_INFINITY), // online-softmax running max seed
-        b.zero_init_frag(norm_acc),
-    ];
+    let mut accs: Vec<Frag<F32>> = o_accs.clone();
+    accs.extend([att_acc, max_acc, norm_acc]);
+    let mut inited: Vec<Effect> = o_accs.iter().map(|&a| b.zero_init_frag(a)).collect();
+    inited.push(b.zero_init_frag(att_acc));
+    inited.push(b.const_init_frag(max_acc, f32::NEG_INFINITY)); // online-softmax running max seed
+    inited.push(b.zero_init_frag(norm_acc));
 
     // Softmax scale folded into the QKᵀ scores: exp2(score·log2(e)/√d) == exp(score/√d).
     let scale = std::f32::consts::LOG2_E / (d as f32).sqrt();
@@ -229,54 +273,68 @@ pub fn flash_attention_fwd(n: usize, d: usize) -> Program {
         b.vec_build(&cs)
     };
     let zero_c = {
-        // QKᵀ's C = 0 (re-zero att every iteration; the carried att read is ignored — carry waste).
+        // QKᵀ's C = 0 (re-zero att every KV block; the carried att read is ignored).
         let zs: Vec<Val<F32>> = (0..EPT).map(|_| b.f32(0.0)).collect();
         b.vec_build(&zs)
     };
+    // Acc-index landmarks in the carry vector.
+    let (i_att, i_max, i_norm) = (dfrags, dfrags + 1, dfrags + 2);
 
-    // ── the three compute bodies (the "pluggable compute body" claim under test) ──
-    // QKᵀ: att = K·Qᵀ (a native tk2 `A·Bᵀ`, contraction over d). Operand = gathered K (slice 0).
+    // ── the three compute bodies ──
+    // QKᵀ: att = K·Qᵀ (contraction over `d` = Σ over `dfrags` `mma` K-steps). Operand = gathered K.
     let qk = Compute::<FaHooks>::new(0, move |b: &mut Builder, op: Option<&FaOp>, reads: &[Val<F32>]| {
-        let k = op.expect("QKᵀ consumes gathered K")[0];
-        let att = b.mma(k, q0, zero_c, EPT); // Val<F32>, ept-wide
-        vec![reads[0], att, reads[2], reads[3]] // o, att', max, norm  (only att changes)
+        let k_frags = op.expect("QKᵀ consumes gathered K");
+        let mut att = zero_c; // re-zero the per-block QKᵀ temporary
+        for s in 0..dfrags {
+            att = b.mma(k_frags[s], q_frags[s], att, EPT); // accumulate the d-slice K·Qᵀ
+        }
+        let mut out: Vec<Val<F32>> = reads[..dfrags].to_vec(); // o_* unchanged
+        out.push(att);
+        out.push(reads[i_max]);
+        out.push(reads[i_norm]);
+        out
     });
 
-    // Online softmax: consumes ONLY the accumulator carry (operand = None). Emits `exp2` + the two
-    // `ds_bpermute` row reductions + the running rescale — the whole novel FA math lives HERE, and it
-    // needs NO barrier of its own (ds_bpermute is barrier-free), so the edge-free-body claim HOLDS.
+    // Online softmax (operand = None): the running-max rescale + exp2 + the two `ds_bpermute` column
+    // reductions — barrier-free, so the compute body stays edge-free. Overwrites `att` with the
+    // softmax weights `P` (still f32) for PV, and rescales every `o_df` by exp2(max_old − max_new).
     let softmax = Compute::<FaHooks>::new(None, move |b: &mut Builder, _op: Option<&FaOp>, reads: &[Val<F32>]| {
-        let (o, att, max_old, norm_old) = (reads[0], reads[1], reads[2], reads[3]);
+        let (att, max_old, norm_old) = (reads[i_att], reads[i_max], reads[i_norm]);
         let s = b.mul(att, scale_bcast); // scaled scores
-        let m = frag_col_reduce(b, s, lane, max_old, true); // running max (broadcast per q)
+        let m = b.frag_col_reduce(s, lane, max_old, false); // running max (per q, broadcast)
         let corr = b.sub(max_old, m);
         let scale_f = b.exp2(corr); // exp2(max_old − max_new)
-        let o2 = b.mul(o, scale_f); // rescale running output
         let norm2 = b.mul(norm_old, scale_f); // rescale running norm
         let sm = b.sub(s, m);
         let p = b.exp2(sm); // softmax weights P (still f32)
-        let norm3 = frag_col_reduce(b, p, lane, norm2, false); // norm += Σ P
-        vec![o2, p, m, norm3]
+        let norm3 = b.frag_col_reduce(p, lane, norm2, true); // norm += Σ_kv P
+        let mut out: Vec<Val<F32>> = (0..dfrags).map(|df| b.mul(reads[df], scale_f)).collect(); // O *= corr
+        out.push(p); // att := P
+        out.push(m);
+        out.push(norm3);
+        out
     });
 
-    // P·V accumulate. Operand = gathered V (slice 1). att-read is P (softmaxed f32), cast to bf16.
-    // NOTE: correct FA is `o += Vᵀ·att` (contraction over kv) = tk1's `mma_atb`; tk2 has only
-    // `A·Bᵀ`, so this `mma(att,V)` is the WRONG contraction orientation — a documented device-numerics
-    // gap (structural completeness holds; the report ranks this the #2 GEMM-shape leak).
+    // P·V accumulate (`mma_atb` over `kv`). Operand = the `dfrags` transposed V fragments (`kv` on
+    // spread). `P` (the softmaxed f32 `att`) feeds PV's B operand with ONLY a bf16 cast — no transpose,
+    // as the QKᵀ accumulator's lane distribution already equals the required operand layout (§5). Each
+    // `o_df` gets O[d in df, q] += Σ_kv V[kv, d]·P[kv, q].
     let pv = Compute::<FaHooks>::new(1, move |b: &mut Builder, op: Option<&FaOp>, reads: &[Val<F32>]| {
-        let vv = op.expect("PV consumes gathered V")[0];
-        let (o, p) = (reads[0], reads[1]);
-        let att_mma = cast_f32_vec_to_bf16(b, p, EPT);
-        let o2 = b.mma(att_mma, vv, o, EPT);
-        vec![o2, reads[1], reads[2], reads[3]] // only o changes
+        let v_frags = op.expect("PV consumes gathered V");
+        let p = b.cast_vec_bf16(reads[i_att]);
+        let mut out: Vec<Val<F32>> = (0..dfrags).map(|df| b.mma(v_frags[df], p, reads[df], EPT)).collect();
+        out.push(reads[i_att]); // att unchanged
+        out.push(reads[i_max]);
+        out.push(reads[i_norm]);
+        out
     });
 
-    let hooks = FaHooks { k_view, v_view, k_stage, v_stage };
+    let hooks = FaHooks { k_view, v_view, k_stage, v_stage, dfrags };
     let acc_final = pipeline(
         &mut b,
         n / kv_blk, // nblocks (streaming over KV)
-        kv_blk * d, // k_step: the FLAT per-block advance (kv_blk rows · d) — see the k_step-conflation finding
-        2,          // ksteps: gather slices (K, V) — NOT a contraction count, unlike matmul
+        kv_blk * d, // k_step: the FLAT per-block advance (kv_blk rows · d)
+        2,          // ksteps: gather slices (K, V)
         &accs,
         &inited,
         None,  // warp_row: no wave-phase ping-pong (single warp)
@@ -293,25 +351,25 @@ pub fn flash_attention_fwd(n: usize, d: usize) -> Program {
     .cluster(pv)
     .build();
 
-    // ── post-loop: normalize O = o / norm, scatter to global O ──
-    let o_final = acc_final[0];
-    let norm_final = acc_final[3];
-    let norm_vec = b.load_frag_vec(norm_final);
+    // ── post-loop: normalize O = o / norm (per q, broadcast across d) and transpose-scatter to O. ──
+    let norm_vec = b.load_frag_vec(acc_final[i_norm]);
     let recip_norm = b.recip(norm_vec);
-    let o_vec = b.load_frag_vec(o_final);
-    let o_norm = b.mul(o_vec, recip_norm);
-
     let d_c = b.idx_const(d as i64);
-    let o_row_base = b.idx_mul(q_origin, d_c); // this workgroup's O flat row origin
     let mut roots = Vec::new();
-    for inner in 0..o_final.map.ept {
-        let inner_c = b.idx_const(inner as i64);
-        let (row, col) = b.lane_rc(o_final.map, lane, inner_c);
-        let row_off = b.idx_mul(row, d_c);
-        let off = b.idx_add(o_row_base, row_off);
-        let off = b.idx_add(off, col);
-        let val = b.vec_extract(o_norm, inner);
-        roots.push(b.store(o, off, val));
+    for df in 0..dfrags {
+        let o_vec = b.load_frag_vec(acc_final[df]);
+        let o_norm = b.mul(o_vec, recip_norm);
+        for inner in 0..EPT {
+            let inner_c = b.idx_const(inner as i64);
+            // o_df is Col-map [d = spread = row, q = flat = col]; scatter to O[q_global, d_global].
+            let (row, col) = b.lane_rc(col_map, lane, inner_c);
+            let q_global = b.idx_add(q_origin, col);
+            let qg_d = b.idx_mul(q_global, d_c);
+            let d_global = crate::kernels::offset_by(&mut b, row, df * EDGE);
+            let off = b.idx_add(qg_d, d_global);
+            let val = b.vec_extract(o_norm, inner);
+            roots.push(b.store(o, off, val));
+        }
     }
 
     let (ir, sink) = b.finish(&roots);
