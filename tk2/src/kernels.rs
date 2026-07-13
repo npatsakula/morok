@@ -288,7 +288,8 @@ fn kblock_impl(
     // Workgroup output tile = (bm·wm) × (bn·wn), computed by a wm×wn grid of 64-lane warps.
     let (big_m, big_n, nthreads) = (bm * wm, bn * wn, wm * wn * WARP);
     assert!(m.is_multiple_of(big_m) && n.is_multiple_of(big_n), "m/n must tile by (bm·wm)/(bn·wn)");
-    let mut b = Builder::new("tk2_matmul_kblock");
+    // Distinct module name from pipe2 (which also uses "tk2_matmul_kblock") so IR dumps don't collide.
+    let mut b = Builder::new("tk2_matmul_clustered");
 
     let c = b.global::<F32>(m * n);
     let a = b.global::<BF16>(m * k);
@@ -408,9 +409,9 @@ fn kblock_impl(
         )
         .cluster(Mem::builder().prefetch([0]).gathers([0]).build()) // C0: load A, gather slice 0
         .cluster(mma(0)) // C1
-        .cluster(Mem::builder().gathers([1]).build()) // C2
+        .cluster(Mem::builder().gathers([1, 2]).build()) // C2: lead slice 2 (3-cluster read latency to hide, per HK)
         .cluster(mma(1)) // C3
-        .cluster(Mem::builder().prefetch([1]).gathers([2, 3]).build()) // C4: load B (HK split), gather 2,3
+        .cluster(Mem::builder().prefetch([1]).gathers([3]).build()) // C4: load B (HK split), gather slice 3 only
         .cluster(mma(2)) // C5
         .cluster(Mem::builder().commit(true).build()) // C6
         .cluster(mma(3)) // C7

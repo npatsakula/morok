@@ -141,6 +141,24 @@ impl<H: Hooks> ClusterCx<'_, H> {
         if self.bare_seals { self.b.bare_barrier(body, deps) } else { self.b.barrier(body, deps) }
     }
 
+    /// **Enter a memory cluster at issue-priority 0** — HK's ping-pong steering. The co-resident
+    /// LOADING warp-row must yield SIMD issue to the COMPUTE row during its memory phase. But the
+    /// compute cluster's trailing `set_prio(0)` ([`Self::compute`]) is anchored on the 32-MFMA result
+    /// values, so when LLVM slides that run across the (independent, deferred) commit the AMDGPU
+    /// setprio-merge pass drops it — the memory phase stays stuck at prio 1 and the loading wave steals
+    /// SIMD issue from the compute wave (the real cause of the ~46% MFMA-util, misread as barrier-bound).
+    /// A `set_prio(0)` anchored on this cluster's `entry` (the preceding barrier) and routed INTO `entry`
+    /// sits inside the memory phase — not adjacent to any `set_prio(1)`, so it survives the merge — and
+    /// the mem ops depending on it keep it live (no DCE). Skipped at the loop-top mem cluster (empty
+    /// `entry`, no raised priority yet). Pure issue-priority hint: bit-exact.
+    pub(crate) fn mem_prio0(&mut self) {
+        if self.entry.is_empty() {
+            return;
+        }
+        let p0 = self.b.set_prio(0, &self.entry).dep();
+        self.entry.push(p0);
+    }
+
     /// The **prefetch** safe op = the `if mc.prefetch && Some(kn)=k_next { reg = ... }` arm: stage
     /// block k+1 global→VGPR (steady only — a no-op when `k_next` is `None`, e.g. epilogue/resident).
     pub(crate) fn prefetch(&mut self, tiles: &[usize]) {
@@ -199,11 +217,25 @@ impl<H: Hooks> ClusterCx<'_, H> {
                 // MFMAs of latency, so this drain is ~free; draining them early leaves NO read-drain
                 // between the commit and the shadowing cluster → the C7-tail write-drain finally defers.
                 // This is HK's WAR-guard drain (hk.dis 0x2830), and it IS the read-before-overwrite WAR.
-                let rd = self.b.swait_lgkmcnt(self.all_gathers[last]);
+                // Anchor the read-drain on the PRIOR COMPUTE cluster's barrier (C5's `bar5`), not the
+                // gathers — so `lgkmcnt(0)` (which drains ALL outstanding reads regardless of anchor)
+                // is POSITIONED after C5's 32-MFMA run, exactly as the clone (hk/gemm.rs:279
+                // `s_waitcnt_lgkmcnt(bar5)`). Anchored on the gathers it could float up before C5's run.
+                let rd_anchor = self.tail_barrier.unwrap_or(self.all_gathers[last]);
+                let rd = self.b.swait_lgkmcnt(rd_anchor);
                 // The WAR drain (`lgkmcnt(0)`) also clears the bare-seal pending drain — it covers every
                 // outstanding gather read, so the shadowing compute cluster (HK's C7) needs no drain.
                 self.undrained = false;
-                let deps: Vec<TileId> = self.all_gathers[..last].to_vec();
+                let mut deps: Vec<TileId> = self.all_gathers[..last].to_vec();
+                // **C5→C6 WALL** (the ~55 TF fix): order the commit's WAR seal AFTER the prior compute
+                // cluster's barrier (`self.entry`, C5's tail). Without this edge the commit depends ONLY on
+                // the gathers, so LLVM slides C5's 32-MFMA run across the independent commit — dragging
+                // C5's `set_prio(0)` (anchored on the MFMA results) adjacent to C7's `set_prio(1)`, where
+                // the AMDGPU merge pass deletes BOTH, leaving the memory phase stuck at prio 1 (the loading
+                // wave then steals SIMD issue from the compute wave = the misdiagnosed "barrier-bound"). The
+                // clone anchors its C6 drain on `bar5` for exactly this (hk/gemm.rs:279). Also makes the
+                // mem-cluster `set_prio(0)` (`mem_prio0`) live — the seal now consumes it, so it can't DCE.
+                deps.extend_from_slice(&self.entry);
                 self.seal(rd, &deps)
             } else {
                 let deps: Vec<TileId> = self.all_gathers[1..].to_vec();
@@ -379,6 +411,7 @@ pub(crate) struct Mem {
 
 impl<H: Hooks> Cluster<H> for Mem {
     fn build(&self, cx: &mut ClusterCx<H>) {
+        cx.mem_prio0(); // drop issue-priority to 0 for this memory phase (HK ping-pong steering)
         if !self.prefetch.is_empty() {
             cx.prefetch(&self.prefetch);
         }
