@@ -4,4 +4,3 @@ mod device;
 mod hk_ir;
 mod lower;
 mod pass;
-mod schedule;

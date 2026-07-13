@@ -130,9 +130,6 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     // ── per-cluster (reset by the driver before each cluster) ──
     this_gathers: Vec<TileId>,
     sealed: bool,
-    /// A commit deferred its drain (AsmDeferred): the next compute cluster (C7) emits the manual
-    /// `lgkmcnt(0)` at its tail and populates `raw_next`. Reset false at the start of each body pass.
-    pending_drain: bool,
 }
 
 impl<H: Hooks> ClusterCx<'_, H> {
@@ -364,42 +361,19 @@ impl<H: Hooks> ClusterCx<'_, H> {
         self.prev_store = stores.iter().map(|e| e.dep()).collect();
         self.first_compute = false;
         let prio0 = self.b.set_prio(0, &new_ids).dep();
-        // If a commit (C6) deferred its drain to this compute cluster (C7), emit the manual `lgkmcnt(0)`
-        // HERE — ordered after this cluster's last MFMA store, so it lands past the 32 MFMAs (hidden) and
-        // BEFORE the tail barrier. The tail barrier then fences the DRAIN, and its dep becomes the deferred
-        // LDS-RAW carry (`raw_next`): the next iteration's gather reads only after the drained barrier.
-        let bar = if self.pending_drain {
-            // Pin the deferred write-drain AFTER the whole 32-MFMA cluster — HK's `sched_barrier`-pinned
-            // drain, the one hint LLVM's machine scheduler actually honours. A compute cluster has no LDS
-            // stores in the loop body (its MFMAs write register accumulators), so `lgkmcnt` can take no
-            // dependency on them and the drain — a bare asm sideeffect — otherwise floats to the C6→C7
-            // boundary (0-MFMA shadow). A `sched.barrier(0)` anchored on ALL 32 MFMA RESULTS floats to
-            // just past the cluster (its data-deps) AND forbids the scheduler hoisting the drain across
-            // it, so the manual `lgkmcnt` lands past the 32 MFMAs: HK's [bare barrier → 32 mfma → drain].
-            let fence = self.b.sched_fence(0, &new_ids);
-            let sw = self.b.swait_lgkmcnt(fence.dep());
-            let mut deps = self.prev_store.clone();
-            deps.push(prio0);
-            let bar = self.seal(sw, &deps).dep();
-            self.raw_next = Some(bar);
-            self.pending_drain = false;
-            bar
-        } else {
-            // MFMA-cluster TRAILING pin (§5c ISA fix): a `sched.barrier(0)` on ALL 32 MFMA RESULTS, so
-            // the tail `s_barrier` cannot hoist up into the run. (The `pending_drain`/C7 branch already
-            // emits this fence for its deferred drain; this gives the other compute clusters the same.)
-            let body = stores[self.n_acc - 1];
-            let mut deps: Vec<TileId> = self.prev_store[..self.n_acc - 1].to_vec();
-            // Route `set_prio(0)` INTO the cluster's seal (clone `gemm.rs:134-136`): the barrier then
-            // happens-after the prio-drop, so on the LAST compute cluster (C7 — whose `entry` no later
-            // cluster consumes) the `s_setprio 0` is kept live by the carried tail barrier instead of
-            // being DCE'd. Without this the loop-back memory phase stays at prio 1 (steering lost).
-            deps.push(prio0);
-            if self.pin_mfma {
-                deps.push(self.b.sched_fence(0, &new_ids).dep());
-            }
-            self.seal(body, &deps).dep()
-        };
+        // MFMA-cluster TRAILING pin (§5c ISA fix): a `sched.barrier(0)` on ALL 32 MFMA RESULTS, so the
+        // tail `s_barrier` cannot hoist up into the run.
+        let body = stores[self.n_acc - 1];
+        let mut deps: Vec<TileId> = self.prev_store[..self.n_acc - 1].to_vec();
+        // Route `set_prio(0)` INTO the cluster's seal (clone `gemm.rs:134-136`): the barrier then
+        // happens-after the prio-drop, so on the LAST compute cluster (C7 — whose `entry` no later
+        // cluster consumes) the `s_setprio 0` is kept live by the carried tail barrier instead of
+        // being DCE'd. Without this the loop-back memory phase stays at prio 1 (steering lost).
+        deps.push(prio0);
+        if self.pin_mfma {
+            deps.push(self.b.sched_fence(0, &new_ids).dep());
+        }
+        let bar = self.seal(body, &deps).dep();
         self.tail_barrier = Some(bar);
         self.entry = vec![bar, prio0];
         self.sealed = true;
@@ -523,7 +497,6 @@ fn run_body<H: Hooks>(
         undrained: Vec::new(),
         this_gathers: Vec::new(),
         sealed: false,
-        pending_drain: false,
     };
     for cluster in clusters {
         cx.this_gathers.clear();

@@ -333,25 +333,16 @@ impl<E: Elem> LdsStage<E> {
         // VGPR). soffset + voffset reproduce the FLAT `goff = (origin+r)·K + k_base + c` (in bytes), but
         // with NO per-iteration 64-bit VGPR address — the load no longer parks on a `v_add` dependency.
         let item_c = b.idx_const(E::dtype().bytes() as i64);
-        // MUBUF prefetch (HK's `buffer_load` over FLAT `global_load`): the buffer base lives in the SGPR
-        // `srsrc` descriptor, and the per-element byte offset rides in `voffset` (`soffset = 0`).
-        //
-        // Two forms, selected by `SVOD_ADV_BASE` (build-time env, host-side): the **advancing base**
-        // (HK's exact scheme, the perf form) folds the workgroup-uniform `(origin·K + k_base)` into the
-        // descriptor base — uniform + loop-variant ⇒ an SGPR advanced per K-tile by a scalar `s_add`,
-        // leaving `voffset = (r·K + c)` per-lane and LOOP-INVARIANT (no per-iteration VGPR address, so the
-        // load never parks on a `v_add`). The default **fixed base** (`base_off = 0`, whole offset in
-        // `voffset`) is bit-exact-safe but keeps a per-iteration VGPR `voffset` (no stall win). The
-        // advancing form's schedule shift exposes the async-LDS ping-pong race, so it is gated behind the
-        // last-gather drain (the commit must not overwrite the single LDS buffer while the lagging
-        // warp-row's gather ds_reads are still in flight).
-        let advancing = std::env::var("SVOD_ADV_BASE").is_ok();
-        let base_off = if advancing {
-            let orig_k = b.idx_mul(self.origin, gstride); // origin·K
-            b.idx_add(orig_k, k_base) // origin·K + k_base — uniform ⇒ SGPR s_add
-        } else {
-            b.idx_const(0)
-        };
+        // MUBUF prefetch (HK's `buffer_load` over FLAT `global_load`) with the **advancing base** (HK's
+        // exact scheme): fold the workgroup-uniform `(origin·K + k_base)` into the descriptor base —
+        // uniform + loop-variant ⇒ an SGPR advanced per K-tile by a scalar `s_add`, leaving
+        // `voffset = (r·K + c)` per-lane and LOOP-INVARIANT (no per-iteration 64-bit VGPR address, so the
+        // load never parks on a `v_add` dependency — the +20% over a fixed base with the whole offset in
+        // `voffset`). Safe under the ping-pong overlap because the asm-opaque gather/commit pins the LDS
+        // reads and the commit's last-gather `lgkmcnt(0)` read-drain completes them before the single-buffer
+        // overwrite (the compiler-visible variant that could not honour that ordering was retired).
+        let orig_k = b.idx_mul(self.origin, gstride); // origin·K
+        let base_off = b.idx_add(orig_k, k_base); // origin·K + k_base — uniform ⇒ SGPR s_add
         let rsrc = b.make_buffer_rsrc(self.src, base_off);
         let mut out = Vec::with_capacity(self.epl / VEC);
         for cg in 0..self.epl / gvec {
@@ -359,17 +350,9 @@ impl<E: Elem> LdsStage<E> {
             let flat = b.idx_add(lane_epl, ec); // gvec-aligned chunk start (stays in one row)
             let r = b.idx_div(flat, cols_c);
             let c = b.idx_mod(flat, cols_c);
-            let goff = if advancing {
-                // Within-tile per-lane element offset r·K + c (loop-invariant; origin+k_base ride the base).
-                let rk = b.idx_mul(r, gstride);
-                b.idx_add(rk, c)
-            } else {
-                // Full per-lane offset ((origin+r)·K + k_base + c) — byte-identical to the shipped form.
-                let grow = b.idx_add(self.origin, r);
-                let goff = b.idx_mul(grow, gstride);
-                let goff = b.idx_add(goff, k_base);
-                b.idx_add(goff, c)
-            };
+            // Within-tile per-lane element offset r·K + c (loop-invariant; origin+k_base ride the base).
+            let rk = b.idx_mul(r, gstride);
+            let goff = b.idx_add(rk, c);
             let voff = b.idx_mul(goff, item_c);
             let wide = b.buffer_load_raw(rsrc, voff, gvec, order); // ONE b128 (or b64) MUBUF load
             for h in 0..gvec / VEC {

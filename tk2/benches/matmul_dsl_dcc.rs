@@ -1,27 +1,20 @@
-//! SCRATCH bench — DCC / delta-color-compression inflation of tk2's **DSL** matmul kernels
-//! (`matmul_lds_kblock_mw_pipe2` + `matmul_lds_kblock_mw_clustered`, the production 256²
-//! config bm=128/bn=64/wm=2/wn=4/k_step=64, 8 warps) at square N ∈ {4096, 8192} under THREE
-//! input-data fills:
+//! SCRATCH bench — DCC / delta-color-compression inflation of tk2's **DSL** matmul kernel
+//! (`matmul_lds_kblock_mw_clustered`, the production 256² config bm=128/bn=64/wm=2/wn=4/k_step=64,
+//! 8 warps) at square N ∈ {4096, 8192} under THREE input-data fills:
 //!   * `u01`  — uniform [0,1) bf16 (`rand_with`); all-positive ⇒ low-variance C ⇒ inflated.
 //!   * `sym`  — centered [-1,1) bf16 (`2*x - 1`); honest signed data (the number to trust).
 //!   * `ones` — all 1.0 bf16 (constant C ⇒ maximally DCC-compressible output).
 //!
-//! Both kernels output **F32** C (A·Bᵀ, B stored [N,K]). Every (kernel, N, fill) is
-//! correctness-gated (allclose vs an f32 reference over the SAME bf16-rounded operands).
-//! The bit-exact `clustered` kernel is HARD-gated (a failure aborts the bench). The `pipe2`
-//! kernel carries a documented ping-pong wave-barrier race (MEMORY:
-//! "pipe2 race = ping-pong wave_barrier") that centered `sym` data exposes but the
-//! large-magnitude `u01` tolerance hides — so it is SOFT-gated (the race is reported with
-//! its max abs err, and the production kernel's throughput is still measured; its timing is
-//! race-independent). Device time via `common::plan_gpu_ns` (PM4 HW stamps) — explicit MIN
-//! over replays printed per row, plus criterion's `bench_plan`.
+//! The kernel outputs **F32** C (A·Bᵀ, B stored [N,K]). Every (N, fill) is correctness-gated
+//! (allclose vs an f32 reference over the SAME bf16-rounded operands). The bit-exact `clustered`
+//! kernel is HARD-gated (a failure aborts the bench). Device time via `common::plan_gpu_ns`
+//! (PM4 HW stamps) — explicit MIN over replays printed per row, plus criterion's `bench_plan`.
 //!
 //! Run: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk2 --bench matmul_dsl_dcc`
 //!
 //! The rig that answered DESIGN.md's "re-measure the DSL @8192 on [-1,1]" question: honest
 //! `sym` DSL is ~473 TF, FLAT with N, vs tk-asm ~639 @8192 — the ~1.4× gap HOLDS and widens
-//! at scale, and `pipe2` (ping-pong) ties `clustered` on speed while soft-failing correctness.
-//! See `tk2/DESIGN.md` (2026-07-12).
+//! at scale. See `tk2/DESIGN.md` (2026-07-12).
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use svod_dtype::DType;
@@ -32,9 +25,7 @@ use svod_tensor::testing::allclose_f32;
 mod common;
 use common::{bench_plan, plan_gpu_ns, requirements_met};
 
-use svod_tk2::{
-    Program, SwizzlePass, VectorizePass, graph_kernel, matmul_lds_kblock_mw_clustered, matmul_lds_kblock_mw_pipe2,
-};
+use svod_tk2::{Program, SwizzlePass, VectorizePass, graph_kernel, matmul_lds_kblock_mw_clustered};
 
 /// The env-selected device (`SVOD_DEVICE`, else default) — same source as `common::rand_bf16`.
 fn dev() -> svod_dtype::DeviceSpec {
@@ -80,17 +71,15 @@ impl Fill {
     }
 }
 
-/// The two DSL matmul kernels under test (both output F32 C, the production 256² config).
+/// The DSL matmul kernel under test (outputs F32 C, the production 256² config).
 #[derive(Clone, Copy)]
 enum Kernel {
-    Pipe2,
     Clustered,
 }
 
 impl Kernel {
     fn name(self) -> &'static str {
         match self {
-            Kernel::Pipe2 => "pipe2",
             Kernel::Clustered => "clustered",
         }
     }
@@ -98,19 +87,15 @@ impl Kernel {
     /// bm=128, bn=64, wm=2, wn=4, k_step=64 ⇒ 256×256 tile, 8 warps — the production config.
     fn build(self, n: usize) -> Program {
         match self {
-            Kernel::Pipe2 => {
-                matmul_lds_kblock_mw_pipe2(n, n, n, 128, 64, 2, 4, 64).apply(VectorizePass).apply(SwizzlePass)
-            }
             Kernel::Clustered => {
                 matmul_lds_kblock_mw_clustered(n, n, n, 128, 64, 2, 4, 64).apply(VectorizePass).apply(SwizzlePass)
             }
         }
     }
 
-    /// The bit-exact `clustered` kernel HARD-gates (abort on correctness fail). `pipe2` carries
-    /// a documented ping-pong race, so it soft-gates (report, keep measuring).
+    /// The bit-exact `clustered` kernel HARD-gates (abort on correctness fail).
     fn hard_gate(self) -> bool {
-        matches!(self, Kernel::Clustered)
+        true
     }
 }
 
@@ -211,7 +196,7 @@ fn bench_matmul_dsl_dcc(c: &mut Criterion) {
             // Kernel computes C = A·Bᵀ (B stored [N,K]) ⇒ reference transposes B.
             let expected = reference(&a, &b.try_transpose(0, 1).expect("Bᵀ for A·Bᵀ reference"));
 
-            for kernel in [Kernel::Pipe2, Kernel::Clustered] {
+            for kernel in [Kernel::Clustered] {
                 let label = format!("{}_{}_n{}", kernel.name(), fill.name(), n);
                 let prog = kernel.build(n);
                 let (y, plan) = plan_of(prog, n, n, &a, &b);
@@ -262,25 +247,17 @@ fn bench_matmul_dsl_dcc(c: &mut Criterion) {
 
     eprintln!("\n[DCC] ---- HONEST (sym) TF + inflation factors ----");
     for &n in &[4096usize, 8192] {
-        for k in ["pipe2", "clustered"] {
+        for k in ["clustered"] {
             if let (Some(u), Some(s), Some(o)) = (get(k, n, "u01"), get(k, n, "sym"), get(k, n, "ones")) {
                 eprintln!("[DCC] {k:>9} N={n}: sym={s:6.1}TF  u01={u:6.1}({:.3}x)  ones={o:6.1}({:.3}x)", u / s, o / s);
             }
         }
     }
 
-    eprintln!("\n[DCC] ---- faster DSL kernel (by honest sym) ----");
-    for &n in &[4096usize, 8192] {
-        if let (Some(p), Some(cl)) = (get("pipe2", n, "sym"), get("clustered", n, "sym")) {
-            let (win, fast, slow) = if p >= cl { ("pipe2", p, cl) } else { ("clustered", cl, p) };
-            eprintln!("[DCC] N={n}: {win} faster — {fast:.1} vs {slow:.1} TF ({:.3}x)", fast / slow);
-        }
-    }
-
     eprintln!("\n[DCC] ---- honest-best DSL vs landmarks (tk-asm / HK) ----");
     let landmarks = [(4096usize, 631.0, 520.0), (8192usize, 639.0, 613.0)];
     for (n, tkasm, hk) in landmarks {
-        let best = [get("pipe2", n, "sym"), get("clustered", n, "sym")].into_iter().flatten().fold(0.0, f64::max);
+        let best = get("clustered", n, "sym").unwrap_or(0.0);
         if best > 0.0 {
             eprintln!(
                 "[DCC] N={n}: best-DSL sym={best:.1}TF | tk-asm={tkasm:.0} (DSL/tk-asm={:.3}, tk-asm/DSL={:.3}x) | HK={hk:.0} (DSL/HK={:.3})",

@@ -2,7 +2,7 @@
 //! banded/contract-checked pipeline, and the Elevate strategy combinators.
 
 use crate::ir::{TileId, TileIr};
-use crate::kernels::{Program, matmul_lds_kblock_mw_pipe2};
+use crate::kernels::{Program, matmul_lds_kblock_mw_clustered};
 use crate::pass::{
     AsStrategy, Band, Fail, Id, IdentityFold, IdentityPass, Pass, PassError, Pipeline, Strategy, fold, or_else,
     repeat_fixpoint, seq, top_down, try_,
@@ -11,7 +11,7 @@ use crate::pass::{
 /// A small kept-kernel program — a generic `Program` fixture for the pass-runner scaffold tests
 /// (which assert only pass-runner behaviour, not kernel semantics).
 fn fixture() -> Program {
-    matmul_lds_kblock_mw_pipe2(64, 64, 128, 64, 64, 1, 1, 64)
+    matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64)
 }
 
 /// A no-op pass in a chosen band (for band-ordering tests).
