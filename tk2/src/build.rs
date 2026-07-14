@@ -908,6 +908,13 @@ impl Builder {
         Val::wrap(self.ir.intern(Node::Mma { a: a.id, b: b.id, c: c.id, ept, asm: true }))
     }
 
+    /// The **shape-generic asm** MFMA — the [`Self::mma_of`] twin forcing the VGPR `=v,v,v,0` form (0
+    /// AGPR, 0 acc-copies). The FA accumulator path: the MFMA writes plain VGPRs the next `exp2`/`max`
+    /// reads in place (aiter's "no accumulator shuffle"), the enabling condition for softmax-under-MFMA.
+    pub fn mma_asm_of<S: crate::shape::MfmaShape>(&mut self, a: Val<BF16>, b: Val<BF16>, c: Val<F32>) -> Val<F32> {
+        self.mma_asm(a, b, c, S::EPT_C)
+    }
+
     /// A fragment handle re-bound to observe `deps` (the post-loop carried read:
     /// `acc.after([end])`), symmetric with [`Self::reg_after`].
     pub fn frag_after<E: Elem>(&mut self, f: Frag<E>, deps: &[TileId]) -> Frag<E> {

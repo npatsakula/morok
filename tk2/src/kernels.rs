@@ -131,10 +131,15 @@ pub(crate) fn load_op_frag(
 /// computes `C = A·Bᵀ` (`A[m,k]`, `B[n,k]`, both K-contiguous) tiled as `(m/32)×(n/32)` output blocks,
 /// each ONE `v_mfma_f32_32x32x8_bf16` per K-slice accumulated over the `k/8` slices, then scatters the
 /// 16-VGPR accumulator via [`Builder::acc_rc`]. It PROVES the 32×32×8 operand layout + accumulator
-/// distribution + intrinsic IN ISOLATION (device-gated allclose vs an f32 reference) before any FA
-/// work — the wide-core analog of `atb_probe`. `m`/`n` multiples of 32, `k` a multiple of 8.
+/// distribution IN ISOLATION (device-gated allclose vs an f32 reference) before any FA work — the
+/// wide-core analog of `atb_probe`. `m`/`n` multiples of 32, `k` a multiple of 8.
+///
+/// `asm` selects the emission: `false` = the intrinsic ([`Builder::mma_of`], AGPR-default accumulator);
+/// `true` = the VGPR `=v,v,v,0` inline-asm form ([`Builder::mma_asm_of`], 0 AGPR / 0 acc-copies) — the
+/// FA-accumulator prerequisite (softmax reads the scores in-place). The gate runs BOTH: the asm form's
+/// bit-exactness against the intrinsic proves the 32×32×8 asm renderer (never validated on device).
 #[allow(clippy::needless_range_loop)]
-pub fn mfma_32x32x8_probe(m: usize, n: usize, k: usize) -> Program {
+pub fn mfma_32x32x8_probe(m: usize, n: usize, k: usize, asm: bool) -> Program {
     use crate::shape::Mfma32x32x8Bf16 as S;
     assert!(
         m.is_multiple_of(S::M) && n.is_multiple_of(S::N) && k.is_multiple_of(S::K),
@@ -163,7 +168,7 @@ pub fn mfma_32x32x8_probe(m: usize, n: usize, k: usize) -> Program {
             for ki in 0..k / S::K {
                 let af = load_op_frag(&mut b, a, a_map, mi * S::M, ki * S::K, k, lane);
                 let bf = load_op_frag(&mut b, bmat, b_map, ni * S::N, ki * S::K, k, lane);
-                acc = b.mma_of::<S>(af, bf, acc);
+                acc = if asm { b.mma_asm_of::<S>(af, bf, acc) } else { b.mma_of::<S>(af, bf, acc) };
             }
             // Scatter the 16-VGPR accumulator: element `i` → C[mi·32 + row, ni·32 + col] via acc_rc.
             for i in 0..S::EPT_C {

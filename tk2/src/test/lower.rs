@@ -130,11 +130,13 @@ fn fa_forward_on_clustercx_lowers_spec_valid() {
 #[test]
 fn mfma_32x32x8_probe_lowers_spec_valid() {
     for (m, n, k) in [(32usize, 32usize, 8usize), (32, 32, 16), (64, 64, 8)] {
-        let p = crate::kernels::mfma_32x32x8_probe(m, n, k);
-        // Exactly the tiled MFMA count: (m/32)·(n/32)·(k/8).
-        let n_mma =
-            (0..p.ir.len()).filter(|&i| matches!(p.ir.node(crate::ir::TileId(i as u32)), Node::Mma { .. })).count();
-        assert_eq!(n_mma, (m / 32) * (n / 32) * (k / 8), "probe {m}×{n}×{k} MFMA count");
-        lower::verify(&p).expect("32×32×8 probe must lower to spec-valid UOp");
+        for asm in [false, true] {
+            let p = crate::kernels::mfma_32x32x8_probe(m, n, k, asm);
+            // Exactly the tiled MFMA count: (m/32)·(n/32)·(k/8).
+            let n_mma =
+                (0..p.ir.len()).filter(|&i| matches!(p.ir.node(crate::ir::TileId(i as u32)), Node::Mma { .. })).count();
+            assert_eq!(n_mma, (m / 32) * (n / 32) * (k / 8), "probe {m}×{n}×{k} MFMA count");
+            lower::verify(&p).expect("32×32×8 probe must lower to spec-valid UOp");
+        }
     }
 }
