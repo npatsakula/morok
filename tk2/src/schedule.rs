@@ -15,7 +15,7 @@
 //! `matmul_lds_kblock_mw_pipe2` authors HipKittens' 8-cluster dot-slice pipeline over this DSL.
 
 use crate::build::{Builder, Effect, Elem, F32, Frag, Idx, Val};
-use crate::ir::{FragMap, TileId};
+use crate::ir::{FragMap, Node, TileId, TileIr};
 use crate::movement::LdsView;
 
 // ══════════════════════════ tokens (move-only value-flow) ══════════════════════════
@@ -165,23 +165,35 @@ impl<E: Elem> TilePool<E> {
 
 // ══════════════════════════════ cluster scopes (typestate) ══════════════════════════════
 //
-// A cluster is one of two KINDS, and the kind is a TYPE, not a runtime flag. `MemScope` (loads /
-// stores / gathers) exposes the memory-side scheduling primitives — the load-pin `fence` and the
-// `drain_lgkm`; `ComputeScope` (the MFMA grid) exposes ONLY the `set_prio` bracket. So `set_prio`
-// on a memory cluster or a load-pin on a compute cluster is a *compile* error, not a convention —
-// the exact "scheduling can attach anywhere" hole in the untyped `crate::pipeline`. Both deref to
-// `&mut Builder` so the kernel-specific movement handles (`LdsView`/`LdsStage`) work unchanged;
-// only the SCHEDULING surface is gated by kind.
+// A cluster is one of two KINDS, and the kind is a TYPE, not a runtime flag. The kind gates the
+// **seal vocabulary** — the FA-redesign §2.2 correctness/scheduling SPLIT:
+//
+//   CORRECTNESS (hard — a dropped one is a silent wrong answer)
+//     · `MemScope::seal_fence`   — the acq-rel `s_barrier` (`Node::Barrier`, implicit `lgkmcnt(0)`):
+//        the K/V LDS RAW/WAR fence. The ONE seal that guards real cross-wave shared-LDS traffic.
+//     · `MemScope::rendezvous`   — the bare `s_barrier` metronome (`Node::BareBarrier`): a workgroup
+//        rendezvous with NO acq-rel fence — the two-warp-group phase-lock carrier.
+//   SCHEDULING (soft — a dropped one costs perf, never correctness; emits NO instruction)
+//     · `ComputeScope::seal_ordering` — a pure `Node::After` combine (ZERO instructions): the
+//        MFMA-grid seal is scheduling-TRANSPARENT, so the softmax VALU/exp interleave under the
+//        MFMAs is not walled. The accumulator RAW is carried per-slot (the store edge), NOT here.
+//     · `ComputeScope::interleave_valu` / `interleave_exp` — the `sched_group_barrier` ratio hint.
+//     · `ComputeScope::set_prio` — the `s_setprio` MFMA-burst priority.
+//
+// So a `set_prio`/interleave on a memory cluster or a `seal_fence` on a compute cluster is a
+// *compile* error, not a convention — the exact "scheduling can attach anywhere" hole in the
+// untyped `crate::pipeline`. Both deref to `&mut Builder` so the movement handles work unchanged.
 
-/// A **memory cluster scope** — loads/stores/gathers. Exposes the memory-side scheduling
-/// primitives (`fence` load-pin, `drain_lgkm`) and the cluster `seal`; NOT `set_prio` (that is
-/// compute-only). Derefs to `&mut Builder` for the movement handles.
+/// A **memory cluster scope** — loads/stores/gathers. Exposes the memory-side correctness seals
+/// (`seal_fence` LDS-RAW/WAR, `rendezvous` metronome) + the load-pin `fence`/`drain_lgkm`; NOT the
+/// compute scheduling surface. Derefs to `&mut Builder` for the movement handles.
 pub struct MemScope<'b> {
     b: &'b mut Builder,
 }
 
-/// A **compute cluster scope** — the MFMA grid. Exposes ONLY the `set_prio` bracket + the `seal`;
-/// no load-pin or drain (those are memory-side). Derefs to `&mut Builder` for `mma`/frag ops.
+/// A **compute cluster scope** — the MFMA grid. Exposes ONLY the scheduling surface (`seal_ordering`,
+/// `interleave_valu`/`interleave_exp`, `set_prio`); no LDS fence (that is memory-side). Derefs to
+/// `&mut Builder` for `mma`/frag ops.
 pub struct ComputeScope<'b> {
     b: &'b mut Builder,
 }
@@ -199,19 +211,26 @@ macro_rules! deref_to_builder {
                 self.b
             }
         }
-        impl<'b> $scope<'b> {
-            /// **Seal the cluster** with the workgroup `s_barrier` boundary. `body` is the last op
-            /// before the barrier; `deps` are additional edges. Returns the barrier effect.
-            pub fn seal(&mut self, body: Effect, deps: &[TileId]) -> Effect {
-                self.b.barrier(body, deps)
-            }
-        }
     };
 }
 deref_to_builder!(MemScope);
 deref_to_builder!(ComputeScope);
 
 impl<'b> MemScope<'b> {
+    /// The **LDS-RAW/WAR correctness seal** — the acq-rel `s_barrier` (`Node::Barrier`): its implicit
+    /// `lgkmcnt(0)` fences the K/V fill before the next gather reads it. The one seal that guards real
+    /// cross-wave shared-LDS traffic. `body` is the last store; `deps` the additional edges.
+    pub fn seal_fence(&mut self, body: Effect, deps: &[TileId]) -> Effect {
+        self.b.barrier(body, deps)
+    }
+
+    /// The **two-warp-group metronome** — a bare `s_barrier` (`Node::BareBarrier`, no acq-rel fence):
+    /// a pure workgroup rendezvous that phase-locks the two stagger groups. Correctness (LDS ordering)
+    /// is supplied separately by `drain_lgkm` at the RAW/WAR points — this only rendezvouses.
+    pub fn rendezvous(&mut self, body: Effect, deps: &[TileId]) -> Effect {
+        self.b.bare_barrier(body, deps)
+    }
+
     /// A **scheduler fence** (`sched_barrier(mask)`) — the load-pin: forbids the machine scheduler
     /// sinking a prefetch load down to the commit's `vmcnt(0)` wait. Memory-cluster-only.
     pub fn fence(&mut self, mask: i64, anchors: &[TileId]) -> Effect {
@@ -226,6 +245,27 @@ impl<'b> MemScope<'b> {
 }
 
 impl<'b> ComputeScope<'b> {
+    /// The **scheduling-transparent seal** — a pure `Node::After` ordering combine (ZERO instructions):
+    /// the MFMA grid's cluster boundary, folding `body` (the last acc store) + `deps` into one token so
+    /// the carry threads on, but emitting NO `s_barrier`/wall — so LLVM is free to interleave the softmax
+    /// VALU/exp under the MFMAs. The accumulator RAW is carried per-slot (the store edge), not by this.
+    pub fn seal_ordering(&mut self, body: Effect, deps: &[TileId]) -> Effect {
+        self.b.combine(body, deps)
+    }
+
+    /// The **interleave ratio** (`sched_group_barrier`): `pairs`×{ 1 MFMA, then `valu` VALU } in
+    /// scheduling group `group` — the softmax reduction VALU folded under the MFMA. Returns the final
+    /// hint effect to thread onward (keeps it live). Compute-cluster-only.
+    pub fn interleave_valu(&mut self, pairs: u32, valu: u32, group: i64, anchors: &[TileId]) -> Option<Effect> {
+        self.b.interleave_valu(pairs, valu, group, anchors)
+    }
+
+    /// The **exp interleave** (`sched_group_barrier`): `pairs`×{ 1 MFMA, then `exp` transcendental } —
+    /// the softmax `exp2` folded under the P·V MFMA. Compute-cluster-only.
+    pub fn interleave_exp(&mut self, pairs: u32, exp: u32, group: i64, anchors: &[TileId]) -> Option<Effect> {
+        self.b.interleave_exp(pairs, exp, group, anchors)
+    }
+
     /// **Wave priority** (`s_setprio`) — bracket the MFMA run so the compute wave wins SIMD issue
     /// slots over the co-resident loading wave. `level=1` before the run, `level=0` after.
     /// Compute-cluster-only: a memory cluster has no `set_prio`.
@@ -388,14 +428,143 @@ pub fn pipeline(
     out
 }
 
+// ══════════════════════════════ verify_v2 (scheduling coherence) ══════════════════════════════
+
+/// **Scheduling-coherence verifier** (FA-redesign §2.6) — the teeth of the correctness/scheduling
+/// split, run at kernel build alongside `pipeline`'s carry-completeness + wave-phase-balance checks.
+/// Three structural checks over the reachable DAG guarantee that **deleting every scheduling hint
+/// leaves a still-correct kernel** (so §5 perf work can never change numerics):
+/// - **setprio balance**: every `s_setprio(1)` has a matching reachable `s_setprio(0)` — a wave stuck
+///   at raised priority starves its ping-pong partner (`crate::pipeline` fixes this bug by hand).
+/// - **interleave sanity**: per scheduling group, Σ `sched_group_barrier(MFMA).size` ≤ the MFMA count
+///   emitted — an over-promise means LLVM silently drops the tail hints (a wrong interleave, not a
+///   crash). A necessary whole-kernel bound (cluster tags are not in the IR).
+/// - **hint purity**: no value-bearing node (`meta.dtype.is_some()`) consumes a scheduling hint
+///   (`SchedGroupBarrier`/`SetPrio`/`SchedFence`) as a child — so removing every hint changes no
+///   computed value. (The typed `Builder` already enforces this — `Effect` ≠ `Val`; this is the
+///   defense-in-depth structural proof.)
+///
+/// A build-time panic (a kernel-authoring bug, not recoverable), matching the carry verifiers.
+pub(crate) fn verify_v2(ir: &TileIr, roots: &[TileId]) {
+    let mut reach: std::collections::HashSet<TileId> = std::collections::HashSet::new();
+    for &r in roots {
+        reach.extend(crate::passes::reachable(ir, r));
+    }
+    let is_hint =
+        |n: &Node| matches!(n, Node::SchedGroupBarrier { .. } | Node::SetPrio { .. } | Node::SchedFence { .. });
+
+    // (1) setprio balance.
+    let prio = |lvl: i64| {
+        reach.iter().filter(|&&id| matches!(ir.node(id), Node::SetPrio { level, .. } if *level == lvl)).count()
+    };
+    let (p1, p0) = (prio(1), prio(0));
+    assert_eq!(
+        p1, p0,
+        "s_setprio unbalanced (prio1: {p1}, prio0: {p0}) — a wave stuck at raised priority starves its partner"
+    );
+
+    // (2) interleave sanity: per group, Σ MFMA-mask hint size ≤ MFMA count.
+    let n_mma = reach.iter().filter(|&&id| matches!(ir.node(id), Node::Mma { .. })).count();
+    let mut promised: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for &id in &reach {
+        if let Node::SchedGroupBarrier { mask, size, group, .. } = ir.node(id)
+            && *mask == Builder::SG_MFMA
+        {
+            *promised.entry(*group).or_default() += *size;
+        }
+    }
+    for (g, sum) in promised {
+        assert!(
+            sum as usize <= n_mma,
+            "interleave group {g} promises {sum} MFMAs but only {n_mma} emitted — LLVM will drop the tail hints"
+        );
+    }
+
+    // (3) hint purity: no value node consumes a hint.
+    for &id in &reach {
+        if ir.meta(id).dtype.is_some() {
+            for c in TileIr::children(ir.node(id)) {
+                assert!(
+                    !is_hint(ir.node(c)),
+                    "value node {} consumes scheduling hint {} — violates the correctness/scheduling split",
+                    id.0,
+                    c.0
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build::{BF16, Builder, F32};
+    use crate::shape::{Mfma32x32x8Bf16 as S, MfmaShape};
 
     #[test]
     fn gathered_is_move_only() {
         let g = Gathered::<crate::build::BF16> { operands: Vec::new(), edges: vec![TileId(0)] };
         let _ops = g.operands(); // consumes g
         // let _dup = g.operands(); // would not compile: borrow of moved value
+    }
+
+    /// A tiny compute cluster authored through the typed scopes — the seal-split + interleave + prio
+    /// vocabulary — must pass `verify_v2`. Proves the API composes + the coherence checks accept a
+    /// well-formed schedule BEFORE FA rides it (step 4). Two MFMAs (VGPR asm) bracketed by set_prio,
+    /// an `interleave_valu<2,5>` hint, sealed scheduling-transparently (`seal_ordering`).
+    #[test]
+    fn typed_scopes_compose_and_verify_v2() {
+        let mut b = Builder::new("tk2_scope_probe");
+        let c = b.global::<F32>(S::M * S::N);
+        let a = b.global::<BF16>(S::M * 2 * S::K);
+        let bmat = b.global::<BF16>(S::N * 2 * S::K);
+        let _wg = b.grid_axis(0, 1);
+        let lane = b.block_axis(64);
+        let (a_map, b_map, dist) = (S::a_map(), S::b_map(), S::acc_dist());
+        let mut roots = Vec::new();
+        compute_cluster(&mut b, |c_scope| {
+            let entry = c_scope.f32(0.0).id;
+            let prio1 = c_scope.set_prio(1, &[entry]).dep();
+            let mut acc = {
+                let zs: Vec<_> = (0..S::EPT_C).map(|_| c_scope.f32(0.0)).collect();
+                c_scope.vec_build(&zs)
+            };
+            for ki in 0..2 {
+                let af = crate::kernels::load_op_frag(c_scope, a, a_map, 0, ki * S::K, 2 * S::K, lane);
+                let bf = crate::kernels::load_op_frag(c_scope, bmat, b_map, 0, ki * S::K, 2 * S::K, lane);
+                acc = c_scope.mma_asm_of::<S>(af, bf, acc);
+            }
+            let hint = c_scope.interleave_valu(2, 5, 1, &[prio1]).expect("pairs>0");
+            let n_c = c_scope.idx_const(S::N as i64);
+            for i in 0..S::EPT_C {
+                let (row, col) = c_scope.acc_rc(dist, lane, i);
+                let rn = c_scope.idx_mul(row, n_c);
+                let off = c_scope.idx_add(rn, col);
+                let v = c_scope.vec_extract(acc, i);
+                roots.push(c_scope.store(c, off, v));
+            }
+            let last = *roots.last().expect("stores");
+            let prio0 = c_scope.set_prio(0, &[last.dep()]).dep();
+            let seal = c_scope.seal_ordering(last, &[prio0, hint.dep()]);
+            roots.push(seal);
+        });
+        let ids: Vec<TileId> = roots.iter().map(|e| e.dep()).collect();
+        verify_v2(&b.ir, &ids); // must accept a balanced, pure schedule
+    }
+
+    /// `verify_v2` REJECTS an unbalanced `s_setprio` (a prio-1 with no reachable prio-0) — the wave
+    /// would stay at raised priority into the loop-back memory phase, starving its partner.
+    #[test]
+    #[should_panic(expected = "s_setprio unbalanced")]
+    fn verify_v2_rejects_unbalanced_setprio() {
+        let mut b = Builder::new("t");
+        let s = b.f32(0.0);
+        let frag = b.define_frag::<F32>(crate::ir::FragMap::gfx942_16x16(true));
+        let z: Vec<_> = (0..4).map(|_| b.f32(0.0)).collect();
+        let zvec = b.vec_build(&z);
+        let store = b.store_frag_vec(frag, zvec);
+        let p1 = b.set_prio(1, &[s.id]); // prio-1, no matching prio-0
+        let root = b.combine(store, &[p1.dep()]);
+        verify_v2(&b.ir, &[root.dep()]);
     }
 }
