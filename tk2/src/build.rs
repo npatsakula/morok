@@ -560,6 +560,13 @@ impl Builder {
         Val::wrap(self.ir.intern(Node::EltwiseBinary { op, a: a.id, b: b.id }))
     }
 
+    /// **Predicated select on an index comparison**: `lo < hi ? then : els`, per element. The
+    /// ragged-tail mask primitive — FA folds an additive `-inf` where `global_kv ≥ n` so the masked
+    /// keys `exp→0`. `lo`/`hi` are index-typed; `then`/`els` are the same-dtype value branches.
+    pub fn select_lt<E: Elem>(&mut self, lo: Idx, hi: Idx, then: Val<E>, els: Val<E>) -> Val<E> {
+        Val::wrap(self.ir.intern(Node::SelectLt { lo: lo.0, hi: hi.0, then: then.id, els: els.id }))
+    }
+
     // ── elementwise unary math (the FA-forward additions — GEMM needed none) ──
     // The whole transcendental table already exists below the boundary (svod-ir's
     // `Op::Unary`); tk2 simply never surfaced it because matmul is transcendental-free.

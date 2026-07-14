@@ -14,7 +14,7 @@ use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Val};
 use crate::ir::{FragMap, TileId, TileIr};
 use crate::movement::{Drain, LdsStage, LdsView, SharedTile};
 use crate::pass::Pass;
-use crate::pipeline::{AccSlot, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
+use crate::pipeline::{AccSlot, BlockCounter, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 
 /// A finished tile-IR program: the arena, its sink root, and the kernel name.
@@ -487,7 +487,7 @@ fn kblock_impl(
                 s,
                 all_slots.clone(),
                 all_slots.clone(),
-                move |b: &mut Builder, op: Option<&MatmulOp>, reads: &[SlotVal]| {
+                move |b: &mut Builder, op: Option<&MatmulOp>, reads: &[SlotVal], _blk: BlockCounter| {
                     let (a_vecs, b_vecs) = op.expect("matmul compute consumes a gathered operand");
                     let mut out = Vec::with_capacity(ri * cj);
                     for i in 0..ri {

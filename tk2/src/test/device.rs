@@ -429,23 +429,38 @@ fn flash_attention_matches_reference_on_gfx942() {
 /// s49` P→PV relayout → padded-transposed-V P·V. `n = 128` (the unrolled-KV assembly's gate). `atol` is the
 /// tight 1e-2 the 16×16 gate uses (the honest bf16-cast error is ~2e-3; a corrupted result is rejected).
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::flash_attention32_matches --nocapture`
+///
+/// Also gates the **ragged tail** (§Step-B): the `(1, 80, …)` cases have `n=80` — NOT a KV-block (32)
+/// multiple — so the last KV block is partial and the online softmax must apply the per-element mask
+/// (`global_kv < n ? score : −∞`) or the out-of-range keys corrupt the softmax. bh=1 for the ragged
+/// cases (a padded buffer absorbs the tile-covering fill/scatter; bh>1 would need a tile-exact `n`).
 #[test]
 #[ignore]
 fn flash_attention32_matches_reference_on_gfx942() {
     use svod_tensor::testing::allclose_f32;
     let dev = svod_dtype::default_device::default_device();
-    let n = 128usize;
-    for (bh, d) in [(3usize, 64usize), (2usize, 128usize)] {
-        let mut q = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand q");
-        let mut k = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand k");
-        let mut v = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand v");
+    const Q_BLK: usize = 128; // NUM_WARPS_32 · 32 (the workgroup Q block)
+    const KV_BLK: usize = 32; // KV_BLK_32
+    // (bh, n, d): the tile-exact full cases (bh>1, n=128) + the RAGGED partial-KV-block cases (bh=1,
+    // n=80 — a partial last KV block exercising the mask at both head dims).
+    for (bh, n, d) in [(3usize, 128usize, 64usize), (2, 128, 128), (1, 80, 64), (1, 80, 128)] {
+        // The kernel's fill + scatter cover ⌈n/tile⌉·tile rows per (b,h) slice; provision the buffers to
+        // match. bh>1 needs a tile-exact `n` (per-slice stride == n); a ragged `n` runs at bh=1 (slice
+        // base 0), the padded tail holding intentional garbage the mask makes irrelevant.
+        let rows_pad = (n.div_ceil(Q_BLK) * Q_BLK).max(n.div_ceil(KV_BLK) * KV_BLK);
+        assert!(bh == 1 || rows_pad == n, "ragged n (padded buffers) is gated at bh=1 only");
+        let rows = bh * rows_pad;
+        let mut q = Tensor::rand_with(&[rows, d], DType::BFloat16, dev.clone()).expect("rand q");
+        let mut k = Tensor::rand_with(&[rows, d], DType::BFloat16, dev.clone()).expect("rand k");
+        let mut v = Tensor::rand_with(&[rows, d], DType::BFloat16, dev.clone()).expect("rand v");
         q.realize().expect("realize q");
         k.realize().expect("realize k");
         v.realize().expect("realize v");
         let (qf, kf, vf) = (as_f32_vec(&q), as_f32_vec(&k), as_f32_vec(&v));
-        let mut expected = vec![0f32; bh * n * d];
+        // Reference over the TRUE `n` rows of each slice (slice s starts at padded row s·rows_pad).
+        let mut expected = vec![0f32; rows * d];
         for s in 0..bh {
-            let z = s * n * d;
+            let z = s * rows_pad * d;
             let o_s = fa_ref(&qf[z..z + n * d], &kf[z..z + n * d], &vf[z..z + n * d], n, d);
             expected[z..z + n * d].copy_from_slice(&o_s);
         }
@@ -453,14 +468,18 @@ fn flash_attention32_matches_reference_on_gfx942() {
         // SwizzlePass folds the K-tile LDS bank swizzle (the as-used tuned path); the gate runs it on to
         // catch any swizzle-layout regression (fill/gather must agree on `lds_col(row, …, d)`).
         let prog = crate::kernels_fa::flash_attention_fwd_32(bh, n, d).apply(SwizzlePass);
-        let out = Tensor::empty(&[bh * n, d], DType::Float32);
+        let out = Tensor::empty(&[rows, d], DType::Float32);
         let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA-32 program");
         let plan = y.prepare().expect("prepare FA-32");
         plan.execute().expect("execute FA-32");
         let got = y.as_vec::<f32>().expect("read FA-32 output");
-        let report = allclose_f32(&got, &expected, atol, 2e-2);
-        println!("FA-32 bh={bh} n={n} d={d}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
-        assert!(report.ok, "FA-32 bh={bh} n={n} d={d} must match the f32 reference: {}", report.message);
+        // Compare ONLY the true `n` rows per slice (the padded tail is intentional garbage).
+        for s in 0..bh {
+            let z = s * rows_pad * d;
+            let report = allclose_f32(&got[z..z + n * d], &expected[z..z + n * d], atol, 2e-2);
+            println!("FA-32 bh={bh} n={n} d={d} slice={s}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+            assert!(report.ok, "FA-32 bh={bh} n={n} d={d} slice={s} must match the f32 reference: {}", report.message);
+        }
     }
 }
 

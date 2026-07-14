@@ -242,6 +242,11 @@ pub enum Node {
     LoadGlobal { buf: TileId, offset: TileId, dtype: DType },
     /// An elementwise binary op on two loaded values.
     EltwiseBinary { op: BinOp, a: TileId, b: TileId },
+    /// A predicated **select on an index comparison**: `lo < hi ? then : els`, per element (FA's
+    /// ragged-tail mask — `select(global_kv < n, score, -inf)`). `lo`/`hi` are index-typed;
+    /// `then`/`els` are the value branches (same dtype). Lowers to `Op::Ternary(Where,
+    /// Op::Binary(Lt, lo, hi), then, els)`. The result inherits `then`'s dtype (a value node).
+    SelectLt { lo: TileId, hi: TileId, then: TileId, els: TileId },
     /// An elementwise **unary** math op (FA-forward addition — the softmax `exp2` / the
     /// normalize `recip`). Lowers to `Op::Unary(UnaryOp::{Exp2,Reciprocal}, x)` — svod-ir
     /// already carries the whole transcendental table; tk2's GEMM path just never used it.
@@ -585,6 +590,7 @@ impl TileIr {
             Node::LdsCol { row, col, cols } => Node::LdsCol { row: f(row), col: f(col), cols },
             Node::LoadGlobal { buf, offset, dtype } => Node::LoadGlobal { buf: f(buf), offset: f(offset), dtype },
             Node::EltwiseBinary { op, a, b } => Node::EltwiseBinary { op, a: f(a), b: f(b) },
+            Node::SelectLt { lo, hi, then, els } => Node::SelectLt { lo: f(lo), hi: f(hi), then: f(then), els: f(els) },
             Node::Unary { op, x } => Node::Unary { op, x: f(x) },
             Node::DsBpermute { addr, data } => Node::DsBpermute { addr: f(addr), data: f(data) },
             Node::VPerm { hi, lo, selector } => Node::VPerm { hi: f(hi), lo: f(lo), selector },
@@ -692,6 +698,12 @@ impl TileIr {
             Node::EltwiseBinary { a, .. } => {
                 let dt = self.meta(*a).dtype.clone().unwrap_or(DType::Float32);
                 TileMeta::value(SmallVec::new(), dt, Residency::Reg)
+            }
+            // A predicated select carries the `then` branch's value dtype+shape (the `els` matches it).
+            Node::SelectLt { then, .. } => {
+                let m = self.meta(*then);
+                let dt = m.dtype.clone().unwrap_or(DType::Float32);
+                TileMeta::value(m.shape.clone(), dt, Residency::Reg)
             }
             // Unary preserves its operand's dtype+shape (an `ept`-vec stays an `ept`-vec, so
             // a fused `exp2` over a fragment vector keeps its width for the downstream reduce).

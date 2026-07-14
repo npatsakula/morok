@@ -159,12 +159,41 @@ impl AccSlot {
     }
 }
 
-/// A **compute body**: the kernel's per-cluster math, given the gathered operand bundle and the values
-/// of the slots the cluster DECLARED it reads (in `reads` order) → the new values for the slots it
-/// DECLARED it writes (in `writes` order). Edge-free (no barrier/dep) — the [`ClusterCx::compute`]
-/// wrapper owns the `set_prio` bracket + the per-slot round-trip. The declared read/write SUBSETS are
-/// what let a cluster touch only the state it uses (no dead round-trip) over a heterogeneous slot set.
-pub(crate) type ComputeBody<H> = dyn Fn(&mut Builder, Option<&<H as Hooks>::Op>, &[SlotVal]) -> Vec<SlotVal>;
+/// The **current KV-block counter** handed to each compute body — the 0-based streaming index.
+/// LAZY on purpose: a body that doesn't mask never materialises it, so it emits NO node and the
+/// emitted (reachable) IR of GEMM/FA-16 stays byte-identical (`test::byte_identity`). Only a body that
+/// masks calls [`Self::idx`], which reuses the live loop counter in the steady pass and mints an
+/// `idx_const(nblocks-1)` in the epilogue (the last, only-possibly-ragged block).
+#[derive(Copy, Clone)]
+pub(crate) enum BlockCounter {
+    /// Steady loop: the live `counter(kr)` — an existing node, so reusing it emits nothing.
+    Steady(Idx),
+    /// Epilogue: the last block index `nblocks-1`, materialised to an `idx_const` only on demand.
+    Epilogue(i64),
+}
+
+impl BlockCounter {
+    /// Materialise the block index as an [`Idx`]. Steady = the existing loop counter (no new node);
+    /// epilogue = a fresh `idx_const(nblocks-1)` (a new node — so a masking body pays for it, an
+    /// unmasked one doesn't, keeping GEMM/FA-16 byte-identical).
+    pub(crate) fn idx(self, b: &mut Builder) -> Idx {
+        match self {
+            BlockCounter::Steady(i) => i,
+            BlockCounter::Epilogue(n) => b.idx_const(n),
+        }
+    }
+}
+
+/// A **compute body**: the kernel's per-cluster math, given the gathered operand bundle, the values of
+/// the slots the cluster DECLARED it reads (in `reads` order), and the current [`BlockCounter`] → the
+/// new values for the slots it DECLARED it writes (in `writes` order). Edge-free (no barrier/dep) — the
+/// [`ClusterCx::compute`] wrapper owns the `set_prio` bracket + the per-slot round-trip. The declared
+/// read/write SUBSETS are what let a cluster touch only the state it uses (no dead round-trip) over a
+/// heterogeneous slot set. The block counter is what a ragged-tail mask needs (FA's `global_kv_index =
+/// block·kv_blk + lane_kv`); bodies that don't mask (GEMM, PV) simply ignore it — and because it is
+/// materialised lazily, ignoring it references no node, so their emitted IR is byte-unchanged.
+pub(crate) type ComputeBody<H> =
+    dyn Fn(&mut Builder, Option<&<H as Hooks>::Op>, &[SlotVal], BlockCounter) -> Vec<SlotVal>;
 
 /// The **safe-op context** — holds the `Builder`, the `Hooks`, and the per-body carry state, and
 /// exposes ONLY the four safe ops. Each op reproduces the corresponding `run_clustered_body` match-
@@ -183,6 +212,10 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     is_carried: &'a [bool],
     seed: &'a [TileId],
     k_next: Option<Idx>,
+    /// The **current KV-block counter** routed into each compute `body` (see [`BlockCounter`]): the loop
+    /// counter in the steady pass, `nblocks-1` in the epilogue. Lazy — a masking body materialises it,
+    /// GEMM/PV ignore it, so their emitted IR stays byte-identical.
+    block: BlockCounter,
     commit_drain: CommitDrain,
     /// The **HK bare-seal policy** (§5c): when set, cluster seals lower to a bare `s_barrier`
     /// ([`Builder::bare_barrier`]) instead of the acq-rel-fenced [`Builder::barrier`], and the LDS
@@ -464,7 +497,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
                 self.accs[s].load_after(self.b, &deps)
             })
             .collect();
-        let new = body(self.b, op_ref, &read_vals);
+        let new = body(self.b, op_ref, &read_vals, self.block);
         assert_eq!(
             new.len(),
             writes.len(),
@@ -584,7 +617,7 @@ impl<H: Hooks> Compute<H> {
         operand: impl Into<Option<usize>>,
         reads: impl Into<Vec<usize>>,
         writes: impl Into<Vec<usize>>,
-        body: impl Fn(&mut Builder, Option<&H::Op>, &[SlotVal]) -> Vec<SlotVal> + 'static,
+        body: impl Fn(&mut Builder, Option<&H::Op>, &[SlotVal], BlockCounter) -> Vec<SlotVal> + 'static,
     ) -> Self {
         Compute { operand: operand.into(), reads: reads.into(), writes: writes.into(), body: Box::new(body) }
     }
@@ -621,6 +654,7 @@ fn run_body<H: Hooks>(
     seed: &[TileId],
     carry: &[Vec<TileId>],
     k_next: Option<Idx>,
+    block: BlockCounter,
     commit_drain: CommitDrain,
     bare_seals: bool,
     pin_mfma: bool,
@@ -634,6 +668,7 @@ fn run_body<H: Hooks>(
         is_carried,
         seed,
         k_next,
+        block,
         commit_drain,
         bare_seals,
         pin_mfma,
@@ -827,6 +862,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             &[loop_seed, kr.dep()],
             &carry,
             steady_k_next,
+            BlockCounter::Steady(tk), // current KV-block counter (steady): the live loop counter
             commit_drain,
             bare_seals,
             pin_mfma,
@@ -874,6 +910,8 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             &[ended.dep()],
             &ep_carry,
             None,
+            // The epilogue processes block `nblocks-1` (the last KV block — the only one that can be ragged).
+            BlockCounter::Epilogue((nblocks - 1) as i64),
             commit_drain,
             bare_seals,
             pin_mfma,

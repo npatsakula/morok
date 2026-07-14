@@ -184,6 +184,12 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
                 BinOp::Max => a.max(&b),
             }
         }
+        // Predicated select on an index comparison → `WHERE(LT(lo, hi), then, els)`. `.lt` yields a
+        // Bool the ternary WHERE requires; the branch dtypes match (checked by `try_where`).
+        Node::SelectLt { lo, hi, then, els } => {
+            let cond = get(low, lo).lt(&get(low, hi));
+            UOp::try_where(cond, get(low, then), get(low, els)).expect("select: bool condition")
+        }
         Node::StoreGlobal { buf, offset, value } => {
             let (buf, off, val) = (get(low, buf), get(low, offset), get(low, value));
             let idx = UOp::index().buffer(buf).indices(vec![off]).ptr(true).call().expect("STORE index construction");

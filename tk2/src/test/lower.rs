@@ -203,3 +203,23 @@ fn mfma_32x32x8_probe_lowers_spec_valid() {
         lower::verify(&p).expect("32×32×8 probe must lower to spec-valid UOp");
     }
 }
+
+/// A **ragged-`n` FA-32** ([`crate::kernels_fa::flash_attention_fwd_32`]) must lower spec-valid: `n=80`
+/// is not a KV-block (32) multiple, so the last KV block is partial and the online softmax carries the
+/// per-element ragged-tail mask (`global_kv < n ? score : −∞`). Proves the new `Node::SelectLt` →
+/// `WHERE(LT,…)` lowering + `type_verify` accept the mask BEFORE the device gate, at `d=64` (2 KV
+/// fragments) and `d=128`, both base and `SwizzlePass` forms. (Constructing it also runs the build-time
+/// `verify_v2` scheduling-coherence + pipeline completeness checks over the masked schedule.)
+#[test]
+fn fa32_ragged_tail_lowers_spec_valid() {
+    for d in [64usize, 128] {
+        let p = crate::kernels_fa::flash_attention_fwd_32(1, 80, d);
+        let n_sel = (0..p.ir.len())
+            .filter(|&i| matches!(p.ir.node(crate::ir::TileId(i as u32)), Node::SelectLt { .. }))
+            .count();
+        assert!(n_sel > 0, "ragged FA-32 (n=80, d={d}) must emit the SelectLt ragged-tail mask");
+        lower::verify(&p).expect("ragged FA-32 must lower spec-valid (base)");
+        let ps = crate::kernels_fa::flash_attention_fwd_32(1, 80, d).apply(crate::SwizzlePass);
+        lower::verify(&ps).expect("ragged FA-32 must lower spec-valid (swizzled)");
+    }
+}

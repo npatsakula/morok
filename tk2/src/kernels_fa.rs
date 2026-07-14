@@ -29,7 +29,7 @@ use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId};
 use crate::kernels::{EDGE, Program, offset_by};
 use crate::movement::{Drain, LdsStage, LdsView, SharedTile};
-use crate::pipeline::{AccSlot, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
+use crate::pipeline::{AccSlot, BlockCounter, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 
 const WARP: usize = 64;
@@ -613,7 +613,7 @@ pub fn flash_attention_fwd(bh: usize, n: usize, d: usize) -> Program {
         0,
         vec![],
         (0..kvf).map(slot_s).collect::<Vec<_>>(),
-        move |b: &mut Builder, op: Option<&FaOp>, _reads: &[SlotVal]| {
+        move |b: &mut Builder, op: Option<&FaOp>, _reads: &[SlotVal], _blk: BlockCounter| {
             let k_frags = op.expect("QKᵀ consumes gathered K");
             (0..kvf)
                 .map(|kf| {
@@ -634,7 +634,7 @@ pub fn flash_attention_fwd(bh: usize, n: usize, d: usize) -> Program {
         None,
         sm_reads,
         sm_writes,
-        move |b: &mut Builder, _op: Option<&FaOp>, reads: &[SlotVal]| {
+        move |b: &mut Builder, _op: Option<&FaOp>, reads: &[SlotVal], _blk: BlockCounter| {
             let (max_old, norm_old) = (reads[kvf].f32(), reads[kvf + 1].f32());
             let s: Vec<Val<F32>> = (0..kvf).map(|kf| b.mul(reads[kf].f32(), scale_bcast)).collect();
             let mut m = max_old; // running max over the kvf fragments (chained reductions)
@@ -667,7 +667,7 @@ pub fn flash_attention_fwd(bh: usize, n: usize, d: usize) -> Program {
         1,
         pv_reads,
         o_idx.clone(),
-        move |b: &mut Builder, op: Option<&FaOp>, reads: &[SlotVal]| {
+        move |b: &mut Builder, op: Option<&FaOp>, reads: &[SlotVal], _blk: BlockCounter| {
             let v_frags = op.expect("PV consumes gathered V");
             (0..dfrags)
                 .map(|df| {
@@ -918,6 +918,35 @@ impl Hooks for Fa32Hooks {
     }
 }
 
+/// **Ragged-tail KV mask** (§Step-B): add `−∞` to every score whose global KV index
+/// `block·KV_BLK_32 + kv_in_tile` is ≥ `n`, so a partial last KV block's out-of-range keys `exp→0`
+/// and contribute to NEITHER the running max NOR the softmax sum (masking `P` alone would let an
+/// out-of-range score pollute the online max and wipe the carried accumulator — the mask MUST precede
+/// the max). `s` is the scaled `EPT_C`-wide score accumulator (`c_map`, so `acc_rc` row = kv-in-tile);
+/// the additive mask is a per-element [`Builder::select_lt`] built from the routed [`BlockCounter`]. A
+/// no-op for a tile-exact `n`, so [`flash_attention_fwd_32`] emits it only when the sequence is ragged.
+fn mask_ragged_kv(b: &mut Builder, s: Val<F32>, blk: BlockCounter, wlane: Idx, n: usize) -> Val<F32> {
+    use crate::shape::Mfma32x32x8Bf16 as S;
+    let dist = S::acc_dist();
+    let base_kv = {
+        let block = blk.idx(b);
+        let kvb = b.idx_const(KV_BLK_32 as i64);
+        b.idx_mul(block, kvb) // block · KV_BLK_32
+    };
+    let n_c = b.idx_const(n as i64);
+    let zero = b.f32(0.0);
+    let ninf = b.f32(f32::NEG_INFINITY);
+    let els: Vec<Val<F32>> = (0..S::EPT_C)
+        .map(|i| {
+            let (row, _col) = b.acc_rc(dist, wlane, i); // row = kv-in-tile
+            let gkv = b.idx_add(base_kv, row);
+            b.select_lt(gkv, n_c, zero, ninf) // 0 if global_kv < n, else −∞
+        })
+        .collect();
+    let mask = b.vec_build(&els);
+    b.add(s, mask)
+}
+
 /// **Streaming FA-forward on the 32×32×8 MFMA** (§Step 6 — the wide-core variant, KEPT SEPARATE from the
 /// frozen 16×16 [`flash_attention_fwd`]). Non-causal, `bh = batch·heads` independent `[bh,n,d]` attentions;
 /// 4 warps × 32 Q rows = a `q_blk = 128` block. Assembles the four device-proven 32×32×8 primitives:
@@ -947,8 +976,15 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     let nthreads = NUM_WARPS_32 * WARP; // 256
     let q_blk = NUM_WARPS_32 * m32; // 128
     let pitch = KV_BLK_32 + VT_PAD; // transposed-V LDS row pitch
-    assert!(n.is_multiple_of(q_blk), "n must be a multiple of the Q block ({q_blk})");
-    assert!(n.is_multiple_of(KV_BLK_32) && n / KV_BLK_32 >= 2, "n must give ≥2 KV blocks (the rolled pipeline)");
+    // Ragged tail supported: `n` need NOT be a multiple of the Q block or the KV block. The Q grid and
+    // the KV stream both round UP (`div_ceil`); the last KV block is masked past the true `n` (the score
+    // mask below), and partial Q rows are computed-but-not-scattered-to-valid-output. PRECONDITION (as
+    // everywhere in tk2 — the fill's raw global loads are unbounded): the caller provisions Q/K/V/O
+    // buffers covering `⌈n/tile⌉·tile` rows per (b,h) slice so the tile-covering fill + scatter stay
+    // in-buffer (the device gate pads the tensors; a tile-exact `n` needs no padding).
+    let nblocks = n.div_ceil(KV_BLK_32);
+    assert!(nblocks >= 2, "n must give ≥2 KV blocks (the rolled pipeline needs nblocks ≥ 2)");
+    let ragged = !n.is_multiple_of(KV_BLK_32); // a partial last KV block ⇒ emit the ragged-tail score mask
     let dslices = d / k8; // QKᵀ K-steps (contract d over K=8)
     let dtiles = d / m32; // PV output d-tiles (32 each)
     let ksl = KV_BLK_32 / k8; // 4 PV K-slices per KV block
@@ -960,8 +996,10 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     let k = b.global::<BF16>(bh * n * d);
     let v = b.global::<BF16>(bh * n * d);
 
-    // Grid = bh × (n/q_blk); decode (bh_idx, qwg). bh_idx·n = this (b,h) slice's global row base.
-    let nqb = n / q_blk;
+    // Grid = bh × ⌈n/q_blk⌉; decode (bh_idx, qwg). bh_idx·n = this (b,h) slice's global row base. The Q
+    // grid rounds UP so a ragged `n` is fully covered; the partial last workgroup's excess Q rows compute
+    // into the (caller-provisioned) buffer tail and are not part of the compared output.
+    let nqb = n.div_ceil(q_blk);
     let wgid = b.grid_axis(0, (bh * nqb) as i64);
     let nqb_c = b.idx_const(nqb as i64);
     let bh_idx = b.idx_div(wgid, nqb_c);
@@ -1062,7 +1100,7 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
         0,
         vec![],
         vec![slot_s],
-        move |b: &mut Builder, op: Option<&Fa32Op>, _reads: &[SlotVal]| {
+        move |b: &mut Builder, op: Option<&Fa32Op>, _reads: &[SlotVal], _blk: BlockCounter| {
             let k_frags = op.expect("QKᵀ consumes gathered K");
             let zeros: Vec<Val<F32>> = (0..S::EPT_C).map(|_| b.f32(0.0)).collect();
             let mut s_acc = b.vec_build(&zeros);
@@ -1079,9 +1117,13 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
         None,
         sm_reads,
         sm_writes,
-        move |b: &mut Builder, _op: Option<&Fa32Op>, reads: &[SlotVal]| {
+        move |b: &mut Builder, _op: Option<&Fa32Op>, reads: &[SlotVal], blk: BlockCounter| {
             let (s_acc, m_run, l_run) = (reads[0].f32(), reads[1].f32(), reads[2].f32());
             let s_scaled = b.mul(s_acc, scale_bcast);
+            // Ragged-tail mask: force scores of keys past the true `n` to −∞ BEFORE the max/exp, so they
+            // drop out of both the online max and the sum. Emitted only when `n` is not a KV-block
+            // multiple; the routed `blk` counter makes it a runtime no-op on every full block.
+            let s_scaled = if ragged { mask_ragged_kv(b, s_scaled, blk, wlane, n) } else { s_scaled };
             let m_new = b.acc_row_reduce_32(s_scaled, wlane, m_run, false);
             let corr = {
                 let diff = b.sub(m_run, m_new);
@@ -1115,7 +1157,7 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
         1,
         pv_reads,
         o_idx.clone(),
-        move |b: &mut Builder, op: Option<&Fa32Op>, reads: &[SlotVal]| {
+        move |b: &mut Builder, op: Option<&Fa32Op>, reads: &[SlotVal], _blk: BlockCounter| {
             let v_frags = op.expect("PV consumes gathered V");
             let b_ops = b.pv_relayout_s49(reads[0].f32());
             let mut anchor = None;
@@ -1152,7 +1194,7 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     let hooks = Fa32Hooks { k, v, k_lds, vt_lds, bh_row_d, tid, epl, q_in, half_off, d, pitch, dslices, dtiles, ksl };
     let acc_final = pipeline(
         &mut b,
-        n / KV_BLK_32, // nblocks (streaming over KV)
+        nblocks,       // nblocks (streaming over KV; ⌈n/kv_blk⌉ — the last block may be ragged)
         KV_BLK_32 * d, // k_step: the FLAT per-block advance (kv_blk rows · d)
         2,             // ksteps: gather slices (K, V)
         &accs,
