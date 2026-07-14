@@ -31,6 +31,8 @@ use crate::kernels::{EDGE, Program, offset_by};
 use crate::movement::{Drain, LdsStage, LdsView, SharedTile};
 use crate::pipeline::{AccSlot, BlockCounter, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
+use crate::tile::BCol;
+use crate::tile_move::{commit, gather, prefetch};
 
 const WARP: usize = 64;
 /// Warps per workgroup for the multi-warp split-Q FA (§1.2): 8 warps × 64 lanes = 512 threads. Each
@@ -234,27 +236,23 @@ pub fn atb_probe(kv: usize, d: usize, q: usize) -> Program {
     let lane = b.block_axis(WARP as i64);
     let zero = b.idx_const(0);
 
-    let col = Mfma16x16x16Bf16::c_map(); // the Col (B/accumulator) map, derived from the marker
+    let col = Mfma16x16x16Bf16::c_map(); // the Col map, still driving the epilogue scatter below
     let v_smem = b.define_local::<BF16>(kv * d);
     let p_smem = b.define_local::<BF16>(kv * q);
-    let v_tile = SharedTile::new(v_smem, d);
-    let p_tile = SharedTile::new(p_smem, q);
 
-    // ── fill V[kv,d] and P[kv,q] into LDS (single warp, whole tile) via the collaborative stage. ──
-    let v_stage = v_tile.stage_view(v, kv * d / WARP, lane, zero, d as i64, Drain::Intrinsic);
-    let p_stage = p_tile.stage_view(p, kv * q / WARP, lane, zero, q as i64, Drain::Intrinsic);
-    let vl = v_stage.prefetch(&mut b, zero, &[]);
-    let pl = p_stage.prefetch(&mut b, zero, &[]);
-    let vf = v_stage.commit(&mut b, &vl, &[]);
-    let pf = p_stage.commit(&mut b, &pl, &[]);
+    // ── fill V[kv,d] and P[kv,q] into LDS via the register-staged movement ops (prefetch → commit).
+    //    (Reg←Global) prefetch stages the whole tile in VGPRs; (Lds←Reg) commit writes it to LDS. ──
+    let vl = prefetch(&mut b, v_smem, d, v, d as i64, kv * d / WARP, lane, zero, zero, &[]);
+    let pl = prefetch(&mut b, p_smem, q, p, q as i64, kv * q / WARP, lane, zero, zero, &[]);
+    let vf = commit(&mut b, v_smem, d, v, d as i64, kv * d / WARP, lane, zero, &vl, &[]);
+    let pf = commit(&mut b, p_smem, q, p, q as i64, kv * q / WARP, lane, zero, &pl, &[]);
     let fill: Vec<TileId> = vf.iter().chain(pf.iter()).map(|e| e.dep()).collect();
     let bar = b.barrier(Effect(fill[0]), &fill[1..]);
 
-    // ── transposed gather: kv (contraction) → spread; d/q (output) → flat, stacked as fragments. ──
-    let v_view = v_tile.gather_view(col, d / EDGE, None, lane, false);
-    let p_view = p_tile.gather_view(col, q / EDGE, None, lane, false);
-    let (v_frags, _gv) = v_view.gather_transposed(&mut b, &[bar.dep()]);
-    let (p_frags, _gp) = p_view.gather_transposed(&mut b, &[bar.dep()]);
+    // ── transposed gather via the (Reg←Lds) op: the BCol operand role derives the transposed read,
+    //    landing kv (contraction) on the spread lane-axis and d/q (output) on flat, stacked as frags. ──
+    let v_frags = gather::<BF16, BCol, Mfma16x16x16Bf16>(&mut b, v_smem, d, EDGE, d, None, lane, &[bar.dep()]);
+    let p_frags = gather::<BF16, BCol, Mfma16x16x16Bf16>(&mut b, p_smem, q, EDGE, q, None, lane, &[bar.dep()]);
 
     // ── O[d,q] = Σ_kv V·P: one MFMA per (d-frag, q-frag) output tile (single kv contraction). ──
     let zero_c = {

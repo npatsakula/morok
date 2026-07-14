@@ -33,6 +33,7 @@ pub(crate) mod pipeline;
 pub mod schedule;
 pub mod shape;
 pub mod tile;
+pub mod tile_move;
 pub mod tile_ops;
 
 pub use build::{Builder, Elem, F32};

@@ -49,7 +49,7 @@ const WARP: usize = 64;
 /// back to GLOBAL `dst` via the same `lane_rc` map (the C tile is Col-layout, so this
 /// is the transposed store) — the mirror of [`gather_frag`]. Returns the terminal
 /// store effects (the kernel's sink roots).
-fn scatter_frag(
+pub(crate) fn scatter_frag(
     b: &mut Builder,
     acc: Frag<F32>,
     dst: Buf<F32>,
