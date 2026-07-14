@@ -32,6 +32,7 @@ pub mod passes;
 pub(crate) mod pipeline;
 pub mod schedule;
 pub mod shape;
+pub mod tile;
 
 pub use build::{Builder, Elem, F32};
 pub use error::{Error, Result};

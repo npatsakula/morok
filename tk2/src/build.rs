@@ -20,7 +20,7 @@ mod sealed {
 
 /// A legal tile element dtype (sealed — the DSL's dtype whitelist). Adding a dtype
 /// is one `impl`; there is no way for a caller to invent an unsupported element.
-pub trait Elem: sealed::Sealed + Copy {
+pub trait Elem: sealed::Sealed + Copy + 'static {
     fn dtype() -> DType;
 }
 
