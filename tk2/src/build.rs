@@ -580,6 +580,39 @@ impl Builder {
         self.vec_build(&copies)
     }
 
+    /// **The 32×32×8 accumulator row-reduction** (the FA-32 softmax over kv — the `EPT_C = 16` analog of
+    /// [`Self::frag_col_reduce`], per §Step 6). The QKᵀ accumulator holds `S[kv, q]` with **kv on the M
+    /// (row) axis**: for a fixed q (`= lane % 32`), the 32 kv split into this lane's **16 in-register**
+    /// [`AccDist`] elements PLUS the `lane ± 32` partner's other 16 (the `lane / 32` half — the reduce must
+    /// use the AccDist geometry, NOT `ept = 4`). This folds (a) the 16 in-register elements, then (b) the
+    /// single `L ↔ L+32` cross-lane partner (barrier-free `ds_bpermute`), folds the running `init`, and
+    /// broadcasts the per-q result to all 16 slots so the caller subtracts it row-wise. `add = false` ⇒ max
+    /// (online-softmax running max); `add = true` ⇒ sum (the norm).
+    pub fn acc_row_reduce_32(&mut self, val: Val<F32>, lane: Idx, init: Val<F32>, add: bool) -> Val<F32> {
+        const WARP: i64 = 64; // gfx942 wave64
+        const EPT_C: usize = 16; // the 32×32×8 accumulator width — a const (the meta-shape gotcha, as above)
+        const HALF: i64 = 32; // lane % 32 = the flat (q) axis; lane / 32 splits the M(kv) reduce in two
+        let comb = |b: &mut Self, a: Val<F32>, c: Val<F32>| if add { b.add(a, c) } else { b.max(a, c) };
+        // (a) in-register fold of this lane's 16 kv-elements (16 of the 32 kv for this q).
+        let mut partial = self.vec_extract(val, 0);
+        for e in 1..EPT_C {
+            let x = self.vec_extract(val, e);
+            partial = comb(self, partial, x);
+        }
+        // (b) the `L ↔ L+32` partner — the OTHER 16 kv of the same q (the `lane / 32` half).
+        let g = self.idx_const(WARP);
+        let dc = self.idx_const(HALF);
+        let sl = self.idx_add(lane, dc);
+        let sl = self.idx_mod(sl, g);
+        let sh = self.shuffle_lane(partial, sl);
+        let mut acc = comb(self, partial, sh);
+        // (c) fold the running init, broadcast to all 16 slots (the caller subtracts it row-wise).
+        let init0 = self.vec_extract(init, 0);
+        acc = comb(self, acc, init0);
+        let copies: Vec<Val<F32>> = (0..EPT_C).map(|_| acc).collect();
+        self.vec_build(&copies)
+    }
+
     // ── register fragments + MMA (the naive matmul vocabulary) ───────────────
 
     /// Allocate a per-lane register fragment carrying its [`FragMap`] MFMA lane-map.

@@ -245,6 +245,50 @@ fn pv_relayout_probe_is_correct_on_gfx942() {
     }
 }
 
+/// Host reference for the softmax-32 probe: per-q softmax over kv `P[kv,q] = 2^(S[kv,q]−m_q) / Σ_kv 2^(…)`,
+/// `m_q = max_kv S[kv,q]` (exp2 basis, matching the kernel's `Builder::exp2`). `S`/`P` are `[kv,q]` row-major.
+fn softmax32_ref(sf: &[f32], kv: usize, q: usize) -> Vec<f32> {
+    let mut e = vec![0f32; kv * q];
+    for qi in 0..q {
+        let m = (0..kv).map(|k| sf[k * q + qi]).fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0f32;
+        for k in 0..kv {
+            sum += (sf[k * q + qi] - m).exp2();
+        }
+        for k in 0..kv {
+            e[k * q + qi] = (sf[k * q + qi] - m).exp2() / sum;
+        }
+    }
+    e
+}
+
+/// **Step-6 softmax-reduction gate** (32×32×8 DE-RISK): the [`Builder::acc_row_reduce_32`] online-softmax
+/// over the `EPT_C = 16` accumulator geometry ([`crate::kernels_fa::softmax32_probe`]) must reproduce the
+/// per-q softmax over kv. A match PROVES the AccDist reduction (16 in-register + `L↔L+32` cross-lane) +
+/// broadcast are correct — the last un-proven FA-32 building block, in isolation before the FA rewrite.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::softmax32_probe --nocapture`
+#[test]
+#[ignore]
+fn softmax32_probe_is_correct_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    const KV: usize = 32;
+    const Q: usize = 32;
+    let dev = svod_dtype::default_device::default_device();
+    let mut s = Tensor::rand_with(&[KV, Q], DType::Float32, dev.clone()).expect("rand s");
+    s.realize().expect("realize s");
+    let expected = softmax32_ref(&as_f32_vec(&s), KV, Q);
+
+    let prog = crate::kernels_fa::softmax32_probe();
+    let out = Tensor::empty(&[KV, Q], DType::Float32);
+    let mut y = graph_kernel(prog, out, &[&s]).expect("wrap softmax32 probe");
+    let plan = y.prepare().expect("prepare");
+    plan.execute().expect("execute");
+    let got = y.as_vec::<f32>().expect("read output");
+    let report = allclose_f32(&got, &expected, 1e-3, 2e-3);
+    println!("softmax32 probe {KV}×{Q}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+    assert!(report.ok, "softmax32 probe must match the per-q softmax reference: {}", report.message);
+}
+
 /// Host f32 reference for the V-transpose probe: `O[d,q] = Σ_kv V[kv,d]·Pt[q,kv]` (V`[kv,d]`, Pt`[q,kv]`,
 /// both bf16 row-major) — the FA `P·V` with V staged through the transposed LDS and P the straight B-operand.
 fn vtrans_ref(vf: &[f32], ptf: &[f32], d: usize, q: usize, kv: usize) -> Vec<f32> {

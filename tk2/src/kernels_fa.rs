@@ -311,6 +311,69 @@ fn load_q_frag_global(
     b.load_frag_vec_after(frag, &stores)
 }
 
+/// **Step-6 softmax-reduction isolation probe** (32×32×8 DE-RISK): proves the [`Builder::acc_row_reduce_32`]
+/// online-softmax reduce over the `EPT_C = 16` accumulator geometry (the FA-32 row-reduce over kv), IN
+/// ISOLATION, before FA. It loads `S[kv, q]` into the 32×32×8 C-accumulator layout (kv on M), computes the
+/// full softmax over kv per q — `P[kv,q] = exp2(S[kv,q] − max_kv) / Σ_kv exp2(…)` — via the 16-in-register +
+/// `L↔L+32` cross-lane reduce, and scatters `P`. A device allclose vs the host softmax proves the AccDist
+/// reduction geometry + broadcast are correct (a missing cross-lane term → the norm sums 16 of 32 kv →
+/// ~2× error). `kv = q = 32` (one 32×32 tile). This is the last un-proven FA-32 building block.
+#[allow(clippy::needless_range_loop)]
+pub fn softmax32_probe() -> Program {
+    use crate::shape::Mfma32x32x8Bf16 as S;
+    const KV: usize = 32;
+    const Q: usize = 32;
+    let mut b = Builder::new("tk2_softmax32_probe");
+    // ABI: output P[kv,q], then input S[kv,q] (f32 scores in the accumulator layout).
+    let out = b.global::<F32>(KV * Q);
+    let s = b.global::<F32>(KV * Q);
+    let _wg = b.grid_axis(0, 1);
+    let lane = b.block_axis(WARP as i64);
+
+    let dist = S::acc_dist();
+    let q_c = b.idx_const(Q as i64);
+    // Load S into the 16-wide accumulator (row = kv, col = q).
+    let s_acc = {
+        let els: Vec<Val<F32>> = (0..S::EPT_C)
+            .map(|i| {
+                let (row, col) = b.acc_rc(dist, lane, i);
+                let off = b.idx_mul(row, q_c);
+                let off = b.idx_add(off, col);
+                b.load(s, off)
+            })
+            .collect();
+        b.vec_build(&els)
+    };
+    // Online softmax over kv (per q): max, exp2(S−max), sum, normalize — all over the AccDist geometry.
+    let neg_inf = {
+        let ni = b.f32(f32::NEG_INFINITY);
+        let cs: Vec<Val<F32>> = (0..S::EPT_C).map(|_| ni).collect();
+        b.vec_build(&cs)
+    };
+    let zero = {
+        let z = b.f32(0.0);
+        let cs: Vec<Val<F32>> = (0..S::EPT_C).map(|_| z).collect();
+        b.vec_build(&cs)
+    };
+    let m = b.acc_row_reduce_32(s_acc, lane, neg_inf, false); // per-q max, broadcast to 16 slots
+    let shifted = b.sub(s_acc, m);
+    let p = b.exp2(shifted); // exp2(S − max), 16-wide
+    let sum = b.acc_row_reduce_32(p, lane, zero, true); // per-q Σ, broadcast
+    let recip = b.recip(sum);
+    let p_norm = b.mul(p, recip); // P / Σ
+    // Scatter P[kv,q].
+    let mut roots = Vec::new();
+    for i in 0..S::EPT_C {
+        let (row, col) = b.acc_rc(dist, lane, i);
+        let off = b.idx_mul(row, q_c);
+        let off = b.idx_add(off, col);
+        let val = b.vec_extract(p_norm, i);
+        roots.push(b.store(out, off, val));
+    }
+    let (ir, sink) = b.finish(&roots);
+    Program { ir, sink, name: "tk2_softmax32_probe".into() }
+}
+
 /// **Step-5 V write-side padded-transpose isolation probe** (32×32×8 DE-RISK): proves that staging V
 /// through a **padded transposed LDS** layout produces the correct 32×32×8 PV **A-operand**, IN ISOLATION,
 /// before FA trusts it. It computes `O[d,q] = Σ_kv V[kv,d]·P[kv,q]` where `V[kv,d]` (natural layout) is
