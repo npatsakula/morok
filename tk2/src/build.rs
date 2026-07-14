@@ -456,6 +456,48 @@ impl Builder {
         Effect(self.ir.intern(Node::SchedFence { mask, deps }))
     }
 
+    /// A **declarative interleave directive** (`sched.group.barrier(mask, size, group)`, FA-redesign
+    /// §2.3) positioned after `anchors` — forms a `size`-instruction group of `mask` ops in scheduling
+    /// group `group`. Emits NO instruction; drives the MFMA:VALU/exp interleave. Route its [`Effect`]
+    /// into a downstream consumer to keep it live + positioned. Prefer the [`Self::interleave_valu`] /
+    /// [`Self::interleave_exp`] ratio helpers; this is the raw primitive.
+    pub fn sched_group(&mut self, mask: i64, size: i64, group: i64, anchors: &[TileId]) -> Effect {
+        let deps = anchors.iter().copied().collect();
+        Effect(self.ir.intern(Node::SchedGroupBarrier { mask, size, group, deps }))
+    }
+
+    /// `sched.group.barrier` mask bits (AMDGPU `SchedGroupBarrier`): matrix ops, vector ALU, and
+    /// transcendental (`v_exp`) — HipKittens' `MFMA_MASK`/`VALU_MASK`/`EXP_MASK`.
+    pub const SG_MFMA: i64 = 0x08;
+    pub const SG_VALU: i64 = 0x02;
+    pub const SG_EXP: i64 = 0x400;
+
+    /// The declarative interleave ratio (HipKittens' `sched_barrier_pairs<Pairs,Cnt,Group>`): repeat
+    /// `pairs`×{ 1 MFMA, then `valu` VALU } in scheduling group `group`, so the softmax reduction VALU
+    /// runs *inside* the matrix pipeline. Emits `2·pairs` hints (zero instructions), chained so each is
+    /// live + ordered after the last; `anchors` anchor the first. Returns the final hint [`Effect`] to
+    /// thread onward. `pairs = 0` is a no-op (returns `None`).
+    pub fn interleave_valu(&mut self, pairs: u32, valu: u32, group: i64, anchors: &[TileId]) -> Option<Effect> {
+        self.interleave(Self::SG_VALU, pairs, valu, group, anchors)
+    }
+
+    /// HipKittens' `sched_barrier_exp_pairs`: repeat `pairs`×{ 1 MFMA, then `exp` transcendental } — the
+    /// softmax `exp2` folded under the P·V MFMA. Same shape as [`Self::interleave_valu`], EXP mask.
+    pub fn interleave_exp(&mut self, pairs: u32, exp: u32, group: i64, anchors: &[TileId]) -> Option<Effect> {
+        self.interleave(Self::SG_EXP, pairs, exp, group, anchors)
+    }
+
+    /// Shared `pairs`×{ 1 MFMA, then `n` `mask`-ops } emitter for the ratio helpers.
+    fn interleave(&mut self, mask: i64, pairs: u32, n: u32, group: i64, anchors: &[TileId]) -> Option<Effect> {
+        let mut last: Option<Effect> = None;
+        for _ in 0..pairs {
+            let a = last.map_or_else(|| anchors.to_vec(), |e| vec![e.dep()]);
+            let mfma = self.sched_group(Self::SG_MFMA, 1, group, &a);
+            last = Some(self.sched_group(mask, n as i64, group, &[mfma.dep()]));
+        }
+        last
+    }
+
     /// A **wave issue-priority** control (`s_setprio level`, DESIGN §5c), positioned after `after`.
     /// Bracket an MFMA cluster `set_prio(1, [entry]) … set_prio(0, [mma results])` so the compute
     /// wave wins SIMD issue over the co-resident loading wave. Route its [`Effect`] into a

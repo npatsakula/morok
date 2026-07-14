@@ -543,6 +543,18 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             );
             UOp::custom(deps, code, DType::Void)
         }
+        // A declarative interleave directive (`sched.group.barrier(mask, size, sync_id)`) → a void
+        // `Op::Custom` whose `deps` are position/liveness anchors only (all three immediates are
+        // Rust-substituted, so no `{N}` placeholders). Emits no instruction — survives to ASM as a
+        // `; sched_group_barrier` comment that drives the MFMA:VALU/exp interleave (FA-redesign §2.3).
+        Node::SchedGroupBarrier { mask, size, group, deps } => {
+            let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();
+            let code = format!(
+                "declare void @llvm.amdgcn.sched.group.barrier(i32, i32, i32)\n\
+                 call void @llvm.amdgcn.sched.group.barrier(i32 {mask}, i32 {size}, i32 {group})"
+            );
+            UOp::custom(deps, code, DType::Void)
+        }
         // `s_setprio level` via the native intrinsic (NOT inline `asm sideeffect`): the AMDGPU
         // scheduler models the intrinsic form, so all prio pairs survive + stay positioned (the asm
         // form gets DCE'd/merged — HK uses the intrinsic).

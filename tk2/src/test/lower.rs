@@ -127,6 +127,73 @@ fn fa_forward_on_clustercx_lowers_spec_valid() {
 /// `v_mfma_f32_32x32x8_bf16` intrinsic selection, and the 16-VGPR `acc_rc` scatter survive lowering +
 /// `type_verify` BEFORE the device gate. Covers one MFMA (32×32×8), a K-loop (32×32×16), and a tiled
 /// output (64×64×8) so the accumulation chain + the M/N tiling are all exercised in the linearizer.
+// ── the SchedGroupBarrier interleave primitive (FA-redesign step 2) ──────────────────────────────
+
+/// The declarative interleave directive ([`crate::build::Builder::interleave_valu`]) must (a) intern
+/// `SchedGroupBarrier` nodes, (b) lower spec-valid, and (c) RENDER to the `@llvm.amdgcn.sched.group.
+/// barrier` builtin the AMDGPU backend emits as the `; sched_group_barrier` interleave comment. A tiny
+/// 2-slice 32×32×8 MFMA burst (VGPR asm accumulator) + a VALU scale carries an `interleave_valu<2,5>`
+/// hint threaded live into the store — the minimal proof the primitive emits before FA depends on it.
+#[test]
+fn sched_group_barrier_lowers_and_renders_the_builtin() {
+    use crate::build::{BF16, Builder, F32};
+    use crate::shape::{Mfma32x32x8Bf16 as S, MfmaShape};
+    let mut b = Builder::new("tk2_sched_group_probe");
+    let c = b.global::<F32>(S::M * S::N);
+    let a = b.global::<BF16>(S::M * 2 * S::K);
+    let bmat = b.global::<BF16>(S::N * 2 * S::K);
+    let _wg = b.grid_axis(0, 1);
+    let lane = b.block_axis(64);
+    let (a_map, b_map, dist) = (S::a_map(), S::b_map(), S::acc_dist());
+    // 2-slice K-loop into one VGPR-asm accumulator.
+    let mut acc = {
+        let zs: Vec<_> = (0..S::EPT_C).map(|_| b.f32(0.0)).collect();
+        b.vec_build(&zs)
+    };
+    for ki in 0..2 {
+        let af = crate::kernels::load_op_frag(&mut b, a, a_map, 0, ki * S::K, 2 * S::K, lane);
+        let bf = crate::kernels::load_op_frag(&mut b, bmat, b_map, 0, ki * S::K, 2 * S::K, lane);
+        acc = b.mma_asm_of::<S>(af, bf, acc);
+    }
+    // A VALU op the interleave can pull under the MFMAs (the softmax-rescale analog).
+    let two = b.f32(2.0);
+    let mut scaled = Vec::with_capacity(S::EPT_C);
+    for i in 0..S::EPT_C {
+        let e = b.vec_extract(acc, i);
+        scaled.push(b.mul(e, two));
+    }
+    let acc = b.vec_build(&scaled);
+    // Scatter, then thread an interleave_valu<pairs=2, valu=5> hint anchored on the last store — live
+    // via the roots, so it survives DCE and reaches the renderer.
+    let n_c = b.idx_const(S::N as i64);
+    let mut roots = Vec::new();
+    for i in 0..S::EPT_C {
+        let (row, col) = b.acc_rc(dist, lane, i);
+        let rn = b.idx_mul(row, n_c);
+        let off = b.idx_add(rn, col);
+        let v = b.vec_extract(acc, i);
+        roots.push(b.store(c, off, v));
+    }
+    let anchor = roots.last().expect("stores").dep();
+    let hint = b.interleave_valu(2, 5, 1, &[anchor]).expect("pairs>0");
+    roots.push(hint);
+    let (ir, sink) = b.finish(&roots);
+    let p = crate::Program { ir, sink, name: "tk2_sched_group_probe".into() };
+
+    // (a) the nodes are interned — 2 pairs × 2 hints = 4 SchedGroupBarrier.
+    let n_sgb = (0..p.ir.len())
+        .filter(|&i| matches!(p.ir.node(crate::ir::TileId(i as u32)), Node::SchedGroupBarrier { .. }))
+        .count();
+    assert_eq!(n_sgb, 4, "interleave_valu<2,_> ⇒ 2×(MFMA+VALU) = 4 SchedGroupBarrier nodes");
+    // (b) spec-valid lowering.
+    lower::verify(&p).expect("sched_group probe must lower spec-valid");
+    // (c) renders the builtin (→ the `; sched_group_barrier` ASM comment).
+    let llvm = crate::launch::render_amd_ir(&p, svod_dtype::AmdArch::Gfx942).expect("render");
+    assert!(llvm.contains("llvm.amdgcn.sched.group.barrier"), "must render the sched.group.barrier builtin");
+    assert!(llvm.contains("i32 8, i32 1"), "MFMA-mask(0x8) size-1 group present");
+    assert!(llvm.contains("i32 2, i32 5"), "VALU-mask(0x2) size-5 group present");
+}
+
 #[test]
 fn mfma_32x32x8_probe_lowers_spec_valid() {
     for (m, n, k) in [(32usize, 32usize, 8usize), (32, 32, 16), (64, 64, 8)] {

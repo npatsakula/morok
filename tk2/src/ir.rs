@@ -420,6 +420,16 @@ pub enum Node {
     /// workgroup sync — it is purely a compiler scheduling boundary. Kept live + ordered by
     /// a downstream consumer that lists it in *its* deps.
     SchedFence { mask: i64, deps: Edges },
+    /// A **declarative interleave directive** (`@llvm.amdgcn.sched.group.barrier(mask, size, sync_id)`,
+    /// FA-redesign §2.3): tells LLVM's post-RA scheduler to form a group of `size` instructions matching
+    /// `mask`, keep the groups in program order, and interleave groups sharing a `group` (SyncID). Unlike
+    /// [`Node::SchedFence`] (a *total* boundary LLVM may move nothing across) this is a *positive* ratio —
+    /// "1 MFMA, then N VALU/exp, repeat" — the load-bearing primitive for softmax-under-MFMA (HipKittens'
+    /// `sched_barrier_pairs`). Emits NO instruction: it survives to ASM only as a `; sched_group_barrier`
+    /// comment; what it PRODUCES is the MFMA:VALU/exp interleave. `deps` are liveness/position anchors
+    /// ONLY (never a correctness edge) — deleting every one leaves a still-correct kernel (the scheduling/
+    /// correctness split). Lowered exactly like [`Node::SchedFence`] (a `Void` `Op::Custom`).
+    SchedGroupBarrier { mask: i64, size: i64, group: i64, deps: Edges },
     /// A **wave issue-priority** control (`s_setprio level`, DESIGN §5c): a void side-effect
     /// positioned after `deps`. Bracketing an MFMA cluster with `set_prio(1) … set_prio(0)`
     /// makes the compute wave win SIMD issue over the co-resident loading wave (the systolic
@@ -633,6 +643,9 @@ impl TileIr {
                 Node::BareBarrier { body: f(body), deps: deps.into_iter().map(&mut f).collect() }
             }
             Node::SchedFence { mask, deps } => Node::SchedFence { mask, deps: deps.into_iter().map(&mut f).collect() },
+            Node::SchedGroupBarrier { mask, size, group, deps } => {
+                Node::SchedGroupBarrier { mask, size, group, deps: deps.into_iter().map(&mut f).collect() }
+            }
             Node::SetPrio { level, deps } => Node::SetPrio { level, deps: deps.into_iter().map(&mut f).collect() },
             Node::WaveBarrier { eq, deps } => Node::WaveBarrier { eq, deps: deps.into_iter().map(&mut f).collect() },
             Node::SchedWallMarker => Node::SchedWallMarker,
@@ -736,6 +749,7 @@ impl TileIr {
             | Node::Barrier { .. }
             | Node::BareBarrier { .. }
             | Node::SchedFence { .. }
+            | Node::SchedGroupBarrier { .. }
             | Node::SetPrio { .. }
             | Node::WaveBarrier { .. }
             | Node::SchedWallMarker
