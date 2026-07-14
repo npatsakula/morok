@@ -344,12 +344,14 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
                 read.bitcast(dtype.vec(ept).expect("ds_read_b64: bf16 vec"))
             }
         }
-        // The `srsrc` buffer descriptor: `make.buffer.rsrc.p0` from the buffer's base pointer (element 0).
+        // The `srsrc` buffer descriptor: `make.buffer.rsrc` from the buffer's base pointer (element 0).
         // `num_bytes` is the SRD extent (bounds); `1114112` = 0x110000 is HK's `make_srsrc` config word.
-        // The buffer-resource descriptor via `make.buffer.rsrc.p0` of `&buf[base_off]`; `num_bytes` = the
-        // SRD byte extent, `1114112` = 0x110000 (HK's `make_srsrc` config, row_stride 0). base_off = 0 in the
-        // shipped fixed-base form (the base is loop-invariant, hoisted, materialised once — no advancing
-        // base-high to sink below its loads). Lowers to a pointer-typed `Op::Custom`.
+        // The buffer-resource descriptor of `&buf[base_off]`; `num_bytes` = the SRD byte extent,
+        // `1114112` = 0x110000 (HK's `make_srsrc` config, row_stride 0). base_off = 0 in the shipped
+        // fixed-base form (the base is loop-invariant, hoisted, materialised once — no advancing base-high
+        // to sink below its loads). Lowers to a pointer-typed `Op::Custom`. LLVM-22 (roc-7.2.4) signature:
+        // the intrinsic is mangled on BOTH the `p8` return and the `p0` source pointer, and the num-records
+        // operand is `i64` (was `.p0` / `i32` on clang-18) — clang rejects the old form as an arg-type error.
         Node::MakeBufferRsrc { buf, base_off, num_bytes } => {
             let (buf, base_off) = (get(low, buf), get(low, base_off));
             let base = UOp::index()
@@ -361,8 +363,8 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             UOp::custom(
                 smallvec![base],
                 format!(
-                    "declare ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p0(ptr, i16, i32, i32)\n\
-                     call ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p0(ptr {{0}}, i16 0, i32 {num_bytes}, i32 1114112)"
+                    "declare ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p0(ptr, i16, i64, i32)\n\
+                     call ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p0(ptr {{0}}, i16 0, i64 {num_bytes}, i32 1114112)"
                 ),
                 DType::Int64,
             )

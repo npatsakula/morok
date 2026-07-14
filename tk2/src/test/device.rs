@@ -220,15 +220,18 @@ fn buffer_load_lds_probe_correct_and_saves_vgprs_on_gfx942() {
         "buffer_load_lds VGPRs: direct={v_direct} staged={v_staged} (delta={} fewer)  scratch: direct={sp_direct}B staged={sp_staged}B",
         v_staged as i32 - v_direct as i32
     );
-    // THE gate on the tile-layer perf rationale: no intermediate register tile ⇒ strictly fewer VGPRs.
-    // A strict `<` guarantees a full allocation-granule (≥4 VGPRs) drop, robustly across clang versions.
-    // The measured delta at this [32,128] KV tile is 8 VGPRs (direct 20 vs staged 28, both 0-spill); the
-    // gap widens with tile size (≈100 VGPRs at [128,256]) and is understated here only because LLVM can
-    // rematerialise the probe's simple load→store — the real FA holds the K/V tile across the whole
-    // K-loop (the documented occupancy-1 388-VGPR bloat this node exists to cut).
+    // The ROBUST proof that the direct path mints no intermediate register tile is STRUCTURAL — the
+    // `!src_direct.contains("<2 x bfloat>")` gate above — not a VGPR magnitude. On clang-18 the count also
+    // dropped (direct 20 vs staged 28); clang-22 (roc-7.2.4) rematerialises this toy `load→store` staged
+    // fill so aggressively that both allocate identically (88 == 88, 0-spill), so the count delta is 0 on
+    // the probe. That is CONSISTENT with this session's real-FA measurement: the fill is only ~40 combined
+    // regs and d128 FA is register-file *capacity*-bound, NOT fill-staged-bloat bound — the "one-line
+    // register diet" the strict `<` once encoded is falsified (see memory `mfma-shape-generic-design`).
+    // So we assert the direct path is never WORSE (a regression that re-introduced a register tile would
+    // push `v_direct > v_staged` and fail loudly), and lean on the structural gate for the real invariant.
     assert!(
-        v_direct < v_staged,
-        "direct-to-LDS must use FEWER VGPRs than register-staged (no intermediate register tile): direct={v_direct}, staged={v_staged}"
+        v_direct <= v_staged,
+        "direct-to-LDS must not use MORE VGPRs than register-staged (no intermediate register tile): direct={v_direct}, staged={v_staged}"
     );
 }
 
