@@ -526,6 +526,7 @@ fn dump_fa32_isa() {
         let (src, bytes) = launch::compile_artifacts(&prog, &device_spec).expect("compile FA-32");
         let parsed = svod_device::amd::program::parse_kernel(&bytes, "tk2_fa_fwd_32").expect("parse FA-32");
         std::fs::write(format!("{dir}/fa32_d{d}.ll"), &src).expect("write ll");
+        std::fs::write(format!("{dir}/fa32_d{d}.co"), &bytes).expect("write co");
         let scratch = { parsed.kd }.private_segment_fixed_size;
         println!(
             "FA-32 d={d}: scratch(spill)={scratch}B/thread — {} (LLVM IR → {dir}/fa32_d{d}.ll)",

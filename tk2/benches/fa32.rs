@@ -3,10 +3,11 @@
 //! attention shapes — the "does 32×32×8 close the gap" headline. Both are gated `allclose` at a small shape
 //! before timing; device time via the shared [`common`] harness.
 //!
-//! HONEST caveat: `flash_attention_fwd_32` is the correctness-first ASSEMBLY (unrolled KV stream, scalar
-//! global-load fills, no LDS swizzle, no ClusterCx pipeline / ping-pong). The 16×16 FA rides the tuned
-//! pipeline (`VectorizePass.then(SwizzlePass)`, register-staged prefetch). This measures the un-tuned wide
-//! core vs the tuned narrow core — a directional number, not the 32×32×8 ceiling.
+//! FA-32 now rides the ClusterCx pipeline (rolled KV loop, register-staged prefetch/commit) with the K-tile
+//! LDS bank swizzle (`SwizzlePass`) and b128 coalesced fill loads — Phases 1+2. Its LDS writes stay scalar
+//! (V's v_perm-deinterleaved coalesced write is a residual the barrier-bound kernel does not need) and it has
+//! NO double-buffer / ping-pong / softmax-under-MFMA interleave (Phase 3). So this measures the swizzled,
+//! single-buffered wide core vs the tuned 16×16 pipeline — an honest gate on how close the DSL is to aiter.
 //!
 //! Run: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk2 --bench fa32`
 
