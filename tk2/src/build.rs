@@ -12,7 +12,7 @@ use std::marker::PhantomData;
 
 use svod_dtype::DType;
 
-use crate::ir::{BinOp, FragMap, IndexOp, Node, Scalar, ScopeAxis, TileId, TileIr};
+use crate::ir::{AccDist, BinOp, FragMap, IndexOp, Node, Scalar, ScopeAxis, TileId, TileIr};
 
 mod sealed {
     pub trait Sealed {}
@@ -263,6 +263,36 @@ impl Builder {
             let col = self.idx_add(lg, inner);
             (row, col)
         }
+    }
+
+    /// The per-lane `(row, col)` of accumulator element `i` under an [`AccDist`] (§migration) — the
+    /// MFMA **accumulator** distribution the [`FragMap`]'s single `lane_rc` run cannot express. For the
+    /// 16×16×16 degenerate case (`m_blocks == 1`) this emits the SAME index nodes as
+    /// [`Self::lane_rc`]'s `transpose` branch (`row = (lane/16)·4 + i`, `col = lane%16`) — the consts are
+    /// created in the same order (`lane_m_stride` then `n_lanes`) and the block term is folded away, so
+    /// interning collapses the two to identical [`TileId`]s (proven in `test::byte_identity`). For
+    /// 32×32×8 the `m_blk·m_block_stride` term adds the four row-blocks (8 apart) the single run lacked.
+    pub fn acc_rc(&mut self, dist: AccDist, lane: Idx, i: usize) -> (Idx, Idx) {
+        let m_blk = i / dist.m_inner;
+        let m_in = i % dist.m_inner;
+        // `lane_m_stride` first, then `n_lanes` — mirrors `lane_rc(transpose)`'s `stride`-then-`cols`
+        // const order so a brand-new const lands at the same id (the byte-identity requirement).
+        let lane_stride = self.idx_const(dist.lane_m_stride as i64);
+        let n_lanes = self.idx_const(dist.n_lanes as i64);
+        let lg = self.idx_div(lane, n_lanes);
+        let lg = self.idx_mul(lg, lane_stride);
+        let inner = self.idx_const(m_in as i64);
+        let row = self.idx_add(lg, inner);
+        // The outer M-block offset (`i/m_inner`·`m_block_stride`) — absent for 16×16×16 (`m_blocks==1`,
+        // so `m_blk == 0`), so no node is emitted there and the 16×16 path stays byte-identical.
+        let row = if m_blk == 0 {
+            row
+        } else {
+            let blk = self.idx_const((m_blk * dist.m_block_stride) as i64);
+            self.idx_add(row, blk)
+        };
+        let col = self.idx_mod(lane, n_lanes);
+        (row, col)
     }
 
     // ── loads / stores (movement, lowered to INDEX + LOAD/STORE) ─────────────

@@ -30,6 +30,7 @@ use crate::ir::{FragMap, TileId};
 use crate::kernels::{EDGE, Program, offset_by};
 use crate::movement::{Drain, LdsStage, LdsView, SharedTile};
 use crate::pipeline::{AccSlot, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
+use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 
 const WARP: usize = 64;
 /// Warps per workgroup for the multi-warp split-Q FA (§1.2): 8 warps × 64 lanes = 512 threads. Each
@@ -136,8 +137,8 @@ impl Hooks for FaHooks {
     }
 }
 
-/// gfx942 elements-per-thread for the 16×16 fragment.
-const EPT: usize = 4;
+/// gfx942 elements-per-thread for the 16×16 fragment — DERIVED from the shape marker (§Step 1; `= 4`).
+const EPT: usize = Mfma16x16x16Bf16::EPT_C;
 
 /// **`mma_atb` isolation probe** (DE-RISK, per the Phase-A brief): a standalone single-warp kernel that
 /// computes `O[d,q] = Σ_kv V[kv,d]·P[kv,q]` — EXACTLY the FA `P·V` contraction (over the shared `kv`
@@ -159,7 +160,7 @@ pub fn atb_probe(kv: usize, d: usize, q: usize) -> Program {
     let lane = b.block_axis(WARP as i64);
     let zero = b.idx_const(0);
 
-    let col = FragMap::gfx942_16x16(true);
+    let col = Mfma16x16x16Bf16::c_map(); // the Col (B/accumulator) map, derived from the marker
     let v_smem = b.define_local::<BF16>(kv * d);
     let p_smem = b.define_local::<BF16>(kv * q);
     let v_tile = SharedTile::new(v_smem, d);
@@ -318,8 +319,8 @@ pub fn flash_attention_fwd(bh: usize, n: usize, d: usize) -> Program {
     let k_smem = b.define_local::<BF16>(kv_blk * d);
     let v_smem = b.define_local::<BF16>(kv_blk * d);
 
-    let row_map = FragMap::gfx942_16x16(false); // A operand (contraction on the spread lane-axis)
-    let col_map = FragMap::gfx942_16x16(true); // B / C / accumulator operands
+    let row_map = Mfma16x16x16Bf16::a_map(); // A operand (contraction on the spread lane-axis)
+    let col_map = Mfma16x16x16Bf16::c_map(); // B / C / accumulator operands (the Col map)
 
     // Movement handles. K (QKᵀ's A, row map): `n_frags = kvf` (the KV-block rows) × d-slices. V (PV's A,
     // col map): transposed gather (`kv` on spread), `dfrags` output frags per kv-slice. K/V shared (no

@@ -21,6 +21,7 @@ use svod_schedule::optimizer::Renderer;
 use crate::error::{self, Result};
 use crate::ir::{BinOp, IndexOp, Node, Scalar, ScopeAxis, TileId, TileIr, UnOp};
 use crate::kernels::Program;
+use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 
 /// The gfx942 16×16×16 bf16→f32 MFMA descriptor, reproduced verbatim from tk's
 /// `wmma_desc`/`wmma_from_tc` (`tk/src/group/mma.rs`): the per-arch×dtype
@@ -35,10 +36,13 @@ use crate::kernels::Program;
 /// gating is a later pass concern, DESIGN.md §2.8).
 fn wmma_desc(dtype_in: &DType) -> WmmaMetadata {
     let ren = Renderer::for_amd_arch(AmdArch::Gfx942);
+    // The intrinsic dims are DERIVED from the shape marker (§Step 1) — `(16, 16, 16)` today, the
+    // selector a per-`Node::Mma` shape will drive once 32×32×8 lands.
+    let dims = Mfma16x16x16Bf16::dims();
     let tc = ren
         .tensor_cores
         .iter()
-        .find(|tc| &tc.dtype_in == dtype_in && tc.dims == (16, 16, 16))
+        .find(|tc| &tc.dtype_in == dtype_in && tc.dims == dims)
         .expect("gfx942 has a 16×16×16 WMMA for the operand dtype (bf16/f16)");
     let axes = |ept: usize| -> Vec<(usize, usize)> { (0..(ept as f64).log2() as usize).map(|i| (4 - i, 2)).collect() };
     WmmaMetadata {

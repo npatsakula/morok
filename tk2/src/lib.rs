@@ -31,6 +31,7 @@ pub mod pass;
 pub mod passes;
 pub(crate) mod pipeline;
 pub mod schedule;
+pub mod shape;
 
 pub use build::{Builder, Elem, F32};
 pub use error::{Error, Result};
@@ -43,6 +44,7 @@ pub use schedule::{
     Carry, Committed, ComputeScope, Gathered, InFlight, MemScope, PipelineCx, SteadyOut, compute_cluster, mem_cluster,
     pipeline,
 };
+pub use shape::{Mfma16x16x16Bf16, MfmaShape};
 
 #[cfg(test)]
 mod test;

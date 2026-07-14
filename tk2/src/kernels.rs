@@ -11,10 +11,11 @@
 //!   which rides the typed [`crate::schedule::pipeline`] driver with the same asm emission.
 
 use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Val};
-use crate::ir::{FragMap, TileId, TileIr};
+use crate::ir::{TileId, TileIr};
 use crate::movement::{Drain, LdsStage, LdsView, SharedTile};
 use crate::pass::Pass;
 use crate::pipeline::{AccSlot, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
+use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 
 /// A finished tile-IR program: the arena, its sink root, and the kernel name.
 pub struct Program {
@@ -38,8 +39,10 @@ impl Program {
     }
 }
 
-/// The gfx942 MFMA edge — one 16×16×16 fragment per workgroup, one 64-lane warp.
-pub(crate) const EDGE: usize = 16;
+/// The gfx942 MFMA edge — one 16×16×16 fragment per workgroup, one 64-lane warp. Now DERIVED from the
+/// [`Mfma16x16x16Bf16`] marker (`M == N == K == 16`) instead of a bare literal (§migration Step 1): the
+/// type computes what was hardcoded, and every `EDGE` call site is byte-identical.
+pub(crate) const EDGE: usize = Mfma16x16x16Bf16::M;
 const WARP: usize = 64;
 
 /// Scatter the accumulated f32 fragment `acc` (already ordered after the K-loop `End`)
@@ -55,10 +58,14 @@ fn scatter_frag(
     lane: Idx,
 ) -> Vec<crate::build::Effect> {
     let rs = b.idx_const(row_stride);
-    (0..acc.map.ept)
+    // The accumulator C-site re-derived from the marker: `acc_rc(acc_dist())` replaces the FragMap
+    // `lane_rc`. For 16×16×16 (`m_blocks == 1`) it interns to the identical index nodes (byte-identical);
+    // for 32×32×8 the AccDist carries the 4×4 block layout a single FragMap run cannot.
+    let dist = Mfma16x16x16Bf16::acc_dist();
+    (0..Mfma16x16x16Bf16::EPT_C)
         .map(|inner| {
             let inner_idx = b.idx_const(inner as i64);
-            let (row, col) = b.lane_rc(acc.map, lane, inner_idx);
+            let (row, col) = b.acc_rc(dist, lane, inner);
             let row_off = b.idx_mul(row, rs);
             let off = b.idx_add(base, row_off);
             let off = b.idx_add(off, col);
@@ -330,9 +337,13 @@ fn kblock_impl(
         (wlane, Some(row_off), Some(col_off), Some(warp_row))
     };
 
-    let a_map = FragMap::gfx942_16x16(false);
-    let bc_map = FragMap::gfx942_16x16(true);
-    let ept = a_map.ept;
+    // Operand + accumulator lane maps and the accumulator width, DERIVED from the shape marker (§Step 1):
+    // A = Row map, B = Col map, C = the accumulator carrier. For 16×16×16 these equal the former
+    // `FragMap::gfx942_16x16(false/true)` / `ept = 4` byte-for-byte.
+    let a_map = Mfma16x16x16Bf16::a_map();
+    let b_map = Mfma16x16x16Bf16::b_map();
+    let c_map = Mfma16x16x16Bf16::c_map();
+    let ept = Mfma16x16x16Bf16::EPT_C;
     let (ri, cj) = (bm / EDGE, bn / EDGE); // per-warp accumulator grid
     let ksteps = k_step / EDGE; // K-fragments per staged block (amortises the 2 barriers)
 
@@ -357,7 +368,7 @@ fn kblock_impl(
     let a_tile = SharedTile::new(a_smem, k_step);
     let b_tile = SharedTile::new(b_smem, k_step);
     let a_view = a_tile.gather_view(a_map, ri, warp_row_off, wlane, asm_gather);
-    let b_view = b_tile.gather_view(bc_map, cj, warp_col_off, wlane, asm_gather);
+    let b_view = b_tile.gather_view(b_map, cj, warp_col_off, wlane, asm_gather);
     // A[M,K] and B[N,K] are BOTH K-contiguous → the identical trivial coalesced fill: `origin` = the
     // M/N row base, `grow_stride` = K. No transpose, no `v_perm` — B's fill IS A's fill.
     let a_stage = a_tile.stage_view(a, epl_a, tid, tm_bm, k as i64, stage_drain);
@@ -366,7 +377,7 @@ fn kblock_impl(
     // ── accumulators: one 16×16 f32 fragment per (i,j), zero-initialised. ALL carried, and every
     //    compute cluster reads+writes the full set — GEMM is the UNIFORM special case of the §3.2
     //    per-cluster read/write contract (`reads = writes = 0..ri·cj`), so it emits byte-identically. ──
-    let acc: Vec<Frag<F32>> = (0..ri * cj).map(|_| b.define_frag::<F32>(bc_map)).collect();
+    let acc: Vec<Frag<F32>> = (0..ri * cj).map(|_| b.define_frag::<F32>(c_map)).collect();
     let accs: Vec<AccSlot> = acc.iter().map(|&f| AccSlot::F32(f)).collect();
     let inited: Vec<Option<Effect>> = acc.iter().map(|&ac| Some(b.zero_init_frag(ac))).collect();
     let all_slots: Vec<usize> = (0..ri * cj).collect();

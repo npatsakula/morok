@@ -153,6 +153,32 @@ impl FragMap {
     }
 }
 
+/// The **MFMA accumulator lane→(row,col) distribution** — the datum a single [`FragMap`] cannot express
+/// (§migration). The accumulator's per-lane elements decompose into a *two-level* M-block split that the
+/// FragMap's one arithmetic-progression `lane_rc` run has no room for. Mirrors CK's `CWarpDstrEncoding`
+/// (`ck_tile/ops/gemm/warp/warp_gemm_attribute_mfma.hpp`): the M axis is `sequence<kCM0PerLane, kCMLane,
+/// kCM1PerLane>`, the N axis `sequence<kCNLane>`. For a per-lane accumulator element `i ∈ [0, ept_c)`
+/// (`m_blk = i / m_inner`, `m_in = i % m_inner`):
+/// - `row = m_blk·m_block_stride + (lane / n_lanes)·lane_m_stride + m_in`
+/// - `col = lane % n_lanes`
+///
+/// 16×16×16 is the degenerate `m_blocks = 1` case (`row = (lane/16)·4 + i`, `col = lane%16`) — identical
+/// to the `transpose` [`FragMap`] `lane_rc`; 32×32×8 is the `m_blocks = 4` case (four row-blocks 8 apart).
+/// Rides as DATA on the shape (derived by the `MfmaShape` marker), never as a surface type (§OPEN-2).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct AccDist {
+    /// Outer M row-blocks per lane — CK `kCM0PerLane` (16×16: 1, 32×32: 4).
+    pub m_blocks: usize,
+    /// Row stride between blocks — CK `kCMLane·kCM1PerLane` (16×16: 16, 32×32: 8).
+    pub m_block_stride: usize,
+    /// Rows per block (the fast per-lane element run) — CK `kCM1PerLane` (16×16: 4, 32×32: 4).
+    pub m_inner: usize,
+    /// Row stride between M-lane groups — CK `kCM1PerLane` (16×16: 4, 32×32: 4).
+    pub lane_m_stride: usize,
+    /// Lanes spanning the N (column) axis — CK `kCNLane` (16×16: 16, 32×32: 32).
+    pub n_lanes: usize,
+}
+
 /// A scope index source: a grid dimension or the block (thread) index. Nesting of
 /// loops is *emergent* from the [`Node::Range`]/[`Node::End`] edges, never authored
 /// as a boundary (DESIGN.md §D boundary constraint).
