@@ -35,6 +35,10 @@ harness = false
 name = "fa"
 harness = false
 
+[[bench]]
+name = "fa32"
+harness = false
+
 # SCRATCH DCC-inflation bench (NOT committed) — sharing `benches/common.rs`.
 [[bench]]
 name = "matmul_dsl_dcc"
