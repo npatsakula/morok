@@ -1173,7 +1173,7 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
             let zeros: Vec<Val<F32>> = (0..S::EPT_C).map(|_| b.f32(0.0)).collect();
             let mut s_acc = b.vec_build(&zeros);
             for ki in 0..dslices {
-                s_acc = b.mma_of::<S>(k_frags[ki], q_frags[ki], s_acc);
+                s_acc = crate::tile_ops::mma::<S>(b, k_frags[ki], q_frags[ki], s_acc);
             }
             vec![SlotVal::F32(s_acc)]
         },
@@ -1192,7 +1192,7 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
             // drop out of both the online max and the sum. Emitted only when `n` is not a KV-block
             // multiple; the routed `blk` counter makes it a runtime no-op on every full block.
             let s_scaled = if ragged { mask_ragged_kv(b, s_scaled, blk, wlane, n) } else { s_scaled };
-            let m_new = b.acc_row_reduce_32(s_scaled, wlane, m_run, false);
+            let m_new = crate::tile_ops::row_reduce::<S>(b, s_scaled, wlane, m_run, false);
             let corr = {
                 let diff = b.sub(m_run, m_new);
                 b.exp2(diff) // exp2(max_old − max_new)
@@ -1202,7 +1202,7 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
                 let sh = b.sub(s_scaled, m_new);
                 b.exp2(sh) // softmax weights P (f32, 16-wide)
             };
-            let l_new = b.acc_row_reduce_32(p, wlane, l_resc, true);
+            let l_new = crate::tile_ops::row_reduce::<S>(b, p, wlane, l_resc, true);
             // Declarative softmax-under-MFMA (plan §2.5): fold the online-exp2 under the block's MFMAs —
             // `interleave_exp<pairs, exp>` in SyncID group 1. The hint emits NO instruction; it is kept
             // live by routing it into the carried `p` value (`val_after`), so it survives DCE and sits in
@@ -1227,7 +1227,7 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
         o_idx.clone(),
         move |b: &mut Builder, op: Option<&Fa32Op>, reads: &[SlotVal], _blk: BlockCounter| {
             let v_frags = op.expect("PV consumes gathered V");
-            let b_ops = b.pv_relayout_s49(reads[0].f32());
+            let b_ops = crate::tile_ops::relayout::<S>(b, reads[0].f32());
             let mut anchor = None;
             let mut out: Vec<SlotVal> = (0..dtiles)
                 .map(|dt| {
@@ -1241,7 +1241,7 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
                     // fine with the intrinsic MFMA (it is schedulable, unlike the pinned asm form).
                     let mut o = reads[1 + dt].f32();
                     for s in 0..ksl {
-                        o = b.mma_of::<S>(v_frags[dt * ksl + s], b_ops[s], o);
+                        o = crate::tile_ops::mma::<S>(b, v_frags[dt * ksl + s], b_ops[s], o);
                     }
                     anchor.get_or_insert(o.id);
                     SlotVal::F32(o)
