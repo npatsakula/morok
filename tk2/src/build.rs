@@ -507,6 +507,14 @@ impl Builder {
         Effect(self.ir.intern(Node::SetPrio { level, deps }))
     }
 
+    /// A **value re-bound to observe `deps`** (an ordering edge on a `Val`, §5c) — the passthrough
+    /// [`Node::After`] returns a value equal to `v` but happens-after `deps`. The way a scheduling hint
+    /// (`interleave_valu`/`interleave_exp`) is kept LIVE + positioned inside a loop body: route the hint
+    /// effect into a carried accumulator value, so it rides the carry to the sink instead of being DCE'd.
+    pub fn val_after<E: Elem>(&mut self, v: Val<E>, deps: &[TileId]) -> Val<E> {
+        Val::wrap(self.after_buf(v.id, deps))
+    }
+
     /// An index value re-bound to observe `deps` (an ordering edge on a *value*, §5c): the way a
     /// schedule-steering custom (`wave_barrier`/`set_prio`) is ordered after a barrier without
     /// taking the barrier as a `Op::Custom` dep (which the renderer can't name) — the warp_row

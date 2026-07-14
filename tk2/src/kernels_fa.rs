@@ -741,6 +741,15 @@ const KV_BLK_32: usize = 32;
 /// an un-padded `[d, kv]` transpose regresses, proven by `v_transpose_probe`).
 const VT_PAD: usize = 8;
 
+/// The **softmax-under-MFMA interleave ratios** (plan §2.5/§5-lever-1, HipKittens' `sched_barrier_pairs`
+/// counts). `interleave_exp<PAIRS,CNT>` folds the online `exp2` under the block's MFMAs; `interleave_valu`
+/// folds the reduction VALU under the P·V MFMAs. These are the ONLY perf-tuning knobs (step-6 sweep); the
+/// values here are HK's starting cadence, and the hints are numerics-INERT (verified: the gate is unchanged).
+const FA_EXP_PAIRS: u32 = 4;
+const FA_EXP_CNT: u32 = 3;
+const FA_VALU_PAIRS: u32 = 4;
+const FA_VALU_CNT: u32 = 5;
+
 /// One K/V-slice's gathered A-operands — the FA-32 [`Hooks::Op`]. Slice 0 = K (`dslices` QKᵀ A-operands,
 /// contraction `d` over `K = 8`); slice 1 = V (the `dtiles·ksl` transposed-V A-operands, indexed
 /// `[dt·ksl + s]`, contraction `kv` over `K = 8`). Both `Vec<Val<BF16>>` (`EPT_A = 4` each).
@@ -1053,7 +1062,7 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
             let zeros: Vec<Val<F32>> = (0..S::EPT_C).map(|_| b.f32(0.0)).collect();
             let mut s_acc = b.vec_build(&zeros);
             for ki in 0..dslices {
-                s_acc = b.mma_of::<S>(k_frags[ki], q_frags[ki], s_acc);
+                s_acc = b.mma_asm_of::<S>(k_frags[ki], q_frags[ki], s_acc); // VGPR accumulator (0 AGPR)
             }
             vec![SlotVal::F32(s_acc)]
         },
@@ -1079,6 +1088,14 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
                 b.exp2(sh) // softmax weights P (f32, 16-wide)
             };
             let l_new = b.acc_row_reduce_32(p, wlane, l_resc, true);
+            // Declarative softmax-under-MFMA (plan §2.5): fold the online-exp2 under the block's MFMAs —
+            // `interleave_exp<pairs, exp>` in SyncID group 1. The hint emits NO instruction; it is kept
+            // live by routing it into the carried `p` value (`val_after`), so it survives DCE and sits in
+            // the wall-free compute region. Ratio is a perf knob (step-6 tuning); the mechanism is here.
+            let p = match b.interleave_exp(FA_EXP_PAIRS, FA_EXP_CNT, 1, &[s_scaled.id]) {
+                Some(h) => b.val_after(p, &[h.dep()]),
+                None => p,
+            };
             let mut out = vec![SlotVal::F32(m_new), SlotVal::F32(l_new), SlotVal::F32(p)];
             for i in 0..dtiles {
                 out.push(SlotVal::F32(b.mul(reads[3 + i].f32(), corr))); // O *= corr
@@ -1096,15 +1113,30 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
         move |b: &mut Builder, op: Option<&Fa32Op>, reads: &[SlotVal]| {
             let v_frags = op.expect("PV consumes gathered V");
             let b_ops = b.pv_relayout_s49(reads[0].f32());
-            (0..dtiles)
+            let mut anchor = None;
+            let mut out: Vec<SlotVal> = (0..dtiles)
                 .map(|dt| {
+                    // O accumulator stays in the INTRINSIC (AGPR) form: the loop-carried 64-VGPR O via
+                    // ClusterCx's SROA round-trip does not compose with the asm-sideeffect MFMA (d64 NaN,
+                    // 0 spill) and overflows the VGPR budget at d128. VGPR-resident O (aiter's 0-AGPR) is a
+                    // register-budget redesign (perf lever), not a correctness need — the transient QKᵀ
+                    // scores are already VGPR (the softmax-under-MFMA enabler).
                     let mut o = reads[1 + dt].f32();
                     for s in 0..ksl {
                         o = b.mma_of::<S>(v_frags[dt * ksl + s], b_ops[s], o);
                     }
+                    anchor.get_or_insert(o.id);
                     SlotVal::F32(o)
                 })
-                .collect()
+                .collect();
+            // Declarative reduction-under-MFMA: fold the softmax-max/sum VALU under the P·V MFMAs —
+            // `interleave_valu<pairs, valu>` in SyncID group 2, kept live by routing into O[0].
+            if let (Some(a), Some(SlotVal::F32(o0))) = (anchor, out.first().copied())
+                && let Some(h) = b.interleave_valu(FA_VALU_PAIRS, FA_VALU_CNT, 2, &[a])
+            {
+                out[0] = SlotVal::F32(b.val_after(o0, &[h.dep()]));
+            }
+            out
         },
     );
 
@@ -1151,6 +1183,10 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
             roots.push(b.store(o, off, val));
         }
     }
+    // Scheduling-coherence gate (plan §2.6): setprio balance + interleave sanity + hint purity ⇒
+    // deleting every interleave/prio hint leaves a still-correct kernel. A build-time panic on a bug.
+    let root_ids: Vec<TileId> = roots.iter().map(|e| e.dep()).collect();
+    crate::schedule::verify_v2(&b.ir, &root_ids);
     let (ir, sink) = b.finish(&roots);
     Program { ir, sink, name: "tk2_fa_fwd_32".into() }
 }

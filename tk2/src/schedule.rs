@@ -434,8 +434,9 @@ pub fn pipeline(
 /// split, run at kernel build alongside `pipeline`'s carry-completeness + wave-phase-balance checks.
 /// Three structural checks over the reachable DAG guarantee that **deleting every scheduling hint
 /// leaves a still-correct kernel** (so §5 perf work can never change numerics):
-/// - **setprio balance**: every `s_setprio(1)` has a matching reachable `s_setprio(0)` — a wave stuck
-///   at raised priority starves its ping-pong partner (`crate::pipeline` fixes this bug by hand).
+/// - **setprio balance**: every `s_setprio(1)` RAISE has a matching reachable `s_setprio(0)` DROP
+///   (`prio1 ≤ prio0`) — a wave stuck at raised priority starves its ping-pong partner. A lone DROP is
+///   benign (a softmax cluster with no MFMA burst emits only the closing prio0).
 /// - **interleave sanity**: per scheduling group, Σ `sched_group_barrier(MFMA).size` ≤ the MFMA count
 ///   emitted — an over-promise means LLVM silently drops the tail hints (a wrong interleave, not a
 ///   crash). A necessary whole-kernel bound (cluster tags are not in the IR).
@@ -453,14 +454,15 @@ pub(crate) fn verify_v2(ir: &TileIr, roots: &[TileId]) {
     let is_hint =
         |n: &Node| matches!(n, Node::SchedGroupBarrier { .. } | Node::SetPrio { .. } | Node::SchedFence { .. });
 
-    // (1) setprio balance.
+    // (1) setprio balance — every RAISE (prio1) must have a matching DROP (prio0); a lone prio0 is
+    //     benign (already at base), a lone prio1 leaves the wave stuck at raised priority.
     let prio = |lvl: i64| {
         reach.iter().filter(|&&id| matches!(ir.node(id), Node::SetPrio { level, .. } if *level == lvl)).count()
     };
     let (p1, p0) = (prio(1), prio(0));
-    assert_eq!(
-        p1, p0,
-        "s_setprio unbalanced (prio1: {p1}, prio0: {p0}) — a wave stuck at raised priority starves its partner"
+    assert!(
+        p1 <= p0,
+        "s_setprio unbalanced (prio1: {p1} > prio0: {p0}) — a wave stuck at raised priority starves its partner"
     );
 
     // (2) interleave sanity: per group, Σ MFMA-mask hint size ≤ MFMA count.
@@ -480,9 +482,12 @@ pub(crate) fn verify_v2(ir: &TileIr, roots: &[TileId]) {
         );
     }
 
-    // (3) hint purity: no value node consumes a hint.
+    // (3) hint purity: no COMPUTATION consumes a hint as a value operand. `Node::After` is EXEMPT — it
+    //     is a pure ordering passthrough (its value == its `val` child regardless of the hints in its
+    //     ordering deps), so a hint reachable only through an `After`'s deps changes no computed value.
+    //     Routing a hint into a carried value via `After` (the `val_after` liveness idiom) is thus pure.
     for &id in &reach {
-        if ir.meta(id).dtype.is_some() {
+        if ir.meta(id).dtype.is_some() && !matches!(ir.node(id), Node::After { .. }) {
             for c in TileIr::children(ir.node(id)) {
                 assert!(
                     !is_hint(ir.node(c)),
