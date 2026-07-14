@@ -311,6 +311,91 @@ fn load_q_frag_global(
     b.load_frag_vec_after(frag, &stores)
 }
 
+/// **Step-5 V write-side padded-transpose isolation probe** (32×32×8 DE-RISK): proves that staging V
+/// through a **padded transposed LDS** layout produces the correct 32×32×8 PV **A-operand**, IN ISOLATION,
+/// before FA trusts it. It computes `O[d,q] = Σ_kv V[kv,d]·P[kv,q]` where `V[kv,d]` (natural layout) is
+/// staged into LDS TRANSPOSED to `[d, kv]` with a **padded row pitch** (`kv + PAD`, the conflict-free
+/// bank layout — an un-padded `[d,kv]` transpose bank-conflicts and regresses), then read back **straight**
+/// as the A-operand via a contiguous `ds_read_b64` (4 kv per lane); `P` is the straight B-operand. A device
+/// allclose vs the f32 reference proves the transposed layout + the straight-read addressing yield the
+/// right operand (the read-side of aiter's V relayout; the v_perm-deinterleaved *b64* WRITE is a
+/// write-bandwidth refinement layered on this correct layout, not a correctness requirement of the probe).
+/// `d` a multiple of 32; `q = 32`; `kv = 32` (one KV block, four hardware K=8 slices).
+#[allow(clippy::needless_range_loop)]
+pub fn v_transpose_probe(d: usize) -> Program {
+    use crate::shape::Mfma32x32x8Bf16 as S;
+    const KV: usize = 32;
+    const Q: usize = 32;
+    const PAD: usize = 8; // pitch padding (mult-of-4 kept for the b64 straight read; breaks bank conflicts)
+    let pitch = KV + PAD; // transposed LDS row pitch (d rows, kv+pad cols)
+    assert!(d.is_multiple_of(S::M), "v_transpose_probe: d a multiple of 32");
+    let mut b = Builder::new("tk2_v_transpose_probe");
+    // ABI: O[d,q], then V[kv,d] (natural, transposed here) and Pt[q,kv] (the straight B-operand [N=q,K=kv]).
+    let o = b.global::<F32>(d * Q);
+    let v = b.global::<BF16>(KV * d);
+    let pt = b.global::<BF16>(Q * KV);
+    let _wg = b.grid_axis(0, 1);
+    let lane = b.block_axis(WARP as i64);
+    let zero = b.idx_const(0);
+
+    let a_map = S::a_map();
+    let b_map = S::b_map();
+    let dist = S::acc_dist();
+
+    // ── stage V[kv,d] → LDS transposed to [d, kv] with padded pitch. Each lane writes its coalesced share
+    //    of V (source index `flat = kv·d + d_idx`) to the transposed slot `LDS_T[d_idx·pitch + kv]`. ──
+    let vt = b.define_local::<BF16>(d * pitch);
+    let epl = KV * d / WARP; // elements per lane
+    let epl_c = b.idx_const(epl as i64);
+    let d_c = b.idx_const(d as i64);
+    let pitch_c = b.idx_const(pitch as i64);
+    let lane_epl = b.idx_mul(lane, epl_c);
+    let fills: Vec<TileId> = (0..epl)
+        .map(|i| {
+            let i_c = b.idx_const(i as i64);
+            let flat = b.idx_add(lane_epl, i_c); // source V flat index (kv·d + d_idx)
+            let kv = b.idx_div(flat, d_c);
+            let d_idx = b.idx_mod(flat, d_c);
+            let val = b.load(v, flat);
+            let dst = b.idx_mul(d_idx, pitch_c);
+            let dst = b.idx_add(dst, kv); // transposed padded slot
+            b.store_lds(vt, dst, val).dep()
+        })
+        .collect();
+    let bar = b.barrier(Effect(fills[0]), &fills[1..]);
+
+    // ── P·V: A-operand from the straight (contiguous) transposed read, B-operand P from global. ──
+    let q_c = b.idx_const(Q as i64);
+    let mut roots = Vec::new();
+    for dt in 0..d / S::M {
+        let mut acc = {
+            let zs: Vec<Val<F32>> = (0..S::EPT_C).map(|_| b.f32(0.0)).collect();
+            b.vec_build(&zs)
+        };
+        for s in 0..KV / S::K {
+            // A-operand for K-slice s: LDS_T[d = dt·32 + lane%32][kv = 8s + (lane/32)·4 .. +4] (contiguous).
+            let (row, kloc) = b.lane_rc(a_map, lane, zero); // row = lane%32 = d-in-tile, kloc = (lane/32)·4
+            let d_row = offset_by(&mut b, row, dt * S::M);
+            let base = b.idx_mul(d_row, pitch_c);
+            let kv_base = offset_by(&mut b, kloc, s * S::K); // (lane/32)·4 + 8s
+            let base = b.idx_add(base, kv_base);
+            let a_s = b.load_lds_vec_after(vt, base, S::EPT_A, &[bar.dep()]);
+            let b_s = crate::kernels::load_op_frag(&mut b, pt, b_map, 0, s * S::K, KV, lane);
+            acc = b.mma_of::<S>(a_s, b_s, acc);
+        }
+        for i in 0..S::EPT_C {
+            let (row, col) = b.acc_rc(dist, lane, i);
+            let d_idx = offset_by(&mut b, row, dt * S::M);
+            let off = b.idx_mul(d_idx, q_c);
+            let off = b.idx_add(off, col);
+            let val = b.vec_extract(acc, i);
+            roots.push(b.store(o, off, val));
+        }
+    }
+    let (ir, sink) = b.finish(&roots);
+    Program { ir, sink, name: "tk2_v_transpose_probe".into() }
+}
+
 /// **Streaming FA-forward** (non-causal, 8-warp split-Q, head-dim `d` a multiple of 16) authored on the
 /// [`crate::pipeline`] ClusterCx combinator. `bh = batch·heads` independent attentions over Q/K/V/O
 /// laid out `[bh, n, d]` row-major; `n` = sequence length. Grid = `bh × (n/q_blk)` workgroups, each

@@ -245,6 +245,55 @@ fn pv_relayout_probe_is_correct_on_gfx942() {
     }
 }
 
+/// Host f32 reference for the V-transpose probe: `O[d,q] = Σ_kv V[kv,d]·Pt[q,kv]` (V`[kv,d]`, Pt`[q,kv]`,
+/// both bf16 row-major) — the FA `P·V` with V staged through the transposed LDS and P the straight B-operand.
+fn vtrans_ref(vf: &[f32], ptf: &[f32], d: usize, q: usize, kv: usize) -> Vec<f32> {
+    let mut e = vec![0f32; d * q];
+    for di in 0..d {
+        for qi in 0..q {
+            let mut acc = 0f32;
+            for k in 0..kv {
+                acc += vf[k * d + di] * ptf[qi * kv + k];
+            }
+            e[di * q + qi] = acc;
+        }
+    }
+    e
+}
+
+/// **Step-5 V write-side padded-transpose gate** (32×32×8 DE-RISK): the padded transposed V staging
+/// ([`crate::kernels_fa::v_transpose_probe`]) must reproduce `O[d,q] = Σ_kv V[kv,d]·Pt[q,kv]` with V read
+/// as the 32×32×8 A-operand straight from the transposed LDS. A match PROVES the transposed padded layout +
+/// straight-read addressing yield the correct PV A-operand, in isolation, before FA. Base tile (32×32) and
+/// a wide-`d` tile (64×32, two A-operand tiles over the shared transposed LDS). `q = kv = 32`.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::v_transpose_probe --nocapture`
+#[test]
+#[ignore]
+fn v_transpose_probe_is_correct_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    const KV: usize = 32;
+    const Q: usize = 32;
+    let dev = svod_dtype::default_device::default_device();
+    for d in [32usize, 64] {
+        let mut v = Tensor::rand_with(&[KV, d], DType::BFloat16, dev.clone()).expect("rand v");
+        let mut pt = Tensor::rand_with(&[Q, KV], DType::BFloat16, dev.clone()).expect("rand pt");
+        v.realize().expect("realize v");
+        pt.realize().expect("realize pt");
+        let expected = vtrans_ref(&as_f32_vec(&v), &as_f32_vec(&pt), d, Q, KV);
+        let atol = 0.02 * (KV as f32).sqrt();
+
+        let prog = crate::kernels_fa::v_transpose_probe(d);
+        let out = Tensor::empty(&[d, Q], DType::Float32);
+        let mut y = graph_kernel(prog, out, &[&v, &pt]).expect("wrap v_transpose probe");
+        let plan = y.prepare().expect("prepare");
+        plan.execute().expect("execute");
+        let got = y.as_vec::<f32>().expect("read output");
+        let report = allclose_f32(&got, &expected, atol, 2e-2);
+        println!("v_transpose probe d={d}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+        assert!(report.ok, "v_transpose probe d={d} must match P·V reference: {}", report.message);
+    }
+}
+
 /// Host f32 reference for non-causal FA-forward: `O[q,dd] = Σ_k softmax_k(Q[q]·K[k]/√d)·V[k,dd]`
 /// over the SAME bf16-rounded operands (`q`/`k`/`v` are `[n,d]` row-major, cast to f32 first).
 fn fa_ref(qf: &[f32], kf: &[f32], vf: &[f32], n: usize, d: usize) -> Vec<f32> {
