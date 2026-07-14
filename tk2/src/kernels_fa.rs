@@ -747,7 +747,7 @@ const VT_PAD: usize = 8;
 type Fa32Op = Vec<Val<BF16>>;
 
 /// The register-staged fill carried prefetch→commit: block k+1's K and V chunks in VGPRs (the
-/// collaborative 256-thread fill's per-thread `epl` scalar elements).
+/// collaborative 256-thread fill's per-thread `epl` elements as `gvec`-wide (b128/b64) load chunks).
 struct Fa32Fill {
     k: Vec<Val<BF16>>,
     v: Vec<Val<BF16>>,
@@ -755,11 +755,12 @@ struct Fa32Fill {
 
 /// FA-32's [`Hooks`] — the 32×32×8 movement (natural-K LDS + padded-transposed-V LDS). Rides the SAME
 /// ClusterCx pipeline the 16×16 [`flash_attention_fwd`] drives, but with the 32×32×8 fragment addressing:
-/// each A-operand is a contiguous `EPT_A = 4` LDS run (`ds_read` straight, no register transpose — V's
-/// transpose is done write-side into LDS) rather than the movement layer's 16×16 [`LdsView`] gather. The
-/// fills/gathers are SCALAR in this pass (the vectorized b128 fill + b64 gather are Phase-2 refinements);
-/// gathered operands round-trip through a fragment so the WAR barrier consumes a proper store token
-/// (the [`Hooks::gather`] contract), exactly as the 16×16 FA — SROA elides the store/load.
+/// each A-operand is a contiguous `EPT_A = 4` `ds_read_b64` run (no register transpose — V's transpose is
+/// done write-side into LDS) rather than the movement layer's 16×16 [`LdsView`] gather. The global fill
+/// reads are **b128** coalesced (`load_vec_after`, Phase-2c); the LDS stores stay scalar (the coalesced
+/// write is a fill refinement the barrier-bound kernel doesn't need). Gathered operands round-trip through
+/// a fragment so the WAR barrier consumes a proper store token (the [`Hooks::gather`] contract) — SROA
+/// elides the store/load, exactly as the 16×16 FA.
 struct Fa32Hooks {
     k: Buf<BF16>,
     v: Buf<BF16>,
@@ -792,11 +793,14 @@ impl Hooks for Fa32Hooks {
         k_base: Idx,
         tile: usize,
         prev: Option<Fa32Fill>,
-        _order: &[TileId],
+        order: &[TileId],
     ) -> (Fa32Fill, Vec<TileId>) {
-        // global→VGPR: this thread's coalesced `epl` scalar loads at flat `bh_row·d + k_base + tid·epl`
-        // (the FLAT global index into `[bh, n, d]` — block `k`'s first element is `bh_row·d + k_base`).
+        // global→VGPR: this thread's COALESCED b128 (or b64) vector loads at flat `bh_row·d + k_base +
+        // tid·epl` (block `k`'s first element is `bh_row·d + k_base`). `gvec = 8` (b128) when `epl` tiles it,
+        // else 4 (b64) — the `order` edge pins the loads into this cluster (the ClusterCx load-pin anchors
+        // on the returned values). Each chunk stays within one `kv` row (`gvec ≤ d`), consumed by `commit`.
         let mut reg = prev.unwrap_or(Fa32Fill { k: Vec::new(), v: Vec::new() });
+        let gvec = if self.epl.is_multiple_of(8) { 8 } else { 4 };
         let epl_c = b.idx_const(self.epl as i64);
         let lane_epl = b.idx_mul(self.tid, epl_c);
         let flat_base = b.idx_add(self.bh_row_d, k_base);
@@ -806,10 +810,10 @@ impl Hooks for Fa32Hooks {
             1 => self.v,
             _ => panic!("FA-32 prefetch: tile ∈ {{0=K, 1=V}}, got {tile}"),
         };
-        let loaded: Vec<Val<BF16>> = (0..self.epl)
-            .map(|i| {
-                let off = offset_by(b, flat_base, i);
-                b.load(buf, off)
+        let loaded: Vec<Val<BF16>> = (0..self.epl / gvec)
+            .map(|cg| {
+                let off = offset_by(b, flat_base, cg * gvec);
+                b.load_vec_after(buf, off, gvec, order)
             })
             .collect();
         let anchors = loaded.iter().map(|v| v.id).collect();
@@ -822,29 +826,38 @@ impl Hooks for Fa32Hooks {
     }
 
     fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &Fa32Fill, war: &[TileId]) -> Vec<Effect> {
-        // VGPR→LDS behind the WAR barrier: K natural `[kv, d]`, V transposed `[d, kv]` with padded pitch.
-        // `flat = tid·epl + i → (kv, d_idx)` is block-relative (k_base rides only the global load).
+        // VGPR→LDS behind the WAR barrier. Each prefetched `gvec`-chunk covers `gvec` contiguous d in ONE
+        // `kv` row (`flat = tid·epl + cg·gvec → (kv, d_base)`, block-relative). Writes are SCALAR: K natural
+        // `[kv, d]` through the swizzle hole (`lds_col(kv, …, d)`), V transposed `[d, kv]` at padded pitch.
+        // (A coalesced b64 K write regressed d=64 — a vec_build overhead the barrier-bound kernel doesn't
+        // amortise; aiter's v_perm-deinterleaved coalesced V write is a fill refinement the non-fill-bound
+        // FA-32 doesn't need. The measured 2c win is the b128 coalesced global LOAD, not the LDS store.)
         let k_lds = if war.is_empty() { self.k_lds } else { b.lds_after(self.k_lds, war) };
         let vt_lds = if war.is_empty() { self.vt_lds } else { b.lds_after(self.vt_lds, war) };
+        let gvec = if self.epl.is_multiple_of(8) { 8 } else { 4 };
         let epl_c = b.idx_const(self.epl as i64);
         let lane_epl = b.idx_mul(self.tid, epl_c);
         let d_c = b.idx_const(self.d as i64);
         let pitch_c = b.idx_const(self.pitch as i64);
         let mut effs = Vec::with_capacity(2 * self.epl);
-        for i in 0..self.epl {
-            let flat = offset_by(b, lane_epl, i);
+        for cg in 0..self.epl / gvec {
+            let flat = offset_by(b, lane_epl, cg * gvec);
             let kv = b.idx_div(flat, d_c);
-            let d_idx = b.idx_mod(flat, d_c);
-            // K natural [kv, d] through the `LdsCol` swizzle hole (cols = d, a power of 2 for d ∈ {64,128}):
-            // `SwizzlePass` folds it to the XOR bank-spread, the gather reads the SAME `lds_col(kv, …, d)`.
-            // (V's transpose keeps its padded pitch — non-power-of-2, so the XOR swizzle is not applied.)
-            let k_col = b.lds_col(kv, d_idx, self.d);
-            let k_dst = b.idx_mul(kv, d_c);
-            let k_dst = b.idx_add(k_dst, k_col);
-            effs.push(b.store_lds(k_lds, k_dst, reg.k[i]));
-            let v_dst = b.idx_mul(d_idx, pitch_c);
-            let v_dst = b.idx_add(v_dst, kv); // V transposed [d, kv]
-            effs.push(b.store_lds(vt_lds, v_dst, reg.v[i]));
+            let d_base = b.idx_mod(flat, d_c);
+            let kv_row = b.idx_mul(kv, d_c);
+            let (kchunk, vchunk) = (reg.k[cg], reg.v[cg]);
+            for j in 0..gvec {
+                let d_idx = offset_by(b, d_base, j);
+                // K natural [kv, d] through the swizzle hole; V transposed [d, kv] with padded pitch.
+                let k_col = b.lds_col(kv, d_idx, self.d);
+                let k_dst = b.idx_add(kv_row, k_col);
+                let kval = b.vec_extract(kchunk, j);
+                effs.push(b.store_lds(k_lds, k_dst, kval));
+                let v_dst = b.idx_mul(d_idx, pitch_c);
+                let v_dst = b.idx_add(v_dst, kv);
+                let vval = b.vec_extract(vchunk, j);
+                effs.push(b.store_lds(vt_lds, v_dst, vval));
+            }
         }
         effs
     }

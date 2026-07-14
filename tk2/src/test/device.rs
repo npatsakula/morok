@@ -512,6 +512,28 @@ fn dump_streaming_isa() {
     println!("streaming ISA dumped: {dir}/streaming.ll ({} B), {dir}/streaming.co ({} B)", src.len(), bytes.len());
 }
 
+/// **FA-32 ISA/spill diagnostic** (§Phase-2 bottleneck probe) — dump the compiled FA-32's amdgcn source
+/// and report scratch (spill) bytes/thread, so the Phase-3 handoff knows whether the kernel is spill-bound.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::dump_fa32_isa --nocapture`
+#[test]
+#[ignore]
+fn dump_fa32_isa() {
+    let dir = std::env::var("SVOD_DUMP_DIR").unwrap_or_else(|_| "/tmp/tk2_isa".into());
+    std::fs::create_dir_all(&dir).expect("mkdir dump dir");
+    let device_spec = Tensor::empty(&[1], DType::Float32).device();
+    for d in [64usize, 128usize] {
+        let prog = crate::kernels_fa::flash_attention_fwd_32(2, 2048, d).apply(SwizzlePass);
+        let (src, bytes) = launch::compile_artifacts(&prog, &device_spec).expect("compile FA-32");
+        let parsed = svod_device::amd::program::parse_kernel(&bytes, "tk2_fa_fwd_32").expect("parse FA-32");
+        std::fs::write(format!("{dir}/fa32_d{d}.ll"), &src).expect("write ll");
+        let scratch = { parsed.kd }.private_segment_fixed_size;
+        println!(
+            "FA-32 d={d}: scratch(spill)={scratch}B/thread — {} (LLVM IR → {dir}/fa32_d{d}.ll)",
+            if scratch == 0 { "NO spills" } else { "SPILLING" },
+        );
+    }
+}
+
 /// **0-spill guard for the asm-gather clustered kernels** — the latent-fragility tripwire. The asm
 /// `ds_read_b64`/`ds_write_b64` gather+commit are waitcnt-opaque, so LLVM's spill logic cannot model
 /// their async LDS completion: a register spilled/reloaded around them can carry a value that has not
