@@ -193,6 +193,58 @@ fn mma_atb_probe_is_correct_on_gfx942() {
     }
 }
 
+/// Host f32 reference for the P→PV relayout probe: `O[d,q] = Σ_kv V[d,kv]·P[kv,q]` (V`[d,kv]` bf16,
+/// P`[kv,q]` exact-bf16 f32, both row-major) — the FA `P·V` with `P` in the 32×32×8 accumulator layout.
+fn pv_ref(vf: &[f32], pf: &[f32], d: usize, q: usize, kv: usize) -> Vec<f32> {
+    let mut e = vec![0f32; d * q];
+    for di in 0..d {
+        for qi in 0..q {
+            let mut acc = 0f32;
+            for k in 0..kv {
+                acc += vf[di * kv + k] * pf[k * q + qi];
+            }
+            e[di * q + qi] = acc;
+        }
+    }
+    e
+}
+
+/// **Step-4 P→PV relayout gate** (32×32×8 DE-RISK): the `v_perm_b32` primitive + [`Builder::pv_relayout_s49`]
+/// pack ([`crate::kernels_fa::pv_relayout_probe`]) must reproduce `O[d,q] = Σ_kv V[d,kv]·P[kv,q]` where `P`
+/// is loaded into the 32×32×8 C-accumulator layout and relayout'd to the PV B-operands via `v_perm s49`.
+/// A match PROVES the selector + the accumulator↔B-operand element correspondence in isolation, before FA.
+/// Base tile (32×32), a wide-`d` tile (64×32, 2 A-operand tiles), and a wide-`q` tile (32×64, 2 accumulator
+/// loads/relayouts) exercise both axes. `P` holds exact bf16 values so the pack's truncation is a no-op.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::pv_relayout_probe --nocapture`
+#[test]
+#[ignore]
+fn pv_relayout_probe_is_correct_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    const KV: usize = 32;
+    let dev = svod_dtype::default_device::default_device();
+    for (d, q) in [(32usize, 32usize), (64, 32), (32, 64)] {
+        // P holds EXACT bf16 values (rand bf16 → f32), so the v_perm-pack truncation is a no-op vs ref.
+        let mut p = Tensor::rand_with(&[KV, q], DType::BFloat16, dev.clone()).expect("rand p");
+        let mut v = Tensor::rand_with(&[d, KV], DType::BFloat16, dev.clone()).expect("rand v");
+        p.realize().expect("realize p");
+        v.realize().expect("realize v");
+        let mut p_f32 = p.cast(DType::Float32).expect("p→f32");
+        p_f32.realize().expect("realize p f32");
+        let expected = pv_ref(&as_f32_vec(&v), &as_f32_vec(&p_f32), d, q, KV);
+        let atol = 0.02 * (KV as f32).sqrt();
+
+        let prog = crate::kernels_fa::pv_relayout_probe(d, q);
+        let out = Tensor::empty(&[d, q], DType::Float32);
+        let mut y = graph_kernel(prog, out, &[&p_f32, &v]).expect("wrap pv_relayout probe");
+        let plan = y.prepare().expect("prepare");
+        plan.execute().expect("execute");
+        let got = y.as_vec::<f32>().expect("read output");
+        let report = allclose_f32(&got, &expected, atol, 2e-2);
+        println!("pv_relayout probe d={d} q={q}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+        assert!(report.ok, "pv_relayout probe {d}×{q} must match P·V reference: {}", report.message);
+    }
+}
+
 /// Host f32 reference for non-causal FA-forward: `O[q,dd] = Σ_k softmax_k(Q[q]·K[k]/√d)·V[k,dd]`
 /// over the SAME bf16-rounded operands (`q`/`k`/`v` are `[n,d]` row-major, cast to f32 first).
 fn fa_ref(qf: &[f32], kf: &[f32], vf: &[f32], n: usize, d: usize) -> Vec<f32> {

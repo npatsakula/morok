@@ -100,7 +100,7 @@ pub(crate) fn add_opt(b: &mut Builder, idx: Idx, off: Option<Idx>) -> Idx {
 /// index and `kk` the K contribution, and the global offset is `(outer_base + outer)·k_dim + (k_base +
 /// kk)`. Used only by the 32×32×8 isolation probe (a self-contained gather, free of the EDGE-coupled
 /// movement layer, so it exercises the marker's operand maps directly).
-fn load_op_frag(
+pub(crate) fn load_op_frag(
     b: &mut Builder,
     src: Buf<BF16>,
     map: FragMap,

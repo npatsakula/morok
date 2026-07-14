@@ -804,6 +804,48 @@ impl Builder {
         self.vec_build(&els)
     }
 
+    /// **Intra-lane byte permute** (`v_perm_b32 D, hi, lo, sel` / `llvm.amdgcn.perm`, gfx942 — the
+    /// register-level 2×2 bf16 transpose aiter's 32×32×8 Flash-Attention uses). Over the 8-byte pool
+    /// `{lo.bytes @ 0-3, hi.bytes @ 4-7}`, output byte `i = pool[sel.byte[i]]`; the result is a
+    /// `<2×bf16>` dword. With `sel = S49` over two f32 operands this yields their **truncated bf16 pair**
+    /// (bf16 = an f32's top 16 bits), fusing the f32→bf16 cast with the pack. Barrier-free (a pure ALU
+    /// shuffle), mirroring [`Self::shuffle_lane`]'s `Op::Custom` shape.
+    pub fn v_perm_b32(&mut self, hi: Val<F32>, lo: Val<F32>, selector: i64) -> Val<BF16> {
+        Val::wrap(self.ir.intern(Node::VPerm { hi: hi.id, lo: lo.id, selector }))
+    }
+
+    /// aiter's `s49` selector — gather the HIGH bf16 of each dword pair (bytes {2,3,6,7}), i.e. the
+    /// truncated-bf16 pair of two f32 operands. `s50` (LOW bf16, bytes {0,1,4,5}) is the V-deinterleave twin.
+    pub const S49_HI_BF16: i64 = 0x07060302;
+    /// aiter's `s50` selector — gather the LOW bf16 of each dword pair (bytes {0,1,4,5}); the V-transpose
+    /// deinterleave half (see [`Self::v_perm_b32`]).
+    pub const S50_LO_BF16: i64 = 0x05040100;
+
+    /// **The P→PV relayout under 32×32×8** (aiter's `v_perm s49` pack): the 16-wide f32 QKᵀ accumulator
+    /// (`Mfma32x32x8Bf16::EPT_C = 16`) truncated to bf16 and packed into the **4** PV B-operands (one per
+    /// hardware `K = 8` slice, `EPT_B = 4` bf16 each). By the accumulator↔B-operand layout correspondence
+    /// (proven in `pv_relayout_probe`), B-operand for slice `s` is exactly the truncated bf16 of accumulator
+    /// elements `[4s, 4s+1, 4s+2, 4s+3]` — the intra-lane pack a single [`Self::v_perm_b32`] pair does per
+    /// slice. This is the 32×32×8 replacement for the 16×16×16 zero-cost cast (which no longer holds).
+    pub fn pv_relayout_s49(&mut self, acc: Val<F32>) -> Vec<Val<BF16>> {
+        (0..4)
+            .map(|s| {
+                let e0 = self.vec_extract(acc, 4 * s);
+                let e1 = self.vec_extract(acc, 4 * s + 1);
+                let e2 = self.vec_extract(acc, 4 * s + 2);
+                let e3 = self.vec_extract(acc, 4 * s + 3);
+                // v_perm(hi, lo, s49) = <trunc(lo), trunc(hi)>: dword0 = <e0,e1>, dword1 = <e2,e3>.
+                let d0 = self.v_perm_b32(e1, e0, Self::S49_HI_BF16);
+                let d1 = self.v_perm_b32(e3, e2, Self::S49_HI_BF16);
+                let b0 = self.vec_extract(d0, 0);
+                let b1 = self.vec_extract(d0, 1);
+                let b2 = self.vec_extract(d1, 0);
+                let b3 = self.vec_extract(d1, 1);
+                self.vec_build(&[b0, b1, b2, b3]) // <4×bf16> = bf16(acc[4s..4s+4])
+            })
+            .collect()
+    }
+
     /// The **manual LDS drain** (`s_waitcnt lgkmcnt(0)`, §5c): a void `asm sideeffect` ordered after
     /// `prev` (the last commit write) that stalls until every outstanding LDS op completes — the
     /// exposed drain the asm [`Self::ds_write_b64`] commit needs (its writes are waitcnt-opaque).

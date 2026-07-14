@@ -253,6 +253,16 @@ pub enum Node {
     /// `shuffle_lane`). Barrier-free — the building block of FA's `exp2`-free-of-barrier
     /// online-softmax row reductions. Renders `bitcast f32→i32`, bpermute, `bitcast i32→f32`.
     DsBpermute { addr: TileId, data: TileId },
+    /// An **intra-lane byte permute** (`v_perm_b32 D, hi, lo, sel` → `llvm.amdgcn.perm`, gfx942) — the
+    /// register-level 2×2 bf16 transpose aiter's Flash-Attention uses for the 32×32×8 relayouts. Over an
+    /// 8-byte pool `{lo.bytes[0..4] @ idx 0-3, hi.bytes[0..4] @ idx 4-7}`, output byte `i` = `pool[sel.byte[i]]`.
+    /// The two aiter selectors: `s49 = 0x07060302` gathers the HIGH bf16 of each dword pair (bytes {2,3,6,7})
+    /// — which, over two f32 operands, is exactly their **truncated (RTZ) bf16 pair** packed into one dword
+    /// (bf16 = the top 16 bits of an f32); `s50 = 0x05040100` gathers the LOW bf16 (bytes {0,1,4,5}). `hi`/`lo`
+    /// are the two source dwords (bitcast to i32); `selector` is the compile-time byte-select immediate. The
+    /// result is a `<2 × bf16>` dword (the two gathered bf16 halves). Lowers to a `<2×bf16>`-bitcast of the
+    /// `llvm.amdgcn.perm` i32 result — a hand-written `Op::Custom`, mirroring [`Node::DsBpermute`].
+    VPerm { hi: TileId, lo: TileId, selector: i64 },
     /// Store `value` into `buf` at flat `offset` (an effect).
     StoreGlobal { buf: TileId, offset: TileId, value: TileId },
     /// Vector LOAD of a whole `ept`-element per-lane fragment run from register `buf`
@@ -567,6 +577,7 @@ impl TileIr {
             Node::EltwiseBinary { op, a, b } => Node::EltwiseBinary { op, a: f(a), b: f(b) },
             Node::Unary { op, x } => Node::Unary { op, x: f(x) },
             Node::DsBpermute { addr, data } => Node::DsBpermute { addr: f(addr), data: f(data) },
+            Node::VPerm { hi, lo, selector } => Node::VPerm { hi: f(hi), lo: f(lo), selector },
             Node::StoreGlobal { buf, offset, value } => {
                 Node::StoreGlobal { buf: f(buf), offset: f(offset), value: f(value) }
             }
@@ -678,6 +689,8 @@ impl TileIr {
             }
             // The bpermute'd lane value — a Float32 scalar (transported bitcast through i32).
             Node::DsBpermute { .. } => TileMeta::value(SmallVec::new(), DType::Float32, Residency::Reg),
+            // The v_perm'd value — a `<2 × bf16>` dword (the two gathered/packed bf16 halves).
+            Node::VPerm { .. } => TileMeta::value(SmallVec::from_slice(&[2]), DType::BFloat16, Residency::Reg),
             // A fragment vector value: an `ept`-lane register vector (bookkeeping only;
             // the lowered UOp carries the true `dtype.vec(ept)`).
             Node::LoadRegVec { dtype, ept, .. } | Node::LoadVecAt { dtype, ept, .. } => {

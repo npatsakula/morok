@@ -140,6 +140,74 @@ impl Hooks for FaHooks {
 /// gfx942 elements-per-thread for the 16×16 fragment — DERIVED from the shape marker (§Step 1; `= 4`).
 const EPT: usize = Mfma16x16x16Bf16::EPT_C;
 
+/// **Step-4 P→PV relayout isolation probe** (32×32×8 DE-RISK): proves the `v_perm_b32` primitive AND the
+/// [`Builder::pv_relayout_s49`] pack are correct, IN ISOLATION, before FA trusts them. It computes
+/// `O[d,q] = Σ_kv V[d,kv]·P[kv,q]` where `P` is loaded straight into the 32×32×8 **C-accumulator** layout
+/// (`acc_rc`, the exact distribution a QKᵀ MFMA would leave it in), then relayout'd via `v_perm s49` into
+/// the PV **B-operands**, while `V` is the A-operand — one 32×32×8 MFMA per `K=8` slice accumulated over
+/// the four slices of the 32-row KV block. A device allclose vs the f32 reference proves the selector +
+/// the accumulator↔B-operand element correspondence are right (a wrong selector → high error on a tiny
+/// probe, not silent FA corruption). `P` holds exact bf16 values (f32 buffer) so the pack's truncation is
+/// a no-op vs the reference. `d`/`q` multiples of 32; `kv = 32` (one KV block, four K-slices).
+#[allow(clippy::needless_range_loop)]
+pub fn pv_relayout_probe(d: usize, q: usize) -> Program {
+    use crate::shape::Mfma32x32x8Bf16 as S;
+    const KV: usize = 32; // one 32-row KV block = four hardware K=8 slices
+    assert!(d.is_multiple_of(S::M) && q.is_multiple_of(S::N), "pv_relayout_probe: d, q multiples of 32");
+    let mut b = Builder::new("tk2_pv_relayout_probe");
+    // ABI: output O[d,q], then P[kv,q] (f32, exact-bf16 values) and V[d,kv] (bf16, the A operand).
+    let o = b.global::<F32>(d * q);
+    let p = b.global::<F32>(KV * q);
+    let v = b.global::<BF16>(d * KV);
+    let _wg = b.grid_axis(0, 1);
+    let lane = b.block_axis(WARP as i64);
+
+    let a_map = S::a_map();
+    let dist = S::acc_dist();
+    let q_c = b.idx_const(q as i64);
+    let mut roots = Vec::new();
+    for qt in 0..q / S::N {
+        // ── load P's [kv=32, q-tile] into the 32×32×8 C-accumulator layout (f32), then relayout via
+        //    v_perm s49 into the four PV B-operands (one per K=8 slice). ──
+        let p_acc = {
+            let els: Vec<Val<F32>> = (0..S::EPT_C)
+                .map(|i| {
+                    let (row, col) = b.acc_rc(dist, lane, i); // row = kv, col = q-in-tile
+                    let q_idx = offset_by(&mut b, col, qt * S::N);
+                    let off = b.idx_mul(row, q_c);
+                    let off = b.idx_add(off, q_idx);
+                    b.load(p, off)
+                })
+                .collect();
+            b.vec_build(&els)
+        };
+        let b_ops = b.pv_relayout_s49(p_acc); // 4 × <4×bf16>, one per K-slice
+
+        for dt in 0..d / S::M {
+            let mut acc = {
+                let zs: Vec<Val<F32>> = (0..S::EPT_C).map(|_| b.f32(0.0)).collect();
+                b.vec_build(&zs)
+            };
+            for s in 0..KV / S::K {
+                let a_s = crate::kernels::load_op_frag(&mut b, v, a_map, dt * S::M, s * S::K, KV, lane);
+                acc = b.mma_of::<S>(a_s, b_ops[s], acc);
+            }
+            // scatter O[d,q]: acc element i → O[dt·32 + row(=d), qt·32 + col(=q)] via acc_rc.
+            for i in 0..S::EPT_C {
+                let (row, col) = b.acc_rc(dist, lane, i);
+                let d_idx = offset_by(&mut b, row, dt * S::M);
+                let q_idx = offset_by(&mut b, col, qt * S::N);
+                let off = b.idx_mul(d_idx, q_c);
+                let off = b.idx_add(off, q_idx);
+                let val = b.vec_extract(acc, i);
+                roots.push(b.store(o, off, val));
+            }
+        }
+    }
+    let (ir, sink) = b.finish(&roots);
+    Program { ir, sink, name: "tk2_pv_relayout_probe".into() }
+}
+
 /// **`mma_atb` isolation probe** (DE-RISK, per the Phase-A brief): a standalone single-warp kernel that
 /// computes `O[d,q] = Σ_kv V[kv,d]·P[kv,q]` — EXACTLY the FA `P·V` contraction (over the shared `kv`
 /// row) — via the transposed operand gather ([`LdsView::gather_transposed`]) + the SAME

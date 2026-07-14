@@ -215,6 +215,23 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             );
             sh.bitcast(DType::Float32)
         }
+        // Intra-lane byte permute (`v_perm_b32` / `llvm.amdgcn.perm`) — the register-level 2×2 bf16
+        // transpose. `hi`/`lo` are the two source dwords (bitcast to i32); `selector` is baked into the
+        // call as an immediate (a compile-time byte-select, not an operand). The i32 result is bitcast to
+        // `<2×bf16>` (the two gathered bf16 halves). Hand-written `Op::Custom`, mirroring `DsBpermute`.
+        Node::VPerm { hi, lo, selector } => {
+            let hi = get(low, hi).bitcast(DType::Int32);
+            let lo = get(low, lo).bitcast(DType::Int32);
+            let p = UOp::custom(
+                smallvec![hi, lo],
+                format!(
+                    "declare i32 @llvm.amdgcn.perm(i32, i32, i32)\n\
+                     call i32 @llvm.amdgcn.perm(i32 {{0}}, i32 {{1}}, i32 {selector})"
+                ),
+                DType::Int32,
+            );
+            p.bitcast(DType::BFloat16.vec(2).expect("v_perm: <2×bf16>"))
+        }
         // ONE `<ept × dtype>` vector load of the whole per-lane fragment run (offset 0)
         // — the WMMA operand (mirrors tk's `load_vec_at`).
         Node::LoadRegVec { buf, ept, dtype } => {
