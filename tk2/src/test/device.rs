@@ -134,21 +134,18 @@ fn mfma_32x32x8_probe_is_correct_on_gfx942() {
         let expected = ab_t_ref(&as_f32_vec(&a), &as_f32_vec(&b), m, n, k);
         let atol = 0.02 * (k as f32).sqrt();
 
-        // Run BOTH the intrinsic (AGPR-default) and the VGPR asm `=v,v,v,0` form: the asm form's
-        // bit-exactness validates the 32×32×8 asm renderer (never exercised on device) — the FA
-        // VGPR-accumulator prerequisite (§build-order step 1).
-        for asm in [false, true] {
-            let prog = crate::kernels::mfma_32x32x8_probe(m, n, k, asm);
-            let out = Tensor::empty(&[m, n], DType::Float32);
-            let mut y = graph_kernel(prog, out, &[&a, &b]).expect("wrap 32×32×8 probe");
-            let plan = y.prepare().expect("prepare");
-            plan.execute().expect("execute");
-            let got = y.as_vec::<f32>().expect("read output");
-            let report = allclose_f32(&got, &expected, atol, 2e-2);
-            let form = if asm { "asm" } else { "intrinsic" };
-            println!("mfma_32x32x8 probe {m}×{n}×{k} [{form}]: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
-            assert!(report.ok, "32×32×8 probe {m}×{n}×{k} [{form}] must match A·Bᵀ reference: {}", report.message);
-        }
+        // The intrinsic MFMA (the production fast path — the asm `sideeffect` form was dropped: it is
+        // opaque to the AMDGPU GCNHazardRecognizer, so it emits none of the mandatory 32×32×8 `s_nop`s
+        // and a VALU-adjacent accumulator miscompiles → NaN, device-proven; see `flash_attention_fwd_32`).
+        let prog = crate::kernels::mfma_32x32x8_probe(m, n, k);
+        let out = Tensor::empty(&[m, n], DType::Float32);
+        let mut y = graph_kernel(prog, out, &[&a, &b]).expect("wrap 32×32×8 probe");
+        let plan = y.prepare().expect("prepare");
+        plan.execute().expect("execute");
+        let got = y.as_vec::<f32>().expect("read output");
+        let report = allclose_f32(&got, &expected, atol, 2e-2);
+        println!("mfma_32x32x8 probe {m}×{n}×{k}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+        assert!(report.ok, "32×32×8 probe {m}×{n}×{k} must match A·Bᵀ reference: {}", report.message);
     }
 }
 

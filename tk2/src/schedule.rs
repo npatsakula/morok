@@ -515,7 +515,7 @@ mod tests {
 
     /// A tiny compute cluster authored through the typed scopes — the seal-split + interleave + prio
     /// vocabulary — must pass `verify_v2`. Proves the API composes + the coherence checks accept a
-    /// well-formed schedule BEFORE FA rides it (step 4). Two MFMAs (VGPR asm) bracketed by set_prio,
+    /// well-formed schedule BEFORE FA rides it (step 4). Two MFMAs (intrinsic) bracketed by set_prio,
     /// an `interleave_valu<2,5>` hint, sealed scheduling-transparently (`seal_ordering`).
     #[test]
     fn typed_scopes_compose_and_verify_v2() {
@@ -537,7 +537,7 @@ mod tests {
             for ki in 0..2 {
                 let af = crate::kernels::load_op_frag(c_scope, a, a_map, 0, ki * S::K, 2 * S::K, lane);
                 let bf = crate::kernels::load_op_frag(c_scope, bmat, b_map, 0, ki * S::K, 2 * S::K, lane);
-                acc = c_scope.mma_asm_of::<S>(af, bf, acc);
+                acc = c_scope.mma_of::<S>(af, bf, acc);
             }
             let hint = c_scope.interleave_valu(2, 5, 1, &[prio1]).expect("pairs>0");
             let n_c = c_scope.idx_const(S::N as i64);

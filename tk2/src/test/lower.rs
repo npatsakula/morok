@@ -120,19 +120,12 @@ fn fa_forward_on_clustercx_lowers_spec_valid() {
     );
 }
 
-// ── the 32×32×8 wide-core probe: a second MFMA shape lowers spec-valid ──────────────────────────
-
-/// The 32×32×8 MFMA isolation probe ([`crate::kernels::mfma_32x32x8_probe`]) must lower to spec-valid
-/// device-UOp — proving the `Node::Mma` accumulator-width dispatch (`ept 16 → 32×32×8`), the wide
-/// `v_mfma_f32_32x32x8_bf16` intrinsic selection, and the 16-VGPR `acc_rc` scatter survive lowering +
-/// `type_verify` BEFORE the device gate. Covers one MFMA (32×32×8), a K-loop (32×32×16), and a tiled
-/// output (64×64×8) so the accumulation chain + the M/N tiling are all exercised in the linearizer.
 // ── the SchedGroupBarrier interleave primitive (FA-redesign step 2) ──────────────────────────────
 
 /// The declarative interleave directive ([`crate::build::Builder::interleave_valu`]) must (a) intern
 /// `SchedGroupBarrier` nodes, (b) lower spec-valid, and (c) RENDER to the `@llvm.amdgcn.sched.group.
 /// barrier` builtin the AMDGPU backend emits as the `; sched_group_barrier` interleave comment. A tiny
-/// 2-slice 32×32×8 MFMA burst (VGPR asm accumulator) + a VALU scale carries an `interleave_valu<2,5>`
+/// 2-slice 32×32×8 MFMA burst (intrinsic accumulator) + a VALU scale carries an `interleave_valu<2,5>`
 /// hint threaded live into the store — the minimal proof the primitive emits before FA depends on it.
 #[test]
 fn sched_group_barrier_lowers_and_renders_the_builtin() {
@@ -145,7 +138,7 @@ fn sched_group_barrier_lowers_and_renders_the_builtin() {
     let _wg = b.grid_axis(0, 1);
     let lane = b.block_axis(64);
     let (a_map, b_map, dist) = (S::a_map(), S::b_map(), S::acc_dist());
-    // 2-slice K-loop into one VGPR-asm accumulator.
+    // 2-slice K-loop into one intrinsic-MFMA accumulator.
     let mut acc = {
         let zs: Vec<_> = (0..S::EPT_C).map(|_| b.f32(0.0)).collect();
         b.vec_build(&zs)
@@ -153,7 +146,7 @@ fn sched_group_barrier_lowers_and_renders_the_builtin() {
     for ki in 0..2 {
         let af = crate::kernels::load_op_frag(&mut b, a, a_map, 0, ki * S::K, 2 * S::K, lane);
         let bf = crate::kernels::load_op_frag(&mut b, bmat, b_map, 0, ki * S::K, 2 * S::K, lane);
-        acc = b.mma_asm_of::<S>(af, bf, acc);
+        acc = b.mma_of::<S>(af, bf, acc);
     }
     // A VALU op the interleave can pull under the MFMAs (the softmax-rescale analog).
     let two = b.f32(2.0);
@@ -194,16 +187,19 @@ fn sched_group_barrier_lowers_and_renders_the_builtin() {
     assert!(llvm.contains("i32 2, i32 5"), "VALU-mask(0x2) size-5 group present");
 }
 
+/// The 32×32×8 MFMA isolation probe ([`crate::kernels::mfma_32x32x8_probe`]) must lower to spec-valid
+/// device-UOp — proving the `Node::Mma` accumulator-width dispatch (`ept 16 → 32×32×8`), the wide
+/// `v_mfma_f32_32x32x8_bf16` intrinsic selection, and the 16-VGPR `acc_rc` scatter survive lowering +
+/// `type_verify` BEFORE the device gate. Covers one MFMA (32×32×8), a K-loop (32×32×16), and a tiled
+/// output (64×64×8) so the accumulation chain + the M/N tiling are all exercised in the linearizer.
 #[test]
 fn mfma_32x32x8_probe_lowers_spec_valid() {
     for (m, n, k) in [(32usize, 32usize, 8usize), (32, 32, 16), (64, 64, 8)] {
-        for asm in [false, true] {
-            let p = crate::kernels::mfma_32x32x8_probe(m, n, k, asm);
-            // Exactly the tiled MFMA count: (m/32)·(n/32)·(k/8).
-            let n_mma =
-                (0..p.ir.len()).filter(|&i| matches!(p.ir.node(crate::ir::TileId(i as u32)), Node::Mma { .. })).count();
-            assert_eq!(n_mma, (m / 32) * (n / 32) * (k / 8), "probe {m}×{n}×{k} MFMA count");
-            lower::verify(&p).expect("32×32×8 probe must lower to spec-valid UOp");
-        }
+        let p = crate::kernels::mfma_32x32x8_probe(m, n, k);
+        // Exactly the tiled MFMA count: (m/32)·(n/32)·(k/8).
+        let n_mma =
+            (0..p.ir.len()).filter(|&i| matches!(p.ir.node(crate::ir::TileId(i as u32)), Node::Mma { .. })).count();
+        assert_eq!(n_mma, (m / 32) * (n / 32) * (k / 8), "probe {m}×{n}×{k} MFMA count");
+        lower::verify(&p).expect("32×32×8 probe must lower to spec-valid UOp");
     }
 }
