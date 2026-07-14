@@ -106,7 +106,13 @@ impl Hooks for FaHooks {
         fk.into_iter().chain(fv).collect()
     }
 
-    fn gather(&mut self, b: &mut Builder, slice: usize, raw: &[TileId]) -> (FaOp, Vec<TileId>, TileId) {
+    fn gather(
+        &mut self,
+        b: &mut Builder,
+        slice: usize,
+        _block: BlockCounter,
+        raw: &[TileId],
+    ) -> (FaOp, Vec<TileId>, TileId) {
         let mut vecs = Vec::new();
         let mut g = Vec::new();
         match slice {
@@ -780,6 +786,11 @@ struct Fa32Hooks {
     v: Buf<BF16>,
     k_lds: Lds<BF16>,
     vt_lds: Lds<BF16>,
+    /// Lever-3 LDS double-buffer: when set, `k_lds`/`vt_lds` are allocated 2× and a runtime parity
+    /// offset (`(block±1)%2 · tile`) selects the read/write half so commit(k+1) writes the OTHER buffer
+    /// than gather(k) reads — removing the WAR hazard and letting the two staggered warp-groups read
+    /// non-overwritten buffers. Off ⇒ single tile, parity offset always 0 (bit-identical to pre-lever).
+    double_buf: bool,
     /// `bh_row · d` — this workgroup's (b,h) slice flat base (folded into every fill global offset so the
     /// pipeline's FLAT per-block `k_base` lands at the right `[bh, n, d]` row).
     bh_row_d: Idx,
@@ -794,6 +805,23 @@ struct Fa32Hooks {
     dslices: usize,
     dtiles: usize,
     ksl: usize,
+}
+
+impl Fa32Hooks {
+    /// The runtime parity offset (in elements) into the double-sized K / Vt LDS tiles for `block`:
+    /// `(block % 2) · tile_size`. Both zero when double-buffering is off (so the single-tile addressing
+    /// is bit-identical to the pre-lever kernel).
+    fn parity_off(&self, b: &mut Builder, block: Idx) -> (Idx, Idx) {
+        if !self.double_buf {
+            let z = b.idx_const(0);
+            return (z, z);
+        }
+        let two = b.idx_const(2);
+        let par = b.idx_mod(block, two);
+        let k_tile = b.idx_const((KV_BLK_32 * self.d) as i64);
+        let vt_tile = b.idx_const((self.d * self.pitch) as i64);
+        (b.idx_mul(par, k_tile), b.idx_mul(par, vt_tile))
+    }
 }
 
 impl Hooks for Fa32Hooks {
@@ -839,7 +867,7 @@ impl Hooks for Fa32Hooks {
         (reg, anchors)
     }
 
-    fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &Fa32Fill, war: &[TileId]) -> Vec<Effect> {
+    fn commit(&mut self, b: &mut Builder, k_base: Idx, reg: &Fa32Fill, war: &[TileId]) -> Vec<Effect> {
         // VGPR→LDS behind the WAR barrier. Each prefetched `gvec`-chunk covers `gvec` contiguous d in ONE
         // `kv` row (`flat = tid·epl + cg·gvec → (kv, d_base)`, block-relative). Writes are SCALAR: K natural
         // `[kv, d]` through the swizzle hole (`lds_col(kv, …, d)`), V transposed `[d, kv]` at padded pitch.
@@ -848,6 +876,13 @@ impl Hooks for Fa32Hooks {
         // FA-32 doesn't need. The measured 2c win is the b128 coalesced global LOAD, not the LDS store.)
         let k_lds = if war.is_empty() { self.k_lds } else { b.lds_after(self.k_lds, war) };
         let vt_lds = if war.is_empty() { self.vt_lds } else { b.lds_after(self.vt_lds, war) };
+        // Lever-3: commit writes block k+1 → parity `(k+1)%2`. `k_base = (k+1)·k_step`, so the committed
+        // block index is `k_base / k_step`; its parity offset selects the write half (0 when single-buffered).
+        let (k_off, vt_off) = {
+            let kstep = b.idx_const((KV_BLK_32 * self.d) as i64);
+            let blk1 = b.idx_div(k_base, kstep);
+            self.parity_off(b, blk1)
+        };
         let gvec = if self.epl.is_multiple_of(8) { 8 } else { 4 };
         let epl_c = b.idx_const(self.epl as i64);
         let lane_epl = b.idx_mul(self.tid, epl_c);
@@ -865,10 +900,12 @@ impl Hooks for Fa32Hooks {
                 // K natural [kv, d] through the swizzle hole; V transposed [d, kv] with padded pitch.
                 let k_col = b.lds_col(kv, d_idx, self.d);
                 let k_dst = b.idx_add(kv_row, k_col);
+                let k_dst = b.idx_add(k_dst, k_off); // double-buffer parity half (0 when off)
                 let kval = b.vec_extract(kchunk, j);
                 effs.push(b.store_lds(k_lds, k_dst, kval));
                 let v_dst = b.idx_mul(d_idx, pitch_c);
                 let v_dst = b.idx_add(v_dst, kv);
+                let v_dst = b.idx_add(v_dst, vt_off);
                 let vval = b.vec_extract(vchunk, j);
                 effs.push(b.store_lds(vt_lds, v_dst, vval));
             }
@@ -876,10 +913,21 @@ impl Hooks for Fa32Hooks {
         effs
     }
 
-    fn gather(&mut self, b: &mut Builder, slice: usize, raw: &[TileId]) -> (Fa32Op, Vec<TileId>, TileId) {
+    fn gather(
+        &mut self,
+        b: &mut Builder,
+        slice: usize,
+        block: BlockCounter,
+        raw: &[TileId],
+    ) -> (Fa32Op, Vec<TileId>, TileId) {
         use crate::shape::Mfma32x32x8Bf16 as S;
         let d_c = b.idx_const(self.d as i64);
         let pitch_c = b.idx_const(self.pitch as i64);
+        // Lever-3: gather reads block k → parity `k%2` selects the read half (0 when single-buffered).
+        let (k_off, vt_off) = {
+            let blk = block.idx(b);
+            self.parity_off(b, blk)
+        };
         // Read each contiguous `EPT_A` LDS run, then round-trip through a fragment so the WAR barrier gets
         // a proper store token (the gather contract; SROA elides the store/load into a straight operand).
         let read = |b: &mut Builder, lds: Lds<BF16>, base: Idx, gathers: &mut Vec<TileId>| -> Val<BF16> {
@@ -901,6 +949,7 @@ impl Hooks for Fa32Hooks {
                     let kcol = b.lds_col(self.q_in, col_base, self.d);
                     let base = b.idx_mul(self.q_in, d_c);
                     let base = b.idx_add(base, kcol);
+                    let base = b.idx_add(base, k_off);
                     vecs.push(read(b, self.k_lds, base, &mut gathers));
                 }
             }
@@ -912,6 +961,7 @@ impl Hooks for Fa32Hooks {
                         let base = b.idx_mul(d_row, pitch_c);
                         let kvcol = offset_by(b, self.half_off, s * S::K);
                         let base = b.idx_add(base, kvcol);
+                        let base = b.idx_add(base, vt_off);
                         vecs.push(read(b, self.vt_lds, base, &mut gathers));
                     }
                 }
@@ -1018,6 +1068,17 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     let warp = b.idx_div(tid, warp_c);
     let wlane = b.idx_mod(tid, warp_c);
     let warp_qoff = b.idx_mul(warp, m32_c); // this warp's 32-row Q offset in the [q_blk, d] block
+    // Lever-3 LDS double-buffer: commit(k+1) writes the parity half gather(k) is NOT reading, so the
+    // per-iteration WAR `s_barrier` is dropped and the LDS write overlaps compute. ENABLED for the
+    // occupancy-1 regime (`d ≥ 128`): there the workgroup is register-pressure-bound to 1 wave/SIMD, so
+    // hiding the LDS-write latency instruction-locally is a net win (device-measured +5% at S2048 d128).
+    // DISABLED for the occupancy-2 small-`d` shapes (`d = 64`): there a 2nd resident wave already hides
+    // that latency, so the double-buffer's extra VGPRs + parity math only regress (~-9%, measured). No
+    // ping-pong stagger: device-measured a NET LOSS here — at occupancy 1 the within-workgroup two-group
+    // offset gives no intra-SIMD MFMA overlap (1 wave/SIMD), so its added compute-cluster barriers don't
+    // pay for themselves. (Reaching aiter's stagger win needs occupancy ≥2 first — a VGPR-O redesign.)
+    let double_buf = d >= 128;
+    let warp_row: Option<Idx> = None;
 
     // This warp's global Q-row origin.
     let qblk_c = b.idx_const(q_blk as i64);
@@ -1055,9 +1116,11 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
         })
         .collect();
 
-    // Shared LDS: K natural [kv,d], V transposed padded [d, pitch].
-    let k_lds = b.define_local::<BF16>(KV_BLK_32 * d);
-    let vt_lds = b.define_local::<BF16>(d * pitch);
+    // Shared LDS: K natural [kv,d], V transposed padded [d, pitch]. Doubled (parity-swapped) under the
+    // Lever-3 double-buffer so commit(k+1) and gather(k) touch disjoint halves.
+    let nbuf = if double_buf { 2 } else { 1 };
+    let k_lds = b.define_local::<BF16>(nbuf * KV_BLK_32 * d);
+    let vt_lds = b.define_local::<BF16>(nbuf * d * pitch);
     let epl = KV_BLK_32 * d / nthreads; // collaborative fill, per thread
 
     // Softmax scale folded into exp2: exp2(score·log2(e)/√d) == exp(score/√d). 16-wide broadcast.
@@ -1196,7 +1259,23 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     );
 
     let bh_row_d = b.idx_mul(bh_row, d_c);
-    let hooks = Fa32Hooks { k, v, k_lds, vt_lds, bh_row_d, tid, epl, q_in, half_off, d, pitch, dslices, dtiles, ksl };
+    let hooks = Fa32Hooks {
+        k,
+        v,
+        k_lds,
+        vt_lds,
+        double_buf,
+        bh_row_d,
+        tid,
+        epl,
+        q_in,
+        half_off,
+        d,
+        pitch,
+        dslices,
+        dtiles,
+        ksl,
+    };
     let acc_final = pipeline(
         &mut b,
         nblocks,       // nblocks (streaming over KV; ⌈n/kv_blk⌉ — the last block may be ragged)
@@ -1204,10 +1283,11 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
         2,             // ksteps: gather slices (K, V)
         &accs,
         &inited,
-        None,  // warp_row: no ping-pong (disjoint-Q warps, no co-resident load/compute pair)
-        false, // asm_gather
-        false, // resident
-        CommitDrain::IntrinsicAuto,
+        warp_row, // Lever-2: Some(warp/2) enables the two-group phase stagger (env FA_STAGGER); None = off
+        false,    // asm_gather
+        false,    // resident
+        // Lever-3: double-buffered ⇒ drop the WAR seal (commit/gather touch disjoint parity halves).
+        if double_buf { CommitDrain::IntrinsicNoWar } else { CommitDrain::IntrinsicAuto },
         false, // bare_seals
         false, // pin_mfma
         hooks,

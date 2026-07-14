@@ -263,7 +263,13 @@ impl Hooks for MatmulHooks {
         }
     }
 
-    fn gather(&mut self, b: &mut Builder, slice: usize, raw: &[TileId]) -> (Self::Op, Vec<TileId>, TileId) {
+    fn gather(
+        &mut self,
+        b: &mut Builder,
+        slice: usize,
+        _block: BlockCounter,
+        raw: &[TileId],
+    ) -> (Self::Op, Vec<TileId>, TileId) {
         // One gather per operand VIEW at K-slice `slice` — the view's `asm` field dispatches the
         // `ds_read_b64` asm gather vs the scalar fallback. No addressing params: they ride the view.
         let mut gathers: Vec<TileId> = Vec::new();

@@ -37,6 +37,11 @@ use crate::ir::{Node, TileId, TileIr};
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommitDrain {
     IntrinsicAuto,
+    /// Lever-3 LDS double-buffer: commit(k+1) writes the OTHER parity half than gather(k) reads, so the
+    /// read-before-overwrite WAR hazard is gone — the WAR seal (an `s_barrier` per iteration) is DROPPED.
+    /// The RAW (a later iteration's gather seeing these writes) is still carried by `raw_next`. Same
+    /// intrinsic (compiler-visible `ds_write`) RAW-drain as `IntrinsicAuto`, one fewer workgroup barrier.
+    IntrinsicNoWar,
     /// Phase C-a, retained as the A/B baseline for the deferred drain — no entry wires it (the clustered
     /// entries jumped straight to `AsmDeferred`), so it is exercised only when comparing the two policies.
     #[allow(dead_code)]
@@ -75,9 +80,16 @@ pub(crate) trait Hooks {
     ) -> (Self::Reg, Vec<TileId>);
     /// Commit the staged registers VGPR→LDS behind `war`. Returns the store effects the RAW fences.
     fn commit(&mut self, b: &mut Builder, k_base: Idx, reg: &Self::Reg, war: &[TileId]) -> Vec<Effect>;
-    /// Gather K-slice `slice` LDS→operand-frags after `raw`. Returns the operand bundle, its store-
-    /// fence tokens (the WAR consumes them), and the value `op_anchor` the `set_prio` anchors on.
-    fn gather(&mut self, b: &mut Builder, slice: usize, raw: &[TileId]) -> (Self::Op, Vec<TileId>, TileId);
+    /// Gather K-slice `slice` LDS→operand-frags after `raw`, for the CURRENT block `block` (its parity
+    /// selects the read buffer under LDS double-buffering; single-buffered hooks ignore it). Returns the
+    /// operand bundle, its store-fence tokens (the WAR consumes them), and the `op_anchor` `set_prio` uses.
+    fn gather(
+        &mut self,
+        b: &mut Builder,
+        slice: usize,
+        block: BlockCounter,
+        raw: &[TileId],
+    ) -> (Self::Op, Vec<TileId>, TileId);
 }
 
 /// A **heterogeneous compute-channel value** (DESIGN §3.2 — gentle typing: the dtype rides as DATA, not
@@ -326,7 +338,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
     pub(crate) fn gather(&mut self, s: usize) {
         let mut gdeps = self.seed.to_vec();
         gdeps.extend(&self.entry);
-        let (op, g, op_anchor) = self.hooks.gather(self.b, s, &gdeps);
+        let (op, g, op_anchor) = self.hooks.gather(self.b, s, self.block, &gdeps);
         self.this_gathers.extend(g.iter().copied());
         self.all_gathers.extend(g.iter().copied());
         self.operands[s] = Some((op, op_anchor));
@@ -366,20 +378,26 @@ impl<H: Hooks> ClusterCx<'_, H> {
                 let rd_anchor = self.tail_barrier.unwrap_or(self.all_gathers[last]);
                 let rd = self.b.swait_lgkmcnt(rd_anchor);
                 self.undrained.clear();
-                rd
+                vec![rd.dep()]
+            } else if self.commit_drain == CommitDrain::IntrinsicNoWar {
+                // Double-buffered: no read-before-overwrite hazard (disjoint parity halves), so emit NO
+                // WAR seal. The gather reads are still drained before the next compute by the RAW seal
+                // (a fenced barrier after the commit writes), and the RAW carry is `raw_next` below.
+                Vec::new()
             } else {
                 let deps: Vec<TileId> = self.all_gathers[1..].to_vec();
-                self.seal(Effect(self.all_gathers[0]), &deps)
+                vec![self.seal(Effect(self.all_gathers[0]), &deps).dep()]
             };
             // `fill` = the commit's write effects (intrinsic `ds_write` stores OR asm `ds_write_b64`
             // writes). The DRAIN is owned here now (not by the hook), dispatched on the policy.
-            let fill = self.hooks.commit(self.b, kn, self.reg.as_ref().unwrap(), &[war.dep()]);
+            let fill = self.hooks.commit(self.b, kn, self.reg.as_ref().unwrap(), &war);
             let fill_deps: Vec<TileId> = fill[1..].iter().map(|e| e.dep()).collect();
             match self.commit_drain {
-                CommitDrain::IntrinsicAuto => {
+                CommitDrain::IntrinsicAuto | CommitDrain::IntrinsicNoWar => {
                     // The compiler-visible stores: this RAW barrier auto-drains their `lgkmcnt(0)`.
                     // (IntrinsicAuto is never paired with `bare_seals`, so `seal` = the fenced barrier
-                    // whose acquire IS that auto-drain — the invariant is unchanged here.)
+                    // whose acquire IS that auto-drain — the invariant is unchanged here.) `IntrinsicNoWar`
+                    // shares this RAW seal; it differs only in dropping the WAR seal above (double-buffer).
                     let rn = self.seal(fill[0], &fill_deps).dep();
                     self.raw_next = Some(rn);
                     self.tail_barrier = Some(rn);
@@ -821,7 +839,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         // The prologue's block-0 drain is one-time (outside the steady loop), so both asm policies drain
         // it EXPOSED here — the deferral is specifically about hiding the hot-loop C6 drain, not this seed.
         let raw_seed = match commit_drain {
-            CommitDrain::IntrinsicAuto => {
+            CommitDrain::IntrinsicAuto | CommitDrain::IntrinsicNoWar => {
                 let fill0_deps: Vec<TileId> = fill0[1..].iter().map(|e| e.dep()).collect();
                 b.barrier(fill0[0], &fill0_deps)
             }
