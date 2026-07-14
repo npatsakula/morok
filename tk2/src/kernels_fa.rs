@@ -1053,6 +1053,11 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
 
     // ── the three compute bodies, each declaring ONLY the slots it touches ──
     // QKᵀ: S[kv,q] = Σ_ki mma(K_ki, Q_ki) (K A-operand, Q B-operand). reads nothing (re-zeros); writes `s`.
+    // INTRINSIC MFMA (the production fast path — the asm `sideeffect` form is a dead end here: it is
+    // OPAQUE to the AMDGPU GCNHazardRecognizer, so it emits NONE of the mandatory 32×32×8 `s_nop`s and
+    // a VALU-adjacent accumulator is read before the MFMA result lands → silent miscompile, device-proven
+    // — the PV NaN was exactly this, and QKᵀ-asm only survived by luck of instruction spacing). The
+    // softmax-under-MFMA interleave (`sched_group_barrier`) interleaves fine with the intrinsic.
     let qk = Compute::<Fa32Hooks>::new(
         0,
         vec![],
@@ -1062,7 +1067,7 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
             let zeros: Vec<Val<F32>> = (0..S::EPT_C).map(|_| b.f32(0.0)).collect();
             let mut s_acc = b.vec_build(&zeros);
             for ki in 0..dslices {
-                s_acc = b.mma_asm_of::<S>(k_frags[ki], q_frags[ki], s_acc); // VGPR accumulator (0 AGPR)
+                s_acc = b.mma_of::<S>(k_frags[ki], q_frags[ki], s_acc);
             }
             vec![SlotVal::F32(s_acc)]
         },
@@ -1116,11 +1121,14 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
             let mut anchor = None;
             let mut out: Vec<SlotVal> = (0..dtiles)
                 .map(|dt| {
-                    // O accumulator stays in the INTRINSIC (AGPR) form: the loop-carried 64-VGPR O via
-                    // ClusterCx's SROA round-trip does not compose with the asm-sideeffect MFMA (d64 NaN,
-                    // 0 spill) and overflows the VGPR budget at d128. VGPR-resident O (aiter's 0-AGPR) is a
-                    // register-budget redesign (perf lever), not a correctness need — the transient QKᵀ
-                    // scores are already VGPR (the softmax-under-MFMA enabler).
+                    // O accumulator uses the INTRINSIC MFMA. The asm `sideeffect` form is opaque to the
+                    // AMDGPU GCNHazardRecognizer, so it emits none of the mandatory 32×32×8 hazard `s_nop`s;
+                    // the loop-carried O is VALU-adjacent (softmax `O*=corr` writes it, the epilogue `O/=l`
+                    // reads it), so both hazards fire → device-proven NaN at d64 (0 spill, NOT SROA/pressure;
+                    // `opt -O3` gives byte-identical <16×f32> phis either way). VGPR-resident O (aiter's
+                    // 0-AGPR) additionally overflows the budget at d128 (260 VGPR). O-on-intrinsic is thus a
+                    // correctness + budget requirement, not avoidance; the interleave hints below interleave
+                    // fine with the intrinsic MFMA (it is schedulable, unlike the pinned asm form).
                     let mut o = reads[1 + dt].f32();
                     for s in 0..ksl {
                         o = b.mma_of::<S>(v_frags[dt * ksl + s], b_ops[s], o);
