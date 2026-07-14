@@ -616,6 +616,24 @@ pub const AMD_CDNA_161632: TcConfig = TcConfig {
     tile_grid: (1, 1),
 };
 
+/// **gfx942 32×32×8 bf16→f32 MFMA** (`v_mfma_f32_32x32x8_bf16`) — the wide-tile core used on tk2's
+/// DIRECT `Node::Mma` path. A/B operands are `ept 4`; the accumulator is `ept 16` (16 VGPRs/lane) in the
+/// 4-block layout (`row = 8·(reg/4) + 4·(lane/32) + reg%4`, `col = lane%32` — CK
+/// `kCM0PerLane=4,kCMLane=2,kCM1PerLane=4,kCNLane=32`). Deliberately **NOT** registered in
+/// [`TensorCore::cdna3_tensor_cores`]: the BEAM optimizer's axis-split (`opts`/`swizzle`) for this shape
+/// is a separate derivation the direct path does not need, and registering it with unvalidated `opts`
+/// would risk a wrong BEAM candidate for regular svod matmuls. `render_wmma_amd` reads only `dims` + the
+/// operand dtypes, so `opts`/`swizzle` are left empty; tk2 builds it via `.build(bf16, f32)`.
+pub const AMD_CDNA_323208: TcConfig = TcConfig {
+    dims: (32, 32, 8),
+    threads: 64,
+    ept: (4, 4, 16),
+    opts: &[],
+    swizzle_a: (&[], &[], &[]),
+    swizzle_b: (&[], &[], &[]),
+    tile_grid: (1, 1),
+};
+
 // Apple Metal Tensor Cores
 pub const METAL_888: TcConfig = TcConfig {
     dims: (8, 8, 8),

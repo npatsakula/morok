@@ -79,3 +79,26 @@ impl MfmaShape for Mfma16x16x16Bf16 {
         AccDist { m_blocks: 1, m_block_stride: 16, m_inner: 4, lane_m_stride: 4, n_lanes: 16 }
     }
 }
+
+/// The gfx942 **32×32×8 bf16→f32** MFMA (`v_mfma_f32_32x32x8_bf16`) — aiter's wide-tile core (the
+/// path to ~400–660 TF Flash-Attention). A/B keep `ept 4`; the accumulator is **`ept 16`** (16 VGPRs
+/// per lane) in the four-row-block layout the `AccDist` below encodes. The hardware **K=8** unit —
+/// `WarpGemmMfma…M32N32K16` is simply two of these accumulating, so K=16 tiles are a 2-step K-loop.
+#[derive(Copy, Clone, Debug)]
+pub struct Mfma32x32x8Bf16;
+
+impl MfmaShape for Mfma32x32x8Bf16 {
+    const M: usize = 32;
+    const N: usize = 32;
+    const K: usize = 8;
+    const EPT_A: usize = 4;
+    const EPT_B: usize = 4;
+    const EPT_C: usize = 16;
+
+    // CK `kCM0PerLane=4, kCMLane=2, kCM1PerLane=4, kCNLane=32` ⇒ per-lane element `i`:
+    // `row = 8·(i/4) + 4·(lane/32) + (i%4)`, `col = lane%32` — four row-blocks 8 apart, the (lane/32)
+    // half selecting the +0/+4 offset (confirmed against CK `CWarpDstrEncoding` + the aiter disasm).
+    fn acc_dist() -> AccDist {
+        AccDist { m_blocks: 4, m_block_stride: 8, m_inner: 4, lane_m_stride: 4, n_lanes: 32 }
+    }
+}

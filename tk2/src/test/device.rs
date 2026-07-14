@@ -112,6 +112,40 @@ fn micro_tk_hk_port_is_correct_on_gfx942() {
     unsafe { std::env::remove_var("SVOD_NO_PINGPONG") };
 }
 
+/// **32×32×8 MFMA isolation gate** (§migration Step 3 go/no-go): the wide-core probe
+/// ([`crate::kernels::mfma_32x32x8_probe`]) computes `C = A·Bᵀ` via `v_mfma_f32_32x32x8_bf16` and
+/// scatters its 16-VGPR accumulator through `acc_rc`; it must match the f32 reference over the SAME
+/// bf16-rounded operands. This PROVES the 32×32×8 operand layout + the 4-block accumulator distribution
+/// (`AccDist`) + the intrinsic ARE CORRECT in isolation. Shapes: one MFMA (32×32×8), a K-loop
+/// (32×32×16 = 2 hw K-steps), and M-/N-/both-tiled (64×32×8, 32×64×8, 64×64×16) to stress every axis of
+/// the 4-block accumulator. A mismatch ⟹ the AccDist/operand layout is wrong — debug vs CK
+/// `CWarpDstrEncoding` + the aiter disasm before trusting it in FA.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::mfma_32x32x8_probe --nocapture`
+#[test]
+#[ignore]
+fn mfma_32x32x8_probe_is_correct_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    let dev = svod_dtype::default_device::default_device();
+    for (m, n, k) in [(32usize, 32usize, 8usize), (32, 32, 16), (64, 32, 8), (32, 64, 8), (64, 64, 16)] {
+        let mut a = Tensor::rand_with(&[m, k], DType::BFloat16, dev.clone()).expect("rand a");
+        let mut b = Tensor::rand_with(&[n, k], DType::BFloat16, dev.clone()).expect("rand b"); // B is [N,K]
+        a.realize().expect("realize a");
+        b.realize().expect("realize b");
+        let expected = ab_t_ref(&as_f32_vec(&a), &as_f32_vec(&b), m, n, k);
+        let atol = 0.02 * (k as f32).sqrt();
+
+        let prog = crate::kernels::mfma_32x32x8_probe(m, n, k);
+        let out = Tensor::empty(&[m, n], DType::Float32);
+        let mut y = graph_kernel(prog, out, &[&a, &b]).expect("wrap 32×32×8 probe");
+        let plan = y.prepare().expect("prepare");
+        plan.execute().expect("execute");
+        let got = y.as_vec::<f32>().expect("read output");
+        let report = allclose_f32(&got, &expected, atol, 2e-2);
+        println!("mfma_32x32x8 probe {m}×{n}×{k}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+        assert!(report.ok, "32×32×8 probe {m}×{n}×{k} must match A·Bᵀ reference: {}", report.message);
+    }
+}
+
 /// Host f32 reference for the `mma_atb` probe: `O[d,q] = Σ_kv V[kv,d]·P[kv,q]` (V`[kv,d]`, P`[kv,q]`,
 /// both row-major) — the FA `P·V` contraction over the shared `kv` row.
 fn atb_ref(vf: &[f32], pf: &[f32], kv: usize, d: usize, q: usize) -> Vec<f32> {

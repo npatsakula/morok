@@ -86,14 +86,15 @@ pub fn render_wmma_amd(
     // inner loop's `ds_read`/MFMA program order (the intrinsic form gets reordered
     // into all-memory-then-all-compute). The `0` constraint ties the C accumulator
     // operand to the result register (in==out → the K-reduction chains in place),
-    // exactly mirroring the proven gfx942 spike. Only valid for the f32-accumulating
-    // bf16 K=16 MFMA — the only shape the flag is ever set for; any other (e.g. the
-    // bf16→bf16 reinterpreted accumulator) falls through to the intrinsic.
+    // exactly mirroring the proven gfx942 spike. Valid for the f32-accumulating bf16
+    // MFMAs (K=16 `16x16x16` and K=8 `32x32x8`); the opcode is derived from `dims`, so
+    // `16×16×16` renders byte-identically. Any other (e.g. the bf16→bf16 reinterpreted
+    // accumulator) falls through to the intrinsic.
     let asm_mfma = metadata.asm && arch.is_cdna() && !acc_reinterpreted;
     if asm_mfma {
         kernel.push(format!(
             "  {call_dst} = call {acc_wire} asm sideeffect \
-             \"v_mfma_f32_16x16x16_bf16 $0, $1, $2, $3\", \"=v,v,v,0\"({a_op}, {b_op}, {c_op})"
+             \"v_mfma_f32_{n}x{m}x{k}_bf16 $0, $1, $2, $3\", \"=v,v,v,0\"({a_op}, {b_op}, {c_op})"
         ));
     } else {
         // Carry svod's standard fp fast-math flags (`nsz arcp contract afn` — the

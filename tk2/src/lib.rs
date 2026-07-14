@@ -44,7 +44,7 @@ pub use schedule::{
     Carry, Committed, ComputeScope, Gathered, InFlight, MemScope, PipelineCx, SteadyOut, compute_cluster, mem_cluster,
     pipeline,
 };
-pub use shape::{Mfma16x16x16Bf16, MfmaShape};
+pub use shape::{Mfma16x16x16Bf16, Mfma32x32x8Bf16, MfmaShape};
 
 #[cfg(test)]
 mod test;

@@ -16,12 +16,13 @@ use smallvec::{SmallVec, smallvec};
 use snafu::ResultExt;
 use svod_dtype::{AddrSpace, AmdArch, DType};
 use svod_ir::{AxisId, AxisType, ConstValue, KernelInfo, Op, UOp, WmmaMetadata, WmmaUpcastAxes};
-use svod_schedule::optimizer::Renderer;
+use svod_schedule::optimizer::renderer::AMD_CDNA_323208;
+use svod_schedule::optimizer::{Renderer, TensorCore};
 
 use crate::error::{self, Result};
 use crate::ir::{BinOp, IndexOp, Node, Scalar, ScopeAxis, TileId, TileIr, UnOp};
 use crate::kernels::Program;
-use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
+use crate::shape::{Mfma16x16x16Bf16, Mfma32x32x8Bf16, MfmaShape};
 
 /// The gfx942 16×16×16 bf16→f32 MFMA descriptor, reproduced verbatim from tk's
 /// `wmma_desc`/`wmma_from_tc` (`tk/src/group/mma.rs`): the per-arch×dtype
@@ -34,16 +35,23 @@ use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 ///
 /// Hardcoded to gfx942: this is the correctness scaffold's only target (per-arch
 /// gating is a later pass concern, DESIGN.md §2.8).
-fn wmma_desc(dtype_in: &DType) -> WmmaMetadata {
+fn wmma_desc(dtype_in: &DType, ept_c: usize) -> WmmaMetadata {
     let ren = Renderer::for_amd_arch(AmdArch::Gfx942);
-    // The intrinsic dims are DERIVED from the shape marker (§Step 1) — `(16, 16, 16)` today, the
-    // selector a per-`Node::Mma` shape will drive once 32×32×8 lands.
-    let dims = Mfma16x16x16Bf16::dims();
-    let tc = ren
-        .tensor_cores
-        .iter()
-        .find(|tc| &tc.dtype_in == dtype_in && tc.dims == dims)
-        .expect("gfx942 has a 16×16×16 WMMA for the operand dtype (bf16/f16)");
+    // The MFMA shape is SELECTED by the accumulator width (`Node::Mma.ept == EPT_C`): bf16 `EPT_C 4`
+    // ⇒ 16×16×16 (the registered core), `16` ⇒ 32×32×8 (a direct-path core, deliberately NOT in the
+    // BEAM optimizer list — see `AMD_CDNA_323208`). Deriving from the existing `ept` field adds no
+    // `Node` variant/field, so the 16×16×16 tile-IR AND its lowered metadata stay byte-identical.
+    let tc: TensorCore = if ept_c == Mfma16x16x16Bf16::EPT_C {
+        ren.tensor_cores
+            .iter()
+            .find(|tc| &tc.dtype_in == dtype_in && tc.dims == Mfma16x16x16Bf16::dims())
+            .cloned()
+            .expect("gfx942 has a 16×16×16 WMMA for the operand dtype (bf16/f16)")
+    } else if ept_c == Mfma32x32x8Bf16::EPT_C {
+        AMD_CDNA_323208.build(dtype_in.clone(), DType::Float32)
+    } else {
+        panic!("tk2 wmma_desc: no MFMA shape for accumulator width {ept_c} (bf16 EPT_C ∈ {{4, 16}})")
+    };
     let axes = |ept: usize| -> Vec<(usize, usize)> { (0..(ept as f64).log2() as usize).map(|i| (4 - i, 2)).collect() };
     WmmaMetadata {
         name: format!("WMMA_{}_{}_{}_{:?}_{:?}", tc.dims.0, tc.dims.1, tc.dims.2, tc.dtype_in, tc.dtype_out),
@@ -258,9 +266,11 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
         // One K-fragment MFMA `D = A·B + C` (gfx942 16×16×16 bf16→f32). `asm` flips the shared
         // `render_wmma_amd` to the inline `asm sideeffect` form (schedule-opaque; the `=v,v,v,0` acc
         // tie is identical either way) — the renderer already handles both.
-        Node::Mma { a, b, c, asm, .. } => {
+        Node::Mma { a, b, c, ept, asm } => {
             let (a, b, c) = (get(low, a), get(low, b), get(low, c));
-            let mut desc = wmma_desc(&a.dtype().scalar_dtype());
+            // `ept` (= the accumulator EPT_C) selects the shape in `wmma_desc`; 16×16×16 (ept 4) is
+            // byte-identical, 32×32×8 (ept 16) picks the wide core.
+            let mut desc = wmma_desc(&a.dtype().scalar_dtype(), ept);
             desc.asm = asm;
             UOp::wmma(a, b, c, desc)
         }
