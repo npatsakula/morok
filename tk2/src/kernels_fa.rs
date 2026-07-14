@@ -25,7 +25,7 @@
 //! Device-gated by `flash_attention_matches_reference_on_gfx942` (allclose vs an f32 reference at
 //! d=64 and d=128). Single-buffer; softmax-under-MFMA interleave + swizzle are later Phase-B items.
 
-use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Val};
+use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId};
 use crate::kernels::{EDGE, Program, offset_by};
 use crate::movement::{Drain, LdsStage, LdsView, SharedTile};
@@ -741,16 +741,167 @@ const KV_BLK_32: usize = 32;
 /// an un-padded `[d, kv]` transpose regresses, proven by `v_transpose_probe`).
 const VT_PAD: usize = 8;
 
+/// One K/V-slice's gathered A-operands — the FA-32 [`Hooks::Op`]. Slice 0 = K (`dslices` QKᵀ A-operands,
+/// contraction `d` over `K = 8`); slice 1 = V (the `dtiles·ksl` transposed-V A-operands, indexed
+/// `[dt·ksl + s]`, contraction `kv` over `K = 8`). Both `Vec<Val<BF16>>` (`EPT_A = 4` each).
+type Fa32Op = Vec<Val<BF16>>;
+
+/// The register-staged fill carried prefetch→commit: block k+1's K and V chunks in VGPRs (the
+/// collaborative 256-thread fill's per-thread `epl` scalar elements).
+struct Fa32Fill {
+    k: Vec<Val<BF16>>,
+    v: Vec<Val<BF16>>,
+}
+
+/// FA-32's [`Hooks`] — the 32×32×8 movement (natural-K LDS + padded-transposed-V LDS). Rides the SAME
+/// ClusterCx pipeline the 16×16 [`flash_attention_fwd`] drives, but with the 32×32×8 fragment addressing:
+/// each A-operand is a contiguous `EPT_A = 4` LDS run (`ds_read` straight, no register transpose — V's
+/// transpose is done write-side into LDS) rather than the movement layer's 16×16 [`LdsView`] gather. The
+/// fills/gathers are SCALAR in this pass (the vectorized b128 fill + b64 gather are Phase-2 refinements);
+/// gathered operands round-trip through a fragment so the WAR barrier consumes a proper store token
+/// (the [`Hooks::gather`] contract), exactly as the 16×16 FA — SROA elides the store/load.
+struct Fa32Hooks {
+    k: Buf<BF16>,
+    v: Buf<BF16>,
+    k_lds: Lds<BF16>,
+    vt_lds: Lds<BF16>,
+    /// `bh_row · d` — this workgroup's (b,h) slice flat base (folded into every fill global offset so the
+    /// pipeline's FLAT per-block `k_base` lands at the right `[bh, n, d]` row).
+    bh_row_d: Idx,
+    /// The collaborative fill thread id (all `nthreads`) and its per-thread element run `epl`.
+    tid: Idx,
+    epl: usize,
+    /// The per-warp gather axis parts: `q_in = wlane % 32` (kv/d-in-tile), `half_off = (wlane/32)·4`.
+    q_in: Idx,
+    half_off: Idx,
+    d: usize,
+    pitch: usize,
+    dslices: usize,
+    dtiles: usize,
+    ksl: usize,
+}
+
+impl Hooks for Fa32Hooks {
+    type Op = Fa32Op;
+    type Reg = Fa32Fill;
+    const PREFETCH_TILES: usize = 2; // 0 = K, 1 = V
+
+    fn prefetch(
+        &mut self,
+        b: &mut Builder,
+        k_base: Idx,
+        tile: usize,
+        prev: Option<Fa32Fill>,
+        _order: &[TileId],
+    ) -> (Fa32Fill, Vec<TileId>) {
+        // global→VGPR: this thread's coalesced `epl` scalar loads at flat `bh_row·d + k_base + tid·epl`
+        // (the FLAT global index into `[bh, n, d]` — block `k`'s first element is `bh_row·d + k_base`).
+        let mut reg = prev.unwrap_or(Fa32Fill { k: Vec::new(), v: Vec::new() });
+        let epl_c = b.idx_const(self.epl as i64);
+        let lane_epl = b.idx_mul(self.tid, epl_c);
+        let flat_base = b.idx_add(self.bh_row_d, k_base);
+        let flat_base = b.idx_add(flat_base, lane_epl);
+        let buf = match tile {
+            0 => self.k,
+            1 => self.v,
+            _ => panic!("FA-32 prefetch: tile ∈ {{0=K, 1=V}}, got {tile}"),
+        };
+        let loaded: Vec<Val<BF16>> = (0..self.epl)
+            .map(|i| {
+                let off = offset_by(b, flat_base, i);
+                b.load(buf, off)
+            })
+            .collect();
+        let anchors = loaded.iter().map(|v| v.id).collect();
+        match tile {
+            0 => reg.k = loaded,
+            1 => reg.v = loaded,
+            _ => unreachable!(),
+        }
+        (reg, anchors)
+    }
+
+    fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &Fa32Fill, war: &[TileId]) -> Vec<Effect> {
+        // VGPR→LDS behind the WAR barrier: K natural `[kv, d]`, V transposed `[d, kv]` with padded pitch.
+        // `flat = tid·epl + i → (kv, d_idx)` is block-relative (k_base rides only the global load).
+        let k_lds = if war.is_empty() { self.k_lds } else { b.lds_after(self.k_lds, war) };
+        let vt_lds = if war.is_empty() { self.vt_lds } else { b.lds_after(self.vt_lds, war) };
+        let epl_c = b.idx_const(self.epl as i64);
+        let lane_epl = b.idx_mul(self.tid, epl_c);
+        let d_c = b.idx_const(self.d as i64);
+        let pitch_c = b.idx_const(self.pitch as i64);
+        let mut effs = Vec::with_capacity(2 * self.epl);
+        for i in 0..self.epl {
+            let flat = offset_by(b, lane_epl, i);
+            let kv = b.idx_div(flat, d_c);
+            let d_idx = b.idx_mod(flat, d_c);
+            let k_dst = b.idx_mul(kv, d_c);
+            let k_dst = b.idx_add(k_dst, d_idx); // K natural [kv, d]
+            effs.push(b.store_lds(k_lds, k_dst, reg.k[i]));
+            let v_dst = b.idx_mul(d_idx, pitch_c);
+            let v_dst = b.idx_add(v_dst, kv); // V transposed [d, kv]
+            effs.push(b.store_lds(vt_lds, v_dst, reg.v[i]));
+        }
+        effs
+    }
+
+    fn gather(&mut self, b: &mut Builder, slice: usize, raw: &[TileId]) -> (Fa32Op, Vec<TileId>, TileId) {
+        use crate::shape::Mfma32x32x8Bf16 as S;
+        let d_c = b.idx_const(self.d as i64);
+        let pitch_c = b.idx_const(self.pitch as i64);
+        // Read each contiguous `EPT_A` LDS run, then round-trip through a fragment so the WAR barrier gets
+        // a proper store token (the gather contract; SROA elides the store/load into a straight operand).
+        let read = |b: &mut Builder, lds: Lds<BF16>, base: Idx, gathers: &mut Vec<TileId>| -> Val<BF16> {
+            let v = b.load_lds_vec_after(lds, base, S::EPT_A, raw);
+            let frag = b.define_frag::<BF16>(S::a_map());
+            let st = b.store_frag_vec(frag, v).dep();
+            gathers.push(st);
+            b.load_frag_vec_after(frag, &[st])
+        };
+        let mut vecs = Vec::new();
+        let mut gathers = Vec::new();
+        match slice {
+            // K A-operand: k_lds[kv = q_in, d = ki·8 + half_off .. +4] (contiguous), `dslices` of them.
+            0 => {
+                for ki in 0..self.dslices {
+                    let base = b.idx_mul(self.q_in, d_c);
+                    let dcol = offset_by(b, self.half_off, ki * S::K);
+                    let base = b.idx_add(base, dcol);
+                    vecs.push(read(b, self.k_lds, base, &mut gathers));
+                }
+            }
+            // V A-operand: vt_lds[d = dt·32 + q_in, kv = s·8 + half_off .. +4] (contiguous), `dtiles·ksl`.
+            1 => {
+                for dt in 0..self.dtiles {
+                    for s in 0..self.ksl {
+                        let d_row = offset_by(b, self.q_in, dt * S::M);
+                        let base = b.idx_mul(d_row, pitch_c);
+                        let kvcol = offset_by(b, self.half_off, s * S::K);
+                        let base = b.idx_add(base, kvcol);
+                        vecs.push(read(b, self.vt_lds, base, &mut gathers));
+                    }
+                }
+            }
+            _ => panic!("FA-32 gather: slice ∈ {{0=K, 1=V}}, got {slice}"),
+        }
+        let anchor = vecs[0].id;
+        (vecs, gathers, anchor)
+    }
+}
+
 /// **Streaming FA-forward on the 32×32×8 MFMA** (§Step 6 — the wide-core variant, KEPT SEPARATE from the
 /// frozen 16×16 [`flash_attention_fwd`]). Non-causal, `bh = batch·heads` independent `[bh,n,d]` attentions;
 /// 4 warps × 32 Q rows = a `q_blk = 128` block. Assembles the four device-proven 32×32×8 primitives:
 /// QKᵀ (`v_mfma_f32_32x32x8`, `S[kv,q]`, kv on M) → online softmax over kv via [`Builder::acc_row_reduce_32`]
 /// (the `EPT_C = 16` AccDist reduce) → P→PV relayout via [`Builder::pv_relayout_s49`] (`v_perm s49`) → P·V
-/// with V staged through the padded transposed LDS (read straight). The KV stream is **unrolled** (a
-/// correctness-first assembly — a rolled loop / ClusterCx-pipeline carry for large-`n` throughput is the
-/// remaining perf work), so this is gated at `n = 128`. O/m/l are register-carried across the unrolled
-/// blocks; O is normalised and transpose-scattered in the epilogue. Device-gated by
-/// `flash_attention32_matches_reference_on_gfx942` (tight `atol` at d=64 AND d=128).
+/// with V staged through the padded transposed LDS (read straight).
+///
+/// **Phase 1 (the ClusterCx port):** the KV stream is a **rolled [`crate::pipeline`] loop** (like the 16×16
+/// FA) rather than the correctness-first unrolled assembly — O/m/l are the loop-carried accumulators, the
+/// per-KV `s`/`p` are pipeline TEMPORARIES, and [`Fa32Hooks`] supplies the register-staged prefetch, commit,
+/// and gather over the SAME Mem/QKᵀ/softmax/PV cluster structure. This scales past `n = 128` and inherits the
+/// prefetch/commit/WAR/RAW machinery. Device-gated by `flash_attention32_matches_reference_on_gfx942`
+/// (tight `atol` at d=64 AND d=128); no ping-pong (`warp_row = None`: disjoint-Q warps).
 #[allow(clippy::needless_range_loop)]
 pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     use crate::shape::Mfma32x32x8Bf16 as S;
@@ -761,7 +912,7 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     let q_blk = NUM_WARPS_32 * m32; // 128
     let pitch = KV_BLK_32 + VT_PAD; // transposed-V LDS row pitch
     assert!(n.is_multiple_of(q_blk), "n must be a multiple of the Q block ({q_blk})");
-    assert!(n.is_multiple_of(KV_BLK_32) && n / KV_BLK_32 >= 1, "n must give ≥1 KV block");
+    assert!(n.is_multiple_of(KV_BLK_32) && n / KV_BLK_32 >= 2, "n must give ≥2 KV blocks (the rolled pipeline)");
     let dslices = d / k8; // QKᵀ K-steps (contract d over K=8)
     let dtiles = d / m32; // PV output d-tiles (32 each)
     let ksl = KV_BLK_32 / k8; // 4 PV K-slices per KV block
@@ -796,7 +947,6 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     let q_row_base = b.idx_add(q_origin, warp_qoff);
 
     let d_c = b.idx_const(d as i64);
-    let pitch_c = b.idx_const(pitch as i64);
     // Per-lane axis parts (shared by every fragment gather): q = wlane%32, dloc/kvloc = (wlane/32)·4.
     let (q_in, half_off) = {
         let n_lanes = b.idx_const(m32 as i64); // 32
@@ -826,120 +976,144 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
         })
         .collect();
 
-    // ── carried accumulators (register): O_dt (dtiles × 16-wide f32), running max m, running norm l. ──
-    let mk16 = |b: &mut Builder, v: f32| -> Val<F32> {
-        let c = b.f32(v);
-        let cs: Vec<Val<F32>> = (0..S::EPT_C).map(|_| c).collect();
-        b.vec_build(&cs)
-    };
-    let mut o_acc: Vec<Val<F32>> = (0..dtiles).map(|_| mk16(&mut b, 0.0)).collect();
-    let mut m_run = mk16(&mut b, f32::NEG_INFINITY);
-    let mut l_run = mk16(&mut b, 0.0);
-
     // Shared LDS: K natural [kv,d], V transposed padded [d, pitch].
     let k_lds = b.define_local::<BF16>(KV_BLK_32 * d);
     let vt_lds = b.define_local::<BF16>(d * pitch);
     let epl = KV_BLK_32 * d / nthreads; // collaborative fill, per thread
-    let epl_c = b.idx_const(epl as i64);
-    let lane_epl = b.idx_mul(tid, epl_c);
 
+    // Softmax scale folded into exp2: exp2(score·log2(e)/√d) == exp(score/√d). 16-wide broadcast.
     let scale = std::f32::consts::LOG2_E / (d as f32).sqrt();
-    let scale_bcast = mk16(&mut b, scale);
+    let scale_bcast = {
+        let c = b.f32(scale);
+        let cs: Vec<Val<F32>> = (0..S::EPT_C).map(|_| c).collect();
+        b.vec_build(&cs)
+    };
 
-    // ── the UNROLLED KV stream. `prev_reads` carries the WAR edge (block k+1's fill waits for block k's
-    //    LDS reads via `lds_after`); ONE RAW barrier per block fences the fill before the gathers. ──
-    let nblk = n / KV_BLK_32;
-    let mut prev_reads: Vec<TileId> = Vec::new();
-    let mut prev_bar: Option<Effect> = None;
-    for blk in 0..nblk {
-        let kv_row_base = offset_by(&mut b, bh_row, blk * KV_BLK_32);
-        // WAR barrier (all but the first block): a WORKGROUP sync after the previous block's LDS reads,
-        // so no thread's fill overwrites LDS another thread is still reading (`lds_after` alone orders a
-        // thread past only its OWN reads — the cross-thread WAR needs the barrier's fence-drain). The
-        // fills are then anchored after it (`lds_after`), and the block's RAW barrier fences them.
-        let (k_lds_w, vt_lds_w) = match prev_bar {
-            None => (k_lds, vt_lds),
-            Some(pb) => {
-                let war = b.barrier(pb, &prev_reads);
-                (b.lds_after(k_lds, &[war.dep()]), b.lds_after(vt_lds, &[war.dep()]))
+    // ── the heterogeneous slot set (DESIGN §3.2). CARRIED: `o_0..o_{dtiles-1}` (16-wide f32 PV acc),
+    //    `m` (running max), `l` (running norm). TEMPORARIES (produced+consumed within one KV block):
+    //    `s` (QKᵀ scores, 16-wide f32), `p` (softmax weights, 16-wide f32 → v_perm-packed in PV). All f32
+    //    on the `EPT_C = 16` accumulator (`c_map`); each warp keeps its OWN o/m/l over its 32 Q rows. ──
+    let o_frags: Vec<Frag<F32>> = (0..dtiles).map(|_| b.define_frag::<F32>(S::c_map())).collect();
+    let (m_frag, l_frag) = (b.define_frag::<F32>(S::c_map()), b.define_frag::<F32>(S::c_map()));
+    let (s_frag, p_frag) = (b.define_frag::<F32>(S::c_map()), b.define_frag::<F32>(S::c_map()));
+    let slot_m = dtiles;
+    let slot_l = dtiles + 1;
+    let slot_s = dtiles + 2;
+    let slot_p = dtiles + 3;
+    let mut accs: Vec<AccSlot> = o_frags.iter().map(|&f| AccSlot::F32(f)).collect();
+    accs.extend([AccSlot::F32(m_frag), AccSlot::F32(l_frag), AccSlot::F32(s_frag), AccSlot::F32(p_frag)]);
+    let mut inited: Vec<Option<Effect>> = o_frags.iter().map(|&f| Some(b.zero_init_frag(f))).collect();
+    inited.push(Some(b.const_init_frag(m_frag, f32::NEG_INFINITY))); // running max seed = −∞
+    inited.push(Some(b.zero_init_frag(l_frag))); // running norm seed = 0
+    inited.push(None); // s: temporary
+    inited.push(None); // p: temporary
+
+    // Per-cluster read/write slot sets (asymmetric — the §3.2 point). QKᵀ writes only `s`; softmax reads
+    // {s,m,l,o_*} writes {m,l,p,o_*}; PV reads {p,o_*} writes {o_*}.
+    let o_idx: Vec<usize> = (0..dtiles).collect();
+    let sm_reads: Vec<usize> = [slot_s, slot_m, slot_l].into_iter().chain(0..dtiles).collect();
+    let sm_writes: Vec<usize> = [slot_m, slot_l, slot_p].into_iter().chain(0..dtiles).collect();
+    let pv_reads: Vec<usize> = [slot_p].into_iter().chain(0..dtiles).collect();
+
+    // ── the three compute bodies, each declaring ONLY the slots it touches ──
+    // QKᵀ: S[kv,q] = Σ_ki mma(K_ki, Q_ki) (K A-operand, Q B-operand). reads nothing (re-zeros); writes `s`.
+    let qk = Compute::<Fa32Hooks>::new(
+        0,
+        vec![],
+        vec![slot_s],
+        move |b: &mut Builder, op: Option<&Fa32Op>, _reads: &[SlotVal]| {
+            let k_frags = op.expect("QKᵀ consumes gathered K");
+            let zeros: Vec<Val<F32>> = (0..S::EPT_C).map(|_| b.f32(0.0)).collect();
+            let mut s_acc = b.vec_build(&zeros);
+            for ki in 0..dslices {
+                s_acc = b.mma_of::<S>(k_frags[ki], q_frags[ki], s_acc);
             }
-        };
-        // Collaborative fill: K natural, V transposed. flat = tid·epl + i → (kv, d_idx).
-        let mut fills: Vec<TileId> = Vec::new();
-        for i in 0..epl {
-            let i_c = b.idx_const(i as i64);
-            let flat = b.idx_add(lane_epl, i_c);
-            let kv = b.idx_div(flat, d_c);
-            let d_idx = b.idx_mod(flat, d_c);
-            let g_row = b.idx_add(kv_row_base, kv);
-            let g_off = b.idx_mul(g_row, d_c);
-            let g_off = b.idx_add(g_off, d_idx);
-            let kval = b.load(k, g_off);
-            let vval = b.load(v, g_off);
-            let k_dst = b.idx_mul(kv, d_c);
-            let k_dst = b.idx_add(k_dst, d_idx); // K natural [kv,d]
-            fills.push(b.store_lds(k_lds_w, k_dst, kval).dep());
-            let v_dst = b.idx_mul(d_idx, pitch_c);
-            let v_dst = b.idx_add(v_dst, kv); // V transposed [d, kv]
-            fills.push(b.store_lds(vt_lds_w, v_dst, vval).dep());
-        }
-        let bar = b.barrier(Effect(fills[0]), &fills[1..]);
-        prev_bar = Some(bar);
-        let mut cur_reads: Vec<TileId> = Vec::new();
+            vec![SlotVal::F32(s_acc)]
+        },
+    );
 
-        // QKᵀ: S[kv,q] = Σ_ki mma(K_ki, Q_ki). K_ki = A-operand from k_lds[kv=q_in? no — kv on lane%32].
-        let mut s_acc = mk16(&mut b, 0.0);
-        for ki in 0..dslices {
-            // K A-operand: k_lds[kv = wlane%32, d = 8ki + half_off .. +4] (contiguous 4).
-            let base = b.idx_mul(q_in, d_c); // q_in here == kv-in-tile (lane%32) for the A operand
-            let dcol = offset_by(&mut b, half_off, ki * k8);
-            let base = b.idx_add(base, dcol);
-            let k_frag = b.load_lds_vec_after(k_lds, base, S::EPT_A, &[bar.dep()]);
-            cur_reads.push(k_frag.id);
-            s_acc = b.mma_of::<S>(k_frag, q_frags[ki], s_acc);
-        }
-
-        // Online softmax over kv (per q): scale, running max, rescale O/l, P = exp2(S−max), norm += ΣP.
-        let s_scaled = b.mul(s_acc, scale_bcast);
-        let m_new = b.acc_row_reduce_32(s_scaled, wlane, m_run, false);
-        let corr = {
-            let diff = b.sub(m_run, m_new);
-            b.exp2(diff)
-        };
-        for dt in 0..dtiles {
-            o_acc[dt] = b.mul(o_acc[dt], corr);
-        }
-        let l_resc = b.mul(l_run, corr);
-        let p = {
-            let sh = b.sub(s_scaled, m_new);
-            b.exp2(sh)
-        };
-        l_run = b.acc_row_reduce_32(p, wlane, l_resc, true);
-        m_run = m_new;
-
-        // P→PV relayout (v_perm s49) → 4 B-operands; P·V with V from the transposed LDS.
-        let b_ops = b.pv_relayout_s49(p);
-        for dt in 0..dtiles {
-            for s in 0..ksl {
-                // V A-operand: vt_lds[d = dt·32 + wlane%32, kv = 8s + half_off .. +4] (contiguous 4).
-                let d_row = offset_by(&mut b, q_in, dt * m32);
-                let base = b.idx_mul(d_row, pitch_c);
-                let kvcol = offset_by(&mut b, half_off, s * k8);
-                let base = b.idx_add(base, kvcol);
-                let v_frag = b.load_lds_vec_after(vt_lds, base, S::EPT_A, &[bar.dep()]);
-                cur_reads.push(v_frag.id);
-                o_acc[dt] = b.mma_of::<S>(v_frag, b_ops[s], o_acc[dt]);
+    // Online softmax (operand None): reads {s,m,l,o_*}, writes {m,l,p,o_*}. scale, running max via
+    // `acc_row_reduce_32` (the C=16 AccDist reduce over kv), O/l rescale, P = exp2(S−max), l += Σ_kv P.
+    let softmax = Compute::<Fa32Hooks>::new(
+        None,
+        sm_reads,
+        sm_writes,
+        move |b: &mut Builder, _op: Option<&Fa32Op>, reads: &[SlotVal]| {
+            let (s_acc, m_run, l_run) = (reads[0].f32(), reads[1].f32(), reads[2].f32());
+            let s_scaled = b.mul(s_acc, scale_bcast);
+            let m_new = b.acc_row_reduce_32(s_scaled, wlane, m_run, false);
+            let corr = {
+                let diff = b.sub(m_run, m_new);
+                b.exp2(diff) // exp2(max_old − max_new)
+            };
+            let l_resc = b.mul(l_run, corr);
+            let p = {
+                let sh = b.sub(s_scaled, m_new);
+                b.exp2(sh) // softmax weights P (f32, 16-wide)
+            };
+            let l_new = b.acc_row_reduce_32(p, wlane, l_resc, true);
+            let mut out = vec![SlotVal::F32(m_new), SlotVal::F32(l_new), SlotVal::F32(p)];
+            for i in 0..dtiles {
+                out.push(SlotVal::F32(b.mul(reads[3 + i].f32(), corr))); // O *= corr
             }
-        }
-        prev_reads = cur_reads;
-    }
+            out
+        },
+    );
+
+    // P·V (`mma_atb` over kv): reads {p,o_*}, writes {o_*}. `pv_relayout_s49(p)` → 4 B-operands; contract
+    // the `ksl` K-slices: `o_dt += Σ_s mma(V[dt·ksl+s], b_ops[s])`.
+    let pv = Compute::<Fa32Hooks>::new(
+        1,
+        pv_reads,
+        o_idx.clone(),
+        move |b: &mut Builder, op: Option<&Fa32Op>, reads: &[SlotVal]| {
+            let v_frags = op.expect("PV consumes gathered V");
+            let b_ops = b.pv_relayout_s49(reads[0].f32());
+            (0..dtiles)
+                .map(|dt| {
+                    let mut o = reads[1 + dt].f32();
+                    for s in 0..ksl {
+                        o = b.mma_of::<S>(v_frags[dt * ksl + s], b_ops[s], o);
+                    }
+                    SlotVal::F32(o)
+                })
+                .collect()
+        },
+    );
+
+    let bh_row_d = b.idx_mul(bh_row, d_c);
+    let hooks = Fa32Hooks { k, v, k_lds, vt_lds, bh_row_d, tid, epl, q_in, half_off, d, pitch, dslices, dtiles, ksl };
+    let acc_final = pipeline(
+        &mut b,
+        n / KV_BLK_32, // nblocks (streaming over KV)
+        KV_BLK_32 * d, // k_step: the FLAT per-block advance (kv_blk rows · d)
+        2,             // ksteps: gather slices (K, V)
+        &accs,
+        &inited,
+        None,  // warp_row: no ping-pong (disjoint-Q warps, no co-resident load/compute pair)
+        false, // asm_gather
+        false, // resident
+        CommitDrain::IntrinsicAuto,
+        false, // bare_seals
+        false, // pin_mfma
+        hooks,
+    )
+    .cluster(Mem::builder().prefetch([0, 1]).gathers([0, 1]).commit(true).build())
+    .cluster(qk)
+    .cluster(softmax)
+    .cluster(pv)
+    .build();
 
     // ── epilogue: O /= l (per q, broadcast across d), transpose-scatter to O[q_global, d_global]. ──
-    let recip_l = b.recip(l_run);
+    let recip_l = {
+        let l_vec = b.load_frag_vec(acc_final[slot_l].f32());
+        b.recip(l_vec)
+    };
     let dist = S::acc_dist();
     let mut roots = Vec::new();
     for dt in 0..dtiles {
-        let o_norm = b.mul(o_acc[dt], recip_l);
+        let o_vec = b.load_frag_vec(acc_final[dt].f32());
+        let o_norm = b.mul(o_vec, recip_l);
         for i in 0..S::EPT_C {
             let (row, col) = b.acc_rc(dist, wlane, i); // row = d-in-tile, col = q-in-tile
             let d_global = offset_by(&mut b, row, dt * m32);

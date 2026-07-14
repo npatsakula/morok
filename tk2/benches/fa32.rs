@@ -106,14 +106,18 @@ fn main() {
         eprintln!("svod-tk2 FA-32 bench: skipped (device is not a supported gfx942 GPU)");
         return;
     }
-    eprintln!("\n=== tk2 FA: 32×32×8 (un-tuned assembly) vs 16×16×16 (tuned pipeline) — REAL device TF ===\n");
+    eprintln!("\n=== tk2 FA: 32×32×8 (rolled ClusterCx pipeline) vs 16×16×16 (tuned pipeline) — REAL device TF ===\n");
     gate(true, 2, 128, 128);
     gate(false, 2, 128, 128);
 
-    // (label, b, h, S, d) — S small (the unrolled FA-32 does not scale past ~8 KV blocks; S=256 → 8), large
-    // bh so the grid (`bh·S/128`) fills the 304-CU MI300X. A short-context, machine-filled measurement.
+    // (label, b, h, S, d) — the rolled FA-32 now scales past n=128 (large-S machine-filling shapes), plus
+    // the old short-context shapes for the before→after comparison. `wgs = bh·S/128` fills the 304-CU MI300X.
     let configs = [
-        ("b16·h16", 16usize, 16usize, 128usize, 128usize),
+        ("b2·h16 ", 2usize, 16usize, 2048usize, 128usize),
+        ("b2·h16 ", 2, 16, 2048, 64),
+        ("b4·h16 ", 4, 16, 1024, 128),
+        ("b8·h16 ", 8, 16, 512, 128),
+        ("b16·h16", 16, 16, 128, 128),
         ("b8·h16 ", 8, 16, 256, 128),
         ("b16·h16", 16, 16, 128, 64),
         ("b8·h16 ", 8, 16, 256, 64),
