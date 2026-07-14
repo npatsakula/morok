@@ -745,9 +745,14 @@ const VT_PAD: usize = 8;
 /// counts). `interleave_exp<PAIRS,CNT>` folds the online `exp2` under the block's MFMAs; `interleave_valu`
 /// folds the reduction VALU under the P·V MFMAs. These are the ONLY perf-tuning knobs (step-6 sweep); the
 /// values here are HK's starting cadence, and the hints are numerics-INERT (verified: the gate is unchanged).
-const FA_EXP_PAIRS: u32 = 4;
+/// `PAIRS = 16` covers the full 16-MFMA count of each matmul at d=128 (QKᵀ = d/8, P·V = dtiles·ksl =
+/// d/8), the cadence device-swept as the robust optimum (Lever 1): +2.5% d128 / +4.2% d64 over a
+/// no-hint build. A fixed 16 also beats the "exact" d64 count (8), which hits a scheduler cliff (~-8%
+/// on d64) — measured, not assumed. `CNT` (exp=3, valu=5) is HK's canonical ratio; the sweep confirmed
+/// it is flat across 2–6, so the HK values stand.
+const FA_EXP_PAIRS: u32 = 16;
 const FA_EXP_CNT: u32 = 3;
-const FA_VALU_PAIRS: u32 = 4;
+const FA_VALU_PAIRS: u32 = 16;
 const FA_VALU_CNT: u32 = 5;
 
 /// One K/V-slice's gathered A-operands — the FA-32 [`Hooks::Op`]. Slice 0 = K (`dslices` QKᵀ A-operands,
