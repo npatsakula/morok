@@ -401,6 +401,35 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             );
             load.bitcast(dtype.vec(ept).expect("buffer_load: element vec"))
         }
+        // ONE direct-to-LDS MUBUF DMA (`raw.ptr.buffer.load.lds`): reads the dword at `rsrc[voffset]`
+        // (soffset=0, inst-offset=0) STRAIGHT into LDS at `lds_dst` (the per-wave uniform base → m0;
+        // hardware distributes lane L to m0 + L·4). `{0}`/`{1}`/`{2}` = rsrc / lds_dst / voffset; the
+        // `order` deps ride as ORDERING-ONLY anchors (unreferenced ⇒ never rendered as operands — they
+        // chain the DMAs so one `s_waitcnt vmcnt(0)` drains all). Void (an effect): writes LDS, yields no
+        // register value — the register file is never spent (vs the staged `BufferLoadRaw`→`DsWriteB64`).
+        // gfx942's runtime clang selects this intrinsic ONLY at dword granularity (`size == 4`).
+        Node::BufferLoadLds { rsrc, voffset, lds_dst, ept, dtype, order } => {
+            let rsrc = get(low, rsrc);
+            let lds = get(low, lds_dst);
+            let vo = get(low, voffset).cast(DType::Int32);
+            let size = ept * dtype.bytes();
+            assert_eq!(
+                size, 4,
+                "buffer_load_lds is dword-granular (clang selects raw.ptr.buffer.load.lds at size=4 only)"
+            );
+            let mut deps: SmallVec<[Arc<UOp>; 4]> = smallvec![rsrc, lds, vo];
+            for o in order {
+                deps.push(get(low, o));
+            }
+            UOp::custom(
+                deps,
+                format!(
+                    "declare void @llvm.amdgcn.raw.ptr.buffer.load.lds(ptr addrspace(8), ptr addrspace(3), i32, i32, i32, i32, i32)\n\
+                     call void @llvm.amdgcn.raw.ptr.buffer.load.lds(ptr addrspace(8) {{0}}, ptr addrspace(3) {{1}}, i32 {size}, i32 {{2}}, i32 0, i32 0, i32 0)"
+                ),
+                DType::Void,
+            )
+        }
         // ONE `ds_write_b64 $0, $1 offset:N` LDS store (gfx942 §5c — the commit twin of `DsReadB64`).
         // The `sideeffect` asm writes the bf16 operand (bitcast to `<ept×i16>`) to `base_ptr + off_bytes`;
         // `prev` (the prior fragment's write) rides as an ordering-only operand so the writes stay in

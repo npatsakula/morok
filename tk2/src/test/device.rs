@@ -149,6 +149,89 @@ fn mfma_32x32x8_probe_is_correct_on_gfx942() {
     }
 }
 
+/// **Direct-to-LDS (`BufferLoadLds`) de-risk gate** (tile-layer Step 1): the new `buffer_load_dword …
+/// lds` DMA node must (1) land the SAME LDS bytes as the register-staged `buffer_load_raw`→VGPR→
+/// `store_lds_vec` fill — both read back bit-exact to the input (the fill is an identity dword copy),
+/// hence identical — and (2) compile to FEWER VGPRs (no intermediate register tile: the direct DMA goes
+/// global→LDS, the staged path materialises the whole per-lane dword tile in VGPRs). Correctness is
+/// device-gated; the VGPR delta is decoded statically from the two compiled kernel descriptors. This is
+/// the load-bearing evidence for the tile-layer perf rationale (occupancy-1 FA is register-staged bloat).
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::buffer_load_lds_probe --nocapture`
+#[test]
+#[ignore]
+fn buffer_load_lds_probe_correct_and_saves_vgprs_on_gfx942() {
+    let dev = svod_dtype::default_device::default_device();
+    let (kv_blk, d) = (32usize, 128usize); // a representative K/V-fill tile
+    let tile = kv_blk * d;
+    let mut inp = Tensor::rand_with(&[tile], DType::BFloat16, dev.clone()).expect("rand in");
+    inp.realize().expect("realize in");
+    let in_f = as_f32_vec(&inp);
+
+    // (1) Correctness on device: DIRECT and STAGED both read back bit-exact to the input, so they agree.
+    let run = |direct: bool| -> Vec<f32> {
+        let prog = crate::kernels::lds_fill_probe(kv_blk, d, direct);
+        let out = Tensor::empty(&[tile], DType::BFloat16);
+        let mut y = graph_kernel(prog, out, &[&inp]).expect("wrap lds_fill probe");
+        let plan = y.prepare().expect("prepare");
+        plan.execute().expect("execute");
+        as_f32_vec(&y)
+    };
+    let gd = run(true);
+    let gs = run(false);
+    assert_eq!(gd, in_f, "DIRECT buffer_load_lds fill must be bit-exact vs input (identity dword copy)");
+    assert_eq!(gs, in_f, "STAGED fill must be bit-exact vs input");
+    assert_eq!(gd, gs, "DIRECT and STAGED must produce identical LDS contents");
+    println!("buffer_load_lds bit-exact ✓ direct==staged==input ([{kv_blk},{d}] bf16, {tile} elems)");
+
+    // (2) VGPR delta — decoded from the compiled kernel descriptors (static; needs only clang).
+    let device_spec = Tensor::empty(&[1], DType::Float32).device();
+    let decode = |direct: bool, name: &str| -> (u32, u32, String) {
+        let prog = crate::kernels::lds_fill_probe(kv_blk, d, direct);
+        let (src, bytes) = launch::compile_artifacts(&prog, &device_spec).expect("compile lds_fill");
+        let parsed = svod_device::amd::program::parse_kernel(&bytes, name).expect("parse kernel");
+        let res = svod_device::amd::occupancy::decode_resources(
+            parsed.kd.compute_pgm_rsrc1,
+            parsed.kd.group_segment_fixed_size,
+            parsed.kd.private_segment_fixed_size,
+            64, // gfx942 wave64
+            9,  // CDNA (gfx9)
+        );
+        (res.vgprs, parsed.kd.private_segment_fixed_size, src)
+    };
+    let (v_direct, sp_direct, src_direct) = decode(true, "tk2_lds_fill_direct");
+    let (v_staged, sp_staged, src_staged) = decode(false, "tk2_lds_fill_staged");
+
+    // IR-level evidence the two forms ARE the direct DMA vs the register-staged fill they claim to be.
+    assert!(
+        src_direct.contains("llvm.amdgcn.raw.ptr.buffer.load.lds"),
+        "DIRECT kernel must lower the fill to the raw.ptr.buffer.load.lds DMA"
+    );
+    assert!(
+        !src_direct.contains("<2 x bfloat>"),
+        "DIRECT kernel must NOT materialise a register vector tile for the fill (goes global→LDS)"
+    );
+    assert!(
+        src_staged.contains("<2 x bfloat>"),
+        "STAGED kernel must stage the fill through a register vector (load_vec → store_lds_vec)"
+    );
+    assert!(!src_staged.contains("buffer.load.lds"), "STAGED kernel must NOT use the direct DMA");
+
+    println!(
+        "buffer_load_lds VGPRs: direct={v_direct} staged={v_staged} (delta={} fewer)  scratch: direct={sp_direct}B staged={sp_staged}B",
+        v_staged as i32 - v_direct as i32
+    );
+    // THE gate on the tile-layer perf rationale: no intermediate register tile ⇒ strictly fewer VGPRs.
+    // A strict `<` guarantees a full allocation-granule (≥4 VGPRs) drop, robustly across clang versions.
+    // The measured delta at this [32,128] KV tile is 8 VGPRs (direct 20 vs staged 28, both 0-spill); the
+    // gap widens with tile size (≈100 VGPRs at [128,256]) and is understated here only because LLVM can
+    // rematerialise the probe's simple load→store — the real FA holds the K/V tile across the whole
+    // K-loop (the documented occupancy-1 388-VGPR bloat this node exists to cut).
+    assert!(
+        v_direct < v_staged,
+        "direct-to-LDS must use FEWER VGPRs than register-staged (no intermediate register tile): direct={v_direct}, staged={v_staged}"
+    );
+}
+
 /// Host f32 reference for the `mma_atb` probe: `O[d,q] = Σ_kv V[kv,d]·P[kv,q]` (V`[kv,d]`, P`[kv,q]`,
 /// both row-major) — the FA `P·V` contraction over the shared `kv` row.
 fn atb_ref(vf: &[f32], pf: &[f32], kv: usize, d: usize, q: usize) -> Vec<f32> {

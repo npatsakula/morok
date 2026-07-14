@@ -182,6 +182,101 @@ pub fn mfma_32x32x8_probe(m: usize, n: usize, k: usize) -> Program {
     Program { ir, sink, name: "tk2_mfma_32x32x8_probe".into() }
 }
 
+/// **Direct-to-LDS de-risk probe** (tile-layer Step 1): fill a `[kv_blk, d]` bf16 LDS tile from a global
+/// buffer and read it back, either DIRECT (`buffer_load_dword … lds`, no register tile —
+/// [`Builder::buffer_load_lds`]) or register-STAGED (`buffer_load_raw`→VGPR→`store_lds_vec`, the held
+/// register tile). The fill is an identity dword copy (`LDS[j] = in[j]`), so BOTH forms read back
+/// bit-exact to the input — which proves the direct DMA lands the SAME LDS bytes as the staged path.
+/// The two Programs share an identical readback (only the fill differs), so their VGPR delta is exactly
+/// the register diet: the staged form materialises the whole per-lane dword tile in VGPRs (pinned live
+/// by a `sched_fence`, reproducing the real kernel's prefetch held across the barrier), the direct form
+/// spends none. Single warp (64 lanes); `kv_blk·d` must tile by `64` dwords (`kv_blk·d / 2 % 64 == 0`).
+pub fn lds_fill_probe(kv_blk: usize, d: usize, direct: bool) -> Program {
+    let tile = kv_blk * d; // bf16 elements
+    assert!(tile.is_multiple_of(2), "tile must be an even number of bf16 (dword-packed)");
+    let tile_dw = tile / 2; // dwords
+    assert!(tile_dw.is_multiple_of(WARP), "tile ({tile_dw} dwords) must tile by the warp ({WARP})");
+    let chunks = tile_dw / WARP; // dwords per lane
+    let name = if direct { "tk2_lds_fill_direct" } else { "tk2_lds_fill_staged" };
+    let mut b = Builder::new(name);
+    // ABI: output first, then input (both bf16, `tile` elements).
+    let out = b.global::<BF16>(tile);
+    let inp = b.global::<BF16>(tile);
+    let _wg = b.grid_axis(0, 1);
+    let lane = b.block_axis(WARP as i64);
+    let zero = b.idx_const(0);
+    let one = b.idx_const(1);
+    let two = b.idx_const(2); // bytes per bf16 == bf16 per dword
+    let four = b.idx_const(4); // bytes per dword
+    let lds = b.define_local::<BF16>(tile);
+
+    // Dword `j = c·WARP + lane` — the dword this lane owns in chunk `c`.
+    let jdword = |b: &mut Builder, c: usize, lane: Idx| -> Idx {
+        let cl = b.idx_const((c * WARP) as i64);
+        b.idx_add(cl, lane)
+    };
+
+    let bar = if direct {
+        // ── DIRECT: `buffer_load_dword … lds` (no register tile), chained + vmcnt-drained. ──
+        let rsrc = b.make_buffer_rsrc(inp, zero);
+        let mut prev: Option<TileId> = None;
+        let mut effs: Vec<TileId> = Vec::with_capacity(chunks);
+        for c in 0..chunks {
+            let j = jdword(&mut b, c, lane);
+            let voff = b.idx_mul(j, four); // per-lane global byte offset
+            // Per-wave UNIFORM LDS base for chunk `c` (bf16 elements): the hardware adds lane·4 B, so this
+            // carries NO lane term — c·WARP dwords = c·WARP·2 bf16 elements.
+            let lds_base = b.idx_const((c * WARP * 2) as i64);
+            let lds_ptr = b.lds_ptr_as3(lds, lds_base, &[]);
+            let order = prev.map(|p| vec![p]).unwrap_or_default();
+            let eff = b.buffer_load_lds::<BF16>(rsrc, voff, lds_ptr, 2, &order);
+            prev = Some(eff.dep());
+            effs.push(eff.dep());
+        }
+        // ONE `s_waitcnt vmcnt(0)` after the last (chained ⇒ all) DMA drains every direct load into LDS.
+        let vdrain = b.swait_vmcnt(*effs.last().expect("≥1 chunk"));
+        b.barrier(vdrain, &effs)
+    } else {
+        // ── STAGED: global `load_vec` → VGPR (held) → `store_lds_vec` — the register-staged fill (the
+        // real kernel's compiler-visible `Drain::Intrinsic` commit), dword-granular to match the direct
+        // LDS layout exactly. This is the intermediate register tile the direct DMA elides. ──
+        let mut loaded: Vec<Val<BF16>> = Vec::with_capacity(chunks);
+        for c in 0..chunks {
+            let j = jdword(&mut b, c, lane);
+            let src = b.idx_mul(j, two); // global bf16-element offset j·2 (one dword)
+            loaded.push(b.load_vec::<BF16>(inp, src, 2));
+        }
+        // Pin the whole per-lane dword tile live (`sched_fence` load-pin): the real kernel's barrier sits
+        // between prefetch and commit, so the loads cannot interleave with the stores — reproduce that
+        // held-tile register pressure rather than letting LLVM collapse it away.
+        let load_ids: Vec<TileId> = loaded.iter().map(|v| v.id).collect();
+        let pin = b.sched_fence(0, &load_ids);
+        let mut effs: Vec<TileId> = Vec::with_capacity(chunks);
+        for (c, &val) in loaded.iter().enumerate() {
+            let j = jdword(&mut b, c, lane);
+            let dst = b.idx_mul(j, two); // LDS bf16-element offset j·2
+            let ldsw = b.lds_after(lds, &[pin.dep()]);
+            effs.push(b.store_lds_vec(ldsw, dst, val).dep());
+        }
+        b.barrier(Effect(effs[0]), &effs[1..])
+    };
+
+    // ── readback (SHARED — identical for both forms): lane L reads its dwords, stores to out[j]. ──
+    let bar_dep = bar.dep();
+    let mut roots = Vec::new();
+    for c in 0..chunks {
+        let j = jdword(&mut b, c, lane);
+        let e0 = b.idx_mul(j, two); // bf16 element j·2
+        let e1 = b.idx_add(e0, one); // bf16 element j·2 + 1
+        let v0: Val<BF16> = b.load_lds_after(lds, e0, &[bar_dep]);
+        let v1: Val<BF16> = b.load_lds_after(lds, e1, &[bar_dep]);
+        roots.push(b.store(out, e0, v0));
+        roots.push(b.store(out, e1, v1));
+    }
+    let (ir, sink) = b.finish(&roots);
+    Program { ir, sink, name: name.into() }
+}
+
 /// The register-staged fill bundle carried between the pipeline's prefetch and commit: A's and
 /// B's b64/b128 chunks held in VGPRs. Since B is taken **`[N,K]`** (HK's pre-transposed layout), its
 /// fill is the SAME trivial coalesced `load→ds_write` as A — no register transpose, no `v_perm`. At

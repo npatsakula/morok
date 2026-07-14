@@ -344,6 +344,20 @@ pub enum Node {
     /// path, and without a non-zero `soffset` (mishandled by the config). `order` are ordering-only anchors
     /// (the authoring cluster A@C0 / B@C4). Renders as `load.bitcast(<ept×elem>)` of the `<dwords×i32>`.
     BufferLoadRaw { rsrc: TileId, voffset: TileId, ept: usize, dtype: DType, order: Edges },
+    /// ONE **direct-to-LDS** MUBUF load (`llvm.amdgcn.raw.ptr.buffer.load.lds`, gfx942 — aiter/HK's
+    /// async global→LDS DMA): reads the `ept`-element (one **dword**, 4 B) run at `rsrc[voffset]` bytes
+    /// (`soffset = 0`) and writes it STRAIGHT to LDS at `lds_dst` — the register file is never spent (no
+    /// intermediate VGPR tile, unlike the register-staged [`Node::BufferLoadRaw`]→[`Node::DsWriteB64`]
+    /// route the existing kernels use). This is the tile-layer register diet (occupancy-1 FA is
+    /// register-staged bloat). `lds_dst` is a `ptr addrspace(3)` ([`Node::LdsPtrAs3`]) — the per-wave
+    /// UNIFORM LDS base (goes to `m0`); the hardware distributes each active lane L to `m0 + L·4 B`
+    /// (aiter's `warp_offset = wid·64·DMA_BYTES` packing), so `lds_dst` must NOT carry a per-lane term.
+    /// `voffset` is the per-lane global byte offset (a VGPR). Renders `buffer_load_dword … offen lds`; the
+    /// completion rides `vmcnt` (drained by [`Node::SWaitVmcnt`], NOT the `s_barrier`'s `lgkmcnt`). The
+    /// intrinsic selects ONLY at the dword granularity (`ept·sizeof(dtype) == 4`) on the runtime clang;
+    /// wider `dwordx{2,4}` forms fail backend selection. Returns an ORDERING token (an EFFECT), not a
+    /// register value. `order` are ordering-only anchors (chain the DMAs so one `vmcnt(0)` drains all).
+    BufferLoadLds { rsrc: TileId, voffset: TileId, lds_dst: TileId, ept: usize, dtype: DType, order: Edges },
     /// ONE inline-asm `ds_write_b64 $base, $val offset:N` LDS store (gfx942, DESIGN §5c — the
     /// **commit** twin of [`Node::DsReadB64`]): writes the `ept`-element bf16 `value` to
     /// `base_ptr + off_bytes`. Being `asm sideeffect` it is OPAQUE to LLVM's waitcnt pass, so unlike
@@ -620,6 +634,14 @@ impl TileIr {
                 dtype,
                 order: order.into_iter().map(&mut f).collect(),
             },
+            Node::BufferLoadLds { rsrc, voffset, lds_dst, ept, dtype, order } => Node::BufferLoadLds {
+                rsrc: f(rsrc),
+                voffset: f(voffset),
+                lds_dst: f(lds_dst),
+                ept,
+                dtype,
+                order: order.into_iter().map(&mut f).collect(),
+            },
             Node::DsWriteB64 { base_ptr, off_bytes, value, ept, prev, hk_form } => Node::DsWriteB64 {
                 base_ptr: f(base_ptr),
                 off_bytes,
@@ -755,6 +777,7 @@ impl TileIr {
             Node::StoreGlobal { .. }
             | Node::StoreRegVec { .. }
             | Node::StoreVecAt { .. }
+            | Node::BufferLoadLds { .. }
             | Node::DsWriteB64 { .. }
             | Node::SWaitLgkmcnt { .. }
             | Node::SWaitVmcnt { .. }

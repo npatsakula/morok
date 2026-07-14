@@ -398,6 +398,38 @@ impl Builder {
         }))
     }
 
+    /// ONE **direct-to-LDS** MUBUF DMA ([`Node::BufferLoadLds`] → `raw.ptr.buffer.load.lds` →
+    /// `buffer_load_dword … offen lds`): loads the `ept`-element dword at `rsrc[voffset]` bytes STRAIGHT
+    /// into LDS at `lds_dst` — no intermediate VGPR (the register-diet twin of the staged
+    /// [`Self::buffer_load_raw`]→[`Self::store_lds_vec`]/[`Self::ds_write_b64`] route). `lds_dst` (from
+    /// [`Self::lds_ptr_as3`]) is the per-wave UNIFORM LDS base (→ `m0`); the hardware distributes each
+    /// lane L to `m0 + L·4 B`, so pass NO per-lane term. `voffset` is the per-lane global byte offset.
+    /// Returns an ordering [`Effect`] (writes LDS, no value); completion rides `vmcnt` — drain with
+    /// [`Self::swait_vmcnt`] before the reader. Dword-granular only (`ept·sizeof(E) == 4`).
+    pub fn buffer_load_lds<E: Elem>(
+        &mut self,
+        rsrc: Idx,
+        voffset: Idx,
+        lds_dst: Idx,
+        ept: usize,
+        order: &[TileId],
+    ) -> Effect {
+        assert_eq!(
+            ept * E::dtype().bytes(),
+            4,
+            "buffer_load_lds is dword-granular (raw.ptr.buffer.load.lds selects size=4 only)"
+        );
+        let order = order.iter().copied().collect();
+        Effect(self.ir.intern(Node::BufferLoadLds {
+            rsrc: rsrc.0,
+            voffset: voffset.0,
+            lds_dst: lds_dst.0,
+            ept,
+            dtype: E::dtype(),
+            order,
+        }))
+    }
+
     /// ONE `<ept×E>` vector store of a contiguous LDS run at flat `base` ([`Node::StoreVecAt`]
     /// → `ds_write_b64`/`b128`) — the store mirror of [`Self::load_lds_vec_after`], replacing
     /// `ept` scalar `store_lds` for a contiguous, aligned run (the vectorised fill).
