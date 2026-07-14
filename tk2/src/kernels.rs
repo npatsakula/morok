@@ -288,7 +288,7 @@ struct FillRegs {
 }
 
 /// matmul's [`Hooks`] impl for the §5c clustered [`pipeline`] — the ONLY kernel-specific part of the
-/// clustered schedule. It rides the [`crate::movement`] handles (so the prefetch/commit/gather bodies
+/// clustered schedule. It rides the [`crate::tile_move`] handles (so the prefetch/commit/gather bodies
 /// name no addressing) and carries `ri`/`cj`/`ept` for the per-accumulator MFMA grid. `Op` is the
 /// `(A-vecs, B-vecs)` operand bundle of one K-slice; `Reg` is [`FillRegs`]. The prefetch/commit
 /// bodies stage the register-buffered fill; the gather emits one K-slice's `ds_read` operands.

@@ -4,7 +4,7 @@
 //!
 //! The split of concerns:
 //! - [`Hooks`] — the ONLY kernel-specific movement: `prefetch`/`commit`/`gather`. matmul's impl
-//!   (`MatmulHooks`) rides the [`crate::movement`] handles; FA will supply its own. The compute math
+//!   (`MatmulHooks`) rides the [`crate::tile_move`] handles; FA will supply its own. The compute math
 //!   is NOT here — it rides each [`Compute`] cluster's body, so a new compute kind grows no `Hooks`.
 //! - [`ClusterCx`] — the **safe-op layer**. A cluster body calls `prefetch`/`gather`/`commit`/`compute`
 //!   and NEVER names a barrier or a dependency edge; each safe op threads the EXACT ordering edges

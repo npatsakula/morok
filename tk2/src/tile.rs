@@ -1,7 +1,7 @@
 //! **The declarative tile-type layer** (`scratchpad/tile_layer_design.md` §1) — a deriving device that
 //! generalizes [`crate::shape::MfmaShape`] from "the matrix-core shape" to "the whole tile". A tile is a
 //! zero-sized *type* whose parameters (dtype, dims, operand role / swizzle, MFMA shape) *compute* a
-//! [`TileDesc`] — plain DATA, exactly the fields [`crate::movement::LdsView`]/`LdsStage` thread by hand
+//! [`TileDesc`] — plain DATA, exactly the fields [`crate::tile_move::LdsView`]/`LdsStage` thread by hand
 //! today. No [`crate::ir::Node`] gains a type parameter (Recommendation C, `shape.rs:8-14`): the type
 //! computes the constants, the IR stays data-driven, so the arena/lowering/verifier are untouched.
 //!
@@ -159,7 +159,7 @@ pub trait Swizzle: Copy + 'static {
 
 /// Contiguous (no XOR) — the padded / direct-to-LDS-compatible layout. A direct-to-LDS fill REQUIRES
 /// this: the hardware pins lane `L`→`m0 + L·4`, so a per-lane XOR cannot be applied on the fill side
-/// (this session's finding). The [`crate::movement`] register-staged fill can use either.
+/// (this session's finding). The [`crate::tile_move`] register-staged fill can use either.
 #[derive(Copy, Clone, Debug)]
 pub struct Plain;
 /// The HK/CK bank-conflict XOR swizzle (`col ^ delta(row)`). Only reachable via the register-staged

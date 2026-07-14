@@ -50,7 +50,7 @@ struct FaFill {
     v: Vec<Val<BF16>>,
 }
 
-/// FA's [`Hooks`] — the ONLY kernel-specific movement. It rides the SAME [`crate::movement`]
+/// FA's [`Hooks`] — the ONLY kernel-specific movement. It rides the SAME [`crate::tile_move`]
 /// handles matmul does (proving the movement layer is not GEMM-bound); the compute math rides the
 /// [`Compute`] bodies below, so `Hooks` grows no per-cluster compute method. `PREFETCH_TILES = 2`
 /// (K, V) as in matmul (A, B), but the two tiles are the two *operands of two different matmuls*
