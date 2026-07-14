@@ -28,7 +28,7 @@ mod common;
 use common::{bench_plan, plan_gpu_ns, rand_bf16, requirements_met};
 
 use svod_tk2::kernels_fa::flash_attention_fwd;
-use svod_tk2::{SwizzlePass, graph_kernel};
+use svod_tk2::{SwizzlePass, VectorizePass, graph_kernel};
 
 /// FA-forward FLOPs, **non-causal**: `4·B·H·S²·d`. Two matmuls each cost `2·B·H·S²·d` FLOPs
 /// (QKᵀ: `S×S` scores over `d` MACs; P·V: `S×d` outputs over `S` MACs) → `2 MACs/FLOP`. Causal
@@ -78,9 +78,11 @@ fn fa_ref(qf: &[f32], kf: &[f32], vf: &[f32], s: usize, d: usize) -> Vec<f32> {
 /// Wrap the FA `Program` for `bh` stacked `[s,d]` attentions as a graph-node Tensor over `(q,k,v)`
 /// (each bf16 `[bh·s, d]`) with an f32 `[bh·s, d]` output, and prepare its execution plan.
 fn plan_of_fa(bh: usize, s: usize, d: usize, q: &Tensor, k: &Tensor, v: &Tensor) -> (Tensor, ExecutionPlan) {
-    // SwizzlePass ONLY (never VectorizePass — it mis-fuses FA's column-strided transposed V gather,
-    // corrupting numerics to ~0.1 error; SwizzlePass folds the LDS bank-conflict swizzle → +82% TF).
-    let prog = flash_attention_fwd(bh, s, d).apply(SwizzlePass);
+    // Vectorize.then(Swizzle): VectorizePass fuses the straight K gather → `ds_read_b64` (halving the
+    // scalar `ds_read_u16` LDS-wait traffic); the transposed V gather packs its strided reads into a
+    // single `store_frag_vec`, so it presents no fusible run and stays bit-exact. SwizzlePass folds the
+    // LDS bank swizzle (+82% TF).
+    let prog = flash_attention_fwd(bh, s, d).apply(VectorizePass).apply(SwizzlePass);
     let out = Tensor::empty(&[bh * s, d], DType::Float32);
     let mut y = graph_kernel(prog, out, &[q, k, v]).expect("wrap FA as graph node");
     let plan = y.prepare().expect("prepare FA execution plan");

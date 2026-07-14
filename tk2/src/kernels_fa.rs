@@ -251,10 +251,14 @@ fn load_q_frag_global(
 /// data transpose — while `V` is gathered transposed so `kv` lands on the MFMA contraction axis).
 /// Device-gated by `flash_attention_matches_reference_on_gfx942`. Returns a lowerable [`Program`].
 ///
-/// **PASS REQUIREMENT**: apply `.apply(SwizzlePass)` — it folds the LDS bank-conflict swizzle (~81% →
-/// ~29% conflicts, +82% TF; the free lunch matmul takes and this omitted). Do **NOT** apply
-/// `VectorizePass`: it mis-fuses the column-strided transposed V gather and corrupts numerics
-/// (verified: max_abs_err 3.9e-4 → ~1e-1). SwizzlePass ALONE, unlike matmul's `Vectorize.then(Swizzle)`.
+/// **PASS REQUIREMENT**: apply `.apply(VectorizePass).apply(SwizzlePass)` (matmul's order). SwizzlePass
+/// folds the LDS bank-conflict swizzle (~81% → ~29% conflicts, +82% TF). VectorizePass fuses the
+/// **straight K gather** into `ds_read_b64` (halving the scalar `ds_read_u16` LDS-wait traffic —
+/// `ds_read_u16` 128→64, `ds_read_b64` 0→16 at d=128); it leaves the **transposed V gather** untouched
+/// because [`LdsView::gather_transposed`] packs its `ept` column-strided reads into a single
+/// `store_frag_vec` (no fusible `ept`-scalar-store run), so V stays bit-exact (the naive per-element V
+/// gather is what made VectorizePass corrupt numerics 3.9e-4 → ~1e-1 before). V's strided read is the
+/// residual scalar gather (its register transpose is barrier-bound — see report).
 ///
 /// Accumulator carry (all `Frag<F32>`, Col map): `[o_0 .. o_{d/16−1}, att, max, norm]`. `o_df` is the
 /// `[d, q]`-layout PV accumulator for output d-fragment `df` (`q` on the flat lane-axis, matching `att`

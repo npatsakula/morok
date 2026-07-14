@@ -195,7 +195,14 @@ impl<E: Elem> LdsView<E> {
         let vecs = (0..self.n_frags)
             .map(|f| {
                 let frag = b.define_frag::<E>(self.map);
-                let stores: Vec<TileId> = (0..self.map.ept)
+                // The `ept` column-strided scalar reads, packed into ONE `vec_build`→`store_frag_vec`
+                // (a `StoreRegVec`, NOT `ept` scalar `store_frag_elem`s). Numerically bit-identical to
+                // the per-element store — the same 4 loads in the same `e=0..3` order — but it presents
+                // NO fusible `ept`-scalar-store run to [`crate::VectorizePass`], so the pass leaves this
+                // strided gather alone (fusing it would mis-read `ept` contiguous LDS, corrupting V —
+                // the reason FA formerly had to omit VectorizePass entirely) while STILL fusing the
+                // straight K gather. The strided V read stays scalar `ds_read_u16`; K vectorises.
+                let loaded: Vec<Val<E>> = (0..self.map.ept)
                     .map(|e| {
                         let e_idx = b.idx_const(e as i64);
                         // Col map ⇒ (frag_row = spread = contraction, frag_col = flat = output).
@@ -206,12 +213,13 @@ impl<E: Elem> LdsView<E> {
                         let col_part = b.lds_col(row, col, self.inner); // swizzle hole (flat = col at base)
                         let row_off = b.idx_mul(row, inner_c);
                         let off = b.idx_add(row_off, col_part);
-                        let v = b.load_lds_after(self.lds, off, raw);
-                        b.store_frag_elem(frag, e_idx, v).dep()
+                        b.load_lds_after(self.lds, off, raw)
                     })
                     .collect();
-                gathers.extend(stores.iter().copied());
-                b.load_frag_vec_after(frag, &stores)
+                let packed = b.vec_build(&loaded);
+                let st = b.store_frag_vec(frag, packed).dep();
+                gathers.push(st);
+                b.load_frag_vec_after(frag, &[st])
             })
             .collect();
         (vecs, gathers)

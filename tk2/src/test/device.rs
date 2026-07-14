@@ -219,13 +219,16 @@ fn flash_attention_matches_reference_on_gfx942() {
             expected[z..z + n * d].copy_from_slice(&o_s);
         }
         // TIGHT atol: the honest bf16-P-cast error is ~2e-3, so a fixed 1e-2 passes correct FA with
-        // margin while REJECTING a corrupted-but-plausible result (e.g. adding VectorizePass mis-fuses
-        // the transposed V gather → ~1e-1 error, which the old `0.02·√d`≈0.23 tolerance wrongly passed).
+        // margin while REJECTING a corrupted-but-plausible result (a mis-fused V gather → ~1e-1 error,
+        // which the old `0.02·√d`≈0.23 tolerance wrongly passed). This gate DELIBERATELY runs with
+        // VectorizePass on to catch any V-gather mis-fusion regression.
         let atol = 1e-2;
 
-        // SwizzlePass ONLY: folds the LDS bank-conflict swizzle (+82% TF); NEVER VectorizePass (it
-        // corrupts the column-strided transposed V gather — verified: error 3.9e-4 → ~1e-1).
-        let prog = crate::kernels_fa::flash_attention_fwd(bh, n, d).apply(SwizzlePass);
+        // Vectorize.then(Swizzle) (matmul's order): VectorizePass now fuses ONLY the straight K gather
+        // into `ds_read_b64` — the transposed V gather packs its strided reads into a single
+        // `store_frag_vec` (see `LdsView::gather_transposed`), presenting no fusible scalar run, so the
+        // pass leaves V bit-exact. SwizzlePass folds the LDS bank swizzle (+82% TF).
+        let prog = crate::kernels_fa::flash_attention_fwd(bh, n, d).apply(VectorizePass).apply(SwizzlePass);
         let out = Tensor::empty(&[bh * n, d], DType::Float32);
         let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA program");
         let plan = y.prepare().expect("prepare FA");
@@ -255,7 +258,7 @@ fn fa_forward_launches_on_gfx942() {
     k.realize().expect("realize k");
     v.realize().expect("realize v");
 
-    let prog = crate::kernels_fa::flash_attention_fwd(bh, n, d).apply(SwizzlePass);
+    let prog = crate::kernels_fa::flash_attention_fwd(bh, n, d).apply(VectorizePass).apply(SwizzlePass);
     let out = Tensor::empty(&[bh * n, d], DType::Float32);
     let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA program");
     let plan = y.prepare().expect("prepare FA");

@@ -89,8 +89,11 @@ fn fa_forward_on_clustercx_lowers_spec_valid() {
     let count = |p: &crate::Program, pred: &dyn Fn(&Node) -> bool| {
         (0..p.ir.len()).filter(|&i| pred(p.ir.node(crate::ir::TileId(i as u32)))).count()
     };
-    // bh=2, 8-warp split-Q, kv_blk=32 (2 KV-frags); SwizzlePass = the production form (bank-conflict fold).
-    let p = crate::kernels_fa::flash_attention_fwd(2, 128, 64).apply(crate::passes::SwizzlePass);
+    // bh=2, 8-warp split-Q, kv_blk=32 (2 KV-frags); Vectorize.then(Swizzle) = the production form (K
+    // gather fused to ds_read_b64 + the bank-conflict swizzle fold).
+    let p = crate::kernels_fa::flash_attention_fwd(2, 128, 64)
+        .apply(crate::passes::VectorizePass)
+        .apply(crate::passes::SwizzlePass);
     lower::verify(&p).expect("FA-forward on ClusterCx must lower to spec-valid UOp");
     // The novel FA vocabulary is present: exp2 (2×/iter), recip (normalize), and the ds_bpermute
     // cross-lane reduction tree (3 shuffles × 2 reductions/iter).
@@ -103,14 +106,16 @@ fn fa_forward_on_clustercx_lowers_spec_valid() {
     // `s_barrier` (a pure `Node::After` ordering combine instead) — only the load-bearing Mem WAR/RAW
     // pair survives in the hot loop. Count only barriers REACHABLE from the sink (`count` over the raw
     // arena double-counts the dead pre-swizzle offset nodes SwizzlePass supersedes). The reachable
-    // `Node::Barrier`s are exactly: prologue (Q commit + block-0 K/V commit = 2) + steady (WAR + RAW
-    // = 2) + epilogue (Mem gather seal = 1) = 5. Pre-fix (always-barrier) this was 10 — the drop of the
-    // steady loop from 5→2 `s_barrier`/iter is what unwalls the 0-MFMA softmax shadow (device: +6..18% TF).
+    // `Node::Barrier`s are exactly 4: block-0 K/V commit (prologue) + steady (WAR + RAW = 2) + epilogue
+    // (Mem gather seal). It was 5 before commit 8ec2afe6 (Probe B) dropped the Q-LDS staging, which
+    // removed the prologue Q-commit barrier — this assertion was left stale at 5 by that commit and is
+    // corrected to 4 here. Vectorize.then(Swizzle) does not change the count (VectorizePass only fuses
+    // the K gather's scalar loads, adding/removing no workgroup barrier).
     let live: std::collections::HashSet<crate::ir::TileId> =
         crate::passes::reachable(&p.ir, p.sink).into_iter().collect();
     let nbar = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::Barrier { .. })).count();
     assert_eq!(
-        nbar, 5,
-        "FA keeps ONLY the Mem WAR/RAW + prologue/epilogue barriers (compute seals ping-pong-gated off)"
+        nbar, 4,
+        "FA keeps ONLY the Mem WAR/RAW + prologue-commit/epilogue barriers (compute seals ping-pong-gated off)"
     );
 }
