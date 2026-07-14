@@ -835,8 +835,12 @@ impl Hooks for Fa32Hooks {
             let flat = offset_by(b, lane_epl, i);
             let kv = b.idx_div(flat, d_c);
             let d_idx = b.idx_mod(flat, d_c);
+            // K natural [kv, d] through the `LdsCol` swizzle hole (cols = d, a power of 2 for d ∈ {64,128}):
+            // `SwizzlePass` folds it to the XOR bank-spread, the gather reads the SAME `lds_col(kv, …, d)`.
+            // (V's transpose keeps its padded pitch — non-power-of-2, so the XOR swizzle is not applied.)
+            let k_col = b.lds_col(kv, d_idx, self.d);
             let k_dst = b.idx_mul(kv, d_c);
-            let k_dst = b.idx_add(k_dst, d_idx); // K natural [kv, d]
+            let k_dst = b.idx_add(k_dst, k_col);
             effs.push(b.store_lds(k_lds, k_dst, reg.k[i]));
             let v_dst = b.idx_mul(d_idx, pitch_c);
             let v_dst = b.idx_add(v_dst, kv); // V transposed [d, kv]
@@ -862,11 +866,14 @@ impl Hooks for Fa32Hooks {
         let mut gathers = Vec::new();
         match slice {
             // K A-operand: k_lds[kv = q_in, d = ki·8 + half_off .. +4] (contiguous), `dslices` of them.
+            // The 4-run start `col_base` is 4-aligned and the swizzle `delta(row)` is 4-aligned (d ∈
+            // {64,128}), so the swizzled base + [0..4) stays the fill's contiguous 4-run — `ds_read_b64` safe.
             0 => {
                 for ki in 0..self.dslices {
+                    let col_base = offset_by(b, self.half_off, ki * S::K);
+                    let kcol = b.lds_col(self.q_in, col_base, self.d);
                     let base = b.idx_mul(self.q_in, d_c);
-                    let dcol = offset_by(b, self.half_off, ki * S::K);
-                    let base = b.idx_add(base, dcol);
+                    let base = b.idx_add(base, kcol);
                     vecs.push(read(b, self.k_lds, base, &mut gathers));
                 }
             }
@@ -902,6 +909,13 @@ impl Hooks for Fa32Hooks {
 /// and gather over the SAME Mem/QKᵀ/softmax/PV cluster structure. This scales past `n = 128` and inherits the
 /// prefetch/commit/WAR/RAW machinery. Device-gated by `flash_attention32_matches_reference_on_gfx942`
 /// (tight `atol` at d=64 AND d=128); no ping-pong (`warp_row = None`: disjoint-Q warps).
+///
+/// **PASS REQUIREMENT**: apply `.apply(SwizzlePass)`. It folds the **K-tile** LDS bank swizzle (`cols = d`,
+/// a power of 2) into the XOR bank-spread — the fill and gather both route K's column through
+/// `lds_col(row, …, d)`, so they stay in agreement. The **V tile** keeps its padded pitch (non-power-of-2,
+/// so the XOR is not applied — the pad is what breaks its conflicts). VectorizePass is unnecessary: the
+/// K/V gathers are already `ds_read_b64` ([`Builder::load_lds_vec_after`]) and the fills are `store_lds`
+/// (no fusible scalar frag-store run), so the pass touches only the loop-invariant Q prologue (negligible).
 #[allow(clippy::needless_range_loop)]
 pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     use crate::shape::Mfma32x32x8Bf16 as S;

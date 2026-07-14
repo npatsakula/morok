@@ -62,7 +62,10 @@ fn fa_ref(qf: &[f32], kf: &[f32], vf: &[f32], s: usize, d: usize) -> Vec<f32> {
 /// Prepare an execution plan for the given kernel variant (`wide` → FA-32, else the tuned 16×16 FA).
 fn plan_of(wide: bool, bh: usize, s: usize, d: usize, q: &Tensor, k: &Tensor, v: &Tensor) -> (Tensor, ExecutionPlan) {
     let prog = if wide {
-        flash_attention_fwd_32(bh, s, d)
+        // FA-32 rides SwizzlePass ONLY: the K tile swizzles (cols = d, power of 2); the gathers are already
+        // `ds_read_b64` (`load_lds_vec_after`) so VectorizePass has no fusible scalar run (it only touches the
+        // loop-invariant Q prologue — measured negligible). V keeps its padded pitch (non-power-of-2, no XOR).
+        flash_attention_fwd_32(bh, s, d).apply(SwizzlePass)
     } else {
         flash_attention_fwd(bh, s, d).apply(VectorizePass).apply(SwizzlePass)
     };

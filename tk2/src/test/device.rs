@@ -447,7 +447,9 @@ fn flash_attention32_matches_reference_on_gfx942() {
             expected[z..z + n * d].copy_from_slice(&o_s);
         }
         let atol = 1e-2;
-        let prog = crate::kernels_fa::flash_attention_fwd_32(bh, n, d);
+        // SwizzlePass folds the K-tile LDS bank swizzle (the as-used tuned path); the gate runs it on to
+        // catch any swizzle-layout regression (fill/gather must agree on `lds_col(row, …, d)`).
+        let prog = crate::kernels_fa::flash_attention_fwd_32(bh, n, d).apply(SwizzlePass);
         let out = Tensor::empty(&[bh * n, d], DType::Float32);
         let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA-32 program");
         let plan = y.prepare().expect("prepare FA-32");
