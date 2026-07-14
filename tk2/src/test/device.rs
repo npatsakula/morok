@@ -419,6 +419,46 @@ fn flash_attention_matches_reference_on_gfx942() {
     }
 }
 
+/// **FA-32 correctness GATE** (§Step 6): the 32×32×8-MFMA FA ([`crate::kernels_fa::flash_attention_fwd_32`],
+/// kept SEPARATE from the frozen 16×16 FA) must match the SAME f32 reference (non-causal, bf16-rounded
+/// operands) at d=64 AND d=128, over `bh > 1` independent `[bh,n,d]` attentions — validating the assembled
+/// 32×32×8 hot path end-to-end: QKᵀ (`v_mfma_f32_32x32x8`) → `acc_row_reduce_32` online softmax → `v_perm
+/// s49` P→PV relayout → padded-transposed-V P·V. `n = 128` (the unrolled-KV assembly's gate). `atol` is the
+/// tight 1e-2 the 16×16 gate uses (the honest bf16-cast error is ~2e-3; a corrupted result is rejected).
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::flash_attention32_matches --nocapture`
+#[test]
+#[ignore]
+fn flash_attention32_matches_reference_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    let dev = svod_dtype::default_device::default_device();
+    let n = 128usize;
+    for (bh, d) in [(3usize, 64usize), (2usize, 128usize)] {
+        let mut q = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand q");
+        let mut k = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand k");
+        let mut v = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand v");
+        q.realize().expect("realize q");
+        k.realize().expect("realize k");
+        v.realize().expect("realize v");
+        let (qf, kf, vf) = (as_f32_vec(&q), as_f32_vec(&k), as_f32_vec(&v));
+        let mut expected = vec![0f32; bh * n * d];
+        for s in 0..bh {
+            let z = s * n * d;
+            let o_s = fa_ref(&qf[z..z + n * d], &kf[z..z + n * d], &vf[z..z + n * d], n, d);
+            expected[z..z + n * d].copy_from_slice(&o_s);
+        }
+        let atol = 1e-2;
+        let prog = crate::kernels_fa::flash_attention_fwd_32(bh, n, d);
+        let out = Tensor::empty(&[bh * n, d], DType::Float32);
+        let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA-32 program");
+        let plan = y.prepare().expect("prepare FA-32");
+        plan.execute().expect("execute FA-32");
+        let got = y.as_vec::<f32>().expect("read FA-32 output");
+        let report = allclose_f32(&got, &expected, atol, 2e-2);
+        println!("FA-32 bh={bh} n={n} d={d}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+        assert!(report.ok, "FA-32 bh={bh} n={n} d={d} must match the f32 reference: {}", report.message);
+    }
+}
+
 /// **FA-forward `d=16` launch smoke test** on gfx942 — the multi-warp FA at a single head-dim fragment,
 /// where the VEC4-aligned fill forces `kv_blk = 128` (8 KV-fragments, the degenerate `kvf` stress).
 /// Complements the full `flash_attention_matches_reference_on_gfx942` gate (numerics at d=64/128): this
