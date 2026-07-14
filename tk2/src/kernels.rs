@@ -10,12 +10,13 @@
 //!   run unbroken. The hand-inline reference at the same ceiling is [`crate::hk`] (`hk/gemm.rs`, 638 TF),
 //!   which rides the typed [`crate::schedule::pipeline`] driver with the same asm emission.
 
-use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Val};
+use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId, TileIr};
-use crate::movement::{Drain, LdsStage, LdsView, SharedTile};
 use crate::pass::Pass;
 use crate::pipeline::{AccSlot, BlockCounter, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
+use crate::tile::{ARow, BCol};
+use crate::tile_move::{commit, commit_asm, gather, prefetch};
 
 /// A finished tile-IR program: the arena, its sink root, and the kernel name.
 pub struct Program {
@@ -295,13 +296,38 @@ struct FillRegs {
 type MatmulOp = (Vec<Val<BF16>>, Vec<Val<BF16>>);
 
 struct MatmulHooks {
-    a_view: LdsView<BF16>,
-    b_view: LdsView<BF16>,
-    a_stage: LdsStage<BF16>,
-    b_stage: LdsStage<BF16>,
+    /// The shared A/B LDS tiles and their global sources — the raw handles the `tile_move`
+    /// prefetch/commit/gather forwards address. They REPLACE the pre-built `LdsView`/`LdsStage` (which
+    /// the forwards now rebuild internally from these + the params below — `SharedTile`/`gather_view`/
+    /// `stage_view`/`slice` emit no IR, so the emission is byte-identical).
+    a_smem: Lds<BF16>,
+    b_smem: Lds<BF16>,
+    a_src: Buf<BF16>,
+    b_src: Buf<BF16>,
+    /// `k_step` = the LDS tile inner width (`lds_cols`, the flat-layout row stride); `grow` = the global
+    /// row stride `K` (the fill's `grow_stride`, shared by A[M,K] and B[N,K] — both K-contiguous).
+    k_step: usize,
+    grow: i64,
+    /// The collaborative fill addressing (prefetch/commit): `tid` = fill thread id, `origin_a`/`origin_b`
+    /// = the workgroup A-row / B-col origin, `epl_a`/`epl_b` = elements per lane per tile.
+    tid: Idx,
+    origin_a: Idx,
+    origin_b: Idx,
+    epl_a: usize,
+    epl_b: usize,
+    /// The gather addressing: `wlane` = the intra-warp lane, `bm`/`bn` = the per-warp sub-tile extents
+    /// (the gather `tile_rows`/`tile_cols`; A is `(bm, EDGE)` → `ri` fragments, B is `(EDGE, bn)` → `cj`),
+    /// `warp_row_off`/`warp_col_off` = the multi-warp wave's runtime offset into the shared tile.
+    wlane: Idx,
+    bm: usize,
+    bn: usize,
+    warp_row_off: Option<Idx>,
+    warp_col_off: Option<Idx>,
+    /// The gather's arch dispatch (gfx942 `ds_read_b64` vs the scalar intrinsic).
+    asm_gather: bool,
     /// Phase C: HK's waitcnt-opaque `asm ds_write_b64` commit + an EXPOSED manual drain. When set, the
-    /// stages (built with `Drain::Asm`) emit asm writes chained A→B into ONE prev chain, and `commit`
-    /// appends ONE `s_waitcnt lgkmcnt(0)` on the last write (the RAW barrier can't auto-drain the asm).
+    /// commit emits asm writes chained A→B into ONE prev chain (via `tile_move::commit_asm`'s `prev0`),
+    /// and the pipeline owns the drain (the RAW barrier can't auto-drain the asm).
     asm_commit: bool,
 }
 
@@ -326,11 +352,33 @@ impl Hooks for MatmulHooks {
         let mut reg = prev.unwrap_or(FillRegs { a: Vec::new(), b: Vec::new() });
         let loaded = match tile {
             0 => {
-                reg.a = self.a_stage.prefetch(b, k_base, order);
+                reg.a = prefetch(
+                    b,
+                    self.a_smem,
+                    self.k_step,
+                    self.a_src,
+                    self.grow,
+                    self.epl_a,
+                    self.tid,
+                    self.origin_a,
+                    k_base,
+                    order,
+                );
                 &reg.a
             }
             1 => {
-                reg.b = self.b_stage.prefetch(b, k_base, order);
+                reg.b = prefetch(
+                    b,
+                    self.b_smem,
+                    self.k_step,
+                    self.b_src,
+                    self.grow,
+                    self.epl_b,
+                    self.tid,
+                    self.origin_b,
+                    k_base,
+                    order,
+                );
                 &reg.b
             }
             _ => panic!("matmul prefetch: tile ∈ {{0=A, 1=B}}, got {tile}"),
@@ -347,13 +395,59 @@ impl Hooks for MatmulHooks {
             // single drain reaches BOTH. Return the WRITE effects (last = `fill.last()`) — the pipeline
             // combinator owns the drain now (`CommitDrain`: exposed at C6, or deferred to C7's tail), since
             // the RAW barrier can't auto-drain the waitcnt-opaque asm and WHERE it drains is the schedule.
-            let fa = self.a_stage.commit_asm(b, &reg.a, war, None);
+            let fa = commit_asm(
+                b,
+                self.a_smem,
+                self.k_step,
+                self.a_src,
+                self.grow,
+                self.epl_a,
+                self.tid,
+                self.origin_a,
+                &reg.a,
+                war,
+                None,
+            );
             let a_last = fa.last().map(|e| e.dep());
-            let fb = self.b_stage.commit_asm(b, &reg.b, war, a_last);
+            let fb = commit_asm(
+                b,
+                self.b_smem,
+                self.k_step,
+                self.b_src,
+                self.grow,
+                self.epl_b,
+                self.tid,
+                self.origin_b,
+                &reg.b,
+                war,
+                a_last,
+            );
             fa.into_iter().chain(fb).collect()
         } else {
-            let fa = self.a_stage.commit(b, &reg.a, war);
-            let fb = self.b_stage.commit(b, &reg.b, war);
+            let fa = commit(
+                b,
+                self.a_smem,
+                self.k_step,
+                self.a_src,
+                self.grow,
+                self.epl_a,
+                self.tid,
+                self.origin_a,
+                &reg.a,
+                war,
+            );
+            let fb = commit(
+                b,
+                self.b_smem,
+                self.k_step,
+                self.b_src,
+                self.grow,
+                self.epl_b,
+                self.tid,
+                self.origin_b,
+                &reg.b,
+                war,
+            );
             fa.into_iter().chain(fb).collect()
         }
     }
@@ -365,11 +459,35 @@ impl Hooks for MatmulHooks {
         _block: BlockCounter,
         raw: &[TileId],
     ) -> (Self::Op, Vec<TileId>, TileId) {
-        // One gather per operand VIEW at K-slice `slice` — the view's `asm` field dispatches the
-        // `ds_read_b64` asm gather vs the scalar fallback. No addressing params: they ride the view.
+        // One gather per operand at K-slice `slice`, via `tile_move::gather`: the `asm_gather` flag
+        // dispatches the `ds_read_b64` asm gather vs the scalar fallback, and (asm ⇒ straight) routes B's
+        // Col map through the STRAIGHT contiguous gather, not the FA register-transpose. A = ARow over
+        // `(bm, EDGE)` → `ri` frags; B = BCol over `(EDGE, bn)` → `cj` frags — `n_frags` derived by role.
         let mut gathers: Vec<TileId> = Vec::new();
-        let (a_vecs, ga) = self.a_view.slice(slice).gather(b, raw);
-        let (b_vecs, gb) = self.b_view.slice(slice).gather(b, raw);
+        let (a_vecs, ga) = gather::<BF16, ARow, Mfma16x16x16Bf16>(
+            b,
+            self.a_smem,
+            self.k_step,
+            self.bm,
+            EDGE,
+            self.warp_row_off,
+            self.wlane,
+            raw,
+            slice,
+            self.asm_gather,
+        );
+        let (b_vecs, gb) = gather::<BF16, BCol, Mfma16x16x16Bf16>(
+            b,
+            self.b_smem,
+            self.k_step,
+            EDGE,
+            self.bn,
+            self.warp_col_off,
+            self.wlane,
+            raw,
+            slice,
+            self.asm_gather,
+        );
         gathers.extend(ga);
         gathers.extend(gb);
         // op_anchor = an operand VALUE (the first A fragment) for `set_prio` to anchor on.
@@ -481,7 +599,6 @@ fn kblock_impl(
     // so LLVM can't fracture it. Only meaningful for the clustered per-cluster schedule.
     let pin_mfma = pin_mfma && clustered;
     let asm_commit = commit_drain != CommitDrain::IntrinsicAuto;
-    let stage_drain = if asm_commit { Drain::Asm } else { Drain::Intrinsic };
     // Workgroup output tile = (bm·wm) × (bn·wn), computed by a wm×wn grid of 64-lane warps.
     let (big_m, big_n, nthreads) = (bm * wm, bn * wn, wm * wn * WARP);
     assert!(m.is_multiple_of(big_m) && n.is_multiple_of(big_n), "m/n must tile by (bm·wm)/(bn·wn)");
@@ -526,11 +643,9 @@ fn kblock_impl(
         (wlane, Some(row_off), Some(col_off), Some(warp_row))
     };
 
-    // Operand + accumulator lane maps and the accumulator width, DERIVED from the shape marker (§Step 1):
-    // A = Row map, B = Col map, C = the accumulator carrier. For 16×16×16 these equal the former
-    // `FragMap::gfx942_16x16(false/true)` / `ept = 4` byte-for-byte.
-    let a_map = Mfma16x16x16Bf16::a_map();
-    let b_map = Mfma16x16x16Bf16::b_map();
+    // The accumulator lane map + width, DERIVED from the shape marker (§Step 1). The A/B operand maps
+    // (A = Row, B = Col) are now derived inside `tile_move::gather` from the `ARow`/`BCol` roles — the
+    // hooks name the role, not the `FragMap`. For 16×16×16 `c_map` equals `FragMap::gfx942_16x16(true)`.
     let c_map = Mfma16x16x16Bf16::c_map();
     let ept = Mfma16x16x16Bf16::EPT_C;
     let (ri, cj) = (bm / EDGE, bn / EDGE); // per-warp accumulator grid
@@ -547,21 +662,12 @@ fn kblock_impl(
     let tm_bm = b.idx_mul(tile_m, big_m_c); // workgroup A row origin: tile_m·big_m
     let tn_bn = b.idx_mul(tile_n, big_n_c); // workgroup B col origin: tile_n·big_n
 
-    // The read + write movement handles, minted from ONE `SharedTile` per operand so the fill and the
-    // gather share the tile's `cols`/swizzle and cannot desync. `gather_view` → `LdsView` (HK's
-    // `load(rt,st)`); `stage_view` → `LdsStage` (the collaborative global→LDS fill, `load(st,gl)`) —
-    // the tile origin/warp-offset/K-run/map/residency ride as DATA on the handles, so the gather AND
-    // commit call sites name NO addressing params. `asm_gather` is the gather's arch dispatch (gfx942
-    // `ds_read_b64` vs the scalar intrinsic). The SAME handles serve the whole-block and clustered
-    // paths (and FA's K/V gather + stage, by how they are constructed).
-    let a_tile = SharedTile::new(a_smem, k_step);
-    let b_tile = SharedTile::new(b_smem, k_step);
-    let a_view = a_tile.gather_view(a_map, ri, warp_row_off, wlane, asm_gather);
-    let b_view = b_tile.gather_view(b_map, cj, warp_col_off, wlane, asm_gather);
-    // A[M,K] and B[N,K] are BOTH K-contiguous → the identical trivial coalesced fill: `origin` = the
-    // M/N row base, `grow_stride` = K. No transpose, no `v_perm` — B's fill IS A's fill.
-    let a_stage = a_tile.stage_view(a, epl_a, tid, tm_bm, k as i64, stage_drain);
-    let b_stage = b_tile.stage_view(bmat, epl_b, tid, tn_bn, k as i64, stage_drain);
+    // The movement RAW ingredients ride as DATA on `MatmulHooks` (below); the `tile_move` prefetch/
+    // commit/gather forwards rebuild the per-op `SharedTile`/`gather_view`/`stage_view`/`slice` handles
+    // internally (those emit NO IR, so the emission is byte-identical) and name NO addressing at the call
+    // site. `asm_gather` is the gather's arch dispatch (gfx942 `ds_read_b64` vs scalar); A[M,K] and B[N,K]
+    // are BOTH K-contiguous, so the fill is the identical coalesced copy (`origin` = M/N base, `grow` = K,
+    // no transpose, no `v_perm`).
 
     // ── accumulators: one 16×16 f32 fragment per (i,j), zero-initialised. ALL carried, and every
     //    compute cluster reads+writes the full set — GEMM is the UNIFORM special case of the §3.2
@@ -578,7 +684,26 @@ fn kblock_impl(
         // at C1/C3/C5/C7). The pipeline combinator owns ALL placement (per-cluster barrier + set_prio
         // brackets, warp-phase ping-pong, End-fold, resident fork) and runs the completeness verifier
         // at `.build()`; the author declares only the schedule + the `MatmulHooks` (§5c cluster model).
-        let hooks = MatmulHooks { a_view, b_view, a_stage, b_stage, asm_commit };
+        let hooks = MatmulHooks {
+            a_smem,
+            b_smem,
+            a_src: a,
+            b_src: bmat,
+            k_step,
+            grow: k as i64,
+            tid,
+            origin_a: tm_bm,
+            origin_b: tn_bn,
+            epl_a,
+            epl_b,
+            wlane,
+            bm,
+            bn,
+            warp_row_off,
+            warp_col_off,
+            asm_gather,
+            asm_commit,
+        };
         // The compute clusters carry the kernel math (the `ri×cj` MFMA loop) as an edge-free `body` —
         // the combinator brackets it with `set_prio` + the acc round-trip. This is what makes the
         // compute side pluggable: FA's softmax/PV clusters carry their own body, `Hooks` never grows a

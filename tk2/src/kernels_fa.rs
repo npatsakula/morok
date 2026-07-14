@@ -148,6 +148,7 @@ impl Hooks for FaHooks {
                         self.wlane,
                         raw,
                         s,
+                        false,
                     ); // kvf kv-fragments for d-slice s
                     vecs.extend(v);
                     g.extend(gg);
@@ -169,6 +170,7 @@ impl Hooks for FaHooks {
                         self.wlane,
                         raw,
                         kf,
+                        false,
                     );
                     vecs.extend(v);
                     g.extend(gg);
@@ -287,8 +289,10 @@ pub fn atb_probe(kv: usize, d: usize, q: usize) -> Program {
 
     // ── transposed gather via the (Reg←Lds) op: the BCol operand role derives the transposed read,
     //    landing kv (contraction) on the spread lane-axis and d/q (output) on flat, stacked as frags. ──
-    let (v_frags, _) = gather::<BF16, BCol, Mfma16x16x16Bf16>(&mut b, v_smem, d, EDGE, d, None, lane, &[bar.dep()], 0);
-    let (p_frags, _) = gather::<BF16, BCol, Mfma16x16x16Bf16>(&mut b, p_smem, q, EDGE, q, None, lane, &[bar.dep()], 0);
+    let (v_frags, _) =
+        gather::<BF16, BCol, Mfma16x16x16Bf16>(&mut b, v_smem, d, EDGE, d, None, lane, &[bar.dep()], 0, false);
+    let (p_frags, _) =
+        gather::<BF16, BCol, Mfma16x16x16Bf16>(&mut b, p_smem, q, EDGE, q, None, lane, &[bar.dep()], 0, false);
 
     // ── O[d,q] = Σ_kv V·P: one MFMA per (d-frag, q-frag) output tile (single kv contraction). ──
     let zero_c = {

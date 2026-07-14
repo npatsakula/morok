@@ -48,8 +48,10 @@ impl DirectFill for Plain {}
 /// of the tile type, not a threaded flag. `n_frags` is `L::n_frags(tile_rows, tile_cols)`; the map and
 /// `ept` come from `L`+`S`; `lds_cols` is the LDS tile's inner width. `slice` selects the K-run (inner
 /// base `slice·EDGE`, via [`LdsView::slice`](crate::movement)) — `0` reads the tile's leading run (a
-/// whole-tile probe), `s`/`kf` streams a multi-slice operand (FA's K d-slice / V kv-slice). The
-/// compiler-visible (`asm = false`) path — the intrinsic gather a barrier's `lgkmcnt` auto-drains.
+/// whole-tile probe), `s`/`kf` streams a multi-slice operand (FA's K d-slice / V kv-slice). `asm` is the
+/// arch dispatch threaded onto the view: gfx942's waitcnt-opaque `ds_read_b64` gather vs the
+/// compiler-visible intrinsic (a barrier's `lgkmcnt` auto-drains) — and it also gates the straight-vs-
+/// transposed choice below (asm implies the straight contiguous gather, per the note there).
 /// Returns one operand `Val` per fragment AND the store-fence tokens (the WAR barrier consumes them at
 /// the pipeline commit; a whole-tile probe drops them).
 #[allow(clippy::too_many_arguments)]
@@ -63,11 +65,16 @@ pub fn gather<E: Elem, L: RegLayout, S: MfmaShape>(
     lane: Idx,
     deps: &[TileId],
     slice: usize,
+    asm: bool,
 ) -> (Vec<Val<E>>, Vec<TileId>) {
     let map = L::frag::<S>().expect("gather: Src must fill an operand tile (ARow/BCol), not an accumulator");
     let n_frags = L::n_frags::<S>(tile_rows, tile_cols);
-    let view = SharedTile::new(src, lds_cols).gather_view(map, n_frags, warp_off, lane, false).slice(slice);
-    if map.transpose { view.gather_transposed(b, deps) } else { view.gather(b, deps) }
+    let view = SharedTile::new(src, lds_cols).gather_view(map, n_frags, warp_off, lane, asm).slice(slice);
+    // The strided register-transpose gather (FA's V) is taken ONLY for a transposed map on the
+    // compiler-visible path; the asm `ds_read_b64` reads a CONTIGUOUS run, so it serves the STRAIGHT
+    // gather even for a transposed map (matmul's `Bᵀ`: a Col map that is K-contiguous in LDS —
+    // `gather_asm` swaps the lane axes and reads it straight).
+    if map.transpose && !asm { view.gather_transposed(b, deps) } else { view.gather(b, deps) }
 }
 
 /// **`(Reg ← Global)` — the register-staged prefetch.** Issues the coalesced global loads for the
@@ -114,6 +121,33 @@ pub fn commit<E: Elem>(
     SharedTile::new(dst, lds_cols)
         .stage_view(src, epl, lane, origin, grow_stride, Drain::Intrinsic)
         .commit(b, chunks, war)
+}
+
+/// **`(Lds ← Reg)` — the waitcnt-opaque asm commit** (§5c). The [`Drain::Asm`] twin of [`commit`]: each
+/// prefetched chunk is written with an `asm ds_write_b64` the RAW barrier can NOT auto-drain (HK's
+/// waitcnt-opaque write — the drain PLACEMENT is the schedule, owned by the pipeline's `CommitDrain`, so
+/// this op emits none). The `sideeffect` writes chain in program order via `prev0`: the clustered commit
+/// threads A's last write into B's `prev0` so ONE later drain reaches BOTH (the A→B prev-chain). Same
+/// `src`/`origin`/`grow_stride`/`epl`/`lane` stage as [`prefetch`]/[`commit`] (they select no bytes on
+/// the write side — the commit reads only `dst`/`lds_cols`/`epl`/`lane`). Forwards to
+/// [`LdsStage::commit_asm`](crate::movement).
+#[allow(clippy::too_many_arguments)]
+pub fn commit_asm<E: Elem>(
+    b: &mut Builder,
+    dst: Lds<E>,
+    lds_cols: usize,
+    src: Buf<E>,
+    grow_stride: i64,
+    epl: usize,
+    lane: Idx,
+    origin: Idx,
+    chunks: &[Val<E>],
+    war: &[TileId],
+    prev0: Option<TileId>,
+) -> Vec<Effect> {
+    SharedTile::new(dst, lds_cols)
+        .stage_view(src, epl, lane, origin, grow_stride, Drain::Asm)
+        .commit_asm(b, chunks, war, prev0)
 }
 
 /// **`(Lds ← Global)` — the direct-to-LDS fill (register diet).** One `raw.ptr.buffer.load.lds` DMA
