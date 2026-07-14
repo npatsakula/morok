@@ -25,9 +25,9 @@
 //! Device-gated by `flash_attention_matches_reference_on_gfx942` (allclose vs an f32 reference at
 //! d=64 and d=128). Single-buffer; softmax-under-MFMA interleave + swizzle are later Phase-B items.
 
-use crate::build::{BF16, Builder, Effect, F32, Frag, Idx, Val};
+use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Val};
 use crate::ir::{FragMap, TileId};
-use crate::kernels::{EDGE, Program};
+use crate::kernels::{EDGE, Program, offset_by};
 use crate::movement::{Drain, LdsStage, LdsView, SharedTile};
 use crate::pipeline::{AccSlot, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
 
@@ -209,6 +209,39 @@ pub fn atb_probe(kv: usize, d: usize, q: usize) -> Program {
     Program { ir, sink, name: "tk2_atb_probe".into() }
 }
 
+/// Load this warp's QKᵀ B-operand Q fragment for d-slice `s` straight from GLOBAL into registers
+/// (Probe B — no LDS staging). Reproduces exactly the col-map fragment the LDS gather produced, but
+/// sourced from global Q at `[q_row_base + flat, s·16 + spread]` (row-major, stride `d`): each warp's
+/// 16 Q rows are warp-PRIVATE (disjoint across the 8 warps), so LDS-staging Q bought NO cross-warp
+/// sharing — only a 32KB (d=128) LDS tile that capped occupancy at 1 wg/CU. The fragment is
+/// loop-invariant (the QKᵀ B operand), so it is hoisted once and lives in VGPRs for the whole KV stream.
+fn load_q_frag_global(
+    b: &mut Builder,
+    q: Buf<BF16>,
+    map: FragMap,
+    q_row_base: Idx,
+    d: usize,
+    s: usize,
+    lane: Idx,
+) -> Val<BF16> {
+    let frag = b.define_frag::<BF16>(map);
+    let d_c = b.idx_const(d as i64);
+    // Col map ⇒ `lane_rc` yields (spread = contraction d-row, flat = Q-row within the 16-row sub-block).
+    let stores: Vec<TileId> = (0..map.ept)
+        .map(|e| {
+            let e_idx = b.idx_const(e as i64);
+            let (spread, flat) = b.lane_rc(map, lane, e_idx);
+            let row = b.idx_add(q_row_base, flat); // global Q row = this warp's origin + flat
+            let col = offset_by(b, spread, s * EDGE); // global d column = spread + s·16
+            let off = b.idx_mul(row, d_c);
+            let off = b.idx_add(off, col);
+            let v = b.load(q, off);
+            b.store_frag_elem(frag, e_idx, v).dep()
+        })
+        .collect();
+    b.load_frag_vec_after(frag, &stores)
+}
+
 /// **Streaming FA-forward** (non-causal, 8-warp split-Q, head-dim `d` a multiple of 16) authored on the
 /// [`crate::pipeline`] ClusterCx combinator. `bh = batch·heads` independent attentions over Q/K/V/O
 /// laid out `[bh, n, d]` row-major; `n` = sequence length. Grid = `bh × (n/q_blk)` workgroups, each
@@ -275,48 +308,40 @@ pub fn flash_attention_fwd(bh: usize, n: usize, d: usize) -> Program {
     let wlane = b.idx_mod(tid, warp_c); // wave-local lane (the ds_bpermute reduce stays per-warp)
     let warp_qoff = b.idx_mul(warp, edge_c); // this warp's Q-row offset into the [q_blk, d] tile
 
-    // ── LDS tiles: K/V shared [kv_blk, d]; Q the whole [q_blk, d] workgroup block. ──
+    // ── LDS tiles: K/V shared [kv_blk, d]. Q is NOT staged through LDS (Probe B): each warp's 16 Q
+    //    rows are warp-PRIVATE, so LDS-staging Q amortised nothing — it only wasted a 32KB (d=128) tile
+    //    that capped occupancy at 1 wg/CU. Q is loaded global→VGPR directly in the prologue below. ──
     let k_smem = b.define_local::<BF16>(kv_blk * d);
     let v_smem = b.define_local::<BF16>(kv_blk * d);
-    let q_smem = b.define_local::<BF16>(q_blk * d);
 
     let row_map = FragMap::gfx942_16x16(false); // A operand (contraction on the spread lane-axis)
     let col_map = FragMap::gfx942_16x16(true); // B / C / accumulator operands
 
-    // Movement handles. K (QKᵀ's A, row map): `n_frags = kvf` (the KV-block rows) × d-slices. Q (QKᵀ's
-    // B, col map): this warp's single 16-row sub-block via `warp_off = warp_qoff`. V (PV's A, col map):
-    // transposed gather (`kv` on spread), `dfrags` output frags per kv-slice. K/V shared (no warp off).
+    // Movement handles. K (QKᵀ's A, row map): `n_frags = kvf` (the KV-block rows) × d-slices. V (PV's A,
+    // col map): transposed gather (`kv` on spread), `dfrags` output frags per kv-slice. K/V shared (no
+    // warp off). Q has no LDS view — it is register-resident (loaded straight from global below).
     let k_tile = SharedTile::new(k_smem, d);
     let v_tile = SharedTile::new(v_smem, d);
-    let q_tile = SharedTile::new(q_smem, d);
     let k_view = k_tile.gather_view(row_map, kvf, None, wlane, false);
     let v_view = v_tile.gather_view(col_map, dfrags, None, wlane, false);
-    let q_view = q_tile.gather_view(col_map, 1, Some(warp_qoff), wlane, false);
 
-    let (epl_kv, epl_q) = (kv_blk * d / nthreads, q_blk * d / nthreads); // 512-thread collaborative fill
-    let zero = b.idx_const(0);
+    let epl_kv = kv_blk * d / nthreads; // 512-thread collaborative fill
     // K/V stream: staged by ALL 512 threads (`tid`); origin = this (b,h)'s row base `bh_row`, the
     // per-block advance rides `k_base` (so block k reads rows `[bh_idx·n + k·kv_blk, ...]`).
     let k_stage = k_tile.stage_view(k, epl_kv, tid, bh_row, d as i64, Drain::Intrinsic);
     let v_stage = v_tile.stage_view(v, epl_kv, tid, bh_row, d as i64, Drain::Intrinsic);
-    // Q: the whole [q_blk, d] block staged ONCE by all 512 threads from Q[bh_idx·n + qwg·q_blk .., :].
+    // Q-row origin: the whole [q_blk, d] block base for this workgroup; each warp owns rows
+    // [warp_qoff, warp_qoff+16) within it.
     let qblk_c = b.idx_const(q_blk as i64);
     let q_off = b.idx_mul(qwg, qblk_c);
     let q_origin = b.idx_add(bh_row, q_off); // global Q-row origin = bh_idx·n + qwg·q_blk (in rows)
-    let q_stage = q_tile.stage_view(q, epl_q, tid, q_origin, d as i64, Drain::Intrinsic);
 
-    // ── prologue: stage + commit Q once, then EACH warp gathers its own 16-row sub-block's `dfrags`
-    //    d-slices (loop-invariant QKᵀ B; `warp_qoff` in the view selects this warp's Q rows). ──
-    let q_loaded = q_stage.prefetch(&mut b, zero, &[]);
-    let q_fill = q_stage.commit(&mut b, &q_loaded, &[]);
-    let q_fill_deps: Vec<TileId> = q_fill[1..].iter().map(|e| e.dep()).collect();
-    let q_bar = b.barrier(q_fill[0], &q_fill_deps);
-    let q_frags: Vec<Val<BF16>> = (0..dfrags)
-        .map(|s| {
-            let (qv, _g) = q_view.slice(s).gather(&mut b, &[q_bar.dep()]);
-            qv[0]
-        })
-        .collect();
+    // ── prologue: EACH warp loads its own 16 Q rows (its `dfrags` d-slices) global→VGPR directly
+    //    (Probe B — NO LDS staging, NO barrier). `q_row_base` = this warp's global Q-row origin; the
+    //    QKᵀ B-operand fragment (col map) is loop-invariant, so it is hoisted once into VGPRs. ──
+    let q_row_base = b.idx_add(q_origin, warp_qoff);
+    let q_frags: Vec<Val<BF16>> =
+        (0..dfrags).map(|s| load_q_frag_global(&mut b, q, col_map, q_row_base, d, s, wlane)).collect();
 
     // ── the heterogeneous slot set (DESIGN §3.2). CARRIED (seeded, loop-carried): `o_0..o_{dfrags-1}`
     //    (f32), `m` (running max), `l` (running norm). TEMPORARIES (no seed, produced+consumed within
@@ -462,7 +487,7 @@ pub fn flash_attention_fwd(bh: usize, n: usize, d: usize) -> Program {
     let norm_vec = b.load_frag_vec(acc_final[slot_l].f32());
     let recip_norm = b.recip(norm_vec);
     let d_c = b.idx_const(d as i64);
-    let q_row_base = b.idx_add(q_origin, warp_qoff); // this warp's global Q-row origin
+    // `q_row_base` (this warp's global Q-row origin) was computed in the prologue (Probe B).
     let mut roots = Vec::new();
     for df in 0..dfrags {
         let o_vec = b.load_frag_vec(acc_final[df].f32());
