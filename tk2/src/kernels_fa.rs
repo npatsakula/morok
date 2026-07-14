@@ -28,10 +28,9 @@
 use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId};
 use crate::kernels::{EDGE, Program, offset_by};
-use crate::movement::{Drain, LdsStage, LdsView, SharedTile};
 use crate::pipeline::{AccSlot, BlockCounter, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
-use crate::tile::BCol;
+use crate::tile::{ARow, BCol};
 use crate::tile_move::{commit, gather, prefetch};
 
 const WARP: usize = 64;
@@ -57,10 +56,23 @@ struct FaFill {
 /// (K, V) as in matmul (A, B), but the two tiles are the two *operands of two different matmuls*
 /// (K feeds QKᵀ, V feeds PV) rather than the A/B of one — the first shape strain (see report).
 struct FaHooks {
-    k_view: LdsView<BF16>,
-    v_view: LdsView<BF16>,
-    k_stage: LdsStage<BF16>,
-    v_stage: LdsStage<BF16>,
+    /// The shared K/V LDS tiles `[kv_blk, d]` and their global sources — the raw handles the
+    /// `tile_move` prefetch/commit/gather forwards address. They REPLACE the pre-built `LdsView`/
+    /// `LdsStage` (which the forwards now rebuild internally from these + the params below — the
+    /// `SharedTile`/`gather_view`/`slice` builders emit no IR, so the emission is byte-identical).
+    k_smem: Lds<BF16>,
+    v_smem: Lds<BF16>,
+    k: Buf<BF16>,
+    v: Buf<BF16>,
+    /// The collaborative 512-thread fill addressing (prefetch/commit): `tid` = fill thread id,
+    /// `bh_row` = this (b,h)'s row origin, `epl_kv` = elements per lane. `d` = the LDS tile inner width
+    /// / global row stride (and V's transposed-gather `tile_cols`); K's gather `tile_rows` is `kvf·16`.
+    tid: Idx,
+    bh_row: Idx,
+    epl_kv: usize,
+    /// The per-warp gather lane (the gather/`ds_bpermute` stays within each 64-lane warp).
+    wlane: Idx,
+    d: usize,
     /// `d / 16` — the head-dim fragment count. QKᵀ contracts over `d` as this many `mma` K-steps
     /// (K row-map slices); PV's `V` is gathered as this many transposed output-`d` fragments.
     dfrags: usize,
@@ -85,13 +97,14 @@ impl Hooks for FaHooks {
         order: &[TileId],
     ) -> (FaFill, Vec<TileId>) {
         let mut reg = prev.unwrap_or(FaFill { k: Vec::new(), v: Vec::new() });
+        let (d, s) = (self.d, self.d as i64);
         let loaded = match tile {
             0 => {
-                reg.k = self.k_stage.prefetch(b, k_base, order);
+                reg.k = prefetch(b, self.k_smem, d, self.k, s, self.epl_kv, self.tid, self.bh_row, k_base, order);
                 &reg.k
             }
             1 => {
-                reg.v = self.v_stage.prefetch(b, k_base, order);
+                reg.v = prefetch(b, self.v_smem, d, self.v, s, self.epl_kv, self.tid, self.bh_row, k_base, order);
                 &reg.v
             }
             _ => panic!("FA prefetch: tile ∈ {{0=K, 1=V}}, got {tile}"),
@@ -101,10 +114,11 @@ impl Hooks for FaHooks {
     }
 
     fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &FaFill, war: &[TileId]) -> Vec<Effect> {
-        // Intrinsic commit (an `s_barrier` auto-drains the `ds_write` `lgkmcnt(0)`) — the simplest
-        // policy; the asm/deferred-drain machinery is a matmul-perf concern, orthogonal to FA's shape.
-        let fk = self.k_stage.commit(b, &reg.k, war);
-        let fv = self.v_stage.commit(b, &reg.v, war);
+        // Intrinsic commit (an `s_barrier` auto-drains the `ds_write` `lgkmcnt(0)`) — `tile_move::commit`
+        // pins `Drain::Intrinsic`; the asm/deferred-drain machinery is a matmul-perf concern, orthogonal.
+        let (d, s) = (self.d, self.d as i64);
+        let fk = commit(b, self.k_smem, d, self.k, s, self.epl_kv, self.tid, self.bh_row, &reg.k, war);
+        let fv = commit(b, self.v_smem, d, self.v, s, self.epl_kv, self.tid, self.bh_row, &reg.v, war);
         fk.into_iter().chain(fv).collect()
     }
 
@@ -122,8 +136,19 @@ impl Hooks for FaHooks {
             // lane-axis; `slice(s)` selects d-columns `[s·16, s·16+16)`, the view's `n_frags = kvf`
             // stacking the KV-block rows). Indexed `[s·kvf + kf]`; QKᵀ = Σ_s mma(K[s,kf], Q_s) per `kf`.
             0 => {
+                // `ARow` derives the row map + straight gather; `tile_rows = kvf·16` gives `n_frags = kvf`.
                 for s in 0..self.dfrags {
-                    let (v, gg) = self.k_view.slice(s).gather(b, raw); // kvf kv-fragments for d-slice s
+                    let (v, gg) = gather::<BF16, ARow, Mfma16x16x16Bf16>(
+                        b,
+                        self.k_smem,
+                        self.d,
+                        self.kvf * EDGE,
+                        EDGE,
+                        None,
+                        self.wlane,
+                        raw,
+                        s,
+                    ); // kvf kv-fragments for d-slice s
                     vecs.extend(v);
                     g.extend(gg);
                 }
@@ -132,8 +157,19 @@ impl Hooks for FaHooks {
             // lane-axis — the `mma_atb` orientation). `slice(kf)` sets the kv-row base `kf·16`, then a
             // transposed gather yields the `dfrags` output-d fragments. Indexed `[kf·dfrags + df]`.
             1 => {
+                // `BCol` derives the col map + transposed gather; `tile_cols = d` gives `n_frags = dfrags`.
                 for kf in 0..self.kvf {
-                    let (v, gg) = self.v_view.slice(kf).gather_transposed(b, raw);
+                    let (v, gg) = gather::<BF16, BCol, Mfma16x16x16Bf16>(
+                        b,
+                        self.v_smem,
+                        self.d,
+                        EDGE,
+                        self.d,
+                        None,
+                        self.wlane,
+                        raw,
+                        kf,
+                    );
                     vecs.extend(v);
                     g.extend(gg);
                 }
@@ -251,8 +287,8 @@ pub fn atb_probe(kv: usize, d: usize, q: usize) -> Program {
 
     // ── transposed gather via the (Reg←Lds) op: the BCol operand role derives the transposed read,
     //    landing kv (contraction) on the spread lane-axis and d/q (output) on flat, stacked as frags. ──
-    let v_frags = gather::<BF16, BCol, Mfma16x16x16Bf16>(&mut b, v_smem, d, EDGE, d, None, lane, &[bar.dep()]);
-    let p_frags = gather::<BF16, BCol, Mfma16x16x16Bf16>(&mut b, p_smem, q, EDGE, q, None, lane, &[bar.dep()]);
+    let (v_frags, _) = gather::<BF16, BCol, Mfma16x16x16Bf16>(&mut b, v_smem, d, EDGE, d, None, lane, &[bar.dep()], 0);
+    let (p_frags, _) = gather::<BF16, BCol, Mfma16x16x16Bf16>(&mut b, p_smem, q, EDGE, q, None, lane, &[bar.dep()], 0);
 
     // ── O[d,q] = Σ_kv V·P: one MFMA per (d-frag, q-frag) output tile (single kv contraction). ──
     let zero_c = {
@@ -539,22 +575,16 @@ pub fn flash_attention_fwd(bh: usize, n: usize, d: usize) -> Program {
     let k_smem = b.define_local::<BF16>(kv_blk * d);
     let v_smem = b.define_local::<BF16>(kv_blk * d);
 
-    let row_map = Mfma16x16x16Bf16::a_map(); // A operand (contraction on the spread lane-axis)
     let col_map = Mfma16x16x16Bf16::c_map(); // B / C / accumulator operands (the Col map)
 
-    // Movement handles. K (QKᵀ's A, row map): `n_frags = kvf` (the KV-block rows) × d-slices. V (PV's A,
-    // col map): transposed gather (`kv` on spread), `dfrags` output frags per kv-slice. K/V shared (no
-    // warp off). Q has no LDS view — it is register-resident (loaded straight from global below).
-    let k_tile = SharedTile::new(k_smem, d);
-    let v_tile = SharedTile::new(v_smem, d);
-    let k_view = k_tile.gather_view(row_map, kvf, None, wlane, false);
-    let v_view = v_tile.gather_view(col_map, dfrags, None, wlane, false);
-
     let epl_kv = kv_blk * d / nthreads; // 512-thread collaborative fill
-    // K/V stream: staged by ALL 512 threads (`tid`); origin = this (b,h)'s row base `bh_row`, the
-    // per-block advance rides `k_base` (so block k reads rows `[bh_idx·n + k·kv_blk, ...]`).
-    let k_stage = k_tile.stage_view(k, epl_kv, tid, bh_row, d as i64, Drain::Intrinsic);
-    let v_stage = v_tile.stage_view(v, epl_kv, tid, bh_row, d as i64, Drain::Intrinsic);
+    // Movement rides the `tile_move` vocabulary: `FaHooks` carries the raw K/V LDS tiles, their global
+    // sources, and the fill/gather addressing (`tid`/`bh_row`/`epl_kv`/`wlane`/`d`), and
+    // `tile_move::{prefetch, commit, gather}` rebuild the `LdsStage`/`LdsView` internally — byte-identical
+    // to a pre-built handle (the builders emit no IR). K = QKᵀ's A (row map, straight gather, `kvf`
+    // KV-frags per d-slice); V = PV's A (col map, transposed gather, `dfrags` output frags per kv-slice);
+    // K/V shared (no warp off); staged by ALL 512 threads (`tid`), origin = this (b,h)'s row base
+    // `bh_row`, the per-block advance riding `k_base`. Q has no LDS view — it is register-resident.
     // Q-row origin: the whole [q_blk, d] block base for this workgroup; each warp owns rows
     // [warp_qoff, warp_qoff+16) within it.
     let qblk_c = b.idx_const(q_blk as i64);
@@ -685,7 +715,7 @@ pub fn flash_attention_fwd(bh: usize, n: usize, d: usize) -> Program {
         },
     );
 
-    let hooks = FaHooks { k_view, v_view, k_stage, v_stage, dfrags, kvf };
+    let hooks = FaHooks { k_smem, v_smem, k, v, tid, bh_row, epl_kv, wlane, d, dfrags, kvf };
     let acc_final = pipeline(
         &mut b,
         n / kv_blk, // nblocks (streaming over KV)

@@ -46,10 +46,12 @@ impl DirectFill for Plain {}
 /// choosing `.gather()` (straight, ARow) or `.gather_transposed()` (BCol) **by the operand role `L`**:
 /// the [`FragMap`](crate::ir::FragMap) `L` derives carries `transpose`, so the direction is a property
 /// of the tile type, not a threaded flag. `n_frags` is `L::n_frags(tile_rows, tile_cols)`; the map and
-/// `ept` come from `L`+`S`; `lds_cols` is the LDS tile's inner width. The compiler-visible (`asm =
-/// false`) path — the intrinsic gather a barrier's `lgkmcnt` auto-drains. Returns one operand `Val` per
-/// fragment (the fence tokens the [`LdsView`](crate::movement) returns are ordering-only and dropped,
-/// as at the gather call sites today).
+/// `ept` come from `L`+`S`; `lds_cols` is the LDS tile's inner width. `slice` selects the K-run (inner
+/// base `slice·EDGE`, via [`LdsView::slice`](crate::movement)) — `0` reads the tile's leading run (a
+/// whole-tile probe), `s`/`kf` streams a multi-slice operand (FA's K d-slice / V kv-slice). The
+/// compiler-visible (`asm = false`) path — the intrinsic gather a barrier's `lgkmcnt` auto-drains.
+/// Returns one operand `Val` per fragment AND the store-fence tokens (the WAR barrier consumes them at
+/// the pipeline commit; a whole-tile probe drops them).
 #[allow(clippy::too_many_arguments)]
 pub fn gather<E: Elem, L: RegLayout, S: MfmaShape>(
     b: &mut Builder,
@@ -60,12 +62,12 @@ pub fn gather<E: Elem, L: RegLayout, S: MfmaShape>(
     warp_off: Option<Idx>,
     lane: Idx,
     deps: &[TileId],
-) -> Vec<Val<E>> {
+    slice: usize,
+) -> (Vec<Val<E>>, Vec<TileId>) {
     let map = L::frag::<S>().expect("gather: Src must fill an operand tile (ARow/BCol), not an accumulator");
     let n_frags = L::n_frags::<S>(tile_rows, tile_cols);
-    let view = SharedTile::new(src, lds_cols).gather_view(map, n_frags, warp_off, lane, false);
-    let (vals, _fence) = if map.transpose { view.gather_transposed(b, deps) } else { view.gather(b, deps) };
-    vals
+    let view = SharedTile::new(src, lds_cols).gather_view(map, n_frags, warp_off, lane, false).slice(slice);
+    if map.transpose { view.gather_transposed(b, deps) } else { view.gather(b, deps) }
 }
 
 /// **`(Reg ← Global)` — the register-staged prefetch.** Issues the coalesced global loads for the
