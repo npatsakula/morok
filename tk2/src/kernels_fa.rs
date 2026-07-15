@@ -29,7 +29,7 @@ use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId};
 use crate::kernels::{EDGE, Program, offset_by};
 use crate::partition::RowPartition;
-use crate::pipeline::{AccSlot, BlockCounter, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
+use crate::pipeline::{AccSlot, BlockCounter, CommitDrain, Compute, Hooks, Init, Mem, SlotSet, SlotVal, pipeline};
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 use crate::tile::{ARow, BCol, Plain, Xor};
 use crate::tile_move::{commit, commit_run, gather, gather_run, prefetch};
@@ -1116,24 +1116,20 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     //    `m` (running max), `l` (running norm). TEMPORARIES (produced+consumed within one KV block):
     //    `s` (QKᵀ scores, 16-wide f32), `p` (softmax weights, 16-wide f32 → v_perm-packed in PV). All f32
     //    on the `EPT_C = 16` accumulator (`c_map`); each warp keeps its OWN o/m/l over its 32 Q rows. ──
-    let o_frags: Vec<Frag<F32>> = (0..dtiles).map(|_| b.define_frag::<F32>(S::c_map())).collect();
-    let (m_frag, l_frag) = (b.define_frag::<F32>(S::c_map()), b.define_frag::<F32>(S::c_map()));
-    let (s_frag, p_frag) = (b.define_frag::<F32>(S::c_map()), b.define_frag::<F32>(S::c_map()));
-    let slot_m = dtiles;
-    let slot_l = dtiles + 1;
-    let slot_s = dtiles + 2;
-    let slot_p = dtiles + 3;
-    let mut accs: Vec<AccSlot> = o_frags.iter().map(|&f| AccSlot::F32(f)).collect();
-    accs.extend([AccSlot::F32(m_frag), AccSlot::F32(l_frag), AccSlot::F32(s_frag), AccSlot::F32(p_frag)]);
-    let mut inited: Vec<Option<Effect>> = o_frags.iter().map(|&f| Some(b.zero_init_frag(f))).collect();
-    inited.push(Some(b.const_init_frag(m_frag, f32::NEG_INFINITY))); // running max seed = −∞
-    inited.push(Some(b.zero_init_frag(l_frag))); // running norm seed = 0
-    inited.push(None); // s: temporary
-    inited.push(None); // p: temporary
+    // Declared, not hand-numbered (Phase 3): `SlotSet` allocates each fragment as it is declared but
+    // DEFERS every init to `finish`, so the emission stays "all define_frags, then all inits" (o×dtiles,
+    // m, l, s, p → zero o×dtiles, const m, zero l) — byte-identical to the old hand-written slot table.
+    let mut slots = SlotSet::new();
+    let o_idx = slots.carried_group(&mut b, dtiles, S::c_map(), Init::Zero);
+    let slot_m = slots.carried(&mut b, S::c_map(), Init::Const(f32::NEG_INFINITY)); // running max seed = −∞
+    let slot_l = slots.carried(&mut b, S::c_map(), Init::Zero); // running norm seed = 0
+    let slot_s = slots.temp(&mut b, S::c_map()); // QKᵀ scores (temporary)
+    let slot_p = slots.temp(&mut b, S::c_map()); // softmax weights (temporary)
+    let (accs, inited) = slots.finish(&mut b);
 
     // Per-cluster read/write slot sets (asymmetric — the §3.2 point). QKᵀ writes only `s`; softmax reads
-    // {s,m,l,o_*} writes {m,l,p,o_*}; PV reads {p,o_*} writes {o_*}.
-    let o_idx: Vec<usize> = (0..dtiles).collect();
+    // {s,m,l,o_*} writes {m,l,p,o_*}; PV reads {p,o_*} writes {o_*}. `o_idx` is the carried_group's
+    // returned slot indices (0..dtiles).
     let sm_reads: Vec<usize> = [slot_s, slot_m, slot_l].into_iter().chain(0..dtiles).collect();
     let sm_writes: Vec<usize> = [slot_m, slot_l, slot_p].into_iter().chain(0..dtiles).collect();
     let pv_reads: Vec<usize> = [slot_p].into_iter().chain(0..dtiles).collect();

@@ -24,7 +24,7 @@
 use std::collections::HashSet;
 
 use crate::build::{BF16, Builder, Effect, F32, Frag, Idx, Val};
-use crate::ir::{Node, TileId, TileIr};
+use crate::ir::{FragMap, Node, TileId, TileIr};
 
 /// The commit's **drain placement policy** (DESIGN §5c) — WHERE the collaborative fill's LDS writes
 /// are made visible before the next-iteration gather. [`CommitDrain::IntrinsicAuto`] is the
@@ -163,6 +163,78 @@ impl AccSlot {
             AccSlot::F32(f) => f.id,
             AccSlot::BF16(f) => f.id,
         }
+    }
+}
+
+/// The **seed policy** of a carried [`SlotSet`] slot — how [`SlotSet::finish`] initialises it (a
+/// temporary carries no `Init` and finishes to `None`). Mirrors the two accumulator seeders:
+/// [`Init::Zero`] → [`Builder::zero_init_frag`], [`Init::Const`] → [`Builder::const_init_frag`].
+#[derive(Copy, Clone)]
+pub(crate) enum Init {
+    /// Seed to 0 (GEMM's C, FA's `o`/`l` running norm).
+    Zero,
+    /// Seed to a constant (FA's `m` running max = −∞).
+    Const(f32),
+}
+
+/// A **declarative accumulator-slot builder** (Phase 3) — derives the pipeline's `(accs, inited)`
+/// vectors from a slot DECLARATION, retiring the hand-written `slot_m = dtiles`, `slot_l = dtiles + 1`,
+/// … index bookkeeping FA-32 used to carry (the error-prone part: a mis-numbered slot silently reads
+/// the wrong fragment).
+///
+/// **Deferred-init / byte-identity contract:** each `carried*`/`temp` call allocates its fragment
+/// IMMEDIATELY (assigning the next slot index in declaration order) but RECORDS its init policy rather
+/// than emitting it; [`SlotSet::finish`] then emits ALL the inits together, in declaration order. This
+/// reproduces the old "all `define_frag`s first, then all inits" emission exactly, so under hash-consing
+/// the arena is bit-for-bit unchanged. (Emitting an init at declaration time would interleave
+/// define/init and change the node order — so `finish` owns every init.)
+pub(crate) struct SlotSet {
+    slots: Vec<(Frag<F32>, Option<Init>)>,
+}
+
+impl SlotSet {
+    pub(crate) fn new() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    /// Allocate one f32 fragment at the next slot index, recording its init policy (`None` = temporary).
+    fn push(&mut self, b: &mut Builder, map: FragMap, init: Option<Init>) -> usize {
+        let idx = self.slots.len();
+        let frag = b.define_frag::<F32>(map);
+        self.slots.push((frag, init));
+        idx
+    }
+
+    /// Declare a GROUP of `count` carried f32 accumulators sharing one `init` (FA-32's `o_0..o_{d-1}`
+    /// PV tiles) → their slot indices, in declaration order.
+    pub(crate) fn carried_group(&mut self, b: &mut Builder, count: usize, map: FragMap, init: Init) -> Vec<usize> {
+        (0..count).map(|_| self.push(b, map, Some(init))).collect()
+    }
+
+    /// Declare one carried f32 accumulator (loop-carried + seeded + End-folded) → its slot index.
+    pub(crate) fn carried(&mut self, b: &mut Builder, map: FragMap, init: Init) -> usize {
+        self.push(b, map, Some(init))
+    }
+
+    /// Declare one temporary f32 slot — produced+consumed within a single iteration, no seed → its slot index.
+    pub(crate) fn temp(&mut self, b: &mut Builder, map: FragMap) -> usize {
+        self.push(b, map, None)
+    }
+
+    /// Emit ALL inits (in declaration order; temporaries → `None`) and return the pipeline's
+    /// `(accs, inited)` carry vectors.
+    pub(crate) fn finish(self, b: &mut Builder) -> (Vec<AccSlot>, Vec<Option<Effect>>) {
+        let accs = self.slots.iter().map(|&(f, _)| AccSlot::F32(f)).collect();
+        let inited = self
+            .slots
+            .iter()
+            .map(|&(f, init)| match init {
+                Some(Init::Zero) => Some(b.zero_init_frag(f)),
+                Some(Init::Const(v)) => Some(b.const_init_frag(f, v)),
+                None => None,
+            })
+            .collect();
+        (accs, inited)
     }
 }
 
