@@ -17,13 +17,23 @@ use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 use crate::tile::{ARow, BCol};
 use crate::tile_move::{commit_asm, gather, prefetch};
 
-/// The register-staged fill bundle carried between the pipeline's prefetch and commit: A's and
-/// B's b64/b128 chunks held in VGPRs. Since B is taken **`[N,K]`** (HK's pre-transposed layout), its
-/// fill is the SAME trivial coalesced `load→ds_write` as A — no register transpose, no `v_perm`. At
-/// `stages=2` the prefetch runs a K-block ahead of the commit so the global-load latency overlaps.
+/// The register-staged fill bundle carried between the pipeline's prefetch and commit: the two operands'
+/// b64/b128 chunks held in VGPRs, indexed by tile (`[A, B]`). Since B is taken **`[N,K]`** (HK's
+/// pre-transposed layout), its fill is the SAME trivial coalesced `load→ds_write` as A — no register
+/// transpose, no `v_perm`. At `stages=2` the prefetch runs a K-block ahead of the commit.
 struct FillRegs {
-    a: Vec<Val<BF16>>,
-    b: Vec<Val<BF16>>,
+    chunks: [Vec<Val<BF16>>; 2],
+}
+
+/// One matmul operand's movement context — its shared LDS tile, global source, workgroup row/col origin,
+/// and per-lane element run. A[M,K] and B[N,K] share the SAME fill (both K-contiguous), so prefetch and
+/// commit index `operands[tile]` rather than duplicating an A-arm and a B-arm.
+#[derive(Copy, Clone)]
+struct Operand {
+    smem: Lds<BF16>,
+    src: Buf<BF16>,
+    origin: Idx,
+    epl: usize,
 }
 
 /// matmul's [`Hooks`] impl for the §5c clustered [`pipeline`] — the ONLY kernel-specific part of the
@@ -35,27 +45,18 @@ struct FillRegs {
 type MatmulOp = (Vec<Val<BF16>>, Vec<Val<BF16>>);
 
 struct MatmulHooks {
-    /// The shared A/B LDS tiles and their global sources — the raw handles the `tile_move`
-    /// prefetch/commit/gather forwards address. They REPLACE the pre-built `LdsView`/`LdsStage` (which
-    /// the forwards now rebuild internally from these + the params below — `SharedTile`/`gather_view`/
-    /// `stage_view`/`slice` emit no IR, so the emission is byte-identical).
-    a_smem: Lds<BF16>,
-    b_smem: Lds<BF16>,
-    a_src: Buf<BF16>,
-    b_src: Buf<BF16>,
+    /// The two operands' movement context (`[A, B]`) — LDS tile, global source, origin, per-lane run —
+    /// the raw handles the `tile_move` prefetch/commit forwards address (they rebuild the `SharedTile`/
+    /// `stage_view` internally; those emit no IR, so the emission is byte-identical). A[M,K] / B[N,K] are
+    /// both K-contiguous, so the fill is symmetric and prefetch/commit index by tile.
+    operands: [Operand; 2],
     /// `k_step` = the LDS tile inner width (`lds_cols`, the flat-layout row stride); `grow` = the global
-    /// row stride `K` (the fill's `grow_stride`, shared by A[M,K] and B[N,K] — both K-contiguous).
+    /// row stride `K` (the fill's `grow_stride`, shared by both operands). `tid` = the fill thread id.
     k_step: usize,
     grow: i64,
-    /// The collaborative fill addressing (prefetch/commit): `tid` = fill thread id, `origin_a`/`origin_b`
-    /// = the workgroup A-row / B-col origin, `epl_a`/`epl_b` = elements per lane per tile.
     tid: Idx,
-    origin_a: Idx,
-    origin_b: Idx,
-    epl_a: usize,
-    epl_b: usize,
     /// The gather addressing: `wlane` = the intra-warp lane, `bm`/`bn` = the per-warp sub-tile extents
-    /// (the gather `tile_rows`/`tile_cols`; A is `(bm, EDGE)` → `ri` fragments, B is `(EDGE, bn)` → `cj`),
+    /// (A is `(bm, EDGE)` → `ri` fragments, B is `(EDGE, bn)` → `cj` — role-asymmetric, so NOT grouped),
     /// `warp_row_off`/`warp_col_off` = the multi-warp wave's runtime offset into the shared tile.
     wlane: Idx,
     bm: usize,
@@ -78,47 +79,18 @@ impl Hooks for MatmulHooks {
         prev: Option<FillRegs>,
         order: &[TileId],
     ) -> (FillRegs, Vec<TileId>) {
-        // Two operand tiles: 0 = A, 1 = B. HK loads A@C0 and B@C4 so each global load hides under a
-        // different compute cluster; the schedule names which cluster stages which tile, and the fill
-        // accumulates across them (`prev`) for the single C6 commit that writes BOTH to LDS. `order`
-        // (the cluster entry) pins each tile's load into its cluster so the split survives lowering.
-        let mut reg = prev.unwrap_or(FillRegs { a: Vec::new(), b: Vec::new() });
-        let loaded = match tile {
-            0 => {
-                reg.a = prefetch(
-                    b,
-                    self.a_smem,
-                    self.k_step,
-                    self.a_src,
-                    self.grow,
-                    self.epl_a,
-                    self.tid,
-                    self.origin_a,
-                    k_base,
-                    order,
-                );
-                &reg.a
-            }
-            1 => {
-                reg.b = prefetch(
-                    b,
-                    self.b_smem,
-                    self.k_step,
-                    self.b_src,
-                    self.grow,
-                    self.epl_b,
-                    self.tid,
-                    self.origin_b,
-                    k_base,
-                    order,
-                );
-                &reg.b
-            }
-            _ => panic!("matmul prefetch: tile ∈ {{0=A, 1=B}}, got {tile}"),
-        };
+        // Tile `0 = A`, `1 = B` (the pipeline's `PREFETCH_TILES = 2` numeric ids). HK loads A@C0 and B@C4
+        // so each global load hides under a different compute cluster; the fill accumulates across them
+        // (`prev`) for the single C6 commit that writes BOTH. `order` (the cluster entry) pins each tile's
+        // load into its cluster. The operands' fill is symmetric, so index `operands[tile]` — no per-tile
+        // arm, no `_ => panic` (the array bound IS the operand count).
+        let mut reg = prev.unwrap_or_else(|| FillRegs { chunks: [Vec::new(), Vec::new()] });
+        let op = self.operands[tile];
+        reg.chunks[tile] =
+            prefetch(b, op.smem, self.k_step, op.src, self.grow, op.epl, self.tid, op.origin, k_base, order);
         // The load result values — the `sched_fence(0)` load-pin anchors on these so LLVM cannot sink
         // the global load down to its consumer (the commit), exposing the DRAM latency.
-        let anchors: Vec<TileId> = loaded.iter().map(|v| v.id).collect();
+        let anchors: Vec<TileId> = reg.chunks[tile].iter().map(|v| v.id).collect();
         (reg, anchors)
     }
 
@@ -128,30 +100,31 @@ impl Hooks for MatmulHooks {
         // into ONE `prev` chain (thread A's tail into B) so a single drain reaches BOTH; return the WRITE
         // effects — the pipeline owns the drain (`CommitDrain::AsmDeferred`, since the RAW barrier can't
         // auto-drain the waitcnt-opaque asm and WHERE it drains is the schedule).
+        let [op_a, op_b] = self.operands;
         let fa = commit_asm(
             b,
-            self.a_smem,
+            op_a.smem,
             self.k_step,
-            self.a_src,
+            op_a.src,
             self.grow,
-            self.epl_a,
+            op_a.epl,
             self.tid,
-            self.origin_a,
-            &reg.a,
+            op_a.origin,
+            &reg.chunks[0],
             war,
             None,
         );
         let a_last = fa.last().map(|e| e.dep());
         let fb = commit_asm(
             b,
-            self.b_smem,
+            op_b.smem,
             self.k_step,
-            self.b_src,
+            op_b.src,
             self.grow,
-            self.epl_b,
+            op_b.epl,
             self.tid,
-            self.origin_b,
-            &reg.b,
+            op_b.origin,
+            &reg.chunks[1],
             war,
             a_last,
         );
@@ -172,7 +145,7 @@ impl Hooks for MatmulHooks {
         let mut gathers: Vec<TileId> = Vec::new();
         let (a_vecs, ga) = gather::<BF16, ARow, Mfma16x16x16Bf16>(
             b,
-            self.a_smem,
+            self.operands[0].smem,
             self.k_step,
             self.bm,
             EDGE,
@@ -184,7 +157,7 @@ impl Hooks for MatmulHooks {
         );
         let (b_vecs, gb) = gather::<BF16, BCol, Mfma16x16x16Bf16>(
             b,
-            self.b_smem,
+            self.operands[1].smem,
             self.k_step,
             EDGE,
             self.bn,
@@ -353,17 +326,13 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, wm: usize, wn
         // brackets, warp-phase ping-pong, End-fold, resident fork) and runs the completeness verifier
         // at `.build()`; the author declares only the schedule + the `MatmulHooks` (§5c cluster model).
         let hooks = MatmulHooks {
-            a_smem,
-            b_smem,
-            a_src: a,
-            b_src: bmat,
+            operands: [
+                Operand { smem: a_smem, src: a, origin: tm_bm, epl: epl_a },
+                Operand { smem: b_smem, src: bmat, origin: tn_bn, epl: epl_b },
+            ],
             k_step,
             grow: k as i64,
             tid,
-            origin_a: tm_bm,
-            origin_b: tn_bn,
-            epl_a,
-            epl_b,
             wlane,
             bm,
             bn,
