@@ -70,7 +70,7 @@ fn matmul_clustered_hk_replica_is_bit_exact_on_gfx942() {
 }
 
 /// **32×32×8 MFMA isolation gate** (§migration Step 3 go/no-go): the wide-core probe
-/// ([`crate::kernels::mfma_32x32x8_probe`]) computes `C = A·Bᵀ` via `v_mfma_f32_32x32x8_bf16` and
+/// ([`crate::test::probes::mfma_32x32x8_probe`]) computes `C = A·Bᵀ` via `v_mfma_f32_32x32x8_bf16` and
 /// scatters its 16-VGPR accumulator through `acc_rc`; it must match the f32 reference over the SAME
 /// bf16-rounded operands. This PROVES the 32×32×8 operand layout + the 4-block accumulator distribution
 /// (`AccDist`) + the intrinsic ARE CORRECT in isolation. Shapes: one MFMA (32×32×8), a K-loop
@@ -94,7 +94,7 @@ fn mfma_32x32x8_probe_is_correct_on_gfx942() {
         // The intrinsic MFMA (the production fast path — the asm `sideeffect` form was dropped: it is
         // opaque to the AMDGPU GCNHazardRecognizer, so it emits none of the mandatory 32×32×8 `s_nop`s
         // and a VALU-adjacent accumulator miscompiles → NaN, device-proven; see `flash_attention_fwd_32`).
-        let prog = crate::kernels::mfma_32x32x8_probe(m, n, k);
+        let prog = crate::test::probes::mfma_32x32x8_probe(m, n, k);
         let out = Tensor::empty(&[m, n], DType::Float32);
         let mut y = graph_kernel(prog, out, &[&a, &b]).expect("wrap 32×32×8 probe");
         let plan = y.prepare().expect("prepare");
@@ -141,7 +141,7 @@ fn mma_atb_probe_is_correct_on_gfx942() {
         let expected = atb_ref(&as_f32_vec(&v), &as_f32_vec(&p), kv, d, q);
         let atol = 0.02 * (kv as f32).sqrt();
 
-        let prog = crate::kernels_fa::atb_probe(kv, d, q);
+        let prog = crate::test::probes::atb_probe(kv, d, q);
         let out = Tensor::empty(&[d, q], DType::Float32);
         let mut y = graph_kernel(prog, out, &[&v, &p]).expect("wrap atb probe");
         let plan = y.prepare().expect("prepare");
@@ -170,7 +170,7 @@ fn pv_ref(vf: &[f32], pf: &[f32], d: usize, q: usize, kv: usize) -> Vec<f32> {
 }
 
 /// **Step-4 P→PV relayout gate** (32×32×8 DE-RISK): the `v_perm_b32` primitive + [`Builder::pv_relayout_s49`]
-/// pack ([`crate::kernels_fa::pv_relayout_probe`]) must reproduce `O[d,q] = Σ_kv V[d,kv]·P[kv,q]` where `P`
+/// pack ([`crate::test::probes::pv_relayout_probe`]) must reproduce `O[d,q] = Σ_kv V[d,kv]·P[kv,q]` where `P`
 /// is loaded into the 32×32×8 C-accumulator layout and relayout'd to the PV B-operands via `v_perm s49`.
 /// A match PROVES the selector + the accumulator↔B-operand element correspondence in isolation, before FA.
 /// Base tile (32×32), a wide-`d` tile (64×32, 2 A-operand tiles), and a wide-`q` tile (32×64, 2 accumulator
@@ -193,7 +193,7 @@ fn pv_relayout_probe_is_correct_on_gfx942() {
         let expected = pv_ref(&as_f32_vec(&v), &as_f32_vec(&p_f32), d, q, KV);
         let atol = 0.02 * (KV as f32).sqrt();
 
-        let prog = crate::kernels_fa::pv_relayout_probe(d, q);
+        let prog = crate::test::probes::pv_relayout_probe(d, q);
         let out = Tensor::empty(&[d, q], DType::Float32);
         let mut y = graph_kernel(prog, out, &[&p_f32, &v]).expect("wrap pv_relayout probe");
         let plan = y.prepare().expect("prepare");
@@ -223,7 +223,7 @@ fn softmax32_ref(sf: &[f32], kv: usize, q: usize) -> Vec<f32> {
 }
 
 /// **Step-6 softmax-reduction gate** (32×32×8 DE-RISK): the [`Builder::acc_row_reduce_32`] online-softmax
-/// over the `EPT_C = 16` accumulator geometry ([`crate::kernels_fa::softmax32_probe`]) must reproduce the
+/// over the `EPT_C = 16` accumulator geometry ([`crate::test::probes::softmax32_probe`]) must reproduce the
 /// per-q softmax over kv. A match PROVES the AccDist reduction (16 in-register + `L↔L+32` cross-lane) +
 /// broadcast are correct — the last un-proven FA-32 building block, in isolation before the FA rewrite.
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::softmax32_probe --nocapture`
@@ -238,7 +238,7 @@ fn softmax32_probe_is_correct_on_gfx942() {
     s.realize().expect("realize s");
     let expected = softmax32_ref(&as_f32_vec(&s), KV, Q);
 
-    let prog = crate::kernels_fa::softmax32_probe();
+    let prog = crate::test::probes::softmax32_probe();
     let out = Tensor::empty(&[KV, Q], DType::Float32);
     let mut y = graph_kernel(prog, out, &[&s]).expect("wrap softmax32 probe");
     let plan = y.prepare().expect("prepare");
@@ -266,7 +266,7 @@ fn vtrans_ref(vf: &[f32], ptf: &[f32], d: usize, q: usize, kv: usize) -> Vec<f32
 }
 
 /// **Step-5 V write-side padded-transpose gate** (32×32×8 DE-RISK): the padded transposed V staging
-/// ([`crate::kernels_fa::v_transpose_probe`]) must reproduce `O[d,q] = Σ_kv V[kv,d]·Pt[q,kv]` with V read
+/// ([`crate::test::probes::v_transpose_probe`]) must reproduce `O[d,q] = Σ_kv V[kv,d]·Pt[q,kv]` with V read
 /// as the 32×32×8 A-operand straight from the transposed LDS. A match PROVES the transposed padded layout +
 /// straight-read addressing yield the correct PV A-operand, in isolation, before FA. Base tile (32×32) and
 /// a wide-`d` tile (64×32, two A-operand tiles over the shared transposed LDS). `q = kv = 32`.
@@ -286,7 +286,7 @@ fn v_transpose_probe_is_correct_on_gfx942() {
         let expected = vtrans_ref(&as_f32_vec(&v), &as_f32_vec(&pt), d, Q, KV);
         let atol = 0.02 * (KV as f32).sqrt();
 
-        let prog = crate::kernels_fa::v_transpose_probe(d);
+        let prog = crate::test::probes::v_transpose_probe(d);
         let out = Tensor::empty(&[d, Q], DType::Float32);
         let mut y = graph_kernel(prog, out, &[&v, &pt]).expect("wrap v_transpose probe");
         let plan = y.prepare().expect("prepare");

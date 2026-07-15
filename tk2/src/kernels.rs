@@ -10,9 +10,9 @@
 //!   run unbroken.
 
 use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Val};
-use crate::ir::{FragMap, TileId, TileIr};
+use crate::ir::{TileId, TileIr};
 use crate::pass::Pass;
-use crate::pipeline::{AccSlot, BlockCounter, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
+use crate::pipeline::{BlockCounter, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 use crate::tile::{ARow, BCol};
 use crate::tile_move::{commit, commit_asm, gather, prefetch};
@@ -92,94 +92,6 @@ pub(crate) fn add_opt(b: &mut Builder, idx: Idx, off: Option<Idx>) -> Idx {
         Some(o) => b.idx_add(idx, o),
         None => idx,
     }
-}
-
-/// Load ONE MFMA operand fragment (`map.ept` wide) straight from a global `[outer, K]` (row-major, row
-/// stride `k_dim`) into a register fragment, addressed by `map`'s `lane_rc`. For a Row (A) map the lane
-/// pair is `(M-row, K)`; for a Col (B) map it is `(K-spread, N-flat)` — so `outer` is the M (A) / N (B)
-/// index and `kk` the K contribution, and the global offset is `(outer_base + outer)·k_dim + (k_base +
-/// kk)`. Used only by the 32×32×8 isolation probe (a self-contained gather, free of the EDGE-coupled
-/// movement layer, so it exercises the marker's operand maps directly).
-pub(crate) fn load_op_frag(
-    b: &mut Builder,
-    src: Buf<BF16>,
-    map: FragMap,
-    outer_base: usize,
-    k_base: usize,
-    k_dim: usize,
-    lane: Idx,
-) -> Val<BF16> {
-    let frag = b.define_frag::<BF16>(map);
-    let k_c = b.idx_const(k_dim as i64);
-    let stores: Vec<TileId> = (0..map.ept)
-        .map(|e| {
-            let e_idx = b.idx_const(e as i64);
-            let (r, cc) = b.lane_rc(map, lane, e_idx);
-            let (outer, kk) = if map.transpose { (cc, r) } else { (r, cc) };
-            let row = offset_by(b, outer, outer_base);
-            let col = offset_by(b, kk, k_base);
-            let off = b.idx_mul(row, k_c);
-            let off = b.idx_add(off, col);
-            let v = b.load(src, off);
-            b.store_frag_elem(frag, e_idx, v).dep()
-        })
-        .collect();
-    b.load_frag_vec_after(frag, &stores)
-}
-
-/// **32×32×8 MFMA isolation probe** (§migration Step 3 DE-RISK): a standalone single-warp kernel that
-/// computes `C = A·Bᵀ` (`A[m,k]`, `B[n,k]`, both K-contiguous) tiled as `(m/32)×(n/32)` output blocks,
-/// each ONE `v_mfma_f32_32x32x8_bf16` per K-slice accumulated over the `k/8` slices, then scatters the
-/// 16-VGPR accumulator via [`Builder::acc_rc`]. It PROVES the 32×32×8 operand layout + accumulator
-/// distribution IN ISOLATION (device-gated allclose vs an f32 reference) before any FA work — the
-/// wide-core analog of `atb_probe`. `m`/`n` multiples of 32, `k` a multiple of 8. Emitted with the
-/// intrinsic MFMA ([`Builder::mma_of`], the production fast path).
-#[allow(clippy::needless_range_loop)]
-pub fn mfma_32x32x8_probe(m: usize, n: usize, k: usize) -> Program {
-    use crate::shape::Mfma32x32x8Bf16 as S;
-    assert!(
-        m.is_multiple_of(S::M) && n.is_multiple_of(S::N) && k.is_multiple_of(S::K),
-        "probe dims must tile by 32×32×8"
-    );
-    let mut b = Builder::new("tk2_mfma_32x32x8_probe");
-    // ABI: output C[m,n] first, then inputs A[m,k], B[n,k] (B is [N,K] — A·Bᵀ, both K-contiguous).
-    let c = b.global::<F32>(m * n);
-    let a = b.global::<BF16>(m * k);
-    let bmat = b.global::<BF16>(n * k);
-    let _wg = b.grid_axis(0, 1);
-    let lane = b.block_axis(WARP as i64);
-
-    let a_map = S::a_map();
-    let b_map = S::b_map();
-    let dist = S::acc_dist();
-    let n_c = b.idx_const(n as i64);
-    let mut roots = Vec::new();
-    for mi in 0..m / S::M {
-        for ni in 0..n / S::N {
-            // Accumulate `k/8` MFMAs into a 16-wide f32 value (the C accumulator, register-carried).
-            let mut acc = {
-                let zs: Vec<Val<F32>> = (0..S::EPT_C).map(|_| b.f32(0.0)).collect();
-                b.vec_build(&zs)
-            };
-            for ki in 0..k / S::K {
-                let af = load_op_frag(&mut b, a, a_map, mi * S::M, ki * S::K, k, lane);
-                let bf = load_op_frag(&mut b, bmat, b_map, ni * S::N, ki * S::K, k, lane);
-                acc = b.mma_of::<S>(af, bf, acc);
-            }
-            // Scatter the 16-VGPR accumulator: element `i` → C[mi·32 + row, ni·32 + col] via acc_rc.
-            for i in 0..S::EPT_C {
-                let (row, col) = b.acc_rc(dist, lane, i);
-                let m_idx = offset_by(&mut b, row, mi * S::M);
-                let n_idx = offset_by(&mut b, col, ni * S::N);
-                let off = b.idx_mul(m_idx, n_c);
-                let off = b.idx_add(off, n_idx);
-                let v = b.vec_extract(acc, i);
-                roots.push(b.store(c, off, v));
-            }
-        }
-    }
-    let (ir, sink) = b.finish(&roots);
-    Program { ir, sink, name: "tk2_mfma_32x32x8_probe".into() }
 }
 
 /// The register-staged fill bundle carried between the pipeline's prefetch and commit: A's and
@@ -539,10 +451,9 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, wm: usize, wn
     // ── accumulators: one 16×16 f32 fragment per (i,j), zero-initialised. ALL carried, and every
     //    compute cluster reads+writes the full set — GEMM is the UNIFORM special case of the §3.2
     //    per-cluster read/write contract (`reads = writes = 0..ri·cj`), so it emits byte-identically. ──
-    let acc: Vec<Frag<F32>> = (0..ri * cj).map(|_| b.define_frag::<F32>(c_map)).collect();
-    let accs: Vec<AccSlot> = acc.iter().map(|&f| AccSlot::F32(f)).collect();
-    let inited: Vec<Option<Effect>> = acc.iter().map(|&ac| Some(b.zero_init_frag(ac))).collect();
-    let all_slots: Vec<usize> = (0..ri * cj).collect();
+    let mut slots = crate::pipeline::SlotSet::new();
+    let all_slots = slots.carried_group(&mut b, ri * cj, c_map, crate::pipeline::Init::Zero);
+    let (accs, inited) = slots.finish(&mut b);
 
     let acc_final = {
         // The §5c clustered HK replica: the movement handles + fills feed the 8-cluster HK schedule

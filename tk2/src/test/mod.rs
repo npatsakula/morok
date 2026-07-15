@@ -4,4 +4,5 @@ mod byte_identity;
 mod device;
 mod lower;
 mod pass;
+mod probes;
 mod tile;

@@ -144,8 +144,8 @@ fn sched_group_barrier_lowers_and_renders_the_builtin() {
         b.vec_build(&zs)
     };
     for ki in 0..2 {
-        let af = crate::kernels::load_op_frag(&mut b, a, a_map, 0, ki * S::K, 2 * S::K, lane);
-        let bf = crate::kernels::load_op_frag(&mut b, bmat, b_map, 0, ki * S::K, 2 * S::K, lane);
+        let af = crate::test::probes::load_op_frag(&mut b, a, a_map, 0, ki * S::K, 2 * S::K, lane);
+        let bf = crate::test::probes::load_op_frag(&mut b, bmat, b_map, 0, ki * S::K, 2 * S::K, lane);
         acc = b.mma_of::<S>(af, bf, acc);
     }
     // A VALU op the interleave can pull under the MFMAs (the softmax-rescale analog).
@@ -187,7 +187,7 @@ fn sched_group_barrier_lowers_and_renders_the_builtin() {
     assert!(llvm.contains("i32 2, i32 5"), "VALU-mask(0x2) size-5 group present");
 }
 
-/// The 32×32×8 MFMA isolation probe ([`crate::kernels::mfma_32x32x8_probe`]) must lower to spec-valid
+/// The 32×32×8 MFMA isolation probe ([`crate::test::probes::mfma_32x32x8_probe`]) must lower to spec-valid
 /// device-UOp — proving the `Node::Mma` accumulator-width dispatch (`ept 16 → 32×32×8`), the wide
 /// `v_mfma_f32_32x32x8_bf16` intrinsic selection, and the 16-VGPR `acc_rc` scatter survive lowering +
 /// `type_verify` BEFORE the device gate. Covers one MFMA (32×32×8), a K-loop (32×32×16), and a tiled
@@ -195,7 +195,7 @@ fn sched_group_barrier_lowers_and_renders_the_builtin() {
 #[test]
 fn mfma_32x32x8_probe_lowers_spec_valid() {
     for (m, n, k) in [(32usize, 32usize, 8usize), (32, 32, 16), (64, 64, 8)] {
-        let p = crate::kernels::mfma_32x32x8_probe(m, n, k);
+        let p = crate::test::probes::mfma_32x32x8_probe(m, n, k);
         // Exactly the tiled MFMA count: (m/32)·(n/32)·(k/8).
         let n_mma =
             (0..p.ir.len()).filter(|&i| matches!(p.ir.node(crate::ir::TileId(i as u32)), Node::Mma { .. })).count();
