@@ -25,7 +25,7 @@ use svod_tensor::testing::allclose_f32;
 mod common;
 use common::{bench_plan, plan_gpu_ns, requirements_met};
 
-use svod_tk2::{Program, SwizzlePass, VectorizePass, graph_kernel, matmul_lds_kblock_mw_clustered};
+use svod_tk2::{Program, SwizzlePass, Tiling, VectorizePass, graph_kernel, matmul_lds_kblock_mw_clustered};
 
 /// The env-selected device (`SVOD_DEVICE`, else default) — same source as `common::rand_bf16`.
 fn dev() -> svod_dtype::DeviceSpec {
@@ -88,7 +88,7 @@ impl Kernel {
     fn build(self, n: usize) -> Program {
         match self {
             Kernel::Clustered => {
-                matmul_lds_kblock_mw_clustered(n, n, n, 128, 64, 2, 4, 64).apply(VectorizePass).apply(SwizzlePass)
+                matmul_lds_kblock_mw_clustered(n, n, n, Tiling::default()).apply(VectorizePass).apply(SwizzlePass)
             }
         }
     }

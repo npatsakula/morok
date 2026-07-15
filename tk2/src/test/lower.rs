@@ -62,7 +62,12 @@ fn matmul_lds_kblock_clustered_lowers_and_balances_the_wave_phase() {
     let count = |p: &crate::Program, pred: &dyn Fn(&Node) -> bool| {
         (0..p.ir.len()).filter(|&i| pred(p.ir.node(crate::ir::TileId(i as u32)))).count()
     };
-    let p = crate::kernels::matmul::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64);
+    let p = crate::kernels::matmul::matmul_lds_kblock_mw_clustered(
+        128,
+        128,
+        256,
+        crate::kernels::matmul::Tiling { bm: 64, bn: 64, wm: 2, wn: 2, k_step: 64 },
+    );
     lower::verify(&p).expect("clustered HK replica must lower to spec-valid UOp");
     assert!(count(&p, &|n| matches!(n, Node::SetPrio { .. })) > 0, "compute clusters ⇒ SetPrio nodes");
     assert_eq!(count(&p, &|n| matches!(n, Node::WaveBarrier { eq: 1, .. })), 1, "one eq=1 prologue wave barrier");
@@ -70,9 +75,14 @@ fn matmul_lds_kblock_clustered_lowers_and_balances_the_wave_phase() {
     // Composes with the refinement passes: VectorizePass is a no-op on the asm gather (no fusible
     // scalar run), and SwizzlePass folds the (fragment-invariant) XOR delta into the asm base offset's
     // `lds_col` — so the swizzled clustered kernel still lowers spec-valid.
-    let sw = crate::kernels::matmul::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64)
-        .apply(crate::passes::VectorizePass)
-        .apply(crate::passes::SwizzlePass);
+    let sw = crate::kernels::matmul::matmul_lds_kblock_mw_clustered(
+        128,
+        128,
+        256,
+        crate::kernels::matmul::Tiling { bm: 64, bn: 64, wm: 2, wn: 2, k_step: 64 },
+    )
+    .apply(crate::passes::VectorizePass)
+    .apply(crate::passes::SwizzlePass);
     lower::verify(&sw).expect("clustered.apply(Vectorize).apply(Swizzle) must lower spec-valid");
 }
 

@@ -19,7 +19,7 @@ use svod_tensor::testing::allclose_f32;
 mod common;
 use common::{bench_plan, rand_bf16, requirements_met};
 
-use svod_tk2::{Program, SwizzlePass, VectorizePass, graph_kernel, matmul_lds_kblock_mw_clustered};
+use svod_tk2::{Program, SwizzlePass, Tiling, VectorizePass, graph_kernel, matmul_lds_kblock_mw_clustered};
 
 /// f32 ground truth `A·B` over the SAME bf16-rounded operands (both kernel and
 /// reference see the realized bf16 values cast up to f32).
@@ -72,7 +72,7 @@ fn bench_matmul_rect(c: &mut Criterion) {
             let expected = reference(&a, &b.try_transpose(0, 1).expect("Bᵀ for A·Bᵀ reference"));
             // Clustered 256² config, vec+swizzle (bit-exact bijections), F32 C store.
             let prog =
-                matmul_lds_kblock_mw_clustered(m, n, k, 128, 64, 2, 4, 64).apply(VectorizePass).apply(SwizzlePass);
+                matmul_lds_kblock_mw_clustered(m, n, k, Tiling::default()).apply(VectorizePass).apply(SwizzlePass);
             let (y, plan) = plan_of(prog, m, n, &a, &b);
             assert_correct(&y, &plan, &expected, k, "clustered_rect");
             group.bench_with_input(BenchmarkId::new(format!("clustered/{name}"), t), &t, |bch, _| {

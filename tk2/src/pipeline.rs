@@ -801,9 +801,20 @@ pub(crate) struct Pipeline<'a, H: Hooks> {
     clusters: Vec<Box<dyn Cluster<H>>>,
 }
 
+/// The pipeline's scheduling policy — the per-cluster placement knobs. Grouped so `pipeline()` names them
+/// instead of a positional bool sequence.
+#[derive(Copy, Clone)]
+pub(crate) struct Sched {
+    pub asm_gather: bool,
+    pub resident: bool,
+    pub commit_drain: CommitDrain,
+    pub bare_seals: bool,
+    pub pin_mfma: bool,
+}
+
 /// Open a clustered pipeline over `hooks`. `nblocks = k/k_step ≥ 2`; `warp_row = Some` enables the
-/// wave-phase ping-pong; `resident` drops the steady prefetch/commit (compute-resident microkernel);
-/// `bare_seals` swaps the acq-rel-fenced cluster barriers for HK's bare `s_barrier` + explicit drains.
+/// wave-phase ping-pong; `sched.resident` drops the steady prefetch/commit (compute-resident microkernel);
+/// `sched.bare_seals` swaps the acq-rel-fenced cluster barriers for HK's bare `s_barrier` + explicit drains.
 /// `inited[s] = Some(seed)` marks slot `s` CARRIED (loop-carried + End-folded); `None` a per-iteration
 /// TEMPORARY (not carried — produced and consumed within one pass, e.g. FA's QKᵀ scores / softmax `P`).
 #[allow(clippy::too_many_arguments)]
@@ -815,13 +826,10 @@ pub(crate) fn pipeline<'a, H: Hooks>(
     accs: &'a [AccSlot],
     inited: &'a [Option<Effect>],
     warp_row: Option<Idx>,
-    asm_gather: bool,
-    resident: bool,
-    commit_drain: CommitDrain,
-    bare_seals: bool,
-    pin_mfma: bool,
+    sched: Sched,
     hooks: H,
 ) -> Pipeline<'a, H> {
+    let Sched { asm_gather, resident, commit_drain, bare_seals, pin_mfma } = sched;
     Pipeline {
         b,
         hooks,

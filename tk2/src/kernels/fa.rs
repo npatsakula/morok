@@ -29,7 +29,9 @@ use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId};
 use crate::kernels::{EDGE, Program, offset_by};
 use crate::partition::RowPartition;
-use crate::pipeline::{AccSlot, BlockCounter, CommitDrain, Compute, Hooks, Init, Mem, SlotSet, SlotVal, pipeline};
+use crate::pipeline::{
+    AccSlot, BlockCounter, CommitDrain, Compute, Hooks, Init, Mem, Sched, SlotSet, SlotVal, pipeline,
+};
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 use crate::tile::{ARow, BCol, Plain, Xor};
 use crate::tile_move::{commit, commit_run, gather, gather_run, prefetch};
@@ -444,12 +446,15 @@ pub fn flash_attention_fwd(bh: usize, n: usize, d: usize) -> Program {
         2,          // ksteps: gather slices (K, V)
         &accs,
         &inited,
-        None,  // warp_row: FA wants NO wave-phase ping-pong — warps run disjoint Q rows, so there is
-        false, // asm_gather   no co-resident load/compute pair to steer (the brief: keep it None)
-        false, // resident
-        CommitDrain::IntrinsicAuto,
-        false, // bare_seals
-        false, // pin_mfma
+        None, // warp_row: FA wants NO wave-phase ping-pong — warps run disjoint Q rows, so there is
+        // no co-resident load/compute pair to steer (the brief: keep it None)
+        Sched {
+            asm_gather: false,
+            resident: false,
+            commit_drain: CommitDrain::IntrinsicAuto,
+            bare_seals: false,
+            pin_mfma: false,
+        },
         hooks,
     )
     .cluster(Mem::builder().prefetch([0, 1]).gathers([0, 1]).commit(true).build())
@@ -963,12 +968,14 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
         &accs,
         &inited,
         warp_row, // Lever-2: Some(warp/2) enables the two-group phase stagger (env FA_STAGGER); None = off
-        false,    // asm_gather
-        false,    // resident
-        // Lever-3: double-buffered ⇒ drop the WAR seal (commit/gather touch disjoint parity halves).
-        if double_buf { CommitDrain::IntrinsicNoWar } else { CommitDrain::IntrinsicAuto },
-        false, // bare_seals
-        false, // pin_mfma
+        Sched {
+            asm_gather: false,
+            resident: false,
+            // Lever-3: double-buffered ⇒ drop the WAR seal (commit/gather touch disjoint parity halves).
+            commit_drain: if double_buf { CommitDrain::IntrinsicNoWar } else { CommitDrain::IntrinsicAuto },
+            bare_seals: false,
+            pin_mfma: false,
+        },
         hooks,
     )
     .cluster(Mem::builder().prefetch([0, 1]).gathers([0, 1]).commit(true).build())

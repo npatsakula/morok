@@ -3,7 +3,7 @@
 
 use crate::ir::{TileId, TileIr};
 use crate::kernels::Program;
-use crate::kernels::matmul::matmul_lds_kblock_mw_clustered;
+use crate::kernels::matmul::{Tiling, matmul_lds_kblock_mw_clustered};
 use crate::pass::{
     AsStrategy, Band, Fail, Id, IdentityFold, IdentityPass, Pass, PassError, Pipeline, Strategy, fold, or_else,
     repeat_fixpoint, seq, top_down, try_,
@@ -12,7 +12,7 @@ use crate::pass::{
 /// A small kept-kernel program — a generic `Program` fixture for the pass-runner scaffold tests
 /// (which assert only pass-runner behaviour, not kernel semantics).
 fn fixture() -> Program {
-    matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64)
+    matmul_lds_kblock_mw_clustered(128, 128, 256, Tiling { bm: 64, bn: 64, wm: 2, wn: 2, k_step: 64 })
 }
 
 /// A no-op pass in a chosen band (for band-ordering tests).

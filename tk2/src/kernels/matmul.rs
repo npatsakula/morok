@@ -3,7 +3,7 @@
 //!
 //! - [`matmul_lds_kblock_mw_clustered`] — the **asm clustered HK replica**: the 8-cluster schedule via
 //!   the [`crate::pipeline`] combinator with asm-opaque `ds_read_b64`/`ds_write_b64` gather+commit and
-//!   `mma_asm` (backed by [`kblock_impl`] + [`MatmulHooks`]). Asm-opacity is load-bearing for BOTH
+//!   `mma_asm` (backed by [`MatmulHooks`]). Asm-opacity is load-bearing for BOTH
 //!   correctness and speed: it pins the LDS reads/writes so the single-buffer commit can't race a
 //!   ping-pong-lagged read (the intrinsic "asm-free" variant could not be made race-safe — LLVM
 //!   reschedules compiler-visible LDS ops past any authored barrier/drain), and it keeps the 32-MFMA
@@ -12,7 +12,7 @@
 use super::{EDGE, Program, WARP, add_opt, scatter_frag};
 use crate::build::{BF16, Buf, Builder, Effect, F32, Idx, Lds, Val};
 use crate::ir::TileId;
-use crate::pipeline::{BlockCounter, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
+use crate::pipeline::{BlockCounter, CommitDrain, Compute, Hooks, Mem, Sched, SlotVal, pipeline};
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 use crate::tile::{ARow, BCol};
 use crate::tile_move::{commit_asm, gather, prefetch};
@@ -216,23 +216,43 @@ pub(crate) fn l2_swizzle(b: &mut Builder, wgid: Idx, grid_m: i64, grid_n: i64) -
     (tile_m, tile_n)
 }
 
-/// **K-blocked, LDS-staged, block-tiled** matmul (DESIGN.md §5b step 1b-ii — the
-/// occupancy win). Like [`matmul_lds_tiled`] (bm×bn tile, `(bm/16)×(bn/16)` reused
-/// accumulators) but the A/B strips are re-staged **per K-fragment inside the K-loop**
-/// (K_STEP = 16) instead of the whole K at once — so the LDS footprint is a tiny
-/// `(bm·16 + 16·bn)·2` bytes **independent of K** (bm=bn=64 ⇒ 4 KB ⇒ ~16 resident
-/// workgroups), keeping occupancy high at any K. This is the fix for 1b-i's occupancy
-/// collapse. The single LDS buffer is reused every iteration, so each K-block needs two
-/// workgroup barriers (mirroring tk's `gemm_core`): a **RAW** fence after the fill (reads
-/// see the staged data) and a **WAR** fence after the LDS reads (the next fill must not
-/// overwrite until every lane finished reading). The WAR fence is routed into the
-/// accumulator reads so it is scoped inside the K-loop. `m/n` multiples of `bm/bn`;
-/// `bm/bn/k` multiples of 16. Emits the LDS addressing through [`Builder::lds_col`], so
-/// the flat layout is the base; `.apply(`[`SwizzlePass`](crate::passes::SwizzlePass)`)`
-/// turns it into the bank-swizzled one — the swizzle is a **composable refinement**, not
-/// hand-woven here (bm/bn/k_step ∈ {16,32,64} for the single-subtile swizzle).
-#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
-fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, wm: usize, wn: usize, k_step: usize) -> Program {
+/// The clustered matmul's tiling config — the per-warp sub-tile dims + warp grid + K-step. Grouped so
+/// the easily-swapped bm/bn and wm/wn are named at the call site; `Default` is the production config.
+#[derive(Copy, Clone, Debug)]
+pub struct Tiling {
+    pub bm: usize,
+    pub bn: usize,
+    pub wm: usize,
+    pub wn: usize,
+    pub k_step: usize,
+}
+
+impl Default for Tiling {
+    fn default() -> Self {
+        Tiling { bm: 128, bn: 64, wm: 2, wn: 4, k_step: 64 } // the §5c HK config
+    }
+}
+
+/// The **clustered HK replica** (DESIGN §5c): a 256²-tile stages=2 overlap whose steady body is
+/// decomposed into the 8-cluster memory/compute
+/// sequence with ALL scheduling placed by the [`crate::pipeline`] driver — the per-cluster `sched_fence(0)` then
+/// `s_barrier` boundary, the `set_prio` compute brackets, and the warp-phase ping-pong (one
+/// asymmetric `wave_barrier` per warp-row). Use HK's tiling `(bm=128, bn=64, wm=2, wn=4, k_step=64)`
+/// so `warp_row = warp/4` in `{0,1}` gives the two phase groups. Balance is verified at build.
+///
+/// **K-blocked, LDS-staged, block-tiled** (DESIGN.md §5b step 1b-ii — the occupancy win): the A/B
+/// strips are re-staged **per K-fragment inside the K-loop** (`k_step`) instead of the whole K at once
+/// — so the LDS footprint is a tiny `(bm·k_step + k_step·bn)·2` bytes **independent of K**, keeping
+/// occupancy high at any K. The single LDS buffer is reused every iteration, so each K-block needs two
+/// workgroup barriers (mirroring tk's `gemm_core`): a **RAW** fence after the fill (reads see the staged
+/// data) and a **WAR** fence after the LDS reads (the next fill must not overwrite until every lane
+/// finished reading). `m/n` multiples of `bm·wm`/`bn·wn`; `bm/bn/k` multiples of 16. Emits the LDS
+/// addressing through [`Builder::lds_col`], so the flat layout is the base; `.apply(`[`SwizzlePass`](crate::passes::SwizzlePass)`)`
+/// turns it into the bank-swizzled one — the swizzle is a **composable refinement**, not hand-woven
+/// here (bm/bn/k_step ∈ {16,32,64} for the single-subtile swizzle).
+#[allow(clippy::needless_range_loop)]
+pub fn matmul_lds_kblock_mw_clustered(m: usize, n: usize, k: usize, t: Tiling) -> Program {
+    let Tiling { bm, bn, wm, wn, k_step } = t;
     assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
     assert!(k_step.is_multiple_of(EDGE) && k.is_multiple_of(k_step), "k_step multiple of 16, K multiple of k_step");
     assert!(wm >= 1 && wn >= 1, "at least one warp per axis");
@@ -370,11 +390,13 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, wm: usize, wn
             &accs,
             &inited,
             warp_row,
-            true,
-            false,
-            CommitDrain::AsmDeferred,
-            true,
-            false,
+            Sched {
+                asm_gather: true,
+                resident: false,
+                commit_drain: CommitDrain::AsmDeferred,
+                bare_seals: true,
+                pin_mfma: false,
+            },
             hooks,
         )
         .cluster(Mem::builder().prefetch([0]).gathers([0]).build()) // C0: load A, gather slice 0
@@ -410,24 +432,4 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, wm: usize, wn
     let (ir, sink) = b.finish(&roots);
     // The wave-phase balance + carry-completeness are verified inside `Pipeline::build` (§5c/3c).
     Program { ir, sink, name: "tk2_matmul_kblock".into() }
-}
-
-/// The **clustered HK replica** (DESIGN §5c): a 256²-tile stages=2 overlap whose steady body is
-/// decomposed into the 8-cluster memory/compute
-/// sequence with ALL scheduling placed by the [`crate::pipeline`] driver — the per-cluster `sched_fence(0)` then
-/// `s_barrier` boundary, the `set_prio` compute brackets, and the warp-phase ping-pong (one
-/// asymmetric `wave_barrier` per warp-row). Use HK's tiling `(bm=128, bn=64, wm=2, wn=4, k_step=64)`
-/// so `warp_row = warp/4` in `{0,1}` gives the two phase groups. Balance is verified at build.
-#[allow(clippy::too_many_arguments)]
-pub fn matmul_lds_kblock_mw_clustered(
-    m: usize,
-    n: usize,
-    k: usize,
-    bm: usize,
-    bn: usize,
-    wm: usize,
-    wn: usize,
-    k_step: usize,
-) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step)
 }

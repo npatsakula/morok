@@ -9,7 +9,7 @@
 use crate::ir::{TileId, TileIr};
 use crate::kernels::Program;
 use crate::kernels::fa::{flash_attention_fwd, flash_attention_fwd_32};
-use crate::kernels::matmul::matmul_lds_kblock_mw_clustered;
+use crate::kernels::matmul::{Tiling, matmul_lds_kblock_mw_clustered};
 use crate::test::probes::atb_probe;
 use crate::{SwizzlePass, VectorizePass};
 
@@ -49,7 +49,7 @@ fn sig(p: &Program) -> u64 {
 /// the clustered matmul (base + vec+sw) at the bit-exact test's tiling, FA (base + vec+sw), and the
 /// `atb_probe`. Same shapes the device gates use, so a host diff localises what a device gate would.
 fn signatures() -> Vec<(&'static str, u64)> {
-    let mm = || matmul_lds_kblock_mw_clustered(256, 256, 256, 128, 64, 2, 4, 64);
+    let mm = || matmul_lds_kblock_mw_clustered(256, 256, 256, Tiling::default());
     let fa = || flash_attention_fwd(2, 128, 128);
     // FA-32 (the 32×32×8 wide-core FA): the `tile_move::{gather_run, commit_run}` derivation of
     // `Fa32Hooks`'s fragment addressing must leave the emitted IR unchanged. `fa32` is the double-buffered

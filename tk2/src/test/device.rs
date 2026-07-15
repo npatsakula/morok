@@ -54,7 +54,8 @@ fn matmul_clustered_hk_replica_is_bit_exact_on_gfx942() {
 
     // HK tiling: bm=128, bn=64, wm=2, wn=4 (warp_row = warp/4 ∈ {0,1} = the two phase groups).
     for (suffix, apply_passes) in [("base", false), ("vec+sw", true)] {
-        let mut prog = crate::kernels::matmul::matmul_lds_kblock_mw_clustered(m, n, k, 128, 64, 2, 4, 64);
+        let mut prog =
+            crate::kernels::matmul::matmul_lds_kblock_mw_clustered(m, n, k, crate::kernels::matmul::Tiling::default());
         if apply_passes {
             prog = prog.apply(VectorizePass).apply(SwizzlePass);
         }
@@ -482,9 +483,14 @@ fn dump_streaming_isa() {
     std::fs::create_dir_all(&dir).expect("mkdir dump dir");
     let device_spec = Tensor::empty(&[1], DType::Float32).device();
     // HK tiling (bm=128, bn=64, wm=2, wn=4, k_step=64); the production vec+swizzle passes.
-    let prog = crate::kernels::matmul::matmul_lds_kblock_mw_clustered(4096, 4096, 4096, 128, 64, 2, 4, 64)
-        .apply(VectorizePass)
-        .apply(SwizzlePass);
+    let prog = crate::kernels::matmul::matmul_lds_kblock_mw_clustered(
+        4096,
+        4096,
+        4096,
+        crate::kernels::matmul::Tiling::default(),
+    )
+    .apply(VectorizePass)
+    .apply(SwizzlePass);
     let (src, bytes) = crate::launch::compile_artifacts(&prog, &device_spec).expect("compile artifacts");
     std::fs::write(format!("{dir}/streaming.ll"), &src).expect("write ll");
     std::fs::write(format!("{dir}/streaming.co"), &bytes).expect("write co");
@@ -527,8 +533,15 @@ fn dump_fa32_isa() {
 #[ignore]
 fn asm_clustered_kernels_have_zero_spills() {
     let device_spec = Tensor::empty(&[1], DType::Float32).device();
-    let variants =
-        [("clustered", crate::kernels::matmul::matmul_lds_kblock_mw_clustered(4096, 4096, 4096, 128, 64, 2, 4, 64))];
+    let variants = [(
+        "clustered",
+        crate::kernels::matmul::matmul_lds_kblock_mw_clustered(
+            4096,
+            4096,
+            4096,
+            crate::kernels::matmul::Tiling::default(),
+        ),
+    )];
     for (label, prog) in variants {
         let prog = prog.apply(VectorizePass).apply(SwizzlePass);
         let (_src, bytes) = launch::compile_artifacts(&prog, &device_spec).expect("compile clustered kernel");
