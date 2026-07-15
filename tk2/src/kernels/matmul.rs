@@ -15,7 +15,7 @@ use crate::ir::TileId;
 use crate::pipeline::{BlockCounter, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 use crate::tile::{ARow, BCol};
-use crate::tile_move::{commit, commit_asm, gather, prefetch};
+use crate::tile_move::{commit_asm, gather, prefetch};
 
 /// The register-staged fill bundle carried between the pipeline's prefetch and commit: A's and
 /// B's b64/b128 chunks held in VGPRs. Since B is taken **`[N,K]`** (HK's pre-transposed layout), its
@@ -62,12 +62,6 @@ struct MatmulHooks {
     bn: usize,
     warp_row_off: Option<Idx>,
     warp_col_off: Option<Idx>,
-    /// The gather's arch dispatch (gfx942 `ds_read_b64` vs the scalar intrinsic).
-    asm_gather: bool,
-    /// Phase C: HK's waitcnt-opaque `asm ds_write_b64` commit + an EXPOSED manual drain. When set, the
-    /// commit emits asm writes chained A→B into ONE prev chain (via `tile_move::commit_asm`'s `prev0`),
-    /// and the pipeline owns the drain (the RAW barrier can't auto-drain the asm).
-    asm_commit: bool,
 }
 
 impl Hooks for MatmulHooks {
@@ -129,66 +123,39 @@ impl Hooks for MatmulHooks {
     }
 
     fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &FillRegs, war: &[TileId]) -> Vec<Effect> {
-        if self.asm_commit {
-            // Asm commit (§5c): chain A then B writes into ONE `prev` chain (thread A's tail into B) so a
-            // single drain reaches BOTH. Return the WRITE effects (last = `fill.last()`) — the pipeline
-            // combinator owns the drain now (`CommitDrain`: exposed at C6, or deferred to C7's tail), since
-            // the RAW barrier can't auto-drain the waitcnt-opaque asm and WHERE it drains is the schedule.
-            let fa = commit_asm(
-                b,
-                self.a_smem,
-                self.k_step,
-                self.a_src,
-                self.grow,
-                self.epl_a,
-                self.tid,
-                self.origin_a,
-                &reg.a,
-                war,
-                None,
-            );
-            let a_last = fa.last().map(|e| e.dep());
-            let fb = commit_asm(
-                b,
-                self.b_smem,
-                self.k_step,
-                self.b_src,
-                self.grow,
-                self.epl_b,
-                self.tid,
-                self.origin_b,
-                &reg.b,
-                war,
-                a_last,
-            );
-            fa.into_iter().chain(fb).collect()
-        } else {
-            let fa = commit(
-                b,
-                self.a_smem,
-                self.k_step,
-                self.a_src,
-                self.grow,
-                self.epl_a,
-                self.tid,
-                self.origin_a,
-                &reg.a,
-                war,
-            );
-            let fb = commit(
-                b,
-                self.b_smem,
-                self.k_step,
-                self.b_src,
-                self.grow,
-                self.epl_b,
-                self.tid,
-                self.origin_b,
-                &reg.b,
-                war,
-            );
-            fa.into_iter().chain(fb).collect()
-        }
+        // HK's waitcnt-opaque asm `ds_write_b64` commit (§5c — the only commit path; the production config
+        // bake fixed the clustered kernel to asm, so there is no intrinsic fallback). Chain A then B writes
+        // into ONE `prev` chain (thread A's tail into B) so a single drain reaches BOTH; return the WRITE
+        // effects — the pipeline owns the drain (`CommitDrain::AsmDeferred`, since the RAW barrier can't
+        // auto-drain the waitcnt-opaque asm and WHERE it drains is the schedule).
+        let fa = commit_asm(
+            b,
+            self.a_smem,
+            self.k_step,
+            self.a_src,
+            self.grow,
+            self.epl_a,
+            self.tid,
+            self.origin_a,
+            &reg.a,
+            war,
+            None,
+        );
+        let a_last = fa.last().map(|e| e.dep());
+        let fb = commit_asm(
+            b,
+            self.b_smem,
+            self.k_step,
+            self.b_src,
+            self.grow,
+            self.epl_b,
+            self.tid,
+            self.origin_b,
+            &reg.b,
+            war,
+            a_last,
+        );
+        fa.into_iter().chain(fb).collect()
     }
 
     fn gather(
@@ -198,9 +165,9 @@ impl Hooks for MatmulHooks {
         _block: BlockCounter,
         raw: &[TileId],
     ) -> (Self::Op, Vec<TileId>, TileId) {
-        // One gather per operand at K-slice `slice`, via `tile_move::gather`: the `asm_gather` flag
-        // dispatches the `ds_read_b64` asm gather vs the scalar fallback, and (asm ⇒ straight) routes B's
-        // Col map through the STRAIGHT contiguous gather, not the FA register-transpose. A = ARow over
+        // One gather per operand at K-slice `slice`, via `tile_move::gather` in its asm `ds_read_b64` form
+        // (the production path — the `true` below; asm ⇒ straight, so B's Col map routes through the
+        // STRAIGHT contiguous gather, not the FA register-transpose). A = ARow over
         // `(bm, EDGE)` → `ri` frags; B = BCol over `(EDGE, bn)` → `cj` frags — `n_frags` derived by role.
         let mut gathers: Vec<TileId> = Vec::new();
         let (a_vecs, ga) = gather::<BF16, ARow, Mfma16x16x16Bf16>(
@@ -213,7 +180,7 @@ impl Hooks for MatmulHooks {
             self.wlane,
             raw,
             slice,
-            self.asm_gather,
+            true,
         );
         let (b_vecs, gb) = gather::<BF16, BCol, Mfma16x16x16Bf16>(
             b,
@@ -225,7 +192,7 @@ impl Hooks for MatmulHooks {
             self.wlane,
             raw,
             slice,
-            self.asm_gather,
+            true,
         );
         gathers.extend(ga);
         gathers.extend(gb);
@@ -402,8 +369,6 @@ fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, wm: usize, wn
             bn,
             warp_row_off,
             warp_col_off,
-            asm_gather: true,
-            asm_commit: true,
         };
         // The compute clusters carry the kernel math (the `ri×cj` MFMA loop) as an edge-free `body` —
         // the combinator brackets it with `set_prio` + the acc round-trip. This is what makes the
