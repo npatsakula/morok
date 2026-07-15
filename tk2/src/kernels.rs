@@ -7,8 +7,7 @@
 //!   correctness and speed: it pins the LDS reads/writes so the single-buffer commit can't race a
 //!   ping-pong-lagged read (the intrinsic "asm-free" variant could not be made race-safe — LLVM
 //!   reschedules compiler-visible LDS ops past any authored barrier/drain), and it keeps the 32-MFMA
-//!   run unbroken. The hand-inline reference at the same ceiling is [`crate::hk`] (`hk/gemm.rs`, 638 TF),
-//!   which rides the typed [`crate::schedule::pipeline`] driver with the same asm emission.
+//!   run unbroken.
 
 use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId, TileIr};

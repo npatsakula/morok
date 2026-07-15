@@ -328,7 +328,7 @@ pub enum Node {
     /// (`"ds_read_b64 $0, $1 offset:$2\0A", "=v,v,i,~{memory}"(i32 addr, i64 off)` → `i64` result,
     /// bitcast to `<ept×bf16>`) — an i32 raw-address operand, the offset as an `i` immediate operand,
     /// and a `~{memory}` clobber, matching `hk-micro_tk.ll`. The default form (existing clustered
-    /// kernel) is byte-unchanged; the [`crate::hk`] port uses the flagged form.
+    /// kernel) is byte-unchanged; the HK port uses the flagged form.
     DsReadB64 { base_ptr: TileId, off_bytes: i64, ept: usize, dtype: DType, prev: Option<TileId>, hk_form: bool },
     /// The **buffer-resource descriptor** (`ptr addrspace(8)`) of a global buffer — `make.buffer.rsrc.p0`
     /// of `&buf[base_off]`; `num_bytes` = the buffer byte-extent (the SRD bound), config `0x110000` (HK's
@@ -371,7 +371,7 @@ pub enum Node {
     /// (`"ds_write_b64 $0, $1\0A", "v,v,~{memory}"(i32 addr, i64 val)` — an i32 raw-address operand
     /// with the offset folded into the address (NO `offset:` immediate), an `i64` value, and a
     /// `~{memory}` clobber, matching `hk-micro_tk.ll`). The default form (clustered kernel) is
-    /// byte-unchanged; the [`crate::hk`] port uses the flagged form.
+    /// byte-unchanged; the HK port uses the flagged form.
     DsWriteB64 { base_ptr: TileId, off_bytes: i64, value: TileId, ept: usize, prev: Option<TileId>, hk_form: bool },
     /// The **manual LDS drain** (`s_waitcnt lgkmcnt(0)`, gfx942 §5c): a void `asm sideeffect` that
     /// stalls until every outstanding LDS op completes — the EXPOSED drain the [`Node::DsWriteB64`]
@@ -382,31 +382,31 @@ pub enum Node {
     /// The **VMEM drain** (`s_waitcnt vmcnt(0)`, gfx942) — the [`Node::SWaitLgkmcnt`] twin for the
     /// global-load half of HipKittens' cooperative `G::load` (drain the `buffer_load`/`global_load`
     /// before the LDS commit). A void `asm sideeffect`; `prev` (the last load) pins it after the
-    /// loads in program order (ordering-only). An EFFECT. Used only by the [`crate::hk`] port.
+    /// loads in program order (ordering-only). An EFFECT. Used only by the HK port.
     SWaitVmcnt { prev: TileId },
     /// **`ptrtoint ptr addrspace(3) → i32`** of an [`Node::LdsPtrAs3`] base — the raw i32 LDS byte
     /// address HipKittens' `ds_read_b64`/`ds_write_b64` asm takes as its `v` address operand (the
     /// oracle's `i32 %262`, not a typed pointer). Feeds the `hk_form` [`Node::DsReadB64`]/
-    /// [`Node::DsWriteB64`]. Used only by the [`crate::hk`] port.
+    /// [`Node::DsWriteB64`]. Used only by the HK port.
     PtrToI32 { ptr: TileId },
     /// The **legacy `<4 x i32>` buffer-resource descriptor** (HipKittens' `make_srsrc`, `st.cuh`):
     /// `ptrtoint`→`bitcast i64→<2×i32>`→`shufflevector`→insert w3 = `1114112` (0x110000) + w2 =
     /// `num_bytes` (the range) — the SRD `{ptr, range, 0x110000}` the oracle's
     /// `raw.buffer.load.i128` consumes, distinct from the p0 [`Node::MakeBufferRsrc`]
     /// (`make.buffer.rsrc.p0`) the existing kernels use. Lowers to the multi-instruction SRD chain
-    /// producing an `<4 x i32>` value. Used only by the [`crate::hk`] port (GAP-1).
+    /// producing an `<4 x i32>` value. Used only by the HK port (GAP-1).
     MakeSrsrc { buf: TileId, base_off: TileId, num_bytes: i64 },
     /// ONE **`llvm.amdgcn.raw.buffer.load.i128`** MUBUF load over a legacy `<4 x i32>` SRD
     /// ([`Node::MakeSrsrc`]) — HipKittens' mainloop DRAM prefetch (`load_global_to_register_buffer`).
     /// Reads a 128-bit chunk (`ept` `dtype` elements) at `rsrc[voffset]` bytes (`soffset = 0`),
     /// bitcast `i128 → <ept×dtype>`. `order` are ordering-only anchors (the authoring cluster). The
     /// `.i128` legacy form the oracle emits, NOT the p0 `raw.ptr.buffer.load.v4i32`
-    /// ([`Node::BufferLoadRaw`]) the existing kernels use. Used only by the [`crate::hk`] port (GAP-1).
+    /// ([`Node::BufferLoadRaw`]) the existing kernels use. Used only by the HK port (GAP-1).
     BufferLoadI128 { rsrc: TileId, voffset: TileId, ept: usize, dtype: DType, order: Edges },
     /// **fp32 → bf16 truncation** (`bitcast float→i32`; `lshr 16`; `trunc i16`; `bitcast bfloat`) —
     /// HipKittens' `convertor<bf16,float>` = `(uint16_t)(bits(f) >> 16)`, the truncating (NOT
     /// round-to-nearest) C store the oracle emits. tk2's default f32→bf16 cast is RNE, so the
-    /// [`crate::hk`] `store` uses this explicit truncation to match HK's IR + numerics.
+    /// HK `store` uses this explicit truncation to match HK's IR + numerics.
     Bf16Trunc { val: TileId },
     /// A workgroup synchronization barrier (`s.barrier`): `body` (a store) passes
     /// through as the effect, and every write in `deps` is fenced — all must complete

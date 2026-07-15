@@ -2,7 +2,6 @@
 
 mod byte_identity;
 mod device;
-mod hk_ir;
 mod lower;
 mod pass;
 mod tile;

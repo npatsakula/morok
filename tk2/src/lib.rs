@@ -7,20 +7,19 @@
 //! - [`ir`] — the interned, hash-consed tile-IR ADT (§1-§2): ONE DAG carrying algorithm + schedule
 //!   as data, with ordering as first-class edges. [`build`] is the typed builder over it.
 //! - [`movement`] — the `LdsView`/`LdsStage`/`SharedTile` handles carrying LDS addressing as data.
-//! - [`schedule`] — the typed cluster-pipeline driver (`schedule::pipeline` + the 8-wave ping-pong)
-//!   backing the hand-inline [`hk`] clone; [`pipeline`] is the declarative combinator form backing the
-//!   asm `clustered` kernel.
+//! - [`schedule`] — the [`schedule::verify_v2`] scheduling-coherence verifier (the correctness/
+//!   scheduling-split teeth); [`pipeline`] is the declarative combinator form backing the asm
+//!   `clustered` kernel.
 //! - [`pass`]/[`passes`] — the strategy-combinator runner + the `.apply`-able [`SwizzlePass`]/
 //!   [`VectorizePass`] refinements.
 //! - [`lower`] — the verified lowering to a device-UOp SINK → svod's `do_linearize → type_verify →
 //!   render` path (§D); [`launch`] dispatches on device.
 //!
-//! [`kernels`] keeps the asm `clustered` HK matmul; [`hk`] is the hand-inline reference at the ceiling.
+//! [`kernels`] keeps the asm `clustered` HK matmul.
 
 pub mod build;
 pub mod error;
 pub mod graph;
-pub mod hk;
 pub mod ir;
 pub mod kernels;
 pub mod kernels_fa;
@@ -42,10 +41,6 @@ pub use ir::{Node, TileId, TileIr};
 pub use kernels::{Program, matmul_lds_kblock_mw_clustered};
 pub use pass::{Band, Fold, Pass, Pipeline, Strategy};
 pub use passes::{SwizzlePass, VectorizePass};
-pub use schedule::{
-    Carry, Committed, ComputeScope, Gathered, InFlight, MemScope, PipelineCx, SteadyOut, compute_cluster, mem_cluster,
-    pipeline,
-};
 pub use shape::{Mfma16x16x16Bf16, Mfma32x32x8Bf16, MfmaShape};
 
 #[cfg(test)]
