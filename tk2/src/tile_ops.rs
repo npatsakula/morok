@@ -45,3 +45,11 @@ pub fn relayout<S: MfmaShape>(b: &mut Builder, p: Val<F32>) -> Vec<Val<BF16>> {
         (m, n, k) => panic!("relayout: no P→PV mechanism for shape {m}×{n}×{k}"),
     }
 }
+
+/// Broadcast scalar `v` across the `S::EPT_C`-wide accumulator vector — the softmax scale/zero splat
+/// (`(0..EPT_C).map(|_| v)` → `vec_build`). The width is the shape's accumulator EPT, not a threaded
+/// const, so it can't be applied at the wrong width.
+pub fn splat<S: MfmaShape>(b: &mut Builder, v: Val<F32>) -> Val<F32> {
+    let cs: Vec<Val<F32>> = (0..S::EPT_C).map(|_| v).collect();
+    b.vec_build(&cs)
+}

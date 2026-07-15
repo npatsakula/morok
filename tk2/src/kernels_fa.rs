@@ -1108,8 +1108,7 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     let scale = std::f32::consts::LOG2_E / (d as f32).sqrt();
     let scale_bcast = {
         let c = b.f32(scale);
-        let cs: Vec<Val<F32>> = (0..S::EPT_C).map(|_| c).collect();
-        b.vec_build(&cs)
+        crate::tile_ops::splat::<S>(&mut b, c)
     };
 
     // ── the heterogeneous slot set (DESIGN §3.2). CARRIED: `o_0..o_{dtiles-1}` (16-wide f32 PV acc),
@@ -1147,8 +1146,8 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
         vec![slot_s],
         move |b: &mut Builder, op: Option<&Fa32Op>, _reads: &[SlotVal], _blk: BlockCounter| {
             let k_frags = op.expect("QKᵀ consumes gathered K");
-            let zeros: Vec<Val<F32>> = (0..S::EPT_C).map(|_| b.f32(0.0)).collect();
-            let mut s_acc = b.vec_build(&zeros);
+            let z = b.f32(0.0);
+            let mut s_acc = crate::tile_ops::splat::<S>(b, z);
             for ki in 0..dslices {
                 s_acc = crate::tile_ops::mma::<S>(b, k_frags[ki], q_frags[ki], s_acc);
             }
