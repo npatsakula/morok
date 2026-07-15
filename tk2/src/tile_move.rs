@@ -77,6 +77,121 @@ pub fn gather<E: Elem, L: RegLayout, S: MfmaShape>(
     if map.transpose && !asm { view.gather_transposed(b, deps) } else { view.gather(b, deps) }
 }
 
+/// **`(Reg ← Lds)` — the 32×32×8 contiguous-run operand gather** (the wide-MFMA sibling of [`gather`]).
+/// Each `S::EPT_A`-wide fragment is ONE `ds_read_b64` of a CONTIGUOUS LDS run — the register transpose
+/// the PV `V` needs is done write-side into LDS (see [`commit_run`]), so BOTH K and V read STRAIGHT here
+/// (unlike [`gather`]'s per-element scalar/asm read + the transposed-`V` register transpose). The whole
+/// address is derived from the tile TYPES: the operand [`FragMap`] + `EPT_A` from `S`, the
+/// `(tile_rows/M)×(tile_cols/K)` fragment tiling with per-fragment tile-offset `(rt·M, ct·K)` from the
+/// [`ARow`](crate::tile::ARow) role, and the swizzle (`lds_col` vs plain) from `Sw` — so K (`Xor`) reads
+/// through the bank-swizzle hole and V (`Plain`, padded `inner` pitch) reads flat. `row`/`col` are the
+/// lane partition `lane_rc(S::a_map(), lane, 0)` (supplied once by the kernel as `q_in`/`half_off`);
+/// `parity` is the block-dependent double-buffer element offset (`0` when single-buffered). Returns one
+/// operand `Val` and one store-fence token per fragment (the WAR-barrier contract, as [`gather`]).
+#[allow(clippy::too_many_arguments)]
+pub fn gather_run<E: Elem, Sw: Swizzle, S: MfmaShape>(
+    b: &mut Builder,
+    src: Lds<E>,
+    inner: usize,
+    tile_rows: usize,
+    tile_cols: usize,
+    row: Idx,
+    col: Idx,
+    parity: Idx,
+    raw: &[TileId],
+) -> (Vec<Val<E>>, Vec<TileId>) {
+    let map = S::a_map();
+    let swizzled = !Sw::layout(inner).transforms.is_empty();
+    let inner_c = b.idx_const(inner as i64);
+    let (rt_n, ct_n) = (tile_rows / S::M, tile_cols / S::K);
+    let mut vecs = Vec::with_capacity(rt_n * ct_n);
+    let mut gathers = Vec::with_capacity(rt_n * ct_n);
+    for rt in 0..rt_n {
+        for ct in 0..ct_n {
+            let row_full = offset_by(b, row, rt * S::M); // rt·M (0 for a single-M-tile operand, e.g. K)
+            let base = if swizzled {
+                // Natural tile (K): col-offset → swizzle hole → row·inner (matches the hand-rolled order).
+                let col_full = offset_by(b, col, ct * S::K);
+                let col_part = b.lds_col(row_full, col_full, inner);
+                let ri = b.idx_mul(row_full, inner_c);
+                let base = b.idx_add(ri, col_part);
+                b.idx_add(base, parity)
+            } else {
+                // Transposed padded tile (V): row·inner → col-offset (no swizzle; the pad breaks conflicts).
+                let ri = b.idx_mul(row_full, inner_c);
+                let col_full = offset_by(b, col, ct * S::K);
+                let base = b.idx_add(ri, col_full);
+                b.idx_add(base, parity)
+            };
+            // One `ds_read_b64` of the contiguous `EPT_A` run, round-tripped through a fragment so the WAR
+            // barrier gets a proper store token (SROA elides the store/load into a straight operand).
+            let v = b.load_lds_vec_after(src, base, S::EPT_A, raw);
+            let frag = b.define_frag::<E>(map);
+            let st = b.store_frag_vec(frag, v).dep();
+            gathers.push(st);
+            vecs.push(b.load_frag_vec_after(frag, &[st]));
+        }
+    }
+    (vecs, gathers)
+}
+
+/// **`(Lds ← Reg)` — FA-32's fused K/V staged commit** (the wide-MFMA sibling of [`commit`]). Writes the
+/// prefetched `gvec`-chunks of the next block into BOTH shared tiles in ONE interleaved pass: K NATURAL
+/// `[kv, d]` through its swizzle hole (`SwK`), V TRANSPOSED to `[d, kv]` at the padded `vt_pitch`
+/// (`SwV`). Both destinations decode the SAME source `[kv, d]` chunk (`flat → (kv, d_base)`), so the
+/// index math is shared and the two stores stay interleaved (the emission the pipeline's RAW barrier
+/// fences); the per-tile layout (swizzle / transpose / pitch) is DERIVED from the tile types. `k_lds`/
+/// `vt_lds` are the caller's (already WAR-ordered) LDS handles; `k_parity`/`vt_parity` the block-dependent
+/// double-buffer element offsets (`0` when single-buffered). Scalar `store_lds` (the coalesced write is a
+/// fill refinement the barrier-bound kernel doesn't need). Returns the store effects the RAW barrier fences.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_run<E: Elem, SwK: Swizzle, SwV: Swizzle>(
+    b: &mut Builder,
+    k_lds: Lds<E>,
+    k_cols: usize,
+    vt_lds: Lds<E>,
+    vt_pitch: usize,
+    k_chunks: &[Val<E>],
+    v_chunks: &[Val<E>],
+    epl: usize,
+    tid: Idx,
+    k_parity: Idx,
+    vt_parity: Idx,
+) -> Vec<Effect> {
+    let swiz_k = !SwK::layout(k_cols).transforms.is_empty();
+    let swiz_v = !SwV::layout(vt_pitch).transforms.is_empty();
+    let gvec = if epl.is_multiple_of(8) { 8 } else { 4 };
+    let epl_c = b.idx_const(epl as i64);
+    let lane_epl = b.idx_mul(tid, epl_c);
+    let d_c = b.idx_const(k_cols as i64);
+    let pitch_c = b.idx_const(vt_pitch as i64);
+    let mut effs = Vec::with_capacity(2 * epl);
+    for cg in 0..epl / gvec {
+        let flat = offset_by(b, lane_epl, cg * gvec);
+        let kv = b.idx_div(flat, d_c);
+        let d_base = b.idx_mod(flat, d_c);
+        let kv_row = b.idx_mul(kv, d_c);
+        let (kchunk, vchunk) = (k_chunks[cg], v_chunks[cg]);
+        for j in 0..gvec {
+            let d_idx = offset_by(b, d_base, j);
+            // K natural [kv, d] through the swizzle hole.
+            let k_col = if swiz_k { b.lds_col(kv, d_idx, k_cols) } else { d_idx };
+            let k_dst = b.idx_add(kv_row, k_col);
+            let k_dst = b.idx_add(k_dst, k_parity);
+            let kval = b.vec_extract(kchunk, j);
+            effs.push(b.store_lds(k_lds, k_dst, kval));
+            // V transposed [d, kv] at the padded pitch.
+            let v_row = b.idx_mul(d_idx, pitch_c);
+            let v_col = if swiz_v { b.lds_col(d_idx, kv, vt_pitch) } else { kv };
+            let v_dst = b.idx_add(v_row, v_col);
+            let v_dst = b.idx_add(v_dst, vt_parity);
+            let vval = b.vec_extract(vchunk, j);
+            effs.push(b.store_lds(vt_lds, v_dst, vval));
+        }
+    }
+    effs
+}
+
 /// **`(Reg ← Global)` — the register-staged prefetch.** Issues the coalesced global loads for the
 /// `dst` LDS tile's share, staging them in VGPRs (no LDS write yet); pair with [`commit`]. `grow_stride`
 /// is the global row stride, `epl` the per-lane element run, `origin` the tile's row base, `k_base` the

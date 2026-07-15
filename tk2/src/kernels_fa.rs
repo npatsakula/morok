@@ -30,8 +30,8 @@ use crate::ir::{FragMap, TileId};
 use crate::kernels::{EDGE, Program, offset_by};
 use crate::pipeline::{AccSlot, BlockCounter, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
-use crate::tile::{ARow, BCol};
-use crate::tile_move::{commit, gather, prefetch};
+use crate::tile::{ARow, BCol, Plain, Xor};
+use crate::tile_move::{commit, commit_run, gather, gather_run, prefetch};
 
 const WARP: usize = 64;
 /// Warps per workgroup for the multi-warp split-Q FA (§1.2): 8 warps × 64 lanes = 512 threads. Each
@@ -829,14 +829,14 @@ struct Fa32Hooks {
     /// The collaborative fill thread id (all `nthreads`) and its per-thread element run `epl`.
     tid: Idx,
     epl: usize,
-    /// The per-warp gather axis parts: `q_in = wlane % 32` (kv/d-in-tile), `half_off = (wlane/32)·4`.
+    /// The per-warp gather axis parts: `q_in = wlane % 32` (kv/d-in-tile), `half_off = (wlane/32)·4` —
+    /// i.e. `lane_rc(S::a_map(), wlane, 0)`, the `(row, col)` the derived [`gather_run`] addresses with.
+    /// The fragment count / per-fragment tile-offsets are DERIVED from the tile dims (`d`/`pitch` +
+    /// `KV_BLK_32`/`S::M`), so `dslices`/`dtiles`/`ksl` no longer ride the struct.
     q_in: Idx,
     half_off: Idx,
     d: usize,
     pitch: usize,
-    dslices: usize,
-    dtiles: usize,
-    ksl: usize,
 }
 
 impl Fa32Hooks {
@@ -900,49 +900,23 @@ impl Hooks for Fa32Hooks {
     }
 
     fn commit(&mut self, b: &mut Builder, k_base: Idx, reg: &Fa32Fill, war: &[TileId]) -> Vec<Effect> {
-        // VGPR→LDS behind the WAR barrier. Each prefetched `gvec`-chunk covers `gvec` contiguous d in ONE
-        // `kv` row (`flat = tid·epl + cg·gvec → (kv, d_base)`, block-relative). Writes are SCALAR: K natural
-        // `[kv, d]` through the swizzle hole (`lds_col(kv, …, d)`), V transposed `[d, kv]` at padded pitch.
-        // (A coalesced b64 K write regressed d=64 — a vec_build overhead the barrier-bound kernel doesn't
-        // amortise; aiter's v_perm-deinterleaved coalesced V write is a fill refinement the non-fill-bound
-        // FA-32 doesn't need. The measured 2c win is the b128 coalesced global LOAD, not the LDS store.)
+        // VGPR→LDS behind the WAR barrier via the derived fused K/V commit. The block-dependent runtime
+        // params stay in the hook: the WAR `lds_after` re-bind and the Lever-3 double-buffer parity —
+        // commit writes block k+1 → parity `(k+1)%2` (`k_base = (k+1)·k_step`, so the committed block index
+        // is `k_base / k_step`; its parity offset selects the write half, 0 when single-buffered). The
+        // K-natural-swizzled + V-transposed-padded addressing (and the SCALAR `store_lds` — a coalesced
+        // write regressed the barrier-bound kernel) is derived by `commit_run` from the K (`Xor`) / V
+        // (`Plain`, padded `pitch`) tile types.
         let k_lds = if war.is_empty() { self.k_lds } else { b.lds_after(self.k_lds, war) };
         let vt_lds = if war.is_empty() { self.vt_lds } else { b.lds_after(self.vt_lds, war) };
-        // Lever-3: commit writes block k+1 → parity `(k+1)%2`. `k_base = (k+1)·k_step`, so the committed
-        // block index is `k_base / k_step`; its parity offset selects the write half (0 when single-buffered).
         let (k_off, vt_off) = {
             let kstep = b.idx_const((KV_BLK_32 * self.d) as i64);
             let blk1 = b.idx_div(k_base, kstep);
             self.parity_off(b, blk1)
         };
-        let gvec = if self.epl.is_multiple_of(8) { 8 } else { 4 };
-        let epl_c = b.idx_const(self.epl as i64);
-        let lane_epl = b.idx_mul(self.tid, epl_c);
-        let d_c = b.idx_const(self.d as i64);
-        let pitch_c = b.idx_const(self.pitch as i64);
-        let mut effs = Vec::with_capacity(2 * self.epl);
-        for cg in 0..self.epl / gvec {
-            let flat = offset_by(b, lane_epl, cg * gvec);
-            let kv = b.idx_div(flat, d_c);
-            let d_base = b.idx_mod(flat, d_c);
-            let kv_row = b.idx_mul(kv, d_c);
-            let (kchunk, vchunk) = (reg.k[cg], reg.v[cg]);
-            for j in 0..gvec {
-                let d_idx = offset_by(b, d_base, j);
-                // K natural [kv, d] through the swizzle hole; V transposed [d, kv] with padded pitch.
-                let k_col = b.lds_col(kv, d_idx, self.d);
-                let k_dst = b.idx_add(kv_row, k_col);
-                let k_dst = b.idx_add(k_dst, k_off); // double-buffer parity half (0 when off)
-                let kval = b.vec_extract(kchunk, j);
-                effs.push(b.store_lds(k_lds, k_dst, kval));
-                let v_dst = b.idx_mul(d_idx, pitch_c);
-                let v_dst = b.idx_add(v_dst, kv);
-                let v_dst = b.idx_add(v_dst, vt_off);
-                let vval = b.vec_extract(vchunk, j);
-                effs.push(b.store_lds(vt_lds, v_dst, vval));
-            }
-        }
-        effs
+        commit_run::<BF16, Xor, Plain>(
+            b, k_lds, self.d, vt_lds, self.pitch, &reg.k, &reg.v, self.epl, self.tid, k_off, vt_off,
+        )
     }
 
     fn gather(
@@ -953,53 +927,32 @@ impl Hooks for Fa32Hooks {
         raw: &[TileId],
     ) -> (Fa32Op, Vec<TileId>, TileId) {
         use crate::shape::Mfma32x32x8Bf16 as S;
-        let d_c = b.idx_const(self.d as i64);
-        let pitch_c = b.idx_const(self.pitch as i64);
-        // Lever-3: gather reads block k → parity `k%2` selects the read half (0 when single-buffered).
+        // Lever-3: gather reads block k → parity `k%2` selects the read half (0 when single-buffered) —
+        // the one genuinely block-dependent runtime param, so it stays in the hook.
         let (k_off, vt_off) = {
             let blk = block.idx(b);
             self.parity_off(b, blk)
         };
-        // Read each contiguous `EPT_A` LDS run, then round-trip through a fragment so the WAR barrier gets
-        // a proper store token (the gather contract; SROA elides the store/load into a straight operand).
-        let read = |b: &mut Builder, lds: Lds<BF16>, base: Idx, gathers: &mut Vec<TileId>| -> Val<BF16> {
-            let v = b.load_lds_vec_after(lds, base, S::EPT_A, raw);
-            let frag = b.define_frag::<BF16>(S::a_map());
-            let st = b.store_frag_vec(frag, v).dep();
-            gathers.push(st);
-            b.load_frag_vec_after(frag, &[st])
-        };
-        let mut vecs = Vec::new();
-        let mut gathers = Vec::new();
-        match slice {
-            // K A-operand: k_lds[kv = q_in, d = ki·8 + half_off .. +4] (contiguous), `dslices` of them.
-            // The 4-run start `col_base` is 4-aligned and the swizzle `delta(row)` is 4-aligned (d ∈
-            // {64,128}), so the swizzled base + [0..4) stays the fill's contiguous 4-run — `ds_read_b64` safe.
-            0 => {
-                for ki in 0..self.dslices {
-                    let col_base = offset_by(b, self.half_off, ki * S::K);
-                    let kcol = b.lds_col(self.q_in, col_base, self.d);
-                    let base = b.idx_mul(self.q_in, d_c);
-                    let base = b.idx_add(base, kcol);
-                    let base = b.idx_add(base, k_off);
-                    vecs.push(read(b, self.k_lds, base, &mut gathers));
-                }
-            }
-            // V A-operand: vt_lds[d = dt·32 + q_in, kv = s·8 + half_off .. +4] (contiguous), `dtiles·ksl`.
-            1 => {
-                for dt in 0..self.dtiles {
-                    for s in 0..self.ksl {
-                        let d_row = offset_by(b, self.q_in, dt * S::M);
-                        let base = b.idx_mul(d_row, pitch_c);
-                        let kvcol = offset_by(b, self.half_off, s * S::K);
-                        let base = b.idx_add(base, kvcol);
-                        let base = b.idx_add(base, vt_off);
-                        vecs.push(read(b, self.vt_lds, base, &mut gathers));
-                    }
-                }
-            }
+        // The contiguous-run addressing is DERIVED by `gather_run` from the ARow role + the tile types: K is
+        // the natural `[kv=32, d]` `Xor`-swizzled tile (`dslices = d/8` col-fragments), V the transposed
+        // `[d, kv=32]` `Plain` padded-pitch tile (`dtiles·ksl` fragments). `q_in`/`half_off` = the lane
+        // partition `lane_rc(S::a_map(), wlane, 0)`; the 4-run start stays 4-aligned so the swizzled K read
+        // remains a contiguous `ds_read_b64`.
+        let (vecs, gathers) = match slice {
+            0 => gather_run::<BF16, Xor, S>(b, self.k_lds, self.d, S::M, self.d, self.q_in, self.half_off, k_off, raw),
+            1 => gather_run::<BF16, Plain, S>(
+                b,
+                self.vt_lds,
+                self.pitch,
+                self.d,
+                KV_BLK_32,
+                self.q_in,
+                self.half_off,
+                vt_off,
+                raw,
+            ),
             _ => panic!("FA-32 gather: slice ∈ {{0=K, 1=V}}, got {slice}"),
-        }
+        };
         let anchor = vecs[0].id;
         (vecs, gathers, anchor)
     }
@@ -1291,23 +1244,7 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     );
 
     let bh_row_d = b.idx_mul(bh_row, d_c);
-    let hooks = Fa32Hooks {
-        k,
-        v,
-        k_lds,
-        vt_lds,
-        double_buf,
-        bh_row_d,
-        tid,
-        epl,
-        q_in,
-        half_off,
-        d,
-        pitch,
-        dslices,
-        dtiles,
-        ksl,
-    };
+    let hooks = Fa32Hooks { k, v, k_lds, vt_lds, double_buf, bh_row_d, tid, epl, q_in, half_off, d, pitch };
     let acc_final = pipeline(
         &mut b,
         nblocks,       // nblocks (streaming over KV; ⌈n/kv_blk⌉ — the last block may be ragged)
