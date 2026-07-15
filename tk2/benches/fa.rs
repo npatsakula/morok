@@ -1,5 +1,5 @@
 //! Criterion GPU-device-time bench for the **Flash-Attention forward** kernel
-//! ([`svod_tk2::kernels_fa::flash_attention_fwd`]) on gfx942 — the correct, single-warp FA authored on
+//! ([`svod_tk2::kernels::fa::flash_attention_fwd`]) on gfx942 — the correct, single-warp FA authored on
 //! the ClusterCx pipeline. Modeled on [`super::matmul`]'s harness (shared [`common`]: device-time
 //! stamping, self-skip, `--profile-time` PMC hook).
 //!
@@ -27,7 +27,7 @@ use svod_tensor::Tensor;
 mod common;
 use common::{bench_plan, plan_gpu_ns, rand_bf16, requirements_met};
 
-use svod_tk2::kernels_fa::flash_attention_fwd;
+use svod_tk2::kernels::fa::flash_attention_fwd;
 use svod_tk2::{SwizzlePass, VectorizePass, graph_kernel};
 
 /// FA-forward FLOPs, **non-causal**: `4·B·H·S²·d`. Two matmuls each cost `2·B·H·S²·d` FLOPs

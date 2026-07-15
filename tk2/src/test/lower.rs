@@ -62,7 +62,7 @@ fn matmul_lds_kblock_clustered_lowers_and_balances_the_wave_phase() {
     let count = |p: &crate::Program, pred: &dyn Fn(&Node) -> bool| {
         (0..p.ir.len()).filter(|&i| pred(p.ir.node(crate::ir::TileId(i as u32)))).count()
     };
-    let p = crate::kernels::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64);
+    let p = crate::kernels::matmul::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64);
     lower::verify(&p).expect("clustered HK replica must lower to spec-valid UOp");
     assert!(count(&p, &|n| matches!(n, Node::SetPrio { .. })) > 0, "compute clusters ⇒ SetPrio nodes");
     assert_eq!(count(&p, &|n| matches!(n, Node::WaveBarrier { eq: 1, .. })), 1, "one eq=1 prologue wave barrier");
@@ -70,7 +70,7 @@ fn matmul_lds_kblock_clustered_lowers_and_balances_the_wave_phase() {
     // Composes with the refinement passes: VectorizePass is a no-op on the asm gather (no fusible
     // scalar run), and SwizzlePass folds the (fragment-invariant) XOR delta into the asm base offset's
     // `lds_col` — so the swizzled clustered kernel still lowers spec-valid.
-    let sw = crate::kernels::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64)
+    let sw = crate::kernels::matmul::matmul_lds_kblock_mw_clustered(128, 128, 256, 64, 64, 2, 2, 64)
         .apply(crate::passes::VectorizePass)
         .apply(crate::passes::SwizzlePass);
     lower::verify(&sw).expect("clustered.apply(Vectorize).apply(Swizzle) must lower spec-valid");
@@ -78,7 +78,7 @@ fn matmul_lds_kblock_clustered_lowers_and_balances_the_wave_phase() {
 
 // ── the FA-forward experiment: the ClusterCx pipeline generalised to a second kernel shape ─────
 
-/// The minimal streaming Flash-Attention forward ([`crate::kernels_fa::flash_attention_fwd`])
+/// The minimal streaming Flash-Attention forward ([`crate::kernels::fa::flash_attention_fwd`])
 /// authored on the SAME `pipeline` combinator as the GEMM: `Mem`(gather K,V + prefetch/commit) →
 /// `Compute`(QKᵀ) → `Compute`(online softmax, operand-less) → `Compute`(PV). It must lower to
 /// spec-valid device-UOp — proving the new vocabulary (`exp2`/`recip`/`ds_bpermute` row reductions)
@@ -91,7 +91,7 @@ fn fa_forward_on_clustercx_lowers_spec_valid() {
     };
     // bh=2, 8-warp split-Q, kv_blk=32 (2 KV-frags); Vectorize.then(Swizzle) = the production form (K
     // gather fused to ds_read_b64 + the bank-conflict swizzle fold).
-    let p = crate::kernels_fa::flash_attention_fwd(2, 128, 64)
+    let p = crate::kernels::fa::flash_attention_fwd(2, 128, 64)
         .apply(crate::passes::VectorizePass)
         .apply(crate::passes::SwizzlePass);
     lower::verify(&p).expect("FA-forward on ClusterCx must lower to spec-valid UOp");
@@ -204,7 +204,7 @@ fn mfma_32x32x8_probe_lowers_spec_valid() {
     }
 }
 
-/// A **ragged-`n` FA-32** ([`crate::kernels_fa::flash_attention_fwd_32`]) must lower spec-valid: `n=80`
+/// A **ragged-`n` FA-32** ([`crate::kernels::fa::flash_attention_fwd_32`]) must lower spec-valid: `n=80`
 /// is not a KV-block (32) multiple, so the last KV block is partial and the online softmax carries the
 /// per-element ragged-tail mask (`global_kv < n ? score : −∞`). Proves the new `Node::SelectLt` →
 /// `WHERE(LT,…)` lowering + `type_verify` accept the mask BEFORE the device gate, at `d=64` (2 KV
@@ -213,13 +213,13 @@ fn mfma_32x32x8_probe_lowers_spec_valid() {
 #[test]
 fn fa32_ragged_tail_lowers_spec_valid() {
     for d in [64usize, 128] {
-        let p = crate::kernels_fa::flash_attention_fwd_32(1, 80, d);
+        let p = crate::kernels::fa::flash_attention_fwd_32(1, 80, d);
         let n_sel = (0..p.ir.len())
             .filter(|&i| matches!(p.ir.node(crate::ir::TileId(i as u32)), Node::SelectLt { .. }))
             .count();
         assert!(n_sel > 0, "ragged FA-32 (n=80, d={d}) must emit the SelectLt ragged-tail mask");
         lower::verify(&p).expect("ragged FA-32 must lower spec-valid (base)");
-        let ps = crate::kernels_fa::flash_attention_fwd_32(1, 80, d).apply(crate::SwizzlePass);
+        let ps = crate::kernels::fa::flash_attention_fwd_32(1, 80, d).apply(crate::SwizzlePass);
         lower::verify(&ps).expect("ragged FA-32 must lower spec-valid (swizzled)");
     }
 }

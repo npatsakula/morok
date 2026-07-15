@@ -2,7 +2,8 @@
 //! banded/contract-checked pipeline, and the Elevate strategy combinators.
 
 use crate::ir::{TileId, TileIr};
-use crate::kernels::{Program, matmul_lds_kblock_mw_clustered};
+use crate::kernels::Program;
+use crate::kernels::matmul::matmul_lds_kblock_mw_clustered;
 use crate::pass::{
     AsStrategy, Band, Fail, Id, IdentityFold, IdentityPass, Pass, PassError, Pipeline, Strategy, fold, or_else,
     repeat_fixpoint, seq, top_down, try_,

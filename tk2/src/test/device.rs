@@ -54,7 +54,7 @@ fn matmul_clustered_hk_replica_is_bit_exact_on_gfx942() {
 
     // HK tiling: bm=128, bn=64, wm=2, wn=4 (warp_row = warp/4 ∈ {0,1} = the two phase groups).
     for (suffix, apply_passes) in [("base", false), ("vec+sw", true)] {
-        let mut prog = crate::kernels::matmul_lds_kblock_mw_clustered(m, n, k, 128, 64, 2, 4, 64);
+        let mut prog = crate::kernels::matmul::matmul_lds_kblock_mw_clustered(m, n, k, 128, 64, 2, 4, 64);
         if apply_passes {
             prog = prog.apply(VectorizePass).apply(SwizzlePass);
         }
@@ -330,7 +330,7 @@ fn fa_ref(qf: &[f32], kf: &[f32], vf: &[f32], n: usize, d: usize) -> Vec<f32> {
 }
 
 /// **FA-forward correctness GATE**: the multi-warp (8-warp split-Q), online-softmax FA on the ClusterCx
-/// pipeline ([`crate::kernels_fa::flash_attention_fwd`]) must match the f32 reference (non-causal, same
+/// pipeline ([`crate::kernels::fa::flash_attention_fwd`]) must match the f32 reference (non-causal, same
 /// bf16-rounded operands) at d=64 AND d=128, over `bh > 1` INDEPENDENT attentions (`[bh,n,d]` layout —
 /// this validates the per-(b,h) base addressing on top of the QKᵀ inner-d loop, the two `ds_bpermute`
 /// softmax reductions, the online rescale, and the `mma_atb` P·V). `atol = 0.02·√d`, `rtol = 2e-2`.
@@ -367,7 +367,7 @@ fn flash_attention_matches_reference_on_gfx942() {
         // into `ds_read_b64` — the transposed V gather packs its strided reads into a single
         // `store_frag_vec` (see `LdsView::gather_transposed`), presenting no fusible scalar run, so the
         // pass leaves V bit-exact. SwizzlePass folds the LDS bank swizzle (+82% TF).
-        let prog = crate::kernels_fa::flash_attention_fwd(bh, n, d).apply(VectorizePass).apply(SwizzlePass);
+        let prog = crate::kernels::fa::flash_attention_fwd(bh, n, d).apply(VectorizePass).apply(SwizzlePass);
         let out = Tensor::empty(&[bh * n, d], DType::Float32);
         let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA program");
         let plan = y.prepare().expect("prepare FA");
@@ -379,7 +379,7 @@ fn flash_attention_matches_reference_on_gfx942() {
     }
 }
 
-/// **FA-32 correctness GATE** (§Step 6): the 32×32×8-MFMA FA ([`crate::kernels_fa::flash_attention_fwd_32`],
+/// **FA-32 correctness GATE** (§Step 6): the 32×32×8-MFMA FA ([`crate::kernels::fa::flash_attention_fwd_32`],
 /// kept SEPARATE from the frozen 16×16 FA) must match the SAME f32 reference (non-causal, bf16-rounded
 /// operands) at d=64 AND d=128, over `bh > 1` independent `[bh,n,d]` attentions — validating the assembled
 /// 32×32×8 hot path end-to-end: QKᵀ (`v_mfma_f32_32x32x8`) → `acc_row_reduce_32` online softmax → `v_perm
@@ -424,7 +424,7 @@ fn flash_attention32_matches_reference_on_gfx942() {
         let atol = 1e-2;
         // SwizzlePass folds the K-tile LDS bank swizzle (the as-used tuned path); the gate runs it on to
         // catch any swizzle-layout regression (fill/gather must agree on `lds_col(row, …, d)`).
-        let prog = crate::kernels_fa::flash_attention_fwd_32(bh, n, d).apply(SwizzlePass);
+        let prog = crate::kernels::fa::flash_attention_fwd_32(bh, n, d).apply(SwizzlePass);
         let out = Tensor::empty(&[rows, d], DType::Float32);
         let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA-32 program");
         let plan = y.prepare().expect("prepare FA-32");
@@ -458,7 +458,7 @@ fn fa_forward_launches_on_gfx942() {
     k.realize().expect("realize k");
     v.realize().expect("realize v");
 
-    let prog = crate::kernels_fa::flash_attention_fwd(bh, n, d).apply(VectorizePass).apply(SwizzlePass);
+    let prog = crate::kernels::fa::flash_attention_fwd(bh, n, d).apply(VectorizePass).apply(SwizzlePass);
     let out = Tensor::empty(&[bh * n, d], DType::Float32);
     let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA program");
     let plan = y.prepare().expect("prepare FA");
@@ -482,7 +482,7 @@ fn dump_streaming_isa() {
     std::fs::create_dir_all(&dir).expect("mkdir dump dir");
     let device_spec = Tensor::empty(&[1], DType::Float32).device();
     // HK tiling (bm=128, bn=64, wm=2, wn=4, k_step=64); the production vec+swizzle passes.
-    let prog = crate::kernels::matmul_lds_kblock_mw_clustered(4096, 4096, 4096, 128, 64, 2, 4, 64)
+    let prog = crate::kernels::matmul::matmul_lds_kblock_mw_clustered(4096, 4096, 4096, 128, 64, 2, 4, 64)
         .apply(VectorizePass)
         .apply(SwizzlePass);
     let (src, bytes) = crate::launch::compile_artifacts(&prog, &device_spec).expect("compile artifacts");
@@ -501,7 +501,7 @@ fn dump_fa32_isa() {
     std::fs::create_dir_all(&dir).expect("mkdir dump dir");
     let device_spec = Tensor::empty(&[1], DType::Float32).device();
     for d in [64usize, 128usize] {
-        let prog = crate::kernels_fa::flash_attention_fwd_32(2, 2048, d).apply(SwizzlePass);
+        let prog = crate::kernels::fa::flash_attention_fwd_32(2, 2048, d).apply(SwizzlePass);
         let (src, bytes) = launch::compile_artifacts(&prog, &device_spec).expect("compile FA-32");
         let parsed = svod_device::amd::program::parse_kernel(&bytes, "tk2_fa_fwd_32").expect("parse FA-32");
         std::fs::write(format!("{dir}/fa32_d{d}.ll"), &src).expect("write ll");
@@ -527,7 +527,8 @@ fn dump_fa32_isa() {
 #[ignore]
 fn asm_clustered_kernels_have_zero_spills() {
     let device_spec = Tensor::empty(&[1], DType::Float32).device();
-    let variants = [("clustered", crate::kernels::matmul_lds_kblock_mw_clustered(4096, 4096, 4096, 128, 64, 2, 4, 64))];
+    let variants =
+        [("clustered", crate::kernels::matmul::matmul_lds_kblock_mw_clustered(4096, 4096, 4096, 128, 64, 2, 4, 64))];
     for (label, prog) in variants {
         let prog = prog.apply(VectorizePass).apply(SwizzlePass);
         let (_src, bytes) = launch::compile_artifacts(&prog, &device_spec).expect("compile clustered kernel");

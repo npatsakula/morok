@@ -12,7 +12,7 @@ use crate::build::{Builder, Idx};
 /// rows, each tiled into `tile_rows`-row tiles (one tile per workgroup). For [`flash_attention_fwd_32`]:
 /// `slices = bh` (batch·heads), `rows_per_slice = n` (sequence length), `tile_rows = q_blk`.
 ///
-/// [`flash_attention_fwd_32`]: crate::kernels_fa::flash_attention_fwd_32
+/// [`flash_attention_fwd_32`]: crate::kernels::fa::flash_attention_fwd_32
 #[derive(Copy, Clone, Debug)]
 pub struct RowPartition {
     /// Independent row-blocks (FA: `bh`).

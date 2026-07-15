@@ -1,6 +1,6 @@
 //! **Isolation de-risk probes** — standalone single-warp kernels that each prove ONE building block of
 //! the 32×32×8 / FA pipeline against a device allclose reference. Relocated out of the production
-//! `kernels`/`kernels_fa` modules (they are built ONLY for the device / lower / byte-identity test
+//! `kernels::matmul`/`kernels::fa` modules (they are built ONLY for the device / lower / byte-identity test
 //! gates, never by a kernel or bench). Relocating a probe does NOT change the [`Program`] it builds —
 //! every emitted-IR signature (the `atb_probe` byte-identity gate, the device oracles) is unchanged.
 

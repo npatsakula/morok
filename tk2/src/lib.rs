@@ -15,14 +15,14 @@
 //! - [`lower`] — the verified lowering to a device-UOp SINK → svod's `do_linearize → type_verify →
 //!   render` path (§D); [`launch`] dispatches on device.
 //!
-//! [`kernels`] keeps the asm `clustered` HK matmul.
+//! [`kernels`] holds the device kernels: [`kernels::matmul`] (the asm `clustered` HK matmul) and
+//! [`kernels::fa`] (the Flash-Attention forward kernels).
 
 pub mod build;
 pub mod error;
 pub mod graph;
 pub mod ir;
 pub mod kernels;
-pub mod kernels_fa;
 pub mod launch;
 pub mod lower;
 pub mod partition;
@@ -39,7 +39,8 @@ pub use build::{Builder, Elem, F32};
 pub use error::{Error, Result};
 pub use graph::graph_kernel;
 pub use ir::{Node, TileId, TileIr};
-pub use kernels::{Program, matmul_lds_kblock_mw_clustered};
+pub use kernels::Program;
+pub use kernels::matmul::matmul_lds_kblock_mw_clustered;
 pub use pass::{Band, Fold, Pass, Pipeline, Strategy};
 pub use passes::{SwizzlePass, VectorizePass};
 pub use shape::{Mfma16x16x16Bf16, Mfma32x32x8Bf16, MfmaShape};

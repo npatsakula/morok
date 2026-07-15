@@ -7,8 +7,9 @@
 //! STOP and report (the abstraction is subtly wrong), do not paper over it.
 
 use crate::ir::{TileId, TileIr};
-use crate::kernels::{Program, matmul_lds_kblock_mw_clustered};
-use crate::kernels_fa::{flash_attention_fwd, flash_attention_fwd_32};
+use crate::kernels::Program;
+use crate::kernels::fa::{flash_attention_fwd, flash_attention_fwd_32};
+use crate::kernels::matmul::matmul_lds_kblock_mw_clustered;
 use crate::test::probes::atb_probe;
 use crate::{SwizzlePass, VectorizePass};
 

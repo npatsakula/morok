@@ -1,5 +1,5 @@
-//! Criterion GPU-device-time bench comparing the **32×32×8 FA** ([`svod_tk2::kernels_fa::flash_attention_fwd_32`],
-//! §Step 6) against the frozen **16×16×16 FA** ([`svod_tk2::kernels_fa::flash_attention_fwd`]) at matched
+//! Criterion GPU-device-time bench comparing the **32×32×8 FA** ([`svod_tk2::kernels::fa::flash_attention_fwd_32`],
+//! §Step 6) against the frozen **16×16×16 FA** ([`svod_tk2::kernels::fa::flash_attention_fwd`]) at matched
 //! attention shapes — the "does 32×32×8 close the gap" headline. Both are gated `allclose` at a small shape
 //! before timing; device time via the shared [`common`] harness.
 //!
@@ -18,7 +18,7 @@ use svod_tensor::Tensor;
 mod common;
 use common::{plan_gpu_ns, rand_bf16, requirements_met};
 
-use svod_tk2::kernels_fa::{flash_attention_fwd, flash_attention_fwd_32};
+use svod_tk2::kernels::fa::{flash_attention_fwd, flash_attention_fwd_32};
 use svod_tk2::{SwizzlePass, VectorizePass, graph_kernel};
 
 fn fa_flops_noncausal(bh: usize, s: usize, d: usize) -> u64 {

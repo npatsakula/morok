@@ -2,7 +2,7 @@
 //! correctness/scheduling split. Three structural checks over the reachable tile-IR DAG guarantee
 //! that deleting every scheduling hint (`s_setprio` / `sched_group_barrier` / `sched_barrier`)
 //! leaves a still-correct kernel, so perf tuning can never change numerics. Run at kernel build —
-//! the FA-32 kernel (`kernels_fa.rs`) rides it.
+//! the FA-32 kernel (`kernels/fa.rs`) rides it.
 
 use crate::build::Builder;
 use crate::ir::{Node, TileId, TileIr};
