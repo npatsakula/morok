@@ -6,10 +6,10 @@
 //! [`MfmaShape`], exactly as [`crate::tile_ops`] derives its compute widths from `S`), while the
 //! genuinely-runtime addressing (lane, origin, base, `epl`, ordering deps) stays as explicit params.
 //!
-//! It mirrors [`crate::tile_ops`]'s style (thin, marker-generic free functions over the raw handles),
-//! NOT the const-generic [`crate::tile::Tile`] handle: the probes/kernels this surface serves are
-//! *runtime*-shaped (`atb_probe(kv, d, q)`), so the dims ride as values and the type only carries the
-//! shape/role/swizzle. No addressing/swizzle/asm logic is re-implemented here — that all lives in
+//! It mirrors [`crate::tile_ops`]'s style: thin, marker-generic free functions over the raw handles.
+//! The probes/kernels this surface serves are *runtime*-shaped (`atb_probe(kv, d, q)`), so the dims
+//! ride as values and the [`crate::tile`] marker only carries the operand role / swizzle policy. No
+//! addressing/swizzle/asm logic is re-implemented here — that all lives in
 //! [`crate::tile_move`] and [`crate::build`], which these ops call unchanged.
 //!
 //! ## The §3.2 residency table (design), and what each op forwards to
@@ -19,7 +19,6 @@
 //! | `(Reg, Lds)` gather | [`gather`] | [`SharedTile::gather_view`] → `.gather()` (ARow) / `.gather_transposed()` (BCol) |
 //! | `(Reg, Global)` staged prefetch | [`prefetch`] | [`SharedTile::stage_view`] → [`LdsStage::prefetch`] |
 //! | `(Lds, Reg)` staged commit | [`commit`] | [`SharedTile::stage_view`] → [`LdsStage::commit`] |
-//! | `(Lds, Global)` direct-to-LDS | [`fill_direct`] | [`Builder::buffer_load_lds`] (Plain-only, [`DirectFill`]) |
 //! | `(Global, Reg)` epilogue scatter | [`scatter`] | [`crate::kernels::scatter_frag`] |
 //!
 //! [`LdsStage::prefetch`]: crate::tile_move::LdsStage::prefetch
@@ -31,16 +30,7 @@ use crate::build::{Buf, Builder, Effect, Elem, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId};
 use crate::kernels::{EDGE, add_opt, offset_by};
 use crate::shape::MfmaShape;
-use crate::tile::{Plain, RegLayout, Swizzle};
-
-/// The **residency-move legality gate** for the one pair the handle types don't already constrain
-/// (design §3.2's `MovePath` bound). Every other pair is forbidden structurally — an op that expects
-/// an [`Lds`] cannot be handed a [`Buf`]. The exception is the direct-to-LDS fill: `buffer_load…lds`
-/// pins lane `L → m0 + L·4`, so it CANNOT apply a per-lane bank XOR on the fill side (this session's
-/// hardware finding). Only [`Plain`] implements this trait, so a [`fill_direct`] over a swizzled
-/// ([`crate::tile::Xor`]) tile does not compile.
-pub trait DirectFill: Swizzle {}
-impl DirectFill for Plain {}
+use crate::tile::{RegLayout, Swizzle};
 
 /// **`(Reg ← Lds)` — the operand gather.** Reads `Src`'s LDS run into the register operand fragments,
 /// choosing `.gather()` (straight, ARow) or `.gather_transposed()` (BCol) **by the operand role `L`**:
@@ -263,23 +253,6 @@ pub fn commit_asm<E: Elem>(
     SharedTile::new(dst, lds_cols)
         .stage_view(src, epl, lane, origin, grow_stride, Drain::Asm)
         .commit_asm(b, chunks, war, prev0)
-}
-
-/// **`(Lds ← Global)` — the direct-to-LDS fill (register diet).** One `raw.ptr.buffer.load.lds` DMA
-/// straight into LDS, NO intermediate VGPR — the register-bypass twin of [`prefetch`]+[`commit`]. Only
-/// legal for a [`Plain`] tile (the [`DirectFill`] bound): the hardware pins lane `L → m0 + L·4`, so a
-/// swizzled direct fill can't be authored. `rsrc`/`voffset`/`lds_dst` are the caller's runtime
-/// addressing (buffer descriptor, per-lane byte offset, per-wave LDS base); the dword-granular width is
-/// derived from `E`. Forwards to [`Builder::buffer_load_lds`].
-pub fn fill_direct<E: Elem, Sw: DirectFill>(
-    b: &mut Builder,
-    rsrc: Idx,
-    voffset: Idx,
-    lds_dst: Idx,
-    order: &[TileId],
-) -> Effect {
-    let ept = 4 / E::dtype().bytes(); // dword-granular: ept·sizeof(E) == 4
-    b.buffer_load_lds::<E>(rsrc, voffset, lds_dst, ept, order)
 }
 
 /// **`(Global ← Reg)` — the accumulator scatter epilogue.** Writes a register accumulator fragment back
