@@ -28,9 +28,8 @@ use crate::ir::{Node, TileId, TileIr};
 
 /// The commit's **drain placement policy** (DESIGN §5c) — WHERE the collaborative fill's LDS writes
 /// are made visible before the next-iteration gather. [`CommitDrain::IntrinsicAuto`] is the
-/// compiler-visible `ds_write` whose `lgkmcnt(0)` the C6 RAW `s_barrier` auto-drains. The asm variants
-/// use the waitcnt-opaque `asm ds_write_b64` (the barrier can NOT auto-drain it): [`CommitDrain::AsmExposed`]
-/// (Phase C-a) drains at C6 with an EXPOSED manual `s_waitcnt lgkmcnt(0)` (0-MFMA shadow);
+/// compiler-visible `ds_write` whose `lgkmcnt(0)` the C6 RAW `s_barrier` auto-drains. The asm variant
+/// uses the waitcnt-opaque `asm ds_write_b64` (the barrier can NOT auto-drain it):
 /// [`CommitDrain::AsmDeferred`] (Phase C-b, HK's deferred drain) leaves the C6 barrier BARE and moves the
 /// manual drain to C7's tail — after the 32 MFMAs (hidden) and before C7's tail barrier (so the
 /// drain-before-barrier still gives every wave cross-wave visibility of its own writes).
@@ -42,10 +41,6 @@ pub(crate) enum CommitDrain {
     /// The RAW (a later iteration's gather seeing these writes) is still carried by `raw_next`. Same
     /// intrinsic (compiler-visible `ds_write`) RAW-drain as `IntrinsicAuto`, one fewer workgroup barrier.
     IntrinsicNoWar,
-    /// Phase C-a, retained as the A/B baseline for the deferred drain — no entry wires it (the clustered
-    /// entries jumped straight to `AsmDeferred`), so it is exercised only when comparing the two policies.
-    #[allow(dead_code)]
-    AsmExposed,
     AsmDeferred,
 }
 
@@ -399,14 +394,6 @@ impl<H: Hooks> ClusterCx<'_, H> {
                     // whose acquire IS that auto-drain — the invariant is unchanged here.) `IntrinsicNoWar`
                     // shares this RAW seal; it differs only in dropping the WAR seal above (double-buffer).
                     let rn = self.seal(fill[0], &fill_deps).dep();
-                    self.raw_next = Some(rn);
-                    self.tail_barrier = Some(rn);
-                    self.entry = vec![rn];
-                }
-                CommitDrain::AsmExposed => {
-                    // C-a: the opaque asm writes need an EXPOSED manual drain here at C6 (0-MFMA shadow).
-                    let sw = self.b.swait_lgkmcnt(fill.last().expect("asm commit emits ≥1 write").dep());
-                    let rn = self.seal(sw, &[]).dep();
                     self.raw_next = Some(rn);
                     self.tail_barrier = Some(rn);
                     self.entry = vec![rn];
@@ -843,7 +830,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
                 let fill0_deps: Vec<TileId> = fill0[1..].iter().map(|e| e.dep()).collect();
                 b.barrier(fill0[0], &fill0_deps)
             }
-            CommitDrain::AsmExposed | CommitDrain::AsmDeferred => {
+            CommitDrain::AsmDeferred => {
                 let sw = b.swait_lgkmcnt(fill0.last().expect("asm commit emits ≥1 write").dep());
                 b.barrier(sw, &[])
             }

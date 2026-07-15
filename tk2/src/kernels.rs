@@ -552,52 +552,15 @@ pub(crate) fn l2_swizzle(b: &mut Builder, wgid: Idx, grid_m: i64, grid_n: i64) -
 /// turns it into the bank-swizzled one — the swizzle is a **composable refinement**, not
 /// hand-woven here (bm/bn/k_step ∈ {16,32,64} for the single-subtile swizzle).
 #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
-fn kblock_impl(
-    m: usize,
-    n: usize,
-    k: usize,
-    bm: usize,
-    bn: usize,
-    wm: usize,
-    wn: usize,
-    k_step: usize,
-    stages: usize,
-    clustered: bool,
-    asm_gather: bool,
-    resident: bool,
-    commit_drain: CommitDrain,
-    bare_seals: bool,
-    pin_mfma: bool,
-) -> Program {
+fn kblock_impl(m: usize, n: usize, k: usize, bm: usize, bn: usize, wm: usize, wn: usize, k_step: usize) -> Program {
     assert!(bm.is_multiple_of(EDGE) && bn.is_multiple_of(EDGE) && k.is_multiple_of(EDGE), "tile dims multiples of 16");
     assert!(k_step.is_multiple_of(EDGE) && k.is_multiple_of(k_step), "k_step multiple of 16, K multiple of k_step");
     assert!(wm >= 1 && wn >= 1, "at least one warp per axis");
-    assert!(stages == 1 || stages == 2, "kblock: stages ∈ {{1, 2}}");
-    // stages=2 (register-staged pipeline) needs ≥2 K-blocks to overlap; single-block K = stages=1.
-    let stages = if k / k_step >= 2 { stages } else { 1 };
-    // `kblock_impl` is now the clustered §5c path only. `clustered` stays true for any valid call
-    // (k/k_step ≥ 2 ⇒ stages=2); the gate is defensive — a stages=1 collapse would trip the
-    // pipeline's `nblocks ≥ 2` assert at construction, never silently miscompile.
-    let clustered = clustered && stages == 2;
-    // The asm `ds_read_b64 offset:N` gather is the clustered path's spill cure (§5c) — it only
-    // steers the per-slice `gather_slice` (the whole-block kloop keeps the compiler-visible gather).
-    // gfx942-only; tk2 hardcodes gfx942, so the flag alone gates it.
-    let asm_gather = asm_gather && clustered;
-    // Compute-residency (stage the tile once, no steady-loop global load) only makes sense for the
-    // clustered pipeline — it decomposes that body into the HK schedule with prefetch/commit dropped.
-    let resident = resident && clustered;
-    // The asm `ds_write_b64` commit (§5c Phase C) is the clustered path's waitcnt-opaque write. Gated to
-    // clustered so the whole-block `commit_fn` (which does not drain) only ever sees `Drain::Intrinsic`.
-    // The pipeline's `CommitDrain` (drain PLACEMENT) and the stage's `Drain` (asm-vs-intrinsic write) are
-    // derived from ONE source so they cannot disagree: any asm policy ⟹ `Drain::Asm` + `asm_commit`.
-    let commit_drain = if clustered { commit_drain } else { CommitDrain::IntrinsicAuto };
-    // HK bare cluster seals (§5c): a bare `s_barrier` + explicit `lgkmcnt(0)` drains vs the fenced
-    // barrier's implicit 9×/K-block drain. Only meaningful for the clustered per-cluster schedule.
-    let bare_seals = bare_seals && clustered;
-    // MFMA-cluster pin (§5c ISA fix): bracket each 32-MFMA run with a leading + trailing `sched.barrier(0)`
-    // so LLVM can't fracture it. Only meaningful for the clustered per-cluster schedule.
-    let pin_mfma = pin_mfma && clustered;
-    let asm_commit = commit_drain != CommitDrain::IntrinsicAuto;
+    // Production bake (§5c clustered HK replica — "one config, as aiter/hk do"): the scheduling knobs are
+    // fixed here — stages=2, clustered, `asm_gather`, `bare_seals`, `AsmDeferred` commit (⇒ `asm_commit`);
+    // `resident`/`pin_mfma` off. The register-staged pipeline needs ≥2 K-blocks to overlap; a single-block
+    // K would trip the pipeline's `nblocks ≥ 2` assert at construction (production always satisfies this).
+    assert!(k / k_step >= 2, "kblock: clustered pipeline needs ≥2 K-blocks (k/k_step ≥ 2)");
     // Workgroup output tile = (bm·wm) × (bn·wn), computed by a wm×wn grid of 64-lane warps.
     let (big_m, big_n, nthreads) = (bm * wm, bn * wn, wm * wn * WARP);
     assert!(m.is_multiple_of(big_m) && n.is_multiple_of(big_n), "m/n must tile by (bm·wm)/(bn·wn)");
@@ -700,8 +663,8 @@ fn kblock_impl(
             bn,
             warp_row_off,
             warp_col_off,
-            asm_gather,
-            asm_commit,
+            asm_gather: true,
+            asm_commit: true,
         };
         // The compute clusters carry the kernel math (the `ri×cj` MFMA loop) as an edge-free `body` —
         // the combinator brackets it with `set_prio` + the acc round-trip. This is what makes the
@@ -734,11 +697,11 @@ fn kblock_impl(
             &accs,
             &inited,
             warp_row,
-            asm_gather,
-            resident,
-            commit_drain,
-            bare_seals,
-            pin_mfma,
+            true,
+            false,
+            CommitDrain::AsmDeferred,
+            true,
+            false,
             hooks,
         )
         .cluster(Mem::builder().prefetch([0]).gathers([0]).build()) // C0: load A, gather slice 0
@@ -793,5 +756,5 @@ pub fn matmul_lds_kblock_mw_clustered(
     wn: usize,
     k_step: usize,
 ) -> Program {
-    kblock_impl(m, n, k, bm, bn, wm, wn, k_step, 2, true, true, false, CommitDrain::AsmDeferred, true, false)
+    kblock_impl(m, n, k, bm, bn, wm, wn, k_step)
 }
