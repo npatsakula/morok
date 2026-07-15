@@ -75,10 +75,12 @@ const GOLDEN: &[(&str, u64)] = &[
     ("fa", 0x21cb_5221_fdc1_2b88),
     ("fa.vec.sw", 0x50d3_dc07_32b9_ac3e),
     ("atb_probe", 0xa506_f161_b28e_11fc),
-    // FA-32 golden captured pre-`gather_run`/`commit_run` derivation (this session's Phase-1 baseline).
-    ("fa32", 0x5c58_8848_9bdf_1353),
-    ("fa32.sw", 0x1375_0523_c960_3fc5),
-    ("fa32.d64", 0xe8c7_ca9a_2507_dd74),
+    // FA-32 golden re-baselined for Phase 2: the `RowPartition` grid decode interns the same node set
+    // in a different ORDER (front-loaded vs. interspersed with tid/warp), shifting ids — equivalent IR,
+    // device-bit-exact (the `flash_attention32_matches_reference_on_gfx942` gate), NOT a regression.
+    ("fa32", 0x663b_b07a_90be_3bc5),
+    ("fa32.sw", 0x1070_a446_f24e_c88b),
+    ("fa32.d64", 0x979d_3059_9c11_cf0e),
 ];
 
 /// Print the live signatures — run at HEAD to capture the golden values, and any time to eyeball a diff.

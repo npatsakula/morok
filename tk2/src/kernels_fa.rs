@@ -28,6 +28,7 @@
 use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId};
 use crate::kernels::{EDGE, Program, offset_by};
+use crate::partition::RowPartition;
 use crate::pipeline::{AccSlot, BlockCounter, CommitDrain, Compute, Hooks, Mem, SlotVal, pipeline};
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 use crate::tile::{ARow, BCol, Plain, Xor};
@@ -1036,16 +1037,14 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     let k = b.global::<BF16>(bh * n * d);
     let v = b.global::<BF16>(bh * n * d);
 
-    // Grid = bh × ⌈n/q_blk⌉; decode (bh_idx, qwg). bh_idx·n = this (b,h) slice's global row base. The Q
-    // grid rounds UP so a ragged `n` is fully covered; the partial last workgroup's excess Q rows compute
-    // into the (caller-provisioned) buffer tail and are not part of the compared output.
-    let nqb = n.div_ceil(q_blk);
-    let wgid = b.grid_axis(0, (bh * nqb) as i64);
-    let nqb_c = b.idx_const(nqb as i64);
-    let bh_idx = b.idx_div(wgid, nqb_c);
-    let qwg = b.idx_mod(wgid, nqb_c);
-    let n_c = b.idx_const(n as i64);
-    let bh_row = b.idx_mul(bh_idx, n_c);
+    // Grid = bh × ⌈n/q_blk⌉ workgroups over ONE flat axis; a `RowPartition` (Phase 2) derives the grid and
+    // decodes `wgid → pid = (slice = bh_idx, tile = qwg, row_origin = q_origin)`. `row_origin =
+    // bh_idx·n + qwg·q_blk` is the tile's global Q-row origin; `pid.slice·n` is this (b,h) slice's row base.
+    // The Q grid rounds UP (div_ceil) so a ragged `n` is fully covered — the partial last workgroup's
+    // excess Q rows compute into the (caller-provisioned) buffer tail, not the compared output.
+    let part = RowPartition { slices: bh, rows_per_slice: n, tile_rows: q_blk };
+    let wgid = b.grid_axis(0, part.grid_size() as i64);
+    let pid = part.decode(&mut b, wgid);
 
     let tid = b.block_axis(nthreads as i64);
     let warp_c = b.idx_const(WARP as i64);
@@ -1065,11 +1064,8 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     let double_buf = d >= 128;
     let warp_row: Option<Idx> = None;
 
-    // This warp's global Q-row origin.
-    let qblk_c = b.idx_const(q_blk as i64);
-    let q_off = b.idx_mul(qwg, qblk_c);
-    let q_origin = b.idx_add(bh_row, q_off);
-    let q_row_base = b.idx_add(q_origin, warp_qoff);
+    // This warp's global Q-row origin = the tile's row origin + this warp's 32-row Q offset.
+    let q_row_base = b.idx_add(pid.row_origin, warp_qoff);
 
     let d_c = b.idx_const(d as i64);
     // Per-lane axis parts (shared by every fragment gather): q = wlane%32, dloc/kvloc = (wlane/32)·4.
@@ -1243,6 +1239,9 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
         },
     );
 
+    // This (b,h) slice's flat base (rows·d). `bh_row = pid.slice·n` reuses the decode's interned nodes.
+    let n_c = b.idx_const(n as i64);
+    let bh_row = b.idx_mul(pid.slice, n_c);
     let bh_row_d = b.idx_mul(bh_row, d_c);
     let hooks = Fa32Hooks { k, v, k_lds, vt_lds, double_buf, bh_row_d, tid, epl, q_in, half_off, d, pitch };
     let acc_final = pipeline(

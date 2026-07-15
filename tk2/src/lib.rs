@@ -25,6 +25,7 @@ pub mod kernels;
 pub mod kernels_fa;
 pub mod launch;
 pub mod lower;
+pub mod partition;
 pub mod pass;
 pub mod passes;
 pub(crate) mod pipeline;
