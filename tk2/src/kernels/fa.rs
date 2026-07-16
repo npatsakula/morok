@@ -785,11 +785,15 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     // occupancy-1 regime (`d ≥ 128`): there the workgroup is register-pressure-bound to 1 wave/SIMD, so
     // hiding the LDS-write latency instruction-locally is a net win (device-measured +5% at S2048 d128).
     // DISABLED for the occupancy-2 small-`d` shapes (`d = 64`): there a 2nd resident wave already hides
-    // that latency, so the double-buffer's extra VGPRs + parity math only regress (~-9%, measured). No
-    // ping-pong stagger: device-measured a NET LOSS here — at occupancy 1 the within-workgroup two-group
-    // offset gives no intra-SIMD MFMA overlap (1 wave/SIMD), so its added compute-cluster barriers don't
-    // pay for themselves. (Reaching aiter's stagger win needs occupancy ≥2 first — a VGPR-O redesign.)
+    // that latency, so the double-buffer's extra VGPRs + parity math only regress (~-9%, measured).
     let double_buf = d >= 128;
+    // No two-group phase stagger. Enabling it (`warp_row = Some(warp/4)`) is device-proven to re-expose
+    // the ping-pong RACE (non-deterministic ~3e-2 errors at varying elements) — this FA path emits
+    // compiler-visible (intrinsic) LDS, and per the pipe2 finding that race is inherent to such emission
+    // and NOT fixable by fences/drains; only asm-opacity (asm ds_read/ds_write) makes the identical
+    // schedule race-free, which the 32×32×8 `gather_run`/`commit_run` don't yet provide. The occ-2 win
+    // (8-warp split-Q) already lands WITHOUT the stagger; the stagger is deferred pending an asm-opaque
+    // 32×32×8 LDS path.
     let warp_row: Option<Idx> = None;
 
     // This warp's global Q-row origin = the tile's row origin + this warp's 32-row Q offset.
