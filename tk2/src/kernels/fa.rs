@@ -497,9 +497,13 @@ pub fn flash_attention_fwd(bh: usize, n: usize, d: usize) -> Program {
 const NUM_WARPS_32: usize = 4;
 /// The 32×32×8 KV-block size (one MFMA N/M tile = aiter's `ts_kv`). Four hardware `K = 8` slices.
 const KV_BLK_32: usize = 32;
-/// The transposed-V LDS row padding (mult-of-4 kept for the b64 straight read; breaks bank conflicts —
-/// an un-padded `[d, kv]` transpose regresses, proven by `v_transpose_probe`).
-const VT_PAD: usize = 8;
+/// The transposed-V LDS row padding. Pitch = `KV_BLK_32 + VT_PAD` must keep the per-lane b64 V read
+/// conflict-free: consecutive lanes stride `pitch/2` dwords, so only a pitch whose dword-stride has
+/// `gcd(·, 32) = 2` (not 4) spreads 16 lanes across 16 distinct LDS banks — the same spread the XOR
+/// swizzle gives K. `VT_PAD = 8` → pitch 40 → stride 20 → gcd 4 → 8 banks → ~2-way conflict (measured
+/// PMC bankconf ≈ 1.6); `VT_PAD = 4` → pitch 36 → stride 18 → gcd 2 → conflict-free. Still mult-of-4 for
+/// b64 alignment. (An un-padded `[d, kv]` transpose regresses — proven by `v_transpose_probe`.)
+const VT_PAD: usize = 4;
 
 /// The **softmax-under-MFMA interleave ratios** (plan §2.5/§5-lever-1, HipKittens' `sched_barrier_pairs`
 /// counts). `interleave_exp<PAIRS,CNT>` folds the online `exp2` under the block's MFMAs; `interleave_valu`

@@ -77,12 +77,13 @@ const GOLDEN: &[(&str, u64)] = &[
     ("fa", 0x21cb_5221_fdc1_2b88),
     ("fa.vec.sw", 0x50d3_dc07_32b9_ac3e),
     ("atb_probe", 0xa506_f161_b28e_11fc),
-    // FA-32 golden re-baselined for Phase 2: the `RowPartition` grid decode interns the same node set
-    // in a different ORDER (front-loaded vs. interspersed with tid/warp), shifting ids — equivalent IR,
-    // device-bit-exact (the `flash_attention32_matches_reference_on_gfx942` gate), NOT a regression.
-    ("fa32", 0x663b_b07a_90be_3bc5),
-    ("fa32.sw", 0x1070_a446_f24e_c88b),
-    ("fa32.d64", 0x979d_3059_9c11_cf0e),
+    // FA-32 golden re-baselined for the V bank-conflict fix (`VT_PAD 8→4`, pitch 40→36): the transposed-V
+    // LDS pitch is an interned constant threaded through every V address, so changing it shifts the DAG —
+    // an EXPECTED, isolated re-baseline (matmul/fa/atb above are unchanged), device-bit-exact via the
+    // `flash_attention32_matches_reference_on_gfx942` gate, and the intended fix (PMC bankconf 1.6→0).
+    ("fa32", 0xfabf_9191_563c_3cce),
+    ("fa32.sw", 0xd186_8b6f_38ea_bc89),
+    ("fa32.d64", 0x5a20_61ce_efc5_ebd1),
 ];
 
 /// Print the live signatures — run at HEAD to capture the golden values, and any time to eyeball a diff.

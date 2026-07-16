@@ -318,7 +318,7 @@ pub(crate) fn v_transpose_probe(d: usize) -> Program {
     use crate::shape::Mfma32x32x8Bf16 as S;
     const KV: usize = 32;
     const Q: usize = 32;
-    const PAD: usize = 8; // pitch padding (mult-of-4 kept for the b64 straight read; breaks bank conflicts)
+    const PAD: usize = 4; // pitch padding: kv(32)+4 = 36 → b64 dword-stride 18, gcd(18,32)=2 → 16 distinct banks (conflict-free; matches the kernel's VT_PAD)
     let pitch = KV + PAD; // transposed LDS row pitch (d rows, kv+pad cols)
     assert!(d.is_multiple_of(S::M), "v_transpose_probe: d a multiple of 32");
     let mut b = Builder::new("tk2_v_transpose_probe");
