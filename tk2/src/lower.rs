@@ -201,7 +201,31 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
         Node::Unary { op, x } => {
             let x = get(low, x);
             match op {
-                UnOp::Exp2 => x.try_exp2().expect("exp2: float operand"),
+                // Per-lane RAW hardware exp2 (`@llvm.amdgcn.exp2.f32` = bare `v_exp_f32`). The GENERIC
+                // `@llvm.exp2` LLVM lowers to a ~6-op denormal-safe range-reduction ladder PER LANE
+                // (correct for ANY input); softmax feeds `s − m ≤ 0` (in-range; very-negative flushes to 0
+                // = the correct ~0 weight), so the bare op suffices — aiter's choice. The amdgcn intrinsic
+                // is scalar-only, so scalarize HERE: tk2's custom lowering (`opts_to_apply = []`) skips
+                // svod's devectorize pass, so a `v16f32` exp2 would otherwise stay vectorised and legalise
+                // to the ladder. llc-verified (gfx942): 98 → 16 VALU per 16-wide exp2.
+                UnOp::Exp2 => {
+                    let lane = |e: Arc<UOp>| {
+                        UOp::custom(
+                            smallvec![e],
+                            "declare float @llvm.amdgcn.exp2.f32(float)\n\
+                             call afn float @llvm.amdgcn.exp2.f32(float {0})"
+                                .to_string(),
+                            DType::Float32,
+                        )
+                    };
+                    let width = x.dtype().count();
+                    if width <= 1 {
+                        lane(x)
+                    } else {
+                        let out: SmallVec<[Arc<UOp>; 4]> = (0..width).map(|i| lane(x.gep(vec![i]))).collect();
+                        UOp::vectorize(out)
+                    }
+                }
                 UnOp::Recip => UOp::try_reciprocal(&x).expect("reciprocal: float operand"),
             }
         }
