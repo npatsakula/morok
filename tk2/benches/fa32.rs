@@ -129,19 +129,20 @@ fn main() {
         return;
     }
     eprintln!("\n=== tk2 FA: 32×32×8 (rolled ClusterCx pipeline) vs 16×16×16 (tuned pipeline) — REAL device TF ===\n");
-    gate(true, 2, 128, 128);
-    gate(false, 2, 128, 128);
+    gate(true, 2, 256, 128);
+    gate(false, 2, 256, 128);
 
-    // (label, b, h, S, d) — the rolled FA-32 now scales past n=128 (large-S machine-filling shapes), plus
-    // the old short-context shapes for the before→after comparison. `wgs = bh·S/128` fills the 304-CU MI300X.
+    // (label, b, h, S, d) — machine-filling large-S shapes plus short-context ones. All S are ≥256 and
+    // 256-multiples (the 8-warp Q block), so the raw `bh·S` bench buffers cover every workgroup's fill.
+    // `wgs = bh·S/256` fills the 304-CU MI300X.
     let configs = [
         ("b2·h16 ", 2usize, 16usize, 2048usize, 128usize),
         ("b2·h16 ", 2, 16, 2048, 64),
         ("b4·h16 ", 4, 16, 1024, 128),
         ("b8·h16 ", 8, 16, 512, 128),
-        ("b16·h16", 16, 16, 128, 128),
+        ("b16·h16", 16, 16, 256, 128),
         ("b8·h16 ", 8, 16, 256, 128),
-        ("b16·h16", 16, 16, 128, 64),
+        ("b16·h16", 16, 16, 256, 64),
         ("b8·h16 ", 8, 16, 256, 64),
     ];
     eprintln!(
@@ -150,7 +151,7 @@ fn main() {
     );
     for (label, bb, hh, s, d) in configs {
         let bh = bb * hh;
-        let wgs = bh * (s / 128);
+        let wgs = bh * (s / 256);
         let tf16 = measure(false, bh, s, d, label);
         let tf32 = measure(true, bh, s, d, label);
         eprintln!("  {label} {s:>6} {d:>4} {wgs:>6}    {tf16:>10.1}  {tf32:>10.1}  {:>7.2}x", tf32 / tf16);

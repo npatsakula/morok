@@ -490,11 +490,14 @@ pub fn flash_attention_fwd(bh: usize, n: usize, d: usize) -> Program {
     Program { ir, sink, name: "tk2_fa_fwd".into() }
 }
 
-/// Warps per workgroup for the **32×32×8 FA** (§Step 6): 4 warps × 32 Q rows = a `q_blk = 128` block
-/// (matching the 16×16 FA's Q-block for a fair comparison). Each warp owns 32 Q rows and computes its
-/// own 32(kv)×32(q) MFMA tile; all 4 share ONE K/V LDS tile per KV block. No cross-warp reduction (the
-/// softmax `acc_row_reduce_32` stays within each 64-lane warp — disjoint Q rows).
-const NUM_WARPS_32: usize = 4;
+/// Warps per workgroup for the **32×32×8 FA**: 8 warps × 32 Q rows = a `q_blk = 256` block (aiter/HK's
+/// split-Q tiling — Route B). One 512-thread block yields 8 waves = 2 waves/SIMD (**occupancy-2**), the
+/// substrate for the two-group phase stagger (group A's softmax VALU hidden under group B's MFMAs). Each
+/// warp owns 32 Q rows and computes its own 32(kv)×32(q) MFMA tile; all 8 share ONE K/V LDS tile per KV
+/// block. No cross-warp reduction (the softmax `acc_row_reduce_32` stays within each 64-lane warp —
+/// disjoint Q rows), so 4→8 warps leaves every per-wave live value unchanged (≈160 VGPR/wave); only the
+/// collaborative fill's per-lane run shrinks (`epl = KV·d/nthreads`, 512 threads).
+const NUM_WARPS_32: usize = 8;
 /// The 32×32×8 KV-block size (one MFMA N/M tile = aiter's `ts_kv`). Four hardware `K = 8` slices.
 const KV_BLK_32: usize = 32;
 /// The transposed-V LDS row padding. Pitch = `KV_BLK_32 + VT_PAD` must keep the per-lane b64 V read

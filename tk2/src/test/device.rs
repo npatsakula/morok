@@ -397,11 +397,11 @@ fn flash_attention_matches_reference_on_gfx942() {
 fn flash_attention32_matches_reference_on_gfx942() {
     use svod_tensor::testing::allclose_f32;
     let dev = svod_dtype::default_device::default_device();
-    const Q_BLK: usize = 128; // NUM_WARPS_32 · 32 (the workgroup Q block)
+    const Q_BLK: usize = 256; // NUM_WARPS_32 · 32 (the workgroup Q block; 8 warps × 32)
     const KV_BLK: usize = 32; // KV_BLK_32
-    // (bh, n, d): the tile-exact full cases (bh>1, n=128) + the RAGGED partial-KV-block cases (bh=1,
-    // n=80 — a partial last KV block exercising the mask at both head dims).
-    for (bh, n, d) in [(3usize, 128usize, 64usize), (2, 128, 128), (1, 80, 64), (1, 80, 128)] {
+    // (bh, n, d): the tile-exact full cases (bh>1, n a Q-block multiple) + the RAGGED partial-block cases
+    // (bh=1, n=80 — a partial last KV block exercising the mask at both head dims).
+    for (bh, n, d) in [(3usize, 256usize, 64usize), (2, 256, 128), (1, 80, 64), (1, 80, 128)] {
         // The kernel's fill + scatter cover ⌈n/tile⌉·tile rows per (b,h) slice; provision the buffers to
         // match. bh>1 needs a tile-exact `n` (per-slice stride == n); a ragged `n` runs at bh=1 (slice
         // base 0), the padded tail holding intentional garbage the mask makes irrelevant.
