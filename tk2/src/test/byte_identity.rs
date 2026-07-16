@@ -77,12 +77,15 @@ const GOLDEN: &[(&str, u64)] = &[
     ("fa", 0x21cb_5221_fdc1_2b88),
     ("fa.vec.sw", 0x50d3_dc07_32b9_ac3e),
     ("atb_probe", 0xa506_f161_b28e_11fc),
-    // FA-32 golden re-baselined for Route B (`NUM_WARPS_32 4→8`, q_blk 128→256 split-Q): a real
-    // STRUCTURAL change (thread count, grid, per-lane fill run), not a refactor — device-bit-exact via the
-    // `flash_attention32_matches_reference_on_gfx942` gate at the 256-row shapes. matmul/fa/atb unchanged.
-    ("fa32", 0x7705_31fd_4a3b_e708),
-    ("fa32.sw", 0xe9dc_33a4_cf03_09fc),
-    ("fa32.d64", 0xf6c8_662f_ecb4_b752),
+    // FA-32 golden re-baselined for the compute-software-pipeline ROTATION (fused QKᵀ∥softmax cluster,
+    // carried double-buffered `s`, post-loop drain) + the pipeline WAR guard that orders a read-then-
+    // INDEPENDENTLY-written slot's store after the cluster's read-carrying stores (fixes the epilogue
+    // reading the wrong carried scores — the deleted-cross-lane-reduce bug). A real STRUCTURAL change, not a
+    // refactor — device-correct via `flash_attention32_matches_reference_on_gfx942` (uniform ~1.8e-3 at all
+    // shapes incl. ragged n=80). matmul/fa/atb goldens are UNCHANGED (the WAR guard is a no-op there).
+    ("fa32", 0x50ba_7234_e461_ce17),
+    ("fa32.sw", 0x161b_9eb4_b911_49d3),
+    ("fa32.d64", 0x9edb_f1b4_677d_13d5),
 ];
 
 /// Print the live signatures — run at HEAD to capture the golden values, and any time to eyeball a diff.

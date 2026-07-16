@@ -508,6 +508,13 @@ const KV_BLK_32: usize = 32;
 /// b64 alignment. (An un-padded `[d, kv]` transpose regresses — proven by `v_transpose_probe`.)
 const VT_PAD: usize = 4;
 
+/// **V's LDS buffer count for the compute rotation** — TRIPLE-buffered (vs. K's double). The rotation
+/// gathers `V(i−1)` (for P·V(i−1)) while committing `V(i+1)`, so THREE V blocks are live at once
+/// (`i−1`, `i`, `i+1`). V loads/commits block `i+1` exactly like K (no prefetch skew); only the GATHER
+/// reads one block behind, at parity `(counter+2) mod 3 == (counter−1) mod 3`. A bonus: the drain's
+/// `V(nblocks−1)` (committed in the last steady iteration) is still resident, so no post-loop V re-fetch.
+const V_NBUF: usize = 3;
+
 /// The **softmax-under-MFMA interleave ratios** (plan §2.5/§5-lever-1, HipKittens' `sched_barrier_pairs`
 /// counts). `interleave_exp<PAIRS,CNT>` folds the online `exp2` under the block's MFMAs; `interleave_valu`
 /// folds the reduction VALU under the P·V MFMAs. These are the ONLY perf-tuning knobs (step-6 sweep); the
@@ -569,19 +576,27 @@ struct Fa32Hooks {
 }
 
 impl Fa32Hooks {
-    /// The runtime parity offset (in elements) into the double-sized K / Vt LDS tiles for `block`:
-    /// `(block % 2) · tile_size`. Both zero when double-buffering is off (so the single-tile addressing
-    /// is bit-identical to the pre-lever kernel).
-    fn parity_off(&self, b: &mut Builder, block: Idx) -> (Idx, Idx) {
+    /// K's LDS parity offset (elements) for `block`: `(block % 2) · k_tile` when double-buffered, else `0`
+    /// (single tile — bit-identical to the pre-lever kernel).
+    fn k_parity(&self, b: &mut Builder, block: Idx) -> Idx {
         if !self.double_buf {
-            let z = b.idx_const(0);
-            return (z, z);
+            return b.idx_const(0);
         }
         let two = b.idx_const(2);
         let par = b.idx_mod(block, two);
         let k_tile = b.idx_const((KV_BLK_32 * self.d) as i64);
+        b.idx_mul(par, k_tile)
+    }
+
+    /// V's LDS parity offset (elements) into the TRIPLE-buffered `vt_lds`: `(block % 3) · vt_tile`. The
+    /// commit passes `block = i+1` (writes `V(i+1)`); the gather passes `block = counter+2` so it reads
+    /// `(counter−1) mod 3` (the rotation's `V(i−1)`). Always triple-buffered — the three live V blocks
+    /// are always disjoint parities, so no WAR seal is needed for V regardless of K's buffering.
+    fn v_parity(&self, b: &mut Builder, block: Idx) -> Idx {
+        let three = b.idx_const(V_NBUF as i64);
+        let par = b.idx_mod(block, three);
         let vt_tile = b.idx_const((self.d * self.pitch) as i64);
-        (b.idx_mul(par, k_tile), b.idx_mul(par, vt_tile))
+        b.idx_mul(par, vt_tile)
     }
 }
 
@@ -640,8 +655,8 @@ impl Hooks for Fa32Hooks {
         let vt_lds = if war.is_empty() { self.vt_lds } else { b.lds_after(self.vt_lds, war) };
         let (k_off, vt_off) = {
             let kstep = b.idx_const((KV_BLK_32 * self.d) as i64);
-            let blk1 = b.idx_div(k_base, kstep);
-            self.parity_off(b, blk1)
+            let blk1 = b.idx_div(k_base, kstep); // committed block index (K & V both write block i+1)
+            (self.k_parity(b, blk1), self.v_parity(b, blk1))
         };
         commit_run::<BF16, Xor, Plain>(
             b, k_lds, self.d, vt_lds, self.pitch, &reg.k, &reg.v, self.epl, self.tid, k_off, vt_off,
@@ -656,11 +671,14 @@ impl Hooks for Fa32Hooks {
         raw: &[TileId],
     ) -> (Fa32Op, Vec<TileId>, TileId) {
         use crate::shape::Mfma32x32x8Bf16 as S;
-        // Lever-3: gather reads block k → parity `k%2` selects the read half (0 when single-buffered) —
-        // the one genuinely block-dependent runtime param, so it stays in the hook.
+        // K gathers the CURRENT block (parity `counter % 2`, for QKᵀ(i)); V gathers ONE BLOCK BEHIND (for
+        // P·V(i−1)) — parity `(counter−1) % 3`, computed as `(counter+2) % 3` to stay non-negative. This is
+        // the compute-rotation's V skew: it rides the triple-buffer, no prefetch/commit skew, no clamp.
         let (k_off, vt_off) = {
             let blk = block.idx(b);
-            self.parity_off(b, blk)
+            let two = b.idx_const(2);
+            let blk_v = b.idx_add(blk, two); // (counter+2) ≡ (counter−1) (mod 3)
+            (self.k_parity(b, blk), self.v_parity(b, blk_v))
         };
         // The contiguous-run addressing is DERIVED by `gather_run` from the ARow role + the tile types: K is
         // the natural `[kv=32, d]` `Xor`-swizzled tile (`dslices = d/8` col-fragments), V the transposed
@@ -829,11 +847,12 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
         })
         .collect();
 
-    // Shared LDS: K natural [kv,d], V transposed padded [d, pitch]. Doubled (parity-swapped) under the
-    // Lever-3 double-buffer so commit(k+1) and gather(k) touch disjoint halves.
-    let nbuf = if double_buf { 2 } else { 1 };
-    let k_lds = b.define_local::<BF16>(nbuf * KV_BLK_32 * d);
-    let vt_lds = b.define_local::<BF16>(nbuf * d * pitch);
+    // Shared LDS: K natural [kv,d] (double-buffered under Lever-3 so commit(i+1)/gather(i) touch disjoint
+    // halves), V transposed padded [d, pitch] TRIPLE-buffered (the rotation keeps 3 V blocks live: i−1
+    // consumed by P·V, i, i+1 committed — see `V_NBUF`).
+    let k_nbuf = if double_buf { 2 } else { 1 };
+    let k_lds = b.define_local::<BF16>(k_nbuf * KV_BLK_32 * d);
+    let vt_lds = b.define_local::<BF16>(V_NBUF * d * pitch);
     let epl = KV_BLK_32 * d / nthreads; // collaborative fill, per thread
 
     // Softmax scale folded into exp2: exp2(score·log2(e)/√d) == exp(score/√d). 16-wide broadcast.
@@ -852,54 +871,48 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     // m, l, s, p → zero o×dtiles, const m, zero l) — byte-identical to the old hand-written slot table.
     let mut slots = SlotSet::new();
     let o_idx = slots.carried_group(&mut b, dtiles, S::c_map(), Init::Zero);
-    let slot_m = slots.carried(&mut b, S::c_map(), Init::Const(f32::NEG_INFINITY)); // running max seed = −∞
+    // Running max seed = −FLT_MAX (FINITE, not −∞): the rotation's seed block (softmax of the not-yet-real
+    // block 0 at iteration 0) must be inert. With `s` seeded −∞ and `m` finite: `m_new = max(−FLT_MAX,
+    // reduce_max(−∞)) = −FLT_MAX`, so `corr = exp2(−FLT_MAX − (−FLT_MAX)) = exp2(0) = 1` (no `∞−∞` NaN) and
+    // `p = exp2(−∞ − (−FLT_MAX)) = 0` (no phantom mass). The first REAL block's max always exceeds −FLT_MAX,
+    // so the running max is numerically identical to a −∞ seed.
+    let slot_m = slots.carried(&mut b, S::c_map(), Init::Const(-f32::MAX));
     let slot_l = slots.carried(&mut b, S::c_map(), Init::Zero); // running norm seed = 0
-    let slot_s = slots.temp(&mut b, S::c_map()); // QKᵀ scores (temporary)
+    // `s` is CARRIED (double-buffer): the fused QKᵀ∥softmax cluster reads block i−1's scores (carry-in)
+    // and writes block i's fresh QKᵀ, so softmax(i−1)'s VALU is independent of QKᵀ(i)'s MFMAs — the
+    // interleave's independent-MFMA stream. Seed −∞ (an empty block: exp2(−∞−m)=0, no phantom mass).
+    let slot_s = slots.carried(&mut b, S::c_map(), Init::Const(f32::NEG_INFINITY));
     let slot_p = slots.temp(&mut b, S::c_map()); // softmax weights (temporary)
     let (accs, inited) = slots.finish(&mut b);
 
-    // Per-cluster read/write slot sets (asymmetric — the §3.2 point). QKᵀ writes only `s`; softmax reads
-    // {s,m,l,o_*} writes {m,l,p,o_*}; PV reads {p,o_*} writes {o_*}. `o_idx` is the carried_group's
-    // returned slot indices (0..dtiles).
-    let sm_reads: Vec<usize> = [slot_s, slot_m, slot_l].into_iter().chain(0..dtiles).collect();
-    let sm_writes: Vec<usize> = [slot_m, slot_l, slot_p].into_iter().chain(0..dtiles).collect();
+    // Per-cluster read/write slot sets (asymmetric — the §3.2 point). The FUSED QKᵀ∥softmax cluster reads
+    // {s(i−1),m,l,o_*} and writes {s(i),m,l,p,o_*}; PV reads {p,o_*} writes {o_*}. `o_idx` is the
+    // carried_group's returned slot indices (0..dtiles).
+    let qk_reads: Vec<usize> = [slot_s, slot_m, slot_l].into_iter().chain(0..dtiles).collect();
+    let qk_writes: Vec<usize> = [slot_s, slot_m, slot_l, slot_p].into_iter().chain(0..dtiles).collect();
     let pv_reads: Vec<usize> = [slot_p].into_iter().chain(0..dtiles).collect();
 
-    // ── the three compute bodies, each declaring ONLY the slots it touches ──
-    // QKᵀ: S[kv,q] = Σ_ki mma(K_ki, Q_ki) (K A-operand, Q B-operand). reads nothing (re-zeros); writes `s`.
-    // INTRINSIC MFMA (the production fast path — the asm `sideeffect` form is a dead end here: it is
-    // OPAQUE to the AMDGPU GCNHazardRecognizer, so it emits NONE of the mandatory 32×32×8 `s_nop`s and
-    // a VALU-adjacent accumulator is read before the MFMA result lands → silent miscompile, device-proven
-    // — the PV NaN was exactly this, and QKᵀ-asm only survived by luck of instruction spacing). The
-    // softmax-under-MFMA interleave (`sched_group_barrier`) interleaves fine with the intrinsic.
-    let qk = Compute::<Fa32Hooks>::new(
+    // ── the FUSED QKᵀ∥softmax cluster + the PV cluster (the self-contained-cluster restructure) ──
+    // ONE self-contained compute region: (a) online softmax on the CARRIED s (block i−1's raw scores);
+    // (b) QKᵀ(i) → the new s. The 16 QKᵀ MFMAs are the INDEPENDENT stream (they read K(i)/Q, not s(i−1)),
+    // so softmax(i−1)'s exp2/reduce VALU folds UNDER them — the `interleave_exp` hint (group 1) is now
+    // anchored on the QKᵀ MFMA output (`s_acc.id`), a real matrix op in the SAME region, so LLVM honors it
+    // (vs. the old anchor on the non-MFMA `s_scaled.id`, which had no MFMA to group against → dropped).
+    // INTRINSIC MFMA (the asm `sideeffect` form is opaque to the GCNHazardRecognizer → no 32×32×8 hazard
+    // `s_nop`s → device-proven NaN; the intrinsic is schedulable, so the interleave binds fine with it).
+    let qk_softmax = Compute::<Fa32Hooks>::new(
         0,
-        vec![],
-        vec![slot_s],
-        move |b: &mut Builder, op: Option<&Fa32Op>, _reads: &[SlotVal], _blk: BlockCounter| {
+        qk_reads,
+        qk_writes,
+        move |b: &mut Builder, op: Option<&Fa32Op>, reads: &[SlotVal], _blk: BlockCounter| {
             let k_frags = op.expect("QKᵀ consumes gathered K");
-            let z = b.f32(0.0);
-            let mut s_acc = crate::tile_ops::splat::<S>(b, z);
-            for ki in 0..dslices {
-                s_acc = crate::tile_ops::mma::<S>(b, k_frags[ki], q_frags[ki], s_acc);
-            }
-            vec![SlotVal::F32(s_acc)]
-        },
-    );
-
-    // Online softmax (operand None): reads {s,m,l,o_*}, writes {m,l,p,o_*}. scale, running max via
-    // `acc_row_reduce_32` (the C=16 AccDist reduce over kv), O/l rescale, P = exp2(S−max), l += Σ_kv P.
-    let softmax = Compute::<Fa32Hooks>::new(
-        None,
-        sm_reads,
-        sm_writes,
-        move |b: &mut Builder, _op: Option<&Fa32Op>, reads: &[SlotVal], blk: BlockCounter| {
-            let (s_acc, m_run, l_run) = (reads[0].f32(), reads[1].f32(), reads[2].f32());
-            let s_scaled = b.mul(s_acc, scale_bcast);
-            // Ragged-tail mask: force scores of keys past the true `n` to −∞ BEFORE the max/exp, so they
-            // drop out of both the online max and the sum. Emitted only when `n` is not a KV-block
-            // multiple; the routed `blk` counter makes it a runtime no-op on every full block.
-            let s_scaled = if ragged { mask_ragged_kv(b, s_scaled, blk, wlane, n) } else { s_scaled };
+            let (s_prev, m_run, l_run) = (reads[0].f32(), reads[1].f32(), reads[2].f32());
+            // (a) online softmax of block i−1 (the carried scores). scale, running max via
+            // `acc_row_reduce_32` (the C=16 AccDist reduce over kv), O/l rescale, P = exp2(S−max), l += ΣP.
+            // NO ragged mask here: the rotation processes softmax for blocks 0..nblocks−2 only (the loop's
+            // fused cluster never touches the last block); the ONLY possibly-ragged block, nblocks−1, is
+            // softmaxed in the post-loop DRAIN, which applies the mask there.
+            let s_scaled = b.mul(s_prev, scale_bcast);
             let m_new = crate::tile_ops::row_reduce::<S>(b, s_scaled, wlane, m_run, false);
             let corr = {
                 let diff = b.sub(m_run, m_new);
@@ -911,21 +924,27 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
                 b.exp2(sh) // softmax weights P (f32, 16-wide)
             };
             let l_new = crate::tile_ops::row_reduce::<S>(b, p, wlane, l_resc, true);
-            // Declarative softmax-under-MFMA (plan §2.5): fold the online-exp2 under the block's MFMAs —
-            // `interleave_exp<pairs, exp>` in SyncID group 1. The hint emits NO instruction; it is kept
-            // live by routing it into the carried `p` value (`val_after`), so it survives DCE and sits in
-            // the wall-free compute region. Ratio is a perf knob (step-6 tuning); the mechanism is here.
-            let p = match b.interleave_exp(FA_EXP_PAIRS, FA_EXP_CNT, 1, &[s_scaled.id]) {
+            // (b) QKᵀ(i): fresh scores into the CARRIED s buffer — the independent MFMA stream.
+            let z = b.f32(0.0);
+            let mut s_acc = crate::tile_ops::splat::<S>(b, z);
+            for ki in 0..dslices {
+                s_acc = crate::tile_ops::mma::<S>(b, k_frags[ki], q_frags[ki], s_acc);
+            }
+            // Softmax-under-MFMA: fold softmax(i−1)'s exp2 under QKᵀ(i)'s MFMAs — `interleave_exp` (group 1)
+            // anchored on the QKᵀ MFMA output. The hint emits NO instruction; kept live by routing into `p`.
+            let p = match b.interleave_exp(FA_EXP_PAIRS, FA_EXP_CNT, 1, &[s_acc.id]) {
                 Some(h) => b.val_after(p, &[h.dep()]),
                 None => p,
             };
-            let mut out = vec![SlotVal::F32(m_new), SlotVal::F32(l_new), SlotVal::F32(p)];
+            // writes: [s(new), m, l, p, o_*].
+            let mut out = vec![SlotVal::F32(s_acc), SlotVal::F32(m_new), SlotVal::F32(l_new), SlotVal::F32(p)];
             for i in 0..dtiles {
                 out.push(SlotVal::F32(b.mul(reads[3 + i].f32(), corr))); // O *= corr
             }
             out
         },
-    );
+    )
+    .no_prio(); // HK's QKᵀ cluster carries no s_setprio; only the P·V cluster does (keeps the balance).
 
     // P·V (`mma_atb` over kv): reads {p,o_*}, writes {o_*}. `pv_relayout_s49(p)` → 4 B-operands; contract
     // the `ksl` K-slices: `o_dt += Σ_s mma(V[dt·ksl+s], b_ops[s])`.
@@ -990,20 +1009,74 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
         hooks,
     )
     .cluster(Mem::builder().prefetch([0, 1]).gathers([0, 1]).commit(true).build())
-    .cluster(qk)
-    .cluster(softmax)
+    .cluster(qk_softmax)
     .cluster(pv)
     .build();
 
-    // ── epilogue: O /= l (per q, broadcast across d), transpose-scatter to O[q_global, d_global]. ──
-    let recip_l = {
-        let l_vec = b.load_frag_vec(acc_final[slot_l].f32());
-        b.recip(l_vec)
+    // ── DRAIN: block nblocks−1's softmax + P·V (the rotation leaves it undone — its QKᵀ ran in the
+    //    epilogue → carried `s`; softmax/P·V of the LAST block have no following QKᵀ to fuse with). The
+    //    last block's V(nblocks−1) is still resident in the triple-buffered vt_lds (committed in the last
+    //    steady iteration, at parity (nblocks−1)%3), so no re-fetch — just gather it and finish. This is
+    //    also the ONLY block that can be ragged, so the ragged mask lives here. ──
+    let vt_off_drain = b.idx_const(((nblocks - 1) % V_NBUF * (d * pitch)) as i64);
+    let s_last = b.load_frag_vec(acc_final[slot_s].f32()); // block nblocks−1's QKᵀ scores (carried, observes End)
+    let m_run = b.load_frag_vec(acc_final[slot_m].f32());
+    let l_run = b.load_frag_vec(acc_final[slot_l].f32());
+    // The drain's V gather must be emitted in POST-LOOP scope with FRESH nodes — `gather_run` hash-conses
+    // its LDS-address nodes on `(q_in, half_off, vt_lds)`, which the loop's gather already interned INSIDE
+    // the loop body; reusing them post-loop breaks SSA dominance (hard fail at some `n`) and mis-addresses
+    // the read (a ~5%-of-last-block soft error at others). Re-bind all three to observe the loop `End`
+    // (`idx_after`/`lds_after`) so the derived addresses are distinct + dominated by the post-loop region.
+    let end_dep = [s_last.id];
+    let q_in_d = b.idx_after(q_in, &end_dep);
+    let half_off_d = b.idx_after(half_off, &end_dep);
+    let vt_lds_d = b.lds_after(vt_lds, &end_dep);
+    let (v_frags, gathers) =
+        gather_run::<BF16, Plain, S>(&mut b, vt_lds_d, pitch, d, KV_BLK_32, q_in_d, half_off_d, vt_off_drain, &end_dep);
+    // The V `ds_read`s are async — WAIT for them (`lgkmcnt(0)`) before the P·V MMA consumes `v_frags`.
+    let drain_wait = b.swait_lgkmcnt(*gathers.last().expect("V gather emits ≥1 read")).dep();
+    let s_scaled = b.mul(s_last, scale_bcast);
+    let s_scaled = if ragged {
+        mask_ragged_kv(&mut b, s_scaled, BlockCounter::Epilogue((nblocks - 1) as i64), wlane, n)
+    } else {
+        s_scaled
     };
+    let m_new = crate::tile_ops::row_reduce::<S>(&mut b, s_scaled, wlane, m_run, false);
+    let corr = {
+        let diff = b.sub(m_run, m_new);
+        b.exp2(diff)
+    };
+    let l_resc = b.mul(l_run, corr);
+    let p = {
+        let sh = b.sub(s_scaled, m_new);
+        b.exp2(sh)
+    };
+    let l_drain = crate::tile_ops::row_reduce::<S>(&mut b, p, wlane, l_resc, true);
+    let b_ops = crate::tile_ops::relayout::<S>(&mut b, p);
+    // Route each P·V result THROUGH its accumulator fragment (store then load) — the loop's `compute`
+    // wrapper does exactly this (mma → `store_frag_vec` → later `load_frag_vec` → VALU), which gives the
+    // AMDGPU GCNHazardRecognizer a clean MFMA→store boundary; the drain's direct mma→VALU (scatter `mul`)
+    // otherwise trips the 32×32×8 "VALU reads accumulator before the MFMA result lands" hazard.
+    let o_drain: Vec<Frag<F32>> = (0..dtiles)
+        .map(|dt| {
+            let o_run = b.load_frag_vec(acc_final[dt].f32());
+            let o = b.mul(o_run, corr); // O *= corr for the new running max
+            let mut o = b.val_after(o, &[drain_wait]); // order the MMA after the V-read lgkmcnt drain
+            for s in 0..ksl {
+                o = crate::tile_ops::mma::<S>(&mut b, v_frags[dt * ksl + s], b_ops[s], o);
+            }
+            let st = b.store_frag_vec(acc_final[dt].f32(), o).dep();
+            b.frag_after(acc_final[dt].f32(), &[st])
+        })
+        .collect();
+
+    // ── normalize O /= l (per q, broadcast across d) and transpose-scatter to O[q_global, d_global],
+    //    reading the DRAINED final l/O. ──
+    let recip_l = b.recip(l_drain);
     let dist = S::acc_dist();
     let mut roots = Vec::new();
     for dt in 0..dtiles {
-        let o_vec = b.load_frag_vec(acc_final[dt].f32());
+        let o_vec = b.load_frag_vec(o_drain[dt]);
         let o_norm = b.mul(o_vec, recip_l);
         for i in 0..S::EPT_C {
             let (row, col) = b.acc_rc(dist, wlane, i); // row = d-in-tile, col = q-in-tile

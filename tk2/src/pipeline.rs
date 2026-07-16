@@ -340,6 +340,25 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     sealed: bool,
 }
 
+/// True if `target` is in `from`'s dependency cone (short-circuiting DFS) — the WAR guard's
+/// "does this new slot value already carry that slot's read?" test in [`ClusterCx::compute`].
+fn depends_on(ir: &TileIr, from: TileId, target: TileId) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![from];
+    while let Some(id) = stack.pop() {
+        if id == target {
+            return true;
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        for c in TileIr::children(ir.node(id)) {
+            stack.push(c);
+        }
+    }
+    false
+}
+
 impl<H: Hooks> ClusterCx<'_, H> {
     /// A **cluster seal** — the workgroup `s_barrier` closing a cluster. Under the bare-seal policy it
     /// is a bare `s_barrier` (no acq-rel fence, so no forced `lgkmcnt(0)` and no MFMA-overlap throttle);
@@ -494,7 +513,14 @@ impl<H: Hooks> ClusterCx<'_, H> {
     /// operand + acc reads; store back; `set_prio(0)` on the results; the closing `s_barrier` on the
     /// LAST store. Boundary token = `[bar, prio0]`. SEALED. The `body` is edge-free — this wrapper
     /// owns the bracket + round-trip, so the compute is pluggable without a per-kernel `Hooks` method.
-    pub(crate) fn compute(&mut self, operand: Option<usize>, reads: &[usize], writes: &[usize], body: &ComputeBody<H>) {
+    pub(crate) fn compute(
+        &mut self,
+        operand: Option<usize>,
+        prioritize: bool,
+        reads: &[usize],
+        writes: &[usize],
+        body: &ComputeBody<H>,
+    ) {
         assert!(!writes.is_empty(), "a compute cluster must write ≥1 slot (its seal anchors on the last store)");
         // Resolve the gathered operand (if any). `operand = Some(s)` for a compute that consumes a
         // gathered K-slice (matmul MFMA, FA QKᵀ/PV); `None` for one that consumes only the accumulator
@@ -534,7 +560,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
         // loading wave's ping-pong partner (the priority inversion HK's `gemm.rs:114-119` fixes by
         // anchoring on `pre = [entry barrier, lgkmcnt]`). Still gated on `operand.is_some()` (an
         // operand-less compute has no MFMA burst to bracket and relies on the closing `set_prio(0)`).
-        let prio1 = operand.map(|_| {
+        let prio1 = (operand.is_some() && prioritize).then(|| {
             let pre = self.entry.clone();
             self.b.set_prio(1, &pre).dep()
         });
@@ -583,16 +609,45 @@ impl<H: Hooks> ClusterCx<'_, H> {
             writes.len()
         );
         let new_ids: Vec<TileId> = new.iter().map(|v| v.id()).collect();
-        // Store ONLY the DECLARED write slots, threading each as the next reader's RAW (`slot_src`).
-        let stores: Vec<Effect> = writes
+        // WAR guard on a READ-then-INDEPENDENTLY-WRITTEN slot (FA-32's carried QKᵀ scores: the fused
+        // cluster reads s(i−1) then writes the INDEPENDENT s(i) = QKᵀ). Its new value does NOT carry that
+        // read in its dependency cone, so in a STRAIGHT-LINE pass (the epilogue — no loop phi to serialize
+        // the fragment alloca, unlike the steady body) nothing stops the store from being emitted BEFORE
+        // the read: the epilogue's own read AND any post-loop consumer of the same slot then forward from
+        // the just-written value → that block's softmax reduces over the WRONG scores (its cross-lane
+        // `ds_bpermute`s CSE-collapse, a ~1/nblocks error). The store must therefore happen-AFTER the read.
+        // A value-level `After([read])` does NOT work: the After-simplification pass inlines a non-side-
+        // effecting dep (a `Load`) to its sources, dropping the edge. So anchor the guarded store on the
+        // cluster's OTHER stores (real `Store` side-effects, NOT inlined) — every read-consuming result
+        // (`m`/`l`/`o`) flows through one, so the guarded store lands after the read transitively. A
+        // DEPENDENT write (GEMM's `C=mma(A,B,C)`, FA's `o/m/l`) already carries its read ⇒ NOT guarded ⇒
+        // stored in the first pass unchanged (byte-identical, per `test::byte_identity`).
+        let guarded: Vec<bool> = writes
             .iter()
             .zip(&new)
             .map(|(&s, &v)| {
-                let e = self.accs[s].store(self.b, v);
-                self.slot_src[s] = Some(e.dep());
-                e
+                reads.iter().position(|&r| r == s).is_some_and(|ri| !depends_on(&self.b.ir, v.id(), read_vals[ri].id()))
             })
             .collect();
+        let mut stores: Vec<Option<Effect>> = vec![None; writes.len()];
+        let mut anchor: Vec<TileId> = Vec::new(); // the un-guarded stores that carry the reads
+        for (i, (&s, &v)) in writes.iter().zip(&new).enumerate() {
+            if !guarded[i] {
+                let e = self.accs[s].store(self.b, v);
+                self.slot_src[s] = Some(e.dep());
+                anchor.push(e.dep());
+                stores[i] = Some(e);
+            }
+        }
+        for (i, (&s, &v)) in writes.iter().zip(&new).enumerate() {
+            if guarded[i] {
+                let acc = if anchor.is_empty() { self.accs[s] } else { self.accs[s].after(self.b, &anchor) };
+                let e = acc.store(self.b, v);
+                self.slot_src[s] = Some(e.dep());
+                stores[i] = Some(e);
+            }
+        }
+        let stores: Vec<Effect> = stores.into_iter().map(|e| e.expect("every write slot stored")).collect();
         let prio0 = self.b.set_prio(0, &new_ids).dep();
         // MFMA-cluster TRAILING pin (§5c ISA fix): a `sched.barrier(0)` on ALL MFMA RESULTS, so the
         // tail `s_barrier` cannot hoist up into the run.
@@ -681,6 +736,12 @@ pub(crate) struct Compute<H: Hooks> {
     operand: Option<usize>,
     reads: Vec<usize>,
     writes: Vec<usize>,
+    /// Whether this cluster raises issue priority (`s_setprio(1)`) around its MFMA burst. Default `true`
+    /// (GEMM, PV). A FUSED QKᵀ∥softmax cluster sets it FALSE — HK's QKᵀ cluster (Cluster 0) carries NO
+    /// `s_setprio`; only its P·V cluster (Cluster 2) does — so the two co-resident waves' priority bias
+    /// lives on the P·V burst alone. Also restores the `s_setprio` balance the old operand-less softmax
+    /// cluster used to supply (its lone `prio0`), which `verify_v2` checks.
+    prioritize: bool,
     body: Box<ComputeBody<H>>,
 }
 
@@ -696,13 +757,26 @@ impl<H: Hooks> Compute<H> {
         writes: impl Into<Vec<usize>>,
         body: impl Fn(&mut Builder, Option<&H::Op>, &[SlotVal], BlockCounter) -> Vec<SlotVal> + 'static,
     ) -> Self {
-        Compute { operand: operand.into(), reads: reads.into(), writes: writes.into(), body: Box::new(body) }
+        Compute {
+            operand: operand.into(),
+            reads: reads.into(),
+            writes: writes.into(),
+            prioritize: true,
+            body: Box::new(body),
+        }
+    }
+
+    /// Mark this cluster as NOT raising issue priority (see [`Compute::prioritize`]). Fluent; used by the
+    /// FA fused QKᵀ∥softmax cluster.
+    pub(crate) fn no_prio(mut self) -> Self {
+        self.prioritize = false;
+        self
     }
 }
 
 impl<H: Hooks> Cluster<H> for Compute<H> {
     fn build(&self, cx: &mut ClusterCx<H>) {
-        cx.compute(self.operand, &self.reads, &self.writes, self.body.as_ref());
+        cx.compute(self.operand, self.prioritize, &self.reads, &self.writes, self.body.as_ref());
     }
 }
 
