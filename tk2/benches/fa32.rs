@@ -96,12 +96,30 @@ fn gate(wide: bool, bh: usize, s: usize, d: usize) {
     eprintln!("  gate {name} bh={bh} S={s} d={d}: allclose ✓ (max_abs_err {:e})", report.max_abs_err);
 }
 
-fn measure(wide: bool, bh: usize, s: usize, d: usize) -> f64 {
+/// When `SVOD_PMC` requests Tier-4 counters, profile `plan` via [`ProfileOptions::from_env`] and echo
+/// the rendered table — the plain-`main` bench's equivalent of the criterion `--profile-time`
+/// `PlanProfiler` hook (`fa.rs`/`common.rs`). No-op on a bare `cargo bench` (empty/`0` selection).
+fn profile_pmc(plan: &ExecutionPlan, label: &str) {
+    let want = std::env::var("SVOD_PMC").map(|v| !matches!(v.trim(), "" | "0")).unwrap_or(false);
+    if !want {
+        return;
+    }
+    match plan.profile(&svod_runtime::ProfileOptions::from_env()) {
+        Ok(report) => eprintln!("\nsvod PMC [{label}]:\n{}", report.render_table()),
+        Err(e) => eprintln!("  PMC profile [{label}] failed: {e}"),
+    }
+}
+
+fn measure(wide: bool, bh: usize, s: usize, d: usize, label: &str) -> f64 {
     let (q, k, v) = (rand_bf16(&[bh * s, d]), rand_bf16(&[bh * s, d]), rand_bf16(&[bh * s, d]));
     let (_y, plan) = plan_of(wide, bh, s, d, &q, &k, &v);
     plan.execute().expect("execute");
     let iters = 50u64;
     let avg_ns = plan_gpu_ns(&plan, iters) as f64 / iters as f64;
+    // Counters for the FA-32 kernel under study (the 16×16 baseline is profiled by the `fa` bench).
+    if wide {
+        profile_pmc(&plan, &format!("FA-32 {} S{s} d{d}", label.trim()));
+    }
     fa_flops_noncausal(bh, s, d) as f64 / avg_ns / 1e3 // TF
 }
 
@@ -133,8 +151,8 @@ fn main() {
     for (label, bb, hh, s, d) in configs {
         let bh = bb * hh;
         let wgs = bh * (s / 128);
-        let tf16 = measure(false, bh, s, d);
-        let tf32 = measure(true, bh, s, d);
+        let tf16 = measure(false, bh, s, d, label);
+        let tf32 = measure(true, bh, s, d, label);
         eprintln!("  {label} {s:>6} {d:>4} {wgs:>6}    {tf16:>10.1}  {tf32:>10.1}  {:>7.2}x", tf32 / tf16);
     }
 }
