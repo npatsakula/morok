@@ -23,7 +23,7 @@
 
 use std::collections::HashSet;
 
-use crate::build::{BF16, Builder, Effect, F32, Frag, Idx, Val};
+use crate::build::{BF16, Builder, Effect, F32, Frag, Idx, Scope, Val};
 use crate::ir::{FragMap, Node, TileId, TileIr};
 
 /// The commit's **drain placement policy** (DESIGN §5c) — WHERE the collaborative fill's LDS writes
@@ -42,6 +42,54 @@ pub(crate) enum CommitDrain {
     /// intrinsic (compiler-visible `ds_write`) RAW-drain as `IntrinsicAuto`, one fewer workgroup barrier.
     IntrinsicNoWar,
     AsmDeferred,
+    /// Disjoint K2/V3 asm writes are drained and published immediately. This leaves a later compute
+    /// barrier in the body, which is required for safe asymmetric wave-phase progress.
+    AsmPublishedNoWar,
+    /// Direct-to-LDS K plus register-staged V: issue/commit in a memory cluster but defer the full
+    /// VMEM drain and publication barrier until an explicit tail publish after compute.
+    DirectDeferred,
+}
+
+/// What kind of machine completion a hook's commit effects require before LDS publication. This is
+/// deliberately separate from [`CommitDrain`]: hooks classify what they emitted, while the schedule
+/// chooses where and how that class is completed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CommitCompletion {
+    /// Compiler-visible LDS stores; a fenced barrier supplies their LDS completion.
+    Intrinsic,
+    /// Waitcnt-opaque LDS stores; publication requires an explicit `lgkmcnt(0)`.
+    Opaque,
+    /// Direct GLOBAL→LDS VMEM transfers plus waitcnt-opaque LDS stores.
+    DirectAndOpaque,
+}
+
+/// One hook commit and the completion class required by its effects.
+pub(crate) struct CommitBatch {
+    effects: Vec<Effect>,
+    completion: CommitCompletion,
+}
+
+impl CommitBatch {
+    pub(crate) fn new(effects: Vec<Effect>, completion: CommitCompletion) -> Self {
+        assert!(!effects.is_empty(), "a commit batch must contain at least one effect");
+        Self { effects, completion }
+    }
+}
+
+fn validate_commit_policy(completion: CommitCompletion, drain: CommitDrain, bare_seals: bool) {
+    let expected = match drain {
+        CommitDrain::IntrinsicAuto | CommitDrain::IntrinsicNoWar => CommitCompletion::Intrinsic,
+        CommitDrain::AsmDeferred | CommitDrain::AsmPublishedNoWar => CommitCompletion::Opaque,
+        CommitDrain::DirectDeferred => CommitCompletion::DirectAndOpaque,
+    };
+    assert_eq!(
+        completion, expected,
+        "commit completion {completion:?} is incompatible with publication policy {drain:?}"
+    );
+    assert!(
+        !bare_seals || completion == CommitCompletion::Opaque,
+        "bare seals require an opaque-LDS commit with explicit completion"
+    );
 }
 
 /// The kernel-specific hooks the pipeline drives — the ONLY kernel-specific part of the schedule.
@@ -60,6 +108,12 @@ pub(crate) trait Hooks {
     /// `sched.barrier(0)` walls already emitted at each cluster boundary pin the split placement.
     const PREFETCH_TILES: usize;
 
+    /// Prologue issue order. Streaming kernels normally use declaration order; a mixed direct/staged
+    /// transfer may override this so older register loads precede younger direct-to-LDS operations.
+    fn prologue_prefetch_tiles(&self) -> Vec<usize> {
+        (0..Self::PREFETCH_TILES).collect()
+    }
+
     /// Prefetch operand-tile `tile` of block `k_base` global→VGPR (the latency hide), folding the
     /// staged registers into `prev` (the partial fill accumulated by earlier prefetch clusters this
     /// iteration; `None` = start fresh). `order` is the cluster entry: the load is ordered after it so
@@ -73,8 +127,9 @@ pub(crate) trait Hooks {
         prev: Option<Self::Reg>,
         order: &[TileId],
     ) -> (Self::Reg, Vec<TileId>);
-    /// Commit the staged registers VGPR→LDS behind `war`. Returns the store effects the RAW fences.
-    fn commit(&mut self, b: &mut Builder, k_base: Idx, reg: &Self::Reg, war: &[TileId]) -> Vec<Effect>;
+    /// Commit the staged registers VGPR→LDS behind `war`, classifying the returned effects by the
+    /// machine completion they require. The pipeline rejects a mismatched publication policy.
+    fn commit(&mut self, b: &mut Builder, k_base: Idx, reg: &Self::Reg, war: &[TileId]) -> CommitBatch;
     /// Gather K-slice `slice` LDS→operand-frags after `raw`, for the CURRENT block `block` (its parity
     /// selects the read buffer under LDS double-buffering; single-buffered hooks ignore it). Returns the
     /// operand bundle, its store-fence tokens (the WAR consumes them), and the `op_anchor` `set_prio` uses.
@@ -85,6 +140,10 @@ pub(crate) trait Hooks {
         block: BlockCounter,
         raw: &[TileId],
     ) -> (Self::Op, Vec<TileId>, TileId);
+
+    /// Tie every waitcnt-opaque gather value through its completed `lgkmcnt(0)` wait. Intrinsic-only
+    /// hooks must still implement this explicitly, normally by rejecting an impossible invocation.
+    fn ready_after_lgkm(&mut self, b: &mut Builder, op: Self::Op, wait: TileId) -> Self::Op;
 }
 
 /// A **heterogeneous compute-channel value** (DESIGN §3.2 — gentle typing: the dtype rides as DATA, not
@@ -124,7 +183,8 @@ impl SlotVal {
 /// heterogeneous carry of DESIGN §3.2). Whether a slot is CARRIED (seeded + loop-carried + End-folded,
 /// e.g. GEMM's C, FA's `o`/`m`/`l`) or a per-iteration TEMPORARY (no seed, not carried — produced and
 /// consumed within one iteration, e.g. FA's `s`=QKᵀ scores, `p`=softmax weights) is set by the
-/// pipeline's `inited` (`Some` seed ⇒ carried, `None` ⇒ temporary), NOT by the slot itself.
+/// pipeline's `inited` (`Some` seed ⇒ carried, `None` ⇒ temporary), NOT by the slot itself. FA-32's
+/// rotated score tile is carried; its per-iteration probability tile is temporary.
 #[derive(Copy, Clone)]
 pub(crate) enum AccSlot {
     F32(Frag<F32>),
@@ -246,9 +306,9 @@ impl SlotSet {
 #[derive(Copy, Clone)]
 pub(crate) enum BlockCounter {
     /// Steady loop: the live `counter(kr)` — an existing node, so reusing it emits nothing.
-    Steady(Idx),
+    Steady(Idx, Scope),
     /// Epilogue: the last block index `nblocks-1`, materialised to an `idx_const` only on demand.
-    Epilogue(i64),
+    Epilogue(i64, Scope),
 }
 
 impl BlockCounter {
@@ -257,8 +317,18 @@ impl BlockCounter {
     /// unmasked one doesn't, keeping GEMM/FA-16 byte-identical).
     pub(crate) fn idx(self, b: &mut Builder) -> Idx {
         match self {
-            BlockCounter::Steady(i) => i,
-            BlockCounter::Epilogue(n) => b.idx_const(n),
+            BlockCounter::Steady(i, scope) => b.scope_idx(i, scope),
+            BlockCounter::Epilogue(n, scope) => {
+                let n = b.idx_const(n);
+                b.scope_idx(n, scope)
+            }
+        }
+    }
+
+    /// The lexical region in which movement/address expressions for this block are authored.
+    pub(crate) fn scope(self) -> Scope {
+        match self {
+            BlockCounter::Steady(_, scope) | BlockCounter::Epilogue(_, scope) => scope,
         }
     }
 }
@@ -296,6 +366,8 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     /// GEMM/PV ignore it, so their emitted IR stays byte-identical.
     block: BlockCounter,
     commit_drain: CommitDrain,
+    /// Gather hooks emit waitcnt-opaque `ds_read_b64`; explicit readiness is therefore mandatory.
+    asm_gather: bool,
     /// The **HK bare-seal policy** (§5c): when set, cluster seals lower to a bare `s_barrier`
     /// ([`Builder::bare_barrier`]) instead of the acq-rel-fenced [`Builder::barrier`], and the LDS
     /// ordering the fence dropped is re-supplied by an explicit `s_waitcnt lgkmcnt(0)` before each
@@ -326,7 +398,11 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     all_gathers: Vec<TileId>,
     operands: Vec<Option<(H::Op, TileId)>>,
     reg: Option<H::Reg>,
+    committed: bool,
     raw_next: Option<TileId>,
+    /// Writes/direct copies committed without a publication barrier. An explicit publish cluster must
+    /// consume these before the body ends.
+    pending_publish: Option<Effect>,
     tail_barrier: Option<TileId>,
     /// Bare-seal drain bookkeeping: the set of gathered slices whose `ds_read`s are not yet covered by
     /// an `lgkmcnt(0)` drain. A compute over slice `s` drains ONLY if `s` is outstanding (its own
@@ -335,6 +411,8 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     /// later-gathered slice 3 is still outstanding — does NOT stall on a spurious drain (HK's C5 has
     /// none: it drains at C1/C3/C6 only). Cleared each body pass.
     undrained: Vec<usize>,
+    /// Opaque gather stores not yet covered by a queue-wide `lgkmcnt(0)` readiness wait.
+    undrained_reads: Vec<TileId>,
     // ── per-cluster (reset by the driver before each cluster) ──
     this_gathers: Vec<TileId>,
     sealed: bool,
@@ -360,6 +438,23 @@ fn depends_on(ir: &TileIr, from: TileId, target: TileId) -> bool {
 }
 
 impl<H: Hooks> ClusterCx<'_, H> {
+    fn ready_opaque_gathers(&mut self) {
+        if !self.asm_gather || self.undrained_reads.is_empty() {
+            return;
+        }
+        let last = self.undrained_reads[self.undrained_reads.len() - 1];
+        let covered = self.b.combine(Effect(last), &self.undrained_reads[..self.undrained_reads.len() - 1]);
+        let ready = self.b.swait_lgkmcnt(covered.dep());
+        for operand in &mut self.operands {
+            if let Some((op, anchor)) = operand.take() {
+                *operand = Some((self.hooks.ready_after_lgkm(self.b, op, ready.dep()), anchor));
+            }
+        }
+        self.entry.push(ready.dep());
+        self.undrained_reads.clear();
+        self.undrained.clear();
+    }
+
     /// A **cluster seal** — the workgroup `s_barrier` closing a cluster. Under the bare-seal policy it
     /// is a bare `s_barrier` (no acq-rel fence, so no forced `lgkmcnt(0)` and no MFMA-overlap throttle);
     /// otherwise the acq-rel-fenced barrier. The LDS ordering a bare seal drops is re-supplied by the
@@ -418,6 +513,27 @@ impl<H: Hooks> ClusterCx<'_, H> {
         }
     }
 
+    /// Prefetch after this memory cluster's gathers. This is the issue-ordering seam needed for
+    /// `V load -> current gather -> K direct-to-LDS`: no barrier is inserted between the operations.
+    pub(crate) fn prefetch_after_gathers(&mut self, tiles: &[usize]) {
+        if let Some(kn) = self.k_next {
+            self.ready_opaque_gathers();
+            let mut order = self.entry.clone();
+            order.extend(&self.this_gathers);
+            let mut anchors = Vec::new();
+            for &t in tiles {
+                let prev = self.reg.take();
+                let (reg, load_ids) = self.hooks.prefetch(self.b, kn, t, prev, &order);
+                self.reg = Some(reg);
+                anchors.extend(load_ids);
+            }
+            if !anchors.is_empty() {
+                let pin = self.b.sched_fence(0, &anchors).dep();
+                self.entry.push(pin);
+            }
+        }
+    }
+
     /// The **gather** safe op = one iteration of the gather loop: gdeps = `seed` + `entry`; the hook
     /// gathers slice `s`; its fence tokens extend both this cluster's list and the cumulative
     /// `all_gathers` (WAR-fenced by a later commit), and its operand lands at `operands[s]`.
@@ -430,17 +546,26 @@ impl<H: Hooks> ClusterCx<'_, H> {
         self.operands[s] = Some((op, op_anchor));
         // A bare seal will NOT drain these `ds_read`s — flag slice `s` for the compute that consumes it.
         self.undrained.push(s);
+        if self.asm_gather {
+            self.undrained_reads.extend(g);
+        }
     }
 
     /// The **commit** safe op = the commit arm: WAR-fence EVERY gather so far, `commit`, RAW-fence
     /// the fill as the LDS carry-out, and SEAL the cluster (its own barrier is the boundary token).
     /// A no-op (leaving the cluster unsealed) when there is nothing to commit (`k_next`/`reg` absent).
     pub(crate) fn commit(&mut self) {
-        if let Some(kn) = self.k_next
-            && self.reg.is_some()
-        {
-            let last = self.all_gathers.len() - 1;
+        if let Some(kn) = self.k_next {
+            assert!(!self.committed, "a schedule body supports only one commit");
+            let reg = self.reg.take().expect("commit requires a staged fill");
+            self.committed = true;
+            self.ready_opaque_gathers();
             let war = if self.commit_drain == CommitDrain::AsmDeferred {
+                let last = self
+                    .all_gathers
+                    .len()
+                    .checked_sub(1)
+                    .expect("single-buffer opaque commit requires at least one preceding gather");
                 // C-c: drain the outstanding asm gather READS (esp. the early-gathered slice the NEXT
                 // compute cluster consumes) HERE, before the commit writes. `lgkmcnt` is a UNIFIED
                 // read+write counter: if that operand read-drain instead landed AFTER the writes (to
@@ -465,18 +590,24 @@ impl<H: Hooks> ClusterCx<'_, H> {
                 let rd = self.b.swait_lgkmcnt(rd_anchor);
                 self.undrained.clear();
                 vec![rd.dep()]
-            } else if self.commit_drain == CommitDrain::IntrinsicNoWar {
+            } else if matches!(
+                self.commit_drain,
+                CommitDrain::IntrinsicNoWar | CommitDrain::DirectDeferred | CommitDrain::AsmPublishedNoWar
+            ) {
                 // Double-buffered: no read-before-overwrite hazard (disjoint parity halves), so emit NO
                 // WAR seal. The gather reads are still drained before the next compute by the RAW seal
                 // (a fenced barrier after the commit writes), and the RAW carry is `raw_next` below.
                 Vec::new()
             } else {
+                assert!(!self.all_gathers.is_empty(), "single-buffer intrinsic commit requires a preceding gather");
                 let deps: Vec<TileId> = self.all_gathers[1..].to_vec();
                 vec![self.seal(Effect(self.all_gathers[0]), &deps).dep()]
             };
             // `fill` = the commit's write effects (intrinsic `ds_write` stores OR asm `ds_write_b64`
             // writes). The DRAIN is owned here now (not by the hook), dispatched on the policy.
-            let fill = self.hooks.commit(self.b, kn, self.reg.as_ref().unwrap(), &war);
+            let batch = self.hooks.commit(self.b, kn, &reg, &war);
+            validate_commit_policy(batch.completion, self.commit_drain, self.bare_seals);
+            let fill = batch.effects;
             let fill_deps: Vec<TileId> = fill[1..].iter().map(|e| e.dep()).collect();
             match self.commit_drain {
                 CommitDrain::IntrinsicAuto | CommitDrain::IntrinsicNoWar => {
@@ -502,7 +633,41 @@ impl<H: Hooks> ClusterCx<'_, H> {
                     self.tail_barrier = Some(rn);
                     self.entry = vec![rn];
                 }
+                CommitDrain::AsmPublishedNoWar => {
+                    let n = fill.len();
+                    let committed =
+                        self.b.combine(fill[n - 1], &fill[..n - 1].iter().map(|e| e.dep()).collect::<Vec<_>>());
+                    let ready = self.b.swait_lgkmcnt(committed.dep());
+                    let rn = self.seal(ready, &[committed.dep()]).dep();
+                    self.raw_next = Some(rn);
+                    self.tail_barrier = Some(rn);
+                    self.entry = vec![rn];
+                }
+                CommitDrain::DirectDeferred => {
+                    assert!(
+                        self.pending_publish.is_none(),
+                        "a deferred commit must be published before the next commit"
+                    );
+                    let n = fill.len();
+                    let token = self.b.combine(fill[n - 1], &fill[..n - 1].iter().map(|e| e.dep()).collect::<Vec<_>>());
+                    self.pending_publish = Some(token);
+                    self.entry = vec![token.dep()];
+                }
             }
+            self.sealed = true;
+        }
+    }
+
+    /// Complete and publish a deferred direct/staged commit after its covering compute regions.
+    pub(crate) fn publish(&mut self) {
+        if let Some(committed) = self.pending_publish.take() {
+            let covered = self.b.combine(committed, &self.entry);
+            let wait = self.b.swait_vmcnt(covered);
+            let lds_wait = self.b.swait_lgkmcnt(wait.dep());
+            let rn = self.seal(lds_wait, &[covered.dep(), wait.dep()]).dep();
+            self.raw_next = Some(rn);
+            self.tail_barrier = Some(rn);
+            self.entry = vec![rn];
             self.sealed = true;
         }
     }
@@ -513,7 +678,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
     /// operand + acc reads; store back; `set_prio(0)` on the results; the closing `s_barrier` on the
     /// LAST store. Boundary token = `[bar, prio0]`. SEALED. The `body` is edge-free — this wrapper
     /// owns the bracket + round-trip, so the compute is pluggable without a per-kernel `Hooks` method.
-    pub(crate) fn compute(
+    fn compute(
         &mut self,
         operand: Option<usize>,
         prioritize: bool,
@@ -522,6 +687,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
         body: &ComputeBody<H>,
     ) {
         assert!(!writes.is_empty(), "a compute cluster must write ≥1 slot (its seal anchors on the last store)");
+        self.ready_opaque_gathers();
         // Resolve the gathered operand (if any). `operand = Some(s)` for a compute that consumes a
         // gathered K-slice (matmul MFMA, FA QKᵀ/PV); `None` for one that consumes only the accumulator
         // carry (FA softmax). The `unwrap_or_else` is the BUILD-TIME coupling check: it panics during
@@ -706,22 +872,38 @@ pub(crate) struct Mem {
     #[builder(default, into)]
     prefetch: Vec<usize>,
     #[builder(default, into)]
+    prefetch_after_gathers: Vec<usize>,
+    #[builder(default, into)]
     gathers: Vec<usize>,
     #[builder(default)]
     commit: bool,
+    #[builder(default)]
+    publish: bool,
 }
 
 impl<H: Hooks> Cluster<H> for Mem {
     fn build(&self, cx: &mut ClusterCx<H>) {
-        cx.mem_prio0(); // drop issue-priority to 0 for this memory phase (HK ping-pong steering)
+        if !self.publish
+            || !self.prefetch.is_empty()
+            || !self.prefetch_after_gathers.is_empty()
+            || !self.gathers.is_empty()
+        {
+            cx.mem_prio0(); // drop issue-priority to 0 for this memory phase (HK ping-pong steering)
+        }
         if !self.prefetch.is_empty() {
             cx.prefetch(&self.prefetch);
         }
         for &s in &self.gathers {
             cx.gather(s);
         }
+        if !self.prefetch_after_gathers.is_empty() {
+            cx.prefetch_after_gathers(&self.prefetch_after_gathers);
+        }
         if self.commit {
             cx.commit();
+        }
+        if self.publish {
+            cx.publish();
         }
     }
 }
@@ -807,6 +989,7 @@ fn run_body<H: Hooks>(
     k_next: Option<Idx>,
     block: BlockCounter,
     commit_drain: CommitDrain,
+    asm_gather: bool,
     bare_seals: bool,
     pin_mfma: bool,
     ping_pong: bool,
@@ -821,6 +1004,7 @@ fn run_body<H: Hooks>(
         k_next,
         block,
         commit_drain,
+        asm_gather,
         bare_seals,
         pin_mfma,
         ping_pong,
@@ -829,9 +1013,12 @@ fn run_body<H: Hooks>(
         all_gathers: Vec::new(),
         operands: (0..ksteps).map(|_| None).collect(),
         reg: None,
+        committed: false,
         raw_next: None,
+        pending_publish: None,
         tail_barrier: None,
         undrained: Vec::new(),
+        undrained_reads: Vec::new(),
         this_gathers: Vec::new(),
         sealed: false,
     };
@@ -850,6 +1037,14 @@ fn run_body<H: Hooks>(
             cx.tail_barrier = Some(bar);
             cx.entry = vec![bar];
         }
+    }
+    assert!(cx.pending_publish.is_none(), "deferred commit was not followed by a publish cluster");
+    if ping_pong && let Some(raw) = cx.raw_next {
+        let tail = cx.tail_barrier.expect("phased streaming body must end on a barrier");
+        assert!(
+            raw != tail && depends_on(&cx.b.ir, tail, raw),
+            "phased body tail must actually depend on an earlier publication"
+        );
     }
     BodyOut { slot_src: cx.slot_src, raw_next: cx.raw_next, tail_barrier: cx.tail_barrier }
 }
@@ -872,6 +1067,14 @@ pub(crate) struct Pipeline<'a, H: Hooks> {
     commit_drain: CommitDrain,
     bare_seals: bool,
     pin_mfma: bool,
+    /// Optional straight-line schedule between the block-0 LDS seed and the steady loop. FA-32 uses
+    /// this to compute QK(0) and stage block 1 without executing an empty softmax/PV iteration.
+    warmup_clusters: Vec<Box<dyn Cluster<H>>>,
+    /// Carried slots the warmup promises to seed before the rolled loop starts.
+    warmup_seed_slots: Vec<usize>,
+    /// Opt in to distinct warmup/steady/epilogue value scopes. Needed when post-loop dynamic masking
+    /// introduces otherwise-identical address/reduction DAGs; left off for static hot paths.
+    scoped_regions: bool,
     clusters: Vec<Box<dyn Cluster<H>>>,
 }
 
@@ -890,7 +1093,7 @@ pub(crate) struct Sched {
 /// wave-phase ping-pong; `sched.resident` drops the steady prefetch/commit (compute-resident microkernel);
 /// `sched.bare_seals` swaps the acq-rel-fenced cluster barriers for HK's bare `s_barrier` + explicit drains.
 /// `inited[s] = Some(seed)` marks slot `s` CARRIED (loop-carried + End-folded); `None` a per-iteration
-/// TEMPORARY (not carried — produced and consumed within one pass, e.g. FA's QKᵀ scores / softmax `P`).
+/// TEMPORARY (not carried — produced and consumed within one pass, e.g. FA's softmax `P`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pipeline<'a, H: Hooks>(
     b: &'a mut Builder,
@@ -918,11 +1121,36 @@ pub(crate) fn pipeline<'a, H: Hooks>(
         commit_drain,
         bare_seals,
         pin_mfma,
+        warmup_clusters: Vec::new(),
+        warmup_seed_slots: Vec::new(),
+        scoped_regions: false,
         clusters: Vec::new(),
     }
 }
 
 impl<'a, H: Hooks> Pipeline<'a, H> {
+    /// Append a cluster to a one-time block-0 warmup schedule. A warmup stages block 1, writes any
+    /// initial carried state needed by the steady schedule, then starts the rolled loop at block 1.
+    /// It is currently restricted to non-resident, non-ping-pong pipelines with at least two blocks.
+    pub(crate) fn warmup_cluster(mut self, c: impl Cluster<H> + 'static) -> Self {
+        self.warmup_clusters.push(Box::new(c));
+        self
+    }
+
+    /// Require the warmup to write a carried slot. This turns a missing warmup compute cluster into a
+    /// build-time failure rather than silently falling back to the slot's algebraic seed.
+    pub(crate) fn warmup_seed(mut self, slot: usize) -> Self {
+        self.warmup_seed_slots.push(slot);
+        self
+    }
+
+    /// Keep warmup, steady, and epilogue value DAGs lexically distinct. This is a correctness contract
+    /// for kernels whose dynamic tail work can otherwise reuse loop-local expressions.
+    pub(crate) fn scoped_regions(mut self) -> Self {
+        self.scoped_regions = true;
+        self
+    }
+
     /// Append a cluster to the schedule (fluent). Takes any `impl Cluster<H>` (boxed internally), so
     /// the call site is `.cluster(Mem { .. })` / `.cluster(Compute::new(3, body))` — no `Box::new`.
     pub(crate) fn cluster(mut self, c: impl Cluster<H> + 'static) -> Self {
@@ -950,6 +1178,9 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             commit_drain,
             bare_seals,
             pin_mfma,
+            warmup_clusters,
+            warmup_seed_slots,
+            scoped_regions,
             clusters,
         } = self;
         assert!(nblocks >= 2, "pipeline needs nblocks ≥ 2");
@@ -971,12 +1202,14 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         // Stage ALL operand tiles of block 0 (the prologue is off the hot loop, so load placement here
         // is irrelevant — the split-across-clusters hide only matters in the steady body).
         let mut reg0 = None;
-        for t in 0..H::PREFETCH_TILES {
+        for t in hooks.prologue_prefetch_tiles() {
             let (reg, _load_ids) = hooks.prefetch(b, zero, t, reg0, &[]);
             reg0 = Some(reg);
         }
         let reg0 = reg0.expect("a pipeline has ≥1 prefetch tile");
-        let fill0 = hooks.commit(b, zero, &reg0, &[]);
+        let batch0 = hooks.commit(b, zero, &reg0, &[]);
+        validate_commit_policy(batch0.completion, commit_drain, bare_seals);
+        let fill0 = batch0.effects;
         // The prologue's block-0 drain is one-time (outside the steady loop), so both asm policies drain
         // it EXPOSED here — the deferral is specifically about hiding the hot-loop C6 drain, not this seed.
         let raw_seed = match commit_drain {
@@ -984,12 +1217,19 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
                 let fill0_deps: Vec<TileId> = fill0[1..].iter().map(|e| e.dep()).collect();
                 b.barrier(fill0[0], &fill0_deps)
             }
-            CommitDrain::AsmDeferred => {
+            CommitDrain::DirectDeferred => {
+                let n = fill0.len();
+                let committed = b.combine(fill0[n - 1], &fill0[..n - 1].iter().map(|e| e.dep()).collect::<Vec<_>>());
+                let wait = b.swait_vmcnt(committed);
+                let lds_wait = b.swait_lgkmcnt(wait.dep());
+                b.barrier(lds_wait, &[committed.dep(), wait.dep()])
+            }
+            CommitDrain::AsmDeferred | CommitDrain::AsmPublishedNoWar => {
                 let sw = b.swait_lgkmcnt(fill0.last().expect("asm commit emits ≥1 write").dep());
                 b.barrier(sw, &[])
             }
         };
-        let loop_seed = match warp_row {
+        let initial_loop_seed = match warp_row {
             // The eq=1 wave-phase barrier ordered after the prologue commit (`raw_seed`). The barrier
             // rides as an ordering-only dep (`deps[1..]`, unreferenced by the WaveBarrier template) — no
             // longer laundered through `idx_after` into the warp_row operand now that a CUSTOM accepts
@@ -998,67 +1238,150 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             None => raw_seed.dep(),
         };
 
-        // ── steady loop: block k's gathers via the carried RAW; prefetch/commit block k+1. ──
-        let kr = b.range((nblocks - 1) as i64);
-        let tk = b.counter(kr);
-        let k_next_idx = b.idx_add(tk, one);
-        let k_next = b.idx_mul(k_next_idx, ks_c);
-        // Per-slot carry-in: a CARRIED slot's first read routes `[seed, range]`; a TEMPORARY has none
-        // (it must be produced before it is read — enforced in `compute`).
-        let carry: Vec<Vec<TileId>> =
-            (0..n_slots).map(|s| inited[s].map(|e| vec![e.dep(), kr.dep()]).unwrap_or_default()).collect();
-        // Compute-resident: the whole tile is staged ONCE in the prologue, so the steady loop drops
-        // BOTH prefetch and commit (`k_next=None`); the gathers still fire, re-reading the resident
-        // block via `[loop_seed, kr]`.
-        let steady_k_next = if resident { None } else { Some(k_next) };
-        let body = run_body(
-            b,
-            &clusters,
-            &mut hooks,
-            ksteps,
-            accs,
-            &is_carried,
-            &[loop_seed, kr.dep()],
-            &carry,
-            steady_k_next,
-            BlockCounter::Steady(tk), // current KV-block counter (steady): the live loop counter
-            commit_drain,
-            bare_seals,
-            pin_mfma,
-            ping_pong,
-        );
+        // Optional straight-line warmup: block 0 is already in LDS. The warmup schedule gathers it,
+        // stages block 1 (`k_next = k_step`), and may seed carried compute state such as FA-32's S(0).
+        // Its block-1 commit becomes the steady loop's initial LDS-RAW token. Keeping this in Pipeline
+        // reuses the same movement/barrier wrappers as the steady schedule and avoids a second hand-woven
+        // FA movement path.
+        let warmup = if warmup_clusters.is_empty() {
+            None
+        } else {
+            assert!(!resident, "pipeline warmup is only supported for streaming schedules");
+            assert!(warp_row.is_none(), "pipeline warmup is not compatible with wave-phase ping-pong");
+            assert!(nblocks >= 2, "pipeline warmup needs at least two blocks");
+            let warmup_carry: Vec<Vec<TileId>> =
+                inited.iter().map(|e| e.map(|x| vec![x.dep()]).unwrap_or_default()).collect();
+            let warm_scope = if scoped_regions { b.scope(&[initial_loop_seed]) } else { Scope::ROOT };
+            let warm = run_body(
+                b,
+                &warmup_clusters,
+                &mut hooks,
+                ksteps,
+                accs,
+                &is_carried,
+                &[initial_loop_seed],
+                &warmup_carry,
+                Some(ks_c), // commit block 1 while block-0 operands are already gathered
+                BlockCounter::Epilogue(0, warm_scope),
+                commit_drain,
+                asm_gather && matches!(commit_drain, CommitDrain::DirectDeferred | CommitDrain::AsmPublishedNoWar),
+                bare_seals,
+                pin_mfma,
+                ping_pong,
+            );
+            for &slot in &warmup_seed_slots {
+                assert!(slot < n_slots, "warmup seed slot {slot} is out of range");
+                assert!(is_carried[slot], "warmup seed slot {slot} must be carried");
+                assert!(warm.slot_src[slot].is_some(), "warmup did not write required carried slot {slot}");
+            }
+            Some(warm)
+        };
+        let steady_blocks = nblocks - if warmup.is_some() { 2 } else { 1 };
+        let loop_seed = warmup
+            .as_ref()
+            .map(|w| w.raw_next.expect("warmup schedule must commit block 1"))
+            .unwrap_or(initial_loop_seed);
 
-        // ── loop close: fold every CARRIED slot's last store (its carry-out — the writers may differ per
-        //    slot now, so read them from `slot_src`, not one uniform last-cluster store), raw_next (LDS
-        //    carry, streaming only), AND the final cluster's barrier (else DCE drops it → unbalanced
-        //    count → deadlock) under one End. Temporaries are NOT folded — each is reached transitively
-        //    through the carried slot its consumer writes, so it stays live + loop-scoped. ──
-        let carried_stores: Vec<TileId> = carried_slots
-            .iter()
-            .map(|&s| body.slot_src[s].expect("carried slot must be written every iteration (the loop carry)"))
-            .collect();
-        let last = Effect(carried_stores[carried_stores.len() - 1]);
-        let mut fold: Vec<TileId> = carried_stores[..carried_stores.len() - 1].to_vec();
-        match body.raw_next {
-            Some(rn) => fold.push(rn),
-            None => assert!(resident, "streaming schedule must contain a commit cluster (raw_next carry)"),
-        }
-        fold.push(body.tail_barrier.expect("steady body must end on a cluster barrier"));
-        // HK positional wall lattice: the `sched.barrier(0)` paired with every `s_barrier` pins the
-        // opaque asm `ds_read_b64`s inside their cluster (load-bearing for the asm gather's correctness).
-        if asm_gather {
-            fold.push(b.wall_marker().dep());
-        }
-        let combined = b.combine(last, &fold);
-        let ended = b.end(combined, &[kr]);
-        // Every slot's post-loop handle observes the `End`; for carried slots this is the carry-in the
-        // epilogue reads, for temporaries a fresh handle the epilogue re-writes (no collision with the
-        // in-loop stores).
-        let acc_loop: Vec<AccSlot> = accs.iter().map(|a| a.after(b, &[ended.dep()])).collect();
+        // ── steady loop: without a warmup, process blocks 0..last-1 as before. With a warmup, QK(0)
+        //    is already carried and block 1 is staged, so process current blocks 1..last-1. ──
+        let (carry_out, body_raw_next, body_tail_barrier) = if steady_blocks == 0 {
+            // A two-block warm pipeline has no steady iteration: warmup computed block 0 and staged
+            // block 1, so transition those carried stores and the LDS publication directly into the
+            // epilogue. Do not emit `Range(0)`: dead-loop cleanup cannot make loop-local operand values
+            // dominate the epilogue, and relying on it produced invalid LLVM.
+            let warm = warmup.as_ref().expect("only a warmup can leave zero steady blocks");
+            let carried_stores: Vec<TileId> = carried_slots
+                .iter()
+                .map(|&s| warm.slot_src[s].unwrap_or_else(|| inited[s].expect("carried slot has a seed").dep()))
+                .collect();
+            let last = Effect(carried_stores[carried_stores.len() - 1]);
+            let mut fold = carried_stores[..carried_stores.len() - 1].to_vec();
+            let raw = warm.raw_next.expect("warmup schedule must commit block 1");
+            let tail = warm.tail_barrier.expect("warmup schedule must end on a cluster barrier");
+            fold.extend([raw, tail]);
+            if asm_gather {
+                fold.push(b.wall_marker().dep());
+            }
+            (b.combine(last, &fold), Some(raw), Some(tail))
+        } else {
+            let kr = if scoped_regions && let Some(warm) = &warmup {
+                b.range_after(
+                    steady_blocks as i64,
+                    &[
+                        warm.raw_next.expect("warmup schedule must commit block 1"),
+                        warm.tail_barrier.expect("warmup schedule must end on a cluster barrier"),
+                    ],
+                )
+            } else {
+                b.range(steady_blocks as i64)
+            };
+            let tk = b.counter(kr);
+            let current = if warmup.is_some() { b.idx_add(tk, one) } else { tk };
+            let k_next_idx = b.idx_add(current, one);
+            let k_next = b.idx_mul(k_next_idx, ks_c);
+            // Per-slot carry-in: a CARRIED slot's first read routes `[seed, range]`; a TEMPORARY has none
+            // (it must be produced before it is read — enforced in `compute`).
+            let carry: Vec<Vec<TileId>> = (0..n_slots)
+                .map(|s| {
+                    inited[s]
+                        .map(|e| {
+                            let source = warmup.as_ref().and_then(|w| w.slot_src[s]).unwrap_or(e.dep());
+                            vec![source, kr.dep()]
+                        })
+                        .unwrap_or_default()
+                })
+                .collect();
+            // Compute-resident: the whole tile is staged ONCE in the prologue, so the steady loop drops
+            // BOTH prefetch and commit (`k_next=None`); the gathers still fire, re-reading the resident
+            // block via `[loop_seed, kr]`.
+            let steady_k_next = if resident { None } else { Some(k_next) };
+            let steady_scope = if scoped_regions { b.scope(&[kr.dep()]) } else { Scope::ROOT };
+            let body = run_body(
+                b,
+                &clusters,
+                &mut hooks,
+                ksteps,
+                accs,
+                &is_carried,
+                &[loop_seed, kr.dep()],
+                &carry,
+                steady_k_next,
+                BlockCounter::Steady(current, steady_scope), // warmup shifts the current block from 0 to 1
+                commit_drain,
+                asm_gather && matches!(commit_drain, CommitDrain::DirectDeferred | CommitDrain::AsmPublishedNoWar),
+                bare_seals,
+                pin_mfma,
+                ping_pong,
+            );
+
+            // Fold every CARRIED slot's last store, raw_next, and the final cluster barrier under one End.
+            let carried_stores: Vec<TileId> = carried_slots
+                .iter()
+                .map(|&s| body.slot_src[s].expect("carried slot must be written every iteration (the loop carry)"))
+                .collect();
+            let last = Effect(carried_stores[carried_stores.len() - 1]);
+            let mut fold: Vec<TileId> = carried_stores[..carried_stores.len() - 1].to_vec();
+            match body.raw_next {
+                Some(rn) => fold.push(rn),
+                None => assert!(resident, "streaming schedule must contain a commit cluster (raw_next carry)"),
+            }
+            fold.push(body.tail_barrier.expect("steady body must end on a cluster barrier"));
+            // HK positional wall lattice: the `sched.barrier(0)` paired with every `s_barrier` pins the
+            // opaque asm `ds_read_b64`s inside their cluster (load-bearing for the asm gather's correctness).
+            if asm_gather {
+                fold.push(b.wall_marker().dep());
+            }
+            let combined = b.combine(last, &fold);
+            (b.end(combined, &[kr]), body.raw_next, body.tail_barrier)
+        };
+        // Every slot's post-pipeline handle observes either the loop End or the direct no-steady
+        // transition. Carried slots feed the epilogue; temporaries receive a fresh region handle.
+        let acc_loop: Vec<AccSlot> = accs.iter().map(|a| a.after(b, &[carry_out.dep()])).collect();
 
         // ── epilogue: the same schedule for the LAST block (via the End's carried RAW), no
         //    prefetch/commit; then the eq=0 wave-phase barrier rebalances warp-row 0. ──
         let ep_carry: Vec<Vec<TileId>> = (0..n_slots).map(|_| Vec::new()).collect();
+        let ep_scope = if scoped_regions { b.scope(&[carry_out.dep()]) } else { Scope::ROOT };
         let ep = run_body(
             b,
             &clusters,
@@ -1066,19 +1389,18 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             ksteps,
             &acc_loop,
             &is_carried,
-            &[ended.dep()],
+            &[carry_out.dep()],
             &ep_carry,
             None,
             // The epilogue processes block `nblocks-1` (the last KV block — the only one that can be ragged).
-            BlockCounter::Epilogue((nblocks - 1) as i64),
+            BlockCounter::Epilogue((nblocks - 1) as i64, ep_scope),
             commit_drain,
+            asm_gather && matches!(commit_drain, CommitDrain::DirectDeferred | CommitDrain::AsmPublishedNoWar),
             bare_seals,
             pin_mfma,
             ping_pong,
         );
         let scatter_seed = warp_row.map(|wr| {
-            // The eq=0 rebalance barrier ordered after the epilogue's last cluster barrier — the barrier
-            // rides as an ordering-only dep (Stage A), not laundered through `idx_after` into warp_row.
             let anchor = ep.tail_barrier.expect("epilogue must end on a cluster barrier");
             b.wave_barrier(wr, 0, &[anchor]).dep()
         });
@@ -1095,7 +1417,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         // ── completeness check: carry-completeness (a carried slot unwritten in a pass panics the
         //    End-fold above) + the wave-phase balance over the emitted output cone. A build-time panic. ──
         let roots: Vec<TileId> = out.iter().map(|a| a.id()).collect();
-        verify(&b.ir, &roots, body.raw_next, body.tail_barrier, resident);
+        verify(&b.ir, &roots, body_raw_next, body_tail_barrier, resident, ping_pong);
         out
     }
 }
@@ -1115,6 +1437,7 @@ pub(crate) fn verify(
     raw_next: Option<TileId>,
     tail_barrier: Option<TileId>,
     resident: bool,
+    ping_pong: bool,
 ) {
     assert!(raw_next.is_some() || resident, "streaming schedule must contain a commit cluster (raw_next carry)");
     assert!(tail_barrier.is_some(), "steady body must end on a cluster barrier");
@@ -1122,17 +1445,122 @@ pub(crate) fn verify(
     for &r in roots {
         reach.extend(crate::passes::reachable(ir, r));
     }
+    if let Some(raw) = raw_next {
+        assert!(reach.contains(&raw), "publication raw_next is not reachable from pipeline outputs");
+    }
+    let tail = tail_barrier.expect("checked above");
+    assert!(reach.contains(&tail), "tail_barrier is not reachable from pipeline outputs");
     let count = |want: i64| {
         reach.iter().filter(|&&id| matches!(ir.node(id), Node::WaveBarrier { eq, .. } if *eq == want)).count()
     };
     let (n0, n1) = (count(0), count(1));
     assert_eq!(n0, n1, "wave-phase barriers unbalanced (eq=0: {n0}, eq=1: {n1}) — would deadlock the workgroup");
+    if ping_pong {
+        assert_eq!((n0, n1), (1, 1), "a phased pipeline requires exactly one seed and one rebalance barrier");
+        let raw = raw_next.expect("a phased streaming pipeline requires publication");
+        assert!(raw != tail && depends_on(ir, tail, raw), "phased tail must depend on an earlier publication");
+    } else {
+        assert_eq!((n0, n1), (0, 0), "an unphased pipeline must not contain wave-phase barriers");
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
     use crate::build::Builder;
+
+    struct NoGatherHooks {
+        out: crate::build::Buf<F32>,
+        zero: Idx,
+    }
+
+    impl Hooks for NoGatherHooks {
+        type Op = ();
+        type Reg = Val<F32>;
+
+        const PREFETCH_TILES: usize = 1;
+
+        fn prefetch(
+            &mut self,
+            b: &mut Builder,
+            _k_base: Idx,
+            _tile: usize,
+            prev: Option<Self::Reg>,
+            _order: &[TileId],
+        ) -> (Self::Reg, Vec<TileId>) {
+            let value = prev.unwrap_or_else(|| b.f32(1.0));
+            (value, vec![value.id])
+        }
+
+        fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &Self::Reg, war: &[TileId]) -> CommitBatch {
+            assert!(war.is_empty(), "no-WAR test hook must not receive a gather seal");
+            CommitBatch::new(vec![b.store(self.out, self.zero, *reg)], CommitCompletion::Intrinsic)
+        }
+
+        fn gather(
+            &mut self,
+            _b: &mut Builder,
+            _slice: usize,
+            _block: BlockCounter,
+            _raw: &[TileId],
+        ) -> (Self::Op, Vec<TileId>, TileId) {
+            panic!("no-gather hook must not gather")
+        }
+
+        fn ready_after_lgkm(&mut self, _b: &mut Builder, _op: Self::Op, _wait: TileId) -> Self::Op {
+            panic!("no-gather hook has no opaque readiness path")
+        }
+    }
+
+    #[test]
+    fn no_war_commit_accepts_an_empty_gather_set() {
+        let mut b = Builder::new("empty_gather_no_war");
+        let out = b.global::<F32>(1);
+        let zero = b.idx_const(0);
+        let frag = b.define_frag::<F32>(FragMap::gfx942_16x16(true));
+        let accs = [AccSlot::F32(frag)];
+        let inited = [Some(b.zero_init_frag(frag))];
+        let compute = Compute::<NoGatherHooks>::new(None, vec![0], vec![0], |_b, _op, reads, _block| vec![reads[0]]);
+        let final_accs = pipeline(
+            &mut b,
+            2,
+            1,
+            0,
+            &accs,
+            &inited,
+            None,
+            Sched {
+                asm_gather: false,
+                resident: false,
+                commit_drain: CommitDrain::IntrinsicNoWar,
+                bare_seals: false,
+                pin_mfma: false,
+            },
+            NoGatherHooks { out, zero },
+        )
+        .cluster(Mem::builder().prefetch([0]).commit(true).build())
+        .cluster(compute)
+        .build();
+        assert_eq!(final_accs.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "incompatible with publication policy")]
+    fn intrinsic_commit_rejects_opaque_publication_policy() {
+        validate_commit_policy(CommitCompletion::Intrinsic, CommitDrain::AsmDeferred, true);
+    }
+
+    #[test]
+    #[should_panic(expected = "incompatible with publication policy")]
+    fn opaque_commit_rejects_intrinsic_publication_policy() {
+        validate_commit_policy(CommitCompletion::Opaque, CommitDrain::IntrinsicAuto, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "bare seals require")]
+    fn intrinsic_commit_rejects_bare_seals() {
+        validate_commit_policy(CommitCompletion::Intrinsic, CommitDrain::IntrinsicAuto, true);
+    }
 
     /// The dropped-commit-edge is now a BUILD-TIME failure: a streaming schedule whose body produced
     /// no commit (`raw_next=None`, `resident=false`) is rejected by the verifier (was a silent LDS-
@@ -1141,7 +1569,17 @@ mod test {
     #[should_panic(expected = "must contain a commit cluster")]
     fn verify_rejects_streaming_without_commit() {
         let b = Builder::new("t");
-        verify(&b.ir, &[], None, Some(TileId(0)), false);
+        verify(&b.ir, &[], None, Some(TileId(0)), false, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "publication raw_next is not reachable")]
+    fn verify_rejects_unreachable_publication() {
+        let mut b = Builder::new("unreachable_publication");
+        let root = b.idx_const(0).0;
+        let raw = b.idx_const(1).0;
+        let tail = b.idx_const(2).0;
+        verify(&b.ir, &[root], Some(raw), Some(tail), false, false);
     }
 
     /// An unbalanced wave-phase pair (one eq=1 seed, no eq=0 rebalance reachable) is rejected — the
@@ -1157,6 +1595,6 @@ mod test {
         let wb = b.wave_barrier(wr, 1, &[e.dep()]);
         // route the eq=1 barrier into a live root; no eq=0 anywhere → unbalanced.
         let root = b.idx_after(wr, &[wb.dep()]);
-        verify(&b.ir, &[root.0], Some(TileId(0)), Some(TileId(0)), false);
+        verify(&b.ir, &[root.0], Some(e.dep()), Some(wb.dep()), false, true);
     }
 }

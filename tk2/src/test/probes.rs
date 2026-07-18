@@ -16,6 +16,109 @@ const WARP: usize = 64;
 /// gfx942 elements-per-thread for the 16×16 fragment (`= 4`) — the `atb_probe` accumulator width.
 const EPT: usize = Mfma16x16x16Bf16::EPT_C;
 
+/// One-workgroup hardware round trip for [`Builder::global_load_lds_dword`]. Each thread copies one
+/// dword (two bf16 elements) directly from global memory to LDS, the workgroup publishes the writes,
+/// then the same thread reads and stores both elements. This isolates direct-to-LDS correctness from
+/// FA swizzles, stage rotation, and wait scheduling.
+pub(crate) fn direct_lds_probe(n: usize) -> Program {
+    assert!(n >= 2 && n.is_multiple_of(2), "direct LDS probe length must be a positive dword multiple");
+    let threads = n / 2;
+    assert!(threads <= 1024, "direct LDS probe must fit one workgroup");
+
+    let mut b = Builder::new("tk2_direct_lds_device_probe");
+    let out = b.global::<BF16>(n);
+    let src = b.global::<BF16>(n);
+    let lds = b.define_local::<BF16>(n);
+    let _wg = b.grid_axis(0, 1);
+    let tid = b.block_axis(threads as i64);
+    let two = b.idx_const(2);
+    let off0 = b.idx_mul(tid, two);
+    let dma = b.global_load_lds_dword(src, off0, lds, off0, &[]);
+    let published = b.barrier(dma, &[]);
+    let one = b.idx_const(1);
+    let off1 = b.idx_add(off0, one);
+    let v0 = b.load_lds_after(lds, off0, &[published.dep()]);
+    let v1 = b.load_lds_after(lds, off1, &[published.dep()]);
+    let roots = [b.store(out, off0, v0), b.store(out, off1, v1)];
+    let (ir, sink) = b.finish(&roots);
+    Program { ir, sink, name: "tk2_direct_lds_device_probe".into() }
+}
+
+/// FA-32 d128 K-stage round trip: 512 threads issue four direct dwords each into a 32x128
+/// `LdsCol`-swizzled tile, then read the logical row-major values back through the same layout.
+pub(crate) fn direct_lds_swizzled_k_probe() -> Program {
+    const ROWS: usize = 32;
+    const COLS: usize = 128;
+    const THREADS: usize = 512;
+    const EPL: usize = ROWS * COLS / THREADS;
+
+    let mut b = Builder::new("tk2_direct_lds_swizzled_k_probe");
+    let out = b.global::<BF16>(ROWS * COLS);
+    let src = b.global::<BF16>(ROWS * COLS);
+    let lds = b.define_local::<BF16>(ROWS * COLS);
+    let _wg = b.grid_axis(0, 1);
+    let tid = b.block_axis(THREADS as i64);
+    let epl = b.idx_const(EPL as i64);
+    let lane_base = b.idx_mul(tid, epl);
+    let two = b.idx_const(2);
+    let cols = b.idx_const(COLS as i64);
+
+    let mut copies = Vec::with_capacity(EPL / 2);
+    let mut after = Vec::new();
+    for call in 0..EPL / 2 {
+        let dword = if call == 0 { tid } else { offset_by(&mut b, tid, call * THREADS) };
+        let elem = b.idx_mul(dword, two);
+        let row = b.idx_div(elem, cols);
+        let physical_col = b.idx_mod(elem, cols);
+        let logical_col = b.lds_col(row, physical_col, COLS);
+        let row_base = b.idx_mul(row, cols);
+        let src_off = b.idx_add(row_base, logical_col);
+        let dst_off = elem;
+        let copy = b.global_load_lds_dword(src, src_off, lds, dst_off, &after);
+        after = vec![copy.dep()];
+        copies.push(copy);
+    }
+    let n = copies.len();
+    let committed = b.combine(copies[n - 1], &copies[..n - 1].iter().map(|e| e.dep()).collect::<Vec<_>>());
+    let wait = b.swait_vmcnt(committed.dep());
+    let published = b.barrier(wait, &[committed.dep()]);
+
+    let mut roots = Vec::with_capacity(EPL);
+    for elem in 0..EPL {
+        let out_off = offset_by(&mut b, lane_base, elem);
+        let row = b.idx_div(out_off, cols);
+        let col = b.idx_mod(out_off, cols);
+        let row_base = b.idx_mul(row, cols);
+        let swizzled = b.lds_col(row, col, COLS);
+        let lds_off = b.idx_add(row_base, swizzled);
+        let value = b.load_lds_after(lds, lds_off, &[published.dep()]);
+        roots.push(b.store(out, out_off, value));
+    }
+    let (ir, sink) = b.finish(&roots);
+    Program { ir, sink, name: "tk2_direct_lds_swizzled_k_probe".into() }
+}
+
+/// Scalar waitcnt-opaque bf16 LDS write round trip used by the direct-K FA V commit.
+pub(crate) fn ds_write_b16_probe(n: usize) -> Program {
+    assert!(n <= 1024, "ds_write_b16 probe must fit one workgroup");
+    let mut b = Builder::new("tk2_ds_write_b16_probe");
+    let out = b.global::<BF16>(n);
+    let src = b.global::<BF16>(n);
+    let lds = b.define_local::<BF16>(n);
+    let _wg = b.grid_axis(0, 1);
+    let tid = b.block_axis(n as i64);
+    let value = b.load(src, tid);
+    let vmem_ready = b.swait_vmcnt(value.id);
+    let base = b.lds_ptr_as3(lds, tid, &[]);
+    let write = b.ds_write_b16(base, 0, value, Some(vmem_ready.dep()));
+    let lds_ready = b.swait_lgkmcnt(write.dep());
+    let published = b.barrier(lds_ready, &[write.dep()]);
+    let loaded = b.load_lds_after(lds, tid, &[published.dep()]);
+    let root = b.store(out, tid, loaded);
+    let (ir, sink) = b.finish(&[root]);
+    Program { ir, sink, name: "tk2_ds_write_b16_probe".into() }
+}
+
 /// Load ONE MFMA operand fragment (`map.ept` wide) straight from a global `[outer, K]` (row-major, row
 /// stride `k_dim`) into a register fragment, addressed by `map`'s `lane_rc`. For a Row (A) map the lane
 /// pair is `(M-row, K)`; for a Col (B) map it is `(K-spread, N-flat)` — so `outer` is the M (A) / N (B)

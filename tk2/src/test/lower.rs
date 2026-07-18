@@ -38,6 +38,31 @@ fn range_id_disambiguator_keeps_distinct_loops_apart() {
 }
 
 #[test]
+fn lexical_scopes_keep_region_local_expressions_apart() {
+    use crate::build::Builder;
+
+    let mut b = Builder::new("scope_identity");
+    let base = b.idx_const(7);
+    let one = b.idx_const(1);
+    let s0 = b.scope(&[]);
+    let s1 = b.scope(&[]);
+    let a = b.scope_idx(base, s0);
+    let c = b.scope_idx(base, s1);
+    assert_ne!(a.0, c.0, "the same value rebound in distinct scopes must remain distinct");
+    let aa = b.idx_add(a, one);
+    let cc = b.idx_add(c, one);
+    assert_ne!(aa.0, cc.0, "scope identity must propagate into derived address DAGs");
+}
+
+#[test]
+#[should_panic(expected = "reused with different bounds")]
+fn runtime_scalar_rejects_conflicting_bounds() {
+    let mut b = crate::Builder::new("runtime_scalar_bounds");
+    let _ = b.scalar_param("n", 1, 16);
+    let _ = b.scalar_param("n", 1, 32);
+}
+
+#[test]
 fn residency_and_reg_class_fields_present() {
     let mut ir = TileIr::new();
     let g = ir.intern(Node::Global { slot: 0, dtype: DType::Float32, len: 8 });
@@ -46,6 +71,373 @@ fn residency_and_reg_class_fields_present() {
     assert_eq!(ir.meta(r).residency, Residency::Reg);
     // Reg-class channel exists now (the AGPR pass flips this field in Step 3).
     assert_eq!(ir.meta(r).reg_class, RegClass::Vgpr);
+}
+
+#[test]
+fn runtime_domains_and_bounded_views_lower_spec_valid() {
+    use crate::build::{Builder, F32};
+
+    // Dynamic grid plus bounded load/store.
+    let mut b = Builder::new("tk2_dynamic_grid_bounded");
+    let out = b.global::<F32>(16);
+    let input = b.global::<F32>(16);
+    let n = b.scalar_param("n", 1, 16);
+    assert_eq!(n.0, b.scalar_param("n", 1, 16).0, "same runtime scalar declaration must deduplicate");
+    let gid = b.grid_axis_dyn(0, n);
+    let input = b.bounded(input, n);
+    let out = b.bounded(out, n);
+    let zero = b.f32(0.0);
+    let row_stride = b.scalar_param("row_stride", 1, 2);
+    let zero_idx = b.idx_const(0);
+    let one = b.idx_const(1);
+    let value = b.load_strided_bounded(input, [zero_idx, gid], [one, row_stride], zero);
+    let root = b.store_strided_bounded(out, [zero_idx, gid], [one, row_stride], value);
+    let (ir, sink) = b.finish(&[root]);
+    let p = crate::Program { ir, sink, name: "tk2_dynamic_grid_bounded".into() };
+    lower::verify(&p).expect("dynamic grid and bounded accesses must lower spec-valid");
+    let llvm = crate::launch::render_amd_ir(&p, svod_dtype::AmdArch::Gfx942).expect("render dynamic grid");
+    assert!(llvm.contains("i32 %n"), "bounded runtime scalar must render as an i32 kernel argument");
+    assert!(llvm.contains("i32 %row_stride"), "runtime strides must remain body scalar arguments");
+
+    // Dynamic Range over the same authoring primitive. The ended store is the sink root.
+    let mut b = Builder::new("tk2_dynamic_range_bounded");
+    let out = b.global::<F32>(16);
+    let input = b.global::<F32>(16);
+    let n = b.scalar_param("n", 0, 16);
+    let out = b.bounded(out, n);
+    let input = b.bounded(input, n);
+    let limit = b.scalar_param("limit", 0, 16);
+    let trips = b.idx_min(n, limit);
+    let domain = b.iter_domain(trips);
+    let r = b.range_dyn(domain);
+    let i = b.counter(r);
+    let zero = b.f32(0.0);
+    let value = b.load_bounded(input, i, zero);
+    let store = b.store_bounded(out, i, value);
+    let ended = b.end(store, &[r]);
+    let (ir, sink) = b.finish(&[ended]);
+    let p = crate::Program { ir, sink, name: "tk2_dynamic_range_bounded".into() };
+    lower::verify(&p).expect("dynamic Range must lower spec-valid");
+    let llvm = crate::launch::render_amd_ir(&p, svod_dtype::AmdArch::Gfx942).expect("render dynamic Range");
+    assert!(llvm.contains("i32 %n"), "dynamic Range end must use the runtime scalar argument");
+    assert!(llvm.contains("i32 %limit"), "workgroup/domain clamp must use its runtime scalar argument");
+    assert!(llvm.contains("icmp ult i32"), "dynamic Range must emit a runtime loop comparison");
+
+    // Dynamic raw-buffer descriptor over the same bounded-view contract.
+    let mut b = Builder::new("tk2_dynamic_buffer_resource");
+    let out = b.global::<F32>(16);
+    let input = b.global::<F32>(16);
+    let n = b.scalar_param("n", 1, 16);
+    let gid = b.grid_axis_dyn(0, n);
+    let input = b.bounded(input, n);
+    let out = b.bounded(out, n);
+    let rsrc = b.make_buffer_rsrc_bounded(input);
+    let four = b.idx_const(4);
+    let byte_offset = b.idx_mul(gid, four);
+    let value = b.buffer_load_raw::<F32>(rsrc, byte_offset, 1, &[]);
+    let root = b.store_bounded(out, gid, value);
+    let (ir, sink) = b.finish(&[root]);
+    let p = crate::Program { ir, sink, name: "tk2_dynamic_buffer_resource".into() };
+    lower::verify(&p).expect("runtime-bounded raw resource must lower spec-valid");
+    let llvm = crate::launch::render_amd_ir(&p, svod_dtype::AmdArch::Gfx942).expect("render dynamic resource");
+    assert!(llvm.contains("make.buffer.rsrc"), "bounded raw view must render a dynamic resource descriptor");
+}
+
+#[test]
+fn direct_global_to_lds_dword_lowers_and_renders() {
+    use crate::build::{BF16, Builder};
+
+    let mut b = Builder::new("tk2_direct_lds_probe");
+    let src = b.global::<BF16>(1024);
+    let dst = b.define_local::<BF16>(1024);
+    let tid = b.block_axis(512);
+    let two = b.idx_const(2);
+    let off = b.idx_mul(tid, two);
+    let dma = b.global_load_lds_dword(src, off, dst, off, &[]);
+    let partial = b.swait_vmcnt_allowed(dma, 4);
+    let root = b.barrier(partial, &[dma.dep()]);
+    let (ir, sink) = b.finish(&[root]);
+    let p = crate::Program { ir, sink, name: "tk2_direct_lds_probe".into() };
+    lower::verify(&p).expect("direct GLOBAL→LDS DMA must lower spec-valid");
+    let llvm = crate::launch::render_amd_ir(&p, svod_dtype::AmdArch::Gfx942).expect("render direct LDS");
+    assert!(llvm.contains("llvm.amdgcn.global.load.lds"), "must render the gfx942 direct-to-LDS intrinsic");
+    assert!(
+        llvm.contains("call void @llvm.amdgcn.s.waitcnt(i32 3956)"),
+        "must render LLVM's tracked vmcnt(4) readiness wait"
+    );
+}
+
+#[test]
+#[should_panic(expected = "payload must be exactly 64 bits")]
+fn ds_read_b64_rejects_non_b64_payloads() {
+    use crate::build::{BF16, Builder};
+
+    let mut b = Builder::new("bad_b64_payload");
+    let lds = b.define_local::<BF16>(16);
+    let zero = b.idx_const(0);
+    let ptr = b.lds_ptr_as3(lds, zero, &[]);
+    let _ = b.ds_read_b64::<BF16>(ptr, 0, 2, None);
+}
+
+#[test]
+#[should_panic(expected = "requires an lgkm wait")]
+fn opaque_ready_b64_rejects_non_wait_anchors() {
+    use crate::build::{BF16, Builder};
+
+    let mut b = Builder::new("missing_opaque_readiness");
+    let input = b.global::<BF16>(4);
+    let zero = b.idx_const(0);
+    let scalar = b.load(input, zero);
+    let packed = b.vec_build(&[scalar, scalar, scalar, scalar]);
+    let not_a_wait = b.sched_fence(0, &[packed.id]);
+    let _ = b.opaque_ready_b64(packed, not_a_wait.dep());
+}
+
+#[test]
+#[should_panic(expected = "rows must tile")]
+fn gather_run_rejects_truncated_geometry() {
+    use crate::build::{BF16, Builder};
+    use crate::shape::Mfma32x32x8Bf16;
+    use crate::tile::Plain;
+
+    let mut b = Builder::new("bad_gather_geometry");
+    let lds = b.define_local::<BF16>(4096);
+    let zero = b.idx_const(0);
+    let _ = crate::tile_move::gather_run::<BF16, Plain, Mfma32x32x8Bf16>(
+        &mut b,
+        lds,
+        32,
+        31,
+        32,
+        zero,
+        zero,
+        zero,
+        false,
+        &[],
+    );
+}
+
+#[test]
+fn fa32_direct_k_has_ordered_partial_waits_and_tail_publication() {
+    fn counts(n: usize) -> (usize, usize, usize, usize, usize) {
+        let p = crate::kernels::fa::flash_attention_fwd_32_direct_k(1, n, 128).apply(crate::SwizzlePass);
+        lower::verify(&p).expect("direct-K FA must lower spec-valid");
+        let live = crate::passes::reachable(&p.ir, p.sink);
+        let direct = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::GlobalLoadLdsDword { .. })).count();
+        let partial =
+            live.iter().filter(|&&id| matches!(p.ir.node(id), Node::SWaitVmcnt { allowed_outstanding: 4, .. })).count();
+        let full =
+            live.iter().filter(|&&id| matches!(p.ir.node(id), Node::SWaitVmcnt { allowed_outstanding: 0, .. })).count();
+        let writes = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsWriteB16 { .. })).count();
+        let lds_drains = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::SWaitLgkmcnt { .. })).count();
+        (direct, partial, full, writes, lds_drains)
+    }
+
+    assert_eq!(
+        counts(64),
+        (8, 2, 2, 16, 3),
+        "two-block direct K has prologue + warmup transfers and the existing final-V gather drain"
+    );
+    assert_eq!(
+        counts(96),
+        (12, 3, 3, 24, 4),
+        "one steady trip adds one four-dword K issue, partial/full wait pair, V commit, and LDS drain"
+    );
+}
+
+#[test]
+fn fa32_packed_v_replaces_scalar_writes() {
+    for (n, expected_permutes, expected_writes) in [(64usize, 8usize, 4usize), (96, 12, 6)] {
+        let p = crate::kernels::fa::flash_attention_fwd_32_direct_k_packed_v(1, n, 128).apply(crate::SwizzlePass);
+        lower::verify(&p).expect("packed-V direct-K FA must lower spec-valid");
+        let live = crate::passes::reachable(&p.ir, p.sink);
+        let permutes = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::VPermAsm { .. })).count();
+        let writes = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsWriteB64 { hk_form: true, .. })).count();
+        let scalar = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsWriteB16 { .. })).count();
+        assert_eq!((permutes, writes, scalar), (expected_permutes, expected_writes, 0));
+    }
+}
+
+#[test]
+fn fa32_direct_k_opaque_gathers_are_explicitly_readied_without_phase() {
+    for (n, expected_reads, expected_waits) in [(64usize, 64usize, 5usize), (96, 96, 7)] {
+        let p = crate::kernels::fa::flash_attention_fwd_32_direct_k_asm_gather(1, n, 128).apply(crate::SwizzlePass);
+        lower::verify(&p).expect("opaque-gather direct-K FA must lower spec-valid");
+        let live = crate::passes::reachable(&p.ir, p.sink);
+        let reads = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsReadB64 { .. })).count();
+        let waits = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::SWaitLgkmcnt { .. })).count();
+        let phases = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::WaveBarrier { .. })).count();
+        assert_eq!(reads, expected_reads, "unexpected opaque K/V gather count at S={n}");
+        assert_eq!(waits, expected_waits, "unexpected gather/publication readiness count at S={n}");
+        assert_eq!(phases, 0, "asm gather must be qualified before enabling wave-phase staggering");
+    }
+}
+
+#[test]
+fn fa32_register_asm_publication_is_qualification_only_and_unphased() {
+    let p = crate::kernels::fa::flash_attention_fwd_32_register_asm(1, 64, 128).apply(crate::SwizzlePass);
+    lower::verify(&p).expect("register-asm FA must lower spec-valid");
+    let live = crate::passes::reachable(&p.ir, p.sink);
+    let direct = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::GlobalLoadLdsDword { .. })).count();
+    let k_writes = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsWriteB64 { hk_form: true, .. })).count();
+    let v_writes = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsWriteB16 { .. })).count();
+    let phases = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::WaveBarrier { .. })).count();
+    assert_eq!((direct, k_writes, v_writes, phases), (0, 4, 16, 0));
+}
+
+#[test]
+fn fa32_final_asm_v_gather_is_tied_through_opaque_readiness() {
+    use crate::ir::TileId;
+
+    let p = crate::kernels::fa::flash_attention_fwd_32_direct_k_asm_gather(1, 64, 128).apply(crate::SwizzlePass);
+    let live = crate::passes::reachable(&p.ir, p.sink);
+    let drain_wait = live
+        .iter()
+        .copied()
+        .filter(|&id| matches!(p.ir.node(id), Node::SWaitLgkmcnt { .. }))
+        .max()
+        .expect("final gather has an lgkm wait");
+    let tied_final_mmas = live
+        .iter()
+        .filter(|&&id| match p.ir.node(id) {
+            Node::Mma { a, .. } => matches!(
+                p.ir.node(*a),
+                Node::OpaqueReadyB64 {
+                    wait,
+                    ..
+                } if *wait == drain_wait
+            ),
+            _ => false,
+        })
+        .count();
+    assert_eq!(tied_final_mmas, 128 / 8, "every final P·V V operand must be tied through the drain wait");
+    assert!(matches!(p.ir.node(drain_wait), Node::SWaitLgkmcnt { prev: TileId(_) }));
+}
+
+#[test]
+fn fa32_selects_direct_k_only_above_the_measured_crossover() {
+    for (n, expected) in [(512usize, false), (1024, true), (2048, true)] {
+        let p = crate::kernels::fa::flash_attention_fwd_32(1, n, 128).apply(crate::SwizzlePass);
+        let live = crate::passes::reachable(&p.ir, p.sink);
+        let has_direct = live.iter().any(|&id| matches!(p.ir.node(id), Node::GlobalLoadLdsDword { .. }));
+        assert_eq!(has_direct, expected, "unexpected d128 K movement selection at S={n}");
+    }
+    let p = crate::kernels::fa::flash_attention_fwd_32(1, 2048, 64).apply(crate::SwizzlePass);
+    let live = crate::passes::reachable(&p.ir, p.sink);
+    assert!(
+        live.iter().all(|&id| !matches!(p.ir.node(id), Node::GlobalLoadLdsDword { .. })),
+        "d64 must retain register-staged K"
+    );
+}
+
+#[test]
+fn fa32_production_long_d128_uses_only_promoted_movement() {
+    fn underlying_buf(ir: &TileIr, mut id: crate::TileId) -> crate::TileId {
+        while let Node::After { val, .. } = ir.node(id) {
+            id = *val;
+        }
+        id
+    }
+
+    let p = crate::kernels::fa::flash_attention_fwd_32(1, 2048, 128).apply(crate::SwizzlePass);
+    let live = crate::passes::reachable(&p.ir, p.sink);
+    let direct = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::GlobalLoadLdsDword { .. })).count();
+    let intrinsic_gathers = live
+        .iter()
+        .filter(|&&id| match p.ir.node(id) {
+            Node::LoadVecAt { buf, .. } => matches!(p.ir.node(underlying_buf(&p.ir, *buf)), Node::DefineLocal { .. }),
+            _ => false,
+        })
+        .count();
+    let scalar_v_writes = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsWriteB16 { .. })).count();
+    let opaque_gathers = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsReadB64 { .. })).count();
+    let packed_v_permutes = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::VPermAsm { .. })).count();
+    let b64_publications = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsWriteB64 { .. })).count();
+    let phases = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::WaveBarrier { .. })).count();
+    assert_eq!(direct, 12, "production long d128 must use direct K in all three authored regions");
+    assert_eq!(intrinsic_gathers, 96, "production long d128 must retain compiler-visible K/V gathers");
+    assert_eq!(scalar_v_writes, 24, "production long d128 must retain scalar transposed-V publication");
+    assert_eq!(
+        (opaque_gathers, packed_v_permutes, b64_publications, phases),
+        (0, 0, 0, 0),
+        "opaque gather, packed/register-asm publication, and phase staggering are qualification-only"
+    );
+}
+
+#[test]
+fn fa32_public_domain_is_tile_exact_and_head_dim_restricted() {
+    assert!(
+        std::panic::catch_unwind(|| crate::kernels::fa::flash_attention_fwd_32(1, 0, 128)).is_err(),
+        "public FA-32 must reject an empty sequence"
+    );
+    for d in [64usize, 128] {
+        crate::kernels::fa::flash_attention_fwd_32(1, 1024, d);
+        assert!(
+            std::panic::catch_unwind(|| crate::kernels::fa::flash_attention_fwd_32(1, 1023, d)).is_err(),
+            "public FA-32 must reject a Q256-ragged n at d={d}"
+        );
+    }
+    for d in [32usize, 96, 160, 192] {
+        assert!(
+            std::panic::catch_unwind(|| crate::kernels::fa::flash_attention_fwd_32(1, 1024, d)).is_err(),
+            "public FA-32 must reject unsupported d={d}"
+        );
+    }
+    for n in [64usize, 80, 96, 128] {
+        assert!(
+            std::panic::catch_unwind(|| crate::kernels::fa::flash_attention_fwd_32(1, n, 128)).is_err(),
+            "public FA-32 must reject qualification-only n={n}"
+        );
+        crate::kernels::fa::flash_attention_fwd_32_register_k(1, n, 128);
+    }
+}
+
+#[test]
+fn fa32_partial_vmem_wait_follows_older_v_loads_and_four_younger_dmas() {
+    let p = crate::kernels::fa::flash_attention_fwd_32_direct_k(1, 64, 128).apply(crate::SwizzlePass);
+    let live = crate::passes::reachable(&p.ir, p.sink);
+    let waits: Vec<_> = live
+        .iter()
+        .copied()
+        .filter(|&id| matches!(p.ir.node(id), Node::SWaitVmcnt { allowed_outstanding: 4, .. }))
+        .collect();
+    assert!(!waits.is_empty(), "direct-K must contain a vmcnt(4) queue wait");
+    for wait in waits {
+        let Node::SWaitVmcnt { anchor, .. } = p.ir.node(wait) else { unreachable!() };
+        let mut current = *anchor;
+        let mut current_dmas = Vec::new();
+        for i in 0..4 {
+            let Node::GlobalLoadLdsDword { deps, .. } = p.ir.node(current) else {
+                panic!("vmcnt(4) anchor chain entry {i} is not a direct K DMA")
+            };
+            current_dmas.push(current);
+            if i != 3 {
+                current = deps
+                    .iter()
+                    .copied()
+                    .find(|&id| matches!(p.ir.node(id), Node::GlobalLoadLdsDword { .. }))
+                    .expect("the four younger K DMAs must form one issue-order chain");
+            }
+        }
+        let first_dma = *current_dmas.last().expect("four DMAs");
+        let cone = crate::passes::reachable(&p.ir, first_dma);
+        let older_v: Vec<_> = cone
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let Node::LoadVecAt { mut buf, .. } = p.ir.node(id).clone() else {
+                    return false;
+                };
+                while let Node::After { val, .. } = p.ir.node(buf) {
+                    buf = *val;
+                }
+                matches!(p.ir.node(buf), Node::Global { slot: 3, .. })
+            })
+            .collect();
+        assert!(!older_v.is_empty(), "the partial wait must be ordered after the older staged V load");
+        assert_eq!(current_dmas.len(), 4);
+        assert!(current_dmas.iter().all(|id| id.0 < wait.0));
+    }
 }
 
 // ── the verified lowering ────────────────────────────────────────────────────
@@ -223,13 +615,49 @@ fn mfma_32x32x8_probe_lowers_spec_valid() {
 #[test]
 fn fa32_ragged_tail_lowers_spec_valid() {
     for d in [64usize, 128] {
-        let p = crate::kernels::fa::flash_attention_fwd_32(1, 80, d);
+        let p = crate::kernels::fa::flash_attention_fwd_32_register_k(1, 80, d);
         let n_sel = (0..p.ir.len())
             .filter(|&i| matches!(p.ir.node(crate::ir::TileId(i as u32)), Node::SelectLt { .. }))
             .count();
         assert!(n_sel > 0, "ragged FA-32 (n=80, d={d}) must emit the SelectLt ragged-tail mask");
         lower::verify(&p).expect("ragged FA-32 must lower spec-valid (base)");
-        let ps = crate::kernels::fa::flash_attention_fwd_32(1, 80, d).apply(crate::SwizzlePass);
+        let ps = crate::kernels::fa::flash_attention_fwd_32_register_k(1, 80, d).apply(crate::SwizzlePass);
         lower::verify(&ps).expect("ragged FA-32 must lower spec-valid (swizzled)");
+    }
+}
+
+/// Tile-exact FA-32 uses a straight-line QK(0) warmup, so the rolled steady loop processes only blocks
+/// `1..nblocks-2`. Two-block inputs take the explicit warmup-to-epilogue transition and emit no loop;
+/// scoped movement keeps ragged warmup/loop/epilogue address DAGs distinct.
+#[test]
+fn fa32_warmup_covers_scoped_and_no_steady_paths() {
+    let trips = |p: &crate::Program| {
+        (0..p.ir.len())
+            .filter_map(|i| match p.ir.node(crate::ir::TileId(i as u32)) {
+                Node::Range { trips, .. } | Node::RangeAfter { trips, .. } => Some(*trips),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let full = crate::kernels::fa::flash_attention_fwd_32(32, 2048, 64);
+    assert_eq!(trips(&full), vec![62], "64 KV blocks minus warmup and epilogue leaves 62 steady iterations");
+
+    for d in [64usize, 128] {
+        let ragged = crate::kernels::fa::flash_attention_fwd_32_register_k(1, 80, d);
+        assert_eq!(trips(&ragged), vec![1], "three KV blocks minus warmup and epilogue leaves one steady iteration");
+        assert!(
+            (0..ragged.ir.len()).any(|i| matches!(ragged.ir.node(crate::ir::TileId(i as u32)), Node::Scope { .. })),
+            "ragged warmup must carry explicit lexical scope identity"
+        );
+        let ragged_llvm =
+            crate::launch::render_amd_ir(&ragged, svod_dtype::AmdArch::Gfx942).expect("render ragged warmup");
+        assert!(ragged_llvm.contains("loop_entry_"), "three-block ragged warmup has one real steady loop trip");
+
+        let two_blocks = crate::kernels::fa::flash_attention_fwd_32_register_k(1, 64, d);
+        assert!(trips(&two_blocks).is_empty(), "two KV blocks use warmup plus epilogue with no synthetic loop");
+        let two_llvm =
+            crate::launch::render_amd_ir(&two_blocks, svod_dtype::AmdArch::Gfx942).expect("render two-block warmup");
+        assert!(!two_llvm.contains("loop_entry_"), "two-block warmup must not lower a dead/zero-trip loop");
     }
 }

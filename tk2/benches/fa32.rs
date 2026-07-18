@@ -3,11 +3,13 @@
 //! attention shapes — the "does 32×32×8 close the gap" headline. Both are gated `allclose` at a small shape
 //! before timing; device time via the shared [`common`] harness.
 //!
-//! FA-32 now rides the ClusterCx pipeline (rolled KV loop, register-staged prefetch/commit) with the K-tile
-//! LDS bank swizzle (`SwizzlePass`) and b128 coalesced fill loads — Phases 1+2. Its LDS writes stay scalar
-//! (V's v_perm-deinterleaved coalesced write is a residual the barrier-bound kernel does not need) and it has
-//! NO double-buffer / ping-pong / softmax-under-MFMA interleave (Phase 3). So this measures the swizzled,
-//! single-buffered wide core vs the tuned 16×16 pipeline — an honest gate on how close the DSL is to aiter.
+//! FA-32 rides the rolled ClusterCx KV pipeline with register-staged prefetch/commit, XOR-swizzled K,
+//! padded-transposed V, d128 K double-buffering, a three-plane V rotation, and softmax EXP grouped under
+//! the independent QK MFMA stream. A QK(0)-only warmup removes the empty seed softmax/PV for every
+//! supported input; two-block domains use a direct warmup-to-epilogue transition, and ragged domains use
+//! explicit lexical scopes around their loop/tail DAGs. The d64 path additionally remaps workgroups into
+//! XCD-local Q-tile chunks for private-L2 K/V reuse. Phase staggering remains disabled because the
+//! compiler-visible LDS path is not race-free under the asymmetric barrier schedule.
 //!
 //! Run: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk2 --bench fa32`
 
@@ -20,6 +22,52 @@ use common::{plan_gpu_ns, rand_bf16, requirements_met};
 
 use svod_tk2::kernels::fa::{flash_attention_fwd, flash_attention_fwd_32};
 use svod_tk2::{SwizzlePass, VectorizePass, graph_kernel};
+
+#[derive(Copy, Clone, Debug)]
+enum InputDist {
+    Sym,
+    Normal,
+    Normal10,
+    U01,
+    Zeros,
+    Ones,
+}
+
+impl InputDist {
+    fn from_env() -> Self {
+        match std::env::var("SVOD_FA_INPUT").as_deref().unwrap_or("sym") {
+            "sym" => Self::Sym,
+            "normal" => Self::Normal,
+            "normal10" => Self::Normal10,
+            "u01" => Self::U01,
+            "zeros" => Self::Zeros,
+            "ones" => Self::Ones,
+            value => panic!("SVOD_FA_INPUT must be one of sym, normal, normal10, u01, zeros, ones; got {value}"),
+        }
+    }
+
+    fn make(self, shape: &[usize]) -> Tensor {
+        let mut t = match self {
+            Self::Sym => rand_bf16(shape),
+            Self::Normal => Tensor::randn(shape).expect("normal input").cast(DType::BFloat16).expect("normal -> bf16"),
+            Self::Normal10 => {
+                let x = Tensor::randn(shape).expect("normal input");
+                let scale = Tensor::full(shape, 10.0f32, DType::Float32).expect("normal scale");
+                x.try_mul(&scale).expect("normal * 10").cast(DType::BFloat16).expect("normal10 -> bf16")
+            }
+            Self::U01 => Tensor::rand_with(shape, DType::BFloat16, svod_dtype::default_device::default_device())
+                .expect("uniform [0,1) input"),
+            Self::Zeros => Tensor::zeros(shape, DType::BFloat16).expect("zero input"),
+            Self::Ones => Tensor::ones(shape, DType::BFloat16).expect("one input"),
+        };
+        t.realize().expect("realize FA input");
+        t
+    }
+
+    fn inputs(self, shape: &[usize]) -> (Tensor, Tensor, Tensor) {
+        (self.make(shape), self.make(shape), self.make(shape))
+    }
+}
 
 fn fa_flops_noncausal(bh: usize, s: usize, d: usize) -> u64 {
     4 * (bh as u64) * (s as u64) * (s as u64) * (d as u64)
@@ -110,9 +158,17 @@ fn profile_pmc(plan: &ExecutionPlan, label: &str) {
     }
 }
 
-fn measure(wide: bool, bh: usize, s: usize, d: usize, label: &str) -> f64 {
-    let (q, k, v) = (rand_bf16(&[bh * s, d]), rand_bf16(&[bh * s, d]), rand_bf16(&[bh * s, d]));
-    let (_y, plan) = plan_of(wide, bh, s, d, &q, &k, &v);
+#[derive(Copy, Clone)]
+struct Measurement<'a> {
+    label: &'a str,
+    bh: usize,
+    s: usize,
+    d: usize,
+}
+
+fn measure(config: Measurement<'_>, wide: bool, q: &Tensor, k: &Tensor, v: &Tensor) -> f64 {
+    let Measurement { label, bh, s, d } = config;
+    let (_y, plan) = plan_of(wide, bh, s, d, q, k, v);
     plan.execute().expect("execute");
     let iters = 50u64;
     let avg_ns = plan_gpu_ns(&plan, iters) as f64 / iters as f64;
@@ -129,6 +185,8 @@ fn main() {
         return;
     }
     eprintln!("\n=== tk2 FA: 32×32×8 (rolled ClusterCx pipeline) vs 16×16×16 (tuned pipeline) — REAL device TF ===\n");
+    let input_dist = InputDist::from_env();
+    eprintln!("  input distribution: {input_dist:?} (select with SVOD_FA_INPUT)\n");
     gate(true, 2, 256, 128);
     gate(false, 2, 256, 128);
 
@@ -152,8 +210,10 @@ fn main() {
     for (label, bb, hh, s, d) in configs {
         let bh = bb * hh;
         let wgs = bh * (s / 256);
-        let tf16 = measure(false, bh, s, d, label);
-        let tf32 = measure(true, bh, s, d, label);
+        let (q, k, v) = input_dist.inputs(&[bh * s, d]);
+        let measurement = Measurement { label, bh, s, d };
+        let tf16 = measure(measurement, false, &q, &k, &v);
+        let tf32 = measure(measurement, true, &q, &k, &v);
         eprintln!("  {label} {s:>6} {d:>4} {wgs:>6}    {tf16:>10.1}  {tf32:>10.1}  {:>7.2}x", tf32 / tf16);
     }
 }

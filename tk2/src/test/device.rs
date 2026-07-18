@@ -5,7 +5,9 @@
 //! and the per-slice acc round-trip must accumulate exactly), dump its amdgcn ISA, and guard the
 //! asm-gather kernel's 0-spill requirement.
 
+use svod_device::PmcCounter;
 use svod_dtype::DType;
+use svod_runtime::{PmcSelection, ProfileOptions};
 use svod_tensor::Tensor;
 
 use crate::launch;
@@ -105,6 +107,68 @@ fn mfma_32x32x8_probe_is_correct_on_gfx942() {
         println!("mfma_32x32x8 probe {m}×{n}×{k}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
         assert!(report.ok, "32×32×8 probe {m}×{n}×{k} must match A·Bᵀ reference: {}", report.message);
     }
+}
+
+/// The retained direct GLOBAL→LDS primitive must survive real gfx942 selection and workgroup
+/// publication, not only render the expected LLVM intrinsic.
+#[test]
+#[ignore]
+fn direct_global_to_lds_round_trip_is_correct_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    const N: usize = 1024;
+    let dev = svod_dtype::default_device::default_device();
+    let mut input = Tensor::rand_with(&[N], DType::BFloat16, dev).expect("random direct-LDS input");
+    input.realize().expect("realize direct-LDS input");
+    let expected = as_f32_vec(&input);
+
+    let prog = crate::test::probes::direct_lds_probe(N);
+    let out = Tensor::empty(&[N], DType::BFloat16);
+    let mut y = graph_kernel(prog, out, &[&input]).expect("wrap direct-LDS probe");
+    let plan = y.prepare().expect("prepare direct-LDS probe");
+    plan.execute().expect("execute direct-LDS probe");
+    let got = as_f32_vec(&y);
+    let report = allclose_f32(&got, &expected, 0.0, 0.0);
+    assert!(report.ok, "direct GLOBAL→LDS round trip must be exact: {}", report.message);
+}
+
+#[test]
+#[ignore]
+fn direct_global_to_swizzled_k_round_trip_is_correct_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    const N: usize = 32 * 128;
+    let dev = svod_dtype::default_device::default_device();
+    let mut input = Tensor::rand_with(&[N], DType::BFloat16, dev).expect("random swizzled direct-LDS input");
+    input.realize().expect("realize swizzled direct-LDS input");
+    let expected = as_f32_vec(&input);
+
+    let prog = crate::test::probes::direct_lds_swizzled_k_probe().apply(crate::SwizzlePass);
+    let out = Tensor::empty(&[N], DType::BFloat16);
+    let mut y = graph_kernel(prog, out, &[&input]).expect("wrap swizzled direct-LDS probe");
+    let plan = y.prepare().expect("prepare swizzled direct-LDS probe");
+    plan.execute().expect("execute swizzled direct-LDS probe");
+    let got = as_f32_vec(&y);
+    let report = allclose_f32(&got, &expected, 0.0, 0.0);
+    assert!(report.ok, "swizzled direct GLOBAL→LDS round trip must be exact: {}", report.message);
+}
+
+#[test]
+#[ignore]
+fn ds_write_b16_round_trip_is_correct_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    const N: usize = 512;
+    let dev = svod_dtype::default_device::default_device();
+    let mut input = Tensor::rand_with(&[N], DType::BFloat16, dev).expect("random ds_write_b16 input");
+    input.realize().expect("realize ds_write_b16 input");
+    let expected = as_f32_vec(&input);
+
+    let prog = crate::test::probes::ds_write_b16_probe(N);
+    let out = Tensor::empty(&[N], DType::BFloat16);
+    let mut y = graph_kernel(prog, out, &[&input]).expect("wrap ds_write_b16 probe");
+    let plan = y.prepare().expect("prepare ds_write_b16 probe");
+    plan.execute().expect("execute ds_write_b16 probe");
+    let got = as_f32_vec(&y);
+    let report = allclose_f32(&got, &expected, 0.0, 0.0);
+    assert!(report.ok, "ds_write_b16 round trip must be exact: {}", report.message);
 }
 
 /// Host f32 reference for the `mma_atb` probe: `O[d,q] = Σ_kv V[kv,d]·P[kv,q]` (V`[kv,d]`, P`[kv,q]`,
@@ -384,8 +448,10 @@ fn flash_attention_matches_reference_on_gfx942() {
 /// kept SEPARATE from the frozen 16×16 FA) must match the SAME f32 reference (non-causal, bf16-rounded
 /// operands) at d=64 AND d=128, over `bh > 1` independent `[bh,n,d]` attentions — validating the assembled
 /// 32×32×8 hot path end-to-end: QKᵀ (`v_mfma_f32_32x32x8`) → `acc_row_reduce_32` online softmax → `v_perm
-/// s49` P→PV relayout → padded-transposed-V P·V. `n = 128` (the unrolled-KV assembly's gate). `atol` is the
-/// tight 1e-2 the 16×16 gate uses (the honest bf16-cast error is ~2e-3; a corrupted result is rejected).
+/// s49` P→PV relayout → padded-transposed-V P·V. The full cases use `n=256/512`; `atol` is the tight 1e-2
+/// the 16×16 gate uses (the honest bf16-cast error is ~2e-3; a corrupted result is rejected).
+/// The `(8, 512, 64)` case exercises the non-identity d64 XCD remap. The `n=64` cases exercise the
+/// warmup-to-epilogue transition with no steady loop.
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::flash_attention32_matches --nocapture`
 ///
 /// Also gates the **ragged tail** (§Step-B): the `(1, 80, …)` cases have `n=80` — NOT a KV-block (32)
@@ -401,7 +467,15 @@ fn flash_attention32_matches_reference_on_gfx942() {
     const KV_BLK: usize = 32; // KV_BLK_32
     // (bh, n, d): the tile-exact full cases (bh>1, n a Q-block multiple) + the RAGGED partial-block cases
     // (bh=1, n=80 — a partial last KV block exercising the mask at both head dims).
-    for (bh, n, d) in [(3usize, 256usize, 64usize), (2, 256, 128), (1, 80, 64), (1, 80, 128)] {
+    for (bh, n, d) in [
+        (3usize, 256usize, 64usize),
+        (2, 256, 128),
+        (8, 512, 64), // exercises a non-identity d64 8-XCD workgroup remap
+        (1, 64, 64),
+        (1, 64, 128),
+        (1, 80, 64),
+        (1, 80, 128),
+    ] {
         // The kernel's fill + scatter cover ⌈n/tile⌉·tile rows per (b,h) slice; provision the buffers to
         // match. bh>1 needs a tile-exact `n` (per-slice stride == n); a ragged `n` runs at bh=1 (slice
         // base 0), the padded tail holding intentional garbage the mask makes irrelevant.
@@ -425,19 +499,131 @@ fn flash_attention32_matches_reference_on_gfx942() {
         let atol = 1e-2;
         // SwizzlePass folds the K-tile LDS bank swizzle (the as-used tuned path); the gate runs it on to
         // catch any swizzle-layout regression (fill/gather must agree on `lds_col(row, …, d)`).
-        let prog = crate::kernels::fa::flash_attention_fwd_32(bh, n, d).apply(SwizzlePass);
-        let out = Tensor::empty(&[rows, d], DType::Float32);
-        let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA-32 program");
-        let plan = y.prepare().expect("prepare FA-32");
-        plan.execute().expect("execute FA-32");
-        let got = y.as_vec::<f32>().expect("read FA-32 output");
-        // Compare ONLY the true `n` rows per slice (the padded tail is intentional garbage).
-        for s in 0..bh {
-            let z = s * rows_pad * d;
-            let report = allclose_f32(&got[z..z + n * d], &expected[z..z + n * d], atol, 2e-2);
-            println!("FA-32 bh={bh} n={n} d={d} slice={s}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
-            assert!(report.ok, "FA-32 bh={bh} n={n} d={d} slice={s} must match the f32 reference: {}", report.message);
+        let mut variants = if n.is_multiple_of(Q_BLK) {
+            vec![("production", crate::kernels::fa::flash_attention_fwd_32(bh, n, d).apply(SwizzlePass))]
+        } else {
+            vec![(
+                "qualification-register-K",
+                crate::kernels::fa::flash_attention_fwd_32_register_k(bh, n, d).apply(SwizzlePass),
+            )]
+        };
+        if d == 128 {
+            variants.push((
+                "qualification-direct-K",
+                crate::kernels::fa::flash_attention_fwd_32_direct_k(bh, n, d).apply(SwizzlePass),
+            ));
+            variants.push((
+                "qualification-direct-K-packed-V",
+                crate::kernels::fa::flash_attention_fwd_32_direct_k_packed_v(bh, n, d).apply(SwizzlePass),
+            ));
+            variants.push((
+                "qualification-register-asm",
+                crate::kernels::fa::flash_attention_fwd_32_register_asm(bh, n, d).apply(SwizzlePass),
+            ));
         }
+        for (variant, prog) in variants {
+            let out = Tensor::empty(&[rows, d], DType::Float32);
+            let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA-32 program");
+            let plan = y.prepare().expect("prepare FA-32");
+            // Repeat the same prepared plan to expose nondeterministic LDS stage/overwrite races.
+            for run in 0..3 {
+                plan.execute().expect("execute FA-32");
+                let got = y.as_vec::<f32>().expect("read FA-32 output");
+                // Compare ONLY the true `n` rows per slice (the padded tail is intentional garbage).
+                for s in 0..bh {
+                    let z = s * rows_pad * d;
+                    let report = allclose_f32(&got[z..z + n * d], &expected[z..z + n * d], atol, 2e-2);
+                    println!(
+                        "FA-32 {variant} run={run} bh={bh} n={n} d={d} slice={s}: ok={} max_abs_err={:e}",
+                        report.ok, report.max_abs_err
+                    );
+                    assert!(
+                        report.ok,
+                        "FA-32 {variant} run={run} bh={bh} n={n} d={d} slice={s} must match the f32 reference: {}",
+                        report.message
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn flash_attention32_long_direct_k_matches_register_k_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    let dev = svod_dtype::default_device::default_device();
+    let (bh, n, d) = (2usize, 1024usize, 128usize);
+    let mut q = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand long q");
+    let mut k = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand long k");
+    let mut v = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev).expect("rand long v");
+    q.realize().expect("realize long q");
+    k.realize().expect("realize long k");
+    v.realize().expect("realize long v");
+
+    let oracle = crate::kernels::fa::flash_attention_fwd_32_register_k(bh, n, d).apply(SwizzlePass);
+    let out = Tensor::empty(&[bh * n, d], DType::Float32);
+    let mut expected_tensor = graph_kernel(oracle, out, &[&q, &k, &v]).expect("wrap register-K oracle");
+    let oracle_plan = expected_tensor.prepare().expect("prepare register-K oracle");
+    oracle_plan.execute().expect("execute register-K oracle");
+    let expected = expected_tensor.as_vec::<f32>().expect("read register-K oracle");
+
+    let production = crate::kernels::fa::flash_attention_fwd_32(bh, n, d).apply(SwizzlePass);
+    let out = Tensor::empty(&[bh * n, d], DType::Float32);
+    let mut got_tensor = graph_kernel(production, out, &[&q, &k, &v]).expect("wrap production direct-K FA");
+    let production_plan = got_tensor.prepare().expect("prepare production direct-K FA");
+    for run in 0..64 {
+        production_plan.execute().expect("execute production direct-K FA");
+        let got = got_tensor.as_vec::<f32>().expect("read production direct-K FA");
+        let report = allclose_f32(&got, &expected, 0.0, 0.0);
+        assert!(report.ok, "long direct-K run {run} must be bit-exact to register-K: {}", report.message);
+    }
+
+    let asm = crate::kernels::fa::flash_attention_fwd_32_direct_k_asm_gather(bh, n, d).apply(SwizzlePass);
+    let out = Tensor::empty(&[bh * n, d], DType::Float32);
+    let mut asm_tensor = graph_kernel(asm, out, &[&q, &k, &v]).expect("wrap asm-gather direct-K FA");
+    let asm_plan = asm_tensor.prepare().expect("prepare asm-gather direct-K FA");
+    for run in 0..64 {
+        asm_plan.execute().expect("execute asm-gather direct-K FA");
+        let got = asm_tensor.as_vec::<f32>().expect("read asm-gather direct-K FA");
+        let report = allclose_f32(&got, &expected, 0.0, 0.0);
+        assert!(report.ok, "asm-gather direct-K run {run} must be bit-exact to register-K: {}", report.message);
+    }
+}
+
+/// Runtime-DSL integration gate: one compiled graph kernel is replayed with different symbolic grid
+/// extents. The same runtime scalar also bounds both global views, so no access can exceed the logical
+/// prefix even though the physical buffers are allocated to the declared maximum.
+#[test]
+#[ignore]
+fn runtime_grid_and_bounded_views_rebind_without_recompile() {
+    use crate::build::{Builder, F32};
+
+    let dev = svod_dtype::default_device::default_device();
+    let mut input = Tensor::rand_with(&[16], DType::Float32, dev).expect("rand dynamic input");
+    input.realize().expect("realize dynamic input");
+    let expected = input.as_vec::<f32>().expect("read dynamic input");
+
+    let mut b = Builder::new("tk2_runtime_bounded_copy");
+    let out_buf = b.global::<F32>(16);
+    let in_buf = b.global::<F32>(16);
+    let n = b.scalar_param("n", 1, 16);
+    let gid = b.grid_axis_dyn(0, n);
+    let out_view = b.bounded(out_buf, n);
+    let in_view = b.bounded(in_buf, n);
+    let zero = b.f32(0.0);
+    let value = b.load_bounded(in_view, gid, zero);
+    let root = b.store_bounded(out_view, gid, value);
+    let (ir, sink) = b.finish(&[root]);
+    let program = crate::Program { ir, sink, name: "tk2_runtime_bounded_copy".into() };
+
+    let out = Tensor::empty(&[16], DType::Float32);
+    let mut result = graph_kernel(program, out, &[&input]).expect("wrap runtime bounded copy");
+    let mut plan = result.prepare().expect("prepare runtime bounded copy once");
+    for n in [4usize, 11, 16] {
+        plan.execute_with_vars(&[("n", n as i64)]).expect("rebind and execute runtime bounded copy");
+        let got = result.as_vec::<f32>().expect("read runtime bounded copy");
+        assert_eq!(&got[..n], &expected[..n], "runtime bounded prefix n={n}");
     }
 }
 
@@ -512,11 +698,352 @@ fn dump_fa32_isa() {
         let parsed = svod_device::amd::program::parse_kernel(&bytes, "tk2_fa_fwd_32").expect("parse FA-32");
         std::fs::write(format!("{dir}/fa32_d{d}.ll"), &src).expect("write ll");
         std::fs::write(format!("{dir}/fa32_d{d}.co"), &bytes).expect("write co");
-        let scratch = { parsed.kd }.private_segment_fixed_size;
+        let kd = parsed.kd;
+        let scratch = kd.private_segment_fixed_size;
+        let lds = kd.group_segment_fixed_size;
+        let vgprs = ((kd.compute_pgm_rsrc1 & 0x3f) + 1) * 8;
         println!(
-            "FA-32 d={d}: scratch(spill)={scratch}B/thread — {} (LLVM IR → {dir}/fa32_d{d}.ll)",
+            "FA-32 d={d}: VGPRs={vgprs}, LDS={lds}B, scratch={scratch}B/thread — {} (LLVM IR → {dir}/fa32_d{d}.ll)",
             if scratch == 0 { "NO spills" } else { "SPILLING" },
         );
+    }
+}
+
+#[derive(Copy, Clone)]
+struct FaResourceBudget {
+    max_vgprs: u32,
+    max_lds: u32,
+}
+
+fn assert_fa32_resources(label: &str, bytes: &[u8], budget: FaResourceBudget) -> (u32, u32) {
+    let parsed = svod_device::amd::program::parse_kernel(bytes, "tk2_fa_fwd_32").expect("parse FA-32");
+    let kd = parsed.kd;
+    let scratch = kd.private_segment_fixed_size;
+    let lds = kd.group_segment_fixed_size;
+    // gfx942 allocates wave64 VGPRs in groups of eight. The generic occupancy helper currently uses
+    // the four-register GFX10+ wave64 granule, so decode this target's RSRC1 field directly here.
+    let vgprs = ((kd.compute_pgm_rsrc1 & 0x3f) + 1) * 8;
+    assert_eq!(scratch, 0, "{label} must not spill; got {scratch} scratch bytes/thread");
+    assert!(
+        vgprs <= budget.max_vgprs,
+        "{label} exceeds its {}-VGPR allocation budget: {vgprs} VGPRs",
+        budget.max_vgprs
+    );
+    assert!(lds <= budget.max_lds, "{label} exceeds its {}-byte LDS budget: {lds} bytes", budget.max_lds);
+    println!("{label}: VGPRs={vgprs}, scratch={scratch}B/thread, LDS={lds}B");
+    (vgprs, lds)
+}
+
+fn assert_fa32_rendered_llvm_structure(src: &str, d: usize) -> usize {
+    // These are authoring/DSL checks. Scheduler-group intrinsics are compile-time directives, so their
+    // rendered-LLVM cadence is meaningful even though they need not survive as machine instructions.
+    let actual_groups = src.matches("call void @llvm.amdgcn.sched.group.barrier").count();
+    assert_eq!(actual_groups, 128, "FA-32 d={d} rendered-LLVM scheduler-group cadence changed");
+    for (intrinsic, expected) in [
+        ("call void @llvm.amdgcn.sched.group.barrier(i32 8, i32 1, i32 1)", 32),
+        ("call void @llvm.amdgcn.sched.group.barrier(i32 1024, i32 3, i32 1)", 32),
+        ("call void @llvm.amdgcn.sched.group.barrier(i32 8, i32 1, i32 2)", 32),
+        ("call void @llvm.amdgcn.sched.group.barrier(i32 2, i32 5, i32 2)", 32),
+    ] {
+        let actual = src.matches(intrinsic).count();
+        assert_eq!(
+            actual, expected,
+            "FA-32 d={d} rendered-LLVM directive changed: `{intrinsic}` appears {actual} times"
+        );
+    }
+
+    let direct_k = src.contains("call void @llvm.amdgcn.global.load.lds");
+    let partial_wait = src.contains("call void @llvm.amdgcn.s.waitcnt(i32 3956)");
+    let full_wait = src.contains("call void @llvm.amdgcn.s.waitcnt(i32 3952)");
+    let scalar_v = src.contains("asm sideeffect \"ds_write_b16");
+    let packed_v = src.contains("asm sideeffect \"v_perm_b32");
+    let b64_publication = src.contains("asm sideeffect \"ds_write_b64");
+    let opaque_gather = src.contains("asm sideeffect \"ds_read_b64");
+    if d == 128 {
+        assert!(direct_k && partial_wait && full_wait && scalar_v, "long d128 rendered LLVM lost promoted movement");
+        assert!(!packed_v && !b64_publication && !opaque_gather, "qualification-only asm movement reached production");
+    } else {
+        assert!(
+            !direct_k && !partial_wait && !full_wait && !scalar_v && !packed_v && !b64_publication && !opaque_gather,
+            "d64 rendered LLVM must retain register-staged intrinsic movement"
+        );
+    }
+    actual_groups
+}
+
+fn llvm_objdump() -> String {
+    let mut candidates = Vec::new();
+    if let Ok(tool) = std::env::var("SVOD_LLVM_OBJDUMP") {
+        candidates.push(tool);
+    }
+    candidates.extend([
+        "/opt/rocm/llvm/bin/llvm-objdump".to_string(),
+        "llvm-objdump-22".to_string(),
+        "llvm-objdump-21".to_string(),
+        "llvm-objdump-20".to_string(),
+        "llvm-objdump".to_string(),
+    ]);
+    candidates
+        .into_iter()
+        .find(|tool| {
+            std::process::Command::new(tool).arg("--version").output().is_ok_and(|output| output.status.success())
+        })
+        .expect(
+            "FA ISA gate requires ROCm llvm-objdump; set SVOD_LLVM_OBJDUMP or install /opt/rocm/llvm/bin/llvm-objdump",
+        )
+}
+
+fn disassemble_code_object(bytes: &[u8], label: &str) -> String {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_nanos();
+    let safe_label: String = label.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    let path = std::env::temp_dir().join(format!("svod_tk2_{safe_label}_{}_{nonce}.co", std::process::id()));
+    std::fs::write(&path, bytes).expect("write temporary FA code object");
+    let output = std::process::Command::new(llvm_objdump())
+        .args(["-d", "--mcpu=gfx942"])
+        .arg(&path)
+        .output()
+        .expect("run llvm-objdump on FA code object");
+    let _ = std::fs::remove_file(&path);
+    assert!(output.status.success(), "llvm-objdump failed for {label}: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).expect("llvm-objdump output must be UTF-8")
+}
+
+fn assert_fa32_long_d128_isa_sequence(isa: &str) {
+    let body = isa.split_once("<tk2_fa_fwd_32>:").map_or(isa, |(_, body)| body);
+    let lines: Vec<_> = body.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    let partial_waits: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| (line.contains("s_waitcnt") && line.contains("vmcnt(4)")).then_some(i))
+        .collect();
+    assert!(!partial_waits.is_empty(), "final ISA has no d128 vmcnt(4) throttle");
+
+    let has_steady_sequence = partial_waits.into_iter().any(|partial| {
+        let search_start = partial.saturating_sub(256);
+        let stage_start = lines[search_start..partial]
+            .iter()
+            .rposition(|line| line.contains("s_barrier"))
+            .map_or(search_start, |i| search_start + i + 1);
+        let direct_before: Vec<_> =
+            (stage_start..partial).filter(|&i| lines[i].contains("global_load_lds_dword")).collect();
+        if direct_before.len() != 4 {
+            return false;
+        }
+        let first_direct = direct_before[0];
+        let older_v_load = lines[stage_start..first_direct]
+            .iter()
+            .any(|line| line.contains("global_load") && !line.contains("global_load_lds"));
+        if !older_v_load {
+            return false;
+        }
+
+        let Some(full_rel) =
+            lines[partial + 1..].iter().position(|line| line.contains("s_waitcnt") && line.contains("vmcnt(0)"))
+        else {
+            return false;
+        };
+        let full = partial + 1 + full_rel;
+        if lines[partial + 1..full].iter().any(|line| line.contains("s_waitcnt") && line.contains("vmcnt(4)")) {
+            return false;
+        }
+        let writes: Vec<_> = (partial + 1..full).filter(|&i| lines[i].contains("ds_write_b16")).collect();
+        if writes.len() < 8 {
+            return false;
+        }
+        let mfmas = lines[writes[7] + 1..full].iter().filter(|line| line.contains("v_mfma_f32_32x32x8_bf16")).count();
+        if mfmas < 16 {
+            return false;
+        }
+
+        let publication_end = (full + 96).min(lines.len());
+        let Some(lgkm_rel) = lines[full + 1..publication_end]
+            .iter()
+            .position(|line| line.contains("s_waitcnt") && line.contains("lgkmcnt(0)"))
+        else {
+            return false;
+        };
+        let lgkm = full + 1 + lgkm_rel;
+        let Some(barrier_rel) = lines[partial + 1..publication_end].iter().position(|line| line.contains("s_barrier"))
+        else {
+            return false;
+        };
+        let first_barrier = partial + 1 + barrier_rel;
+        first_barrier > lgkm
+    });
+    assert!(
+        has_steady_sequence,
+        "final d128 ISA lost the steady movement/compute/publication sequence: older V load -> four direct K dwords -> \
+         vmcnt(4) -> eight scalar V writes -> >=16 MFMAs -> vmcnt(0) -> lgkmcnt(0) -> s_barrier"
+    );
+}
+
+#[test]
+fn fa32_isa_sequence_rejects_premature_publication_barrier() {
+    let valid = r#"
+<tk2_fa_fwd_32>:
+global_load_dword v0, v1, s[0:1]
+global_load_lds_dword v0, v1, s[0:1]
+global_load_lds_dword v0, v1, s[0:1]
+global_load_lds_dword v0, v1, s[0:1]
+global_load_lds_dword v0, v1, s[0:1]
+s_waitcnt vmcnt(4)
+ds_write_b16 v0, v1
+ds_write_b16 v0, v1
+ds_write_b16 v0, v1
+ds_write_b16 v0, v1
+ds_write_b16 v0, v1
+ds_write_b16 v0, v1
+ds_write_b16 v0, v1
+ds_write_b16 v0, v1
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+v_mfma_f32_32x32x8_bf16 v0, v1, v2, v3
+s_waitcnt vmcnt(0)
+s_waitcnt lgkmcnt(0)
+s_barrier
+"#;
+    assert_fa32_long_d128_isa_sequence(valid);
+
+    let premature = valid.replace("s_waitcnt vmcnt(0)", "s_barrier\ns_waitcnt vmcnt(0)");
+    assert!(
+        std::panic::catch_unwind(|| assert_fa32_long_d128_isa_sequence(&premature)).is_err(),
+        "ISA gate accepted LDS publication before the VMEM/LDS completion waits"
+    );
+}
+
+/// Resource and scheduler regression gate for production and all FA-32 qualification constructors.
+/// Rendered LLVM checks validate DSL construction; wait/movement ordering is checked separately against
+/// disassembly of the final production d128 code object. ELF bytes are intentionally not hashed: the
+/// existing golden framework hashes deterministic tile IR, while clang-produced ELF metadata is
+/// toolchain-specific. The ordered final-ISA sequence is the stable code-object structural gate.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::fa32_stays_within_resource_and_schedule_budget --nocapture`
+#[test]
+#[ignore]
+fn fa32_stays_within_resource_and_schedule_budget() {
+    let device_spec = Tensor::empty(&[1], DType::Float32).device();
+    type Constructor = fn(usize, usize, usize) -> crate::Program;
+    let cases: [(&str, usize, Constructor, FaResourceBudget, bool); 7] = [
+        (
+            "production-d64",
+            64,
+            crate::kernels::fa::flash_attention_fwd_32,
+            // LLVM 22 allocates this unchanged IR at 136 VGPR; the active LLVM 23 backend uses 144.
+            FaResourceBudget { max_vgprs: 144, max_lds: 17_920 },
+            true,
+        ),
+        (
+            "production-long-d128",
+            128,
+            crate::kernels::fa::flash_attention_fwd_32,
+            FaResourceBudget { max_vgprs: 232, max_lds: 44_032 },
+            true,
+        ),
+        (
+            "qualification-forced-direct-k",
+            128,
+            crate::kernels::fa::flash_attention_fwd_32_direct_k,
+            FaResourceBudget { max_vgprs: 232, max_lds: 44_032 },
+            false,
+        ),
+        (
+            "qualification-packed-v",
+            128,
+            crate::kernels::fa::flash_attention_fwd_32_direct_k_packed_v,
+            FaResourceBudget { max_vgprs: 216, max_lds: 44_032 },
+            false,
+        ),
+        (
+            "qualification-opaque-gather",
+            128,
+            crate::kernels::fa::flash_attention_fwd_32_direct_k_asm_gather,
+            FaResourceBudget { max_vgprs: 240, max_lds: 44_032 },
+            false,
+        ),
+        (
+            "qualification-register-oracle",
+            128,
+            crate::kernels::fa::flash_attention_fwd_32_register_k,
+            FaResourceBudget { max_vgprs: 240, max_lds: 44_032 },
+            false,
+        ),
+        (
+            "qualification-register-asm",
+            128,
+            crate::kernels::fa::flash_attention_fwd_32_register_asm,
+            FaResourceBudget { max_vgprs: 232, max_lds: 44_032 },
+            false,
+        ),
+    ];
+    for (label, d, constructor, budget, production) in cases {
+        let prog = constructor(32, 2048, d).apply(SwizzlePass);
+        let (src, bytes) = launch::compile_artifacts(&prog, &device_spec).expect("compile FA-32");
+        assert_fa32_resources(label, &bytes, budget);
+        if production {
+            let actual_groups = assert_fa32_rendered_llvm_structure(&src, d);
+            println!("{label}: rendered-LLVM sched_groups={actual_groups}");
+        }
+        if label == "production-long-d128" {
+            let isa = disassemble_code_object(&bytes, label);
+            assert_fa32_long_d128_isa_sequence(&isa);
+        }
+    }
+}
+
+/// Physical-work gate for the tile-exact FA-32 warmup. The QK(0)-only peel must remove the dummy seed
+/// P·V, leaving exactly two real MFMA contractions per KV block and launched wave. Requires Tier-4 PMC.
+/// `SVOD_DEVICE=AMD:0 SVOD_PMC_FORCE=1 cargo test -p svod-tk2 --lib -- --ignored device::fa32_warmup_has_no_dummy_mfma_work --nocapture`
+#[test]
+#[ignore]
+fn fa32_warmup_has_no_dummy_mfma_work() {
+    let dev = svod_dtype::default_device::default_device();
+    let (bh, n) = (32usize, 2048usize);
+    for d in [64usize, 128] {
+        let mut q = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand q");
+        let mut k = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand k");
+        let mut v = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand v");
+        q.realize().expect("realize q");
+        k.realize().expect("realize k");
+        v.realize().expect("realize v");
+
+        let prog = crate::kernels::fa::flash_attention_fwd_32(bh, n, d).apply(SwizzlePass);
+        let out = Tensor::empty(&[bh * n, d], DType::Float32);
+        let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA-32 program");
+        let plan = y.prepare().expect("prepare FA-32");
+        let report = plan
+            .profile(&ProfileOptions {
+                iters: 1,
+                static_analysis: false,
+                counters: PmcSelection::Custom(vec![PmcCounter::SqWaves, PmcCounter::InstsMfma]),
+            })
+            .expect("profile FA-32 with PMC");
+        let kernel = report
+            .stages
+            .iter()
+            .flat_map(|stage| &stage.kernels)
+            .find(|kernel| kernel.kernel.entry_point == "tk2_fa_fwd_32")
+            .expect("FA-32 profile entry");
+        let counters = kernel.counters.as_ref().expect("PMC counters unavailable; run with SVOD_PMC_FORCE=1");
+        let waves = counters.values[&PmcCounter::SqWaves];
+        let mfma = counters.values[&PmcCounter::InstsMfma];
+        let expected = waves * (n / 32) as u64 * 2 * (d / 8) as u64;
+        assert_eq!(mfma, expected, "FA-32 d={d} executed dummy or missing MFMA work");
+        println!("FA-32 d={d}: waves={waves}, physical MFMA={mfma} (exact useful work)");
     }
 }
 

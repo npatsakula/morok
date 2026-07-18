@@ -26,7 +26,7 @@
 //! [`SharedTile::gather_view`]: crate::tile_move::SharedTile::gather_view
 //! [`SharedTile::stage_view`]: crate::tile_move::SharedTile::stage_view
 
-use crate::build::{Buf, Builder, Effect, Elem, F32, Frag, Idx, Lds, Val};
+use crate::build::{BF16, Buf, Builder, Effect, Elem, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId};
 use crate::kernels::{EDGE, add_opt, offset_by};
 use crate::shape::MfmaShape;
@@ -88,14 +88,22 @@ pub fn gather_run<E: Elem, Sw: Swizzle, S: MfmaShape>(
     row: Idx,
     col: Idx,
     parity: Idx,
+    asm: bool,
     raw: &[TileId],
 ) -> (Vec<Val<E>>, Vec<TileId>) {
     let map = S::a_map();
+    assert!(tile_rows > 0 && tile_rows.is_multiple_of(S::M), "gather_run rows must tile the MFMA M extent");
+    assert!(tile_cols > 0 && tile_cols.is_multiple_of(S::K), "gather_run cols must tile the MFMA K extent");
+    assert!(inner >= tile_cols, "gather_run LDS pitch must cover the logical tile columns");
+    assert!(tile_rows * inner <= src.len, "gather_run logical tile exceeds its LDS allocation");
+    assert_eq!(map.ept, S::EPT_A, "gather_run map width must match the MFMA A operand");
+    assert_eq!(S::EPT_A * E::dtype().bytes(), 8, "gather_run requires one b64 operand payload");
     let swizzled = !Sw::layout(inner).transforms.is_empty();
     let inner_c = b.idx_const(inner as i64);
     let (rt_n, ct_n) = (tile_rows / S::M, tile_cols / S::K);
     let mut vecs = Vec::with_capacity(rt_n * ct_n);
     let mut gathers = Vec::with_capacity(rt_n * ct_n);
+    let mut prev = None;
     for rt in 0..rt_n {
         for ct in 0..ct_n {
             let row_full = offset_by(b, row, rt * S::M); // rt·M (0 for a single-M-tile operand, e.g. K)
@@ -115,9 +123,17 @@ pub fn gather_run<E: Elem, Sw: Swizzle, S: MfmaShape>(
             };
             // One `ds_read_b64` of the contiguous `EPT_A` run, round-tripped through a fragment so the WAR
             // barrier gets a proper store token (SROA elides the store/load into a straight operand).
-            let v = b.load_lds_vec_after(src, base, S::EPT_A, raw);
+            let v = if asm {
+                let base_ptr = b.lds_ptr_as3(src, base, raw);
+                b.ds_read_b64(base_ptr, 0, S::EPT_A, prev)
+            } else {
+                b.load_lds_vec_after(src, base, S::EPT_A, raw)
+            };
             let frag = b.define_frag::<E>(map);
             let st = b.store_frag_vec(frag, v).dep();
+            if asm {
+                prev = Some(st);
+            }
             gathers.push(st);
             vecs.push(b.load_frag_vec_after(frag, &[st]));
         }
@@ -148,9 +164,19 @@ pub fn commit_run<E: Elem, SwK: Swizzle, SwV: Swizzle>(
     k_parity: Idx,
     vt_parity: Idx,
 ) -> Vec<Effect> {
+    const VEC: usize = 4;
+    assert!(epl > 0 && epl.is_multiple_of(VEC), "commit_run epl must be a non-zero b64 multiple");
     let swiz_k = !SwK::layout(k_cols).transforms.is_empty();
     let swiz_v = !SwV::layout(vt_pitch).transforms.is_empty();
     let gvec = if epl.is_multiple_of(8) { 8 } else { 4 };
+    assert!(k_cols.is_multiple_of(gvec), "commit_run source rows must contain whole chunks");
+    assert!(vt_pitch > 0, "commit_run transposed-V pitch must be non-zero");
+    assert_eq!(k_chunks.len(), epl / gvec, "commit_run K chunk count does not match epl");
+    assert_eq!(v_chunks.len(), epl / gvec, "commit_run V chunk count does not match epl");
+    for chunk in k_chunks.iter().chain(v_chunks) {
+        let width = b.ir.meta(chunk.id).shape.iter().copied().product::<usize>().max(1);
+        assert_eq!(width, gvec, "commit_run chunk payload width does not match its geometry");
+    }
     let epl_c = b.idx_const(epl as i64);
     let lane_epl = b.idx_mul(tid, epl_c);
     let d_c = b.idx_const(k_cols as i64);
@@ -180,6 +206,165 @@ pub fn commit_run<E: Elem, SwK: Swizzle, SwV: Swizzle>(
         }
     }
     effs
+}
+
+/// Waitcnt-opaque scalar-bf16 commit for FA's padded-plain, write-transposed V. Adjacent source values
+/// are non-contiguous in LDS, so gfx942 cannot use a direct or b64 write here. Every store is chained
+/// through `prev`; the caller must issue `lgkmcnt(0)` before publication.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_transposed_run_asm(
+    b: &mut Builder,
+    vt_lds: Lds<BF16>,
+    vt_pitch: usize,
+    source_cols: usize,
+    v_chunks: &[Val<BF16>],
+    epl: usize,
+    tid: Idx,
+    vt_parity: Idx,
+    mut prev: Option<TileId>,
+) -> Vec<Effect> {
+    const VEC: usize = 4;
+    assert!(epl > 0 && epl.is_multiple_of(VEC), "transposed asm commit epl must be a non-zero b64 multiple");
+    let gvec = if epl.is_multiple_of(8) { 8 } else { 4 };
+    assert!(
+        source_cols > 0 && source_cols.is_multiple_of(gvec),
+        "transposed asm source rows must contain whole chunks"
+    );
+    assert!(vt_pitch > 0, "transposed asm destination pitch must be non-zero");
+    assert_eq!(v_chunks.len(), epl / gvec, "transposed asm V chunk count does not match epl");
+    for chunk in v_chunks {
+        let width = b.ir.meta(chunk.id).shape.iter().copied().product::<usize>().max(1);
+        assert_eq!(width, gvec, "transposed asm chunk payload width does not match its geometry");
+    }
+    let epl_c = b.idx_const(epl as i64);
+    let lane_epl = b.idx_mul(tid, epl_c);
+    let d_c = b.idx_const(source_cols as i64);
+    let pitch_c = b.idx_const(vt_pitch as i64);
+    let mut effects = Vec::with_capacity(epl);
+    for (cg, &vchunk) in v_chunks.iter().enumerate() {
+        let flat = offset_by(b, lane_epl, cg * gvec);
+        let kv = b.idx_div(flat, d_c);
+        let d_base = b.idx_mod(flat, d_c);
+        let v_row = b.idx_mul(d_base, pitch_c);
+        let v_dst = b.idx_add(v_row, kv);
+        let v_dst = b.idx_add(v_dst, vt_parity);
+        let base = b.lds_ptr_as3(vt_lds, v_dst, &[]);
+        for j in 0..gvec {
+            let value = b.vec_extract(vchunk, j);
+            let write = b.ds_write_b16(base, (j * vt_pitch * 2) as i64, value, prev);
+            prev = Some(write.dep());
+            effects.push(write);
+        }
+    }
+    effects
+}
+
+/// Waitcnt-opaque register-staged d128 K/V commit for phase staggering. K is written as swizzled b64
+/// runs into its alternate K2 plane; V keeps the proven pitch-spaced scalar transpose into V3.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_run_asm<SwK: Swizzle>(
+    b: &mut Builder,
+    k_lds: Lds<BF16>,
+    k_cols: usize,
+    vt_lds: Lds<BF16>,
+    vt_pitch: usize,
+    k_chunks: &[Val<BF16>],
+    v_chunks: &[Val<BF16>],
+    epl: usize,
+    tid: Idx,
+    k_parity: Idx,
+    vt_parity: Idx,
+) -> Vec<Effect> {
+    const VEC: usize = 4;
+    assert!(epl > 0 && epl.is_multiple_of(VEC), "asm commit epl must be a non-zero b64 multiple");
+    let gvec = if epl.is_multiple_of(8) { 8 } else { VEC };
+    assert!(k_cols > 0 && k_cols.is_multiple_of(gvec), "asm commit K rows must contain whole chunks");
+    assert!(vt_pitch > 0, "asm commit transposed-V pitch must be non-zero");
+    assert_eq!(k_chunks.len(), epl / gvec, "asm commit K chunk count does not match epl");
+    assert_eq!(v_chunks.len(), epl / gvec, "asm commit V chunk count does not match epl");
+    for chunk in k_chunks.iter().chain(v_chunks) {
+        let width = b.ir.meta(chunk.id).shape.iter().copied().product::<usize>().max(1);
+        assert_eq!(width, gvec, "asm commit chunk payload width does not match its geometry");
+    }
+    let swizzled = !SwK::layout(k_cols).transforms.is_empty();
+    let epl_c = b.idx_const(epl as i64);
+    let lane_epl = b.idx_mul(tid, epl_c);
+    let cols_c = b.idx_const(k_cols as i64);
+    let mut effects = Vec::with_capacity(k_chunks.len() * (gvec / VEC) + epl);
+    let mut prev = None;
+    for (cg, &chunk) in k_chunks.iter().enumerate() {
+        for half in 0..gvec / VEC {
+            let flat = offset_by(b, lane_epl, cg * gvec + half * VEC);
+            let row = b.idx_div(flat, cols_c);
+            let col = b.idx_mod(flat, cols_c);
+            let col = if swizzled { b.lds_col(row, col, k_cols) } else { col };
+            let row_off = b.idx_mul(row, cols_c);
+            let dst = b.idx_add(row_off, col);
+            let dst = b.idx_add(dst, k_parity);
+            let values: Vec<Val<BF16>> = (0..VEC).map(|i| b.vec_extract(chunk, half * VEC + i)).collect();
+            let value = b.vec_build(&values);
+            let ptr = b.lds_ptr_as3(k_lds, dst, &[]);
+            let addr = b.ptr_to_i32(ptr);
+            let write = b.ds_write_b64_hk(addr, 0, value, prev);
+            prev = Some(write.dep());
+            effects.push(write);
+        }
+    }
+    effects.extend(commit_transposed_run_asm(b, vt_lds, vt_pitch, k_cols, v_chunks, epl, tid, vt_parity, prev));
+    effects
+}
+
+/// AITER-style d128 V commit. Four packed dword loads per lane hold the same d-pair from four KV rows;
+/// four byte permutes form even/odd `<4 x bf16>` columns, then two b64 writes publish both d rows.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_transposed_v4_asm(
+    b: &mut Builder,
+    vt_lds: Lds<BF16>,
+    vt_pitch: usize,
+    v_rows: &[Val<BF16>],
+    tid: Idx,
+    vt_parity: Idx,
+    mut prev: Option<TileId>,
+) -> Vec<Effect> {
+    assert_eq!(v_rows.len(), 4, "packed V commit requires four KV-row dwords per lane");
+    assert!(vt_pitch >= 4 && vt_pitch.is_multiple_of(4), "packed V commit requires a four-element-aligned pitch");
+    for row in v_rows {
+        let width = b.ir.meta(row.id).shape.iter().copied().product::<usize>().max(1);
+        assert_eq!(width, 2, "packed V commit requires one bf16 dword per source row");
+    }
+    let ready_rows: Vec<Val<BF16>> = match prev {
+        Some(ready) => v_rows.iter().map(|&v| b.val_after(v, &[ready])).collect(),
+        None => v_rows.to_vec(),
+    };
+    let even01 = b.v_perm_bf16x2_asm(ready_rows[1], ready_rows[0], Builder::S50_LO_BF16);
+    let odd01 = b.v_perm_bf16x2_asm(ready_rows[1], ready_rows[0], Builder::S49_HI_BF16);
+    let even23 = b.v_perm_bf16x2_asm(ready_rows[3], ready_rows[2], Builder::S50_LO_BF16);
+    let odd23 = b.v_perm_bf16x2_asm(ready_rows[3], ready_rows[2], Builder::S49_HI_BF16);
+    let pack = |b: &mut Builder, lo: Val<BF16>, hi: Val<BF16>| {
+        let values = [b.vec_extract(lo, 0), b.vec_extract(lo, 1), b.vec_extract(hi, 0), b.vec_extract(hi, 1)];
+        b.vec_build(&values)
+    };
+    let even = pack(b, even01, even23);
+    let odd = pack(b, odd01, odd23);
+
+    let warp_c = b.idx_const(64);
+    let four = b.idx_const(4);
+    let two = b.idx_const(2);
+    let warp = b.idx_div(tid, warp_c);
+    let lane = b.idx_mod(tid, warp_c);
+    let kv_base = b.idx_mul(warp, four);
+    let d_even = b.idx_mul(lane, two);
+    let pitch = b.idx_const(vt_pitch as i64);
+    let row = b.idx_mul(d_even, pitch);
+    let dst_even = b.idx_add(row, kv_base);
+    let dst_even = b.idx_add(dst_even, vt_parity);
+
+    let even_ptr = b.lds_ptr_as3(vt_lds, dst_even, &[]);
+    let even_addr = b.ptr_to_i32(even_ptr);
+    let write_even = b.ds_write_b64_hk(even_addr, 0, even, prev);
+    prev = Some(write_even.dep());
+    let write_odd = b.ds_write_b64_hk(even_addr, (vt_pitch * BF16::dtype().bytes()) as i64, odd, prev);
+    vec![write_even, write_odd]
 }
 
 /// **`(Reg ← Global)` — the register-staged prefetch.** Issues the coalesced global loads for the
@@ -626,6 +811,12 @@ impl<E: Elem> LdsStage<E> {
     /// `lgkmcnt(0)`. Returns the store effects the RAW barrier fences. Byte-identical to the original.
     fn commit_intrinsic(self, b: &mut Builder, loaded: &[Val<E>], war: &[TileId]) -> Vec<Effect> {
         const VEC: usize = 4;
+        assert!(self.epl > 0 && self.epl.is_multiple_of(VEC), "intrinsic commit epl must tile b64 chunks");
+        assert_eq!(loaded.len(), self.epl / VEC, "intrinsic commit chunk count does not match epl");
+        for chunk in loaded {
+            let width = b.ir.meta(chunk.id).shape.iter().copied().product::<usize>().max(1);
+            assert_eq!(width * E::dtype().bytes(), 8, "intrinsic commit chunks must be exactly b64");
+        }
         let lds = if war.is_empty() { self.lds } else { b.lds_after(self.lds, war) };
         let epl_c = b.idx_const(self.epl as i64);
         let lane_epl = b.idx_mul(self.lane, epl_c);
@@ -658,6 +849,12 @@ impl<E: Elem> LdsStage<E> {
         prev0: Option<TileId>,
     ) -> Vec<Effect> {
         const VEC: usize = 4;
+        assert!(self.epl > 0 && self.epl.is_multiple_of(VEC), "asm commit epl must tile b64 chunks");
+        assert_eq!(loaded.len(), self.epl / VEC, "asm commit chunk count does not match epl");
+        for chunk in loaded {
+            let width = b.ir.meta(chunk.id).shape.iter().copied().product::<usize>().max(1);
+            assert_eq!(width * E::dtype().bytes(), 8, "asm commit chunks must be exactly b64");
+        }
         let lds = if war.is_empty() { self.lds } else { b.lds_after(self.lds, war) };
         let epl_c = b.idx_const(self.epl as i64);
         let lane_epl = b.idx_mul(self.lane, epl_c);

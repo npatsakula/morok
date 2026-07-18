@@ -22,6 +22,13 @@ use crate::lower;
 /// The buffers must stay allocated for the call; the synchronous dispatch
 /// (`wait=true`) holds them for its duration.
 pub fn run(program: &Program, buffers: &[Buffer]) -> Result<()> {
+    run_with_vars(program, buffers, &[])
+}
+
+/// Compile and synchronously dispatch a tile program with named bounded integer scalar arguments.
+/// Values are reordered to the compiled ABI's `var_names`; missing, duplicate, unknown, and out-of-range
+/// bindings fail before dispatch. The current AMD ABI supports i32-compatible integer values only.
+pub fn run_with_vars(program: &Program, buffers: &[Buffer], vars: &[(&str, i64)]) -> Result<()> {
     snafu::ensure!(!buffers.is_empty(), error::BufferMissingSnafu { slot: 0usize, supplied: 0usize });
 
     // Resolve the concrete Device (renderer/compiler/runtime) for the buffers' device.
@@ -64,10 +71,40 @@ pub fn run(program: &Program, buffers: &[Buffer]) -> Result<()> {
         ptrs.push(unsafe { buf.as_raw_ptr() });
     }
 
-    // No symbolic vars in a hand-built kernel: concrete grid/block from the SPECIALs.
-    let var_vals: HashMap<&str, i64> = HashMap::new();
+    let mut var_vals: HashMap<&str, i64> = HashMap::with_capacity(vars.len());
+    for &(name, value) in vars {
+        if var_vals.insert(name, value).is_some() {
+            return Err(error::Error::RuntimeScalar { name: name.into(), reason: "duplicate binding".into() });
+        }
+    }
+    for &name in var_vals.keys() {
+        if !spec.var_names.iter().any(|expected| expected == name) {
+            return Err(error::Error::RuntimeScalar { name: name.into(), reason: "not used by this kernel".into() });
+        }
+    }
+    for var in &spec.vars {
+        let value = var_vals
+            .get(var.name.as_str())
+            .copied()
+            .ok_or_else(|| error::Error::RuntimeScalar { name: var.name.clone(), reason: "missing binding".into() })?;
+        if !(var.min..=var.max).contains(&value) {
+            return Err(error::Error::RuntimeScalar {
+                name: var.name.clone(),
+                reason: format!("value {value} outside inclusive bounds [{}, {}]", var.min, var.max),
+            });
+        }
+    }
     let dims = spec.launch_dims(&var_vals).context(error::CompileSnafu { name: name.clone() })?;
-    let vals: Vec<i64> = spec.var_names.iter().map(|n| var_vals.get(n.as_str()).copied().unwrap_or(0)).collect();
+    let vals: Vec<i64> = spec
+        .var_names
+        .iter()
+        .map(|n| {
+            var_vals
+                .get(n.as_str())
+                .copied()
+                .ok_or_else(|| error::Error::RuntimeScalar { name: n.clone(), reason: "missing binding".into() })
+        })
+        .collect::<Result<_>>()?;
 
     // SAFETY: pointers are allocated + sized to the kernel's expectations and held
     // alive by the caller; synchronous dispatch drains before return.

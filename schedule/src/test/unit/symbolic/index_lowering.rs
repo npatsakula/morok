@@ -122,6 +122,34 @@ fn test_index_range_lowering() {
 }
 
 #[test]
+fn test_index_range_lowering_preserves_entry_dependencies() {
+    let end = UOp::native_const(100i32).cast(DType::Index);
+    let dep = UOp::custom(smallvec::smallvec![], "; range predecessor".into(), DType::Void);
+    let range = UOp::new(
+        Op::Range {
+            end,
+            axis_id: AxisId::Renumbered(0),
+            axis_type: AxisType::Loop,
+            deps: smallvec::smallvec![dep.clone()],
+        },
+        DType::Index,
+    );
+
+    let RewriteResult::Rewritten(lowered) = pm_lower_index_dtype().rewrite(&range, &mut ()) else {
+        panic!("Index Range should lower");
+    };
+    let Op::Cast { src, dtype } = lowered.op() else {
+        panic!("lowered Range should be cast back to Index");
+    };
+    assert_eq!(*dtype, DType::Index, "lowered Range cast dtype");
+    let Op::Range { deps, .. } = src.op() else {
+        panic!("lowered source should remain a Range");
+    };
+    assert_eq!(deps.len(), 1, "Range entry dependency count");
+    assert_eq!(deps[0].id, dep.id, "Range entry dependencies must survive Index lowering");
+}
+
+#[test]
 fn test_cast_to_index_removal() {
     // Cast from concrete int to Index should be removed
     let concrete = UOp::native_const(42i32);

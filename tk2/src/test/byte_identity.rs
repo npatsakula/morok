@@ -8,7 +8,7 @@
 
 use crate::ir::{TileId, TileIr};
 use crate::kernels::Program;
-use crate::kernels::fa::{flash_attention_fwd, flash_attention_fwd_32};
+use crate::kernels::fa::{flash_attention_fwd, flash_attention_fwd_32, flash_attention_fwd_32_register_k};
 use crate::kernels::matmul::{Tiling, matmul_lds_kblock_mw_clustered};
 use crate::test::probes::atb_probe;
 use crate::{SwizzlePass, VectorizePass};
@@ -53,10 +53,10 @@ fn signatures() -> Vec<(&'static str, u64)> {
     let fa = || flash_attention_fwd(2, 128, 128);
     // FA-32 (the 32×32×8 wide-core FA): the `tile_move::{gather_run, commit_run}` derivation of
     // `Fa32Hooks`'s fragment addressing must leave the emitted IR unchanged. `fa32` is the double-buffered
-    // (d=128) tile-exact case (the device gate's `(2,128,128)`); `fa32.d64` is the single-buffered (d=64)
-    // path (parity offset folds to 0). `fa32.sw` runs SwizzlePass (the K-tile bank swizzle — the as-used
-    // path the device gate applies).
-    let fa32 = || flash_attention_fwd_32(2, 128, 128);
+    // (d=128) historical short-shape case; it uses the crate-private register-staged oracle because the
+    // public production domain is Q256-exact. `fa32.d64` is the single-buffered (d=64) path (parity offset
+    // folds to 0). `fa32.sw` runs SwizzlePass (the K-tile bank swizzle used in production).
+    let fa32 = || flash_attention_fwd_32_register_k(2, 128, 128);
     vec![
         ("matmul", sig(&mm())),
         ("matmul.vec.sw", sig(&mm().apply(VectorizePass).apply(SwizzlePass))),
@@ -65,7 +65,8 @@ fn signatures() -> Vec<(&'static str, u64)> {
         ("atb_probe", sig(&atb_probe(16, 64, 64))),
         ("fa32", sig(&fa32())),
         ("fa32.sw", sig(&fa32().apply(SwizzlePass))),
-        ("fa32.d64", sig(&flash_attention_fwd_32(3, 128, 64))),
+        ("fa32.d64", sig(&flash_attention_fwd_32_register_k(3, 128, 64))),
+        ("fa32.d64.xcd", sig(&flash_attention_fwd_32(8, 512, 64).apply(SwizzlePass))),
     ]
 }
 
@@ -83,9 +84,14 @@ const GOLDEN: &[(&str, u64)] = &[
     // reading the wrong carried scores — the deleted-cross-lane-reduce bug). A real STRUCTURAL change, not a
     // refactor — device-correct via `flash_attention32_matches_reference_on_gfx942` (uniform ~1.8e-3 at all
     // shapes incl. ragged n=80). matmul/fa/atb goldens are UNCHANGED (the WAR guard is a no-op there).
-    ("fa32", 0x50ba_7234_e461_ce17),
-    ("fa32.sw", 0x161b_9eb4_b911_49d3),
-    ("fa32.d64", 0x9edb_f1b4_677d_13d5),
+    // FA-32 rebaselined after the tile-exact QK(0) warmup removed the empty seed softmax/PV. Device
+    // correctness, resource, scheduler-cadence, and repeated performance gates all passed; non-FA
+    // signatures remain unchanged.
+    ("fa32", 0x1d8b_e75f_649b_e62b),
+    ("fa32.sw", 0x336c_a678_a3d3_aa41),
+    ("fa32.d64", 0x84d2_b447_0013_36a5),
+    // d64-only 8-XCD remap, with two Q tiles per slice so the permutation is non-identity.
+    ("fa32.d64.xcd", 0xc36a_7cd6_ac9f_85cd),
 ];
 
 /// Print the live signatures — run at HEAD to capture the golden values, and any time to eyeball a diff.

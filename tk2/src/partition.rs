@@ -48,6 +48,34 @@ impl RowPartition {
         self.slices * self.tiles_per_slice()
     }
 
+    /// Remap the physical round-robin workgroup id into XCD-local chunks of logical row tiles. AMD
+    /// assigns consecutive workgroups across XCDs; de-interleaving by `num_xcds` makes each XCD consume
+    /// `chunk` consecutive logical tiles, preserving K/V cache locality for FA. The transform is used
+    /// only when it is a bijection over the full grid and chunks do not cross slice boundaries.
+    pub fn xcd_swizzle(&self, b: &mut Builder, wgid: Idx, num_xcds: usize, max_chunk: usize) -> Idx {
+        if num_xcds == 0 || max_chunk == 0 {
+            return wgid;
+        }
+        let tiles = self.tiles_per_slice();
+        let chunk = tiles.min(max_chunk);
+        let block = num_xcds * chunk;
+        if chunk == 0 || !tiles.is_multiple_of(chunk) || !self.grid_size().is_multiple_of(block) {
+            return wgid;
+        }
+
+        let nx = b.idx_const(num_xcds as i64);
+        let ch = b.idx_const(chunk as i64);
+        let bl = b.idx_const(block as i64);
+        let xcd = b.idx_mod(wgid, nx);
+        let local = b.idx_div(wgid, nx);
+        let chunk_idx = b.idx_div(local, ch);
+        let pos = b.idx_mod(local, ch);
+        let hi = b.idx_mul(chunk_idx, bl);
+        let mid = b.idx_mul(xcd, ch);
+        let grouped = b.idx_add(hi, mid);
+        b.idx_add(grouped, pos)
+    }
+
     /// Decode a flat workgroup id into `(slice, tile, row_origin)`:
     /// `slice = wgid / tiles_per_slice`, `tile = wgid % tiles_per_slice`, and
     /// `row_origin = slice·rows_per_slice + tile·tile_rows`.

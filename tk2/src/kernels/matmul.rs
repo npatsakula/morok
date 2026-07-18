@@ -10,9 +10,11 @@
 //!   run unbroken.
 
 use super::{EDGE, Program, WARP, add_opt, scatter_frag};
-use crate::build::{BF16, Buf, Builder, Effect, F32, Idx, Lds, Val};
+use crate::build::{BF16, Buf, Builder, F32, Idx, Lds, Val};
 use crate::ir::TileId;
-use crate::pipeline::{BlockCounter, CommitDrain, Compute, Hooks, Mem, Sched, SlotVal, pipeline};
+use crate::pipeline::{
+    BlockCounter, CommitBatch, CommitCompletion, CommitDrain, Compute, Hooks, Mem, Sched, SlotVal, pipeline,
+};
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 use crate::tile::{ARow, BCol};
 use crate::tile_move::{commit_asm, gather, prefetch};
@@ -94,7 +96,7 @@ impl Hooks for MatmulHooks {
         (reg, anchors)
     }
 
-    fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &FillRegs, war: &[TileId]) -> Vec<Effect> {
+    fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &FillRegs, war: &[TileId]) -> CommitBatch {
         // HK's waitcnt-opaque asm `ds_write_b64` commit (§5c — the only commit path; the production config
         // bake fixed the clustered kernel to asm, so there is no intrinsic fallback). Chain A then B writes
         // into ONE `prev` chain (thread A's tail into B) so a single drain reaches BOTH; return the WRITE
@@ -128,7 +130,7 @@ impl Hooks for MatmulHooks {
             war,
             a_last,
         );
-        fa.into_iter().chain(fb).collect()
+        CommitBatch::new(fa.into_iter().chain(fb).collect(), CommitCompletion::Opaque)
     }
 
     fn gather(
@@ -172,6 +174,14 @@ impl Hooks for MatmulHooks {
         // op_anchor = an operand VALUE (the first A fragment) for `set_prio` to anchor on.
         let op_anchor = a_vecs[0].id;
         ((a_vecs, b_vecs), gathers, op_anchor)
+    }
+
+    fn ready_after_lgkm(&mut self, b: &mut Builder, op: Self::Op, wait: TileId) -> Self::Op {
+        let (a, b_op) = op;
+        (
+            a.into_iter().map(|v| b.opaque_ready_b64(v, wait)).collect(),
+            b_op.into_iter().map(|v| b.opaque_ready_b64(v, wait)).collect(),
+        )
     }
 }
 

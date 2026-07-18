@@ -1,9 +1,8 @@
 //! **`MfmaShape` — the matrix-core shape as a compile-time deriving device** (migration Step 1).
 //!
-//! tk2 is presently hardwired to the gfx942 **16×16×16 bf16** MFMA: `EDGE = 16`, `ept = 4`, one
-//! [`FragMap::gfx942_16x16`], one intrinsic. Supporting a second shape (32×32×8) cleanly means the
-//! shape-dependent constants — the operand/accumulator lane maps, the elements-per-thread triple, the
-//! intrinsic dims — must be *derived* from a shape marker, not hand-copied per kernel.
+//! tk2 supports gfx942's **16×16×16** and **32×32×8** bf16 MFMAs. Their shape-dependent constants —
+//! operand/accumulator lane maps, elements-per-thread triples, and intrinsic dimensions — are derived
+//! from shape markers rather than copied into each kernel.
 //!
 //! Per DESIGN §OPEN-2 (`tk2/DESIGN.md`), which splits "tile dims → in types" from "hardware-shape
 //! instruction selection → in data + verifier", a marker is an **authoring-only deriving device**: it
@@ -13,8 +12,8 @@
 //! monomorphisation of the movement layer, no generic explosion. Types compute the constants; the IR
 //! stays data.
 //!
-//! Step 1 lands ONLY [`Mfma16x16x16Bf16`], and every 16×16×16 site is re-derived from it *byte-
-//! identically* (the `test::byte_identity` gate). `Mfma32x32x8Bf16` is a later step.
+//! The `test::byte_identity` gate protects the 16×16×16 derivation, while FA-32 and its primitive probes
+//! exercise [`Mfma32x32x8Bf16`].
 
 use crate::ir::{AccDist, FragMap};
 
@@ -60,8 +59,7 @@ pub trait MfmaShape: Copy + 'static {
     }
 }
 
-/// The gfx942 **16×16×16 bf16→f32** MFMA (`v_mfma_f32_16x16x16_bf16`) — tk2's default and, in Step 1,
-/// its ONLY shape. Every current hardcoded 16×16×16 constant is re-derived from this marker.
+/// The gfx942 **16×16×16 bf16→f32** MFMA (`v_mfma_f32_16x16x16_bf16`) — tk2's compact default shape.
 #[derive(Copy, Clone, Debug)]
 pub struct Mfma16x16x16Bf16;
 

@@ -109,6 +109,7 @@ pub enum UnOp {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum IndexOp {
     Add,
+    Sub,
     Mul,
     Mod,
     Div,
@@ -119,6 +120,8 @@ pub enum IndexOp {
     Shr,
     /// Logical shift-left (the swizzle's `<< 3` bank placement).
     Shl,
+    /// Integer minimum — the workgroup-specific clamp for causal/runtime iteration domains.
+    Min,
 }
 
 /// A register-tile **fragment** lane→(row,col) map — the CDNA 16×16×16 MFMA per-lane
@@ -225,8 +228,20 @@ pub enum Node {
     DefineFrag { id: u32, dtype: DType, frag: FragMap },
     /// A grid/block index value (`Special`), carrying its bound.
     Axis { axis: ScopeAxis, bound: i64 },
+    /// A grid/block index whose launch bound is a runtime index expression.
+    AxisDyn { axis: ScopeAxis, bound: TileId },
     /// A loop counter (`Range`). `id` disambiguates identically-bounded loops.
     Range { id: u32, trips: i64 },
+    /// A statically-sized loop whose entry must follow `deps`. This is the peeled-prologue form: the
+    /// trip count remains constant while the control-flow region has an explicit incoming edge.
+    RangeAfter { id: u32, trips: i64, deps: Edges },
+    /// A runtime-sized loop domain. `deps` optionally order a peeled prologue before loop entry.
+    RangeDyn { id: u32, trips: TileId, deps: Edges },
+    /// A zero-instruction lexical scope marker. `id` prevents address/value DAGs authored in distinct
+    /// control-flow regions from hash-consing together; consumers bind through [`Node::After`].
+    Scope { id: u32, deps: Edges },
+    /// A bounded runtime integer kernel argument. The current device ABI requires i32-compatible bounds.
+    ScalarParam { name: String, min: i64, max: i64 },
     /// A compile-time scalar constant.
     Const { scalar: Scalar, dtype: DType },
     /// Integer addressing arithmetic.
@@ -240,6 +255,8 @@ pub enum Node {
     LdsCol { row: TileId, col: TileId, cols: usize },
     /// Load a scalar/tile from `buf` (a `Global`/`DefineReg`) at flat `offset`.
     LoadGlobal { buf: TileId, offset: TileId, dtype: DType },
+    /// A gated global load: `offset < bound ? buf[offset] : alt`.
+    LoadGlobalBounded { buf: TileId, offset: TileId, bound: TileId, alt: TileId, dtype: DType },
     /// An elementwise binary op on two loaded values.
     EltwiseBinary { op: BinOp, a: TileId, b: TileId },
     /// A predicated **select on an index comparison**: `lo < hi ? then : els`, per element (FA's
@@ -268,8 +285,16 @@ pub enum Node {
     /// result is a `<2 × bf16>` dword (the two gathered bf16 halves). Lowers to a `<2×bf16>`-bitcast of the
     /// `llvm.amdgcn.perm` i32 result — a hand-written `Op::Custom`, mirroring [`Node::DsBpermute`].
     VPerm { hi: TileId, lo: TileId, selector: i64 },
+    /// Waitcnt-opaque packed-bf16 `v_perm_b32`. Used after an explicit partial VMEM wait in the d128
+    /// V transpose so LLVM cannot strengthen `vmcnt(4)` to a full drain at the intrinsic use.
+    VPermAsm { hi: TileId, lo: TileId, selector: i64 },
+    /// A b64 register value tied through side-effect inline asm after an opaque LDS readiness wait.
+    /// This prevents MachineScheduler from moving an MFMA consumer above `SWaitLgkmcnt`.
+    OpaqueReadyB64 { val: TileId, wait: TileId },
     /// Store `value` into `buf` at flat `offset` (an effect).
     StoreGlobal { buf: TileId, offset: TileId, value: TileId },
+    /// A gated global store: write only when `offset < bound`.
+    StoreGlobalBounded { buf: TileId, offset: TileId, bound: TileId, value: TileId },
     /// Vector LOAD of a whole `ept`-element per-lane fragment run from register `buf`
     /// (offset 0) — the `<ept × dtype>` operand a WMMA consumes (mirrors tk's
     /// `load_vec_at`). `buf` is a `DefineFrag` (optionally `After`-wrapped for the
@@ -289,6 +314,10 @@ pub enum Node {
     /// (the vectorised fill; the store mirror of [`Node::LoadVecAt`]). Requires the `ept`
     /// run contiguous + aligned (the A / Row fill; B stays scalar under the transpose).
     StoreVecAt { buf: TileId, base: TileId, value: TileId },
+    /// Hardware direct GLOBAL→LDS DMA (`global_load_lds_dword` on gfx942). The source and destination
+    /// offsets are in elements of their bf16 buffers; the intrinsic transfers one dword. `deps` are
+    /// ordering-only anchors that pin the issue point without routing the payload through VGPRs.
+    GlobalLoadLdsDword { src: TileId, src_offset: TileId, dst: TileId, dst_offset: TileId, deps: Edges },
     /// Extract scalar element `index` from vector value `vec` → `vec.gep([index])`
     /// ([`Op::Gep`](svod_ir::Op::Gep)). The register-transpose primitive (read a column
     /// out of a loaded row-vector); `dtype` is the scalar element type.
@@ -336,6 +365,8 @@ pub enum Node {
     /// an advancing base (`origin·K + k_base`) is HK's perf scheme but flaky here. Feeds
     /// [`Node::BufferLoadRaw`]. Lowers to a pointer-typed `Op::Custom`.
     MakeBufferRsrc { buf: TileId, base_off: TileId, num_bytes: i64 },
+    /// Runtime-bounded modern buffer resource descriptor. `num_bytes` is relative to `base_off`.
+    MakeBufferRsrcDyn { buf: TileId, base_off: TileId, num_bytes: TileId },
     /// ONE `llvm.amdgcn.raw.buffer.load.v{dwords}i32` **MUBUF** load (gfx942 — HK's DRAM prefetch, the
     /// escape from FLAT `global_load`): reads the `ept`-element run at `rsrc[voffset]` bytes, `soffset = 0`.
     /// The address split rides in the DESCRIPTOR: `rsrc`'s base advances per K-tile in SCALAR (see
@@ -353,23 +384,23 @@ pub enum Node {
     /// ordering-only operand — the prior fragment's write — keeping them from hoisting across the
     /// barriers, the silent-stale class §2.1). An EFFECT (a side-effect store, like [`Node::Barrier`]).
     ///
-    /// `hk_form` (default `false`) switches the rendered asm to HipKittens' **literal** IR form
-    /// (`"ds_write_b64 $0, $1\0A", "v,v,~{memory}"(i32 addr, i64 val)` — an i32 raw-address operand
-    /// with the offset folded into the address (NO `offset:` immediate), an `i64` value, and a
-    /// `~{memory}` clobber, matching `hk-micro_tk.ll`). The default form (clustered kernel) is
-    /// byte-unchanged; the HK port uses the flagged form.
+    /// `hk_form` (default `false`) switches the rendered asm to HipKittens' raw-address IR form: an
+    /// i32 address operand, an i64 value, the DS immediate offset, and a `~{memory}` clobber.
     DsWriteB64 { base_ptr: TileId, off_bytes: i64, value: TileId, ept: usize, prev: Option<TileId>, hk_form: bool },
+    /// Waitcnt-opaque scalar bf16 LDS store used by FA's write-transposed V commit. The raw i32 LDS
+    /// address and memory-clobbering inline asm prevent LLVM from conservatively aliasing it with a
+    /// younger direct-to-LDS K transfer and strengthening `vmcnt(4)` to `vmcnt(0)`.
+    DsWriteB16 { base_ptr: TileId, off_bytes: i64, value: TileId, prev: Option<TileId> },
     /// The **manual LDS drain** (`s_waitcnt lgkmcnt(0)`, gfx942 §5c): a void `asm sideeffect` that
     /// stalls until every outstanding LDS op completes — the EXPOSED drain the [`Node::DsWriteB64`]
     /// commit needs (its writes are waitcnt-opaque, so the RAW `s_barrier` no longer fences them; this
     /// re-establishes the store→barrier→load order). `prev` is the last commit write (an ordering-only
     /// operand pinning the drain after the writes in program order). An EFFECT.
     SWaitLgkmcnt { prev: TileId },
-    /// The **VMEM drain** (`s_waitcnt vmcnt(0)`, gfx942) — the [`Node::SWaitLgkmcnt`] twin for the
-    /// global-load half of HipKittens' cooperative `G::load` (drain the `buffer_load`/`global_load`
-    /// before the LDS commit). A void `asm sideeffect`; `prev` (the last load) pins it after the
-    /// loads in program order (ordering-only). An EFFECT. Used only by the HK port.
-    SWaitVmcnt { prev: TileId },
+    /// A queue-wide VMEM wait (`s_waitcnt vmcnt(allowed_outstanding)`, gfx942). Zero is a full drain;
+    /// a positive threshold leaves that many younger queue entries outstanding. `anchor` is a complete
+    /// effect/batch that positions the wait; it does not confer transfer-specific readiness.
+    SWaitVmcnt { anchor: TileId, allowed_outstanding: u8 },
     /// **`ptrtoint ptr addrspace(3) → i32`** of an [`Node::LdsPtrAs3`] base — the raw i32 LDS byte
     /// address HipKittens' `ds_read_b64`/`ds_write_b64` asm takes as its `v` address operand (the
     /// oracle's `i32 %262`, not a typed pointer). Feeds the `hk_form` [`Node::DsReadB64`]/
@@ -511,6 +542,7 @@ pub struct TileIr {
     meta: Vec<TileMeta>,
     dedup: HashMap<Node, TileId>,
     next_range: u32,
+    next_scope: u32,
     next_reg: u32,
     next_slot: u32,
     next_local: u32,
@@ -568,6 +600,12 @@ impl TileIr {
         self.next_range += 1;
         r
     }
+    /// A fresh lexical-scope disambiguator.
+    pub fn fresh_scope_id(&mut self) -> u32 {
+        let s = self.next_scope;
+        self.next_scope += 1;
+        s
+    }
     /// A fresh register slot / disambiguator.
     pub fn fresh_reg_id(&mut self) -> u32 {
         let r = self.next_reg;
@@ -587,20 +625,43 @@ impl TileIr {
     pub fn map_children(node: &Node, mut f: impl FnMut(TileId) -> TileId) -> Node {
         match node.clone() {
             Node::IndexAlu { op, a, b } => Node::IndexAlu { op, a: f(a), b: f(b) },
+            Node::AxisDyn { axis, bound } => Node::AxisDyn { axis, bound: f(bound) },
+            Node::RangeAfter { id, trips, deps } => {
+                Node::RangeAfter { id, trips, deps: deps.into_iter().map(&mut f).collect() }
+            }
+            Node::RangeDyn { id, trips, deps } => {
+                Node::RangeDyn { id, trips: f(trips), deps: deps.into_iter().map(&mut f).collect() }
+            }
+            Node::Scope { id, deps } => Node::Scope { id, deps: deps.into_iter().map(&mut f).collect() },
             Node::LdsCol { row, col, cols } => Node::LdsCol { row: f(row), col: f(col), cols },
             Node::LoadGlobal { buf, offset, dtype } => Node::LoadGlobal { buf: f(buf), offset: f(offset), dtype },
+            Node::LoadGlobalBounded { buf, offset, bound, alt, dtype } => {
+                Node::LoadGlobalBounded { buf: f(buf), offset: f(offset), bound: f(bound), alt: f(alt), dtype }
+            }
             Node::EltwiseBinary { op, a, b } => Node::EltwiseBinary { op, a: f(a), b: f(b) },
             Node::SelectLt { lo, hi, then, els } => Node::SelectLt { lo: f(lo), hi: f(hi), then: f(then), els: f(els) },
             Node::Unary { op, x } => Node::Unary { op, x: f(x) },
             Node::DsBpermute { addr, data } => Node::DsBpermute { addr: f(addr), data: f(data) },
             Node::VPerm { hi, lo, selector } => Node::VPerm { hi: f(hi), lo: f(lo), selector },
+            Node::VPermAsm { hi, lo, selector } => Node::VPermAsm { hi: f(hi), lo: f(lo), selector },
+            Node::OpaqueReadyB64 { val, wait } => Node::OpaqueReadyB64 { val: f(val), wait: f(wait) },
             Node::StoreGlobal { buf, offset, value } => {
                 Node::StoreGlobal { buf: f(buf), offset: f(offset), value: f(value) }
+            }
+            Node::StoreGlobalBounded { buf, offset, bound, value } => {
+                Node::StoreGlobalBounded { buf: f(buf), offset: f(offset), bound: f(bound), value: f(value) }
             }
             Node::LoadRegVec { buf, ept, dtype } => Node::LoadRegVec { buf: f(buf), ept, dtype },
             Node::LoadVecAt { buf, base, ept, dtype } => Node::LoadVecAt { buf: f(buf), base: f(base), ept, dtype },
             Node::StoreRegVec { buf, value } => Node::StoreRegVec { buf: f(buf), value: f(value) },
             Node::StoreVecAt { buf, base, value } => Node::StoreVecAt { buf: f(buf), base: f(base), value: f(value) },
+            Node::GlobalLoadLdsDword { src, src_offset, dst, dst_offset, deps } => Node::GlobalLoadLdsDword {
+                src: f(src),
+                src_offset: f(src_offset),
+                dst: f(dst),
+                dst_offset: f(dst_offset),
+                deps: deps.into_iter().map(&mut f).collect(),
+            },
             Node::VecExtract { vec, index, dtype } => Node::VecExtract { vec: f(vec), index, dtype },
             Node::VecBuild { elements, dtype } => {
                 Node::VecBuild { elements: elements.into_iter().map(&mut f).collect(), dtype }
@@ -612,6 +673,9 @@ impl TileIr {
             }
             Node::MakeBufferRsrc { buf, base_off, num_bytes } => {
                 Node::MakeBufferRsrc { buf: f(buf), base_off: f(base_off), num_bytes }
+            }
+            Node::MakeBufferRsrcDyn { buf, base_off, num_bytes } => {
+                Node::MakeBufferRsrcDyn { buf: f(buf), base_off: f(base_off), num_bytes: f(num_bytes) }
             }
             Node::BufferLoadRaw { rsrc, voffset, ept, dtype, order } => Node::BufferLoadRaw {
                 rsrc: f(rsrc),
@@ -628,8 +692,13 @@ impl TileIr {
                 prev: prev.map(&mut f),
                 hk_form,
             },
+            Node::DsWriteB16 { base_ptr, off_bytes, value, prev } => {
+                Node::DsWriteB16 { base_ptr: f(base_ptr), off_bytes, value: f(value), prev: prev.map(&mut f) }
+            }
             Node::SWaitLgkmcnt { prev } => Node::SWaitLgkmcnt { prev: f(prev) },
-            Node::SWaitVmcnt { prev } => Node::SWaitVmcnt { prev: f(prev) },
+            Node::SWaitVmcnt { anchor, allowed_outstanding } => {
+                Node::SWaitVmcnt { anchor: f(anchor), allowed_outstanding }
+            }
             Node::PtrToI32 { ptr } => Node::PtrToI32 { ptr: f(ptr) },
             Node::MakeSrsrc { buf, base_off, num_bytes } => {
                 Node::MakeSrsrc { buf: f(buf), base_off: f(base_off), num_bytes }
@@ -689,12 +758,20 @@ impl TileIr {
                 m.frag = Some(*frag);
                 m
             }
-            Node::Axis { .. } | Node::Range { .. } => TileMeta::value(SmallVec::new(), DType::Index, Residency::Reg),
+            Node::Axis { .. }
+            | Node::AxisDyn { .. }
+            | Node::Range { .. }
+            | Node::RangeAfter { .. }
+            | Node::RangeDyn { .. }
+            | Node::ScalarParam { .. } => TileMeta::value(SmallVec::new(), DType::Index, Residency::Reg),
+            Node::Scope { .. } => TileMeta::effect(),
             Node::Const { dtype, .. } => TileMeta::value(SmallVec::new(), dtype.clone(), Residency::Reg),
             Node::IndexAlu { .. } | Node::LdsCol { .. } => {
                 TileMeta::value(SmallVec::new(), DType::Index, Residency::Reg)
             }
-            Node::LoadGlobal { dtype, .. } => TileMeta::value(SmallVec::new(), dtype.clone(), Residency::Reg),
+            Node::LoadGlobal { dtype, .. } | Node::LoadGlobalBounded { dtype, .. } => {
+                TileMeta::value(SmallVec::new(), dtype.clone(), Residency::Reg)
+            }
             Node::EltwiseBinary { a, .. } => {
                 let dt = self.meta(*a).dtype.clone().unwrap_or(DType::Float32);
                 TileMeta::value(SmallVec::new(), dt, Residency::Reg)
@@ -715,7 +792,10 @@ impl TileIr {
             // The bpermute'd lane value — a Float32 scalar (transported bitcast through i32).
             Node::DsBpermute { .. } => TileMeta::value(SmallVec::new(), DType::Float32, Residency::Reg),
             // The v_perm'd value — a `<2 × bf16>` dword (the two gathered/packed bf16 halves).
-            Node::VPerm { .. } => TileMeta::value(SmallVec::from_slice(&[2]), DType::BFloat16, Residency::Reg),
+            Node::VPerm { .. } | Node::VPermAsm { .. } => {
+                TileMeta::value(SmallVec::from_slice(&[2]), DType::BFloat16, Residency::Reg)
+            }
+            Node::OpaqueReadyB64 { val, .. } => self.meta(*val).clone(),
             // A fragment vector value: an `ept`-lane register vector (bookkeeping only;
             // the lowered UOp carries the true `dtype.vec(ept)`).
             Node::LoadRegVec { dtype, ept, .. } | Node::LoadVecAt { dtype, ept, .. } => {
@@ -740,6 +820,7 @@ impl TileIr {
             }
             // The `ptr addrspace(8)` buffer descriptor (pointer-like; the lowered custom names its type).
             Node::MakeBufferRsrc { .. } => TileMeta::value(SmallVec::new(), DType::Int64, Residency::Reg),
+            Node::MakeBufferRsrcDyn { .. } => TileMeta::value(SmallVec::new(), DType::Int64, Residency::Reg),
             // The MUBUF prefetch's `<ept×bf16>` value.
             Node::BufferLoadRaw { dtype, ept, .. } => {
                 TileMeta::value(SmallVec::from_slice(&[*ept]), dtype.clone(), Residency::Reg)
@@ -753,9 +834,12 @@ impl TileIr {
             // through it), so it carries the value's residency/dtype/layout.
             Node::After { val, .. } => self.meta(*val).clone(),
             Node::StoreGlobal { .. }
+            | Node::StoreGlobalBounded { .. }
             | Node::StoreRegVec { .. }
             | Node::StoreVecAt { .. }
+            | Node::GlobalLoadLdsDword { .. }
             | Node::DsWriteB64 { .. }
+            | Node::DsWriteB16 { .. }
             | Node::SWaitLgkmcnt { .. }
             | Node::SWaitVmcnt { .. }
             | Node::Barrier { .. }

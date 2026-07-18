@@ -62,6 +62,10 @@ pub enum Error {
         source: Box<svod_device::Error>,
     },
 
+    /// Runtime scalar binding is missing, duplicated, unknown, or outside its declared bounds.
+    #[snafu(display("runtime scalar {name:?}: {reason}"))]
+    RuntimeScalar { name: String, reason: String },
+
     /// The kernel dispatch itself failed.
     #[snafu(display("dispatch {name:?}: {source}"))]
     Dispatch {

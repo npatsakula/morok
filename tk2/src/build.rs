@@ -8,6 +8,7 @@
 //! surface types (HK's single largest unreadability source). We do NOT push
 //! typestate: handles are plain `Copy` wrappers over `TileId`.
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use svod_dtype::DType;
@@ -65,6 +66,13 @@ pub struct Buf<E: Elem> {
     _e: PhantomData<E>,
 }
 
+/// A global buffer view with a runtime logical length and a static maximum allocation.
+#[derive(Copy, Clone, Debug)]
+pub struct BoundedBuf<E: Elem> {
+    pub buf: Buf<E>,
+    pub len: Idx,
+}
+
 /// A register-accumulator handle.
 #[derive(Copy, Clone, Debug)]
 pub struct Reg<E: Elem> {
@@ -100,6 +108,25 @@ pub struct Range {
     pub id: TileId,
 }
 
+/// A reusable runtime iteration domain. Multiple loops may consume the same bounded trip expression
+/// while receiving distinct range IDs.
+#[derive(Copy, Clone, Debug)]
+pub struct IterDomain {
+    pub trips: Idx,
+}
+
+/// A lexical authoring scope. Rebinding a reusable leaf through a scope gives downstream expressions
+/// region identity without emitting an instruction or inventing a memory-ordering dependency.
+#[derive(Copy, Clone, Debug)]
+pub struct Scope {
+    pub id: Option<TileId>,
+}
+
+impl Scope {
+    /// Identity/no-op scope used by schedules that do not need lexical disambiguation.
+    pub const ROOT: Self = Self { id: None };
+}
+
 impl Range {
     /// This loop's range as an ordering edge (keeps a routed read in the loop body).
     pub fn dep(self) -> TileId {
@@ -118,6 +145,25 @@ impl Effect {
     }
 }
 
+/// An effect/batch anchor that positions a queue-wide VMEM wait. Constructed from [`Effect`], not a
+/// payload value, so a wait cannot accidentally claim readiness for one arbitrary transfer result.
+pub struct VmemWaitAnchor(TileId);
+
+impl From<Effect> for VmemWaitAnchor {
+    fn from(effect: Effect) -> Self {
+        Self(effect.dep())
+    }
+}
+
+// Qualification probes predate the typed wait boundary. Keep their test-only source compatibility;
+// production code must supply an Effect or combined commit batch.
+#[cfg(test)]
+impl From<TileId> for VmemWaitAnchor {
+    fn from(id: TileId) -> Self {
+        Self(id)
+    }
+}
+
 impl<E: Elem> Val<E> {
     fn wrap(id: TileId) -> Self {
         Val { id, _e: PhantomData }
@@ -129,11 +175,12 @@ impl<E: Elem> Val<E> {
 pub struct Builder {
     pub ir: TileIr,
     pub name: String,
+    runtime_params: HashMap<String, (i64, i64, TileId)>,
 }
 
 impl Builder {
     pub fn new(name: impl Into<String>) -> Self {
-        Builder { ir: TileIr::new(), name: name.into() }
+        Builder { ir: TileIr::new(), name: name.into(), runtime_params: HashMap::new() }
     }
 
     /// Consume the builder, yielding the arena (for lowering / passes).
@@ -174,9 +221,19 @@ impl Builder {
         Idx(self.ir.intern(Node::Axis { axis: ScopeAxis::Grid(axis), bound }))
     }
 
+    /// A grid index whose launch extent is evaluated from runtime scalar arguments.
+    pub fn grid_axis_dyn(&mut self, axis: u8, bound: Idx) -> Idx {
+        Idx(self.ir.intern(Node::AxisDyn { axis: ScopeAxis::Grid(axis), bound: bound.0 }))
+    }
+
     /// The block (thread) index with `bound` threads.
     pub fn block_axis(&mut self, bound: i64) -> Idx {
         Idx(self.ir.intern(Node::Axis { axis: ScopeAxis::Block, bound }))
+    }
+
+    /// A block index with a runtime local-size bound. Prefer a static block size for tuned GPU kernels.
+    pub fn block_axis_dyn(&mut self, bound: Idx) -> Idx {
+        Idx(self.ir.intern(Node::AxisDyn { axis: ScopeAxis::Block, bound: bound.0 }))
     }
 
     /// Open a loop over `trips` iterations; nesting is emergent from the resulting
@@ -184,6 +241,39 @@ impl Builder {
     pub fn range(&mut self, trips: i64) -> Range {
         let rid = self.ir.fresh_range_id();
         Range { id: self.ir.intern(Node::Range { id: rid, trips }) }
+    }
+
+    /// Open a statically-sized loop after a peeled prologue or other required incoming effects.
+    /// Unlike attaching `deps` to the loop body, this makes those effects dominate the Range itself.
+    pub fn range_after(&mut self, trips: i64, deps: &[TileId]) -> Range {
+        let rid = self.ir.fresh_range_id();
+        let deps = deps.iter().copied().collect();
+        Range { id: self.ir.intern(Node::RangeAfter { id: rid, trips, deps }) }
+    }
+
+    /// Package a runtime trip expression as a reusable iteration domain.
+    pub fn iter_domain(&self, trips: Idx) -> IterDomain {
+        IterDomain { trips }
+    }
+
+    /// Open a loop over a runtime iteration domain.
+    pub fn range_dyn(&mut self, domain: IterDomain) -> Range {
+        self.range_dyn_after(domain, &[])
+    }
+
+    /// Open a runtime-sized loop after a peeled prologue or other incoming effects.
+    pub fn range_dyn_after(&mut self, domain: IterDomain, deps: &[TileId]) -> Range {
+        let rid = self.ir.fresh_range_id();
+        let deps = deps.iter().copied().collect();
+        Range { id: self.ir.intern(Node::RangeDyn { id: rid, trips: domain.trips.0, deps }) }
+    }
+
+    /// Mint a zero-instruction lexical scope marker. Use [`Self::scope_idx`] / [`Self::scope_lds`] on
+    /// reusable leaves before deriving addresses in warmup, loop, epilogue, or drain regions.
+    pub fn scope(&mut self, deps: &[TileId]) -> Scope {
+        let id = self.ir.fresh_scope_id();
+        let deps = deps.iter().copied().collect();
+        Scope { id: Some(self.ir.intern(Node::Scope { id, deps })) }
     }
 
     /// The loop counter as an index value.
@@ -194,6 +284,44 @@ impl Builder {
     /// An index-typed integer constant.
     pub fn idx_const(&mut self, v: i64) -> Idx {
         Idx(self.ir.intern(Node::Const { scalar: Scalar::Int(v), dtype: DType::Index }))
+    }
+
+    /// Declare an i32-compatible bounded runtime integer kernel argument. Reusing a name requires the
+    /// same inclusive bounds and returns the same value handle.
+    pub fn scalar_param(&mut self, name: impl Into<String>, min: i64, max: i64) -> Idx {
+        let name = name.into();
+        assert!(min <= max, "runtime scalar {name:?} has inverted bounds [{min}, {max}]");
+        assert!(
+            min >= i32::MIN as i64 && max <= i32::MAX as i64,
+            "runtime scalar {name:?} bounds must fit the current i32 device ABI"
+        );
+        let mut chars = name.chars();
+        assert!(
+            chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+                && chars.all(|c| c == '_' || c.is_ascii_alphanumeric()),
+            "runtime scalar name {name:?} is not an LLVM identifier"
+        );
+        if let Some(&(old_min, old_max, id)) = self.runtime_params.get(&name) {
+            assert_eq!((old_min, old_max), (min, max), "runtime scalar {name:?} reused with different bounds");
+            return Idx(id);
+        }
+        let id = self.ir.intern(Node::ScalarParam { name: name.clone(), min, max });
+        self.runtime_params.insert(name, (min, max, id));
+        Idx(id)
+    }
+
+    /// Bind a global buffer to a runtime logical element length. The length's declared maximum must not
+    /// exceed the statically allocated capacity when it is a direct scalar parameter or constant.
+    pub fn bounded<E: Elem>(&self, buf: Buf<E>, len: Idx) -> BoundedBuf<E> {
+        let bounds = match self.ir.node(len.0) {
+            Node::ScalarParam { min, max, .. } => Some((*min, *max)),
+            Node::Const { scalar: Scalar::Int(v), dtype } if *dtype == DType::Index => Some((*v, *v)),
+            _ => None,
+        };
+        let (min, max) = bounds.expect("bounded view length must be a direct bounded scalar or index constant");
+        assert!(min >= 0, "bounded view length must be non-negative");
+        assert!(max as usize <= buf.len, "bounded view maximum {max} exceeds buffer capacity {}", buf.len);
+        BoundedBuf { buf, len }
     }
 
     /// An `E`-typed scalar constant.
@@ -210,6 +338,9 @@ impl Builder {
 
     pub fn idx_add(&mut self, a: Idx, b: Idx) -> Idx {
         Idx(self.ir.intern(Node::IndexAlu { op: IndexOp::Add, a: a.0, b: b.0 }))
+    }
+    pub fn idx_sub(&mut self, a: Idx, b: Idx) -> Idx {
+        Idx(self.ir.intern(Node::IndexAlu { op: IndexOp::Sub, a: a.0, b: b.0 }))
     }
     pub fn idx_mul(&mut self, a: Idx, b: Idx) -> Idx {
         Idx(self.ir.intern(Node::IndexAlu { op: IndexOp::Mul, a: a.0, b: b.0 }))
@@ -228,6 +359,27 @@ impl Builder {
     }
     pub fn idx_shl(&mut self, a: Idx, b: Idx) -> Idx {
         Idx(self.ir.intern(Node::IndexAlu { op: IndexOp::Shl, a: a.0, b: b.0 }))
+    }
+    pub fn idx_min(&mut self, a: Idx, b: Idx) -> Idx {
+        Idx(self.ir.intern(Node::IndexAlu { op: IndexOp::Min, a: a.0, b: b.0 }))
+    }
+
+    /// Integer ceil-division for non-negative runtime dimensions.
+    pub fn idx_ceil_div(&mut self, value: Idx, divisor: Idx) -> Idx {
+        let one = self.idx_const(1);
+        let adjustment = self.idx_sub(divisor, one);
+        let numerator = self.idx_add(value, adjustment);
+        self.idx_div(numerator, divisor)
+    }
+
+    /// Compute a flat element offset from runtime/static coordinates and strides.
+    pub fn strided_offset<const R: usize>(&mut self, indices: [Idx; R], strides: [Idx; R]) -> Idx {
+        let mut offset = self.idx_const(0);
+        for axis in 0..R {
+            let term = self.idx_mul(indices[axis], strides[axis]);
+            offset = self.idx_add(offset, term);
+        }
+        offset
     }
 
     /// A **layout-application point** for the column of a `cols`-wide LDS tile access at
@@ -302,6 +454,43 @@ impl Builder {
         Val::wrap(self.ir.intern(Node::LoadGlobal { buf: buf.id, offset: offset.0, dtype: E::dtype() }))
     }
 
+    /// Gated scalar load from a bounded view. Out-of-range lanes produce `alt` and never dereference the
+    /// underlying pointer.
+    pub fn load_bounded<E: Elem>(&mut self, view: BoundedBuf<E>, offset: Idx, alt: Val<E>) -> Val<E> {
+        Val::wrap(self.ir.intern(Node::LoadGlobalBounded {
+            buf: view.buf.id,
+            offset: offset.0,
+            bound: view.len.0,
+            alt: alt.id,
+            dtype: E::dtype(),
+        }))
+    }
+
+    /// Build a bounded vector load from independently gated scalar elements. This defines safe partial
+    /// tail semantics without relying on target-specific raw-buffer straddle behavior.
+    pub fn load_vec_bounded<E: Elem>(&mut self, view: BoundedBuf<E>, base: Idx, ept: usize, alt: Val<E>) -> Val<E> {
+        let values: Vec<Val<E>> = (0..ept)
+            .map(|i| {
+                let i = self.idx_const(i as i64);
+                let offset = self.idx_add(base, i);
+                self.load_bounded(view, offset, alt)
+            })
+            .collect();
+        self.vec_build(&values)
+    }
+
+    /// Bounded scalar load through an R-dimensional strided view.
+    pub fn load_strided_bounded<E: Elem, const R: usize>(
+        &mut self,
+        view: BoundedBuf<E>,
+        indices: [Idx; R],
+        strides: [Idx; R],
+        alt: Val<E>,
+    ) -> Val<E> {
+        let offset = self.strided_offset(indices, strides);
+        self.load_bounded(view, offset, alt)
+    }
+
     /// Load an `E`-element from a register cell at flat `offset` (with an optional
     /// ordering edge — the loop-carry read routes through the prior store + range).
     pub fn load_reg<E: Elem>(&mut self, reg: Reg<E>, offset: Idx) -> Val<E> {
@@ -320,6 +509,28 @@ impl Builder {
     /// Store an `E` value into a global buffer at flat `offset` (a terminal effect).
     pub fn store<E: Elem>(&mut self, buf: Buf<E>, offset: Idx, value: Val<E>) -> Effect {
         Effect(self.ir.intern(Node::StoreGlobal { buf: buf.id, offset: offset.0, value: value.id }))
+    }
+
+    /// Gated scalar store to a bounded view. Out-of-range lanes leave memory untouched.
+    pub fn store_bounded<E: Elem>(&mut self, view: BoundedBuf<E>, offset: Idx, value: Val<E>) -> Effect {
+        Effect(self.ir.intern(Node::StoreGlobalBounded {
+            buf: view.buf.id,
+            offset: offset.0,
+            bound: view.len.0,
+            value: value.id,
+        }))
+    }
+
+    /// Bounded scalar store through an R-dimensional strided view.
+    pub fn store_strided_bounded<E: Elem, const R: usize>(
+        &mut self,
+        view: BoundedBuf<E>,
+        indices: [Idx; R],
+        strides: [Idx; R],
+        value: Val<E>,
+    ) -> Effect {
+        let offset = self.strided_offset(indices, strides);
+        self.store_bounded(view, offset, value)
     }
 
     /// Store an `E` value into a register cell at flat `offset`.
@@ -382,6 +593,15 @@ impl Builder {
         Idx(self.ir.intern(Node::MakeBufferRsrc { buf: buf.id, base_off: base_off.0, num_bytes }))
     }
 
+    /// Build a modern raw-buffer descriptor over a bounded view. The descriptor stays based at element
+    /// zero so its runtime byte extent is exact and does not require saturating base-relative arithmetic.
+    pub fn make_buffer_rsrc_bounded<E: Elem>(&mut self, view: BoundedBuf<E>) -> Idx {
+        let zero = self.idx_const(0);
+        let elem_bytes = self.idx_const(E::dtype().bytes() as i64);
+        let num_bytes = self.idx_mul(view.len, elem_bytes);
+        Idx(self.ir.intern(Node::MakeBufferRsrcDyn { buf: view.buf.id, base_off: zero.0, num_bytes: num_bytes.0 }))
+    }
+
     /// ONE MUBUF `raw.buffer.load` ([`Node::BufferLoadRaw`]) reading the `ept`-element run at
     /// `rsrc[voffset]` bytes (`soffset = 0`), the SGPR-descriptor DRAM prefetch over FLAT `global_load`. The
     /// descriptor base (from [`Self::make_buffer_rsrc`]) advances per K-tile in scalar; `voffset` is the
@@ -403,6 +623,26 @@ impl Builder {
     /// `ept` scalar `store_lds` for a contiguous, aligned run (the vectorised fill).
     pub fn store_lds_vec<E: Elem>(&mut self, lds: Lds<E>, base: Idx, value: Val<E>) -> Effect {
         Effect(self.ir.intern(Node::StoreVecAt { buf: lds.id, base: base.0, value: value.id }))
+    }
+
+    /// Issue one gfx942 hardware direct GLOBAL→LDS dword transfer. Both offsets are bf16-element
+    /// offsets; the source and destination must therefore be even. The returned effect must be folded
+    /// into a later publication barrier, which drains the VMEM-tracked DMA before LDS consumers run.
+    pub fn global_load_lds_dword(
+        &mut self,
+        src: Buf<BF16>,
+        src_offset: Idx,
+        dst: Lds<BF16>,
+        dst_offset: Idx,
+        deps: &[TileId],
+    ) -> Effect {
+        Effect(self.ir.intern(Node::GlobalLoadLdsDword {
+            src: src.id,
+            src_offset: src_offset.0,
+            dst: dst.id,
+            dst_offset: dst_offset.0,
+            deps: deps.iter().copied().collect(),
+        }))
     }
 
     /// Extract scalar element `index` from a vector value ([`Node::VecExtract`] → `gep`).
@@ -521,6 +761,26 @@ impl Builder {
     /// operand carries the ordering, mirroring tk's `a_smem.after([barrier])` (`gfx942.rs:156`).
     pub fn idx_after(&mut self, idx: Idx, deps: &[TileId]) -> Idx {
         Idx(self.after_buf(idx.0, deps))
+    }
+
+    /// Rebind an index leaf to a lexical scope. The value is unchanged; its identity is not.
+    pub fn scope_idx(&mut self, idx: Idx, scope: Scope) -> Idx {
+        match scope.id {
+            Some(id) => Idx(self.after_buf(idx.0, &[id])),
+            None => idx,
+        }
+    }
+
+    /// Rebind an LDS handle to a lexical scope. Derived LDS addresses/loads then remain local to that
+    /// region through tile-IR and UOp hash-consing.
+    pub fn scope_lds<E: Elem>(&mut self, lds: Lds<E>, scope: Scope) -> Lds<E> {
+        match scope.id {
+            Some(scope) => {
+                let id = self.after_buf(lds.id, &[scope]);
+                Lds { id, len: lds.len, _e: PhantomData }
+            }
+            None => lds,
+        }
     }
 
     /// The **HK barrier-wall opt-in** (DESIGN §5c): a void sentinel making codegen pair every
@@ -763,6 +1023,9 @@ impl Builder {
     /// fragment with [`Self::store_frag_vec`]; the WMMA reads it via [`Self::load_frag_vec_after`].
     pub fn ds_read_b64<E: Elem>(&mut self, base_ptr: Idx, off_bytes: i64, ept: usize, prev: Option<TileId>) -> Val<E> {
         assert!((0..=65535).contains(&off_bytes), "ds_read_b64 offset {off_bytes}B exceeds the 16-bit immediate");
+        assert_eq!(off_bytes % 8, 0, "ds_read_b64 offset must be b64-aligned");
+        assert_eq!(ept * E::dtype().bytes(), 8, "ds_read_b64 payload must be exactly 64 bits");
+        assert!(matches!(self.ir.node(base_ptr.0), Node::LdsPtrAs3 { .. }), "ds_read_b64 requires an LDS pointer");
         Val::wrap(self.ir.intern(Node::DsReadB64 {
             base_ptr: base_ptr.0,
             off_bytes,
@@ -785,6 +1048,9 @@ impl Builder {
         prev: Option<TileId>,
     ) -> Val<E> {
         assert!((0..=65535).contains(&off_bytes), "ds_read_b64 offset {off_bytes}B exceeds the 16-bit immediate");
+        assert_eq!(off_bytes % 8, 0, "ds_read_b64 offset must be b64-aligned");
+        assert_eq!(ept * E::dtype().bytes(), 8, "ds_read_b64 payload must be exactly 64 bits");
+        assert!(matches!(self.ir.node(base_i32.0), Node::PtrToI32 { .. }), "HK ds_read_b64 requires a raw LDS address");
         Val::wrap(self.ir.intern(Node::DsReadB64 {
             base_ptr: base_i32.0,
             off_bytes,
@@ -798,6 +1064,7 @@ impl Builder {
     /// **`ptrtoint ptr addrspace(3) → i32`** of an LDS base ([`Self::lds_ptr_as3`]) — the raw i32
     /// LDS address HK's `ds_read_b64`/`ds_write_b64` asm takes (HK port).
     pub fn ptr_to_i32(&mut self, ptr: Idx) -> Idx {
+        assert!(matches!(self.ir.node(ptr.0), Node::LdsPtrAs3 { .. }), "ptr_to_i32 requires an LDS pointer");
         Idx(self.ir.intern(Node::PtrToI32 { ptr: ptr.0 }))
     }
 
@@ -816,6 +1083,9 @@ impl Builder {
         assert!((0..=65535).contains(&off_bytes), "ds_write_b64 offset {off_bytes}B exceeds the 16-bit immediate");
         // `ept` = the operand vector width, read off the value's derived shape (`<ept×E>`).
         let ept = self.ir.meta(value.id).shape.iter().copied().product::<usize>().max(1);
+        assert_eq!(off_bytes % 8, 0, "ds_write_b64 offset must be b64-aligned");
+        assert_eq!(ept * E::dtype().bytes(), 8, "ds_write_b64 payload must be exactly 64 bits");
+        assert!(matches!(self.ir.node(base_ptr.0), Node::LdsPtrAs3 { .. }), "ds_write_b64 requires an LDS pointer");
         Effect(self.ir.intern(Node::DsWriteB64 {
             base_ptr: base_ptr.0,
             off_bytes,
@@ -826,15 +1096,26 @@ impl Builder {
         }))
     }
 
-    /// HipKittens' **literal** `ds_write_b64` commit (the HK port, GAP/Tier-B): same store
-    /// as [`Self::ds_write_b64`] but rendered in HK's exact IR form — an `i32` raw-address operand
-    /// (`base_i32`, with the offset folded into the address, so NO `offset:` immediate), an `i64`
-    /// value (the `<4×bf16>` half bitcast to i64), and a `~{memory}` clobber (matches `hk-micro_tk.ll`).
-    pub fn ds_write_b64_hk<E: Elem>(&mut self, base_i32: Idx, value: Val<E>, prev: Option<TileId>) -> Effect {
+    /// HipKittens-form `ds_write_b64` commit: an `i32` raw-address operand, an `i64` value, and a
+    /// `~{memory}` clobber. `off_bytes` uses the DS instruction's 16-bit immediate.
+    pub fn ds_write_b64_hk<E: Elem>(
+        &mut self,
+        base_i32: Idx,
+        off_bytes: i64,
+        value: Val<E>,
+        prev: Option<TileId>,
+    ) -> Effect {
+        assert!((0..=65535).contains(&off_bytes), "ds_write_b64 offset {off_bytes}B exceeds the 16-bit immediate");
         let ept = self.ir.meta(value.id).shape.iter().copied().product::<usize>().max(1);
+        assert_eq!(off_bytes % 8, 0, "ds_write_b64 offset must be b64-aligned");
+        assert_eq!(ept * E::dtype().bytes(), 8, "ds_write_b64 payload must be exactly 64 bits");
+        assert!(
+            matches!(self.ir.node(base_i32.0), Node::PtrToI32 { .. }),
+            "HK ds_write_b64 requires a raw LDS address"
+        );
         Effect(self.ir.intern(Node::DsWriteB64 {
             base_ptr: base_i32.0,
-            off_bytes: 0,
+            off_bytes,
             value: value.id,
             ept,
             prev,
@@ -842,10 +1123,27 @@ impl Builder {
         }))
     }
 
-    /// The **VMEM drain** (`s_waitcnt vmcnt(0)`) — the [`Self::swait_lgkmcnt`] twin for HK's
-    /// cooperative `G::load` global-load half (HK port). `prev` = the last load.
-    pub fn swait_vmcnt(&mut self, prev: TileId) -> Effect {
-        Effect(self.ir.intern(Node::SWaitVmcnt { prev }))
+    /// Waitcnt-opaque scalar bf16 LDS store. `base_ptr + off_bytes` names the destination and `prev`
+    /// chains writes (or the VMEM readiness wait). A later explicit `lgkmcnt(0)` is required.
+    pub fn ds_write_b16(&mut self, base_ptr: Idx, off_bytes: i64, value: Val<BF16>, prev: Option<TileId>) -> Effect {
+        assert!((0..=65535).contains(&off_bytes), "ds_write_b16 offset {off_bytes}B exceeds the 16-bit immediate");
+        let ept = self.ir.meta(value.id).shape.iter().copied().product::<usize>().max(1);
+        assert_eq!(off_bytes % 2, 0, "ds_write_b16 offset must be scalar-bf16 aligned");
+        assert_eq!(ept, 1, "ds_write_b16 requires a scalar bf16 payload");
+        assert!(matches!(self.ir.node(base_ptr.0), Node::LdsPtrAs3 { .. }), "ds_write_b16 requires an LDS pointer");
+        Effect(self.ir.intern(Node::DsWriteB16 { base_ptr: base_ptr.0, off_bytes, value: value.id, prev }))
+    }
+
+    /// Queue-wide VMEM wait allowing `allowed_outstanding` younger operations to remain. The anchor
+    /// positions the wait after a complete effect/batch; it does not identify one transfer's payload.
+    pub fn swait_vmcnt_allowed(&mut self, anchor: impl Into<VmemWaitAnchor>, allowed_outstanding: u8) -> Effect {
+        assert!(allowed_outstanding <= 63, "gfx942 vmcnt threshold must fit the 6-bit counter");
+        Effect(self.ir.intern(Node::SWaitVmcnt { anchor: anchor.into().0, allowed_outstanding }))
+    }
+
+    /// Full VMEM drain (`s_waitcnt vmcnt(0)`).
+    pub fn swait_vmcnt(&mut self, anchor: impl Into<VmemWaitAnchor>) -> Effect {
+        self.swait_vmcnt_allowed(anchor, 0)
     }
 
     /// The **legacy `<4 x i32>` SRD** (HK's `make_srsrc`, config `0x110000`) of a global `buf` based
@@ -902,6 +1200,23 @@ impl Builder {
     /// shuffle), mirroring [`Self::shuffle_lane`]'s `Op::Custom` shape.
     pub fn v_perm_b32(&mut self, hi: Val<F32>, lo: Val<F32>, selector: i64) -> Val<BF16> {
         Val::wrap(self.ir.intern(Node::VPerm { hi: hi.id, lo: lo.id, selector }))
+    }
+
+    /// Byte-permute two explicitly readied packed-bf16 dwords without exposing VMEM consumption to LLVM.
+    pub fn v_perm_bf16x2_asm(&mut self, hi: Val<BF16>, lo: Val<BF16>, selector: i64) -> Val<BF16> {
+        for value in [hi, lo] {
+            let ept = self.ir.meta(value.id).shape.iter().copied().product::<usize>().max(1);
+            assert_eq!(ept, 2, "v_perm_bf16x2_asm requires packed bf16 dwords");
+        }
+        Val::wrap(self.ir.intern(Node::VPermAsm { hi: hi.id, lo: lo.id, selector }))
+    }
+
+    /// Tie a packed b64 bf16 operand through side-effect asm after an opaque LDS readiness wait.
+    pub fn opaque_ready_b64(&mut self, val: Val<BF16>, wait: TileId) -> Val<BF16> {
+        let ept = self.ir.meta(val.id).shape.iter().copied().product::<usize>().max(1);
+        assert_eq!(ept * BF16::dtype().bytes(), 8, "opaque_ready_b64 requires exactly four bf16 values");
+        assert!(matches!(self.ir.node(wait), Node::SWaitLgkmcnt { .. }), "opaque_ready_b64 requires an lgkm wait");
+        Val::wrap(self.ir.intern(Node::OpaqueReadyB64 { val: val.id, wait }))
     }
 
     /// aiter's `s49` selector — gather the HIGH bf16 of each dword pair (bytes {2,3,6,7}), i.e. the

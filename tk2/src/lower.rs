@@ -146,9 +146,47 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             };
             UOp::special(cidx(bound), n)
         }
+        Node::AxisDyn { axis, bound } => {
+            let n = match axis {
+                ScopeAxis::Grid(a) => format!("gidx{a}"),
+                ScopeAxis::Block => "lidx0".to_string(),
+            };
+            UOp::special(get(low, bound), n)
+        }
         Node::Range { id: rid, trips } => {
             UOp::range_axis(cidx(trips), AxisId::Renumbered(rid as usize), AxisType::Loop)
         }
+        Node::RangeAfter { id: rid, trips, deps } => {
+            let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();
+            UOp::new(
+                Op::Range {
+                    end: cidx(trips),
+                    axis_id: AxisId::Renumbered(rid as usize),
+                    axis_type: AxisType::Loop,
+                    deps: deps.into_iter().collect(),
+                },
+                DType::Index,
+            )
+        }
+        Node::RangeDyn { id: rid, trips, deps } => {
+            let deps: SmallVec<[Arc<UOp>; 2]> = deps.iter().map(|d| get(low, *d)).collect();
+            UOp::new(
+                Op::Range {
+                    end: get(low, trips),
+                    axis_id: AxisId::Renumbered(rid as usize),
+                    axis_type: AxisType::Loop,
+                    deps,
+                },
+                DType::Index,
+            )
+        }
+        // A deterministic, zero-instruction marker. The distinct custom body survives UOp hash-consing;
+        // LLVM renders it as a comment, while `After(value, [scope])` remains a plain value alias.
+        Node::Scope { id, deps } => {
+            let deps: SmallVec<[Arc<UOp>; 4]> = deps.iter().map(|d| get(low, *d)).collect();
+            UOp::custom(deps, format!("; tk2.scope.{id}"), DType::Void)
+        }
+        Node::ScalarParam { name, min, max } => UOp::define_var(name, min, max),
         Node::Const { scalar, dtype } => match scalar {
             Scalar::Int(v) => UOp::const_(dtype, ConstValue::Int(v)),
             Scalar::F32(bits) => UOp::const_(dtype, ConstValue::Float(f32::from_bits(bits) as f64)),
@@ -157,12 +195,17 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             let (a, b) = (get(low, a), get(low, b));
             match op {
                 IndexOp::Add => a.add(&b),
+                IndexOp::Sub => a.sub(&b),
                 IndexOp::Mul => a.mul(&b),
                 IndexOp::Mod => a.mod_(&b),
                 IndexOp::Div => a.idiv(&b),
                 IndexOp::Xor => a.xor(&b),
                 IndexOp::Shr => a.shr(&b),
                 IndexOp::Shl => a.shl(&b),
+                IndexOp::Min => {
+                    let cond = a.lt(&b);
+                    UOp::try_where(cond, a, b).expect("index min: matching integer operands")
+                }
             }
         }
         // Identity (PassThrough): the base kernel's LDS col is flat. `SwizzlePass`
@@ -174,6 +217,18 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             let idx =
                 UOp::index().buffer(buf.clone()).indices(vec![off]).ptr(true).call().expect("LOAD index construction");
             UOp::load().buffer(buf).index(idx).call()
+        }
+        Node::LoadGlobalBounded { buf, offset, bound, alt, .. } => {
+            let (buf, off, bound, alt) = (get(low, buf), get(low, offset), get(low, bound), get(low, alt));
+            let gate = off.lt(&bound);
+            let idx = UOp::index()
+                .buffer(buf.clone())
+                .indices(vec![off])
+                .gate(gate)
+                .ptr(true)
+                .call()
+                .expect("bounded LOAD index construction");
+            UOp::load().buffer(buf).index(idx).alt(alt).call()
         }
         Node::EltwiseBinary { op, a, b } => {
             let (a, b) = (get(low, a), get(low, b));
@@ -193,6 +248,18 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
         Node::StoreGlobal { buf, offset, value } => {
             let (buf, off, val) = (get(low, buf), get(low, offset), get(low, value));
             let idx = UOp::index().buffer(buf).indices(vec![off]).ptr(true).call().expect("STORE index construction");
+            idx.store(val)
+        }
+        Node::StoreGlobalBounded { buf, offset, bound, value } => {
+            let (buf, off, bound, val) = (get(low, buf), get(low, offset), get(low, bound), get(low, value));
+            let gate = off.lt(&bound);
+            let idx = UOp::index()
+                .buffer(buf)
+                .indices(vec![off])
+                .gate(gate)
+                .ptr(true)
+                .call()
+                .expect("bounded STORE index construction");
             idx.store(val)
         }
         // Elementwise unary math → `Op::Unary` (the whole transcendental table is native
@@ -262,6 +329,29 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             );
             p.bitcast(DType::BFloat16.vec(2).expect("v_perm: <2×bf16>"))
         }
+        Node::VPermAsm { hi, lo, selector } => {
+            let hi = get(low, hi).bitcast(DType::Int32);
+            let lo = get(low, lo).bitcast(DType::Int32);
+            let selector = UOp::const_(DType::Int32, ConstValue::Int(selector));
+            let p = UOp::custom(
+                smallvec![hi, lo, selector],
+                "call i32 asm sideeffect \"v_perm_b32 $0, $1, $2, $3\", \
+                 \"=v,v,v,s\"(i32 {0}, i32 {1}, i32 {2})"
+                    .to_string(),
+                DType::Int32,
+            );
+            p.bitcast(DType::BFloat16.vec(2).expect("v_perm asm: <2×bf16>"))
+        }
+        Node::OpaqueReadyB64 { val, wait } => {
+            let val = get(low, val).bitcast(DType::Int64);
+            let wait = get(low, wait);
+            UOp::custom(
+                smallvec![val, wait],
+                "call i64 asm sideeffect \"\", \"=v,0\"(i64 {0})".to_string(),
+                DType::Int64,
+            )
+            .bitcast(DType::BFloat16.vec(4).expect("opaque-ready b64: <4 x bf16>"))
+        }
         // ONE `<ept × dtype>` vector load of the whole per-lane fragment run (offset 0)
         // — the WMMA operand (mirrors tk's `load_vec_at`).
         Node::LoadRegVec { buf, ept, dtype } => {
@@ -302,6 +392,37 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             let idx =
                 UOp::index().buffer(buf).indices(vec![base]).ptr(true).call().expect("VEC_AT store index construction");
             idx.store(val)
+        }
+        // gfx942 direct GLOBAL→LDS dword DMA. This is a VMEM operation whose payload never occupies a
+        // VGPR; the publication barrier that consumes this effect supplies the completion wait.
+        Node::GlobalLoadLdsDword { src, src_offset, dst, dst_offset, deps } => {
+            let src = get(low, src);
+            let src_idx = UOp::index()
+                .buffer(src)
+                .indices(vec![get(low, src_offset)])
+                .ptr(true)
+                .call()
+                .expect("global_load_lds source index");
+            let src_ptr =
+                UOp::custom(smallvec![src_idx], "addrspacecast ptr {0} to ptr addrspace(1)".to_string(), DType::Int32);
+            let dst = get(low, dst);
+            let dst_idx = UOp::index()
+                .buffer(dst)
+                .indices(vec![get(low, dst_offset)])
+                .ptr(true)
+                .call()
+                .expect("global_load_lds destination index");
+            let dst_ptr =
+                UOp::custom(smallvec![dst_idx], "addrspacecast ptr {0} to ptr addrspace(3)".to_string(), DType::Int32);
+            let mut operands: SmallVec<[Arc<UOp>; 4]> = smallvec![src_ptr, dst_ptr];
+            operands.extend(deps.iter().map(|d| get(low, *d)));
+            UOp::custom(
+                operands,
+                "declare void @llvm.amdgcn.global.load.lds(ptr addrspace(1) nocapture, ptr addrspace(3) nocapture, i32, i32, i32)\n\
+                 call void @llvm.amdgcn.global.load.lds(ptr addrspace(1) {0}, ptr addrspace(3) {1}, i32 4, i32 0, i32 0)"
+                    .to_string(),
+                DType::Void,
+            )
         }
         // Extract one scalar lane from a vector (`gep`); build a vector from scalars
         // (`vectorize`) — the register-transpose pair (read a column, pack it).
@@ -393,6 +514,23 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
                 DType::Int64,
             )
         }
+        Node::MakeBufferRsrcDyn { buf, base_off, num_bytes } => {
+            let (buf, base_off, num_bytes) = (get(low, buf), get(low, base_off), get(low, num_bytes));
+            let base = UOp::index()
+                .buffer(buf)
+                .indices(vec![base_off])
+                .ptr(true)
+                .call()
+                .expect("MakeBufferRsrcDyn base-ptr construction");
+            let num_bytes = num_bytes.cast(DType::Int64);
+            UOp::custom(
+                smallvec![base, num_bytes],
+                "declare ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p0(ptr, i16, i64, i32)\n\
+                 call ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p0(ptr {0}, i16 0, i64 {1}, i32 1114112)"
+                    .to_string(),
+                DType::Int64,
+            )
+        }
         // ONE MUBUF `raw.ptr.buffer.load` (HK's DRAM prefetch): reads the `ept`-element run at
         // `rsrc[voffset]` (bytes), `soffset = 0` (a non-zero soffset is mishandled by config `0x110000`).
         // `rsrc`/`voffset` are the referenced `{0}/{1}` operands; `order` rides as ordering-only operands
@@ -435,10 +573,8 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
         Node::DsWriteB64 { base_ptr, off_bytes, value, ept, prev, hk_form } => {
             let base_ptr = get(low, base_ptr);
             if hk_form {
-                // HK's literal IR: i32 raw-address (offset folded into the address, NO `offset:`), an
-                // `i64` value (the `<4×bf16>` half bitcast to i64), a `~{memory}` clobber. The `{{...}}`
-                // are plain-string codegen placeholders/escapes (no Rust format!): `{0}`/`{1}` → operands,
-                // `{{memory}}` → `~{memory}`.
+                // HK-form IR: i32 raw address, i64 value, and a memory clobber. Double braces survive
+                // Rust formatting for the custom-code operand placeholders and LLVM's clobber spelling.
                 let val = get(low, value).bitcast(DType::Int64);
                 let mut deps: SmallVec<[Arc<UOp>; 4]> = smallvec![base_ptr, val];
                 if let Some(p) = prev {
@@ -446,8 +582,10 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
                 }
                 UOp::custom(
                     deps,
-                    "call void asm sideeffect \"ds_write_b64 $0, $1\\0A\", \"v,v,~{{memory}}\"(i32 {0}, i64 {1})"
-                        .to_string(),
+                    format!(
+                        "call void asm sideeffect \"ds_write_b64 $0, $1 offset:{off_bytes}\\0A\", \
+                         \"v,v,~{{{{memory}}}}\"(i32 {{0}}, i64 {{1}})"
+                    ),
                     DType::Void,
                 )
             } else {
@@ -466,6 +604,22 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
                 )
             }
         }
+        Node::DsWriteB16 { base_ptr, off_bytes, value, prev } => {
+            let base = get(low, base_ptr);
+            let val = get(low, value).bitcast(DType::Int16);
+            let mut deps: SmallVec<[Arc<UOp>; 4]> = smallvec![base, val];
+            if let Some(p) = prev {
+                deps.push(get(low, p));
+            }
+            UOp::custom(
+                deps,
+                format!(
+                    "call void asm sideeffect \"ds_write_b16 $0, $1 offset:{off_bytes}\\0A\", \
+                     \"v,v,~{{{{memory}}}}\"(ptr addrspace(3) {{0}}, i16 {{1}})"
+                ),
+                DType::Void,
+            )
+        }
         // The manual LDS drain (`s_waitcnt lgkmcnt(0)`) — a void `asm sideeffect` ordered after the last
         // commit write (`prev`), re-establishing the store→barrier→load order the waitcnt-opaque asm
         // commit would otherwise lose.
@@ -474,12 +628,22 @@ fn lower_node(ir: &TileIr, id: TileId, low: &[Option<Arc<UOp>>], name: &str, glo
             "call void asm sideeffect \"s_waitcnt lgkmcnt(0)\", \"\"()".to_string(),
             DType::Void,
         ),
-        // The VMEM drain (`s_waitcnt vmcnt(0)`) — the lgkmcnt twin for HK's cooperative G::load.
-        Node::SWaitVmcnt { prev } => UOp::custom(
-            smallvec![get(low, prev)],
-            "call void asm sideeffect \"s_waitcnt vmcnt(0)\", \"\"()".to_string(),
-            DType::Void,
-        ),
+        // Queue-wide VMEM readiness wait. Use LLVM's tracked intrinsic rather than opaque asm so
+        // SIInsertWaitcnts can merge it with the load-to-use wait instead of adding a redundant
+        // `vmcnt(0)`. gfx9 encodes VMEM bits [3:0] at [3:0] and [5:4] at [15:14]; all other counters
+        // stay at their no-wait maxima (`0x0f70`).
+        Node::SWaitVmcnt { anchor, allowed_outstanding } => {
+            let count = u32::from(allowed_outstanding);
+            let immediate = 0x0f70 | (count & 0x0f) | ((count & 0x30) << 10);
+            UOp::custom(
+                smallvec![get(low, anchor)],
+                format!(
+                    "declare void @llvm.amdgcn.s.waitcnt(i32)\n\
+                     call void @llvm.amdgcn.s.waitcnt(i32 {immediate})"
+                ),
+                DType::Void,
+            )
+        }
         // `ptrtoint ptr addrspace(3) → i32`: the raw i32 LDS address HK's ds_read/ds_write asm takes.
         // The `ptr` operand is an `LdsPtrAs3` (its RHS is a `ptr addrspace(3)`, so the source type is
         // named literally here — the node's Int32 meta is bookkeeping and never type-annotated).

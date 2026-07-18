@@ -35,7 +35,7 @@ pub mod tile;
 pub mod tile_move;
 pub mod tile_ops;
 
-pub use build::{Builder, Elem, F32};
+pub use build::{BoundedBuf, Builder, Elem, F32, Idx, IterDomain, Scope};
 pub use error::{Error, Result};
 pub use graph::graph_kernel;
 pub use ir::{Node, TileId, TileIr};

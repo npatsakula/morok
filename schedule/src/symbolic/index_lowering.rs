@@ -162,7 +162,16 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
             }
 
             let dt = end_inner.dtype();
-            let result = UOp::new(Op::Range { end: end_inner.clone(), axis_id: *axis_id, axis_type: *axis_type, deps: smallvec::SmallVec::new() }, dt);
+            let Op::Range { deps, .. } = range.op() else { unreachable!() };
+            let result = UOp::new(
+                Op::Range {
+                    end: end_inner.clone(),
+                    axis_id: *axis_id,
+                    axis_type: *axis_type,
+                    deps: deps.clone(),
+                },
+                dt,
+            );
             Some(result.cast(DType::Index))
         },
 
