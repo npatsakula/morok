@@ -260,7 +260,9 @@ pub fn commit_transposed_run_asm(
 }
 
 /// Waitcnt-opaque register-staged d128 K/V commit for phase staggering. K is written as swizzled b64
-/// runs into its alternate K2 plane; V keeps the proven pitch-spaced scalar transpose into V3.
+/// runs into its alternate K2 plane; V is published either PACKED (`packed_v`: v_perm register-transpose +
+/// wide `ds_write_b64`, the bank-conflict-reducing path the ping-pong uses) or via the pitch-spaced scalar
+/// `ds_write_b16` transpose.
 #[allow(clippy::too_many_arguments)]
 pub fn commit_run_asm<SwK: Swizzle>(
     b: &mut Builder,
@@ -274,6 +276,7 @@ pub fn commit_run_asm<SwK: Swizzle>(
     tid: Idx,
     k_parity: Idx,
     vt_parity: Idx,
+    packed_v: bool,
 ) -> Vec<Effect> {
     const VEC: usize = 4;
     assert!(epl > 0 && epl.is_multiple_of(VEC), "asm commit epl must be a non-zero b64 multiple");
@@ -281,10 +284,20 @@ pub fn commit_run_asm<SwK: Swizzle>(
     assert!(k_cols > 0 && k_cols.is_multiple_of(gvec), "asm commit K rows must contain whole chunks");
     assert!(vt_pitch > 0, "asm commit transposed-V pitch must be non-zero");
     assert_eq!(k_chunks.len(), epl / gvec, "asm commit K chunk count does not match epl");
-    assert_eq!(v_chunks.len(), epl / gvec, "asm commit V chunk count does not match epl");
-    for chunk in k_chunks.iter().chain(v_chunks) {
+    for chunk in k_chunks {
         let width = b.ir.meta(chunk.id).shape.iter().copied().product::<usize>().max(1);
-        assert_eq!(width, gvec, "asm commit chunk payload width does not match its geometry");
+        assert_eq!(width, gvec, "asm commit K chunk payload width does not match its geometry");
+    }
+    // V publication: PACKED (v_perm register-transpose + wide `ds_write_b64`, conflict-reducing, four KV-row
+    // dwords per lane) or the scalar pitch-spaced `ds_write_b16` transpose (epl/gvec register chunks).
+    if packed_v {
+        assert_eq!(v_chunks.len(), 4, "packed asm V commit requires four KV-row dwords per lane");
+    } else {
+        assert_eq!(v_chunks.len(), epl / gvec, "asm commit V chunk count does not match epl");
+        for chunk in v_chunks {
+            let width = b.ir.meta(chunk.id).shape.iter().copied().product::<usize>().max(1);
+            assert_eq!(width, gvec, "asm commit V chunk payload width does not match its geometry");
+        }
     }
     let swizzled = !SwK::layout(k_cols).transforms.is_empty();
     let epl_c = b.idx_const(epl as i64);
@@ -310,7 +323,11 @@ pub fn commit_run_asm<SwK: Swizzle>(
             effects.push(write);
         }
     }
-    effects.extend(commit_transposed_run_asm(b, vt_lds, vt_pitch, k_cols, v_chunks, epl, tid, vt_parity, prev));
+    if packed_v {
+        effects.extend(commit_transposed_v4_asm(b, vt_lds, vt_pitch, v_chunks, tid, vt_parity, prev));
+    } else {
+        effects.extend(commit_transposed_run_asm(b, vt_lds, vt_pitch, k_cols, v_chunks, epl, tid, vt_parity, prev));
+    }
     effects
 }
 

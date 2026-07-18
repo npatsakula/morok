@@ -1193,6 +1193,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         // Ping-pong ON ⇔ a wave-phase (`warp_row`) is supplied — the signal that the compute-cluster
         // seals must stay real workgroup `s_barrier`s (the phase carriers). See `ClusterCx::ping_pong`.
         let ping_pong = warp_row.is_some();
+        let has_warmup = !warmup_clusters.is_empty();
         let ks_c = b.idx_const(k_step as i64);
         let one = b.idx_const(1);
 
@@ -1230,12 +1231,15 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             }
         };
         let initial_loop_seed = match warp_row {
-            // The eq=1 wave-phase barrier ordered after the prologue commit (`raw_seed`). The barrier
-            // rides as an ordering-only dep (`deps[1..]`, unreferenced by the WaveBarrier template) — no
-            // longer laundered through `idx_after` into the warp_row operand now that a CUSTOM accepts
-            // a happens-after edge on an effect (Stage A).
-            Some(wr) => b.wave_barrier(wr, 1, &[raw_seed.dep()]).dep(),
-            None => raw_seed.dep(),
+            // No-warmup ping-pong (GEMM): the eq=1 wave-phase barrier ordered after the prologue commit
+            // (`raw_seed`), offsetting warp-row 1 by one cluster. The barrier rides as an ordering-only dep
+            // (`deps[1..]`, unreferenced by the WaveBarrier template) — no longer laundered through
+            // `idx_after` into the warp_row operand now that a CUSTOM accepts a happens-after edge on an
+            // effect (Stage A). With a WARMUP present the stagger is DEFERRED to after the lockstep warmup
+            // (see `loop_seed` below): QK(0) and the carried-score seed run in lockstep BEFORE the crews
+            // offset — HK's pre-stagger prologue. Unphased paths (`None`) are unchanged.
+            Some(wr) if !has_warmup => b.wave_barrier(wr, 1, &[raw_seed.dep()]).dep(),
+            _ => raw_seed.dep(),
         };
 
         // Optional straight-line warmup: block 0 is already in LDS. The warmup schedule gathers it,
@@ -1247,7 +1251,10 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             None
         } else {
             assert!(!resident, "pipeline warmup is only supported for streaming schedules");
-            assert!(warp_row.is_none(), "pipeline warmup is not compatible with wave-phase ping-pong");
+            // Ping-pong WITH a warmup runs the warmup in LOCKSTEP (both crews, `ping_pong=false` below) and
+            // defers the eq=1 stagger to after it. Needs ≥3 KV blocks so ≥1 steady iteration remains to
+            // carry the eq=1 barrier into the loop (a 2-block warm pipeline skips the steady body).
+            assert!(!ping_pong || nblocks >= 3, "phased warm pipeline needs nblocks ≥ 3");
             assert!(nblocks >= 2, "pipeline warmup needs at least two blocks");
             let warmup_carry: Vec<Vec<TileId>> =
                 inited.iter().map(|e| e.map(|x| vec![x.dep()]).unwrap_or_default()).collect();
@@ -1267,7 +1274,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
                 asm_gather && matches!(commit_drain, CommitDrain::DirectDeferred | CommitDrain::AsmPublishedNoWar),
                 bare_seals,
                 pin_mfma,
-                ping_pong,
+                false, // LOCKSTEP warmup: the eq=1 stagger is emitted after it, not within (compute seals stay combines)
             );
             for &slot in &warmup_seed_slots {
                 assert!(slot < n_slots, "warmup seed slot {slot} is out of range");
@@ -1281,6 +1288,14 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             .as_ref()
             .map(|w| w.raw_next.expect("warmup schedule must commit block 1"))
             .unwrap_or(initial_loop_seed);
+        // Ping-pong WITH a warmup: emit the eq=1 stagger barrier HERE, after the lockstep warmup, ordered
+        // after block 1's publication (`loop_seed`). The crews offset by one cluster only once QK(0) and the
+        // carried-score seed are done in lockstep — HK's follower-only prologue `s_barrier`. (No-warmup
+        // ping-pong already emitted its eq=1 in the prologue; unphased/warmup-less paths are untouched.)
+        let loop_seed = match warp_row {
+            Some(wr) if has_warmup => b.wave_barrier(wr, 1, &[loop_seed]).dep(),
+            _ => loop_seed,
+        };
 
         // ── steady loop: without a warmup, process blocks 0..last-1 as before. With a warmup, QK(0)
         //    is already carried and block 1 is staged, so process current blocks 1..last-1. ──

@@ -520,6 +520,15 @@ fn flash_attention32_matches_reference_on_gfx942() {
                 "qualification-register-asm",
                 crate::kernels::fa::flash_attention_fwd_32_register_asm(bh, n, d).apply(SwizzlePass),
             ));
+            if n.is_multiple_of(Q_BLK) {
+                // The 8-wave two-crew phase stagger over the asm-opaque movement. Its correctness proves the
+                // single-parity-half commit is race-free under a lagged crew (the reason the prior compiler-
+                // visible stagger deadlocked); the 3× replay exposes any residual LDS stage/overwrite race.
+                variants.push((
+                    "qualification-pingpong",
+                    crate::kernels::fa::flash_attention_fwd_32_pingpong(bh, n, d).apply(SwizzlePass),
+                ));
+            }
         }
         for (variant, prog) in variants {
             let out = Tensor::empty(&[rows, d], DType::Float32);
@@ -692,18 +701,23 @@ fn dump_fa32_isa() {
     let dir = std::env::var("SVOD_DUMP_DIR").unwrap_or_else(|_| "/tmp/tk2_isa".into());
     std::fs::create_dir_all(&dir).expect("mkdir dump dir");
     let device_spec = Tensor::empty(&[1], DType::Float32).device();
+    let mut variants: Vec<(String, crate::kernels::Program)> = Vec::new();
     for d in [64usize, 128usize] {
-        let prog = crate::kernels::fa::flash_attention_fwd_32(2, 2048, d).apply(SwizzlePass);
+        variants.push((format!("d{d}"), crate::kernels::fa::flash_attention_fwd_32(2, 2048, d).apply(SwizzlePass)));
+    }
+    variants
+        .push(("pp_d128".into(), crate::kernels::fa::flash_attention_fwd_32_pingpong(2, 2048, 128).apply(SwizzlePass)));
+    for (tag, prog) in variants {
         let (src, bytes) = launch::compile_artifacts(&prog, &device_spec).expect("compile FA-32");
         let parsed = svod_device::amd::program::parse_kernel(&bytes, "tk2_fa_fwd_32").expect("parse FA-32");
-        std::fs::write(format!("{dir}/fa32_d{d}.ll"), &src).expect("write ll");
-        std::fs::write(format!("{dir}/fa32_d{d}.co"), &bytes).expect("write co");
+        std::fs::write(format!("{dir}/fa32_{tag}.ll"), &src).expect("write ll");
+        std::fs::write(format!("{dir}/fa32_{tag}.co"), &bytes).expect("write co");
         let kd = parsed.kd;
         let scratch = kd.private_segment_fixed_size;
         let lds = kd.group_segment_fixed_size;
         let vgprs = ((kd.compute_pgm_rsrc1 & 0x3f) + 1) * 8;
         println!(
-            "FA-32 d={d}: VGPRs={vgprs}, LDS={lds}B, scratch={scratch}B/thread — {} (LLVM IR → {dir}/fa32_d{d}.ll)",
+            "FA-32 {tag}: VGPRs={vgprs}, LDS={lds}B, scratch={scratch}B/thread — {} (LLVM IR → {dir}/fa32_{tag}.ll)",
             if scratch == 0 { "NO spills" } else { "SPILLING" },
         );
     }

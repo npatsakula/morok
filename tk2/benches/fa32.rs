@@ -20,8 +20,26 @@ use svod_tensor::Tensor;
 mod common;
 use common::{plan_gpu_ns, rand_bf16, requirements_met};
 
-use svod_tk2::kernels::fa::{flash_attention_fwd, flash_attention_fwd_32};
+use svod_tk2::kernels::fa::{flash_attention_fwd, flash_attention_fwd_32, flash_attention_fwd_32_pingpong};
 use svod_tk2::{SwizzlePass, VectorizePass, graph_kernel};
+
+/// The FA kernel under measurement. `Pp` = the 8-wave two-crew phase-stagger FA-32 (d128 only).
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum Fa {
+    N16,
+    N32,
+    Pp,
+}
+
+impl Fa {
+    fn name(self) -> &'static str {
+        match self {
+            Fa::N16 => "FA-16",
+            Fa::N32 => "FA-32",
+            Fa::Pp => "FA-32pp",
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 enum InputDist {
@@ -108,15 +126,16 @@ fn fa_ref(qf: &[f32], kf: &[f32], vf: &[f32], s: usize, d: usize) -> Vec<f32> {
     o
 }
 
-/// Prepare an execution plan for the given kernel variant (`wide` → FA-32, else the tuned 16×16 FA).
-fn plan_of(wide: bool, bh: usize, s: usize, d: usize, q: &Tensor, k: &Tensor, v: &Tensor) -> (Tensor, ExecutionPlan) {
-    let prog = if wide {
+/// Prepare an execution plan for the given kernel variant.
+fn plan_of(fa: Fa, bh: usize, s: usize, d: usize, q: &Tensor, k: &Tensor, v: &Tensor) -> (Tensor, ExecutionPlan) {
+    let prog = match fa {
         // FA-32 rides SwizzlePass ONLY: the K tile swizzles (cols = d, power of 2); the gathers are already
         // `ds_read_b64` (`load_lds_vec_after`) so VectorizePass has no fusible scalar run (it only touches the
         // loop-invariant Q prologue — measured negligible). V keeps its padded pitch (non-power-of-2, no XOR).
-        flash_attention_fwd_32(bh, s, d).apply(SwizzlePass)
-    } else {
-        flash_attention_fwd(bh, s, d).apply(VectorizePass).apply(SwizzlePass)
+        Fa::N32 => flash_attention_fwd_32(bh, s, d).apply(SwizzlePass),
+        // Ping-pong FA-32: the 8-wave two-crew phase stagger over asm-opaque movement (d128 only).
+        Fa::Pp => flash_attention_fwd_32_pingpong(bh, s, d).apply(SwizzlePass),
+        Fa::N16 => flash_attention_fwd(bh, s, d).apply(VectorizePass).apply(SwizzlePass),
     };
     let out = Tensor::empty(&[bh * s, d], DType::Float32);
     let mut y = graph_kernel(prog, out, &[q, k, v]).expect("wrap FA as graph node");
@@ -125,10 +144,10 @@ fn plan_of(wide: bool, bh: usize, s: usize, d: usize, q: &Tensor, k: &Tensor, v:
 }
 
 /// Gate a variant's numerics at a small shape before timing (the device test is the full gate).
-fn gate(wide: bool, bh: usize, s: usize, d: usize) {
+fn gate(fa: Fa, bh: usize, s: usize, d: usize) {
     use svod_tensor::testing::allclose_f32;
     let (q, k, v) = (rand_bf16(&[bh * s, d]), rand_bf16(&[bh * s, d]), rand_bf16(&[bh * s, d]));
-    let (y, plan) = plan_of(wide, bh, s, d, &q, &k, &v);
+    let (y, plan) = plan_of(fa, bh, s, d, &q, &k, &v);
     plan.execute().expect("execute for gate");
     plan.output_buffer().expect("output buffer").synchronize().expect("sync before read");
     let got = y.as_vec::<f32>().expect("read FA output");
@@ -139,7 +158,7 @@ fn gate(wide: bool, bh: usize, s: usize, d: usize) {
         expected[o..o + s * d].copy_from_slice(&fa_ref(&qf[o..o + s * d], &kf[o..o + s * d], &vf[o..o + s * d], s, d));
     }
     let report = allclose_f32(&got, &expected, 1e-2, 2e-2);
-    let name = if wide { "FA-32" } else { "FA-16" };
+    let name = fa.name();
     assert!(report.ok, "{name} gate bh={bh} S={s} d={d} FAILED before timing: {}", report.message);
     eprintln!("  gate {name} bh={bh} S={s} d={d}: allclose ✓ (max_abs_err {:e})", report.max_abs_err);
 }
@@ -166,15 +185,15 @@ struct Measurement<'a> {
     d: usize,
 }
 
-fn measure(config: Measurement<'_>, wide: bool, q: &Tensor, k: &Tensor, v: &Tensor) -> f64 {
+fn measure(config: Measurement<'_>, fa: Fa, q: &Tensor, k: &Tensor, v: &Tensor) -> f64 {
     let Measurement { label, bh, s, d } = config;
-    let (_y, plan) = plan_of(wide, bh, s, d, q, k, v);
+    let (_y, plan) = plan_of(fa, bh, s, d, q, k, v);
     plan.execute().expect("execute");
     let iters = 50u64;
     let avg_ns = plan_gpu_ns(&plan, iters) as f64 / iters as f64;
-    // Counters for the FA-32 kernel under study (the 16×16 baseline is profiled by the `fa` bench).
-    if wide {
-        profile_pmc(&plan, &format!("FA-32 {} S{s} d{d}", label.trim()));
+    // Counters for the FA-32 kernels under study (the 16×16 baseline is profiled by the `fa` bench).
+    if fa != Fa::N16 {
+        profile_pmc(&plan, &format!("{} {} S{s} d{d}", fa.name(), label.trim()));
     }
     fa_flops_noncausal(bh, s, d) as f64 / avg_ns / 1e3 // TF
 }
@@ -187,8 +206,10 @@ fn main() {
     eprintln!("\n=== tk2 FA: 32×32×8 (rolled ClusterCx pipeline) vs 16×16×16 (tuned pipeline) — REAL device TF ===\n");
     let input_dist = InputDist::from_env();
     eprintln!("  input distribution: {input_dist:?} (select with SVOD_FA_INPUT)\n");
-    gate(true, 2, 256, 128);
-    gate(false, 2, 256, 128);
+    gate(Fa::N32, 2, 256, 128);
+    gate(Fa::N32, 2, 1024, 128); // verifies the packed-V d128 long path (n≥1024 activates direct-K + packed V)
+    gate(Fa::N16, 2, 256, 128);
+    gate(Fa::Pp, 2, 256, 128);
 
     // (label, b, h, S, d) — machine-filling large-S shapes plus short-context ones. All S are ≥256 and
     // 256-multiples (the 8-warp Q block), so the raw `bh·S` bench buffers cover every workgroup's fill.
@@ -204,16 +225,25 @@ fn main() {
         ("b8·h16 ", 8, 16, 256, 64),
     ];
     eprintln!(
-        "  {:<9} {:>6} {:>4} {:>6}    {:>10}  {:>10}  {:>8}",
-        "shape", "S", "d", "wgs", "FA-16 TF", "FA-32 TF", "ratio"
+        "  {:<9} {:>6} {:>4} {:>6}    {:>10}  {:>10}  {:>10}  {:>8}",
+        "shape", "S", "d", "wgs", "FA-16 TF", "FA-32 TF", "FA-32pp TF", "pp/32"
     );
     for (label, bb, hh, s, d) in configs {
         let bh = bb * hh;
         let wgs = bh * (s / 256);
         let (q, k, v) = input_dist.inputs(&[bh * s, d]);
         let measurement = Measurement { label, bh, s, d };
-        let tf16 = measure(measurement, false, &q, &k, &v);
-        let tf32 = measure(measurement, true, &q, &k, &v);
-        eprintln!("  {label} {s:>6} {d:>4} {wgs:>6}    {tf16:>10.1}  {tf32:>10.1}  {:>7.2}x", tf32 / tf16);
+        let tf16 = measure(measurement, Fa::N16, &q, &k, &v);
+        let tf32 = measure(measurement, Fa::N32, &q, &k, &v);
+        // The ping-pong FA-32 is d128-only (its constructor asserts d==128 and a Q-block multiple `n`).
+        if d == 128 {
+            let tfpp = measure(measurement, Fa::Pp, &q, &k, &v);
+            eprintln!(
+                "  {label} {s:>6} {d:>4} {wgs:>6}    {tf16:>10.1}  {tf32:>10.1}  {tfpp:>10.1}  {:>7.2}x",
+                tfpp / tf32
+            );
+        } else {
+            eprintln!("  {label} {s:>6} {d:>4} {wgs:>6}    {tf16:>10.1}  {tf32:>10.1}  {:>10}  {:>8}", "-", "-");
+        }
     }
 }

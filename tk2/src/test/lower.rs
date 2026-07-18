@@ -315,18 +315,28 @@ fn fa32_final_asm_v_gather_is_tied_through_opaque_readiness() {
 }
 
 #[test]
-fn fa32_selects_direct_k_only_above_the_measured_crossover() {
-    for (n, expected) in [(512usize, false), (1024, true), (2048, true)] {
+fn fa32_public_d128_routes_to_two_crew_pingpong() {
+    // The public d128 default now routes to the merged two-crew ping-pong (device-fastest at every size):
+    // asm-opaque register-staged K (NOT direct-to-LDS, which is stagger-incompatible) + the wave-phase
+    // stagger (one eq=0 rebalance + one eq=1 seed).
+    for n in [512usize, 1024, 2048] {
         let p = crate::kernels::fa::flash_attention_fwd_32(1, n, 128).apply(crate::SwizzlePass);
         let live = crate::passes::reachable(&p.ir, p.sink);
         let has_direct = live.iter().any(|&id| matches!(p.ir.node(id), Node::GlobalLoadLdsDword { .. }));
-        assert_eq!(has_direct, expected, "unexpected d128 K movement selection at S={n}");
+        let phases = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::WaveBarrier { .. })).count();
+        assert!(!has_direct, "d128 ping-pong uses asm-opaque register-staged K, not direct-to-LDS, at S={n}");
+        assert_eq!(phases, 2, "d128 ping-pong must carry the eq=0/eq=1 wave-phase stagger at S={n}");
     }
+    // d64 stays single-crew register-staged (the ping-pong is d128-only).
     let p = crate::kernels::fa::flash_attention_fwd_32(1, 2048, 64).apply(crate::SwizzlePass);
     let live = crate::passes::reachable(&p.ir, p.sink);
     assert!(
         live.iter().all(|&id| !matches!(p.ir.node(id), Node::GlobalLoadLdsDword { .. })),
         "d64 must retain register-staged K"
+    );
+    assert!(
+        live.iter().all(|&id| !matches!(p.ir.node(id), Node::WaveBarrier { .. })),
+        "d64 stays single-crew (no wave-phase stagger)"
     );
 }
 
@@ -339,7 +349,8 @@ fn fa32_production_long_d128_uses_only_promoted_movement() {
         id
     }
 
-    let p = crate::kernels::fa::flash_attention_fwd_32(1, 2048, 128).apply(crate::SwizzlePass);
+    // The single-crew packed-V movement (the public d128 default now routes to the two-crew ping-pong).
+    let p = crate::kernels::fa::flash_attention_fwd_32_direct_k_packed_v(1, 2048, 128).apply(crate::SwizzlePass);
     let live = crate::passes::reachable(&p.ir, p.sink);
     let direct = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::GlobalLoadLdsDword { .. })).count();
     let intrinsic_gathers = live
@@ -356,12 +367,40 @@ fn fa32_production_long_d128_uses_only_promoted_movement() {
     let phases = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::WaveBarrier { .. })).count();
     assert_eq!(direct, 12, "production long d128 must use direct K in all three authored regions");
     assert_eq!(intrinsic_gathers, 96, "production long d128 must retain compiler-visible K/V gathers");
-    assert_eq!(scalar_v_writes, 24, "production long d128 must retain scalar transposed-V publication");
+    // Production long d128 now publishes V with the PACKED transposed write (v_perm register-transpose +
+    // wide `ds_write_b64`, the +8-10% bank-conflict fix) instead of the scalar `ds_write_b16` scatter: the
+    // narrow b16 write conflicted ~16-way (consecutive fill lanes address d-rows 8 apart → stride 16 mod 32).
+    assert_eq!(scalar_v_writes, 0, "production long d128 must use packed (not scalar b16) transposed-V publication");
     assert_eq!(
-        (opaque_gathers, packed_v_permutes, b64_publications, phases),
-        (0, 0, 0, 0),
-        "opaque gather, packed/register-asm publication, and phase staggering are qualification-only"
+        (packed_v_permutes, b64_publications),
+        (12, 6),
+        "production long d128 packed V = v_perm transposes + wide ds_write_b64 across the three authored regions"
     );
+    assert_eq!(
+        (opaque_gathers, phases),
+        (0, 0),
+        "opaque asm gather and phase staggering remain qualification-only on the production path"
+    );
+}
+
+#[test]
+fn fa32_pingpong_constructs_balanced_and_lowers() {
+    // The ping-pong variant must CONSTRUCT (both `pipeline::verify`'s wave-phase balance check and the
+    // `verify_v2` scheduling gate run at build time), carry EXACTLY one eq=1 stagger seed + one eq=0
+    // rebalance (an imbalance panics in `verify` as a would-be workgroup deadlock), and lower to spec-valid
+    // gfx942 LLVM IR. n=512,d128 ⇒ 16 KV blocks (≥3, so a steady body carries the eq=1 barrier).
+    let p = crate::kernels::fa::flash_attention_fwd_32_pingpong(1, 512, 128).apply(crate::SwizzlePass);
+    let live = crate::passes::reachable(&p.ir, p.sink);
+    let count_eq = |want: i64| {
+        live.iter().filter(|&&id| matches!(p.ir.node(id), Node::WaveBarrier { eq, .. } if *eq == want)).count()
+    };
+    assert_eq!(
+        (count_eq(0), count_eq(1)),
+        (1, 1),
+        "ping-pong FA must carry exactly one eq=0 rebalance and one eq=1 stagger barrier"
+    );
+    let llvm = crate::launch::render_amd_ir(&p, svod_dtype::AmdArch::Gfx942).expect("render ping-pong FA-32");
+    assert!(llvm.contains("barrier"), "ping-pong FA must emit workgroup barriers");
 }
 
 #[test]
