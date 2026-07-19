@@ -23,7 +23,7 @@
 
 use std::collections::HashSet;
 
-use crate::build::{BF16, Builder, Effect, F32, Frag, Idx, Scope, Val};
+use crate::build::{Builder, Effect, F32, Frag, Idx, Scope, Val};
 use crate::ir::{FragMap, Node, TileId, TileIr};
 
 /// The commit's **drain placement policy** (DESIGN §5c) — WHERE the collaborative fill's LDS writes
@@ -45,11 +45,6 @@ pub(crate) enum CommitDrain {
     /// Disjoint K2/V3 asm writes are drained and published immediately. This leaves a later compute
     /// barrier in the body, which is required for safe asymmetric wave-phase progress.
     AsmPublishedNoWar,
-    /// Direct-to-LDS K plus register-staged V: issue/commit in a memory cluster but defer the full
-    /// VMEM drain and publication barrier until an explicit tail publish after compute. Retained as a
-    /// DSL capability (its match arms still route it); no current kernel constructs it.
-    #[allow(dead_code)]
-    DirectDeferred,
 }
 
 /// What kind of machine completion a hook's commit effects require before LDS publication. This is
@@ -61,8 +56,6 @@ pub(crate) enum CommitCompletion {
     Intrinsic,
     /// Waitcnt-opaque LDS stores; publication requires an explicit `lgkmcnt(0)`.
     Opaque,
-    /// Direct GLOBAL→LDS VMEM transfers plus waitcnt-opaque LDS stores.
-    DirectAndOpaque,
 }
 
 /// One hook commit and the completion class required by its effects.
@@ -82,7 +75,6 @@ fn validate_commit_policy(completion: CommitCompletion, drain: CommitDrain, bare
     let expected = match drain {
         CommitDrain::IntrinsicAuto | CommitDrain::IntrinsicNoWar => CommitCompletion::Intrinsic,
         CommitDrain::AsmDeferred | CommitDrain::AsmPublishedNoWar => CommitCompletion::Opaque,
-        CommitDrain::DirectDeferred => CommitCompletion::DirectAndOpaque,
     };
     assert_eq!(
         completion, expected,
@@ -148,38 +140,24 @@ pub(crate) trait Hooks {
     fn ready_after_lgkm(&mut self, b: &mut Builder, op: Self::Op, wait: TileId) -> Self::Op;
 }
 
-/// A **heterogeneous compute-channel value** (DESIGN §3.2 — gentle typing: the dtype rides as DATA, not
-/// a phantom type param) so the channel can carry bf16 `P` beside f32 `o`/`m`/`l`. A cluster body reads
-/// its declared slots as these and returns its declared writes as these; the wrong-dtype accessor
-/// panics at BUILD time (a kernel-authoring error, not a device fault).
+/// A **compute-channel value** (DESIGN §3.2 — gentle typing: the dtype rides as DATA, not a phantom type
+/// param). A cluster body reads its declared slots as these and returns its declared writes as these.
+/// Every current kernel carries f32 slots (`o`/`m`/`l`, QKᵀ scores); the enum keeps the dtype as data so
+/// a second carried dtype is one variant away, not a type-parameter rewrite.
 #[derive(Copy, Clone)]
 pub(crate) enum SlotVal {
     F32(Val<F32>),
-    BF16(Val<BF16>),
 }
 
 impl SlotVal {
-    /// Read this channel value as f32 (panics if it is bf16 — an author dtype mismatch).
+    /// Unwrap the f32 channel value.
     pub(crate) fn f32(self) -> Val<F32> {
-        match self {
-            SlotVal::F32(v) => v,
-            SlotVal::BF16(_) => panic!("compute slot value is bf16 but was read as f32"),
-        }
-    }
-    /// Read this channel value as bf16 (panics if it is f32). Retained DSL accessor for bf16 carry
-    /// slots; no current kernel reads one.
-    #[allow(dead_code)]
-    pub(crate) fn bf16(self) -> Val<BF16> {
-        match self {
-            SlotVal::BF16(v) => v,
-            SlotVal::F32(_) => panic!("compute slot value is f32 but was read as bf16"),
-        }
+        let SlotVal::F32(v) = self;
+        v
     }
     fn id(self) -> TileId {
-        match self {
-            SlotVal::F32(v) => v.id,
-            SlotVal::BF16(v) => v.id,
-        }
+        let SlotVal::F32(v) = self;
+        v.id
     }
 }
 
@@ -192,43 +170,29 @@ impl SlotVal {
 #[derive(Copy, Clone)]
 pub(crate) enum AccSlot {
     F32(Frag<F32>),
-    /// bf16 carry slot — retained DSL capability; no current kernel declares one.
-    #[allow(dead_code)]
-    BF16(Frag<BF16>),
 }
 
 impl AccSlot {
-    /// Unwrap the f32 fragment (panics if bf16) — the post-loop scatter source.
+    /// Unwrap the f32 fragment — the post-loop scatter source.
     pub(crate) fn f32(self) -> Frag<F32> {
-        match self {
-            AccSlot::F32(f) => f,
-            AccSlot::BF16(_) => panic!("acc slot is bf16 but was used as f32"),
-        }
+        let AccSlot::F32(f) = self;
+        f
     }
     fn load_after(self, b: &mut Builder, deps: &[TileId]) -> SlotVal {
-        match self {
-            AccSlot::F32(f) => SlotVal::F32(b.load_frag_vec_after(f, deps)),
-            AccSlot::BF16(f) => SlotVal::BF16(b.load_frag_vec_after(f, deps)),
-        }
+        let AccSlot::F32(f) = self;
+        SlotVal::F32(b.load_frag_vec_after(f, deps))
     }
     fn store(self, b: &mut Builder, v: SlotVal) -> Effect {
-        match (self, v) {
-            (AccSlot::F32(f), SlotVal::F32(x)) => b.store_frag_vec(f, x),
-            (AccSlot::BF16(f), SlotVal::BF16(x)) => b.store_frag_vec(f, x),
-            _ => panic!("acc slot / channel value dtype mismatch on store"),
-        }
+        let (AccSlot::F32(f), SlotVal::F32(x)) = (self, v);
+        b.store_frag_vec(f, x)
     }
     fn after(self, b: &mut Builder, deps: &[TileId]) -> AccSlot {
-        match self {
-            AccSlot::F32(f) => AccSlot::F32(b.frag_after(f, deps)),
-            AccSlot::BF16(f) => AccSlot::BF16(b.frag_after(f, deps)),
-        }
+        let AccSlot::F32(f) = self;
+        AccSlot::F32(b.frag_after(f, deps))
     }
     fn id(self) -> TileId {
-        match self {
-            AccSlot::F32(f) => f.id,
-            AccSlot::BF16(f) => f.id,
-        }
+        let AccSlot::F32(f) = self;
+        f.id
     }
 }
 
@@ -406,9 +370,6 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     reg: Option<H::Reg>,
     committed: bool,
     raw_next: Option<TileId>,
-    /// Writes/direct copies committed without a publication barrier. An explicit publish cluster must
-    /// consume these before the body ends.
-    pending_publish: Option<Effect>,
     tail_barrier: Option<TileId>,
     /// Bare-seal drain bookkeeping: the set of gathered slices whose `ds_read`s are not yet covered by
     /// an `lgkmcnt(0)` drain. A compute over slice `s` drains ONLY if `s` is outstanding (its own
@@ -596,10 +557,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
                 let rd = self.b.swait_lgkmcnt(rd_anchor);
                 self.undrained.clear();
                 vec![rd.dep()]
-            } else if matches!(
-                self.commit_drain,
-                CommitDrain::IntrinsicNoWar | CommitDrain::DirectDeferred | CommitDrain::AsmPublishedNoWar
-            ) {
+            } else if matches!(self.commit_drain, CommitDrain::IntrinsicNoWar | CommitDrain::AsmPublishedNoWar) {
                 // Double-buffered: no read-before-overwrite hazard (disjoint parity halves), so emit NO
                 // WAR seal. The gather reads are still drained before the next compute by the RAW seal
                 // (a fenced barrier after the commit writes), and the RAW carry is `raw_next` below.
@@ -649,31 +607,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
                     self.tail_barrier = Some(rn);
                     self.entry = vec![rn];
                 }
-                CommitDrain::DirectDeferred => {
-                    assert!(
-                        self.pending_publish.is_none(),
-                        "a deferred commit must be published before the next commit"
-                    );
-                    let n = fill.len();
-                    let token = self.b.combine(fill[n - 1], &fill[..n - 1].iter().map(|e| e.dep()).collect::<Vec<_>>());
-                    self.pending_publish = Some(token);
-                    self.entry = vec![token.dep()];
-                }
             }
-            self.sealed = true;
-        }
-    }
-
-    /// Complete and publish a deferred direct/staged commit after its covering compute regions.
-    pub(crate) fn publish(&mut self) {
-        if let Some(committed) = self.pending_publish.take() {
-            let covered = self.b.combine(committed, &self.entry);
-            let wait = self.b.swait_vmcnt(covered);
-            let lds_wait = self.b.swait_lgkmcnt(wait.dep());
-            let rn = self.seal(lds_wait, &[covered.dep(), wait.dep()]).dep();
-            self.raw_next = Some(rn);
-            self.tail_barrier = Some(rn);
-            self.entry = vec![rn];
             self.sealed = true;
         }
     }
@@ -883,19 +817,11 @@ pub(crate) struct Mem {
     gathers: Vec<usize>,
     #[builder(default)]
     commit: bool,
-    #[builder(default)]
-    publish: bool,
 }
 
 impl<H: Hooks> Cluster<H> for Mem {
     fn build(&self, cx: &mut ClusterCx<H>) {
-        if !self.publish
-            || !self.prefetch.is_empty()
-            || !self.prefetch_after_gathers.is_empty()
-            || !self.gathers.is_empty()
-        {
-            cx.mem_prio0(); // drop issue-priority to 0 for this memory phase (HK ping-pong steering)
-        }
+        cx.mem_prio0(); // drop issue-priority to 0 for this memory phase (HK ping-pong steering)
         if !self.prefetch.is_empty() {
             cx.prefetch(&self.prefetch);
         }
@@ -907,9 +833,6 @@ impl<H: Hooks> Cluster<H> for Mem {
         }
         if self.commit {
             cx.commit();
-        }
-        if self.publish {
-            cx.publish();
         }
     }
 }
@@ -1021,7 +944,6 @@ fn run_body<H: Hooks>(
         reg: None,
         committed: false,
         raw_next: None,
-        pending_publish: None,
         tail_barrier: None,
         undrained: Vec::new(),
         undrained_reads: Vec::new(),
@@ -1044,7 +966,6 @@ fn run_body<H: Hooks>(
             cx.entry = vec![bar];
         }
     }
-    assert!(cx.pending_publish.is_none(), "deferred commit was not followed by a publish cluster");
     if ping_pong && let Some(raw) = cx.raw_next {
         let tail = cx.tail_barrier.expect("phased streaming body must end on a barrier");
         assert!(
@@ -1224,13 +1145,6 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
                 let fill0_deps: Vec<TileId> = fill0[1..].iter().map(|e| e.dep()).collect();
                 b.barrier(fill0[0], &fill0_deps)
             }
-            CommitDrain::DirectDeferred => {
-                let n = fill0.len();
-                let committed = b.combine(fill0[n - 1], &fill0[..n - 1].iter().map(|e| e.dep()).collect::<Vec<_>>());
-                let wait = b.swait_vmcnt(committed);
-                let lds_wait = b.swait_lgkmcnt(wait.dep());
-                b.barrier(lds_wait, &[committed.dep(), wait.dep()])
-            }
             CommitDrain::AsmDeferred | CommitDrain::AsmPublishedNoWar => {
                 let sw = b.swait_lgkmcnt(fill0.last().expect("asm commit emits ≥1 write").dep());
                 b.barrier(sw, &[])
@@ -1277,7 +1191,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
                 Some(ks_c), // commit block 1 while block-0 operands are already gathered
                 BlockCounter::Epilogue(0, warm_scope),
                 commit_drain,
-                asm_gather && matches!(commit_drain, CommitDrain::DirectDeferred | CommitDrain::AsmPublishedNoWar),
+                asm_gather && matches!(commit_drain, CommitDrain::AsmPublishedNoWar),
                 bare_seals,
                 pin_mfma,
                 false, // LOCKSTEP warmup: the eq=1 stagger is emitted after it, not within (compute seals stay combines)
@@ -1369,7 +1283,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
                 steady_k_next,
                 BlockCounter::Steady(current, steady_scope), // warmup shifts the current block from 0 to 1
                 commit_drain,
-                asm_gather && matches!(commit_drain, CommitDrain::DirectDeferred | CommitDrain::AsmPublishedNoWar),
+                asm_gather && matches!(commit_drain, CommitDrain::AsmPublishedNoWar),
                 bare_seals,
                 pin_mfma,
                 ping_pong,
@@ -1416,7 +1330,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             // The epilogue processes block `nblocks-1` (the last KV block — the only one that can be ragged).
             BlockCounter::Epilogue((nblocks - 1) as i64, ep_scope),
             commit_drain,
-            asm_gather && matches!(commit_drain, CommitDrain::DirectDeferred | CommitDrain::AsmPublishedNoWar),
+            asm_gather && matches!(commit_drain, CommitDrain::AsmPublishedNoWar),
             bare_seals,
             pin_mfma,
             ping_pong,
