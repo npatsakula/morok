@@ -67,6 +67,8 @@ fn signatures() -> Vec<(&'static str, u64)> {
         ("fa32.sw", sig(&fa32().apply(SwizzlePass))),
         ("fa32.d64", sig(&flash_attention_fwd_32_register_k(3, 128, 64))),
         ("fa32.d64.xcd", sig(&flash_attention_fwd_32(8, 512, 64).apply(SwizzlePass))),
+        ("fa32.d128.prod", sig(&flash_attention_fwd_32(2, 2048, 128))),
+        ("fa32.d128.prod.sw", sig(&flash_attention_fwd_32(2, 2048, 128).apply(SwizzlePass))),
     ]
 }
 
@@ -92,6 +94,11 @@ const GOLDEN: &[(&str, u64)] = &[
     ("fa32.d64", 0x84d2_b447_0013_36a5),
     // d64-only 8-XCD remap, with two Q tiles per slice so the permutation is non-identity.
     ("fa32.d64.xcd", 0xc36a_7cd6_ac9f_85cd),
+    // The d128 PRODUCTION fast/ping-pong path (asm gather+commit, packed V, two-crew ping-pong) — frozen
+    // so the flag-matrix collapse (asm_gather/asm_commit/packed_v/ping_pong → one `fast` flag) is proven
+    // IR-preserving on the FAST path, not only the register-staged oracle path the other FA-32 goldens hit.
+    ("fa32.d128.prod", 0x06bd_40b2_ec99_cf3c),
+    ("fa32.d128.prod.sw", 0x9440_d1c8_4dde_1343),
 ];
 
 /// Print the live signatures — run at HEAD to capture the golden values, and any time to eyeball a diff.
