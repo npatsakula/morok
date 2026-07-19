@@ -557,6 +557,65 @@ fn flash_attention32_matches_reference_on_gfx942() {
     }
 }
 
+/// **FA-32 bf16-O correctness GATE**: the aiter-API-matched ping-pong FA-32
+/// ([`crate::kernels::fa::flash_attention_fwd_32_pingpong_bf16o`]) stores O as **bf16** (RTZ truncation
+/// of the f32 accumulator at the final scatter — the MFMA accumulator stays f32). It must still match
+/// the SAME f32 reference within the widened tolerance bf16 output rounding needs: bf16 has ~8 bits of
+/// mantissa, so RTZ truncation contributes ≤2^-7 ≈ 0.8% relative error on top of the f32 pipeline error
+/// the f32-O gate already tolerates. `atol=1e-2, rtol=3e-2` covers both; the bf16 output is cast to f32
+/// (`as_f32_vec`) for the comparison. d128-only (the ping-pong constraint); the 3× replay exposes any
+/// residual LDS stage/overwrite race, exactly as the f32-O gate.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::flash_attention32_bf16o_matches --nocapture`
+#[test]
+#[ignore]
+fn flash_attention32_bf16o_matches_reference_on_gfx942() {
+    use svod_tensor::testing::allclose_f32;
+    let dev = svod_dtype::default_device::default_device();
+    let bh = 2usize;
+    let d = 128usize;
+    // bf16 output rounding: RTZ truncation error ≤2^-7 relative. atol 1e-2 + rtol 3e-2 covers the f32
+    // pipeline error the f32-O gate tolerates PLUS the extra bf16 truncation — no looser than that.
+    let (atol, rtol) = (1e-2f32, 3e-2f32);
+    for n in [512usize, 1024, 2048] {
+        let rows = bh * n; // every n is a Q-block (256) multiple ⇒ tile-exact ⇒ per-slice stride == n
+        let mut q = Tensor::rand_with(&[rows, d], DType::BFloat16, dev.clone()).expect("rand q");
+        let mut k = Tensor::rand_with(&[rows, d], DType::BFloat16, dev.clone()).expect("rand k");
+        let mut v = Tensor::rand_with(&[rows, d], DType::BFloat16, dev.clone()).expect("rand v");
+        q.realize().expect("realize q");
+        k.realize().expect("realize k");
+        v.realize().expect("realize v");
+        let (qf, kf, vf) = (as_f32_vec(&q), as_f32_vec(&k), as_f32_vec(&v));
+        let mut expected = vec![0f32; rows * d];
+        for s in 0..bh {
+            let z = s * n * d;
+            let o_s = fa_ref(&qf[z..z + n * d], &kf[z..z + n * d], &vf[z..z + n * d], n, d);
+            expected[z..z + n * d].copy_from_slice(&o_s);
+        }
+        let prog = crate::kernels::fa::flash_attention_fwd_32_pingpong_bf16o(bh, n, d).apply(SwizzlePass);
+        // The output tensor is bf16 — half the O write bytes, the aiter-matched store dtype.
+        let out = Tensor::empty(&[rows, d], DType::BFloat16);
+        let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap bf16-O FA-32 program");
+        let plan = y.prepare().expect("prepare bf16-O FA-32");
+        for run in 0..3 {
+            plan.execute().expect("execute bf16-O FA-32");
+            let got = as_f32_vec(&y); // cast the bf16 output back to f32 for the comparison
+            for s in 0..bh {
+                let z = s * n * d;
+                let report = allclose_f32(&got[z..z + n * d], &expected[z..z + n * d], atol, rtol);
+                println!(
+                    "FA-32 bf16-O run={run} bh={bh} n={n} d={d} slice={s}: ok={} max_abs_err={:e}",
+                    report.ok, report.max_abs_err
+                );
+                assert!(
+                    report.ok,
+                    "FA-32 bf16-O run={run} bh={bh} n={n} d={d} slice={s} must match the f32 reference within bf16 tol: {}",
+                    report.message
+                );
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore]
 fn flash_attention32_long_direct_k_matches_register_k_on_gfx942() {
@@ -707,6 +766,10 @@ fn dump_fa32_isa() {
     }
     variants
         .push(("pp_d128".into(), crate::kernels::fa::flash_attention_fwd_32_pingpong(2, 2048, 128).apply(SwizzlePass)));
+    variants.push((
+        "pp_d128_bf16o".into(),
+        crate::kernels::fa::flash_attention_fwd_32_pingpong_bf16o(2, 2048, 128).apply(SwizzlePass),
+    ));
     for (tag, prog) in variants {
         let (src, bytes) = launch::compile_artifacts(&prog, &device_spec).expect("compile FA-32");
         let parsed = svod_device::amd::program::parse_kernel(&bytes, "tk2_fa_fwd_32").expect("parse FA-32");

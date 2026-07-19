@@ -941,7 +941,7 @@ pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
     // that to 2-way and measures +8% at S2048 d128 (301→325). See the two-plane skew (VT_SKEW) for the
     // conflict-free finish. Below the S≥1024 crossover the register-staged path stays faster.
     let long_d128 = d == 128 && n >= 1024;
-    flash_attention_fwd_32_impl(bh, n, d, long_d128, false, false, long_d128, false)
+    flash_attention_fwd_32_impl(bh, n, d, long_d128, false, false, long_d128, false, false)
 }
 
 /// Ping-pong FA-32: the 8-wave two-crew phase stagger (`warp_row = warp/4`) layered on the asm-opaque
@@ -961,41 +961,68 @@ pub fn flash_attention_fwd_32_pingpong(bh: usize, n: usize, d: usize) -> Program
     // fix) under the phase stagger. Packed V rides the asm_commit branch (stagger-safe, opaque), so the
     // two-crew overlap no longer pays the narrow-`ds_write_b16` V-write tax. (direct_k stays incompatible
     // with ping-pong: its separate publish cluster violates the phased-tail-depends-on-publication invariant.)
-    flash_attention_fwd_32_impl(bh, n, d, false, true, true, true, true)
+    flash_attention_fwd_32_impl(bh, n, d, false, true, true, true, true, false)
+}
+
+/// aiter-API-matched **bf16 O** ping-pong FA-32: identical to [`flash_attention_fwd_32_pingpong`] except
+/// the final O scatter truncates the f32 accumulator to bf16 (RTZ, `bits>>16`), halving the O write
+/// bytes. FA-32 is memory-bound and O is ~11% of its traffic as f32, so this removes ~5% of total
+/// bytes — the fair-API match to aiter (which stores bf16-RTZ O). The MFMA accumulator stays f32; only
+/// the store casts. Allocate the output tensor as `DType::BFloat16`. Same `SwizzlePass` requirement,
+/// same d128-only constraint as the f32 ping-pong.
+pub fn flash_attention_fwd_32_pingpong_bf16o(bh: usize, n: usize, d: usize) -> Program {
+    assert_eq!(d, 128, "FA-32 ping-pong currently requires d128 (register asm K2/V3 staging)");
+    let q_blk = NUM_WARPS_32 * crate::shape::Mfma32x32x8Bf16::M;
+    assert!(
+        n > 0 && n.is_multiple_of(q_blk),
+        "FA-32 sequence length n must be a positive multiple of the Q tile ({q_blk})"
+    );
+    flash_attention_fwd_32_impl(bh, n, d, false, true, true, true, true, true)
 }
 
 /// Test-only constructor forcing direct K below the production crossover for warmup/ragged coverage.
 #[cfg(test)]
 pub(crate) fn flash_attention_fwd_32_direct_k(bh: usize, n: usize, d: usize) -> Program {
     assert_eq!(d, 128, "ordered direct K is currently defined only for d128");
-    flash_attention_fwd_32_impl(bh, n, d, true, false, false, false, false)
+    flash_attention_fwd_32_impl(bh, n, d, true, false, false, false, false, false)
 }
 
 /// Test-only direct-K constructor qualifying the packed transposed-V movement experiment.
 #[cfg(test)]
 pub(crate) fn flash_attention_fwd_32_direct_k_packed_v(bh: usize, n: usize, d: usize) -> Program {
     assert_eq!(d, 128, "packed V is currently defined only for d128");
-    flash_attention_fwd_32_impl(bh, n, d, true, false, false, true, false)
+    flash_attention_fwd_32_impl(bh, n, d, true, false, false, true, false, false)
 }
 
 /// Test-only direct-K constructor qualifying waitcnt-opaque K/V gathers before phase staggering.
 #[cfg(test)]
 pub(crate) fn flash_attention_fwd_32_direct_k_asm_gather(bh: usize, n: usize, d: usize) -> Program {
     assert_eq!(d, 128, "ordered direct K is currently defined only for d128");
-    flash_attention_fwd_32_impl(bh, n, d, true, true, false, true, false)
+    flash_attention_fwd_32_impl(bh, n, d, true, true, false, true, false, false)
 }
 
 /// Test-only long-shape oracle retaining the pre-optimization register-staged K path.
 #[cfg(test)]
 pub(crate) fn flash_attention_fwd_32_register_k(bh: usize, n: usize, d: usize) -> Program {
-    flash_attention_fwd_32_impl(bh, n, d, false, false, false, false, false)
+    flash_attention_fwd_32_impl(bh, n, d, false, false, false, false, false, false)
 }
 
 /// Test-only register-staged asm movement without asymmetric wave phasing.
 #[cfg(test)]
 pub(crate) fn flash_attention_fwd_32_register_asm(bh: usize, n: usize, d: usize) -> Program {
     assert_eq!(d, 128, "register asm movement currently requires d128 K2/V3 staging");
-    flash_attention_fwd_32_impl(bh, n, d, false, true, true, false, false)
+    flash_attention_fwd_32_impl(bh, n, d, false, true, true, false, false, false)
+}
+
+/// The output-O buffer handle, monomorphized over its store dtype so the ping-pong FA can ship an
+/// aiter-matched **bf16 O** (half the O-write bytes — the one unblocked memory-side lever for this
+/// memory-bound kernel) alongside the f32 default without a second impl. The MFMA accumulator stays
+/// f32; only the FINAL scatter re-types — the bf16 path truncates (RTZ, [`Builder::bf16_trunc`], the
+/// `bits>>16` cast) at the store, matching aiter's bf16-RTZ O store.
+#[derive(Copy, Clone)]
+enum OutO {
+    F32(Buf<F32>),
+    Bf16(Buf<BF16>),
 }
 
 #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
@@ -1008,6 +1035,7 @@ fn flash_attention_fwd_32_impl(
     asm_commit: bool,
     packed_v: bool,
     ping_pong: bool,
+    bf16_o: bool,
 ) -> Program {
     use crate::shape::Mfma32x32x8Bf16 as S;
     assert!(d.is_multiple_of(S::M), "FA-32 head dim d must be a multiple of 32");
@@ -1030,8 +1058,9 @@ fn flash_attention_fwd_32_impl(
     let ksl = KV_BLK_32 / k8; // 4 PV K-slices per KV block
 
     let mut b = Builder::new("tk2_fa_fwd_32");
-    // ABI: O[bh·n, d] then Q, K, V — each `[bh, n, d]` row-major.
-    let o = b.global::<F32>(bh * n * d);
+    // ABI: O[bh·n, d] then Q, K, V — each `[bh, n, d]` row-major. O binds the first ABI slot regardless
+    // of its store dtype (f32 default, or aiter-matched bf16 under `bf16_o`); Q/K/V follow unchanged.
+    let o = if bf16_o { OutO::Bf16(b.global::<BF16>(bh * n * d)) } else { OutO::F32(b.global::<F32>(bh * n * d)) };
     let q = b.global::<BF16>(bh * n * d);
     let k = b.global::<BF16>(bh * n * d);
     let v = b.global::<BF16>(bh * n * d);
@@ -1512,7 +1541,15 @@ fn flash_attention_fwd_32_impl(
             let off = b.idx_mul(q_global, d_c);
             let off = b.idx_add(off, d_global);
             let val = b.vec_extract(o_norm, i);
-            roots.push(b.store(o, off, val));
+            // The MFMA accumulator is f32; only the store re-types. bf16 O truncates (RTZ) here.
+            let eff = match o {
+                OutO::F32(buf) => b.store(buf, off, val),
+                OutO::Bf16(buf) => {
+                    let val = b.bf16_trunc(val);
+                    b.store(buf, off, val)
+                }
+            };
+            roots.push(eff);
         }
     }
     // Scheduling-coherence gate (plan §2.6): setprio balance + interleave sanity + hint purity ⇒

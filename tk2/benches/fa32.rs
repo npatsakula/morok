@@ -20,15 +20,19 @@ use svod_tensor::Tensor;
 mod common;
 use common::{plan_gpu_ns, rand_bf16, requirements_met};
 
-use svod_tk2::kernels::fa::{flash_attention_fwd, flash_attention_fwd_32, flash_attention_fwd_32_pingpong};
+use svod_tk2::kernels::fa::{
+    flash_attention_fwd, flash_attention_fwd_32, flash_attention_fwd_32_pingpong, flash_attention_fwd_32_pingpong_bf16o,
+};
 use svod_tk2::{SwizzlePass, VectorizePass, graph_kernel};
 
-/// The FA kernel under measurement. `Pp` = the 8-wave two-crew phase-stagger FA-32 (d128 only).
+/// The FA kernel under measurement. `Pp` = the 8-wave two-crew phase-stagger FA-32 (d128 only); `PpB` =
+/// the same ping-pong but with the aiter-matched **bf16 O** store (half the O write bytes).
 #[derive(Copy, Clone, PartialEq, Debug)]
 enum Fa {
     N16,
     N32,
     Pp,
+    PpB,
 }
 
 impl Fa {
@@ -37,6 +41,15 @@ impl Fa {
             Fa::N16 => "FA-16",
             Fa::N32 => "FA-32",
             Fa::Pp => "FA-32pp",
+            Fa::PpB => "FA-32ppB",
+        }
+    }
+
+    /// The output-O dtype: the bf16-O ping-pong stores O as bf16, every other variant as f32.
+    fn out_dtype(self) -> DType {
+        match self {
+            Fa::PpB => DType::BFloat16,
+            _ => DType::Float32,
         }
     }
 }
@@ -135,9 +148,11 @@ fn plan_of(fa: Fa, bh: usize, s: usize, d: usize, q: &Tensor, k: &Tensor, v: &Te
         Fa::N32 => flash_attention_fwd_32(bh, s, d).apply(SwizzlePass),
         // Ping-pong FA-32: the 8-wave two-crew phase stagger over asm-opaque movement (d128 only).
         Fa::Pp => flash_attention_fwd_32_pingpong(bh, s, d).apply(SwizzlePass),
+        // bf16-O ping-pong: identical schedule, O truncated f32→bf16 at the store (half the O write bytes).
+        Fa::PpB => flash_attention_fwd_32_pingpong_bf16o(bh, s, d).apply(SwizzlePass),
         Fa::N16 => flash_attention_fwd(bh, s, d).apply(VectorizePass).apply(SwizzlePass),
     };
-    let out = Tensor::empty(&[bh * s, d], DType::Float32);
+    let out = Tensor::empty(&[bh * s, d], fa.out_dtype());
     let mut y = graph_kernel(prog, out, &[q, k, v]).expect("wrap FA as graph node");
     let plan = y.prepare().expect("prepare FA execution plan");
     (y, plan)
@@ -150,14 +165,17 @@ fn gate(fa: Fa, bh: usize, s: usize, d: usize) {
     let (y, plan) = plan_of(fa, bh, s, d, &q, &k, &v);
     plan.execute().expect("execute for gate");
     plan.output_buffer().expect("output buffer").synchronize().expect("sync before read");
-    let got = y.as_vec::<f32>().expect("read FA output");
+    // Cast the output to f32 for the comparison (identity for the f32-O variants; the bf16→f32 read for PpB).
+    let got = as_f32(&y);
     let (qf, kf, vf) = (as_f32(&q), as_f32(&k), as_f32(&v));
     let mut expected = vec![0f32; bh * s * d];
     for z in 0..bh {
         let o = z * s * d;
         expected[o..o + s * d].copy_from_slice(&fa_ref(&qf[o..o + s * d], &kf[o..o + s * d], &vf[o..o + s * d], s, d));
     }
-    let report = allclose_f32(&got, &expected, 1e-2, 2e-2);
+    // bf16-O rounding (RTZ) adds ≤2^-7 relative error, so PpB gets the widened rtol; f32-O keeps the tight one.
+    let rtol = if fa == Fa::PpB { 3e-2 } else { 2e-2 };
+    let report = allclose_f32(&got, &expected, 1e-2, rtol);
     let name = fa.name();
     assert!(report.ok, "{name} gate bh={bh} S={s} d={d} FAILED before timing: {}", report.message);
     eprintln!("  gate {name} bh={bh} S={s} d={d}: allclose ✓ (max_abs_err {:e})", report.max_abs_err);
@@ -210,6 +228,7 @@ fn main() {
     gate(Fa::N32, 2, 1024, 128); // verifies the packed-V d128 long path (n≥1024 activates direct-K + packed V)
     gate(Fa::N16, 2, 256, 128);
     gate(Fa::Pp, 2, 256, 128);
+    gate(Fa::PpB, 2, 256, 128); // bf16-O ping-pong (aiter-matched O store)
 
     // (label, b, h, S, d) — machine-filling large-S shapes plus short-context ones. All S are ≥256 and
     // 256-multiples (the 8-warp Q block), so the raw `bh·S` bench buffers cover every workgroup's fill.
@@ -245,5 +264,27 @@ fn main() {
         } else {
             eprintln!("  {label} {s:>6} {d:>4} {wgs:>6}    {tf16:>10.1}  {tf32:>10.1}  {:>10}  {:>8}", "-", "-");
         }
+    }
+
+    // ── bf16-O headline: the aiter-API match. FA-32 is memory-bound and O is ~11% of its traffic as f32,
+    //    so a bf16 O store (half those bytes) removes ~5% of total DRAM traffic. Compare the f32-O ping-pong
+    //    (`Pp`) against the bf16-O ping-pong (`PpB`) at matched d128 shapes under the SAME input, machine-
+    //    filling (wgs = 256). Run once per distribution via SVOD_FA_INPUT (sym default, u01 = aiter's). ──
+    eprintln!("\n  === FA-32 O dtype: f32 vs bf16 (aiter-API match) — {input_dist:?} input ===");
+    eprintln!(
+        "  {:<9} {:>6} {:>4} {:>6}    {:>12}  {:>12}  {:>8}",
+        "shape", "S", "d", "wgs", "Pp(f32-O) TF", "PpB(bf16-O) TF", "gain"
+    );
+    for (label, bb, hh, s, d) in
+        [("b8·h16 ", 8usize, 16usize, 512usize, 128usize), ("b4·h16 ", 4, 16, 1024, 128), ("b2·h16 ", 2, 16, 2048, 128)]
+    {
+        let bh = bb * hh;
+        let wgs = bh * (s / 256);
+        let (q, k, v) = input_dist.inputs(&[bh * s, d]);
+        let measurement = Measurement { label, bh, s, d };
+        let tf_f32 = measure(measurement, Fa::Pp, &q, &k, &v);
+        let tf_bf16 = measure(measurement, Fa::PpB, &q, &k, &v);
+        let gain = (tf_bf16 / tf_f32 - 1.0) * 100.0;
+        eprintln!("  {label} {s:>6} {d:>4} {wgs:>6}    {tf_f32:>12.1}  {tf_bf16:>12.1}  {gain:>+7.1}%");
     }
 }
