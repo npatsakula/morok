@@ -526,7 +526,7 @@ fn flash_attention32_matches_reference_on_gfx942() {
                 // visible stagger deadlocked); the 3× replay exposes any residual LDS stage/overwrite race.
                 variants.push((
                     "qualification-pingpong",
-                    crate::kernels::fa::flash_attention_fwd_32_pingpong(bh, n, d).apply(SwizzlePass),
+                    crate::kernels::fa::flash_attention_fwd_32(bh, n, d).apply(SwizzlePass),
                 ));
             }
         }
@@ -558,7 +558,7 @@ fn flash_attention32_matches_reference_on_gfx942() {
 }
 
 /// **FA-32 bf16-O correctness GATE**: the aiter-API-matched ping-pong FA-32
-/// ([`crate::kernels::fa::flash_attention_fwd_32_pingpong_bf16o`]) stores O as **bf16** (RTZ truncation
+/// ([`crate::kernels::fa::flash_attention_fwd_32_bf16`]) stores O as **bf16** (RTZ truncation
 /// of the f32 accumulator at the final scatter — the MFMA accumulator stays f32). It must still match
 /// the SAME f32 reference within the widened tolerance bf16 output rounding needs: bf16 has ~8 bits of
 /// mantissa, so RTZ truncation contributes ≤2^-7 ≈ 0.8% relative error on top of the f32 pipeline error
@@ -591,7 +591,7 @@ fn flash_attention32_bf16o_matches_reference_on_gfx942() {
             let o_s = fa_ref(&qf[z..z + n * d], &kf[z..z + n * d], &vf[z..z + n * d], n, d);
             expected[z..z + n * d].copy_from_slice(&o_s);
         }
-        let prog = crate::kernels::fa::flash_attention_fwd_32_pingpong_bf16o(bh, n, d).apply(SwizzlePass);
+        let prog = crate::kernels::fa::flash_attention_fwd_32_bf16(bh, n, d).apply(SwizzlePass);
         // The output tensor is bf16 — half the O write bytes, the aiter-matched store dtype.
         let out = Tensor::empty(&[rows, d], DType::BFloat16);
         let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap bf16-O FA-32 program");
@@ -764,11 +764,9 @@ fn dump_fa32_isa() {
     for d in [64usize, 128usize] {
         variants.push((format!("d{d}"), crate::kernels::fa::flash_attention_fwd_32(2, 2048, d).apply(SwizzlePass)));
     }
-    variants
-        .push(("pp_d128".into(), crate::kernels::fa::flash_attention_fwd_32_pingpong(2, 2048, 128).apply(SwizzlePass)));
     variants.push((
         "pp_d128_bf16o".into(),
-        crate::kernels::fa::flash_attention_fwd_32_pingpong_bf16o(2, 2048, 128).apply(SwizzlePass),
+        crate::kernels::fa::flash_attention_fwd_32_bf16(2, 2048, 128).apply(SwizzlePass),
     ));
     for (tag, prog) in variants {
         let (src, bytes) = launch::compile_artifacts(&prog, &device_spec).expect("compile FA-32");

@@ -906,12 +906,23 @@ fn mask_ragged_kv(b: &mut Builder, s: Val<F32>, blk: BlockCounter, wlane: Idx, n
 /// (the `EPT_C = 16` AccDist reduce) → P→PV relayout via [`Builder::pv_relayout_s49`] (`v_perm s49`) → P·V
 /// with V staged through the padded transposed LDS (read straight).
 ///
-/// **Phase 1 (the ClusterCx port):** the KV stream is a **rolled [`crate::pipeline`] loop** (like the 16×16
-/// FA) rather than the correctness-first unrolled assembly — O/m/l are the loop-carried accumulators, the
-/// per-KV `s`/`p` ride the rotated QK/softmax/PV dataflow, and [`Fa32Hooks`] supplies the register-staged
-/// prefetch, commit, and gather. This scales past `n = 128` and inherits the
-/// prefetch/commit/WAR/RAW machinery. Device-gated by `flash_attention32_matches_reference_on_gfx942`
-/// (tight `atol` at d=64 AND d=128); no ping-pong (`warp_row = None`: disjoint-Q warps).
+/// **The ONE production f32-O kernel** — the fastest config is hardcoded per head dim (validated + selected
+/// in [`flash_attention_fwd_32_fastest`], the single source of the config). The KV stream is a **rolled
+/// [`crate::pipeline`] loop**: O/m/l are the loop-carried accumulators, the per-KV `s`/`p` ride the rotated
+/// QK/softmax/PV dataflow, and [`Fa32Hooks`] supplies the register-staged prefetch, commit, and gather
+/// (scales past `n = 128`, inherits the prefetch/commit/WAR/RAW machinery). Device-gated by
+/// `flash_attention32_matches_reference_on_gfx942` (tight `atol` at d=64 AND d=128).
+/// * **d128** rides the 8-wave two-crew **ping-pong** (`warp_row = warp/4`): HK's phase stagger layered on
+///   the asm-opaque (`asm_gather`/`asm_commit`) register-staged K + PACKED transposed V (`v_perm` + wide
+///   `ds_write_b64`, the LDS bank-conflict fix). The engine runs the warmup in lockstep, then offsets the
+///   crews (one wave per SIMD each), and every steady cluster seal becomes the workgroup `s_barrier` that
+///   carries the phase. The opaque LDS movement is what makes the single-parity-half commit race-free under
+///   a lagged crew (a compiler-visible LDS emission reschedules past any barrier — see the matmul clone).
+///   Device-measured 1.02–1.09× over the single-crew packed-V path; public `n` is a Q-block (256) multiple
+///   ⇒ never ragged ⇒ always ping-pong-eligible (`nblocks ≥ 8 ≥ 3`).
+/// * **d64** stays **single-crew** (`warp_row = None`, disjoint-Q warps): the ping-pong is d128-only (its
+///   K2/V3 asm staging), and d64's 2nd resident wave already hides the LDS-write latency the double-buffer
+///   would otherwise pay for.
 ///
 /// **PASS REQUIREMENT**: apply `.apply(SwizzlePass)`. It folds the **K-tile** LDS bank swizzle (`cols = d`,
 /// a power of 2) into the XOR bank-spread — the fill and gather both route K's column through
@@ -919,65 +930,35 @@ fn mask_ragged_kv(b: &mut Builder, s: Val<F32>, blk: BlockCounter, wlane: Idx, n
 /// so the XOR is not applied — the pad is what breaks its conflicts). VectorizePass is unnecessary: the
 /// K/V gathers are already `ds_read_b64` ([`Builder::load_lds_vec_after`]) and the fills are `store_lds`
 /// (no fusible scalar frag-store run), so the pass touches only the loop-invariant Q prologue (negligible).
-#[allow(clippy::needless_range_loop)]
 pub fn flash_attention_fwd_32(bh: usize, n: usize, d: usize) -> Program {
+    flash_attention_fwd_32_fastest(bh, n, d, false)
+}
+
+/// aiter-API-matched **bf16 O** FA-32: identical to [`flash_attention_fwd_32`] (the SAME fastest
+/// per-head-dim config) except the final O scatter truncates the f32 accumulator to bf16 (RTZ,
+/// [`Builder::bf16_trunc`], the `bits>>16` cast), halving the O write bytes. FA-32 is memory-bound and O is
+/// ~11% of its traffic as f32, so this removes ~5% of total bytes — the fair-API match to aiter (which
+/// stores bf16-RTZ O). The MFMA accumulator stays f32; only the store casts. Allocate the output tensor as
+/// `DType::BFloat16`. Same `SwizzlePass` requirement as the f32 kernel.
+pub fn flash_attention_fwd_32_bf16(bh: usize, n: usize, d: usize) -> Program {
+    flash_attention_fwd_32_fastest(bh, n, d, true)
+}
+
+/// The single source of the FA-32 production config: validate the public domain (`d ∈ {64,128}`, `n` a
+/// positive Q-block multiple ⇒ tile-exact, never ragged) and dispatch the fastest per-head-dim flags into
+/// the shared [`flash_attention_fwd_32_impl`] engine. `pp = d == 128` selects the whole d128 fast bundle at
+/// once (`asm_gather` + `asm_commit` + `packed_v` + `ping_pong` — the merged two-crew ping-pong, fastest at
+/// every d128 size); d64 clears every flag (single-crew register path). `bf16_o` re-types only the final O
+/// scatter. The config lives HERE and nowhere else.
+fn flash_attention_fwd_32_fastest(bh: usize, n: usize, d: usize, bf16_o: bool) -> Program {
     assert!(matches!(d, 64 | 128), "FA-32 supports only head dimensions d=64 or d=128");
     let q_blk = NUM_WARPS_32 * crate::shape::Mfma32x32x8Bf16::M;
     assert!(
         n > 0 && n.is_multiple_of(q_blk),
         "FA-32 sequence length n must be a positive multiple of the Q tile ({q_blk})"
     );
-    // d128: the MERGED two-crew ping-pong is the fastest at EVERY d128 size (device-measured 1.02–1.09× over
-    // the single-crew packed-V path). Public `n` is a Q-block (256) multiple ⇒ never ragged ⇒ always
-    // ping-pong-eligible (nblocks ≥ 8 ≥ 3). d64 stays single-crew (the ping-pong is d128-only).
-    if d == 128 {
-        return flash_attention_fwd_32_pingpong(bh, n, d);
-    }
-    // Direct K amortizes its address/wait machinery only on long d128 streams. Centered-data A/B
-    // measurements cross the 3% gate at S>=1024; shorter shapes retain the faster register path.
-    // d128 long path: direct-to-LDS K + PACKED transposed V (v_perm register-transpose + wide `ds_write_b64`).
-    // The packed V write replaces the scalar `ds_write_b16` transpose whose consecutive fill lanes address
-    // d-rows 8 apart (dword stride 144 ≡ 16 mod 32 → ~16-way LDS bank conflict); the b64 packed write drops
-    // that to 2-way and measures +8% at S2048 d128 (301→325). See the two-plane skew (VT_SKEW) for the
-    // conflict-free finish. Below the S≥1024 crossover the register-staged path stays faster.
-    let long_d128 = d == 128 && n >= 1024;
-    flash_attention_fwd_32_impl(bh, n, d, long_d128, false, false, long_d128, false, false)
-}
-
-/// Ping-pong FA-32: the 8-wave two-crew phase stagger (`warp_row = warp/4`) layered on the asm-opaque
-/// register-staged movement — HK's schedule adapted to gfx942. Reuses the warmup + drain; the engine runs
-/// the warmup in lockstep and offsets the crews after it, and every steady cluster seal becomes the
-/// workgroup `s_barrier` that carries the phase. The opaque (`asm_gather`/`asm_commit`) LDS movement is
-/// what makes the single-parity-half commit race-free under a lagged crew (compiler-visible LDS reschedules
-/// past any barrier — see the matmul clone). d128 only for now (K2/V3 asm staging).
-pub fn flash_attention_fwd_32_pingpong(bh: usize, n: usize, d: usize) -> Program {
-    assert_eq!(d, 128, "FA-32 ping-pong currently requires d128 (register asm K2/V3 staging)");
-    let q_blk = NUM_WARPS_32 * crate::shape::Mfma32x32x8Bf16::M;
-    assert!(
-        n > 0 && n.is_multiple_of(q_blk),
-        "FA-32 sequence length n must be a positive multiple of the Q tile ({q_blk})"
-    );
-    // Asm-opaque register-staged K + PACKED transposed V (v_perm + wide `ds_write_b64`, the bank-conflict
-    // fix) under the phase stagger. Packed V rides the asm_commit branch (stagger-safe, opaque), so the
-    // two-crew overlap no longer pays the narrow-`ds_write_b16` V-write tax. (direct_k stays incompatible
-    // with ping-pong: its separate publish cluster violates the phased-tail-depends-on-publication invariant.)
-    flash_attention_fwd_32_impl(bh, n, d, false, true, true, true, true, false)
-}
-
-/// aiter-API-matched **bf16 O** ping-pong FA-32: identical to [`flash_attention_fwd_32_pingpong`] except
-/// the final O scatter truncates the f32 accumulator to bf16 (RTZ, `bits>>16`), halving the O write
-/// bytes. FA-32 is memory-bound and O is ~11% of its traffic as f32, so this removes ~5% of total
-/// bytes — the fair-API match to aiter (which stores bf16-RTZ O). The MFMA accumulator stays f32; only
-/// the store casts. Allocate the output tensor as `DType::BFloat16`. Same `SwizzlePass` requirement,
-/// same d128-only constraint as the f32 ping-pong.
-pub fn flash_attention_fwd_32_pingpong_bf16o(bh: usize, n: usize, d: usize) -> Program {
-    assert_eq!(d, 128, "FA-32 ping-pong currently requires d128 (register asm K2/V3 staging)");
-    let q_blk = NUM_WARPS_32 * crate::shape::Mfma32x32x8Bf16::M;
-    assert!(
-        n > 0 && n.is_multiple_of(q_blk),
-        "FA-32 sequence length n must be a positive multiple of the Q tile ({q_blk})"
-    );
-    flash_attention_fwd_32_impl(bh, n, d, false, true, true, true, true, true)
+    let pp = d == 128;
+    flash_attention_fwd_32_impl(bh, n, d, false, pp, pp, pp, pp, bf16_o)
 }
 
 /// Test-only constructor forcing direct K below the production crossover for warmup/ragged coverage.

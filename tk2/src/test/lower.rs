@@ -385,11 +385,11 @@ fn fa32_production_long_d128_uses_only_promoted_movement() {
 
 #[test]
 fn fa32_pingpong_constructs_balanced_and_lowers() {
-    // The ping-pong variant must CONSTRUCT (both `pipeline::verify`'s wave-phase balance check and the
-    // `verify_v2` scheduling gate run at build time), carry EXACTLY one eq=1 stagger seed + one eq=0
-    // rebalance (an imbalance panics in `verify` as a would-be workgroup deadlock), and lower to spec-valid
-    // gfx942 LLVM IR. n=512,d128 ⇒ 16 KV blocks (≥3, so a steady body carries the eq=1 barrier).
-    let p = crate::kernels::fa::flash_attention_fwd_32_pingpong(1, 512, 128).apply(crate::SwizzlePass);
+    // The d128 production kernel (the ping-pong) must CONSTRUCT (both `pipeline::verify`'s wave-phase balance
+    // check and the `verify_v2` scheduling gate run at build time), carry EXACTLY one eq=1 stagger seed + one
+    // eq=0 rebalance (an imbalance panics in `verify` as a would-be workgroup deadlock), and lower to
+    // spec-valid gfx942 LLVM IR. n=512,d128 ⇒ 16 KV blocks (≥3, so a steady body carries the eq=1 barrier).
+    let p = crate::kernels::fa::flash_attention_fwd_32(1, 512, 128).apply(crate::SwizzlePass);
     let live = crate::passes::reachable(&p.ir, p.sink);
     let count_eq = |want: i64| {
         live.iter().filter(|&&id| matches!(p.ir.node(id), Node::WaveBarrier { eq, .. } if *eq == want)).count()
