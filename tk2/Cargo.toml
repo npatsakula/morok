@@ -30,11 +30,7 @@ test-case = "3.3.1"
 name = "matmul"
 harness = false
 
-# GPU device-time bench for the FA-forward schedule (criterion) sharing `benches/common.rs`.
-[[bench]]
-name = "fa"
-harness = false
-
+# GPU device-time bench for the FA-32 kernel (plain main) sharing `benches/common.rs`.
 [[bench]]
 name = "fa32"
 harness = false

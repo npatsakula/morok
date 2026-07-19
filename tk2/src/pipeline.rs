@@ -46,7 +46,9 @@ pub(crate) enum CommitDrain {
     /// barrier in the body, which is required for safe asymmetric wave-phase progress.
     AsmPublishedNoWar,
     /// Direct-to-LDS K plus register-staged V: issue/commit in a memory cluster but defer the full
-    /// VMEM drain and publication barrier until an explicit tail publish after compute.
+    /// VMEM drain and publication barrier until an explicit tail publish after compute. Retained as a
+    /// DSL capability (its match arms still route it); no current kernel constructs it.
+    #[allow(dead_code)]
     DirectDeferred,
 }
 
@@ -164,7 +166,9 @@ impl SlotVal {
             SlotVal::BF16(_) => panic!("compute slot value is bf16 but was read as f32"),
         }
     }
-    /// Read this channel value as bf16 (panics if it is f32).
+    /// Read this channel value as bf16 (panics if it is f32). Retained DSL accessor for bf16 carry
+    /// slots; no current kernel reads one.
+    #[allow(dead_code)]
     pub(crate) fn bf16(self) -> Val<BF16> {
         match self {
             SlotVal::BF16(v) => v,
@@ -188,6 +192,8 @@ impl SlotVal {
 #[derive(Copy, Clone)]
 pub(crate) enum AccSlot {
     F32(Frag<F32>),
+    /// bf16 carry slot — retained DSL capability; no current kernel declares one.
+    #[allow(dead_code)]
     BF16(Frag<BF16>),
 }
 

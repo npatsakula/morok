@@ -1,502 +1,38 @@
-//! **Flash-Attention forward on the ClusterCx declarative pipeline** — a NUMERICALLY CORRECT,
-//! MULTI-WARP (8-warp split-Q) FA-forward proving [`crate::pipeline`] (built for the HK GEMM)
-//! generalises to a second, differently-shaped kernel. Streams K/V blocks: QKᵀ → online-softmax → P·V
-//! accumulate → normalize → write O. Non-causal, `bh = batch·heads` independent attentions (`[bh,n,d]`
-//! layout), head dim `d` any multiple of 16.
+//! **Flash-Attention forward on the 32×32×8 MFMA** (gfx942 wide-core), authored on the
+//! [`crate::pipeline`] ClusterCx combinator. Non-causal, `bh = batch·heads` independent `[bh,n,d]`
+//! attentions; head dim `d ∈ {64,128}`. Streams K/V blocks: QKᵀ (`v_mfma_f32_32x32x8`) → online softmax
+//! over kv → P→PV `v_perm` relayout → P·V accumulate → normalize → write O.
 //!
-//! ## The two matmuls (both `mma_atb` — contraction over the shared row)
-//! - **QKᵀ** contracts over `d`: `K` (row map) and `Q` (col map) are gathered with `d` on the MFMA
-//!   spread (contraction) lane-axis, summed over `d/16` `mma` K-steps → `att[kv, q]` (`q` on flat).
-//! - **P·V** contracts over `kv`: the QKᵀ f32 accumulator `P` feeds PV's operand with ONLY a bf16
-//!   cast — its lane distribution already equals the required operand layout (the CK "free relayout",
-//!   DESIGN §5) — while `V` is gathered TRANSPOSED ([`LdsView::gather_transposed`]) so `kv` lands on
-//!   the spread axis. Both use the SAME `v_mfma_f32_16x16x16`; the orientation is purely the operand
-//!   lane layout, NOT a new hardware op (proven in isolation by `atb_probe` + its device gate).
+//! ## 8-warp split-Q
+//! A workgroup owns a `q_blk = 256`-row Q block over 8 warps (512 threads); warp `w` owns Q rows
+//! `[w·32, w·32+32)`. K/V are shared in LDS (natural-K, padded-transposed-V), filled once per KV block by
+//! the collaborative 512-thread fill. Each warp keeps its OWN o/m/l registers and reduces within its own
+//! 64 lanes (`acc_row_reduce_32` — warps run disjoint Q rows, so no cross-warp reduction).
 //!
-//! ## Multi-warp split-Q (§1.2)
-//! A workgroup owns a `q_blk = 128`-row Q block over 8 warps (512 threads); warp `w` owns Q rows
-//! `[w·16, w·16+16)`. K/V are shared in LDS — loaded ONCE per KV block by a collaborative 512-thread
-//! fill (the 8× occupancy + K/V-bandwidth lever). Each warp keeps its OWN o/m/l registers (the warp
-//! offset rides the Q-gather + O-scatter addressing, not the slot count) and reduces WITHIN its 64
-//! lanes (`frag_col_reduce`/`ds_bpermute` is single-warp — warps run disjoint Q rows, so no cross-warp
-//! reduction). `kv_blk` = 16 (`d=128`) or 32 (`d=64`, 2 KV-fragments) so the 512-thread fill is
-//! VEC4-aligned. No ping-pong (`warp_row=None`): there is no co-resident load/compute pair to steer.
+//! ## Production config ([`flash_attention_fwd_32`], one `fast` flag per head dim)
+//! * **d128** rides the 8-wave two-crew **ping-pong**: HK's phase stagger over asm-opaque register-staged
+//!   K + packed transposed V (`v_perm` + `ds_write_b64`, the LDS bank-conflict fix), with softmax+QKᵀ+P·V
+//!   merged into one 32-MFMA cluster so the `s_barrier` handoff amortizes like the matmul clone.
+//! * **d64** stays **single-crew** register-staged: its 2nd resident wave already hides the LDS-write
+//!   latency the double-buffer would pay for.
 //!
-//! Device-gated by `flash_attention_matches_reference_on_gfx942` (allclose vs an f32 reference at
-//! d=64 and d=128). Single-buffer; softmax-under-MFMA interleave + swizzle are later Phase-B items.
+//! Device-gated by `flash_attention32_matches_reference_on_gfx942` (tight `atol` at d=64 AND d=128,
+//! including ragged `n`). Apply `.apply(SwizzlePass)` (it folds the K-tile LDS bank swizzle).
 
-use crate::build::{BF16, Buf, Builder, Effect, F32, Frag, Idx, Lds, Scope, Val};
-use crate::ir::{FragMap, TileId};
-use crate::kernels::{EDGE, Program, offset_by};
+use crate::build::{BF16, Buf, Builder, F32, Frag, Idx, Lds, Scope, Val};
+use crate::ir::TileId;
+use crate::kernels::{Program, offset_by};
 use crate::partition::RowPartition;
 use crate::pipeline::{
-    AccSlot, BlockCounter, CommitBatch, CommitCompletion, CommitDrain, Compute, Hooks, Init, Mem, Sched, SlotSet,
-    SlotVal, pipeline,
+    BlockCounter, CommitBatch, CommitCompletion, CommitDrain, Compute, Hooks, Init, Mem, Sched, SlotSet, SlotVal,
+    pipeline,
 };
-use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
-use crate::tile::{ARow, BCol, Plain, Xor};
-use crate::tile_move::{
-    commit, commit_run, commit_run_asm, commit_transposed_run_asm, commit_transposed_v4_asm, gather, gather_run,
-    prefetch,
-};
+use crate::shape::MfmaShape;
+use crate::tile::{Plain, Xor};
+use crate::tile_move::{commit_run, commit_run_asm, gather_run};
 
+/// Lanes per wavefront on gfx942 — the 64-lane warp shared by every FA-32 gather/reduce.
 const WARP: usize = 64;
-/// Warps per workgroup for the multi-warp split-Q FA (§1.2): 8 warps × 64 lanes = 512 threads. Each
-/// warp owns 16 Q rows; all 8 share ONE K/V LDS tile (loaded once per KV block by the 512-thread
-/// collaborative fill — the 8× occupancy + K/V-bandwidth lever). No cross-warp reduction: the softmax
-/// `frag_col_reduce` (`ds_bpermute` over 64 lanes) stays within each warp (disjoint Q rows).
-const NUM_WARPS: usize = 8;
-
-/// One K-slice's gathered fragments — the [`Hooks::Op`]. Slice 0 = K (QKᵀ operand),
-/// slice 1 = V (PV operand). Both are `Vec<Val<BF16>>` (one per outer fragment).
-type FaOp = Vec<Val<BF16>>;
-
-/// The register-staged fill carried prefetch→commit: block k+1's K and V chunks in VGPRs.
-struct FaFill {
-    k: Vec<Val<BF16>>,
-    v: Vec<Val<BF16>>,
-}
-
-/// FA's [`Hooks`] — the ONLY kernel-specific movement. It rides the SAME [`crate::tile_move`]
-/// handles matmul does (proving the movement layer is not GEMM-bound); the compute math rides the
-/// [`Compute`] bodies below, so `Hooks` grows no per-cluster compute method. `PREFETCH_TILES = 2`
-/// (K, V) as in matmul (A, B), but the two tiles are the two *operands of two different matmuls*
-/// (K feeds QKᵀ, V feeds PV) rather than the A/B of one — the first shape strain (see report).
-struct FaHooks {
-    /// The shared K/V LDS tiles `[kv_blk, d]` and their global sources — the raw handles the
-    /// `tile_move` prefetch/commit/gather forwards address. They REPLACE the pre-built `LdsView`/
-    /// `LdsStage` (which the forwards now rebuild internally from these + the params below — the
-    /// `SharedTile`/`gather_view`/`slice` builders emit no IR, so the emission is byte-identical).
-    k_smem: Lds<BF16>,
-    v_smem: Lds<BF16>,
-    k: Buf<BF16>,
-    v: Buf<BF16>,
-    /// The collaborative 512-thread fill addressing (prefetch/commit): `tid` = fill thread id,
-    /// `bh_row` = this (b,h)'s row origin, `epl_kv` = elements per lane. `d` = the LDS tile inner width
-    /// / global row stride (and V's transposed-gather `tile_cols`); K's gather `tile_rows` is `kvf·16`.
-    tid: Idx,
-    bh_row: Idx,
-    epl_kv: usize,
-    /// The per-warp gather lane (the gather/`ds_bpermute` stays within each 64-lane warp).
-    wlane: Idx,
-    d: usize,
-    /// `d / 16` — the head-dim fragment count. QKᵀ contracts over `d` as this many `mma` K-steps
-    /// (K row-map slices); PV's `V` is gathered as this many transposed output-`d` fragments.
-    dfrags: usize,
-    /// `kv_blk / 16` — the KV-block fragment count. K's row-map view stacks `kvf` kv-fragments (its
-    /// `n_frags`); V is gathered `kvf × dfrags` (a transposed gather per kv-slice). `kvf = 1` for the
-    /// single-fragment KV block (`d = 128`); `2` when `kv_blk = 32` (`d = 64`, so the 512-thread fill
-    /// is VEC4-aligned). K is returned indexed `[s·kvf + kf]`, V indexed `[kf·dfrags + df]`.
-    kvf: usize,
-}
-
-impl Hooks for FaHooks {
-    type Op = FaOp;
-    type Reg = FaFill;
-    const PREFETCH_TILES: usize = 2; // 0 = K, 1 = V
-
-    fn prefetch(
-        &mut self,
-        b: &mut Builder,
-        k_base: Idx,
-        tile: usize,
-        prev: Option<FaFill>,
-        order: &[TileId],
-    ) -> (FaFill, Vec<TileId>) {
-        let mut reg = prev.unwrap_or(FaFill { k: Vec::new(), v: Vec::new() });
-        let (d, s) = (self.d, self.d as i64);
-        let loaded = match tile {
-            0 => {
-                reg.k = prefetch(b, self.k_smem, d, self.k, s, self.epl_kv, self.tid, self.bh_row, k_base, order);
-                &reg.k
-            }
-            1 => {
-                reg.v = prefetch(b, self.v_smem, d, self.v, s, self.epl_kv, self.tid, self.bh_row, k_base, order);
-                &reg.v
-            }
-            _ => panic!("FA prefetch: tile ∈ {{0=K, 1=V}}, got {tile}"),
-        };
-        let anchors = loaded.iter().map(|v| v.id).collect();
-        (reg, anchors)
-    }
-
-    fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &FaFill, war: &[TileId]) -> CommitBatch {
-        // Intrinsic commit (an `s_barrier` auto-drains the `ds_write` `lgkmcnt(0)`) — `tile_move::commit`
-        // pins `Drain::Intrinsic`; the asm/deferred-drain machinery is a matmul-perf concern, orthogonal.
-        let (d, s) = (self.d, self.d as i64);
-        let fk = commit(b, self.k_smem, d, self.k, s, self.epl_kv, self.tid, self.bh_row, &reg.k, war);
-        let fv = commit(b, self.v_smem, d, self.v, s, self.epl_kv, self.tid, self.bh_row, &reg.v, war);
-        CommitBatch::new(fk.into_iter().chain(fv).collect(), CommitCompletion::Intrinsic)
-    }
-
-    fn gather(
-        &mut self,
-        b: &mut Builder,
-        slice: usize,
-        _block: BlockCounter,
-        raw: &[TileId],
-    ) -> (FaOp, Vec<TileId>, TileId) {
-        let mut vecs = Vec::new();
-        let mut g = Vec::new();
-        match slice {
-            // K: QKᵀ's A operand as `dfrags · kvf` fragments (row map, contraction `d` on the spread
-            // lane-axis; `slice(s)` selects d-columns `[s·16, s·16+16)`, the view's `n_frags = kvf`
-            // stacking the KV-block rows). Indexed `[s·kvf + kf]`; QKᵀ = Σ_s mma(K[s,kf], Q_s) per `kf`.
-            0 => {
-                // `ARow` derives the row map + straight gather; `tile_rows = kvf·16` gives `n_frags = kvf`.
-                for s in 0..self.dfrags {
-                    let (v, gg) = gather::<BF16, ARow, Mfma16x16x16Bf16>(
-                        b,
-                        self.k_smem,
-                        self.d,
-                        self.kvf * EDGE,
-                        EDGE,
-                        None,
-                        self.wlane,
-                        raw,
-                        s,
-                        false,
-                    ); // kvf kv-fragments for d-slice s
-                    vecs.extend(v);
-                    g.extend(gg);
-                }
-            }
-            // V: PV's A operand as `kvf · dfrags` TRANSPOSED fragments (contraction `kv` on the spread
-            // lane-axis — the `mma_atb` orientation). `slice(kf)` sets the kv-row base `kf·16`, then a
-            // transposed gather yields the `dfrags` output-d fragments. Indexed `[kf·dfrags + df]`.
-            1 => {
-                // `BCol` derives the col map + transposed gather; `tile_cols = d` gives `n_frags = dfrags`.
-                for kf in 0..self.kvf {
-                    let (v, gg) = gather::<BF16, BCol, Mfma16x16x16Bf16>(
-                        b,
-                        self.v_smem,
-                        self.d,
-                        EDGE,
-                        self.d,
-                        None,
-                        self.wlane,
-                        raw,
-                        kf,
-                        false,
-                    );
-                    vecs.extend(v);
-                    g.extend(gg);
-                }
-            }
-            _ => panic!("FA gather: slice ∈ {{0=K, 1=V}}, got {slice}"),
-        }
-        let anchor = vecs[0].id;
-        (vecs, g, anchor)
-    }
-
-    fn ready_after_lgkm(&mut self, _b: &mut Builder, _op: Self::Op, _wait: TileId) -> Self::Op {
-        panic!("FA-16 uses compiler-visible gathers and has no opaque readiness path")
-    }
-}
-
-/// gfx942 elements-per-thread for the 16×16 fragment — DERIVED from the shape marker (§Step 1; `= 4`).
-const EPT: usize = Mfma16x16x16Bf16::EPT_C;
-
-/// Load this warp's QKᵀ B-operand Q fragment for d-slice `s` straight from GLOBAL into registers
-/// (Probe B — no LDS staging). Reproduces exactly the col-map fragment the LDS gather produced, but
-/// sourced from global Q at `[q_row_base + flat, s·16 + spread]` (row-major, stride `d`): each warp's
-/// 16 Q rows are warp-PRIVATE (disjoint across the 8 warps), so LDS-staging Q bought NO cross-warp
-/// sharing — only a 32KB (d=128) LDS tile that capped occupancy at 1 wg/CU. The fragment is
-/// loop-invariant (the QKᵀ B operand), so it is hoisted once and lives in VGPRs for the whole KV stream.
-fn load_q_frag_global(
-    b: &mut Builder,
-    q: Buf<BF16>,
-    map: FragMap,
-    q_row_base: Idx,
-    d: usize,
-    s: usize,
-    lane: Idx,
-) -> Val<BF16> {
-    let frag = b.define_frag::<BF16>(map);
-    let d_c = b.idx_const(d as i64);
-    // Col map ⇒ `lane_rc` yields (spread = contraction d-row, flat = Q-row within the 16-row sub-block).
-    let stores: Vec<TileId> = (0..map.ept)
-        .map(|e| {
-            let e_idx = b.idx_const(e as i64);
-            let (spread, flat) = b.lane_rc(map, lane, e_idx);
-            let row = b.idx_add(q_row_base, flat); // global Q row = this warp's origin + flat
-            let col = offset_by(b, spread, s * EDGE); // global d column = spread + s·16
-            let off = b.idx_mul(row, d_c);
-            let off = b.idx_add(off, col);
-            let v = b.load(q, off);
-            b.store_frag_elem(frag, e_idx, v).dep()
-        })
-        .collect();
-    b.load_frag_vec_after(frag, &stores)
-}
-
-/// **Streaming FA-forward** (non-causal, 8-warp split-Q, head-dim `d` a multiple of 16) authored on the
-/// [`crate::pipeline`] ClusterCx combinator. `bh = batch·heads` independent attentions over Q/K/V/O
-/// laid out `[bh, n, d]` row-major; `n` = sequence length. Grid = `bh × (n/q_blk)` workgroups, each
-/// owning one `q_blk=128`-row Q block within its (b,h) slice. NUMERICALLY CORRECT: streams K/V blocks,
-/// computing QKᵀ (Σ over `d/16` `mma` K-steps), the online-softmax running max/rescale/norm, and the PV
-/// accumulate as `mma_atb` (the QKᵀ f32 accumulator `P` feeds PV's operand with only a bf16 cast — no
-/// data transpose — while `V` is gathered transposed so `kv` lands on the MFMA contraction axis).
-/// Device-gated by `flash_attention_matches_reference_on_gfx942`. Returns a lowerable [`Program`].
-///
-/// **PASS REQUIREMENT**: apply `.apply(VectorizePass).apply(SwizzlePass)` (matmul's order). SwizzlePass
-/// folds the LDS bank-conflict swizzle (~81% → ~29% conflicts, +82% TF). VectorizePass fuses the
-/// **straight K gather** into `ds_read_b64` (halving the scalar `ds_read_u16` LDS-wait traffic —
-/// `ds_read_u16` 128→64, `ds_read_b64` 0→16 at d=128); it leaves the **transposed V gather** untouched
-/// because [`LdsView::gather_transposed`] packs its `ept` column-strided reads into a single
-/// `store_frag_vec` (no fusible `ept`-scalar-store run), so V stays bit-exact (the naive per-element V
-/// gather is what made VectorizePass corrupt numerics 3.9e-4 → ~1e-1 before). V's strided read is the
-/// residual scalar gather (its register transpose is barrier-bound — see report).
-///
-/// Accumulator carry (all `Frag<F32>`, Col map): `[o_0 .. o_{d/16−1}, att, max, norm]`. `o_df` is the
-/// `[d, q]`-layout PV accumulator for output d-fragment `df` (`q` on the flat lane-axis, matching `att`
-/// / `max` / `norm`); `att` is the per-KV-block QKᵀ temporary (re-zeroed each block, then overwritten
-/// with the softmax weights `P` for PV to consume); `max`/`norm` are the per-Q online-softmax stats
-/// (broadcast across the fragment). O is normalised (`o/norm`) and transpose-scattered in the epilogue.
-#[allow(clippy::needless_range_loop)] // the d-fragment index also drives the output-d tile base
-pub fn flash_attention_fwd(bh: usize, n: usize, d: usize) -> Program {
-    assert!(d.is_multiple_of(EDGE), "head dim d must be a multiple of 16");
-    assert!(bh >= 1, "bh (batch·heads) must be ≥ 1");
-    let nthreads = NUM_WARPS * WARP; // 512
-    let q_blk = NUM_WARPS * EDGE; // 128 — the workgroup Q block (8 warps × 16 rows)
-    // The collaborative 512-thread K/V fill must be VEC4-aligned: `kv_blk·d % (nthreads·4) == 0`. Pick
-    // the smallest multiple of 16 that satisfies it (d=128 → 16 = 1 fragment; d=64 → 32 = 2 fragments —
-    // exactly tk1's KV_BLK=32). Larger `kv_blk` is processed as `kvf = kv_blk/16` KV-fragments.
-    let kv_blk = {
-        let mut kb = EDGE;
-        while !(kb * d).is_multiple_of(nthreads * 4) {
-            kb += EDGE;
-        }
-        kb
-    };
-    let (dfrags, kvf) = (d / EDGE, kv_blk / EDGE);
-    assert!(n.is_multiple_of(q_blk), "N must be a multiple of the workgroup Q block ({q_blk})");
-    assert!(n / kv_blk >= 2, "N must give ≥2 KV blocks (n / kv_blk ≥ 2)");
-
-    let mut b = Builder::new("tk2_fa_fwd");
-    // ABI: output O first, then inputs Q, K, V — each `[bh, n, d]` row-major (bh stacked `[n,d]` slices).
-    let o = b.global::<F32>(bh * n * d);
-    let q = b.global::<BF16>(bh * n * d);
-    let k = b.global::<BF16>(bh * n * d);
-    let v = b.global::<BF16>(bh * n * d);
-
-    // Grid = `bh × (n/q_blk)` workgroups over ONE flat axis, decoded into `(bh_idx, qwg)` — each (b,h)
-    // owns `n/q_blk` consecutive workgroups. `bh_idx·n` is this slice's global ROW base (folded into the
-    // Q origin + K/V stage origin, so the O scatter — expressed off `q_origin` — inherits it for free).
-    let nqb = n / q_blk;
-    let wgid = b.grid_axis(0, (bh * nqb) as i64);
-    let nqb_c = b.idx_const(nqb as i64);
-    let bh_idx = b.idx_div(wgid, nqb_c);
-    let qwg = b.idx_mod(wgid, nqb_c);
-    let n_c = b.idx_const(n as i64);
-    let bh_row = b.idx_mul(bh_idx, n_c); // this (b,h) slice's row base = bh_idx·n
-
-    // 8 warps (512 threads). `tid → (warp, wlane)`: warp `w` owns Q rows `[w·16, w·16+16)` (offset
-    // `warp_qoff`) within its Q block, and reduces/scatters over its own 64 lanes.
-    let tid = b.block_axis(nthreads as i64);
-    let warp_c = b.idx_const(WARP as i64);
-    let edge_c = b.idx_const(EDGE as i64);
-    let warp = b.idx_div(tid, warp_c);
-    let wlane = b.idx_mod(tid, warp_c); // wave-local lane (the ds_bpermute reduce stays per-warp)
-    let warp_qoff = b.idx_mul(warp, edge_c); // this warp's Q-row offset into the [q_blk, d] tile
-
-    // ── LDS tiles: K/V shared [kv_blk, d]. Q is NOT staged through LDS (Probe B): each warp's 16 Q
-    //    rows are warp-PRIVATE, so LDS-staging Q amortised nothing — it only wasted a 32KB (d=128) tile
-    //    that capped occupancy at 1 wg/CU. Q is loaded global→VGPR directly in the prologue below. ──
-    let k_smem = b.define_local::<BF16>(kv_blk * d);
-    let v_smem = b.define_local::<BF16>(kv_blk * d);
-
-    let col_map = Mfma16x16x16Bf16::c_map(); // B / C / accumulator operands (the Col map)
-
-    let epl_kv = kv_blk * d / nthreads; // 512-thread collaborative fill
-    // Movement rides the `tile_move` vocabulary: `FaHooks` carries the raw K/V LDS tiles, their global
-    // sources, and the fill/gather addressing (`tid`/`bh_row`/`epl_kv`/`wlane`/`d`), and
-    // `tile_move::{prefetch, commit, gather}` rebuild the `LdsStage`/`LdsView` internally — byte-identical
-    // to a pre-built handle (the builders emit no IR). K = QKᵀ's A (row map, straight gather, `kvf`
-    // KV-frags per d-slice); V = PV's A (col map, transposed gather, `dfrags` output frags per kv-slice);
-    // K/V shared (no warp off); staged by ALL 512 threads (`tid`), origin = this (b,h)'s row base
-    // `bh_row`, the per-block advance riding `k_base`. Q has no LDS view — it is register-resident.
-    // Q-row origin: the whole [q_blk, d] block base for this workgroup; each warp owns rows
-    // [warp_qoff, warp_qoff+16) within it.
-    let qblk_c = b.idx_const(q_blk as i64);
-    let q_off = b.idx_mul(qwg, qblk_c);
-    let q_origin = b.idx_add(bh_row, q_off); // global Q-row origin = bh_idx·n + qwg·q_blk (in rows)
-
-    // ── prologue: EACH warp loads its own 16 Q rows (its `dfrags` d-slices) global→VGPR directly
-    //    (Probe B — NO LDS staging, NO barrier). `q_row_base` = this warp's global Q-row origin; the
-    //    QKᵀ B-operand fragment (col map) is loop-invariant, so it is hoisted once into VGPRs. ──
-    let q_row_base = b.idx_add(q_origin, warp_qoff);
-    let q_frags: Vec<Val<BF16>> =
-        (0..dfrags).map(|s| load_q_frag_global(&mut b, q, col_map, q_row_base, d, s, wlane)).collect();
-
-    // ── the heterogeneous slot set (DESIGN §3.2). CARRIED (seeded, loop-carried): `o_0..o_{dfrags-1}`
-    //    (f32), `m` (running max), `l` (running norm). TEMPORARIES (no seed, produced+consumed within
-    //    one KV block): `s_0..s_{kvf-1}` (f32 QKᵀ scores, one per KV-fragment), `p_0..p_{kvf-1}` (BF16
-    //    softmax weights — native in the channel, no cast-in-PV). Per-warp registers give each warp its
-    //    own o/m/l over its 16 Q rows (the warp offset rides the addressing, NOT the slot count). ──
-    let o_frags: Vec<Frag<F32>> = (0..dfrags).map(|_| b.define_frag::<F32>(col_map)).collect();
-    let (m_frag, l_frag) = (b.define_frag::<F32>(col_map), b.define_frag::<F32>(col_map));
-    let s_frags: Vec<Frag<F32>> = (0..kvf).map(|_| b.define_frag::<F32>(col_map)).collect();
-    let p_frags: Vec<Frag<BF16>> = (0..kvf).map(|_| b.define_frag::<BF16>(col_map)).collect();
-    let slot_m = dfrags;
-    let slot_l = dfrags + 1;
-    let slot_s = |kf: usize| dfrags + 2 + kf; // s_0..s_{kvf-1}
-    let slot_p = |kf: usize| dfrags + 2 + kvf + kf; // p_0..p_{kvf-1}
-    let mut accs: Vec<AccSlot> = o_frags.iter().map(|&f| AccSlot::F32(f)).collect();
-    accs.extend([AccSlot::F32(m_frag), AccSlot::F32(l_frag)]);
-    accs.extend(s_frags.iter().map(|&f| AccSlot::F32(f)));
-    accs.extend(p_frags.iter().map(|&f| AccSlot::BF16(f)));
-    let mut inited: Vec<Option<Effect>> = o_frags.iter().map(|&f| Some(b.zero_init_frag(f))).collect();
-    inited.push(Some(b.const_init_frag(m_frag, f32::NEG_INFINITY))); // running max seed = −∞
-    inited.push(Some(b.zero_init_frag(l_frag))); // running norm seed = 0
-    inited.extend((0..2 * kvf).map(|_| None)); // s_*, p_*: temporaries (produced fresh each block)
-
-    // Per-cluster read/write slot sets (asymmetric — the point of §3.2). QKᵀ writes only `s_*`; softmax
-    // reads {s_*,m,l,o_*} writes {m,l,p_*,o_*}; PV reads {p_*,o_*} writes {o_*}.
-    let o_idx: Vec<usize> = (0..dfrags).collect();
-    let sm_reads: Vec<usize> = (0..kvf).map(slot_s).chain([slot_m, slot_l]).chain(0..dfrags).collect();
-    let sm_writes: Vec<usize> = [slot_m, slot_l].into_iter().chain((0..kvf).map(slot_p)).chain(0..dfrags).collect();
-    let pv_reads: Vec<usize> = (0..kvf).map(slot_p).chain(0..dfrags).collect();
-
-    // Softmax scale folded into the QKᵀ scores: exp2(score·log2(e)/√d) == exp(score/√d).
-    let scale = std::f32::consts::LOG2_E / (d as f32).sqrt();
-    let scale_bcast = {
-        let s = b.f32(scale);
-        let cs: Vec<Val<F32>> = (0..EPT).map(|_| s).collect();
-        b.vec_build(&cs)
-    };
-    let zero_c = {
-        // QKᵀ's C = 0 (att re-zeroed every KV block — `s_*` are temporaries, not read from the carry).
-        let zs: Vec<Val<F32>> = (0..EPT).map(|_| b.f32(0.0)).collect();
-        b.vec_build(&zs)
-    };
-
-    // ── the three compute bodies, each declaring ONLY the slots it touches ──
-    // QKᵀ: att[kf] = K[kf]·Qᵀ over the `kvf` KV-fragments (each contracting `d` = Σ over `dfrags` `mma`
-    // K-steps). reads nothing (re-zeros); writes the `kvf` `s_*`. K indexed `[s·kvf + kf]`.
-    let qk = Compute::<FaHooks>::new(
-        0,
-        vec![],
-        (0..kvf).map(slot_s).collect::<Vec<_>>(),
-        move |b: &mut Builder, op: Option<&FaOp>, _reads: &[SlotVal], _blk: BlockCounter| {
-            let k_frags = op.expect("QKᵀ consumes gathered K");
-            (0..kvf)
-                .map(|kf| {
-                    let mut att = zero_c;
-                    for s in 0..dfrags {
-                        att = b.mma(k_frags[s * kvf + kf], q_frags[s], att, EPT); // d-slice K·Qᵀ
-                    }
-                    SlotVal::F32(att)
-                })
-                .collect()
-        },
-    );
-
-    // Online softmax (operand = None): reads {s_*, m, l, o_*}, writes {m, l, p_*, o_*}. Reduce over ALL
-    // `kvf·16` KV rows by CHAINING `frag_col_reduce` across the KV-fragments (each fold takes the prior
-    // as its running init) — barrier-free `ds_bpermute`, per warp. Produces `p_*` as BF16.
-    let softmax = Compute::<FaHooks>::new(
-        None,
-        sm_reads,
-        sm_writes,
-        move |b: &mut Builder, _op: Option<&FaOp>, reads: &[SlotVal], _blk: BlockCounter| {
-            let (max_old, norm_old) = (reads[kvf].f32(), reads[kvf + 1].f32());
-            let s: Vec<Val<F32>> = (0..kvf).map(|kf| b.mul(reads[kf].f32(), scale_bcast)).collect();
-            let mut m = max_old; // running max over the kvf fragments (chained reductions)
-            for &sk in &s {
-                m = b.frag_col_reduce(sk, wlane, m, false);
-            }
-            let corr = b.sub(max_old, m);
-            let scale_f = b.exp2(corr); // exp2(max_old − max_new)
-            let mut norm = b.mul(norm_old, scale_f); // rescale, then fold Σ_kv P over the fragments
-            let mut p_bf: Vec<Val<BF16>> = Vec::with_capacity(kvf);
-            for &sk in &s {
-                let sm = b.sub(sk, m);
-                let p = b.exp2(sm); // softmax weights P (f32)
-                norm = b.frag_col_reduce(p, wlane, norm, true);
-                p_bf.push(b.cast_vec_bf16(p)); // cast into the channel (PV reads bf16)
-            }
-            let mut out = vec![SlotVal::F32(m), SlotVal::F32(norm)];
-            out.extend(p_bf.into_iter().map(SlotVal::BF16));
-            for i in 0..dfrags {
-                out.push(SlotVal::F32(b.mul(reads[kvf + 2 + i].f32(), scale_f))); // O *= corr
-            }
-            out
-        },
-    );
-
-    // P·V accumulate (`mma_atb` over `kv`): reads {p_*, o_*}, writes {o_*}. Contract over the `kvf`
-    // KV-fragments: `o_df += Σ_kf mma(V[kf,df], p_kf)`. `P` is native bf16; V is the transposed gather
-    // indexed `[kf·dfrags + df]`.
-    let pv = Compute::<FaHooks>::new(
-        1,
-        pv_reads,
-        o_idx.clone(),
-        move |b: &mut Builder, op: Option<&FaOp>, reads: &[SlotVal], _blk: BlockCounter| {
-            let v_frags = op.expect("PV consumes gathered V");
-            (0..dfrags)
-                .map(|df| {
-                    let mut o = reads[kvf + df].f32();
-                    for kf in 0..kvf {
-                        o = b.mma(v_frags[kf * dfrags + df], reads[kf].bf16(), o, EPT);
-                    }
-                    SlotVal::F32(o)
-                })
-                .collect()
-        },
-    );
-
-    let hooks = FaHooks { k_smem, v_smem, k, v, tid, bh_row, epl_kv, wlane, d, dfrags, kvf };
-    let acc_final = pipeline(
-        &mut b,
-        n / kv_blk, // nblocks (streaming over KV)
-        kv_blk * d, // k_step: the FLAT per-block advance (kv_blk rows · d)
-        2,          // ksteps: gather slices (K, V)
-        &accs,
-        &inited,
-        None, // warp_row: FA wants NO wave-phase ping-pong — warps run disjoint Q rows, so there is
-        // no co-resident load/compute pair to steer (the brief: keep it None)
-        Sched {
-            asm_gather: false,
-            resident: false,
-            commit_drain: CommitDrain::IntrinsicAuto,
-            bare_seals: false,
-            pin_mfma: false,
-        },
-        hooks,
-    )
-    .cluster(Mem::builder().prefetch([0, 1]).gathers([0, 1]).commit(true).build())
-    .cluster(qk)
-    .cluster(softmax)
-    .cluster(pv)
-    .build();
-
-    // ── post-loop: normalize O = o / norm (per q, broadcast across d) and transpose-scatter to O. Each
-    //    warp writes its own 16 Q rows: `q_global = q_origin + warp_qoff + q_in_frag`. ──
-    let norm_vec = b.load_frag_vec(acc_final[slot_l].f32());
-    let recip_norm = b.recip(norm_vec);
-    let d_c = b.idx_const(d as i64);
-    // `q_row_base` (this warp's global Q-row origin) was computed in the prologue (Probe B).
-    let mut roots = Vec::new();
-    for df in 0..dfrags {
-        let o_vec = b.load_frag_vec(acc_final[df].f32());
-        let o_norm = b.mul(o_vec, recip_norm);
-        for inner in 0..EPT {
-            let inner_c = b.idx_const(inner as i64);
-            // o_df is Col-map [d = spread = row, q = flat = col]; scatter to O[q_global, d_global].
-            let (row, col) = b.lane_rc(col_map, wlane, inner_c);
-            let q_global = b.idx_add(q_row_base, col);
-            let qg_d = b.idx_mul(q_global, d_c);
-            let d_global = crate::kernels::offset_by(&mut b, row, df * EDGE);
-            let off = b.idx_add(qg_d, d_global);
-            let val = b.vec_extract(o_norm, inner);
-            roots.push(b.store(o, off, val));
-        }
-    }
-
-    let (ir, sink) = b.finish(&roots);
-    Program { ir, sink, name: "tk2_fa_fwd".into() }
-}
 
 /// Warps per workgroup for the **32×32×8 FA**: 8 warps × 32 Q rows = a `q_blk = 256` block (aiter/HK's
 /// split-Q tiling — Route B). One 512-thread block yields 8 waves = 2 waves/SIMD (**occupancy-2**), the
@@ -546,18 +82,16 @@ type Fa32Op = Vec<Val<BF16>>;
 /// collaborative 512-thread fill's per-thread `epl` elements as `gvec`-wide (b128/b64) load chunks).
 struct Fa32Fill {
     k: Vec<Val<BF16>>,
-    k_dma: Vec<Effect>,
     v: Vec<Val<BF16>>,
 }
 
-/// FA-32's [`Hooks`] — the 32×32×8 movement (natural-K LDS + padded-transposed-V LDS). Rides the SAME
-/// ClusterCx pipeline the 16×16 [`flash_attention_fwd`] drives, but with the 32×32×8 fragment addressing:
-/// each A-operand is a contiguous `EPT_A = 4` `ds_read_b64` run (no register transpose — V's transpose is
-/// done write-side into LDS) rather than the movement layer's 16×16 [`LdsView`] gather. The global fill
+/// FA-32's [`Hooks`] — the 32×32×8 movement (natural-K LDS + padded-transposed-V LDS). Rides the
+/// ClusterCx pipeline with 32×32×8 fragment addressing: each A-operand is a contiguous `EPT_A = 4`
+/// `ds_read_b64` run (no register transpose — V's transpose is done write-side into LDS). The global fill
 /// reads are **b128** coalesced (`load_vec_after`, Phase-2c); the LDS stores stay scalar (the coalesced
 /// write is a fill refinement the barrier-bound kernel doesn't need). Gathered operands round-trip through
 /// a fragment so the WAR barrier consumes a proper store token (the [`Hooks::gather`] contract) — SROA
-/// elides the store/load, exactly as the 16×16 FA.
+/// elides the store/load.
 struct Fa32Hooks {
     k: Buf<BF16>,
     v: Buf<BF16>,
@@ -580,19 +114,13 @@ struct Fa32Hooks {
     half_off: Idx,
     d: usize,
     pitch: usize,
-    /// d128 experimental path: K writes directly to its alternate LDS plane while V remains
-    /// register-staged for the required write-side transpose.
-    direct_k: bool,
-    /// Use waitcnt-opaque LDS operand reads with explicit pipeline readiness waits.
-    asm_gather: bool,
-    /// Register-staged K/V publish through waitcnt-opaque asm writes.
-    asm_commit: bool,
-    /// Four-row dword V prefetch plus packed b64 transposed commit.
-    packed_v: bool,
-    /// Two-crew phase stagger with the 2-cluster MERGED compute (softmax+QKᵀ+P·V in one 32-MFMA cluster so
-    /// the `s_barrier` handoff amortizes like the matmul clone — small clusters lose to the barrier tax).
-    /// When set, `gather(0)` returns K++V concatenated (the merged cluster consumes both).
-    ping_pong: bool,
+    /// The production d128 fast bundle, on/off as ONE switch: waitcnt-opaque LDS gathers (explicit
+    /// readiness waits), register-staged K/V publish through opaque asm writes, four-row packed b64
+    /// transposed-V commit (`v_perm` + `ds_write_b64`, the LDS bank-conflict fix), and the two-crew phase
+    /// stagger over a single MERGED compute cluster (softmax+QKᵀ+P·V in one 32-MFMA cluster so the
+    /// `s_barrier` handoff amortizes like the matmul clone). When set, `gather(0)` returns K++V
+    /// concatenated (the merged cluster consumes both). Cleared for the single-crew register-staged path.
+    fast: bool,
 }
 
 impl Fa32Hooks {
@@ -625,10 +153,6 @@ impl Hooks for Fa32Hooks {
     type Reg = Fa32Fill;
     const PREFETCH_TILES: usize = 2; // 0 = K, 1 = V
 
-    fn prologue_prefetch_tiles(&self) -> Vec<usize> {
-        if self.direct_k { vec![1, 0] } else { vec![0, 1] }
-    }
-
     fn prefetch(
         &mut self,
         b: &mut Builder,
@@ -637,49 +161,14 @@ impl Hooks for Fa32Hooks {
         prev: Option<Fa32Fill>,
         order: &[TileId],
     ) -> (Fa32Fill, Vec<TileId>) {
-        let mut reg = prev.unwrap_or(Fa32Fill { k: Vec::new(), k_dma: Vec::new(), v: Vec::new() });
+        let mut reg = prev.unwrap_or(Fa32Fill { k: Vec::new(), v: Vec::new() });
         let gvec = if self.epl.is_multiple_of(8) { 8 } else { 4 };
         let epl_c = b.idx_const(self.epl as i64);
         let lane_epl = b.idx_mul(self.tid, epl_c);
         let flat_base = b.idx_add(self.bh_row_d, k_base);
         let flat_base = b.idx_add(flat_base, lane_epl);
 
-        if tile == 0 && self.direct_k {
-            let d_c = b.idx_const(self.d as i64);
-            let two = b.idx_const(2);
-            let kstep = b.idx_const((KV_BLK_32 * self.d) as i64);
-            let blk = b.idx_div(k_base, kstep);
-            let parity = self.k_parity(b, blk);
-            let mut deps = order.to_vec();
-            // V is issued first so vmcnt(4) can complete those older register loads while the four
-            // younger direct-K DMAs remain in flight. The prologue has no cluster fence between its
-            // tile prefetches, so carry the V values explicitly into the first DMA's issue order.
-            deps.extend(reg.v.iter().map(|value| value.id));
-            let mut dma = Vec::with_capacity(self.epl / 2);
-            for call in 0..self.epl / 2 {
-                // Each instruction must target one wave-coalesced run of physical LDS dwords. Invert
-                // the XOR layout on the global source because XOR is self-inverse: physical LDS column
-                // `p` receives logical source column `lds_col(row, p)`.
-                let dword = if call == 0 { self.tid } else { offset_by(b, self.tid, call * NUM_WARPS_32 * WARP) };
-                let elem = b.idx_mul(dword, two);
-                let row = b.idx_div(elem, d_c);
-                let physical_col = b.idx_mod(elem, d_c);
-                let logical_col = b.lds_col(row, physical_col, self.d);
-                let row_off = b.idx_mul(row, d_c);
-                let src = b.idx_add(row_off, logical_col);
-                let src = b.idx_add(k_base, src);
-                let src = b.idx_add(self.bh_row_d, src);
-                let dst = b.idx_add(parity, elem);
-                let copy = b.global_load_lds_dword(self.k, src, self.k_lds, dst, &deps);
-                deps = vec![copy.dep()];
-                dma.push(copy);
-            }
-            let anchors = dma.iter().map(|e| e.dep()).collect();
-            reg.k_dma = dma;
-            return (reg, anchors);
-        }
-
-        if tile == 1 && self.packed_v {
+        if tile == 1 && self.fast {
             let warp_c = b.idx_const(WARP as i64);
             let four = b.idx_const(4);
             let two = b.idx_const(2);
@@ -726,46 +215,14 @@ impl Hooks for Fa32Hooks {
 
     fn commit(&mut self, b: &mut Builder, k_base: Idx, reg: &Fa32Fill, war: &[TileId]) -> CommitBatch {
         let k_lds = if war.is_empty() { self.k_lds } else { b.lds_after(self.k_lds, war) };
-        // Keep baseline interning order byte-identical: the intrinsic path historically rebound both
-        // LDS handles before constructing parity expressions.
-        let vt_lds = (!self.direct_k).then(|| if war.is_empty() { self.vt_lds } else { b.lds_after(self.vt_lds, war) });
+        // Keep baseline interning order byte-identical: rebind both LDS handles before the parity math.
+        let vt_lds = if war.is_empty() { self.vt_lds } else { b.lds_after(self.vt_lds, war) };
         let (k_off, vt_off) = {
             let kstep = b.idx_const((KV_BLK_32 * self.d) as i64);
             let blk1 = b.idx_div(k_base, kstep); // committed block index (K & V both write block i+1)
             (self.k_parity(b, blk1), self.v_parity(b, blk1))
         };
-        if self.direct_k {
-            assert!(war.is_empty(), "direct K uses disjoint K2/V3 stages and must not emit a WAR seal");
-            let last_dma = reg.k_dma.last().expect("direct K commit requires issued DMA").dep();
-            let allowed = u8::try_from(reg.k_dma.len()).expect("direct K DMA batch must fit vmcnt");
-            let v_ready = b.swait_vmcnt_allowed(Effect(last_dma), allowed);
-            let mut effects = reg.k_dma.clone();
-            if self.packed_v {
-                effects.extend(commit_transposed_v4_asm(
-                    b,
-                    self.vt_lds,
-                    self.pitch,
-                    &reg.v,
-                    self.tid,
-                    vt_off,
-                    Some(v_ready.dep()),
-                ));
-            } else {
-                effects.extend(commit_transposed_run_asm(
-                    b,
-                    self.vt_lds,
-                    self.pitch,
-                    self.d,
-                    &reg.v,
-                    self.epl,
-                    self.tid,
-                    vt_off,
-                    Some(v_ready.dep()),
-                ));
-            }
-            return CommitBatch::new(effects, CommitCompletion::DirectAndOpaque);
-        }
-        if self.asm_commit {
+        if self.fast {
             assert!(war.is_empty(), "asm K2/V3 commit must target disjoint stages without a WAR seal");
             return CommitBatch::new(
                 commit_run_asm::<Xor>(
@@ -780,24 +237,14 @@ impl Hooks for Fa32Hooks {
                     self.tid,
                     k_off,
                     vt_off,
-                    self.packed_v,
+                    self.fast, // packed V (four-row v_perm + ds_write_b64)
                 ),
                 CommitCompletion::Opaque,
             );
         }
         CommitBatch::new(
             commit_run::<BF16, Xor, Plain>(
-                b,
-                k_lds,
-                self.d,
-                vt_lds.expect("intrinsic FA commit has a V LDS handle"),
-                self.pitch,
-                &reg.k,
-                &reg.v,
-                self.epl,
-                self.tid,
-                k_off,
-                vt_off,
+                b, k_lds, self.d, vt_lds, self.pitch, &reg.k, &reg.v, self.epl, self.tid, k_off, vt_off,
             ),
             CommitCompletion::Intrinsic,
         )
@@ -831,26 +278,17 @@ impl Hooks for Fa32Hooks {
         // partition `lane_rc(S::a_map(), wlane, 0)`; the 4-run start stays 4-aligned so the swizzled K read
         // remains a contiguous `ds_read_b64`.
         let gather_k = |b: &mut Builder, q_in: Idx, half_off: Idx| {
-            gather_run::<BF16, Xor, S>(b, k_lds, self.d, S::M, self.d, q_in, half_off, k_off, self.asm_gather, raw)
+            gather_run::<BF16, Xor, S>(b, k_lds, self.d, S::M, self.d, q_in, half_off, k_off, self.fast, raw)
         };
         let gather_v = |b: &mut Builder, q_in: Idx, half_off: Idx| {
             gather_run::<BF16, Plain, S>(
-                b,
-                vt_lds,
-                self.pitch,
-                self.d,
-                KV_BLK_32,
-                q_in,
-                half_off,
-                vt_off,
-                self.asm_gather,
-                raw,
+                b, vt_lds, self.pitch, self.d, KV_BLK_32, q_in, half_off, vt_off, self.fast, raw,
             )
         };
         let (vecs, gathers) = match slice {
             // 2-cluster ping-pong: the single merged compute cluster consumes BOTH K (QKᵀ) and V (P·V), so
             // gather them together — K fragments first (`dslices`), then V (`dtiles·ksl`).
-            0 if self.ping_pong => {
+            0 if self.fast => {
                 let (mut kv, mut kg) = gather_k(b, q_in, half_off);
                 let (vv, vg) = gather_v(b, q_in, half_off);
                 kv.extend(vv);
@@ -899,8 +337,8 @@ fn mask_ragged_kv(b: &mut Builder, s: Val<F32>, blk: BlockCounter, wlane: Idx, n
     b.add(s, mask)
 }
 
-/// **Streaming FA-forward on the 32×32×8 MFMA** (§Step 6 — the wide-core variant, KEPT SEPARATE from the
-/// frozen 16×16 [`flash_attention_fwd`]). Non-causal, `bh = batch·heads` independent `[bh,n,d]` attentions;
+/// **Streaming FA-forward on the 32×32×8 MFMA** (the wide-core kernel). Non-causal, `bh = batch·heads`
+/// independent `[bh,n,d]` attentions;
 /// 8 warps × 32 Q rows = a `q_blk = 256` block. Assembles the four device-proven 32×32×8 primitives:
 /// QKᵀ (`v_mfma_f32_32x32x8`, `S[kv,q]`, kv on M) → online softmax over kv via [`Builder::acc_row_reduce_32`]
 /// (the `EPT_C = 16` AccDist reduce) → P→PV relayout via [`Builder::pv_relayout_s49`] (`v_perm s49`) → P·V
@@ -913,7 +351,7 @@ fn mask_ragged_kv(b: &mut Builder, s: Val<F32>, blk: BlockCounter, wlane: Idx, n
 /// (scales past `n = 128`, inherits the prefetch/commit/WAR/RAW machinery). Device-gated by
 /// `flash_attention32_matches_reference_on_gfx942` (tight `atol` at d=64 AND d=128).
 /// * **d128** rides the 8-wave two-crew **ping-pong** (`warp_row = warp/4`): HK's phase stagger layered on
-///   the asm-opaque (`asm_gather`/`asm_commit`) register-staged K + PACKED transposed V (`v_perm` + wide
+///   the asm-opaque register-staged K + PACKED transposed V (`v_perm` + wide
 ///   `ds_write_b64`, the LDS bank-conflict fix). The engine runs the warmup in lockstep, then offsets the
 ///   crews (one wave per SIMD each), and every steady cluster seal becomes the workgroup `s_barrier` that
 ///   carries the phase. The opaque LDS movement is what makes the single-parity-half commit race-free under
@@ -945,10 +383,10 @@ pub fn flash_attention_fwd_32_bf16(bh: usize, n: usize, d: usize) -> Program {
 }
 
 /// The single source of the FA-32 production config: validate the public domain (`d ∈ {64,128}`, `n` a
-/// positive Q-block multiple ⇒ tile-exact, never ragged) and dispatch the fastest per-head-dim flags into
-/// the shared [`flash_attention_fwd_32_impl`] engine. `pp = d == 128` selects the whole d128 fast bundle at
-/// once (`asm_gather` + `asm_commit` + `packed_v` + `ping_pong` — the merged two-crew ping-pong, fastest at
-/// every d128 size); d64 clears every flag (single-crew register path). `bf16_o` re-types only the final O
+/// positive Q-block multiple ⇒ tile-exact, never ragged) and dispatch the fastest per-head-dim flag into
+/// the shared [`flash_attention_fwd_32_impl`] engine. `fast = d == 128` selects the whole d128 fast bundle
+/// (asm-opaque gather + commit, packed transposed V, and the merged two-crew ping-pong — fastest at every
+/// d128 size); d64 clears it (single-crew register-staged path). `bf16_o` re-types only the final O
 /// scatter. The config lives HERE and nowhere else.
 fn flash_attention_fwd_32_fastest(bh: usize, n: usize, d: usize, bf16_o: bool) -> Program {
     assert!(matches!(d, 64 | 128), "FA-32 supports only head dimensions d=64 or d=128");
@@ -957,42 +395,14 @@ fn flash_attention_fwd_32_fastest(bh: usize, n: usize, d: usize, bf16_o: bool) -
         n > 0 && n.is_multiple_of(q_blk),
         "FA-32 sequence length n must be a positive multiple of the Q tile ({q_blk})"
     );
-    let pp = d == 128;
-    flash_attention_fwd_32_impl(bh, n, d, false, pp, pp, pp, pp, bf16_o)
+    flash_attention_fwd_32_impl(bh, n, d, d == 128, bf16_o)
 }
 
-/// Test-only constructor forcing direct K below the production crossover for warmup/ragged coverage.
-#[cfg(test)]
-pub(crate) fn flash_attention_fwd_32_direct_k(bh: usize, n: usize, d: usize) -> Program {
-    assert_eq!(d, 128, "ordered direct K is currently defined only for d128");
-    flash_attention_fwd_32_impl(bh, n, d, true, false, false, false, false, false)
-}
-
-/// Test-only direct-K constructor qualifying the packed transposed-V movement experiment.
-#[cfg(test)]
-pub(crate) fn flash_attention_fwd_32_direct_k_packed_v(bh: usize, n: usize, d: usize) -> Program {
-    assert_eq!(d, 128, "packed V is currently defined only for d128");
-    flash_attention_fwd_32_impl(bh, n, d, true, false, false, true, false, false)
-}
-
-/// Test-only direct-K constructor qualifying waitcnt-opaque K/V gathers before phase staggering.
-#[cfg(test)]
-pub(crate) fn flash_attention_fwd_32_direct_k_asm_gather(bh: usize, n: usize, d: usize) -> Program {
-    assert_eq!(d, 128, "ordered direct K is currently defined only for d128");
-    flash_attention_fwd_32_impl(bh, n, d, true, true, false, true, false, false)
-}
-
-/// Test-only long-shape oracle retaining the pre-optimization register-staged K path.
+/// Test-only register-staged oracle: the single-crew intrinsic movement path (`fast = false`) at any `n`
+/// — the ragged-capable + differential reference the production fast path is validated against.
 #[cfg(test)]
 pub(crate) fn flash_attention_fwd_32_register_k(bh: usize, n: usize, d: usize) -> Program {
-    flash_attention_fwd_32_impl(bh, n, d, false, false, false, false, false, false)
-}
-
-/// Test-only register-staged asm movement without asymmetric wave phasing.
-#[cfg(test)]
-pub(crate) fn flash_attention_fwd_32_register_asm(bh: usize, n: usize, d: usize) -> Program {
-    assert_eq!(d, 128, "register asm movement currently requires d128 K2/V3 staging");
-    flash_attention_fwd_32_impl(bh, n, d, false, true, true, false, false, false)
+    flash_attention_fwd_32_impl(bh, n, d, false, false)
 }
 
 /// The output-O buffer handle, monomorphized over its store dtype so the ping-pong FA can ship an
@@ -1006,18 +416,8 @@ enum OutO {
     Bf16(Buf<BF16>),
 }
 
-#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
-fn flash_attention_fwd_32_impl(
-    bh: usize,
-    n: usize,
-    d: usize,
-    direct_k: bool,
-    asm_gather: bool,
-    asm_commit: bool,
-    packed_v: bool,
-    ping_pong: bool,
-    bf16_o: bool,
-) -> Program {
+#[allow(clippy::needless_range_loop)]
+fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o: bool) -> Program {
     use crate::shape::Mfma32x32x8Bf16 as S;
     assert!(d.is_multiple_of(S::M), "FA-32 head dim d must be a multiple of 32");
     assert!(bh >= 1, "bh must be ≥ 1");
@@ -1070,12 +470,12 @@ fn flash_attention_fwd_32_impl(
     // hiding the LDS-write latency instruction-locally is a net win (device-measured +5% at S2048 d128).
     // DISABLED for the occupancy-2 small-`d` shapes (`d = 64`): there a 2nd resident wave already hides
     // that latency, so the double-buffer's extra VGPRs + parity math only regress (~-9%, measured).
-    let double_buf = d >= 128 || direct_k;
+    let double_buf = d >= 128;
     // Lever-2: the 8-wave two-crew phase stagger. `warp_row = warp/4 ∈ {0,1}` splits the 8 waves into a
     // leader crew (warps 0-3) and follower crew (warps 4-7), one wave per SIMD each — HK's `warpid()/4`.
     // The engine runs the warmup in lockstep, then offsets the crews (eq=1 after warmup, eq=0 rebalance in
     // the epilogue), and every steady cluster seal becomes the workgroup `s_barrier` that carries the phase.
-    let warp_row: Option<Idx> = if ping_pong {
+    let warp_row: Option<Idx> = if fast {
         let four = b.idx_const(4);
         Some(b.idx_div(warp, four))
     } else {
@@ -1345,70 +745,38 @@ fn flash_attention_fwd_32_impl(
     let n_c = b.idx_const(n as i64);
     let bh_row = b.idx_mul(pid.slice, n_c);
     let bh_row_d = b.idx_mul(bh_row, d_c);
-    let hooks = Fa32Hooks {
-        k,
-        v,
-        k_lds,
-        vt_lds,
-        double_buf,
-        bh_row_d,
-        tid,
-        epl,
-        q_in,
-        half_off,
-        d,
-        pitch,
-        direct_k,
-        asm_gather,
-        asm_commit,
-        packed_v,
-        ping_pong,
-    };
+    let hooks = Fa32Hooks { k, v, k_lds, vt_lds, double_buf, bh_row_d, tid, epl, q_in, half_off, d, pitch, fast };
     let pipe = pipeline(
         &mut b,
         nblocks,       // nblocks (streaming over KV; ⌈n/kv_blk⌉ — the last block may be ragged)
         KV_BLK_32 * d, // k_step: the FLAT per-block advance (kv_blk rows · d)
         // gather slices: 2 (K, V) normally; 1 MERGED (K++V) for the 2-cluster ping-pong.
-        if ping_pong { 1 } else { 2 },
+        if fast { 1 } else { 2 },
         &accs,
         &inited,
         warp_row, // Some(warp/4) for the ping-pong path enables the two-crew phase stagger; None = single-crew
         Sched {
-            asm_gather,
+            asm_gather: fast,
             resident: false,
             // Lever-3: double-buffered ⇒ drop the WAR seal (commit/gather touch disjoint parity halves).
-            commit_drain: if asm_commit {
+            commit_drain: if fast {
                 CommitDrain::AsmPublishedNoWar
-            } else if direct_k {
-                CommitDrain::DirectDeferred
             } else if double_buf {
                 CommitDrain::IntrinsicNoWar
             } else {
                 CommitDrain::IntrinsicAuto
             },
-            bare_seals: asm_commit,
+            bare_seals: fast,
             pin_mfma: false,
         },
         hooks,
     );
-    let pipe = if direct_k {
-        pipe.warmup_cluster(Mem::builder().prefetch([1]).gathers([0]).prefetch_after_gathers([0]).commit(true).build())
-            .warmup_cluster(qk_warmup)
-            .warmup_cluster(Mem::builder().publish(true).build())
-            .warmup_seed(slot_s)
-    } else {
-        pipe.warmup_cluster(Mem::builder().prefetch([0, 1]).gathers([0]).commit(true).build())
-            .warmup_cluster(qk_warmup)
-            .warmup_seed(slot_s)
-    };
+    let pipe = pipe
+        .warmup_cluster(Mem::builder().prefetch([0, 1]).gathers([0]).commit(true).build())
+        .warmup_cluster(qk_warmup)
+        .warmup_seed(slot_s);
     let pipe = if ragged { pipe.scoped_regions() } else { pipe };
-    let acc_final = if direct_k {
-        pipe.cluster(Mem::builder().prefetch([1]).gathers([0, 1]).prefetch_after_gathers([0]).commit(true).build())
-            .cluster(qk_softmax)
-            .cluster(pv)
-            .cluster(Mem::builder().publish(true).build())
-            .build()
-    } else if ping_pong {
+    let acc_final = if fast {
         // 2-cluster ping-pong: Mem (prefetch next K+V, gather the MERGED K++V, commit) + the merged 32-MFMA
         // compute. 2 `s_barrier`s/block, amortizing the phase handoff over 32 MFMAs (the matmul-clone ratio,
         // which beats single-crew). The 3-cluster variant (separate softmax/PV clusters for aiter's cross-crew
@@ -1465,13 +833,13 @@ fn flash_attention_fwd_32_impl(
         q_in_d,
         half_off_d,
         vt_off_drain,
-        asm_gather,
+        fast,
         &end_dep,
     );
     // The V `ds_read`s are async — WAIT for them (`lgkmcnt(0)`) before the P·V MMA consumes `v_frags`.
     let drain_wait = b.swait_lgkmcnt(*gathers.last().expect("V gather emits ≥1 read")).dep();
     let v_frags: Vec<Val<BF16>> =
-        if asm_gather { v_frags.into_iter().map(|v| b.opaque_ready_b64(v, drain_wait)).collect() } else { v_frags };
+        if fast { v_frags.into_iter().map(|v| b.opaque_ready_b64(v, drain_wait)).collect() } else { v_frags };
     let s_scaled = b.mul(s_last, scale_bcast);
     let s_scaled = if ragged {
         mask_ragged_kv(&mut b, s_scaled, BlockCounter::Epilogue((nblocks - 1) as i64, drain_scope), wlane_d, n)

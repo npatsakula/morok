@@ -1,7 +1,6 @@
-//! Criterion GPU-device-time bench comparing the **32×32×8 FA** ([`svod_tk2::kernels::fa::flash_attention_fwd_32`],
-//! §Step 6) against the frozen **16×16×16 FA** ([`svod_tk2::kernels::fa::flash_attention_fwd`]) at matched
-//! attention shapes — the "does 32×32×8 close the gap" headline. Both are gated `allclose` at a small shape
-//! before timing; device time via the shared [`common`] harness.
+//! GPU-device-time bench for the **32×32×8 FA** ([`svod_tk2::kernels::fa::flash_attention_fwd_32`]) at
+//! realistic attention shapes, plus the aiter-matched **bf16 O** variant. Each config is gated `allclose`
+//! at a small shape before timing; device time via the shared [`common`] harness.
 //!
 //! FA-32 rides the rolled ClusterCx KV pipeline with register-staged prefetch/commit, XOR-swizzled K,
 //! padded-transposed V, d128 K double-buffering, a three-plane V rotation, and softmax EXP grouped under
@@ -20,15 +19,14 @@ use svod_tensor::Tensor;
 mod common;
 use common::{plan_gpu_ns, rand_bf16, requirements_met};
 
-use svod_tk2::kernels::fa::{flash_attention_fwd, flash_attention_fwd_32, flash_attention_fwd_32_bf16};
-use svod_tk2::{SwizzlePass, VectorizePass, graph_kernel};
+use svod_tk2::kernels::fa::{flash_attention_fwd_32, flash_attention_fwd_32_bf16};
+use svod_tk2::{SwizzlePass, graph_kernel};
 
 /// The FA kernel under measurement. `N32` = the production 32×32×8 FA (d128 rides the 8-wave two-crew
 /// phase-stagger ping-pong, d64 the single-crew path); `Bf16` = the same production config but with the
 /// aiter-matched **bf16 O** store (half the O write bytes, d128).
 #[derive(Copy, Clone, PartialEq, Debug)]
 enum Fa {
-    N16,
     N32,
     Bf16,
 }
@@ -36,7 +34,6 @@ enum Fa {
 impl Fa {
     fn name(self) -> &'static str {
         match self {
-            Fa::N16 => "FA-16",
             Fa::N32 => "FA-32",
             Fa::Bf16 => "FA-32bf16",
         }
@@ -145,7 +142,6 @@ fn plan_of(fa: Fa, bh: usize, s: usize, d: usize, q: &Tensor, k: &Tensor, v: &Te
         Fa::N32 => flash_attention_fwd_32(bh, s, d).apply(SwizzlePass),
         // bf16-O production FA-32: identical schedule, O truncated f32→bf16 at the store (half the O bytes).
         Fa::Bf16 => flash_attention_fwd_32_bf16(bh, s, d).apply(SwizzlePass),
-        Fa::N16 => flash_attention_fwd(bh, s, d).apply(VectorizePass).apply(SwizzlePass),
     };
     let out = Tensor::empty(&[bh * s, d], fa.out_dtype());
     let mut y = graph_kernel(prog, out, &[q, k, v]).expect("wrap FA as graph node");
@@ -204,10 +200,7 @@ fn measure(config: Measurement<'_>, fa: Fa, q: &Tensor, k: &Tensor, v: &Tensor) 
     plan.execute().expect("execute");
     let iters = 50u64;
     let avg_ns = plan_gpu_ns(&plan, iters) as f64 / iters as f64;
-    // Counters for the FA-32 kernels under study (the 16×16 baseline is profiled by the `fa` bench).
-    if fa != Fa::N16 {
-        profile_pmc(&plan, &format!("{} {} S{s} d{d}", fa.name(), label.trim()));
-    }
+    profile_pmc(&plan, &format!("{} {} S{s} d{d}", fa.name(), label.trim()));
     fa_flops_noncausal(bh, s, d) as f64 / avg_ns / 1e3 // TF
 }
 
@@ -216,12 +209,11 @@ fn main() {
         eprintln!("svod-tk2 FA-32 bench: skipped (device is not a supported gfx942 GPU)");
         return;
     }
-    eprintln!("\n=== tk2 FA: 32×32×8 (rolled ClusterCx pipeline) vs 16×16×16 (tuned pipeline) — REAL device TF ===\n");
+    eprintln!("\n=== tk2 FA-32: 32×32×8 rolled ClusterCx pipeline — REAL device TF ===\n");
     let input_dist = InputDist::from_env();
     eprintln!("  input distribution: {input_dist:?} (select with SVOD_FA_INPUT)\n");
     gate(Fa::N32, 2, 256, 128);
     gate(Fa::N32, 2, 1024, 128); // the d128 production ping-pong at a longer stream
-    gate(Fa::N16, 2, 256, 128);
     gate(Fa::Bf16, 2, 256, 128); // bf16-O production FA-32 (aiter-matched O store)
 
     // (label, b, h, S, d) — machine-filling large-S shapes plus short-context ones. All S are ≥256 and
@@ -237,15 +229,14 @@ fn main() {
         ("b16·h16", 16, 16, 256, 64),
         ("b8·h16 ", 8, 16, 256, 64),
     ];
-    eprintln!("  {:<9} {:>6} {:>4} {:>6}    {:>10}  {:>10}", "shape", "S", "d", "wgs", "FA-16 TF", "FA-32 TF");
+    eprintln!("  {:<9} {:>6} {:>4} {:>6}    {:>10}", "shape", "S", "d", "wgs", "FA-32 TF");
     for (label, bb, hh, s, d) in configs {
         let bh = bb * hh;
         let wgs = bh * (s / 256);
         let (q, k, v) = input_dist.inputs(&[bh * s, d]);
         let measurement = Measurement { label, bh, s, d };
-        let tf16 = measure(measurement, Fa::N16, &q, &k, &v);
         let tf32 = measure(measurement, Fa::N32, &q, &k, &v);
-        eprintln!("  {label} {s:>6} {d:>4} {wgs:>6}    {tf16:>10.1}  {tf32:>10.1}");
+        eprintln!("  {label} {s:>6} {d:>4} {wgs:>6}    {tf32:>10.1}");
     }
 
     // ── bf16-O headline: the aiter-API match. FA-32 is memory-bound and O is ~11% of its traffic as f32,

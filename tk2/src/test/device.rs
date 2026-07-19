@@ -394,56 +394,6 @@ fn fa_ref(qf: &[f32], kf: &[f32], vf: &[f32], n: usize, d: usize) -> Vec<f32> {
     o
 }
 
-/// **FA-forward correctness GATE**: the multi-warp (8-warp split-Q), online-softmax FA on the ClusterCx
-/// pipeline ([`crate::kernels::fa::flash_attention_fwd`]) must match the f32 reference (non-causal, same
-/// bf16-rounded operands) at d=64 AND d=128, over `bh > 1` INDEPENDENT attentions (`[bh,n,d]` layout —
-/// this validates the per-(b,h) base addressing on top of the QKᵀ inner-d loop, the two `ds_bpermute`
-/// softmax reductions, the online rescale, and the `mma_atb` P·V). `atol = 0.02·√d`, `rtol = 2e-2`.
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::flash_attention_matches --nocapture`
-#[test]
-#[ignore]
-fn flash_attention_matches_reference_on_gfx942() {
-    use svod_tensor::testing::allclose_f32;
-    let dev = svod_dtype::default_device::default_device();
-    let n = 128usize;
-    for (bh, d) in [(3usize, 64usize), (2usize, 128usize)] {
-        // Q/K/V are `[bh·n, d]` (= `[bh, n, d]` flat) — bh stacked independent attentions.
-        let mut q = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand q");
-        let mut k = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand k");
-        let mut v = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand v");
-        q.realize().expect("realize q");
-        k.realize().expect("realize k");
-        v.realize().expect("realize v");
-        let (qf, kf, vf) = (as_f32_vec(&q), as_f32_vec(&k), as_f32_vec(&v));
-        // Reference: `bh` independent `[n,d]` attentions, each at global row base `s·n`.
-        let mut expected = vec![0f32; bh * n * d];
-        for s in 0..bh {
-            let z = s * n * d;
-            let o_s = fa_ref(&qf[z..z + n * d], &kf[z..z + n * d], &vf[z..z + n * d], n, d);
-            expected[z..z + n * d].copy_from_slice(&o_s);
-        }
-        // TIGHT atol: the honest bf16-P-cast error is ~2e-3, so a fixed 1e-2 passes correct FA with
-        // margin while REJECTING a corrupted-but-plausible result (a mis-fused V gather → ~1e-1 error,
-        // which the old `0.02·√d`≈0.23 tolerance wrongly passed). This gate DELIBERATELY runs with
-        // VectorizePass on to catch any V-gather mis-fusion regression.
-        let atol = 1e-2;
-
-        // Vectorize.then(Swizzle) (matmul's order): VectorizePass now fuses ONLY the straight K gather
-        // into `ds_read_b64` — the transposed V gather packs its strided reads into a single
-        // `store_frag_vec` (see `LdsView::gather_transposed`), presenting no fusible scalar run, so the
-        // pass leaves V bit-exact. SwizzlePass folds the LDS bank swizzle (+82% TF).
-        let prog = crate::kernels::fa::flash_attention_fwd(bh, n, d).apply(VectorizePass).apply(SwizzlePass);
-        let out = Tensor::empty(&[bh * n, d], DType::Float32);
-        let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA program");
-        let plan = y.prepare().expect("prepare FA");
-        plan.execute().expect("execute FA");
-        let got = y.as_vec::<f32>().expect("read FA output");
-        let report = allclose_f32(&got, &expected, atol, 2e-2);
-        println!("FA-forward bh={bh} n={n} d={d}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
-        assert!(report.ok, "FA-forward bh={bh} n={n} d={d} must match the f32 reference: {}", report.message);
-    }
-}
-
 /// **FA-32 correctness GATE** (§Step 6): the 32×32×8-MFMA FA ([`crate::kernels::fa::flash_attention_fwd_32`],
 /// kept SEPARATE from the frozen 16×16 FA) must match the SAME f32 reference (non-causal, bf16-rounded
 /// operands) at d=64 AND d=128, over `bh > 1` independent `[bh,n,d]` attentions — validating the assembled
@@ -498,38 +448,18 @@ fn flash_attention32_matches_reference_on_gfx942() {
         }
         let atol = 1e-2;
         // SwizzlePass folds the K-tile LDS bank swizzle (the as-used tuned path); the gate runs it on to
-        // catch any swizzle-layout regression (fill/gather must agree on `lds_col(row, …, d)`).
-        let mut variants = if n.is_multiple_of(Q_BLK) {
-            vec![("production", crate::kernels::fa::flash_attention_fwd_32(bh, n, d).apply(SwizzlePass))]
-        } else {
-            vec![(
-                "qualification-register-K",
-                crate::kernels::fa::flash_attention_fwd_32_register_k(bh, n, d).apply(SwizzlePass),
-            )]
-        };
-        if d == 128 {
-            variants.push((
-                "qualification-direct-K",
-                crate::kernels::fa::flash_attention_fwd_32_direct_k(bh, n, d).apply(SwizzlePass),
-            ));
-            variants.push((
-                "qualification-direct-K-packed-V",
-                crate::kernels::fa::flash_attention_fwd_32_direct_k_packed_v(bh, n, d).apply(SwizzlePass),
-            ));
-            variants.push((
-                "qualification-register-asm",
-                crate::kernels::fa::flash_attention_fwd_32_register_asm(bh, n, d).apply(SwizzlePass),
-            ));
-            if n.is_multiple_of(Q_BLK) {
-                // The 8-wave two-crew phase stagger over the asm-opaque movement. Its correctness proves the
-                // single-parity-half commit is race-free under a lagged crew (the reason the prior compiler-
-                // visible stagger deadlocked); the 3× replay exposes any residual LDS stage/overwrite race.
-                variants.push((
-                    "qualification-pingpong",
-                    crate::kernels::fa::flash_attention_fwd_32(bh, n, d).apply(SwizzlePass),
-                ));
-            }
+        // catch any swizzle-layout regression (fill/gather must agree on `lds_col(row, …, d)`). Two kernels:
+        // the PRODUCTION fast path (tile-exact `n` only — d128 ping-pong / d64 single-crew) and the
+        // register-staged ORACLE (any `n`, the ragged + differential reference). The 3× replay per variant
+        // exposes any residual LDS stage/overwrite race in the fast path's asm-opaque movement.
+        let mut variants = Vec::new();
+        if n.is_multiple_of(Q_BLK) {
+            variants.push(("production", crate::kernels::fa::flash_attention_fwd_32(bh, n, d).apply(SwizzlePass)));
         }
+        variants.push((
+            "qualification-register-K",
+            crate::kernels::fa::flash_attention_fwd_32_register_k(bh, n, d).apply(SwizzlePass),
+        ));
         for (variant, prog) in variants {
             let out = Tensor::empty(&[rows, d], DType::Float32);
             let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA-32 program");
@@ -616,9 +546,11 @@ fn flash_attention32_bf16o_matches_reference_on_gfx942() {
     }
 }
 
+/// The d128 PRODUCTION fast path (ping-pong over asm-opaque movement) must be bit-exact to the
+/// register-staged ORACLE at a long stream, replayed 64× to expose any residual LDS stage/overwrite race.
 #[test]
 #[ignore]
-fn flash_attention32_long_direct_k_matches_register_k_on_gfx942() {
+fn flash_attention32_long_production_matches_register_k_on_gfx942() {
     use svod_tensor::testing::allclose_f32;
     let dev = svod_dtype::default_device::default_device();
     let (bh, n, d) = (2usize, 1024usize, 128usize);
@@ -638,24 +570,13 @@ fn flash_attention32_long_direct_k_matches_register_k_on_gfx942() {
 
     let production = crate::kernels::fa::flash_attention_fwd_32(bh, n, d).apply(SwizzlePass);
     let out = Tensor::empty(&[bh * n, d], DType::Float32);
-    let mut got_tensor = graph_kernel(production, out, &[&q, &k, &v]).expect("wrap production direct-K FA");
-    let production_plan = got_tensor.prepare().expect("prepare production direct-K FA");
+    let mut got_tensor = graph_kernel(production, out, &[&q, &k, &v]).expect("wrap production FA");
+    let production_plan = got_tensor.prepare().expect("prepare production FA");
     for run in 0..64 {
-        production_plan.execute().expect("execute production direct-K FA");
-        let got = got_tensor.as_vec::<f32>().expect("read production direct-K FA");
+        production_plan.execute().expect("execute production FA");
+        let got = got_tensor.as_vec::<f32>().expect("read production FA");
         let report = allclose_f32(&got, &expected, 0.0, 0.0);
-        assert!(report.ok, "long direct-K run {run} must be bit-exact to register-K: {}", report.message);
-    }
-
-    let asm = crate::kernels::fa::flash_attention_fwd_32_direct_k_asm_gather(bh, n, d).apply(SwizzlePass);
-    let out = Tensor::empty(&[bh * n, d], DType::Float32);
-    let mut asm_tensor = graph_kernel(asm, out, &[&q, &k, &v]).expect("wrap asm-gather direct-K FA");
-    let asm_plan = asm_tensor.prepare().expect("prepare asm-gather direct-K FA");
-    for run in 0..64 {
-        asm_plan.execute().expect("execute asm-gather direct-K FA");
-        let got = asm_tensor.as_vec::<f32>().expect("read asm-gather direct-K FA");
-        let report = allclose_f32(&got, &expected, 0.0, 0.0);
-        assert!(report.ok, "asm-gather direct-K run {run} must be bit-exact to register-K: {}", report.message);
+        assert!(report.ok, "long production run {run} must be bit-exact to register-K: {}", report.message);
     }
 }
 
@@ -693,36 +614,6 @@ fn runtime_grid_and_bounded_views_rebind_without_recompile() {
         let got = result.as_vec::<f32>().expect("read runtime bounded copy");
         assert_eq!(&got[..n], &expected[..n], "runtime bounded prefix n={n}");
     }
-}
-
-/// **FA-forward `d=16` launch smoke test** on gfx942 — the multi-warp FA at a single head-dim fragment,
-/// where the VEC4-aligned fill forces `kv_blk = 128` (8 KV-fragments, the degenerate `kvf` stress).
-/// Complements the full `flash_attention_matches_reference_on_gfx942` gate (numerics at d=64/128): this
-/// one confirms the `d=16 / kvf=8` shape compiles + executes without a GPU fault and produces finite
-/// output. `n = 256` (2 KV blocks × 2 workgroups over the 128-row Q block).
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::fa_forward_launches --nocapture`
-#[test]
-#[ignore]
-fn fa_forward_launches_on_gfx942() {
-    let (bh, n, d) = (1usize, 256usize, 16);
-    let dev = svod_dtype::default_device::default_device();
-    let mut q = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand q");
-    let mut k = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev.clone()).expect("rand k");
-    let mut v = Tensor::rand_with(&[bh * n, d], DType::BFloat16, dev).expect("rand v");
-    q.realize().expect("realize q");
-    k.realize().expect("realize k");
-    v.realize().expect("realize v");
-
-    let prog = crate::kernels::fa::flash_attention_fwd(bh, n, d).apply(VectorizePass).apply(SwizzlePass);
-    let out = Tensor::empty(&[bh * n, d], DType::Float32);
-    let mut y = graph_kernel(prog, out, &[&q, &k, &v]).expect("wrap FA program");
-    let plan = y.prepare().expect("prepare FA");
-    plan.execute().expect("execute FA on device");
-    let got = y.as_vec::<f32>().expect("read FA output");
-    let finite = got.iter().filter(|x| x.is_finite()).count();
-    let sample = &got[..d.min(8)];
-    println!("FA-forward bh={bh} n={n} d={d}: launched OK, {}/{} finite outputs, sample={sample:?}", finite, got.len());
-    assert!(finite > 0, "FA-forward must produce at least some finite output (launch/exec sanity)");
 }
 
 /// Dump the **DRAM-streaming clustered** kernel's amdgcn LLVM IR + compiled code object to the
@@ -1002,7 +893,7 @@ s_barrier
     );
 }
 
-/// Resource and scheduler regression gate for production and all FA-32 qualification constructors.
+/// Resource and scheduler regression gate for the production kernels and the register-staged oracle.
 /// Rendered LLVM checks validate DSL construction; wait/movement ordering is checked separately against
 /// disassembly of the final production d128 code object. ELF bytes are intentionally not hashed: the
 /// existing golden framework hashes deterministic tile IR, while clang-produced ELF metadata is
@@ -1013,7 +904,7 @@ s_barrier
 fn fa32_stays_within_resource_and_schedule_budget() {
     let device_spec = Tensor::empty(&[1], DType::Float32).device();
     type Constructor = fn(usize, usize, usize) -> crate::Program;
-    let cases: [(&str, usize, Constructor, FaResourceBudget, bool); 7] = [
+    let cases: [(&str, usize, Constructor, FaResourceBudget, bool); 3] = [
         (
             "production-d64",
             64,
@@ -1030,38 +921,10 @@ fn fa32_stays_within_resource_and_schedule_budget() {
             true,
         ),
         (
-            "qualification-forced-direct-k",
-            128,
-            crate::kernels::fa::flash_attention_fwd_32_direct_k,
-            FaResourceBudget { max_vgprs: 232, max_lds: 44_032 },
-            false,
-        ),
-        (
-            "qualification-packed-v",
-            128,
-            crate::kernels::fa::flash_attention_fwd_32_direct_k_packed_v,
-            FaResourceBudget { max_vgprs: 216, max_lds: 44_032 },
-            false,
-        ),
-        (
-            "qualification-opaque-gather",
-            128,
-            crate::kernels::fa::flash_attention_fwd_32_direct_k_asm_gather,
-            FaResourceBudget { max_vgprs: 240, max_lds: 44_032 },
-            false,
-        ),
-        (
             "qualification-register-oracle",
             128,
             crate::kernels::fa::flash_attention_fwd_32_register_k,
             FaResourceBudget { max_vgprs: 240, max_lds: 44_032 },
-            false,
-        ),
-        (
-            "qualification-register-asm",
-            128,
-            crate::kernels::fa::flash_attention_fwd_32_register_asm,
-            FaResourceBudget { max_vgprs: 232, max_lds: 44_032 },
             false,
         ),
     ];

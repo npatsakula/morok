@@ -218,78 +218,12 @@ fn gather_run_rejects_truncated_geometry() {
 }
 
 #[test]
-fn fa32_direct_k_has_ordered_partial_waits_and_tail_publication() {
-    fn counts(n: usize) -> (usize, usize, usize, usize, usize) {
-        let p = crate::kernels::fa::flash_attention_fwd_32_direct_k(1, n, 128).apply(crate::SwizzlePass);
-        lower::verify(&p).expect("direct-K FA must lower spec-valid");
-        let live = crate::passes::reachable(&p.ir, p.sink);
-        let direct = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::GlobalLoadLdsDword { .. })).count();
-        let partial =
-            live.iter().filter(|&&id| matches!(p.ir.node(id), Node::SWaitVmcnt { allowed_outstanding: 4, .. })).count();
-        let full =
-            live.iter().filter(|&&id| matches!(p.ir.node(id), Node::SWaitVmcnt { allowed_outstanding: 0, .. })).count();
-        let writes = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsWriteB16 { .. })).count();
-        let lds_drains = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::SWaitLgkmcnt { .. })).count();
-        (direct, partial, full, writes, lds_drains)
-    }
-
-    assert_eq!(
-        counts(64),
-        (8, 2, 2, 16, 3),
-        "two-block direct K has prologue + warmup transfers and the existing final-V gather drain"
-    );
-    assert_eq!(
-        counts(96),
-        (12, 3, 3, 24, 4),
-        "one steady trip adds one four-dword K issue, partial/full wait pair, V commit, and LDS drain"
-    );
-}
-
-#[test]
-fn fa32_packed_v_replaces_scalar_writes() {
-    for (n, expected_permutes, expected_writes) in [(64usize, 8usize, 4usize), (96, 12, 6)] {
-        let p = crate::kernels::fa::flash_attention_fwd_32_direct_k_packed_v(1, n, 128).apply(crate::SwizzlePass);
-        lower::verify(&p).expect("packed-V direct-K FA must lower spec-valid");
-        let live = crate::passes::reachable(&p.ir, p.sink);
-        let permutes = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::VPermAsm { .. })).count();
-        let writes = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsWriteB64 { hk_form: true, .. })).count();
-        let scalar = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsWriteB16 { .. })).count();
-        assert_eq!((permutes, writes, scalar), (expected_permutes, expected_writes, 0));
-    }
-}
-
-#[test]
-fn fa32_direct_k_opaque_gathers_are_explicitly_readied_without_phase() {
-    for (n, expected_reads, expected_waits) in [(64usize, 64usize, 5usize), (96, 96, 7)] {
-        let p = crate::kernels::fa::flash_attention_fwd_32_direct_k_asm_gather(1, n, 128).apply(crate::SwizzlePass);
-        lower::verify(&p).expect("opaque-gather direct-K FA must lower spec-valid");
-        let live = crate::passes::reachable(&p.ir, p.sink);
-        let reads = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsReadB64 { .. })).count();
-        let waits = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::SWaitLgkmcnt { .. })).count();
-        let phases = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::WaveBarrier { .. })).count();
-        assert_eq!(reads, expected_reads, "unexpected opaque K/V gather count at S={n}");
-        assert_eq!(waits, expected_waits, "unexpected gather/publication readiness count at S={n}");
-        assert_eq!(phases, 0, "asm gather must be qualified before enabling wave-phase staggering");
-    }
-}
-
-#[test]
-fn fa32_register_asm_publication_is_qualification_only_and_unphased() {
-    let p = crate::kernels::fa::flash_attention_fwd_32_register_asm(1, 64, 128).apply(crate::SwizzlePass);
-    lower::verify(&p).expect("register-asm FA must lower spec-valid");
-    let live = crate::passes::reachable(&p.ir, p.sink);
-    let direct = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::GlobalLoadLdsDword { .. })).count();
-    let k_writes = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsWriteB64 { hk_form: true, .. })).count();
-    let v_writes = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsWriteB16 { .. })).count();
-    let phases = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::WaveBarrier { .. })).count();
-    assert_eq!((direct, k_writes, v_writes, phases), (0, 4, 16, 0));
-}
-
-#[test]
 fn fa32_final_asm_v_gather_is_tied_through_opaque_readiness() {
     use crate::ir::TileId;
 
-    let p = crate::kernels::fa::flash_attention_fwd_32_direct_k_asm_gather(1, 64, 128).apply(crate::SwizzlePass);
+    // The d128 production (fast) path gathers V through waitcnt-opaque asm reads, so the post-loop DRAIN
+    // must tie every final P·V V operand through the drain's lgkmcnt readiness (`opaque_ready_b64`).
+    let p = crate::kernels::fa::flash_attention_fwd_32(1, 512, 128).apply(crate::SwizzlePass);
     let live = crate::passes::reachable(&p.ir, p.sink);
     let drain_wait = live
         .iter()
@@ -341,49 +275,6 @@ fn fa32_public_d128_routes_to_two_crew_pingpong() {
 }
 
 #[test]
-fn fa32_production_long_d128_uses_only_promoted_movement() {
-    fn underlying_buf(ir: &TileIr, mut id: crate::TileId) -> crate::TileId {
-        while let Node::After { val, .. } = ir.node(id) {
-            id = *val;
-        }
-        id
-    }
-
-    // The single-crew packed-V movement (the public d128 default now routes to the two-crew ping-pong).
-    let p = crate::kernels::fa::flash_attention_fwd_32_direct_k_packed_v(1, 2048, 128).apply(crate::SwizzlePass);
-    let live = crate::passes::reachable(&p.ir, p.sink);
-    let direct = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::GlobalLoadLdsDword { .. })).count();
-    let intrinsic_gathers = live
-        .iter()
-        .filter(|&&id| match p.ir.node(id) {
-            Node::LoadVecAt { buf, .. } => matches!(p.ir.node(underlying_buf(&p.ir, *buf)), Node::DefineLocal { .. }),
-            _ => false,
-        })
-        .count();
-    let scalar_v_writes = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsWriteB16 { .. })).count();
-    let opaque_gathers = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsReadB64 { .. })).count();
-    let packed_v_permutes = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::VPermAsm { .. })).count();
-    let b64_publications = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::DsWriteB64 { .. })).count();
-    let phases = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::WaveBarrier { .. })).count();
-    assert_eq!(direct, 12, "production long d128 must use direct K in all three authored regions");
-    assert_eq!(intrinsic_gathers, 96, "production long d128 must retain compiler-visible K/V gathers");
-    // Production long d128 now publishes V with the PACKED transposed write (v_perm register-transpose +
-    // wide `ds_write_b64`, the +8-10% bank-conflict fix) instead of the scalar `ds_write_b16` scatter: the
-    // narrow b16 write conflicted ~16-way (consecutive fill lanes address d-rows 8 apart → stride 16 mod 32).
-    assert_eq!(scalar_v_writes, 0, "production long d128 must use packed (not scalar b16) transposed-V publication");
-    assert_eq!(
-        (packed_v_permutes, b64_publications),
-        (12, 6),
-        "production long d128 packed V = v_perm transposes + wide ds_write_b64 across the three authored regions"
-    );
-    assert_eq!(
-        (opaque_gathers, phases),
-        (0, 0),
-        "opaque asm gather and phase staggering remain qualification-only on the production path"
-    );
-}
-
-#[test]
 fn fa32_pingpong_constructs_balanced_and_lowers() {
     // The d128 production kernel (the ping-pong) must CONSTRUCT (both `pipeline::verify`'s wave-phase balance
     // check and the `verify_v2` scheduling gate run at build time), carry EXACTLY one eq=1 stagger seed + one
@@ -431,54 +322,6 @@ fn fa32_public_domain_is_tile_exact_and_head_dim_restricted() {
     }
 }
 
-#[test]
-fn fa32_partial_vmem_wait_follows_older_v_loads_and_four_younger_dmas() {
-    let p = crate::kernels::fa::flash_attention_fwd_32_direct_k(1, 64, 128).apply(crate::SwizzlePass);
-    let live = crate::passes::reachable(&p.ir, p.sink);
-    let waits: Vec<_> = live
-        .iter()
-        .copied()
-        .filter(|&id| matches!(p.ir.node(id), Node::SWaitVmcnt { allowed_outstanding: 4, .. }))
-        .collect();
-    assert!(!waits.is_empty(), "direct-K must contain a vmcnt(4) queue wait");
-    for wait in waits {
-        let Node::SWaitVmcnt { anchor, .. } = p.ir.node(wait) else { unreachable!() };
-        let mut current = *anchor;
-        let mut current_dmas = Vec::new();
-        for i in 0..4 {
-            let Node::GlobalLoadLdsDword { deps, .. } = p.ir.node(current) else {
-                panic!("vmcnt(4) anchor chain entry {i} is not a direct K DMA")
-            };
-            current_dmas.push(current);
-            if i != 3 {
-                current = deps
-                    .iter()
-                    .copied()
-                    .find(|&id| matches!(p.ir.node(id), Node::GlobalLoadLdsDword { .. }))
-                    .expect("the four younger K DMAs must form one issue-order chain");
-            }
-        }
-        let first_dma = *current_dmas.last().expect("four DMAs");
-        let cone = crate::passes::reachable(&p.ir, first_dma);
-        let older_v: Vec<_> = cone
-            .iter()
-            .copied()
-            .filter(|&id| {
-                let Node::LoadVecAt { mut buf, .. } = p.ir.node(id).clone() else {
-                    return false;
-                };
-                while let Node::After { val, .. } = p.ir.node(buf) {
-                    buf = *val;
-                }
-                matches!(p.ir.node(buf), Node::Global { slot: 3, .. })
-            })
-            .collect();
-        assert!(!older_v.is_empty(), "the partial wait must be ordered after the older staged V load");
-        assert_eq!(current_dmas.len(), 4);
-        assert!(current_dmas.iter().all(|id| id.0 < wait.0));
-    }
-}
-
 // ── the verified lowering ────────────────────────────────────────────────────
 
 #[test]
@@ -518,48 +361,6 @@ fn matmul_lds_kblock_clustered_lowers_and_balances_the_wave_phase() {
 }
 
 // ── the FA-forward experiment: the ClusterCx pipeline generalised to a second kernel shape ─────
-
-/// The minimal streaming Flash-Attention forward ([`crate::kernels::fa::flash_attention_fwd`])
-/// authored on the SAME `pipeline` combinator as the GEMM: `Mem`(gather K,V + prefetch/commit) →
-/// `Compute`(QKᵀ) → `Compute`(online softmax, operand-less) → `Compute`(PV). It must lower to
-/// spec-valid device-UOp — proving the new vocabulary (`exp2`/`recip`/`ds_bpermute` row reductions)
-/// and the operand-less softmax cluster survive lowering + `type_verify`. (Device NUMERICS are a
-/// separate, partly-stubbed matter — see the module docs; this asserts the STRUCTURE compiles.)
-#[test]
-fn fa_forward_on_clustercx_lowers_spec_valid() {
-    let count = |p: &crate::Program, pred: &dyn Fn(&Node) -> bool| {
-        (0..p.ir.len()).filter(|&i| pred(p.ir.node(crate::ir::TileId(i as u32)))).count()
-    };
-    // bh=2, 8-warp split-Q, kv_blk=32 (2 KV-frags); Vectorize.then(Swizzle) = the production form (K
-    // gather fused to ds_read_b64 + the bank-conflict swizzle fold).
-    let p = crate::kernels::fa::flash_attention_fwd(2, 128, 64)
-        .apply(crate::passes::VectorizePass)
-        .apply(crate::passes::SwizzlePass);
-    lower::verify(&p).expect("FA-forward on ClusterCx must lower to spec-valid UOp");
-    // The novel FA vocabulary is present: exp2 (2×/iter), recip (normalize), and the ds_bpermute
-    // cross-lane reduction tree (3 shuffles × 2 reductions/iter).
-    assert!(count(&p, &|n| matches!(n, Node::Unary { .. })) >= 3, "softmax ⇒ exp2/recip Unary nodes");
-    assert!(count(&p, &|n| matches!(n, Node::DsBpermute { .. })) >= 6, "row reductions ⇒ ds_bpermute nodes");
-    // The operand-less softmax cluster + the two matmul clusters ⇒ SetPrio brackets, one commit RAW.
-    assert!(count(&p, &|n| matches!(n, Node::Mma { .. })) >= 2, "QKᵀ + PV ⇒ ≥2 MMAs");
-    // Ping-pong-gated compute seals: FA's disjoint-Q warps (`warp_row = None`) exchange only per-warp
-    // registers between QKᵀ/softmax/PV, so those steady compute-cluster seals emit NO workgroup
-    // `s_barrier` (a pure `Node::After` ordering combine instead) — only the load-bearing Mem WAR/RAW
-    // pair survives in the hot loop. Count only barriers REACHABLE from the sink (`count` over the raw
-    // arena double-counts the dead pre-swizzle offset nodes SwizzlePass supersedes). The reachable
-    // `Node::Barrier`s are exactly 4: block-0 K/V commit (prologue) + steady (WAR + RAW = 2) + epilogue
-    // (Mem gather seal). It was 5 before commit 8ec2afe6 (Probe B) dropped the Q-LDS staging, which
-    // removed the prologue Q-commit barrier — this assertion was left stale at 5 by that commit and is
-    // corrected to 4 here. Vectorize.then(Swizzle) does not change the count (VectorizePass only fuses
-    // the K gather's scalar loads, adding/removing no workgroup barrier).
-    let live: std::collections::HashSet<crate::ir::TileId> =
-        crate::passes::reachable(&p.ir, p.sink).into_iter().collect();
-    let nbar = live.iter().filter(|&&id| matches!(p.ir.node(id), Node::Barrier { .. })).count();
-    assert_eq!(
-        nbar, 4,
-        "FA keeps ONLY the Mem WAR/RAW + prologue-commit/epilogue barriers (compute seals ping-pong-gated off)"
-    );
-}
 
 // ── the SchedGroupBarrier interleave primitive (FA-redesign step 2) ──────────────────────────────
 

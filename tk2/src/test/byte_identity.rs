@@ -8,7 +8,7 @@
 
 use crate::ir::{TileId, TileIr};
 use crate::kernels::Program;
-use crate::kernels::fa::{flash_attention_fwd, flash_attention_fwd_32, flash_attention_fwd_32_register_k};
+use crate::kernels::fa::{flash_attention_fwd_32, flash_attention_fwd_32_register_k};
 use crate::kernels::matmul::{Tiling, matmul_lds_kblock_mw_clustered};
 use crate::test::probes::atb_probe;
 use crate::{SwizzlePass, VectorizePass};
@@ -50,7 +50,6 @@ fn sig(p: &Program) -> u64 {
 /// `atb_probe`. Same shapes the device gates use, so a host diff localises what a device gate would.
 fn signatures() -> Vec<(&'static str, u64)> {
     let mm = || matmul_lds_kblock_mw_clustered(256, 256, 256, Tiling::default());
-    let fa = || flash_attention_fwd(2, 128, 128);
     // FA-32 (the 32×32×8 wide-core FA): the `tile_move::{gather_run, commit_run}` derivation of
     // `Fa32Hooks`'s fragment addressing must leave the emitted IR unchanged. `fa32` is the double-buffered
     // (d=128) historical short-shape case; it uses the crate-private register-staged oracle because the
@@ -60,8 +59,6 @@ fn signatures() -> Vec<(&'static str, u64)> {
     vec![
         ("matmul", sig(&mm())),
         ("matmul.vec.sw", sig(&mm().apply(VectorizePass).apply(SwizzlePass))),
-        ("fa", sig(&fa())),
-        ("fa.vec.sw", sig(&fa().apply(VectorizePass).apply(SwizzlePass))),
         ("atb_probe", sig(&atb_probe(16, 64, 64))),
         ("fa32", sig(&fa32())),
         ("fa32.sw", sig(&fa32().apply(SwizzlePass))),
@@ -77,8 +74,6 @@ fn signatures() -> Vec<(&'static str, u64)> {
 const GOLDEN: &[(&str, u64)] = &[
     ("matmul", 0xc592_10e1_e156_59aa),
     ("matmul.vec.sw", 0xb6c6_8775_50c9_547c),
-    ("fa", 0x21cb_5221_fdc1_2b88),
-    ("fa.vec.sw", 0x50d3_dc07_32b9_ac3e),
     ("atb_probe", 0xa506_f161_b28e_11fc),
     // FA-32 golden re-baselined for the compute-software-pipeline ROTATION (fused QKᵀ∥softmax cluster,
     // carried double-buffered `s`, post-loop drain) + the pipeline WAR guard that orders a read-then-
