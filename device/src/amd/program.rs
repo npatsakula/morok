@@ -31,6 +31,99 @@ const R_AMDGPU_ABS64: u32 = 3;
 const R_AMDGPU_REL32: u32 = 4;
 const R_AMDGPU_REL64: u32 = 5;
 
+/// How a dispatch's `(buffers, vals)` map into the kernarg segment.
+///
+/// svod's own clang-emitted kernels lay buffers first (u64 each) then scalars
+/// (i32 each) with no gaps — [`KernargLayout::Conventional`], byte-identical to
+/// the historical packing. An external vendor code object (e.g. aiter's
+/// `bf16gemm*.co`) interleaves pointers, scalars, explicit padding, and pointers
+/// again at fixed 16-byte-strided offsets that no convention predicts — so
+/// [`KernargLayout::Explicit`] carries the exact per-slot placement parsed from
+/// the code object's metadata note ([`super::metadata::parse_amdgpu_metadata`]).
+#[derive(Debug, Clone)]
+pub enum KernargLayout {
+    /// Buffers (8 B GVA) packed first, then scalars (4 B i32), tightly. The slot
+    /// is NOT pre-zeroed — svod's kernels never read past their own args, so the
+    /// arena's stale tail is harmless. Arity comes from `buf_count`/`var_count`.
+    Conventional,
+    /// Explicit per-slot placement. The slot is zeroed first (so padding, hidden
+    /// args, and omitted-null pointers default to 0), then each slot pulls the
+    /// next buffer VA (pointer) or the next scalar (`size` low bytes) and writes
+    /// it at its fixed byte offset. Slot order defines the `(buffers, vals)`
+    /// order the caller must supply.
+    Explicit(Vec<KernargSlot>),
+}
+
+/// One host-filled kernarg slot: a fixed byte offset + how to fill it.
+#[derive(Debug, Clone, Copy)]
+pub struct KernargSlot {
+    /// Byte offset within the kernarg segment.
+    pub offset: usize,
+    /// Whether this slot takes a buffer VA or a scalar value.
+    pub kind: SlotKind,
+}
+
+/// The fill source for a [`KernargSlot`].
+#[derive(Debug, Clone, Copy)]
+pub enum SlotKind {
+    /// An 8-byte GPU VA, from the next `buffers[]` entry.
+    Pointer,
+    /// A `size`-byte scalar, from the low bytes of the next `vals[]` entry.
+    Scalar { size: usize },
+}
+
+impl SlotKind {
+    /// Bytes this slot occupies (pointers are always 8).
+    fn size_bytes(self) -> usize {
+        match self {
+            SlotKind::Pointer => 8,
+            SlotKind::Scalar { size } => size,
+        }
+    }
+}
+
+impl KernargLayout {
+    /// Derive an explicit layout from a parsed kernel's ordered `.args`, skipping
+    /// compiler padding (`by_value` args named `"pad"`) and hidden/injected args
+    /// (they stay zero). Pointer args become [`SlotKind::Pointer`] slots consumed
+    /// from `buffers` in order; by-value args become [`SlotKind::Scalar`] slots
+    /// consumed from `vals` in order — so a caller supplies buffers in
+    /// pointer-declaration order and vals in scalar-declaration order.
+    pub fn from_metadata(meta: &crate::amd::metadata::KernelMeta) -> Self {
+        use crate::amd::metadata::ValueKind;
+        let slots = meta
+            .args
+            .iter()
+            .filter_map(|a| {
+                if a.value_kind.is_hidden() || a.name.as_deref() == Some("pad") {
+                    return None;
+                }
+                let kind = if a.value_kind.is_pointer() {
+                    SlotKind::Pointer
+                } else if matches!(a.value_kind, ValueKind::ByValue) {
+                    SlotKind::Scalar { size: a.size as usize }
+                } else {
+                    return None; // sampler/image/etc. are not host-fillable here
+                };
+                Some(KernargSlot { offset: a.offset as usize, kind })
+            })
+            .collect();
+        KernargLayout::Explicit(slots)
+    }
+
+    /// `(pointer_count, scalar_count)` — the required `(buffers.len, vals.len)`.
+    /// `None` for [`KernargLayout::Conventional`], whose arity lives on the program.
+    fn counts(&self) -> Option<(usize, usize)> {
+        match self {
+            KernargLayout::Conventional => None,
+            KernargLayout::Explicit(slots) => {
+                let ptrs = slots.iter().filter(|s| matches!(s.kind, SlotKind::Pointer)).count();
+                Some((ptrs, slots.len() - ptrs))
+            }
+        }
+    }
+}
+
 /// Pre-execution metadata extracted from a single kernel's ELF.
 #[derive(Debug, Clone)]
 pub struct ParsedKernel {
@@ -272,6 +365,10 @@ pub struct AmdProgram {
     buf_count: usize,
     /// Number of scalar (i64) variable arguments.
     var_count: usize,
+    /// How `(buffers, vals)` map into the kernarg segment. `Conventional` for
+    /// svod's own clang kernels (byte-identical historical packing); `Explicit`
+    /// for an external `.co` loaded via [`AmdProgram::load_external`].
+    kernarg_layout: KernargLayout,
     /// Keep the VRAM code-object buffer alive for the program's lifetime.
     _code_buf: RawBuffer,
 }
@@ -453,14 +550,109 @@ impl AmdProgram {
             kd: parsed.kd,
             buf_count,
             var_count,
+            kernarg_layout: KernargLayout::Conventional,
             _code_buf: code_buf,
         })
+    }
+
+    /// Load an external (non-svod) AMDGPU code object and pack its kernargs at the
+    /// exact offsets its metadata note declares, rather than svod's buffers-first
+    /// convention. `meta` is one entry from [`super::metadata::parse_amdgpu_metadata`]
+    /// over the same `bytes`; its `.symbol` (`"<name>.kd"`) resolves the descriptor
+    /// and its `.args` build the [`KernargLayout::Explicit`] slot list. The caller
+    /// then dispatches with `buffers` in pointer-declaration order and `vals` in
+    /// scalar-declaration order (padding / hidden / null args are omitted and stay
+    /// zero).
+    pub fn load_external(
+        device: Arc<AmdDevice>,
+        allocator: &AmdAllocator,
+        bytes: &[u8],
+        meta: &crate::amd::metadata::KernelMeta,
+    ) -> Result<Self> {
+        let layout = KernargLayout::from_metadata(meta);
+        let (buf_count, var_count) = layout.counts().expect("from_metadata yields Explicit");
+        let kernel_name = meta.symbol.strip_suffix(".kd").unwrap_or(&meta.name);
+        let mut prog = Self::load(device, allocator, bytes, kernel_name, buf_count, var_count)?;
+        // Hand-written asm kernels (aiter) leave the descriptor's `kernarg_size`
+        // field 0 — the HSA loader takes the size from the metadata note instead.
+        // The note is the kernarg-ABI authority, so adopt its segment size (drives
+        // the arena bump + the extent guard below).
+        prog.kd.kernarg_size = meta.kernarg_segment_size as u32;
+        // Every explicit slot must land inside the descriptor's kernarg segment.
+        if let KernargLayout::Explicit(slots) = &layout {
+            let extent = slots.iter().map(|s| s.offset + s.kind.size_bytes()).max().unwrap_or(0);
+            if extent > prog.kernarg_size() {
+                return Err(Error::Runtime {
+                    message: format!(
+                        "AmdProgram::load_external '{kernel_name}': arg extent {extent} > kd.kernarg_size {}",
+                        prog.kernarg_size()
+                    ),
+                });
+            }
+        }
+        prog.kernarg_layout = layout;
+        Ok(prog)
     }
 
     pub(crate) fn kernarg_size(&self) -> usize {
         // KFD-side kernarg_size is the byte count for the entire kernarg
         // record (already includes alignment padding).
         self.kd.kernarg_size as usize
+    }
+
+    /// Byte extent the kernargs occupy — the guard `execute_on` checks against
+    /// `kernarg_size()`. Conventional packs tight (`8·bufs + 4·vars`); Explicit
+    /// is the furthest slot end.
+    fn kernarg_extent(&self) -> usize {
+        match &self.kernarg_layout {
+            KernargLayout::Conventional => self.buf_count * 8 + self.var_count * 4,
+            KernargLayout::Explicit(slots) => slots.iter().map(|s| s.offset + s.kind.size_bytes()).max().unwrap_or(0),
+        }
+    }
+
+    /// Write one kernarg record at `host_base` per this program's layout.
+    ///
+    /// # Safety
+    /// `host_base` must point at a writable region of at least `kernarg_size()`
+    /// bytes owned by the caller for the duration of the dispatch.
+    unsafe fn pack_kernargs(&self, host_base: *mut u8, buffers: &[*mut u8], vals: &[i64]) {
+        unsafe {
+            match &self.kernarg_layout {
+                KernargLayout::Conventional => {
+                    // Buffers (8 B GVA) then scalars (i32, 4 B) — the renderer's
+                    // `(ptr.., i32..)` order. No pre-zero (historical behaviour).
+                    let mut cursor = 0usize;
+                    for buf in buffers {
+                        std::ptr::copy_nonoverlapping((*buf as u64).to_le_bytes().as_ptr(), host_base.add(cursor), 8);
+                        cursor += 8;
+                    }
+                    for v in vals {
+                        std::ptr::copy_nonoverlapping((*v as i32).to_le_bytes().as_ptr(), host_base.add(cursor), 4);
+                        cursor += 4;
+                    }
+                }
+                KernargLayout::Explicit(slots) => {
+                    // Zero first so padding / hidden / omitted-null slots read 0
+                    // (the arena slot carries stale bytes from prior dispatches).
+                    std::ptr::write_bytes(host_base, 0, self.kernarg_size());
+                    let (mut bi, mut vi) = (0usize, 0usize);
+                    for slot in slots {
+                        match slot.kind {
+                            SlotKind::Pointer => {
+                                let bytes = (buffers[bi] as u64).to_le_bytes();
+                                std::ptr::copy_nonoverlapping(bytes.as_ptr(), host_base.add(slot.offset), 8);
+                                bi += 1;
+                            }
+                            SlotKind::Scalar { size } => {
+                                let bytes = (vals[vi] as u64).to_le_bytes();
+                                std::ptr::copy_nonoverlapping(bytes.as_ptr(), host_base.add(slot.offset), size);
+                                vi += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -706,16 +898,13 @@ impl AmdProgram {
                 message: format!("AmdProgram: expected {} scalar vals, got {}", self.var_count, vals.len()),
             });
         }
-        // Kernarg layout:
-        //   - Each buffer argument = 8 bytes (64-bit GPU pointer)
-        //   - Each scalar variable = 4 bytes (uint32)
-        // Scalars pack as i32 because svod's renderer lowers
-        // `Index` → `i32` via `pm_lower_index_dtype`. The kernel descriptor
-        // emitted by clang reflects this — a kernel with `(ptr, ptr, ..., i32
-        // %v0, i32 %v1)` has `kernarg_size = bufs*8 + vars*4`, NOT bufs*8 +
-        // vars*8. Packing each val as 8 bytes here would overflow the
-        // descriptor and corrupt the next kernarg slot in the arena.
-        let needed = self.buf_count * 8 + self.var_count * 4;
+        // Kernarg layout (see `KernargLayout`):
+        //   - Conventional: each buffer = 8 B (64-bit GVA), each scalar = 4 B
+        //     (i32). Scalars pack as i32 because svod's renderer lowers `Index`
+        //     → `i32`; a kernel with `(ptr.., i32..)` has `kernarg_size = bufs*8
+        //     + vars*4`. Packing a val as 8 B would corrupt the next arena slot.
+        //   - Explicit: each slot writes at its parsed byte offset.
+        let needed = self.kernarg_extent();
         if needed > self.kernarg_size() {
             return Err(Error::Runtime {
                 message: format!(
@@ -742,21 +931,10 @@ impl AmdProgram {
         // ordering above guarantees the slot stays valid through dispatch.
         let arena = pool.arena();
         let off = arena.bump(self.kernarg_size(), 16)?;
-        // SAFETY: arena returned a valid slot; the dispatch lock serializes
-        // writers, so no concurrent writer holds the same offset.
+        // SAFETY: arena returned a valid `kernarg_size()` slot; the dispatch lock
+        // serializes writers, so no concurrent writer holds the same offset.
         let host_base = unsafe { arena.host_at(off) };
-        let mut cursor = 0usize;
-        for buf in buffers {
-            let bytes = (*buf as u64).to_le_bytes();
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host_base.add(cursor), 8) };
-            cursor += 8;
-        }
-        for v in vals {
-            // Truncate i64 → i32 to match the kernel's `i32` var dtype.
-            let bytes = (*v as i32).to_le_bytes();
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host_base.add(cursor), 4) };
-            cursor += 4;
-        }
+        unsafe { self.pack_kernargs(host_base, buffers, vals) };
         let kernarg_gpu = arena.gpu_at(off);
 
         // 2. Submit sequence:
@@ -994,6 +1172,45 @@ impl AmdProgram {
             }
             Ok(handle)
         }
+    }
+
+    /// Dispatch once, synchronously, and return the kernel's on-device time in
+    /// nanoseconds (the CP's start/end timestamps, 100 MHz → 10 ns/tick). Mirrors
+    /// the [`Program::execute`] fallback — assigns its own owner and ensures
+    /// scratch — but profiles the dispatch so a bench can read HW device time
+    /// directly, without an [`crate::device::Program`]/`ExecutionPlan` wrapper.
+    /// `global_size` is in workgroups, `local_size` is threads-per-block.
+    ///
+    /// # Safety
+    /// Same contract as [`AmdProgram::execute_on`]: every pointer in `buffers`
+    /// must be a live GPU VA that outlives the dispatch, `vals` must match the
+    /// kernel's scalar arity, and the launch dims must be valid for the kernel.
+    pub unsafe fn execute_timed(
+        &self,
+        buffers: &[*mut u8],
+        vals: &[i64],
+        global_size: Option<[usize; 3]>,
+        local_size: Option<[usize; 3]>,
+    ) -> Result<u64> {
+        let alloc = crate::amd::AmdAllocator::new(self.device_id)?;
+        let owner = self.dev.core().assign_owner(&alloc)?;
+        owner.pool().ensure_has_local_memory(self.kd.private_segment_fixed_size)?;
+        // SAFETY: forwarded to the caller's contract above.
+        let handle = unsafe {
+            self.execute_on(
+                &owner,
+                buffers,
+                vals,
+                global_size,
+                local_size,
+                /*wait=*/ true,
+                /*profile=*/ true,
+            )?
+        };
+        let (start, end) = handle
+            .and_then(|h| h.timestamps_ns())
+            .ok_or_else(|| Error::Runtime { message: format!("AmdProgram '{}': no GPU timestamps", self.name) })?;
+        Ok(end.saturating_sub(start))
     }
 }
 

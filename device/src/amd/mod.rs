@@ -57,7 +57,7 @@ pub use iface::{AllocKind, AllocResult, AmdIface, KfdIface, QueueHandle, RingDes
 pub use kernarg::KernargArena;
 pub use metadata::{KernelArg, KernelMeta, MetadataError, ValueKind, parse_amdgpu_metadata};
 #[cfg(unix)]
-pub use program::AmdProgram;
+pub use program::{AmdProgram, KernargLayout, KernargSlot, SlotKind};
 #[cfg(unix)]
 pub use queue::{AmdComputeQueue, AmdCopyQueue};
 #[cfg(unix)]

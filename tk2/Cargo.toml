@@ -30,6 +30,12 @@ test-case = "3.3.1"
 name = "matmul"
 harness = false
 
+# Vendor comparison: AMD aiter's asm bf16 GEMM loaded via the external-.co launch
+# path (AmdProgram::load_external + parsed kernarg layout), same shapes/data as matmul.
+[[bench]]
+name = "vendor_gemm"
+harness = false
+
 # GPU device-time bench for the FA-32 kernel (plain main) sharing `benches/common.rs`.
 [[bench]]
 name = "fa32"
