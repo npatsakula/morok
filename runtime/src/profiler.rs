@@ -530,8 +530,12 @@ fn render_stage_table(s: &StageProfile) -> String {
             // Device constants are device-wide (same for every dispatch); adopt
             // the first non-zero ones seen.
             if r.derived_ctx.device_simds == 0 {
-                r.derived_ctx =
-                    DerivedCtx { xcc_num: cs.xcc_num, device_simds: cs.device_simds, wall_secs: 0.0, gpu_stamped: false };
+                r.derived_ctx = DerivedCtx {
+                    xcc_num: cs.xcc_num,
+                    device_simds: cs.device_simds,
+                    wall_secs: 0.0,
+                    gpu_stamped: false,
+                };
             }
         }
     }
