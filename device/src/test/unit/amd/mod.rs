@@ -4,6 +4,7 @@
 //! a supported GPU. Module gating mirrors `crate::amd` itself: `topology` and
 //! `sys` compile everywhere; the rest is `cfg(unix)` (KFD/AM FFI).
 
+mod metadata;
 mod occupancy;
 #[cfg(unix)]
 mod pmc;

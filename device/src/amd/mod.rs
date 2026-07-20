@@ -30,6 +30,7 @@ pub mod graph;
 pub mod iface;
 #[cfg(unix)]
 pub mod kernarg;
+pub mod metadata;
 pub mod occupancy;
 #[cfg(unix)]
 pub mod pmc;
@@ -54,6 +55,7 @@ pub use graph::AmdGraph;
 pub use iface::{AllocKind, AllocResult, AmdIface, KfdIface, QueueHandle, RingDesc};
 #[cfg(unix)]
 pub use kernarg::KernargArena;
+pub use metadata::{KernelArg, KernelMeta, MetadataError, ValueKind, parse_amdgpu_metadata};
 #[cfg(unix)]
 pub use program::AmdProgram;
 #[cfg(unix)]
