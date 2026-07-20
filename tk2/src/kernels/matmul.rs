@@ -239,7 +239,50 @@ pub struct Tiling {
 
 impl Default for Tiling {
     fn default() -> Self {
-        Tiling { bm: 128, bn: 64, wm: 2, wn: 4, k_step: 64 } // the §5c HK config
+        Tiling { bm: 128, bn: 64, wm: 2, wn: 4, k_step: 64 } // the §5c HK config → big_m=big_n=256 (64 KB LDS, 1 WG/CU)
+    }
+}
+
+/// The **small-M/N 128²-tile** config — tk2's port of tk1's `BLOCK128_CFG`
+/// (`tk/src/kernels/matmul/amd/gfx942.rs`). Same 8-warp (2×4) / `k_step=64` choreography as
+/// [`Tiling::default`], only the per-warp sub-tile is halved (`bm=64, bn=32`) so the workgroup output
+/// tile is **128×128** instead of 256×256. Two wins, identical microkernel:
+/// - **4× denser grid.** The workgroup count is `(m/128)·(n/128)` — 4× the 256² tile's `(m/256)·(n/256)`.
+///   At small M/N the 256² grid leaves most of the 304-CU MI300X idle (grid-starved); the 128² grid
+///   keeps it fed.
+/// - **2 WG/CU.** The LDS footprint is `(big_m·k_step + k_step·big_n)·2 = (128·64 + 64·128)·2 = 32 KB`
+///   (vs the 256² tile's 64 KB), so two workgroups are co-resident per CU (64 KB LDS/CU) instead of one
+///   — doubling the latency-hiding overlap.
+///
+/// `bm=64/bn=32/k_step=64 ∈ {16,32,64}` keep it [`SwizzlePass`](crate::passes::SwizzlePass)-compatible, and
+/// `warp_row = warp/wn ∈ {0,1}` (wm=2) still drives the §5c ping-pong. M/N must tile by 128; K by `k_step`.
+pub const SMALL: Tiling = Tiling { bm: 64, bn: 32, wm: 2, wn: 4, k_step: 64 };
+
+/// The minimum 256²-tile workgroup count `(m/256)·(n/256)` at which the 256² [`Tiling::default`] tile is
+/// preferred over the 128² [`SMALL`] tile — the **measured** grid-starvation crossover on the 304-CU
+/// MI300X (gfx942). Below this the 256² grid starves the machine and [`SMALL`]'s 4×-denser grid + 2 WG/CU
+/// win; at or above it the 256² tile's larger per-WG MFMA duty wins.
+///
+/// Set from the tk2 bench sweep (`benches/matmul.rs`, device numbers): at `wg256 = 32` (m=256,n=8192) the
+/// 128² tile wins **2.08×** (227 vs 109 TF/s) and at `wg256 = 112` (m=256,n=28672) **1.33×**; at
+/// `wg256 = 256` (m=2048,n=8192) the 256² tile retakes the lead (614 vs 470 TF/s, 128² only 0.77×) and
+/// stays ahead for all larger grids. The crossover therefore lies in `(112, 256]`, matching tk1's square
+/// `n≥4096 ⇒ (4096/256)² = 256` crossover — so `256`.
+pub const BIG_TILE_MIN_WGS: usize = 256;
+
+/// **N-aware tile selector** — tk2's port of tk1's `cfg_for_gfx942` (`tk/src/kernels/matmul/amd/gfx942.rs`),
+/// generalised to the rectangular `(m, n)` grid. Returns the 256² [`Tiling::default`] when its
+/// `(m/256)·(n/256)` grid fills the machine (`≥ `[`BIG_TILE_MIN_WGS`]` workgroups) — where its larger
+/// per-WG MFMA duty wins — and the 128² [`SMALL`] tile below that, where the 256² grid is starved and
+/// [`SMALL`]'s 4×-denser grid + 2 WG/CU take the lead. `m`/`n` not both 256-multiples ⇒ the 256² tile can't
+/// tile them, so [`SMALL`] (which only needs 128-multiples) is used regardless. The returned tile still
+/// requires its own divisibility (`m`/`n` ÷ `big_m`/`big_n`); the caller enforces it.
+pub fn tiling_for_mn(m: usize, n: usize) -> Tiling {
+    let wgs_256 = (m / 256) * (n / 256);
+    if m.is_multiple_of(256) && n.is_multiple_of(256) && wgs_256 >= BIG_TILE_MIN_WGS {
+        Tiling::default()
+    } else {
+        SMALL
     }
 }
 

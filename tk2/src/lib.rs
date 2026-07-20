@@ -40,7 +40,7 @@ pub use error::{Error, Result};
 pub use graph::graph_kernel;
 pub use ir::{Node, TileId, TileIr};
 pub use kernels::Program;
-pub use kernels::matmul::{Tiling, matmul_lds_kblock_mw_clustered};
+pub use kernels::matmul::{BIG_TILE_MIN_WGS, SMALL, Tiling, matmul_lds_kblock_mw_clustered, tiling_for_mn};
 pub use pass::{Band, Fold, Pass, Pipeline, Strategy};
 pub use passes::{SwizzlePass, VectorizePass};
 pub use shape::{Mfma16x16x16Bf16, Mfma32x32x8Bf16, MfmaShape};

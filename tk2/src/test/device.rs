@@ -72,6 +72,75 @@ fn matmul_clustered_hk_replica_is_bit_exact_on_gfx942() {
     }
 }
 
+/// The **128²-tile (`SMALL`) correctness + occupancy gate** — the ported tk1 `BLOCK128_CFG`. Two claims:
+/// (1) the halved-sub-tile config (`bm=64,bn=32,wm=2,wn=4`) is bit-exact vs the f32 `A·Bᵀ` reference at a
+/// small RECTANGULAR shape (base AND vec+swizzle), and (2) it compiles with **0 spills** and reaches
+/// **2 WG/CU** on the 304-CU MI300X (the occupancy win over the 256² default's 1 WG/CU), computed from the
+/// compiled kernel descriptor's LDS (32 KB) + VGPR usage against the gfx942 geometry (64 KB LDS/CU, 512
+/// VGPRs/SIMD × 4 SIMD, ≤32 waves/CU, 512 threads = 8 waves/WG). The 256² default is printed for contrast.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::matmul_small_tile --nocapture`
+#[test]
+#[ignore]
+fn matmul_small_tile_is_correct_and_2wg_per_cu_on_gfx942() {
+    use crate::kernels::matmul::{SMALL, Tiling, matmul_lds_kblock_mw_clustered};
+    use svod_tensor::testing::allclose_f32;
+    // Rectangular small-M case: m=256 (2 128²-tile rows), n=1024, k=512 — grid-starved for the 256² tile.
+    let (m, n, k) = (256usize, 1024usize, 512usize);
+    let dev = svod_dtype::default_device::default_device();
+    let mut a = Tensor::rand_with(&[m, k], DType::BFloat16, dev.clone()).expect("rand a");
+    let mut b = Tensor::rand_with(&[n, k], DType::BFloat16, dev).expect("rand b"); // B is [N,K] (A·Bᵀ)
+    a.realize().expect("realize a");
+    b.realize().expect("realize b");
+    let expected = ab_t_ref(&as_f32_vec(&a), &as_f32_vec(&b), m, n, k);
+    let atol = 0.02 * (k as f32).sqrt();
+
+    for (suffix, apply_passes) in [("base", false), ("vec+sw", true)] {
+        let mut prog = matmul_lds_kblock_mw_clustered(m, n, k, SMALL);
+        if apply_passes {
+            prog = prog.apply(VectorizePass).apply(SwizzlePass);
+        }
+        let out = Tensor::empty(&[m, n], DType::Float32);
+        let mut y = graph_kernel(prog, out, &[&a, &b]).expect("wrap");
+        let plan = y.prepare().expect("prepare");
+        plan.execute().expect("execute");
+        let got = y.as_vec::<f32>().expect("read output");
+        let report = allclose_f32(&got, &expected, atol, 2e-2);
+        println!("SMALL 128² tile/{suffix} {m}×{n}×{k}: ok={} max_abs_err={:e}", report.ok, report.max_abs_err);
+        assert!(report.ok, "SMALL 128² tile/{suffix} must match reference: {}", report.message);
+    }
+
+    // ── occupancy: compile SMALL and the 256² default, decode WG/CU from the descriptor. ──
+    let device_spec = Tensor::empty(&[1], DType::Float32).device();
+    // gfx942 MI300X CU geometry (rocminfo): 64 KB LDS/CU, 4 SIMD/CU, 512 VGPRs/SIMD (wave64, granule 8),
+    // ≤32 waves/CU. A workgroup here is 512 threads = 8 waves.
+    const LDS_PER_CU: u32 = 64 * 1024;
+    const VGPR_PER_SIMD: u32 = 512;
+    const SIMD_PER_CU: u32 = 4;
+    const MAX_WAVES_PER_CU: u32 = 32;
+    const WAVES_PER_WG: u32 = 8; // 512 threads / 64
+    let wg_per_cu = |lds: u32, vgprs: u32| -> u32 {
+        let vgpr_alloc = vgprs.max(1).div_ceil(8) * 8;
+        let vgpr_waves = (VGPR_PER_SIMD / vgpr_alloc) * SIMD_PER_CU; // waves/CU the VGPR file allows
+        let waves_cu = vgpr_waves.min(MAX_WAVES_PER_CU);
+        let by_waves = waves_cu / WAVES_PER_WG;
+        let by_lds = LDS_PER_CU.checked_div(lds).unwrap_or(by_waves); // lds==0 ⇒ LDS never limits
+        by_waves.min(by_lds)
+    };
+    for (label, tiling, want_wg) in [("SMALL 128²", SMALL, 2u32), ("default 256²", Tiling::default(), 1u32)] {
+        let prog = matmul_lds_kblock_mw_clustered(4096, 4096, 4096, tiling).apply(VectorizePass).apply(SwizzlePass);
+        let (_src, bytes) = launch::compile_artifacts(&prog, &device_spec).expect("compile tile");
+        let parsed = svod_device::amd::program::parse_kernel(&bytes, "tk2_matmul_kblock").expect("parse kernel");
+        let kd = parsed.kd;
+        let scratch = kd.private_segment_fixed_size;
+        let lds = kd.group_segment_fixed_size;
+        let vgprs = ((kd.compute_pgm_rsrc1 & 0x3f) + 1) * 8;
+        let wg = wg_per_cu(lds, vgprs);
+        println!("{label}: VGPRs={vgprs}, LDS={lds}B, scratch={scratch}B/thread → {wg} WG/CU");
+        assert_eq!(scratch, 0, "{label} must compile with 0 spills; got {scratch} scratch B/thread");
+        assert_eq!(wg, want_wg, "{label} expected {want_wg} WG/CU, got {wg}");
+    }
+}
+
 /// **32×32×8 MFMA isolation gate** (§migration Step 3 go/no-go): the wide-core probe
 /// ([`crate::test::probes::mfma_32x32x8_probe`]) computes `C = A·Bᵀ` via `v_mfma_f32_32x32x8_bf16` and
 /// scatters its 16-VGPR accumulator through `acc_rc`; it must match the f32 reference over the SAME
