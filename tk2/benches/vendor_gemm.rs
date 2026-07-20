@@ -259,9 +259,95 @@ fn bench_vendor_gemm(c: &mut Criterion) {
     group.finish();
 }
 
+/// Path to the prebuilt HipKittens wrapper code object. Built once from
+/// `benches/vendor/hk_bf16_gemm.cpp` (its header carries the hipcc command);
+/// absent → the HK bench self-skips.
+fn hk_co_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/vendor/hk_bf16_gemm_gfx942.co")
+}
+
+/// One HK dispatch of `C[8192,8192] = A·Bᵀ` (bf16 out), device-time ns. Kernarg =
+/// 3 pointers A,B,C (no scalars — dims are baked into the kernel); grid = 1024
+/// workgroups of 256 threads. Tensors MUST outlive the call.
+fn hk_dispatch_ns(prog: &AmdProgram, a: &Tensor, b: &Tensor, out: &Tensor) -> u64 {
+    let (ab, bb, ob) = (a.buffer().expect("a"), b.buffer().expect("b"), out.buffer().expect("out"));
+    ab.ensure_allocated().expect("a alloc");
+    bb.ensure_allocated().expect("b alloc");
+    ob.ensure_allocated().expect("out alloc");
+    // SAFETY: the three tensors outlive this dispatch (held by the caller).
+    let buffers = unsafe { [ab.as_raw_ptr(), bb.as_raw_ptr(), ob.as_raw_ptr()] };
+    let vals: [i64; 0] = [];
+    // SAFETY: 3 live GPU VAs match the parsed pointer arity; the kernel's fixed
+    // launch is 1024 workgroups of 512 threads (8 warps × 64-wide waves).
+    unsafe { prog.execute_timed(&buffers, &vals, Some([1024, 1, 1]), Some([512, 1, 1])) }.expect("hk dispatch")
+}
+
+/// HipKittens `micro_tk` bf16 GEMM — a source-compiled kernel loaded through the
+/// SAME external-`.co` path as aiter (flat-kernarg wrapper, see
+/// `benches/vendor/hk_bf16_gemm.cpp`). Fixed 8192³, F32 output, plain B — so it
+/// compares directly against aiter/tk2 at the `attn_out` m=8192 point. First real
+/// HK-kernel-through-svod measurement (the prior HK number was a tk2 DSL replica).
+fn bench_hk_gemm(c: &mut Criterion) {
+    if !requirements_met() {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(hk_co_path()) else {
+        eprintln!(
+            "HK GEMM bench: skipped (missing {}; build via benches/vendor/hk_bf16_gemm.cpp)",
+            hk_co_path().display()
+        );
+        return;
+    };
+    let Some(meta) = parse_amdgpu_metadata(&bytes).expect("parse HK metadata").into_iter().next() else {
+        return;
+    };
+    let DeviceSpec::Amd { device_id } = Tensor::empty(&[1], DType::Float32).device() else {
+        return;
+    };
+    let alloc = AmdAllocator::new(device_id).expect("amd allocator");
+    let prog = AmdProgram::load_external(Arc::clone(&alloc.dev), &alloc, &bytes, &meta).expect("load_external HK");
+
+    let (m, n, k) = (8192usize, 8192, 8192);
+    let a = rand_bf16(&[m, k]);
+    let b = rand_bf16(&[n, k]); // plain B — HK swizzles in LDS, no pre-shuffle
+    let out = zeros_f32(m, n); // HK wrapper stores f32
+    let expected = reference(&a, &b);
+
+    // Correctness gate: allclose vs the f32 reference.
+    let _ = hk_dispatch_ns(&prog, &a, &b, &out);
+    let got = out.as_vec::<f32>().expect("read hk out");
+    let atol = 0.02 * (k as f32).sqrt();
+    let report = allclose_f32(&got, &expected, atol, 2e-2);
+    assert!(report.ok, "HK GEMM 8192³ must match reference: {}", report.message);
+
+    for _ in 0..2 {
+        let _ = hk_dispatch_ns(&prog, &a, &b, &out);
+    }
+    const ITERS: u64 = 40;
+    let mut total = 0u64;
+    for _ in 0..ITERS {
+        total += hk_dispatch_ns(&prog, &a, &b, &out);
+    }
+    println!("\n=== HipKittens micro_tk bf16 GEMM 8192³ (f32 out) — device TFLOP/s ===");
+    println!("hk-8192³ (attn_out m=8192): {:.1} TF/s", tflops(m, n, k, total / ITERS));
+
+    let mut group = c.benchmark_group("vendor_gemm");
+    group.throughput(Throughput::Elements(2 * m as u64 * n as u64 * k as u64));
+    group.bench_with_input(BenchmarkId::new("hk/attn_out", m), &m, |bch, _| {
+        bch.iter_custom(|iters| {
+            let mut total = 0u64;
+            for _ in 0..iters {
+                total += hk_dispatch_ns(&prog, &a, &b, &out);
+            }
+            Duration::from_nanos(total)
+        });
+    });
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_vendor_gemm
+    targets = bench_vendor_gemm, bench_hk_gemm
 }
 criterion_main!(benches);
