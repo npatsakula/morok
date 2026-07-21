@@ -182,15 +182,15 @@ fn ds_read_b64_rejects_non_b64_payloads() {
 #[test]
 #[should_panic(expected = "requires an lgkm wait")]
 fn opaque_ready_b64_rejects_non_wait_anchors() {
-    use crate::build::{BF16, Builder};
+    use crate::build::{BF16, Builder, Edge};
 
     let mut b = Builder::new("missing_opaque_readiness");
     let input = b.global::<BF16>(4);
     let zero = b.idx_const(0);
     let scalar = b.load(input, zero);
     let packed = b.vec_build(&[scalar, scalar, scalar, scalar]);
-    let not_a_wait = b.sched_fence(0, &[packed.id]);
-    let _ = b.opaque_ready_b64(packed, not_a_wait.dep());
+    let not_a_wait = b.sched_fence(0, &[Edge::anchor(packed.id)]);
+    let _ = b.opaque_ready_b64(packed, not_a_wait.dep().raw());
 }
 
 #[test]
@@ -388,7 +388,7 @@ fn sched_group_barrier_lowers_and_renders_the_builtin() {
     for ki in 0..2 {
         let af = crate::test::probes::load_op_frag(&mut b, a, a_map, 0, ki * S::K, 2 * S::K, lane);
         let bf = crate::test::probes::load_op_frag(&mut b, bmat, b_map, 0, ki * S::K, 2 * S::K, lane);
-        acc = b.mma_of::<S>(af, bf, acc);
+        acc = b.mma(af, bf, acc, S::EPT_C);
     }
     // A VALU op the interleave can pull under the MFMAs (the softmax-rescale analog).
     let two = b.f32(2.0);

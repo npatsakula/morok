@@ -13,10 +13,10 @@
 use crate::build::{BF16, Builder, F32, Idx, Val};
 use crate::shape::MfmaShape;
 
-/// MMA `D = A·B + C` at shape `S` — width from `S::EPT_C` (via [`Builder::mma_of`]). The uniform typed
-/// surface for both QKᵀ and P·V; the intrinsic dims come from `S`, no `ept` argument.
+/// MMA `D = A·B + C` at shape `S` — width from `S::EPT_C`. The uniform typed surface for both QKᵀ and
+/// P·V; the intrinsic dims come from `S`, no `ept` argument.
 pub fn mma<S: MfmaShape>(b: &mut Builder, a: Val<BF16>, bb: Val<BF16>, c: Val<F32>) -> Val<F32> {
-    b.mma_of::<S>(a, bb, c)
+    b.mma(a, bb, c, S::EPT_C)
 }
 
 /// Row-reduce the accumulator along its implicit contraction axis, WIDTH + geometry SELECTED BY `S`:

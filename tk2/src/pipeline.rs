@@ -22,8 +22,9 @@
 //! (ordering-as-edges owned by the op layer, a build-time completeness check), not codegen.
 
 use std::collections::HashSet;
+use std::marker::PhantomData;
 
-use crate::build::{Builder, Effect, F32, Frag, Idx, Scope, Val};
+use crate::build::{Builder, Edge, Effect, Elem, F32, Frag, Idx, Scope, Val};
 use crate::ir::{FragMap, Node, TileId, TileIr};
 
 /// The commit's **drain placement policy** (DESIGN §5c) — WHERE the collaborative fill's LDS writes
@@ -86,6 +87,43 @@ fn validate_commit_policy(completion: CommitCompletion, drain: CommitDrain, bare
     );
 }
 
+/// The **single LDS-publication decision** a kernel makes per commit. It fixes BOTH halves that used to
+/// be chosen independently and reconciled at runtime by [`validate_commit_policy`]: the [`CommitDrain`]
+/// the schedule uses and the [`CommitCompletion`] the commit hook emits. Deriving both from one value
+/// makes the two structurally unable to drift — the drain/completion mismatch the validator guards is
+/// now unrepresentable at the authoring layer (the validator stays as unfireable defense-in-depth).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Publication {
+    /// Compiler-visible `ds_write` + a fenced barrier supplies LDS completion (single-buffered).
+    IntrinsicWar,
+    /// Intrinsic writes to the disjoint double-buffer half — the WAR seal is dropped.
+    IntrinsicNoWar,
+    /// Waitcnt-opaque asm writes, drained lazily (the hot-loop tail hides the `lgkmcnt(0)`).
+    AsmDeferred,
+    /// Opaque asm writes drained + published immediately (double-buffered, no WAR seal).
+    AsmPublished,
+}
+
+impl Publication {
+    /// The schedule's drain policy (fed to [`Sched::commit_drain`]).
+    pub(crate) fn drain(self) -> CommitDrain {
+        match self {
+            Publication::IntrinsicWar => CommitDrain::IntrinsicAuto,
+            Publication::IntrinsicNoWar => CommitDrain::IntrinsicNoWar,
+            Publication::AsmDeferred => CommitDrain::AsmDeferred,
+            Publication::AsmPublished => CommitDrain::AsmPublishedNoWar,
+        }
+    }
+
+    /// The machine completion the commit hook's effects require (fed to [`CommitBatch::new`]).
+    pub(crate) fn completion(self) -> CommitCompletion {
+        match self {
+            Publication::IntrinsicWar | Publication::IntrinsicNoWar => CommitCompletion::Intrinsic,
+            Publication::AsmDeferred | Publication::AsmPublished => CommitCompletion::Opaque,
+        }
+    }
+}
+
 /// The kernel-specific hooks the pipeline drives — the ONLY kernel-specific part of the schedule.
 /// For matmul: `Op` is the `(A-vecs, B-vecs)` operand bundle of one K-slice, `Reg` is the register-
 /// staged fill (`FillRegs`). Each hook is a pure emission: it interns nodes and returns handles; ALL
@@ -119,11 +157,11 @@ pub(crate) trait Hooks {
         k_base: Idx,
         tile: usize,
         prev: Option<Self::Reg>,
-        order: &[TileId],
-    ) -> (Self::Reg, Vec<TileId>);
+        order: &[Edge],
+    ) -> (Self::Reg, Vec<Edge>);
     /// Commit the staged registers VGPR→LDS behind `war`, classifying the returned effects by the
     /// machine completion they require. The pipeline rejects a mismatched publication policy.
-    fn commit(&mut self, b: &mut Builder, k_base: Idx, reg: &Self::Reg, war: &[TileId]) -> CommitBatch;
+    fn commit(&mut self, b: &mut Builder, k_base: Idx, reg: &Self::Reg, war: &[Edge]) -> CommitBatch;
     /// Gather K-slice `slice` LDS→operand-frags after `raw`, for the CURRENT block `block` (its parity
     /// selects the read buffer under LDS double-buffering; single-buffered hooks ignore it). Returns the
     /// operand bundle, its store-fence tokens (the WAR consumes them), and the `op_anchor` `set_prio` uses.
@@ -132,8 +170,8 @@ pub(crate) trait Hooks {
         b: &mut Builder,
         slice: usize,
         block: BlockCounter,
-        raw: &[TileId],
-    ) -> (Self::Op, Vec<TileId>, TileId);
+        raw: &[Edge],
+    ) -> (Self::Op, Vec<Edge>, Edge);
 
     /// Tie every waitcnt-opaque gather value through its completed `lgkmcnt(0)` wait. Intrinsic-only
     /// hooks must still implement this explicitly, normally by rejecting an impossible invocation.
@@ -178,7 +216,7 @@ impl AccSlot {
         let AccSlot::F32(f) = self;
         f
     }
-    fn load_after(self, b: &mut Builder, deps: &[TileId]) -> SlotVal {
+    fn load_after(self, b: &mut Builder, deps: &[Edge]) -> SlotVal {
         let AccSlot::F32(f) = self;
         SlotVal::F32(b.load_frag_vec_after(f, deps))
     }
@@ -186,7 +224,7 @@ impl AccSlot {
         let (AccSlot::F32(f), SlotVal::F32(x)) = (self, v);
         b.store_frag_vec(f, x)
     }
-    fn after(self, b: &mut Builder, deps: &[TileId]) -> AccSlot {
+    fn after(self, b: &mut Builder, deps: &[Edge]) -> AccSlot {
         let AccSlot::F32(f) = self;
         AccSlot::F32(b.frag_after(f, deps))
     }
@@ -195,6 +233,80 @@ impl AccSlot {
         f.id
     }
 }
+
+// ── typed slot handles — newtypes over the runtime slot index the engine uses, with the
+//    element dtype as a phantom and "carried vs temporary" encoded in the TYPE. They retire the bare
+//    `usize` the kernels used to hand-number (`slot_m = dtiles`, `[slot_s, slot_m, slot_l].chain(…)`),
+//    the documented mis-numbering hazard, while erasing to the SAME index the `ClusterCx`/End-fold
+//    already consume — so the engine is untouched and emission stays byte-identical. ──────────────────
+
+/// A **carried accumulator slot** (seeded + loop-carried + End-folded): GEMM's C tile, FA's `o`/`m`/`l`/`s`.
+#[derive(Copy, Clone)]
+pub(crate) struct Acc<E: Elem> {
+    idx: usize,
+    _e: PhantomData<E>,
+}
+
+/// A **per-iteration temporary slot** (produced+consumed within one pass, no seed, not carried): FA's `p`.
+#[derive(Copy, Clone)]
+pub(crate) struct Temp<E: Elem> {
+    idx: usize,
+    _e: PhantomData<E>,
+}
+
+/// A **contiguous carried group** sharing one seed: GEMM's `c[ri·cj]`, FA's `o[dtiles]`. Addressable as
+/// a group (its slots feed a read/write set via [`AsSlots`]) or per-tile ([`Self::slot`]).
+#[derive(Copy, Clone)]
+pub(crate) struct AccArray<E: Elem> {
+    base: usize,
+    len: usize,
+    _e: PhantomData<E>,
+}
+
+impl<E: Elem> Acc<E> {
+    pub(crate) fn index(self) -> usize {
+        self.idx
+    }
+}
+impl<E: Elem> AccArray<E> {
+    /// The `i`-th slot of the group (bounds-checked — cheap insurance against the off-by-one this targets).
+    pub(crate) fn slot(self, i: usize) -> Acc<E> {
+        assert!(i < self.len, "AccArray index {i} out of bounds (len {})", self.len);
+        Acc { idx: self.base + i, _e: PhantomData }
+    }
+}
+
+/// Flatten typed slot handles into the `Vec<usize>` read/write index list the engine consumes — the
+/// typed replacement for hand-built `[slot_s, slot_m, slot_l].into_iter().chain(0..dtiles)` arithmetic.
+pub(crate) trait AsSlots {
+    fn push_slots(&self, out: &mut Vec<usize>);
+}
+impl<E: Elem> AsSlots for Acc<E> {
+    fn push_slots(&self, out: &mut Vec<usize>) {
+        out.push(self.idx);
+    }
+}
+impl<E: Elem> AsSlots for Temp<E> {
+    fn push_slots(&self, out: &mut Vec<usize>) {
+        out.push(self.idx);
+    }
+}
+impl<E: Elem> AsSlots for AccArray<E> {
+    fn push_slots(&self, out: &mut Vec<usize>) {
+        out.extend(self.base..self.base + self.len);
+    }
+}
+
+/// Build a `reads`/`writes` slot-index list from typed handles in declaration order:
+/// `slot_set![carry.s, carry.m, carry.l, carry.o]`.
+macro_rules! slot_set {
+    ($($h:expr),* $(,)?) => {{
+        let mut v: ::std::vec::Vec<usize> = ::std::vec::Vec::new();
+        $( $crate::pipeline::AsSlots::push_slots(&$h, &mut v); )*
+        v
+    }};
+}
+pub(crate) use slot_set;
 
 /// The **seed policy** of a carried [`SlotSet`] slot — how [`SlotSet::finish`] initialises it (a
 /// temporary carries no `Init` and finishes to `None`). Mirrors the two accumulator seeders:
@@ -207,7 +319,7 @@ pub(crate) enum Init {
     Const(f32),
 }
 
-/// A **declarative accumulator-slot builder** (Phase 3) — derives the pipeline's `(accs, inited)`
+/// A **declarative accumulator-slot builder** — derives the pipeline's `(accs, inited)`
 /// vectors from a slot DECLARATION, retiring the hand-written `slot_m = dtiles`, `slot_l = dtiles + 1`,
 /// … index bookkeeping FA-32 used to carry (the error-prone part: a mis-numbered slot silently reads
 /// the wrong fragment).
@@ -235,20 +347,24 @@ impl SlotSet {
         idx
     }
 
-    /// Declare a GROUP of `count` carried f32 accumulators sharing one `init` (FA-32's `o_0..o_{d-1}`
-    /// PV tiles) → their slot indices, in declaration order.
-    pub(crate) fn carried_group(&mut self, b: &mut Builder, count: usize, map: FragMap, init: Init) -> Vec<usize> {
-        (0..count).map(|_| self.push(b, map, Some(init))).collect()
+    /// Declare one carried f32 accumulator → an [`Acc`] handle (loop-carried + seeded + End-folded).
+    pub(crate) fn carried_typed(&mut self, b: &mut Builder, map: FragMap, init: Init) -> Acc<F32> {
+        Acc { idx: self.push(b, map, Some(init)), _e: PhantomData }
     }
 
-    /// Declare one carried f32 accumulator (loop-carried + seeded + End-folded) → its slot index.
-    pub(crate) fn carried(&mut self, b: &mut Builder, map: FragMap, init: Init) -> usize {
-        self.push(b, map, Some(init))
+    /// Declare a run of `count` carried f32 accumulators sharing one `init` → an [`AccArray`] (GEMM's
+    /// `c[ri·cj]`, FA's `o[dtiles]`). Slots are pushed in order, so emission matches the old per-slot loop.
+    pub(crate) fn carried_array(&mut self, b: &mut Builder, count: usize, map: FragMap, init: Init) -> AccArray<F32> {
+        let base = self.slots.len();
+        for _ in 0..count {
+            self.push(b, map, Some(init));
+        }
+        AccArray { base, len: count, _e: PhantomData }
     }
 
-    /// Declare one temporary f32 slot — produced+consumed within a single iteration, no seed → its slot index.
-    pub(crate) fn temp(&mut self, b: &mut Builder, map: FragMap) -> usize {
-        self.push(b, map, None)
+    /// Declare one temporary f32 slot (produced+consumed within a pass, no seed) → a [`Temp`] handle.
+    pub(crate) fn temp_typed(&mut self, b: &mut Builder, map: FragMap) -> Temp<F32> {
+        Temp { idx: self.push(b, map, None), _e: PhantomData }
     }
 
     /// Emit ALL inits (in declaration order; temporaries → `None`) and return the pipeline's
@@ -325,11 +441,11 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     accs: &'a [AccSlot],
     /// Per-slot carry-in edge: `[inited, range]` (steady) / `[]` (epilogue, the `acc_loop` frag observes
     /// the loop `End`) for a CARRIED slot; `[]` for a TEMPORARY (which must be written before it is read).
-    carry: &'a [Vec<TileId>],
+    carry: &'a [Vec<Edge>],
     /// Per-slot carried flag (`inited[s].is_some()`) — a read of a not-yet-written slot is a carry-in
     /// (carried) or an authoring bug (temporary read before produced).
     is_carried: &'a [bool],
-    seed: &'a [TileId],
+    seed: &'a [Edge],
     k_next: Option<Idx>,
     /// The **current KV-block counter** routed into each compute `body` (see [`BlockCounter`]): the loop
     /// counter in the steady pass, `nblocks-1` in the epilogue. Lazy — a masking body materialises it,
@@ -348,29 +464,29 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     /// 32-MFMA run nor sink an `s_barrier`/`s_waitcnt lgkmcnt(0)` into the middle of it (the measured
     /// re-batch — `kernel_instr.md §2`: intrinsic MFMAs are NOT held by a single positional fence).
     pin_mfma: bool,
-    /// **Ping-pong on** (`warp_row.is_some()`, the GEMM path): the compute-cluster seals ARE the
-    /// wave-phase carriers — the eq-offset warp-row pair rendezvous at each `s_barrier`, so the seal
-    /// MUST stay a real workgroup barrier. Ping-pong OFF (FA: disjoint-Q warps, `warp_row.is_none()`):
+    /// **Seals carry the wave phase** (`WaveTopology::PingPong`, the GEMM path): the compute-cluster
+    /// seals ARE the wave-phase carriers — the eq-offset warp-row pair rendezvous at each `s_barrier`, so
+    /// the seal MUST stay a real workgroup barrier. `false` (FA: disjoint-Q warps, `WaveTopology::Disjoint`):
     /// the compute clusters exchange ONLY per-warp registers (V is gathered to VGPRs in the Mem cluster;
     /// the softmax reduce is a per-warp `ds_bpermute`; PV never touches LDS), so a workgroup barrier at
     /// a compute seal guards no cross-warp state AND walls the 0-MFMA softmax shadow — its seal drops to
     /// a pure ordering combine (no `s_barrier`). See [`Self::compute`]. The load-bearing Mem-cluster
     /// WAR/RAW seals ([`Self::commit`]) are UNCHANGED either way — they guard real shared-LDS traffic.
-    ping_pong: bool,
+    seals_carry_phase: bool,
     // ── carries (persist across clusters within one body) ──
-    entry: Vec<TileId>,
+    entry: Vec<Edge>,
     /// Per-slot source of the NEXT read this body pass: `Some(store)` = the last cluster that wrote the
     /// slot (its store is the intra-iteration RAW), `None` = not yet written (read from the slot's
     /// carry-in). Replaces the old `first_compute` bool + full `prev_store`: with per-cluster write
     /// subsets each slot is threaded independently, so a cluster that skips a slot leaves its source
     /// intact (no dead round-trip). The first read of a carried slot (`None`) uses `carry[s]`.
-    slot_src: Vec<Option<TileId>>,
-    all_gathers: Vec<TileId>,
-    operands: Vec<Option<(H::Op, TileId)>>,
+    slot_src: Vec<Option<Edge>>,
+    all_gathers: Vec<Edge>,
+    operands: Vec<Option<(H::Op, Edge)>>,
     reg: Option<H::Reg>,
     committed: bool,
-    raw_next: Option<TileId>,
-    tail_barrier: Option<TileId>,
+    raw_next: Option<Edge>,
+    tail_barrier: Option<Edge>,
     /// Bare-seal drain bookkeeping: the set of gathered slices whose `ds_read`s are not yet covered by
     /// an `lgkmcnt(0)` drain. A compute over slice `s` drains ONLY if `s` is outstanding (its own
     /// operand), then clears ALL (the unified `lgkmcnt(0)` completes every read); a commit's read-drain
@@ -379,9 +495,9 @@ pub(crate) struct ClusterCx<'a, H: Hooks> {
     /// none: it drains at C1/C3/C6 only). Cleared each body pass.
     undrained: Vec<usize>,
     /// Opaque gather stores not yet covered by a queue-wide `lgkmcnt(0)` readiness wait.
-    undrained_reads: Vec<TileId>,
+    undrained_reads: Vec<Edge>,
     // ── per-cluster (reset by the driver before each cluster) ──
-    this_gathers: Vec<TileId>,
+    this_gathers: Vec<Edge>,
     sealed: bool,
 }
 
@@ -410,11 +526,11 @@ impl<H: Hooks> ClusterCx<'_, H> {
             return;
         }
         let last = self.undrained_reads[self.undrained_reads.len() - 1];
-        let covered = self.b.combine(Effect(last), &self.undrained_reads[..self.undrained_reads.len() - 1]);
+        let covered = self.b.combine(Effect(last.raw()), &self.undrained_reads[..self.undrained_reads.len() - 1]);
         let ready = self.b.swait_lgkmcnt(covered.dep());
         for operand in &mut self.operands {
             if let Some((op, anchor)) = operand.take() {
-                *operand = Some((self.hooks.ready_after_lgkm(self.b, op, ready.dep()), anchor));
+                *operand = Some((self.hooks.ready_after_lgkm(self.b, op, ready.dep().raw()), anchor));
             }
         }
         self.entry.push(ready.dep());
@@ -426,7 +542,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
     /// is a bare `s_barrier` (no acq-rel fence, so no forced `lgkmcnt(0)` and no MFMA-overlap throttle);
     /// otherwise the acq-rel-fenced barrier. The LDS ordering a bare seal drops is re-supplied by the
     /// explicit drains in [`Self::compute`]/[`Self::commit`], so callers pass the SAME `(body, deps)`.
-    fn seal(&mut self, body: Effect, deps: &[TileId]) -> Effect {
+    fn seal(&mut self, body: Effect, deps: &[Edge]) -> Effect {
         if self.bare_seals { self.b.bare_barrier(body, deps) } else { self.b.barrier(body, deps) }
     }
 
@@ -460,7 +576,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
             // Pin the loads to THIS cluster's entry (the preceding cluster's boundary barrier), so a
             // split B@C4 lands between the right MFMA clusters instead of hoisting to the loop top.
             let order = self.entry.clone();
-            let mut anchors: Vec<TileId> = Vec::new();
+            let mut anchors: Vec<Edge> = Vec::new();
             for &t in tiles {
                 let prev = self.reg.take();
                 let (reg, load_ids) = self.hooks.prefetch(self.b, kn, t, prev, &order);
@@ -487,7 +603,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
             self.ready_opaque_gathers();
             let mut order = self.entry.clone();
             order.extend(&self.this_gathers);
-            let mut anchors = Vec::new();
+            let mut anchors: Vec<Edge> = Vec::new();
             for &t in tiles {
                 let prev = self.reg.take();
                 let (reg, load_ids) = self.hooks.prefetch(self.b, kn, t, prev, &order);
@@ -564,15 +680,15 @@ impl<H: Hooks> ClusterCx<'_, H> {
                 Vec::new()
             } else {
                 assert!(!self.all_gathers.is_empty(), "single-buffer intrinsic commit requires a preceding gather");
-                let deps: Vec<TileId> = self.all_gathers[1..].to_vec();
-                vec![self.seal(Effect(self.all_gathers[0]), &deps).dep()]
+                let deps: Vec<Edge> = self.all_gathers[1..].to_vec();
+                vec![self.seal(Effect(self.all_gathers[0].raw()), &deps).dep()]
             };
             // `fill` = the commit's write effects (intrinsic `ds_write` stores OR asm `ds_write_b64`
             // writes). The DRAIN is owned here now (not by the hook), dispatched on the policy.
             let batch = self.hooks.commit(self.b, kn, &reg, &war);
             validate_commit_policy(batch.completion, self.commit_drain, self.bare_seals);
             let fill = batch.effects;
-            let fill_deps: Vec<TileId> = fill[1..].iter().map(|e| e.dep()).collect();
+            let fill_deps: Vec<Edge> = fill[1..].iter().map(|e| e.dep()).collect();
             match self.commit_drain {
                 CommitDrain::IntrinsicAuto | CommitDrain::IntrinsicNoWar => {
                     // The compiler-visible stores: this RAW barrier auto-drains their `lgkmcnt(0)`.
@@ -676,7 +792,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
         // run nor hoist the run's first MFMA above the reads. Paired with the trailing pin, the run is
         // indivisible (the measured re-batch cure — a single trailing fence did NOT hold it).
         if self.pin_mfma {
-            let mut anchors: Vec<TileId> = self.entry.clone();
+            let mut anchors: Vec<Edge> = self.entry.clone();
             anchors.extend(op_anchor);
             anchors.extend(prio1);
             let lead = self.b.sched_fence(0, &anchors).dep();
@@ -714,7 +830,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
             new.len(),
             writes.len()
         );
-        let new_ids: Vec<TileId> = new.iter().map(|v| v.id()).collect();
+        let new_ids: Vec<Edge> = new.iter().map(|v| Edge::anchor(v.id())).collect();
         // WAR guard on a READ-then-INDEPENDENTLY-WRITTEN slot (FA-32's carried QKᵀ scores: the fused
         // cluster reads s(i−1) then writes the INDEPENDENT s(i) = QKᵀ). Its new value does NOT carry that
         // read in its dependency cone, so in a STRAIGHT-LINE pass (the epilogue — no loop phi to serialize
@@ -736,7 +852,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
             })
             .collect();
         let mut stores: Vec<Option<Effect>> = vec![None; writes.len()];
-        let mut anchor: Vec<TileId> = Vec::new(); // the un-guarded stores that carry the reads
+        let mut anchor: Vec<Edge> = Vec::new(); // the un-guarded stores that carry the reads
         for (i, (&s, &v)) in writes.iter().zip(&new).enumerate() {
             if !guarded[i] {
                 let e = self.accs[s].store(self.b, v);
@@ -758,7 +874,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
         // MFMA-cluster TRAILING pin (§5c ISA fix): a `sched.barrier(0)` on ALL MFMA RESULTS, so the
         // tail `s_barrier` cannot hoist up into the run.
         let body_eff = stores[writes.len() - 1];
-        let mut deps: Vec<TileId> = stores[..writes.len() - 1].iter().map(|e| e.dep()).collect();
+        let mut deps: Vec<Edge> = stores[..writes.len() - 1].iter().map(|e| e.dep()).collect();
         // Route `set_prio(0)` INTO the cluster's seal (clone `gemm.rs:134-136`): the barrier then
         // happens-after the prio-drop, so on the LAST compute cluster (C7 — whose `entry` no later
         // cluster consumes) the `s_setprio 0` is kept live by the carried tail barrier instead of
@@ -773,7 +889,7 @@ impl<H: Hooks> ClusterCx<'_, H> {
         if self.pin_mfma {
             deps.push(self.b.sched_fence(0, &new_ids).dep());
         }
-        // The **compute seal**, gated on ping-pong (`self.ping_pong`, see the field doc). With ping-pong
+        // The **compute seal**, gated on `self.seals_carry_phase` (see the field doc). With ping-pong
         // ON (GEMM) it is the workgroup `s_barrier` that doubles as the wave-phase carrier — kept exactly
         // as before (byte-identical emission). With ping-pong OFF (FA) the compute clusters share no
         // cross-warp LDS state, so the `s_barrier` guards nothing and only walls the softmax-under-MFMA
@@ -783,7 +899,11 @@ impl<H: Hooks> ClusterCx<'_, H> {
         // accumulator carry stays live, but LLVM is free to interleave the softmax VALU under the MFMAs.
         // The real accumulator RAW is threaded per-slot via `slot_src` (the store effect directly), NOT
         // this seal, so dropping the barrier cannot break the cross-cluster data dependency.
-        let bar = if self.ping_pong { self.seal(body_eff, &deps).dep() } else { self.b.combine(body_eff, &deps).dep() };
+        let bar = if self.seals_carry_phase {
+            self.seal(body_eff, &deps).dep()
+        } else {
+            self.b.combine(body_eff, &deps).dep()
+        };
         self.tail_barrier = Some(bar);
         self.entry = vec![bar, prio0];
         self.sealed = true;
@@ -895,9 +1015,9 @@ impl<H: Hooks> Cluster<H> for Compute<H> {
 struct BodyOut {
     /// Per-slot last store this pass (`None` = never written — only valid for a temporary the epilogue
     /// happens not to touch). The End-fold reads each CARRIED slot's last store from here.
-    slot_src: Vec<Option<TileId>>,
-    raw_next: Option<TileId>,
-    tail_barrier: Option<TileId>,
+    slot_src: Vec<Option<Edge>>,
+    raw_next: Option<Edge>,
+    tail_barrier: Option<Edge>,
 }
 
 /// Walk a schedule once through a fresh [`ClusterCx`], emitting each cluster's bracket + carries.
@@ -913,15 +1033,15 @@ fn run_body<H: Hooks>(
     ksteps: usize,
     accs: &[AccSlot],
     is_carried: &[bool],
-    seed: &[TileId],
-    carry: &[Vec<TileId>],
+    seed: &[Edge],
+    carry: &[Vec<Edge>],
     k_next: Option<Idx>,
     block: BlockCounter,
     commit_drain: CommitDrain,
     asm_gather: bool,
     bare_seals: bool,
     pin_mfma: bool,
-    ping_pong: bool,
+    seals_carry_phase: bool,
 ) -> BodyOut {
     let mut cx = ClusterCx {
         b,
@@ -936,7 +1056,7 @@ fn run_body<H: Hooks>(
         asm_gather,
         bare_seals,
         pin_mfma,
-        ping_pong,
+        seals_carry_phase,
         entry: Vec::new(),
         slot_src: vec![None; accs.len()],
         all_gathers: Vec::new(),
@@ -959,17 +1079,17 @@ fn run_body<H: Hooks>(
         // cluster. A cluster that emitted nothing (epilogue commit) is skipped.
         if !cx.this_gathers.is_empty() && !cx.sealed {
             let n = cx.this_gathers.len();
-            let body = Effect(cx.this_gathers[n - 1]);
-            let deps: Vec<TileId> = cx.this_gathers[..n - 1].to_vec();
+            let body = Effect(cx.this_gathers[n - 1].raw());
+            let deps: Vec<Edge> = cx.this_gathers[..n - 1].to_vec();
             let bar = cx.seal(body, &deps).dep();
             cx.tail_barrier = Some(bar);
             cx.entry = vec![bar];
         }
     }
-    if ping_pong && let Some(raw) = cx.raw_next {
+    if seals_carry_phase && let Some(raw) = cx.raw_next {
         let tail = cx.tail_barrier.expect("phased streaming body must end on a barrier");
         assert!(
-            raw != tail && depends_on(&cx.b.ir, tail, raw),
+            raw.raw() != tail.raw() && depends_on(&cx.b.ir, tail.raw(), raw.raw()),
             "phased body tail must actually depend on an earlier publication"
         );
     }
@@ -988,7 +1108,7 @@ pub(crate) struct Pipeline<'a, H: Hooks> {
     ksteps: usize,
     accs: &'a [AccSlot],
     inited: &'a [Option<Effect>],
-    warp_row: Option<Idx>,
+    topology: WaveTopology,
     asm_gather: bool,
     resident: bool,
     commit_drain: CommitDrain,
@@ -1016,7 +1136,81 @@ pub(crate) struct Sched {
     pub pin_mfma: bool,
 }
 
-/// Open a clustered pipeline over `hooks`. `nblocks = k/k_step ≥ 2`; `warp_row = Some` enables the
+/// The workgroup's **wave topology** — how its warp-rows relate across the compute clusters. `Disjoint`
+/// warps (FA single-crew) exchange only per-warp registers, so a compute seal guards no cross-warp state
+/// and drops to a pure ordering combine. `PingPong` runs an eq-offset warp-row pair that rendezvous at
+/// every compute seal (GEMM, FA-fast), so the seal MUST stay a real workgroup `s_barrier` (the phase
+/// carrier). `groups`/`offset` describe the crew count and the one-cluster stagger — the emission is
+/// driven by the balanced eq=1/eq=0 barrier pair, so they are self-documenting metadata, not operands.
+#[derive(Copy, Clone)]
+pub(crate) enum WaveTopology {
+    Disjoint,
+    PingPong { warp_row: Idx, groups: u8, offset: u8 },
+}
+
+impl WaveTopology {
+    /// Ping-pong ⇒ the compute-cluster seals ARE the wave-phase carriers (must stay real workgroup
+    /// barriers, not pure ordering combines). The renamed successor of `ping_pong = warp_row.is_some()`.
+    fn seals_carry_phase(self) -> bool {
+        matches!(self, WaveTopology::PingPong { .. })
+    }
+
+    /// The `(eq=0, eq=1)` wave-barrier count a balanced pipeline emits: `(1, 1)` phased, `(0, 0)` disjoint.
+    /// The verifier keys its deadlock check on this instead of a bare bool.
+    fn barrier_census(self) -> (usize, usize) {
+        match self {
+            WaveTopology::PingPong { .. } => (1, 1),
+            WaveTopology::Disjoint => (0, 0),
+        }
+    }
+
+    /// Emit the eq=1 **stagger** barrier ordered after `after`, offsetting one warp-row by a cluster so
+    /// the crews ping-pong. Returns the ordering edge to seed the loop AND the linear [`WavePhase`]
+    /// witness that obliges a matching [`Self::realign`]. Only meaningful on `PingPong`.
+    fn stagger(self, b: &mut Builder, after: Edge) -> (Edge, WavePhase) {
+        let WaveTopology::PingPong { warp_row, groups, offset } = self else {
+            unreachable!("stagger on a disjoint topology");
+        };
+        // A ping-pong needs ≥2 crews and a stagger of a whole (non-empty, in-range) crew — else the
+        // eq-offset pair cannot rendezvous. Debug-only: this validates the topology's self-description
+        // and emits no IR (byte-identity is untouched).
+        debug_assert!(groups >= 2, "ping-pong needs ≥2 crews, got {groups}");
+        debug_assert!((1..groups).contains(&offset), "stagger offset {offset} must lie in 1..{groups}");
+        let edge = b.wave_barrier(warp_row, 1, &[after]).dep();
+        (edge, WavePhase { consumed: false })
+    }
+
+    /// Consume the [`WavePhase`] witness with the matching eq=0 **realign** barrier ordered after
+    /// `after` — the half that lets the offset warp-row rejoin so the workgroup does not deadlock at exit.
+    fn realign(self, mut phase: WavePhase, b: &mut Builder, after: Edge) -> Edge {
+        let WaveTopology::PingPong { warp_row, .. } = self else {
+            unreachable!("realign on a disjoint topology");
+        };
+        phase.consumed = true;
+        b.wave_barrier(warp_row, 0, &[after]).dep()
+    }
+}
+
+/// A **linear witness** that an eq=1 wave-phase stagger was emitted and MUST be balanced by a matching
+/// eq=0 realign — otherwise one warp-row waits on an `s_barrier` the other never reaches and the
+/// workgroup deadlocks. `#[must_use]` catches an ignored witness at compile time; the drop bomb catches a
+/// runtime drop (an authoring path that staggered but forgot to realign). Sole producer:
+/// [`WaveTopology::stagger`]; sole consumer: [`WaveTopology::realign`].
+#[must_use]
+struct WavePhase {
+    consumed: bool,
+}
+
+impl Drop for WavePhase {
+    fn drop(&mut self) {
+        assert!(
+            self.consumed || std::thread::panicking(),
+            "a wave-phase stagger (eq=1) was never realigned (eq=0) — the workgroup would deadlock"
+        );
+    }
+}
+
+/// Open a clustered pipeline over `hooks`. `nblocks = k/k_step ≥ 2`; `topology = PingPong` enables the
 /// wave-phase ping-pong; `sched.resident` drops the steady prefetch/commit (compute-resident microkernel);
 /// `sched.bare_seals` swaps the acq-rel-fenced cluster barriers for HK's bare `s_barrier` + explicit drains.
 /// `inited[s] = Some(seed)` marks slot `s` CARRIED (loop-carried + End-folded); `None` a per-iteration
@@ -1029,7 +1223,7 @@ pub(crate) fn pipeline<'a, H: Hooks>(
     ksteps: usize,
     accs: &'a [AccSlot],
     inited: &'a [Option<Effect>],
-    warp_row: Option<Idx>,
+    topology: WaveTopology,
     sched: Sched,
     hooks: H,
 ) -> Pipeline<'a, H> {
@@ -1042,7 +1236,7 @@ pub(crate) fn pipeline<'a, H: Hooks>(
         ksteps,
         accs,
         inited,
-        warp_row,
+        topology,
         asm_gather,
         resident,
         commit_drain,
@@ -1099,7 +1293,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             ksteps,
             accs,
             inited,
-            warp_row,
+            topology,
             asm_gather,
             resident,
             commit_drain,
@@ -1117,9 +1311,12 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         let is_carried: Vec<bool> = inited.iter().map(|e| e.is_some()).collect();
         let carried_slots: Vec<usize> = (0..n_slots).filter(|&s| is_carried[s]).collect();
         assert!(!carried_slots.is_empty(), "a pipeline must carry ≥1 accumulator across the loop");
-        // Ping-pong ON ⇔ a wave-phase (`warp_row`) is supplied — the signal that the compute-cluster
-        // seals must stay real workgroup `s_barrier`s (the phase carriers). See `ClusterCx::ping_pong`.
-        let ping_pong = warp_row.is_some();
+        // Ping-pong ⇔ the topology carries the wave phase — the signal that the compute-cluster seals
+        // must stay real workgroup `s_barrier`s (the phase carriers). See `ClusterCx::seals_carry_phase`.
+        let seals_carry_phase = topology.seals_carry_phase();
+        // The linear witness that an eq=1 stagger was emitted and owes a matching eq=0 realign. Set at
+        // whichever stagger site fires (no-warmup prologue / post-warmup), consumed at the epilogue.
+        let mut phase: Option<WavePhase> = None;
         let has_warmup = !warmup_clusters.is_empty();
         let ks_c = b.idx_const(k_step as i64);
         let one = b.idx_const(1);
@@ -1142,7 +1339,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         // it EXPOSED here — the deferral is specifically about hiding the hot-loop C6 drain, not this seed.
         let raw_seed = match commit_drain {
             CommitDrain::IntrinsicAuto | CommitDrain::IntrinsicNoWar => {
-                let fill0_deps: Vec<TileId> = fill0[1..].iter().map(|e| e.dep()).collect();
+                let fill0_deps: Vec<Edge> = fill0[1..].iter().map(|e| e.dep()).collect();
                 b.barrier(fill0[0], &fill0_deps)
             }
             CommitDrain::AsmDeferred | CommitDrain::AsmPublishedNoWar => {
@@ -1150,15 +1347,17 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
                 b.barrier(sw, &[])
             }
         };
-        let initial_loop_seed = match warp_row {
-            // No-warmup ping-pong (GEMM): the eq=1 wave-phase barrier ordered after the prologue commit
-            // (`raw_seed`), offsetting warp-row 1 by one cluster. The barrier rides as an ordering-only dep
-            // (`deps[1..]`, unreferenced by the WaveBarrier template) — no longer laundered through
-            // `idx_after` into the warp_row operand now that a CUSTOM accepts a happens-after edge on an
-            // effect (Stage A). With a WARMUP present the stagger is DEFERRED to after the lockstep warmup
-            // (see `loop_seed` below): QK(0) and the carried-score seed run in lockstep BEFORE the crews
-            // offset — HK's pre-stagger prologue. Unphased paths (`None`) are unchanged.
-            Some(wr) if !has_warmup => b.wave_barrier(wr, 1, &[raw_seed.dep()]).dep(),
+        let initial_loop_seed = match topology {
+            // No-warmup ping-pong (GEMM): the eq=1 wave-phase stagger ordered after the prologue commit
+            // (`raw_seed`), offsetting warp-row 1 by one cluster. With a WARMUP present the stagger is
+            // DEFERRED to after the lockstep warmup (see `loop_seed` below): QK(0) and the carried-score
+            // seed run in lockstep BEFORE the crews offset — HK's pre-stagger prologue. Disjoint paths are
+            // unchanged. The `WavePhase` witness threads the owed eq=0 realign to the epilogue.
+            WaveTopology::PingPong { .. } if !has_warmup => {
+                let (edge, ph) = topology.stagger(b, raw_seed.dep());
+                phase = Some(ph);
+                edge
+            }
             _ => raw_seed.dep(),
         };
 
@@ -1171,12 +1370,12 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             None
         } else {
             assert!(!resident, "pipeline warmup is only supported for streaming schedules");
-            // Ping-pong WITH a warmup runs the warmup in LOCKSTEP (both crews, `ping_pong=false` below) and
+            // Ping-pong WITH a warmup runs the warmup in LOCKSTEP (both crews, `seals_carry_phase=false` below) and
             // defers the eq=1 stagger to after it. Needs ≥3 KV blocks so ≥1 steady iteration remains to
             // carry the eq=1 barrier into the loop (a 2-block warm pipeline skips the steady body).
-            assert!(!ping_pong || nblocks >= 3, "phased warm pipeline needs nblocks ≥ 3");
+            assert!(!seals_carry_phase || nblocks >= 3, "phased warm pipeline needs nblocks ≥ 3");
             assert!(nblocks >= 2, "pipeline warmup needs at least two blocks");
-            let warmup_carry: Vec<Vec<TileId>> =
+            let warmup_carry: Vec<Vec<Edge>> =
                 inited.iter().map(|e| e.map(|x| vec![x.dep()]).unwrap_or_default()).collect();
             let warm_scope = if scoped_regions { b.scope(&[initial_loop_seed]) } else { Scope::ROOT };
             let warm = run_body(
@@ -1212,8 +1411,12 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         // after block 1's publication (`loop_seed`). The crews offset by one cluster only once QK(0) and the
         // carried-score seed are done in lockstep — HK's follower-only prologue `s_barrier`. (No-warmup
         // ping-pong already emitted its eq=1 in the prologue; unphased/warmup-less paths are untouched.)
-        let loop_seed = match warp_row {
-            Some(wr) if has_warmup => b.wave_barrier(wr, 1, &[loop_seed]).dep(),
+        let loop_seed = match topology {
+            WaveTopology::PingPong { .. } if has_warmup => {
+                let (edge, ph) = topology.stagger(b, loop_seed);
+                phase = Some(ph);
+                edge
+            }
             _ => loop_seed,
         };
 
@@ -1225,11 +1428,11 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             // epilogue. Do not emit `Range(0)`: dead-loop cleanup cannot make loop-local operand values
             // dominate the epilogue, and relying on it produced invalid LLVM.
             let warm = warmup.as_ref().expect("only a warmup can leave zero steady blocks");
-            let carried_stores: Vec<TileId> = carried_slots
+            let carried_stores: Vec<Edge> = carried_slots
                 .iter()
                 .map(|&s| warm.slot_src[s].unwrap_or_else(|| inited[s].expect("carried slot has a seed").dep()))
                 .collect();
-            let last = Effect(carried_stores[carried_stores.len() - 1]);
+            let last = Effect(carried_stores[carried_stores.len() - 1].raw());
             let mut fold = carried_stores[..carried_stores.len() - 1].to_vec();
             let raw = warm.raw_next.expect("warmup schedule must commit block 1");
             let tail = warm.tail_barrier.expect("warmup schedule must end on a cluster barrier");
@@ -1256,7 +1459,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             let k_next = b.idx_mul(k_next_idx, ks_c);
             // Per-slot carry-in: a CARRIED slot's first read routes `[seed, range]`; a TEMPORARY has none
             // (it must be produced before it is read — enforced in `compute`).
-            let carry: Vec<Vec<TileId>> = (0..n_slots)
+            let carry: Vec<Vec<Edge>> = (0..n_slots)
                 .map(|s| {
                     inited[s]
                         .map(|e| {
@@ -1286,16 +1489,16 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
                 asm_gather && matches!(commit_drain, CommitDrain::AsmPublishedNoWar),
                 bare_seals,
                 pin_mfma,
-                ping_pong,
+                seals_carry_phase,
             );
 
             // Fold every CARRIED slot's last store, raw_next, and the final cluster barrier under one End.
-            let carried_stores: Vec<TileId> = carried_slots
+            let carried_stores: Vec<Edge> = carried_slots
                 .iter()
                 .map(|&s| body.slot_src[s].expect("carried slot must be written every iteration (the loop carry)"))
                 .collect();
-            let last = Effect(carried_stores[carried_stores.len() - 1]);
-            let mut fold: Vec<TileId> = carried_stores[..carried_stores.len() - 1].to_vec();
+            let last = Effect(carried_stores[carried_stores.len() - 1].raw());
+            let mut fold: Vec<Edge> = carried_stores[..carried_stores.len() - 1].to_vec();
             match body.raw_next {
                 Some(rn) => fold.push(rn),
                 None => assert!(resident, "streaming schedule must contain a commit cluster (raw_next carry)"),
@@ -1315,7 +1518,7 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
 
         // ── epilogue: the same schedule for the LAST block (via the End's carried RAW), no
         //    prefetch/commit; then the eq=0 wave-phase barrier rebalances warp-row 0. ──
-        let ep_carry: Vec<Vec<TileId>> = (0..n_slots).map(|_| Vec::new()).collect();
+        let ep_carry: Vec<Vec<Edge>> = (0..n_slots).map(|_| Vec::new()).collect();
         let ep_scope = if scoped_regions { b.scope(&[carry_out.dep()]) } else { Scope::ROOT };
         let ep = run_body(
             b,
@@ -1333,17 +1536,19 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
             asm_gather && matches!(commit_drain, CommitDrain::AsmPublishedNoWar),
             bare_seals,
             pin_mfma,
-            ping_pong,
+            seals_carry_phase,
         );
-        let scatter_seed = warp_row.map(|wr| {
+        // Consume the `WavePhase` witness with the matching eq=0 realign (or `None` on a disjoint topology
+        // whose witness was never minted). `take` leaves `phase = None`, so its drop is a clean no-op.
+        let scatter_seed = phase.take().map(|ph| {
             let anchor = ep.tail_barrier.expect("epilogue must end on a cluster barrier");
-            b.wave_barrier(wr, 0, &[anchor]).dep()
+            topology.realign(ph, b, anchor)
         });
         let out: Vec<AccSlot> = acc_loop
             .iter()
             .enumerate()
             .map(|(s, a)| {
-                let mut deps: Vec<TileId> = ep.slot_src[s].into_iter().collect();
+                let mut deps: Vec<Edge> = ep.slot_src[s].into_iter().collect();
                 deps.extend(scatter_seed);
                 a.after(b, &deps)
             })
@@ -1352,7 +1557,14 @@ impl<'a, H: Hooks> Pipeline<'a, H> {
         // ── completeness check: carry-completeness (a carried slot unwritten in a pass panics the
         //    End-fold above) + the wave-phase balance over the emitted output cone. A build-time panic. ──
         let roots: Vec<TileId> = out.iter().map(|a| a.id()).collect();
-        verify(&b.ir, &roots, body_raw_next, body_tail_barrier, resident, ping_pong);
+        verify(
+            &b.ir,
+            &roots,
+            body_raw_next.map(|e| e.raw()),
+            body_tail_barrier.map(|e| e.raw()),
+            resident,
+            topology.barrier_census(),
+        );
         out
     }
 }
@@ -1372,7 +1584,7 @@ pub(crate) fn verify(
     raw_next: Option<TileId>,
     tail_barrier: Option<TileId>,
     resident: bool,
-    ping_pong: bool,
+    expected_census: (usize, usize),
 ) {
     assert!(raw_next.is_some() || resident, "streaming schedule must contain a commit cluster (raw_next carry)");
     assert!(tail_barrier.is_some(), "steady body must end on a cluster barrier");
@@ -1389,13 +1601,15 @@ pub(crate) fn verify(
         reach.iter().filter(|&&id| matches!(ir.node(id), Node::WaveBarrier { eq, .. } if *eq == want)).count()
     };
     let (n0, n1) = (count(0), count(1));
-    assert_eq!(n0, n1, "wave-phase barriers unbalanced (eq=0: {n0}, eq=1: {n1}) — would deadlock the workgroup");
-    if ping_pong {
-        assert_eq!((n0, n1), (1, 1), "a phased pipeline requires exactly one seed and one rebalance barrier");
+    let (e0, e1) = expected_census;
+    assert_eq!(
+        (n0, n1),
+        (e0, e1),
+        "wave-phase barriers unbalanced (eq=0: {n0}, eq=1: {n1}; topology expects {e0}/{e1}) — would deadlock the workgroup"
+    );
+    if expected_census != (0, 0) {
         let raw = raw_next.expect("a phased streaming pipeline requires publication");
         assert!(raw != tail && depends_on(ir, tail, raw), "phased tail must depend on an earlier publication");
-    } else {
-        assert_eq!((n0, n1), (0, 0), "an unphased pipeline must not contain wave-phase barriers");
     }
 }
 
@@ -1421,13 +1635,13 @@ mod test {
             _k_base: Idx,
             _tile: usize,
             prev: Option<Self::Reg>,
-            _order: &[TileId],
-        ) -> (Self::Reg, Vec<TileId>) {
+            _order: &[Edge],
+        ) -> (Self::Reg, Vec<Edge>) {
             let value = prev.unwrap_or_else(|| b.f32(1.0));
-            (value, vec![value.id])
+            (value, vec![Edge::anchor(value.id)])
         }
 
-        fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &Self::Reg, war: &[TileId]) -> CommitBatch {
+        fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &Self::Reg, war: &[Edge]) -> CommitBatch {
             assert!(war.is_empty(), "no-WAR test hook must not receive a gather seal");
             CommitBatch::new(vec![b.store(self.out, self.zero, *reg)], CommitCompletion::Intrinsic)
         }
@@ -1437,8 +1651,8 @@ mod test {
             _b: &mut Builder,
             _slice: usize,
             _block: BlockCounter,
-            _raw: &[TileId],
-        ) -> (Self::Op, Vec<TileId>, TileId) {
+            _raw: &[Edge],
+        ) -> (Self::Op, Vec<Edge>, Edge) {
             panic!("no-gather hook must not gather")
         }
 
@@ -1463,7 +1677,7 @@ mod test {
             0,
             &accs,
             &inited,
-            None,
+            WaveTopology::Disjoint,
             Sched {
                 asm_gather: false,
                 resident: false,
@@ -1504,7 +1718,7 @@ mod test {
     #[should_panic(expected = "must contain a commit cluster")]
     fn verify_rejects_streaming_without_commit() {
         let b = Builder::new("t");
-        verify(&b.ir, &[], None, Some(TileId(0)), false, false);
+        verify(&b.ir, &[], None, Some(TileId(0)), false, (0, 0));
     }
 
     #[test]
@@ -1514,7 +1728,7 @@ mod test {
         let root = b.idx_const(0).0;
         let raw = b.idx_const(1).0;
         let tail = b.idx_const(2).0;
-        verify(&b.ir, &[root], Some(raw), Some(tail), false, false);
+        verify(&b.ir, &[root], Some(raw), Some(tail), false, (0, 0));
     }
 
     /// An unbalanced wave-phase pair (one eq=1 seed, no eq=0 rebalance reachable) is rejected — the
@@ -1530,6 +1744,6 @@ mod test {
         let wb = b.wave_barrier(wr, 1, &[e.dep()]);
         // route the eq=1 barrier into a live root; no eq=0 anywhere → unbalanced.
         let root = b.idx_after(wr, &[wb.dep()]);
-        verify(&b.ir, &[root.0], Some(e.dep()), Some(wb.dep()), false, true);
+        verify(&b.ir, &[root.0], Some(e.dep().raw()), Some(wb.dep().raw()), false, (1, 1));
     }
 }

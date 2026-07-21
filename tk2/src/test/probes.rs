@@ -4,8 +4,8 @@
 //! gates, never by a kernel or bench). Relocating a probe does NOT change the [`Program`] it builds —
 //! every emitted-IR signature (the `atb_probe` byte-identity gate, the device oracles) is unchanged.
 
-use crate::build::{BF16, Buf, Builder, Effect, F32, Idx, Val};
-use crate::ir::{FragMap, TileId};
+use crate::build::{BF16, Buf, Builder, Edge, Effect, F32, Idx, Val};
+use crate::ir::FragMap;
 use crate::kernels::{EDGE, Program, offset_by};
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 use crate::tile::BCol;
@@ -80,7 +80,7 @@ pub(crate) fn direct_lds_swizzled_k_probe() -> Program {
     }
     let n = copies.len();
     let committed = b.combine(copies[n - 1], &copies[..n - 1].iter().map(|e| e.dep()).collect::<Vec<_>>());
-    let wait = b.swait_vmcnt(committed.dep());
+    let wait = b.swait_vmcnt(committed);
     let published = b.barrier(wait, &[committed.dep()]);
 
     let mut roots = Vec::with_capacity(EPL);
@@ -110,7 +110,7 @@ pub(crate) fn ds_write_b16_probe(n: usize) -> Program {
     let value = b.load(src, tid);
     let vmem_ready = b.swait_vmcnt(value.id);
     let base = b.lds_ptr_as3(lds, tid, &[]);
-    let write = b.ds_write_b16(base, 0, value, Some(vmem_ready.dep()));
+    let write = b.ds_write_b16(base, 0, value, Some(vmem_ready.dep().raw()));
     let lds_ready = b.swait_lgkmcnt(write.dep());
     let published = b.barrier(lds_ready, &[write.dep()]);
     let loaded = b.load_lds_after(lds, tid, &[published.dep()]);
@@ -136,7 +136,7 @@ pub(crate) fn load_op_frag(
 ) -> Val<BF16> {
     let frag = b.define_frag::<BF16>(map);
     let k_c = b.idx_const(k_dim as i64);
-    let stores: Vec<TileId> = (0..map.ept)
+    let stores: Vec<Edge> = (0..map.ept)
         .map(|e| {
             let e_idx = b.idx_const(e as i64);
             let (r, cc) = b.lane_rc(map, lane, e_idx);
@@ -158,7 +158,7 @@ pub(crate) fn load_op_frag(
 /// 16-VGPR accumulator via [`Builder::acc_rc`]. It PROVES the 32×32×8 operand layout + accumulator
 /// distribution IN ISOLATION (device-gated allclose vs an f32 reference) before any FA work — the
 /// wide-core analog of `atb_probe`. `m`/`n` multiples of 32, `k` a multiple of 8. Emitted with the
-/// intrinsic MFMA ([`Builder::mma_of`], the production fast path).
+/// intrinsic MFMA ([`Builder::mma`]).
 #[allow(clippy::needless_range_loop)]
 pub(crate) fn mfma_32x32x8_probe(m: usize, n: usize, k: usize) -> Program {
     use crate::shape::Mfma32x32x8Bf16 as S;
@@ -189,7 +189,7 @@ pub(crate) fn mfma_32x32x8_probe(m: usize, n: usize, k: usize) -> Program {
             for ki in 0..k / S::K {
                 let af = load_op_frag(&mut b, a, a_map, mi * S::M, ki * S::K, k, lane);
                 let bf = load_op_frag(&mut b, bmat, b_map, ni * S::N, ki * S::K, k, lane);
-                acc = b.mma_of::<S>(af, bf, acc);
+                acc = b.mma(af, bf, acc, S::EPT_C);
             }
             // Scatter the 16-VGPR accumulator: element `i` → C[mi·32 + row, ni·32 + col] via acc_rc.
             for i in 0..S::EPT_C {
@@ -257,7 +257,7 @@ pub(crate) fn pv_relayout_probe(d: usize, q: usize) -> Program {
             };
             for s in 0..KV / S::K {
                 let a_s = load_op_frag(&mut b, v, a_map, dt * S::M, s * S::K, KV, lane);
-                acc = b.mma_of::<S>(a_s, b_ops[s], acc);
+                acc = b.mma(a_s, b_ops[s], acc, S::EPT_C);
             }
             // scatter O[d,q]: acc element i → O[dt·32 + row(=d), qt·32 + col(=q)] via acc_rc.
             for i in 0..S::EPT_C {
@@ -305,8 +305,8 @@ pub(crate) fn atb_probe(kv: usize, d: usize, q: usize) -> Program {
     let pl = prefetch(&mut b, p_smem, q, p, q as i64, kv * q / WARP, lane, zero, zero, &[]);
     let vf = commit(&mut b, v_smem, d, v, d as i64, kv * d / WARP, lane, zero, &vl, &[]);
     let pf = commit(&mut b, p_smem, q, p, q as i64, kv * q / WARP, lane, zero, &pl, &[]);
-    let fill: Vec<TileId> = vf.iter().chain(pf.iter()).map(|e| e.dep()).collect();
-    let bar = b.barrier(Effect(fill[0]), &fill[1..]);
+    let fill: Vec<Edge> = vf.iter().chain(pf.iter()).map(|e| e.dep()).collect();
+    let bar = b.barrier(Effect(fill[0].raw()), &fill[1..]);
 
     // ── transposed gather via the (Reg←Lds) op: the BCol operand role derives the transposed read,
     //    landing kv (contraction) on the spread lane-axis and d/q (output) on flat, stacked as frags. ──
@@ -445,7 +445,7 @@ pub(crate) fn v_transpose_probe(d: usize) -> Program {
     let d_c = b.idx_const(d as i64);
     let pitch_c = b.idx_const(pitch as i64);
     let lane_epl = b.idx_mul(lane, epl_c);
-    let fills: Vec<TileId> = (0..epl)
+    let fills: Vec<Edge> = (0..epl)
         .map(|i| {
             let i_c = b.idx_const(i as i64);
             let flat = b.idx_add(lane_epl, i_c); // source V flat index (kv·d + d_idx)
@@ -457,7 +457,7 @@ pub(crate) fn v_transpose_probe(d: usize) -> Program {
             b.store_lds(vt, dst, val).dep()
         })
         .collect();
-    let bar = b.barrier(Effect(fills[0]), &fills[1..]);
+    let bar = b.barrier(Effect(fills[0].raw()), &fills[1..]);
 
     // ── P·V: A-operand from the straight (contiguous) transposed read, B-operand P from global. ──
     let q_c = b.idx_const(Q as i64);
@@ -476,7 +476,7 @@ pub(crate) fn v_transpose_probe(d: usize) -> Program {
             let base = b.idx_add(base, kv_base);
             let a_s = b.load_lds_vec_after(vt, base, S::EPT_A, &[bar.dep()]);
             let b_s = load_op_frag(&mut b, pt, b_map, 0, s * S::K, KV, lane);
-            acc = b.mma_of::<S>(a_s, b_s, acc);
+            acc = b.mma(a_s, b_s, acc, S::EPT_C);
         }
         for i in 0..S::EPT_C {
             let (row, col) = b.acc_rc(dist, lane, i);

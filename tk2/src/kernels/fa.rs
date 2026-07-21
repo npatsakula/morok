@@ -19,17 +19,29 @@
 //! Device-gated by `flash_attention32_matches_reference_on_gfx942` (tight `atol` at d=64 AND d=128,
 //! including ragged `n`). Apply `.apply(SwizzlePass)` (it folds the K-tile LDS bank swizzle).
 
-use crate::build::{BF16, Buf, Builder, F32, Frag, Idx, Lds, Scope, Val};
+use crate::build::{BF16, Buf, Builder, Edge, F32, Frag, Idx, Lds, Scope, Val};
 use crate::ir::TileId;
 use crate::kernels::{Program, offset_by};
 use crate::partition::RowPartition;
 use crate::pipeline::{
-    BlockCounter, CommitBatch, CommitCompletion, CommitDrain, Compute, Hooks, Init, Mem, Sched, SlotSet, SlotVal,
-    pipeline,
+    Acc, AccArray, BlockCounter, CommitBatch, Compute, Hooks, Init, Mem, Publication, Sched, SlotSet, SlotVal, Temp,
+    WaveTopology, pipeline, slot_set,
 };
 use crate::shape::MfmaShape;
 use crate::tile::{Plain, Xor};
 use crate::tile_move::{commit_run, commit_run_asm, gather_run};
+
+/// FA-32's typed accumulator record. `o` is the per-`dtiles` PV accumulator group; `m`/`l`
+/// are the running softmax max/norm; `s` is the double-buffered (rotated) QKᵀ scores; `p` is the softmax
+/// weights — a TEMPORARY in the 4-cluster path and body-local (never a slot) in the 2-cluster merged
+/// path. Field order o→m→l→s→p is the slot/emission order.
+struct FaCarry {
+    o: AccArray<F32>,
+    m: Acc<F32>,
+    l: Acc<F32>,
+    s: Acc<F32>,
+    p: Temp<F32>,
+}
 
 /// Lanes per wavefront on gfx942 — the 64-lane warp shared by every FA-32 gather/reduce.
 const WARP: usize = 64;
@@ -114,6 +126,9 @@ struct Fa32Hooks {
     half_off: Idx,
     d: usize,
     pitch: usize,
+    /// The single LDS-publication decision — fixes both this commit's completion and the schedule's
+    /// drain ([`Sched::commit_drain`] below) from one value, so the two cannot drift.
+    publication: Publication,
     /// The production d128 fast bundle, on/off as ONE switch: waitcnt-opaque LDS gathers (explicit
     /// readiness waits), register-staged K/V publish through opaque asm writes, four-row packed b64
     /// transposed-V commit (`v_perm` + `ds_write_b64`, the LDS bank-conflict fix), and the two-crew phase
@@ -159,8 +174,8 @@ impl Hooks for Fa32Hooks {
         k_base: Idx,
         tile: usize,
         prev: Option<Fa32Fill>,
-        order: &[TileId],
-    ) -> (Fa32Fill, Vec<TileId>) {
+        order: &[Edge],
+    ) -> (Fa32Fill, Vec<Edge>) {
         let mut reg = prev.unwrap_or(Fa32Fill { k: Vec::new(), v: Vec::new() });
         let gvec = if self.epl.is_multiple_of(8) { 8 } else { 4 };
         let epl_c = b.idx_const(self.epl as i64);
@@ -187,7 +202,7 @@ impl Hooks for Fa32Hooks {
                     b.load_vec_after(self.v, off, 2, order)
                 })
                 .collect();
-            let anchors = reg.v.iter().map(|v| v.id).collect();
+            let anchors: Vec<Edge> = reg.v.iter().map(|v| Edge::anchor(v.id)).collect();
             return (reg, anchors);
         }
 
@@ -204,7 +219,7 @@ impl Hooks for Fa32Hooks {
                 b.load_vec_after(buf, off, gvec, order)
             })
             .collect();
-        let anchors = loaded.iter().map(|v| v.id).collect();
+        let anchors: Vec<Edge> = loaded.iter().map(|v| Edge::anchor(v.id)).collect();
         match tile {
             0 => reg.k = loaded,
             1 => reg.v = loaded,
@@ -213,7 +228,7 @@ impl Hooks for Fa32Hooks {
         (reg, anchors)
     }
 
-    fn commit(&mut self, b: &mut Builder, k_base: Idx, reg: &Fa32Fill, war: &[TileId]) -> CommitBatch {
+    fn commit(&mut self, b: &mut Builder, k_base: Idx, reg: &Fa32Fill, war: &[Edge]) -> CommitBatch {
         let k_lds = if war.is_empty() { self.k_lds } else { b.lds_after(self.k_lds, war) };
         // Keep baseline interning order byte-identical: rebind both LDS handles before the parity math.
         let vt_lds = if war.is_empty() { self.vt_lds } else { b.lds_after(self.vt_lds, war) };
@@ -239,14 +254,14 @@ impl Hooks for Fa32Hooks {
                     vt_off,
                     self.fast, // packed V (four-row v_perm + ds_write_b64)
                 ),
-                CommitCompletion::Opaque,
+                self.publication.completion(),
             );
         }
         CommitBatch::new(
             commit_run::<BF16, Xor, Plain>(
                 b, k_lds, self.d, vt_lds, self.pitch, &reg.k, &reg.v, self.epl, self.tid, k_off, vt_off,
             ),
-            CommitCompletion::Intrinsic,
+            self.publication.completion(),
         )
     }
 
@@ -255,8 +270,8 @@ impl Hooks for Fa32Hooks {
         b: &mut Builder,
         slice: usize,
         block: BlockCounter,
-        raw: &[TileId],
-    ) -> (Fa32Op, Vec<TileId>, TileId) {
+        raw: &[Edge],
+    ) -> (Fa32Op, Vec<Edge>, Edge) {
         use crate::shape::Mfma32x32x8Bf16 as S;
         let scope = block.scope();
         let q_in = b.scope_idx(self.q_in, scope);
@@ -299,7 +314,7 @@ impl Hooks for Fa32Hooks {
             1 => gather_v(b, q_in, half_off),
             _ => panic!("FA-32 gather: slice ∈ {{0=K, 1=V}}, got {slice}"),
         };
-        let anchor = vecs[0].id;
+        let anchor = Edge::anchor(vecs[0].id);
         (vecs, gathers, anchor)
     }
 
@@ -446,7 +461,7 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
     let k = b.global::<BF16>(bh * n * d);
     let v = b.global::<BF16>(bh * n * d);
 
-    // Grid = bh × ⌈n/q_blk⌉ workgroups over ONE flat axis; a `RowPartition` (Phase 2) derives the grid and
+    // Grid = bh × ⌈n/q_blk⌉ workgroups over ONE flat axis; a `RowPartition` derives the grid and
     // decodes `wgid → pid = (slice = bh_idx, tile = qwg, row_origin = q_origin)`. `row_origin =
     // bh_idx·n + qwg·q_blk` is the tile's global Q-row origin; `pid.slice·n` is this (b,h) slice's row base.
     // The Q grid rounds UP (div_ceil) so a ragged `n` is fully covered — the partial last workgroup's
@@ -503,7 +518,7 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
             let dcol = offset_by(&mut b, half_off, ki * k8);
             let base = b.idx_add(base, dcol);
             let frag = b.define_frag::<BF16>(S::b_map());
-            let stores: Vec<TileId> = (0..S::EPT_B)
+            let stores: Vec<Edge> = (0..S::EPT_B)
                 .map(|e| {
                     let e_c = b.idx_const(e as i64);
                     let off = b.idx_add(base, e_c);
@@ -530,35 +545,33 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
         crate::tile_ops::splat::<S>(&mut b, c)
     };
 
-    // ── the heterogeneous slot set (DESIGN §3.2). CARRIED: `o_0..o_{dtiles-1}` (16-wide f32 PV acc),
-    //    `m` (running max), `l` (running norm), and rotated `s` (QKᵀ scores, 16-wide f32). TEMPORARY:
-    //    `p` (softmax weights, 16-wide f32 → v_perm-packed in PV). All f32
-    //    on the `EPT_C = 16` accumulator (`c_map`); each warp keeps its OWN o/m/l over its 32 Q rows. ──
-    // Declared, not hand-numbered (Phase 3): `SlotSet` allocates each fragment as it is declared but
-    // DEFERS every init to `finish`, so the emission stays "all define_frags, then all inits" (o×dtiles,
-    // m, l, s, p → zero o×dtiles, const m, zero l) — byte-identical to the old hand-written slot table.
+    // ── the heterogeneous slot set as the typed `FaCarry` record (see its doc for the carried/temporary
+    //    layout). All f32 on the `EPT_C = 16` accumulator (`c_map`); each warp keeps its OWN o/m/l over its
+    //    32 Q rows. `SlotSet` allocates each fragment as the fields declare but DEFERS every init to
+    //    `finish`, so the emission is "all define_frags, then all inits" (zero o×dtiles, const m, zero l,
+    //    const s). ──
+    //
+    // `m` seed = −FLT_MAX (FINITE, not −∞): the rotation's seed block (softmax of the not-yet-real block 0
+    // at iteration 0) must be inert. With `s` seeded −∞ and `m` finite: `m_new = max(−FLT_MAX,
+    // reduce_max(−∞)) = −FLT_MAX`, so `corr = exp2(0) = 1` (no `∞−∞` NaN) and `p = exp2(−∞−(−FLT_MAX)) = 0`
+    // (no phantom mass). `s` is CARRIED (double-buffer): the fused QKᵀ∥softmax cluster reads block i−1's
+    // scores (carry-in) and writes block i's fresh QKᵀ, so softmax(i−1)'s VALU is independent of QKᵀ(i)'s
+    // MFMAs — the interleave's independent-MFMA stream (seed −∞, an empty block).
     let mut slots = SlotSet::new();
-    let o_idx = slots.carried_group(&mut b, dtiles, S::c_map(), Init::Zero);
-    // Running max seed = −FLT_MAX (FINITE, not −∞): the rotation's seed block (softmax of the not-yet-real
-    // block 0 at iteration 0) must be inert. With `s` seeded −∞ and `m` finite: `m_new = max(−FLT_MAX,
-    // reduce_max(−∞)) = −FLT_MAX`, so `corr = exp2(−FLT_MAX − (−FLT_MAX)) = exp2(0) = 1` (no `∞−∞` NaN) and
-    // `p = exp2(−∞ − (−FLT_MAX)) = 0` (no phantom mass). The first REAL block's max always exceeds −FLT_MAX,
-    // so the running max is numerically identical to a −∞ seed.
-    let slot_m = slots.carried(&mut b, S::c_map(), Init::Const(-f32::MAX));
-    let slot_l = slots.carried(&mut b, S::c_map(), Init::Zero); // running norm seed = 0
-    // `s` is CARRIED (double-buffer): the fused QKᵀ∥softmax cluster reads block i−1's scores (carry-in)
-    // and writes block i's fresh QKᵀ, so softmax(i−1)'s VALU is independent of QKᵀ(i)'s MFMAs — the
-    // interleave's independent-MFMA stream. Seed −∞ (an empty block: exp2(−∞−m)=0, no phantom mass).
-    let slot_s = slots.carried(&mut b, S::c_map(), Init::Const(f32::NEG_INFINITY));
-    let slot_p = slots.temp(&mut b, S::c_map()); // softmax weights (temporary)
+    let carry = FaCarry {
+        o: slots.carried_array(&mut b, dtiles, S::c_map(), Init::Zero),
+        m: slots.carried_typed(&mut b, S::c_map(), Init::Const(-f32::MAX)),
+        l: slots.carried_typed(&mut b, S::c_map(), Init::Zero),
+        s: slots.carried_typed(&mut b, S::c_map(), Init::Const(f32::NEG_INFINITY)),
+        p: slots.temp_typed(&mut b, S::c_map()),
+    };
     let (accs, inited) = slots.finish(&mut b);
 
-    // Per-cluster read/write slot sets (asymmetric — the §3.2 point). The FUSED QKᵀ∥softmax cluster reads
-    // {s(i−1),m,l,o_*} and writes {s(i),m,l,p,o_*}; PV reads {p,o_*} writes {o_*}. `o_idx` is the
-    // carried_group's returned slot indices (0..dtiles).
-    let qk_reads: Vec<usize> = [slot_s, slot_m, slot_l].into_iter().chain(0..dtiles).collect();
-    let qk_writes: Vec<usize> = [slot_s, slot_m, slot_l, slot_p].into_iter().chain(0..dtiles).collect();
-    let pv_reads: Vec<usize> = [slot_p].into_iter().chain(0..dtiles).collect();
+    // Per-cluster read/write slot sets (asymmetric — the §3.2 point), now named by field, not hand-numbered:
+    // the FUSED QKᵀ∥softmax cluster reads {s(i−1),m,l,o_*} and writes {s(i),m,l,p,o_*}; PV reads {p,o_*}.
+    let qk_reads = slot_set![carry.s, carry.m, carry.l, carry.o];
+    let qk_writes = slot_set![carry.s, carry.m, carry.l, carry.p, carry.o];
+    let pv_reads = slot_set![carry.p, carry.o];
 
     // Warmup QK(0), with no seed softmax and no zero-weight P·V. The warmup memory cluster gathers K0
     // before committing K1/V1, so d64's single K buffer cannot be overwritten before its operands are
@@ -567,7 +580,7 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
     let qk_warmup = Compute::<Fa32Hooks>::new(
         0,
         vec![],
-        vec![slot_s],
+        slot_set![carry.s],
         move |b: &mut Builder, op: Option<&Fa32Op>, _reads: &[SlotVal], _blk: BlockCounter| {
             let k_frags = op.expect("FA warmup QK consumes gathered K0");
             let z = b.f32(0.0);
@@ -622,7 +635,7 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
             }
             // Softmax-under-MFMA: fold softmax(i−1)'s exp2 under QKᵀ(i)'s MFMAs — `interleave_exp` (group 1)
             // anchored on the QKᵀ MFMA output. The hint emits NO instruction; kept live by routing into `p`.
-            let p = match b.interleave_exp(FA_EXP_PAIRS, FA_EXP_CNT, 1, &[s_acc.id]) {
+            let p = match b.interleave_exp(FA_EXP_PAIRS, FA_EXP_CNT, 1, &[Edge::anchor(s_acc.id)]) {
                 Some(h) => b.val_after(p, &[h.dep()]),
                 None => p,
             };
@@ -645,7 +658,7 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
     let pv = Compute::<Fa32Hooks>::new(
         1,
         pv_reads,
-        o_idx.clone(),
+        slot_set![carry.o],
         move |b: &mut Builder, op: Option<&Fa32Op>, reads: &[SlotVal], _blk: BlockCounter| {
             let v_frags = op.expect("PV consumes gathered V");
             let b_ops = crate::tile_ops::relayout::<S>(b, reads[0].f32());
@@ -671,7 +684,7 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
             // Declarative reduction-under-MFMA: fold the softmax-max/sum VALU under the P·V MFMAs —
             // `interleave_valu<pairs, valu>` in SyncID group 2, kept live by routing into O[0].
             if let (Some(a), Some(SlotVal::F32(o0))) = (anchor, out.first().copied())
-                && let Some(h) = b.interleave_valu(FA_VALU_PAIRS, FA_VALU_CNT, 2, &[a])
+                && let Some(h) = b.interleave_valu(FA_VALU_PAIRS, FA_VALU_CNT, 2, &[Edge::anchor(a)])
             {
                 out[0] = SlotVal::F32(b.val_after(o0, &[h.dep()]));
             }
@@ -683,7 +696,7 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
     // so the phase-stagger `s_barrier` amortizes over 32 MFMAs (matching the matmul clone) instead of the
     // 4-cluster's 16 — the small-cluster barrier tax is why the split ping-pong lost to single-crew
     // production. Operand 0 is the merged K++V gather (`ksteps=1`); `p` is a local, not a written slot.
-    let merged_reads: Vec<usize> = [slot_s, slot_m, slot_l].into_iter().chain(o_idx.iter().copied()).collect();
+    let merged_reads = slot_set![carry.s, carry.m, carry.l, carry.o];
     let merged = Compute::<Fa32Hooks>::new(
         0,
         merged_reads.clone(),
@@ -713,7 +726,7 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
             for ki in 0..dslices {
                 s_acc = crate::tile_ops::mma::<S>(b, k_frags[ki], q_frags_pp[ki], s_acc);
             }
-            let s_acc = match b.interleave_exp(FA_EXP_PAIRS, FA_EXP_CNT, 1, &[s_acc.id]) {
+            let s_acc = match b.interleave_exp(FA_EXP_PAIRS, FA_EXP_CNT, 1, &[Edge::anchor(s_acc.id)]) {
                 Some(h) => b.val_after(s_acc, &[h.dep()]),
                 None => s_acc,
             };
@@ -731,7 +744,7 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
                 })
                 .collect();
             if let (Some(a), Some(SlotVal::F32(o0))) = (anchor, o_out.first().copied())
-                && let Some(h) = b.interleave_valu(FA_VALU_PAIRS, FA_VALU_CNT, 2, &[a])
+                && let Some(h) = b.interleave_valu(FA_VALU_PAIRS, FA_VALU_CNT, 2, &[Edge::anchor(a)])
             {
                 o_out[0] = SlotVal::F32(b.val_after(o0, &[h.dep()]));
             }
@@ -745,7 +758,18 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
     let n_c = b.idx_const(n as i64);
     let bh_row = b.idx_mul(pid.slice, n_c);
     let bh_row_d = b.idx_mul(bh_row, d_c);
-    let hooks = Fa32Hooks { k, v, k_lds, vt_lds, double_buf, bh_row_d, tid, epl, q_in, half_off, d, pitch, fast };
+    // The single LDS-publication decision, derived ONCE from the config: the fast asm path publishes
+    // immediately; a double-buffer drops the WAR seal; the baseline single-buffer fences it. Both the
+    // commit hook's completion and the schedule's drain read from it — they cannot disagree.
+    let publication = if fast {
+        Publication::AsmPublished
+    } else if double_buf {
+        Publication::IntrinsicNoWar
+    } else {
+        Publication::IntrinsicWar
+    };
+    let hooks =
+        Fa32Hooks { k, v, k_lds, vt_lds, double_buf, bh_row_d, tid, epl, q_in, half_off, d, pitch, publication, fast };
     let pipe = pipeline(
         &mut b,
         nblocks,       // nblocks (streaming over KV; ⌈n/kv_blk⌉ — the last block may be ragged)
@@ -754,18 +778,14 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
         if fast { 1 } else { 2 },
         &accs,
         &inited,
-        warp_row, // Some(warp/4) for the ping-pong path enables the two-crew phase stagger; None = single-crew
+        // Some(warp/4) → the two-crew ping-pong stagger; None → single-crew disjoint-Q warps.
+        warp_row.map_or(WaveTopology::Disjoint, |wr| WaveTopology::PingPong { warp_row: wr, groups: 2, offset: 1 }),
         Sched {
             asm_gather: fast,
             resident: false,
             // Lever-3: double-buffered ⇒ drop the WAR seal (commit/gather touch disjoint parity halves).
-            commit_drain: if fast {
-                CommitDrain::AsmPublishedNoWar
-            } else if double_buf {
-                CommitDrain::IntrinsicNoWar
-            } else {
-                CommitDrain::IntrinsicAuto
-            },
+            // Same `publication` decision as the commit hook's completion — one source, no drift.
+            commit_drain: publication.drain(),
             bare_seals: fast,
             pin_mfma: false,
         },
@@ -774,7 +794,7 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
     let pipe = pipe
         .warmup_cluster(Mem::builder().prefetch([0, 1]).gathers([0]).commit(true).build())
         .warmup_cluster(qk_warmup)
-        .warmup_seed(slot_s);
+        .warmup_seed(carry.s.index());
     let pipe = if ragged { pipe.scoped_regions() } else { pipe };
     let acc_final = if fast {
         // 2-cluster ping-pong: Mem (prefetch next K+V, gather the MERGED K++V, commit) + the merged 32-MFMA
@@ -795,15 +815,15 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
     //    steady iteration, at parity (nblocks−1)%3), so no re-fetch — just gather it and finish. This is
     //    also the ONLY block that can be ragged, so the ragged mask lives here. ──
     let vt_off_drain = b.idx_const(((nblocks - 1) % V_NBUF * (d * pitch)) as i64);
-    let s_last = b.load_frag_vec(acc_final[slot_s].f32()); // block nblocks−1's QKᵀ scores (carried, observes End)
-    let m_run = b.load_frag_vec(acc_final[slot_m].f32());
-    let l_run = b.load_frag_vec(acc_final[slot_l].f32());
+    let s_last = b.load_frag_vec(acc_final[carry.s.index()].f32()); // block nblocks−1's QKᵀ scores (carried, observes End)
+    let m_run = b.load_frag_vec(acc_final[carry.m.index()].f32());
+    let l_run = b.load_frag_vec(acc_final[carry.l.index()].f32());
     // The drain's V gather must be emitted in POST-LOOP scope with FRESH nodes — `gather_run` hash-conses
     // its LDS-address nodes on `(q_in, half_off, vt_lds)`, which the loop's gather already interned INSIDE
     // the loop body; reusing them post-loop breaks SSA dominance (hard fail at some `n`) and mis-addresses
     // the read (a ~5%-of-last-block soft error at others). Re-bind the shared leaves to one anchored
     // lexical scope so all drain address/reduction DAGs are distinct and dominated post-pipeline.
-    let end_dep = [s_last.id];
+    let end_dep = [Edge::anchor(s_last.id)];
     let (drain_scope, q_in_d, half_off_d, vt_lds_d, wlane_d) = if ragged {
         let scope = b.scope(&end_dep);
         (
@@ -839,7 +859,7 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
     // The V `ds_read`s are async — WAIT for them (`lgkmcnt(0)`) before the P·V MMA consumes `v_frags`.
     let drain_wait = b.swait_lgkmcnt(*gathers.last().expect("V gather emits ≥1 read")).dep();
     let v_frags: Vec<Val<BF16>> =
-        if fast { v_frags.into_iter().map(|v| b.opaque_ready_b64(v, drain_wait)).collect() } else { v_frags };
+        if fast { v_frags.into_iter().map(|v| b.opaque_ready_b64(v, drain_wait.raw())).collect() } else { v_frags };
     let s_scaled = b.mul(s_last, scale_bcast);
     let s_scaled = if ragged {
         mask_ragged_kv(&mut b, s_scaled, BlockCounter::Epilogue((nblocks - 1) as i64, drain_scope), wlane_d, n)
@@ -864,14 +884,15 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
     // otherwise trips the 32×32×8 "VALU reads accumulator before the MFMA result lands" hazard.
     let o_drain: Vec<Frag<F32>> = (0..dtiles)
         .map(|dt| {
-            let o_run = b.load_frag_vec(acc_final[dt].f32());
+            let o_slot = carry.o.slot(dt).index(); // the dt-th PV accumulator's runtime slot (== dt; typed)
+            let o_run = b.load_frag_vec(acc_final[o_slot].f32());
             let o = b.mul(o_run, corr); // O *= corr for the new running max
             let mut o = b.val_after(o, &[drain_wait]); // order the MMA after the V-read lgkmcnt drain
             for s in 0..ksl {
                 o = crate::tile_ops::mma::<S>(&mut b, v_frags[dt * ksl + s], b_ops[s], o);
             }
-            let st = b.store_frag_vec(acc_final[dt].f32(), o).dep();
-            b.frag_after(acc_final[dt].f32(), &[st])
+            let st = b.store_frag_vec(acc_final[o_slot].f32(), o).dep();
+            b.frag_after(acc_final[o_slot].f32(), &[st])
         })
         .collect();
 
@@ -903,7 +924,7 @@ fn flash_attention_fwd_32_impl(bh: usize, n: usize, d: usize, fast: bool, bf16_o
     }
     // Scheduling-coherence gate (plan §2.6): setprio balance + interleave sanity + hint purity ⇒
     // deleting every interleave/prio hint leaves a still-correct kernel. A build-time panic on a bug.
-    let root_ids: Vec<TileId> = roots.iter().map(|e| e.dep()).collect();
+    let root_ids: Vec<TileId> = roots.iter().map(|e| e.dep().raw()).collect();
     crate::schedule::verify_v2(&b.ir, &root_ids);
     let (ir, sink) = b.finish(&roots);
     Program { ir, sink, name: "tk2_fa_fwd_32".into() }

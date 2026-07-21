@@ -126,6 +126,30 @@ fn acc_rc_matches_lane_rc_for_16x16x16() {
     }
 }
 
+/// The shape-matched MMA entry points (`mma_of`/`mma_asm_of`) erase to the plain
+/// [`Builder::mma`]/[`Builder::mma_asm`]: the `Tile<M,K>·Tile<K,N>→Tile<M,N>` composition check lives
+/// only in the types, so the interned `Node::Mma` is identical and hash-consing collapses the shaped and
+/// unshaped calls to ONE `TileId`. This proves the type layer adds zero IR — the matmul clustered kernel
+/// stays byte-identical after the `mma_asm` → `mma_asm_of` migration (its GOLDEN below is unchanged).
+#[test]
+fn shaped_mma_interns_equal_to_plain_mma_16x16x16() {
+    use crate::build::Builder;
+    use crate::shape::{Mfma16x16x16Bf16 as S, MfmaShape};
+    let mut b = Builder::new("mma_shape_probe");
+    let fa = b.define_frag::<crate::build::BF16>(S::a_map());
+    let fb = b.define_frag::<crate::build::BF16>(S::b_map());
+    let fc = b.define_frag::<crate::build::F32>(S::c_map());
+    let (a, bb, c) = (b.load_frag_vec(fa), b.load_frag_vec(fb), b.load_frag_vec(fc));
+    // Intrinsic path: shaped `mma_of` == plain `mma`.
+    let plain = b.mma(a, bb, c, S::EPT_C);
+    let shaped = b.mma_of::<S, 16, 16, 16>(a.tile::<16, 16>(), bb.tile::<16, 16>(), c.tile::<16, 16>());
+    assert_eq!(plain.id, shaped.erase().id, "shaped mma_of must intern-equal plain mma");
+    // Asm path (the matmul kernel's site): shaped `mma_asm_of` == plain `mma_asm`.
+    let plain_asm = b.mma_asm(a, bb, c, S::EPT_C);
+    let shaped_asm = b.mma_asm_of::<S, 16, 16, 16>(a.tile::<16, 16>(), bb.tile::<16, 16>(), c.tile::<16, 16>());
+    assert_eq!(plain_asm.id, shaped_asm.erase().id, "shaped mma_asm_of must intern-equal plain mma_asm");
+}
+
 /// The gate: the emitted IR of every proof kernel must equal its golden signature.
 #[test]
 fn emitted_ir_is_byte_identical_after_marker_refactor() {

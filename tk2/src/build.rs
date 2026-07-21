@@ -54,6 +54,25 @@ pub struct Val<E: Elem> {
     _e: PhantomData<E>,
 }
 
+/// A **shape-labelled view** over a [`Val`] — an `R×C` MMA tile whose dims live only in the type
+/// (const generics) and ERASE at the matrix-core op. It exists solely in the straight-line
+/// `gather → mma` window and is NEVER carried in a slot, so the interned IR and the [`Frag`]/
+/// `AccSlot` carry path stay data-driven (no monomorphisation of the movement layer). The shape
+/// match `Tile<M,K> · Tile<K,N> → Tile<M,N>` — a *shared* `const K` — is what type-checks operand
+/// composition with no type-level arithmetic; the accumulator width still rides as data via
+/// [`crate::shape::MfmaShape`]. See [`Builder::mma_of`] / [`Builder::mma_asm_of`].
+#[derive(Copy, Clone, Debug)]
+pub struct Tile<E: Elem, const R: usize, const C: usize> {
+    val: Val<E>,
+}
+
+impl<E: Elem, const R: usize, const C: usize> Tile<E, R, C> {
+    /// Drop the shape label back to the underlying value (the erasure at the op boundary).
+    pub fn erase(self) -> Val<E> {
+        self.val
+    }
+}
+
 /// An index-typed value handle (addressing arithmetic / loop counters / axes).
 #[derive(Copy, Clone, Debug)]
 pub struct Idx(pub TileId);
@@ -129,18 +148,40 @@ impl Scope {
 
 impl Range {
     /// This loop's range as an ordering edge (keeps a routed read in the loop body).
-    pub fn dep(self) -> TileId {
-        self.id
+    pub fn dep(self) -> Edge {
+        Edge(self.id)
     }
 }
 
 /// An effect handle (a store, an ended store, an after-wrapped buffer).
 #[derive(Copy, Clone, Debug)]
+#[must_use]
 pub struct Effect(pub TileId);
 
 impl Effect {
     /// This effect as an ordering edge (a happens-before token).
-    pub fn dep(self) -> TileId {
+    pub fn dep(self) -> Edge {
+        Edge(self.0)
+    }
+}
+
+/// A happens-before ordering token — an [`Effect`] or [`Range`] completion routed as a scheduling
+/// edge. A newtype over `TileId`: a payload value id cannot masquerade as an ordering token, and the
+/// one sanctioned value→edge cast is the explicit [`Edge::anchor`]. Erases to the same `TileId`, so
+/// the interned IR is unchanged.
+#[derive(Copy, Clone, Debug)]
+#[must_use]
+pub struct Edge(TileId);
+
+impl Edge {
+    /// The ONE sanctioned value-id → ordering-edge cast: pin a scheduling hint on a *value* whose
+    /// completion positions it (a load result used as a `sched_fence` anchor, a `set_prio` op anchor,
+    /// a scope marker, the `wave_barrier` warp-row operand's neighbours).
+    pub fn anchor(id: TileId) -> Self {
+        Self(id)
+    }
+    /// The underlying id, unpacked only at the interning boundary.
+    pub(crate) fn raw(self) -> TileId {
         self.0
     }
 }
@@ -151,7 +192,7 @@ pub struct VmemWaitAnchor(TileId);
 
 impl From<Effect> for VmemWaitAnchor {
     fn from(effect: Effect) -> Self {
-        Self(effect.dep())
+        Self(effect.0)
     }
 }
 
@@ -167,6 +208,11 @@ impl From<TileId> for VmemWaitAnchor {
 impl<E: Elem> Val<E> {
     fn wrap(id: TileId) -> Self {
         Val { id, _e: PhantomData }
+    }
+
+    /// Label this value's logical `R×C` MMA-tile shape (a zero-cost view; erases at the op).
+    pub fn tile<const R: usize, const C: usize>(self) -> Tile<E, R, C> {
+        Tile { val: self }
     }
 }
 
@@ -245,9 +291,9 @@ impl Builder {
 
     /// Open a statically-sized loop after a peeled prologue or other required incoming effects.
     /// Unlike attaching `deps` to the loop body, this makes those effects dominate the Range itself.
-    pub fn range_after(&mut self, trips: i64, deps: &[TileId]) -> Range {
+    pub fn range_after(&mut self, trips: i64, deps: &[Edge]) -> Range {
         let rid = self.ir.fresh_range_id();
-        let deps = deps.iter().copied().collect();
+        let deps = deps.iter().map(|e| e.raw()).collect();
         Range { id: self.ir.intern(Node::RangeAfter { id: rid, trips, deps }) }
     }
 
@@ -262,17 +308,17 @@ impl Builder {
     }
 
     /// Open a runtime-sized loop after a peeled prologue or other incoming effects.
-    pub fn range_dyn_after(&mut self, domain: IterDomain, deps: &[TileId]) -> Range {
+    pub fn range_dyn_after(&mut self, domain: IterDomain, deps: &[Edge]) -> Range {
         let rid = self.ir.fresh_range_id();
-        let deps = deps.iter().copied().collect();
+        let deps = deps.iter().map(|e| e.raw()).collect();
         Range { id: self.ir.intern(Node::RangeDyn { id: rid, trips: domain.trips.0, deps }) }
     }
 
     /// Mint a zero-instruction lexical scope marker. Use [`Self::scope_idx`] / [`Self::scope_lds`] on
     /// reusable leaves before deriving addresses in warmup, loop, epilogue, or drain regions.
-    pub fn scope(&mut self, deps: &[TileId]) -> Scope {
+    pub fn scope(&mut self, deps: &[Edge]) -> Scope {
         let id = self.ir.fresh_scope_id();
-        let deps = deps.iter().copied().collect();
+        let deps = deps.iter().map(|e| e.raw()).collect();
         Scope { id: Some(self.ir.intern(Node::Scope { id, deps })) }
     }
 
@@ -501,7 +547,7 @@ impl Builder {
     /// (`reg.after([prev_store, range, …])`), so the read observes the
     /// routed-through effects/ranges — the loop-carry read (DESIGN.md §2.1). `deps`
     /// may mix effect and range handles (see [`Effect::dep`] / [`Range::dep`]).
-    pub fn load_reg_after<E: Elem>(&mut self, reg: Reg<E>, offset: Idx, deps: &[TileId]) -> Val<E> {
+    pub fn load_reg_after<E: Elem>(&mut self, reg: Reg<E>, offset: Idx, deps: &[Edge]) -> Val<E> {
         let after = self.after_buf(reg.id, deps);
         Val::wrap(self.ir.intern(Node::LoadGlobal { buf: after, offset: offset.0, dtype: E::dtype() }))
     }
@@ -550,7 +596,7 @@ impl Builder {
     /// the pipeline's commit-after-WAR — the write that overwrites the strip must follow the
     /// previous iteration's gather (the WAR barrier), carried through `[seed, range]`. The
     /// `After` edge on the destination buffer is the store analog of [`Self::load_lds_after`].
-    pub fn store_lds_after<E: Elem>(&mut self, lds: Lds<E>, offset: Idx, value: Val<E>, deps: &[TileId]) -> Effect {
+    pub fn store_lds_after<E: Elem>(&mut self, lds: Lds<E>, offset: Idx, value: Val<E>, deps: &[Edge]) -> Effect {
         let after = self.after_buf(lds.id, deps);
         Effect(self.ir.intern(Node::StoreGlobal { buf: after, offset: offset.0, value: value.id }))
     }
@@ -560,7 +606,7 @@ impl Builder {
     /// (vs. threading `deps` into each `store_lds*`) keeps the vectorised/scalar fill functions
     /// dep-agnostic — the ordering rides on the destination handle they already write to. The
     /// buffer analog of [`Self::frag_after`].
-    pub fn lds_after<E: Elem>(&mut self, lds: Lds<E>, deps: &[TileId]) -> Lds<E> {
+    pub fn lds_after<E: Elem>(&mut self, lds: Lds<E>, deps: &[Edge]) -> Lds<E> {
         let id = self.after_buf(lds.id, deps);
         Lds { id, len: lds.len, _e: PhantomData }
     }
@@ -576,7 +622,7 @@ impl Builder {
     /// LDS reads carry their RAW ordering), so the linearizer emits the load in `deps`' cluster instead
     /// of floating it to the loop top. Used to PIN the split prefetch (HK's A@C0 / B@C4): the load nodes
     /// hash-cons identically regardless of authoring cluster, so without this edge the split is a no-op.
-    pub fn load_vec_after<E: Elem>(&mut self, buf: Buf<E>, base: Idx, ept: usize, deps: &[TileId]) -> Val<E> {
+    pub fn load_vec_after<E: Elem>(&mut self, buf: Buf<E>, base: Idx, ept: usize, deps: &[Edge]) -> Val<E> {
         let buf = if deps.is_empty() { buf.id } else { self.after_buf(buf.id, deps) };
         Val::wrap(self.ir.intern(Node::LoadVecAt { buf, base: base.0, ept, dtype: E::dtype() }))
     }
@@ -607,8 +653,8 @@ impl Builder {
     /// descriptor base (from [`Self::make_buffer_rsrc`]) advances per K-tile in scalar; `voffset` is the
     /// per-lane within-tile byte offset (loop-invariant). `order` pins the load into its authoring cluster
     /// (ordering-only, as [`Self::load_vec_after`]'s `deps`).
-    pub fn buffer_load_raw<E: Elem>(&mut self, rsrc: Idx, voffset: Idx, ept: usize, order: &[TileId]) -> Val<E> {
-        let order = order.iter().copied().collect();
+    pub fn buffer_load_raw<E: Elem>(&mut self, rsrc: Idx, voffset: Idx, ept: usize, order: &[Edge]) -> Val<E> {
+        let order = order.iter().map(|e| e.raw()).collect();
         Val::wrap(self.ir.intern(Node::BufferLoadRaw {
             rsrc: rsrc.0,
             voffset: voffset.0,
@@ -634,14 +680,14 @@ impl Builder {
         src_offset: Idx,
         dst: Lds<BF16>,
         dst_offset: Idx,
-        deps: &[TileId],
+        deps: &[Edge],
     ) -> Effect {
         Effect(self.ir.intern(Node::GlobalLoadLdsDword {
             src: src.id,
             src_offset: src_offset.0,
             dst: dst.id,
             dst_offset: dst_offset.0,
-            deps: deps.iter().copied().collect(),
+            deps: deps.iter().map(|e| e.raw()).collect(),
         }))
     }
 
@@ -662,7 +708,7 @@ impl Builder {
     /// The `After` edge on the buffer makes the store→barrier→load order explicit —
     /// omitting it is the silent-miscompile class (§2.1). Prefer this over any bare
     /// LDS load (a lane may read another lane's write only past the barrier).
-    pub fn load_lds_after<E: Elem>(&mut self, lds: Lds<E>, offset: Idx, deps: &[TileId]) -> Val<E> {
+    pub fn load_lds_after<E: Elem>(&mut self, lds: Lds<E>, offset: Idx, deps: &[Edge]) -> Val<E> {
         let after = self.after_buf(lds.id, deps);
         Val::wrap(self.ir.intern(Node::LoadGlobal { buf: after, offset: offset.0, dtype: E::dtype() }))
     }
@@ -671,8 +717,8 @@ impl Builder {
     /// must complete before any consumer routed [`Self::load_lds_after`] (or otherwise
     /// `After` the returned effect) proceeds. The `store → barrier → load` fence the
     /// LDS stage needs (mirrors tk's `store.barrier(deps)`).
-    pub fn barrier(&mut self, body: Effect, deps: &[TileId]) -> Effect {
-        let deps = deps.iter().copied().collect();
+    pub fn barrier(&mut self, body: Effect, deps: &[Edge]) -> Effect {
+        let deps = deps.iter().map(|e| e.raw()).collect();
         Effect(self.ir.intern(Node::Barrier { body: body.0, deps }))
     }
 
@@ -681,8 +727,8 @@ impl Builder {
     /// does NOT force an `lgkmcnt(0)` LDS drain. The LDS ordering the fence dropped MUST be re-supplied
     /// by an explicit [`Self::swait_lgkmcnt`] at the RAW/WAR/pre-MFMA points (caller's obligation — a
     /// missing drain is a silent stale read). `body` + `deps` are pure happens-after anchors.
-    pub fn bare_barrier(&mut self, body: Effect, deps: &[TileId]) -> Effect {
-        let deps = deps.iter().copied().collect();
+    pub fn bare_barrier(&mut self, body: Effect, deps: &[Edge]) -> Effect {
+        let deps = deps.iter().map(|e| e.raw()).collect();
         Effect(self.ir.intern(Node::BareBarrier { body: body.0, deps }))
     }
 
@@ -691,8 +737,8 @@ impl Builder {
     /// the prefetch load values, so the fence sits just past them and the AMDGPU scheduler may
     /// not sink them below it. Route the fence's [`Effect`] into a downstream consumer's deps to
     /// keep it live and force the rest of the body after it. `mask = 0` = a total fence.
-    pub fn sched_fence(&mut self, mask: i64, anchors: &[TileId]) -> Effect {
-        let deps = anchors.iter().copied().collect();
+    pub fn sched_fence(&mut self, mask: i64, anchors: &[Edge]) -> Effect {
+        let deps = anchors.iter().map(|e| e.raw()).collect();
         Effect(self.ir.intern(Node::SchedFence { mask, deps }))
     }
 
@@ -701,8 +747,8 @@ impl Builder {
     /// group `group`. Emits NO instruction; drives the MFMA:VALU/exp interleave. Route its [`Effect`]
     /// into a downstream consumer to keep it live + positioned. Prefer the [`Self::interleave_valu`] /
     /// [`Self::interleave_exp`] ratio helpers; this is the raw primitive.
-    pub fn sched_group(&mut self, mask: i64, size: i64, group: i64, anchors: &[TileId]) -> Effect {
-        let deps = anchors.iter().copied().collect();
+    pub fn sched_group(&mut self, mask: i64, size: i64, group: i64, anchors: &[Edge]) -> Effect {
+        let deps = anchors.iter().map(|e| e.raw()).collect();
         Effect(self.ir.intern(Node::SchedGroupBarrier { mask, size, group, deps }))
     }
 
@@ -717,18 +763,18 @@ impl Builder {
     /// runs *inside* the matrix pipeline. Emits `2·pairs` hints (zero instructions), chained so each is
     /// live + ordered after the last; `anchors` anchor the first. Returns the final hint [`Effect`] to
     /// thread onward. `pairs = 0` is a no-op (returns `None`).
-    pub fn interleave_valu(&mut self, pairs: u32, valu: u32, group: i64, anchors: &[TileId]) -> Option<Effect> {
+    pub fn interleave_valu(&mut self, pairs: u32, valu: u32, group: i64, anchors: &[Edge]) -> Option<Effect> {
         self.interleave(Self::SG_VALU, pairs, valu, group, anchors)
     }
 
     /// HipKittens' `sched_barrier_exp_pairs`: repeat `pairs`×{ 1 MFMA, then `exp` transcendental } — the
     /// softmax `exp2` folded under the P·V MFMA. Same shape as [`Self::interleave_valu`], EXP mask.
-    pub fn interleave_exp(&mut self, pairs: u32, exp: u32, group: i64, anchors: &[TileId]) -> Option<Effect> {
+    pub fn interleave_exp(&mut self, pairs: u32, exp: u32, group: i64, anchors: &[Edge]) -> Option<Effect> {
         self.interleave(Self::SG_EXP, pairs, exp, group, anchors)
     }
 
     /// Shared `pairs`×{ 1 MFMA, then `n` `mask`-ops } emitter for the ratio helpers.
-    fn interleave(&mut self, mask: i64, pairs: u32, n: u32, group: i64, anchors: &[TileId]) -> Option<Effect> {
+    fn interleave(&mut self, mask: i64, pairs: u32, n: u32, group: i64, anchors: &[Edge]) -> Option<Effect> {
         let mut last: Option<Effect> = None;
         for _ in 0..pairs {
             let a = last.map_or_else(|| anchors.to_vec(), |e| vec![e.dep()]);
@@ -742,8 +788,8 @@ impl Builder {
     /// Bracket an MFMA cluster `set_prio(1, [entry]) … set_prio(0, [mma results])` so the compute
     /// wave wins SIMD issue over the co-resident loading wave. Route its [`Effect`] into a
     /// downstream consumer to keep it live and ordered.
-    pub fn set_prio(&mut self, level: i64, after: &[TileId]) -> Effect {
-        let deps = after.iter().copied().collect();
+    pub fn set_prio(&mut self, level: i64, after: &[Edge]) -> Effect {
+        let deps = after.iter().map(|e| e.raw()).collect();
         Effect(self.ir.intern(Node::SetPrio { level, deps }))
     }
 
@@ -751,7 +797,7 @@ impl Builder {
     /// [`Node::After`] returns a value equal to `v` but happens-after `deps`. The way a scheduling hint
     /// (`interleave_valu`/`interleave_exp`) is kept LIVE + positioned inside a loop body: route the hint
     /// effect into a carried accumulator value, so it rides the carry to the sink instead of being DCE'd.
-    pub fn val_after<E: Elem>(&mut self, v: Val<E>, deps: &[TileId]) -> Val<E> {
+    pub fn val_after<E: Elem>(&mut self, v: Val<E>, deps: &[Edge]) -> Val<E> {
         Val::wrap(self.after_buf(v.id, deps))
     }
 
@@ -759,14 +805,14 @@ impl Builder {
     /// schedule-steering custom (`wave_barrier`/`set_prio`) is ordered after a barrier without
     /// taking the barrier as a `Op::Custom` dep (which the renderer can't name) — the warp_row
     /// operand carries the ordering, mirroring tk's `a_smem.after([barrier])` (`gfx942.rs:156`).
-    pub fn idx_after(&mut self, idx: Idx, deps: &[TileId]) -> Idx {
+    pub fn idx_after(&mut self, idx: Idx, deps: &[Edge]) -> Idx {
         Idx(self.after_buf(idx.0, deps))
     }
 
     /// Rebind an index leaf to a lexical scope. The value is unchanged; its identity is not.
     pub fn scope_idx(&mut self, idx: Idx, scope: Scope) -> Idx {
         match scope.id {
-            Some(id) => Idx(self.after_buf(idx.0, &[id])),
+            Some(id) => Idx(self.after_buf(idx.0, &[Edge::anchor(id)])),
             None => idx,
         }
     }
@@ -776,7 +822,7 @@ impl Builder {
     pub fn scope_lds<E: Elem>(&mut self, lds: Lds<E>, scope: Scope) -> Lds<E> {
         match scope.id {
             Some(scope) => {
-                let id = self.after_buf(lds.id, &[scope]);
+                let id = self.after_buf(lds.id, &[Edge::anchor(scope)]);
                 Lds { id, len: lds.len, _e: PhantomData }
             }
             None => lds,
@@ -795,9 +841,9 @@ impl Builder {
     /// downstream consumer to keep it live and ordered (an un-executed barrier deadlocks, so it
     /// must never be DCE'd). Place OUTSIDE the loop (prologue `eq=1` / epilogue `eq=0`) — the asm
     /// skip-label is uniquified per construction, not per clang-unrolled copy.
-    pub fn wave_barrier(&mut self, warp_row: Idx, eq: i64, after: &[TileId]) -> Effect {
+    pub fn wave_barrier(&mut self, warp_row: Idx, eq: i64, after: &[Edge]) -> Effect {
         let mut deps: crate::ir::Edges = smallvec::smallvec![warp_row.0];
-        deps.extend(after.iter().copied());
+        deps.extend(after.iter().map(|e| e.raw()));
         Effect(self.ir.intern(Node::WaveBarrier { eq, deps }))
     }
 
@@ -959,7 +1005,7 @@ impl Builder {
     /// Vector-read the fragment run through completion of `deps` — the loop-carried
     /// accumulator read (`acc.after([init, range])`) / the post-gather operand read
     /// (`frag.after([gather stores])`).
-    pub fn load_frag_vec_after<E: Elem>(&mut self, f: Frag<E>, deps: &[TileId]) -> Val<E> {
+    pub fn load_frag_vec_after<E: Elem>(&mut self, f: Frag<E>, deps: &[Edge]) -> Val<E> {
         let after = self.after_buf(f.id, deps);
         Val::wrap(self.ir.intern(Node::LoadRegVec { buf: after, ept: f.map.ept, dtype: E::dtype() }))
     }
@@ -1000,7 +1046,7 @@ impl Builder {
     /// ONE `<ept×E>` vector load of a contiguous LDS run at flat `base`, ordered after
     /// `deps` (the fill barrier) — the vectorised fragment gather ([`Node::LoadVecAt`] →
     /// `ds_read_b64`). Replaces `ept` scalar `load_lds_after` for a contiguous run.
-    pub fn load_lds_vec_after<E: Elem>(&mut self, lds: Lds<E>, base: Idx, ept: usize, deps: &[TileId]) -> Val<E> {
+    pub fn load_lds_vec_after<E: Elem>(&mut self, lds: Lds<E>, base: Idx, ept: usize, deps: &[Edge]) -> Val<E> {
         let after = self.after_buf(lds.id, deps);
         Val::wrap(self.ir.intern(Node::LoadVecAt { buf: after, base: base.0, ept, dtype: E::dtype() }))
     }
@@ -1010,7 +1056,7 @@ impl Builder {
     /// ONE `addrspacecast(index_off(lds, base))` VGPR the slice's [`Self::ds_read_b64`] gathers all
     /// read from (DESIGN §5c — HK's operand gather is ONE base + a per-fragment `offset:` immediate,
     /// so the `lane_rc` address is materialised once, not per fragment; the VGPR-spill-cliff cure).
-    pub fn lds_ptr_as3<E: Elem>(&mut self, lds: Lds<E>, base: Idx, raw: &[TileId]) -> Idx {
+    pub fn lds_ptr_as3<E: Elem>(&mut self, lds: Lds<E>, base: Idx, raw: &[Edge]) -> Idx {
         let buf = if raw.is_empty() { lds.id } else { self.after_buf(lds.id, raw) };
         Idx(self.ir.intern(Node::LdsPtrAs3 { buf, base: base.0 }))
     }
@@ -1158,9 +1204,9 @@ impl Builder {
     /// `load_global_to_register_buffer`, HK port, GAP-1): reads a 128-bit chunk (`ept`
     /// `E`-elements) at `rsrc[voffset]` bytes (`soffset = 0`). `order` pins the load into its
     /// authoring cluster (ordering-only). `ept · sizeof(E)` must be 128 bits.
-    pub fn buffer_load_i128<E: Elem>(&mut self, rsrc: Idx, voffset: Idx, ept: usize, order: &[TileId]) -> Val<E> {
+    pub fn buffer_load_i128<E: Elem>(&mut self, rsrc: Idx, voffset: Idx, ept: usize, order: &[Edge]) -> Val<E> {
         assert_eq!(ept * E::dtype().bytes(), 16, "raw.buffer.load.i128 chunk must be 128 bits (16 bytes)");
-        let order = order.iter().copied().collect();
+        let order = order.iter().map(|e| e.raw()).collect();
         Val::wrap(self.ir.intern(Node::BufferLoadI128 {
             rsrc: rsrc.0,
             voffset: voffset.0,
@@ -1254,8 +1300,8 @@ impl Builder {
     /// The **manual LDS drain** (`s_waitcnt lgkmcnt(0)`, §5c): a void `asm sideeffect` ordered after
     /// `prev` (the last commit write) that stalls until every outstanding LDS op completes — the
     /// exposed drain the asm [`Self::ds_write_b64`] commit needs (its writes are waitcnt-opaque).
-    pub fn swait_lgkmcnt(&mut self, prev: TileId) -> Effect {
-        Effect(self.ir.intern(Node::SWaitLgkmcnt { prev }))
+    pub fn swait_lgkmcnt(&mut self, prev: Edge) -> Effect {
+        Effect(self.ir.intern(Node::SWaitLgkmcnt { prev: prev.raw() }))
     }
 
     /// One K-fragment MFMA `D = A·B + C` (gfx942 16×16×16 bf16→f32) via the **intrinsic**.
@@ -1264,13 +1310,32 @@ impl Builder {
         Val::wrap(self.ir.intern(Node::Mma { a: a.id, b: b.id, c: c.id, ept, asm: false }))
     }
 
-    /// The **shape-generic** intrinsic MFMA (§migration): issues shape `S`'s MFMA, deriving the
-    /// accumulator width from `S::EPT_C` (which is what selects the intrinsic at lowering — bf16
-    /// `EPT_C 4 → 16×16×16`, `16 → 32×32×8`). No `Node` field is added, so a `16×16×16` `mma_of` interns
-    /// identically to [`Self::mma`] and the existing IR is byte-unchanged. `a`/`b` are the operand
-    /// fragments (`EPT_A`/`EPT_B` wide), `c` the `EPT_C`-wide accumulator.
-    pub fn mma_of<S: crate::shape::MfmaShape>(&mut self, a: Val<BF16>, b: Val<BF16>, c: Val<F32>) -> Val<F32> {
-        self.mma(a, b, c, S::EPT_C)
+    /// The **shape-matched** intrinsic MFMA: `Tile<M,K> · Tile<K,N> → Tile<M,N>` — the
+    /// *shared* `const K` type-checks operand composition, and the accumulator width comes from
+    /// `S::EPT_C` as data (`4 → 16×16×16`, `16 → 32×32×8`). Erases via [`Self::mma`], so the interned
+    /// `Node::Mma` is byte-identical (no `Node` field added). The `debug_assert` bridges the type-level
+    /// `M/N/K` to the shape marker's data consts — the one seam where the type and the data must agree.
+    ///
+    /// A mismatched inner dim is a **compile error** (the shared `K` fails to unify):
+    /// ```compile_fail
+    /// use svod_tk2::build::{Builder, BF16, F32};
+    /// use svod_tk2::shape::{Mfma16x16x16Bf16 as S, MfmaShape};
+    /// let mut b = Builder::new("shape_fail");
+    /// let fa = b.define_frag::<BF16>(S::a_map());
+    /// let fb = b.define_frag::<BF16>(S::b_map());
+    /// let fc = b.define_frag::<F32>(S::c_map());
+    /// let (a, bb, c) = (b.load_frag_vec(fa), b.load_frag_vec(fb), b.load_frag_vec(fc));
+    /// // A is 16×8, B is 16×16 → the inner dims (8 vs 16) disagree → no `mma_of` for these tiles.
+    /// let _ = b.mma_of::<S, 16, 16, 16>(a.tile::<16, 8>(), bb.tile::<16, 16>(), c.tile::<16, 16>());
+    /// ```
+    pub fn mma_of<S: crate::shape::MfmaShape, const M: usize, const K: usize, const N: usize>(
+        &mut self,
+        a: Tile<BF16, M, K>,
+        b: Tile<BF16, K, N>,
+        c: Tile<F32, M, N>,
+    ) -> Tile<F32, M, N> {
+        debug_assert_eq!((M, N, K), (S::M, S::N, S::K), "Tile dims disagree with MfmaShape S");
+        self.mma(a.erase(), b.erase(), c.erase(), S::EPT_C).tile::<M, N>()
     }
 
     /// The **asm** MFMA (`v_mfma_f32_16x16x16_bf16` as inline `asm sideeffect`, §5c): schedule-opaque
@@ -1280,9 +1345,21 @@ impl Builder {
         Val::wrap(self.ir.intern(Node::Mma { a: a.id, b: b.id, c: c.id, ept, asm: true }))
     }
 
+    /// The **shape-matched** asm MFMA — the [`Self::mma_of`] twin over [`Self::mma_asm`] (the §5c
+    /// schedule-opaque channel). Erases identically, so the clustered matmul's `Node::Mma` is unchanged.
+    pub fn mma_asm_of<S: crate::shape::MfmaShape, const M: usize, const K: usize, const N: usize>(
+        &mut self,
+        a: Tile<BF16, M, K>,
+        b: Tile<BF16, K, N>,
+        c: Tile<F32, M, N>,
+    ) -> Tile<F32, M, N> {
+        debug_assert_eq!((M, N, K), (S::M, S::N, S::K), "Tile dims disagree with MfmaShape S");
+        self.mma_asm(a.erase(), b.erase(), c.erase(), S::EPT_C).tile::<M, N>()
+    }
+
     /// A fragment handle re-bound to observe `deps` (the post-loop carried read:
     /// `acc.after([end])`), symmetric with [`Self::reg_after`].
-    pub fn frag_after<E: Elem>(&mut self, f: Frag<E>, deps: &[TileId]) -> Frag<E> {
+    pub fn frag_after<E: Elem>(&mut self, f: Frag<E>, deps: &[Edge]) -> Frag<E> {
         let id = self.after_buf(f.id, deps);
         Frag { id, map: f.map, _e: PhantomData }
     }
@@ -1294,8 +1371,8 @@ impl Builder {
     /// observed before `deps`. Used for the loop-carried accumulator read/reinit.
     /// `deps` are raw handles so an edge may be an [`Effect`] (a store) OR a
     /// [`Range`] (keeps the read inside the loop body).
-    fn after_buf(&mut self, buf: TileId, deps: &[TileId]) -> TileId {
-        let deps = deps.iter().copied().collect();
+    fn after_buf(&mut self, buf: TileId, deps: &[Edge]) -> TileId {
+        let deps = deps.iter().map(|e| e.raw()).collect();
         self.ir.intern(Node::After { val: buf, deps })
     }
 
@@ -1314,13 +1391,13 @@ impl Builder {
     /// NOT serialized against each other (only this combine waits for all). The tk
     /// `endrange_to` obligation, expressed as an ordering edge instead of acc-read
     /// chaining. Every accumulator then reads its final value post-loop via `.after([end])`.
-    pub fn combine(&mut self, e: Effect, deps: &[TileId]) -> Effect {
+    pub fn combine(&mut self, e: Effect, deps: &[Edge]) -> Effect {
         Effect(self.after_buf(e.0, deps))
     }
 
     /// A register handle re-bound to observe `deps` (the post-loop carried read:
     /// `reg.after([end])`). Returns a fresh [`Reg`] over the ordering-wrapped buffer.
-    pub fn reg_after<E: Elem>(&mut self, reg: Reg<E>, deps: &[TileId]) -> Reg<E> {
+    pub fn reg_after<E: Elem>(&mut self, reg: Reg<E>, deps: &[Edge]) -> Reg<E> {
         let id = self.after_buf(reg.id, deps);
         Reg { id, len: reg.len, _e: PhantomData }
     }

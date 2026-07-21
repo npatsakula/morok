@@ -10,10 +10,10 @@
 //!   run unbroken.
 
 use super::{EDGE, Program, WARP, add_opt, scatter_frag};
-use crate::build::{BF16, Buf, Builder, F32, Idx, Lds, Val};
+use crate::build::{BF16, Buf, Builder, Edge, F32, Idx, Lds, Val};
 use crate::ir::TileId;
 use crate::pipeline::{
-    BlockCounter, CommitBatch, CommitCompletion, CommitDrain, Compute, Hooks, Mem, Sched, SlotVal, pipeline,
+    BlockCounter, CommitBatch, Compute, Hooks, Mem, Publication, Sched, SlotVal, WaveTopology, pipeline, slot_set,
 };
 use crate::shape::{Mfma16x16x16Bf16, MfmaShape};
 use crate::tile::{ARow, BCol};
@@ -65,6 +65,9 @@ struct MatmulHooks {
     bn: usize,
     warp_row_off: Option<Idx>,
     warp_col_off: Option<Idx>,
+    /// The single LDS-publication decision — fixes both the commit's completion (here) and the
+    /// schedule's drain (the `Sched.commit_drain` below), so the two cannot drift.
+    publication: Publication,
 }
 
 impl Hooks for MatmulHooks {
@@ -79,8 +82,8 @@ impl Hooks for MatmulHooks {
         k_base: Idx,
         tile: usize,
         prev: Option<FillRegs>,
-        order: &[TileId],
-    ) -> (FillRegs, Vec<TileId>) {
+        order: &[Edge],
+    ) -> (FillRegs, Vec<Edge>) {
         // Tile `0 = A`, `1 = B` (the pipeline's `PREFETCH_TILES = 2` numeric ids). HK loads A@C0 and B@C4
         // so each global load hides under a different compute cluster; the fill accumulates across them
         // (`prev`) for the single C6 commit that writes BOTH. `order` (the cluster entry) pins each tile's
@@ -92,11 +95,11 @@ impl Hooks for MatmulHooks {
             prefetch(b, op.smem, self.k_step, op.src, self.grow, op.epl, self.tid, op.origin, k_base, order);
         // The load result values — the `sched_fence(0)` load-pin anchors on these so LLVM cannot sink
         // the global load down to its consumer (the commit), exposing the DRAM latency.
-        let anchors: Vec<TileId> = reg.chunks[tile].iter().map(|v| v.id).collect();
+        let anchors: Vec<Edge> = reg.chunks[tile].iter().map(|v| Edge::anchor(v.id)).collect();
         (reg, anchors)
     }
 
-    fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &FillRegs, war: &[TileId]) -> CommitBatch {
+    fn commit(&mut self, b: &mut Builder, _k_base: Idx, reg: &FillRegs, war: &[Edge]) -> CommitBatch {
         // HK's waitcnt-opaque asm `ds_write_b64` commit (§5c — the only commit path; the production config
         // bake fixed the clustered kernel to asm, so there is no intrinsic fallback). Chain A then B writes
         // into ONE `prev` chain (thread A's tail into B) so a single drain reaches BOTH; return the WRITE
@@ -116,7 +119,7 @@ impl Hooks for MatmulHooks {
             war,
             None,
         );
-        let a_last = fa.last().map(|e| e.dep());
+        let a_last = fa.last().map(|e| e.dep().raw());
         let fb = commit_asm(
             b,
             op_b.smem,
@@ -130,7 +133,7 @@ impl Hooks for MatmulHooks {
             war,
             a_last,
         );
-        CommitBatch::new(fa.into_iter().chain(fb).collect(), CommitCompletion::Opaque)
+        CommitBatch::new(fa.into_iter().chain(fb).collect(), self.publication.completion())
     }
 
     fn gather(
@@ -138,13 +141,13 @@ impl Hooks for MatmulHooks {
         b: &mut Builder,
         slice: usize,
         _block: BlockCounter,
-        raw: &[TileId],
-    ) -> (Self::Op, Vec<TileId>, TileId) {
+        raw: &[Edge],
+    ) -> (Self::Op, Vec<Edge>, Edge) {
         // One gather per operand at K-slice `slice`, via `tile_move::gather` in its asm `ds_read_b64` form
         // (the production path — the `true` below; asm ⇒ straight, so B's Col map routes through the
         // STRAIGHT contiguous gather, not the FA register-transpose). A = ARow over
         // `(bm, EDGE)` → `ri` frags; B = BCol over `(EDGE, bn)` → `cj` frags — `n_frags` derived by role.
-        let mut gathers: Vec<TileId> = Vec::new();
+        let mut gathers: Vec<Edge> = Vec::new();
         let (a_vecs, ga) = gather::<BF16, ARow, Mfma16x16x16Bf16>(
             b,
             self.operands[0].smem,
@@ -172,7 +175,7 @@ impl Hooks for MatmulHooks {
         gathers.extend(ga);
         gathers.extend(gb);
         // op_anchor = an operand VALUE (the first A fragment) for `set_prio` to anchor on.
-        let op_anchor = a_vecs[0].id;
+        let op_anchor = Edge::anchor(a_vecs[0].id);
         ((a_vecs, b_vecs), gathers, op_anchor)
     }
 
@@ -362,7 +365,6 @@ pub fn matmul_lds_kblock_mw_clustered(m: usize, n: usize, k: usize, t: Tiling) -
     // (A = Row, B = Col) are now derived inside `tile_move::gather` from the `ARow`/`BCol` roles — the
     // hooks name the role, not the `FragMap`. For 16×16×16 `c_map` equals `FragMap::gfx942_16x16(true)`.
     let c_map = Mfma16x16x16Bf16::c_map();
-    let ept = Mfma16x16x16Bf16::EPT_C;
     let (ri, cj) = (bm / EDGE, bn / EDGE); // per-warp accumulator grid
     let ksteps = k_step / EDGE; // K-fragments per staged block (amortises the 2 barriers)
 
@@ -388,7 +390,8 @@ pub fn matmul_lds_kblock_mw_clustered(m: usize, n: usize, k: usize, t: Tiling) -
     //    compute cluster reads+writes the full set — GEMM is the UNIFORM special case of the §3.2
     //    per-cluster read/write contract (`reads = writes = 0..ri·cj`), so it emits byte-identically. ──
     let mut slots = crate::pipeline::SlotSet::new();
-    let all_slots = slots.carried_group(&mut b, ri * cj, c_map, crate::pipeline::Init::Zero);
+    // The `ri·cj` output-tile accumulators as ONE typed carried group (was a bare `Vec<usize>`).
+    let acc_c = slots.carried_array(&mut b, ri * cj, c_map, crate::pipeline::Init::Zero);
     let (accs, inited) = slots.finish(&mut b);
 
     let acc_final = {
@@ -411,6 +414,7 @@ pub fn matmul_lds_kblock_mw_clustered(m: usize, n: usize, k: usize, t: Tiling) -
             bn,
             warp_row_off,
             warp_col_off,
+            publication: Publication::AsmDeferred,
         };
         // The compute clusters carry the kernel math (the `ri×cj` MFMA loop) as an edge-free `body` —
         // the combinator brackets it with `set_prio` + the acc round-trip. This is what makes the
@@ -419,8 +423,8 @@ pub fn matmul_lds_kblock_mw_clustered(m: usize, n: usize, k: usize, t: Tiling) -
         let mma = |s: usize| -> Compute<MatmulHooks> {
             Compute::new(
                 s,
-                all_slots.clone(),
-                all_slots.clone(),
+                slot_set![acc_c],
+                slot_set![acc_c],
                 move |b: &mut Builder, op: Option<&MatmulOp>, reads: &[SlotVal], _blk: BlockCounter| {
                     let (a_vecs, b_vecs) = op.expect("matmul compute consumes a gathered operand");
                     let mut out = Vec::with_capacity(ri * cj);
@@ -428,7 +432,16 @@ pub fn matmul_lds_kblock_mw_clustered(m: usize, n: usize, k: usize, t: Tiling) -
                         for j in 0..cj {
                             // Asm-sideeffect MFMA (opaque to LLVM's scheduler → the 32-run cannot be
                             // fractured; tk's `mma_abt_asm` pin, verified: the intrinsic path is unpinnable).
-                            out.push(SlotVal::F32(b.mma_asm(a_vecs[i], b_vecs[j], reads[i * cj + j].f32(), ept)));
+                            // Shape-matched entry: `Tile<16,16>·Tile<16,16>→Tile<16,16>` (shared K), erasing
+                            // to the identical asm `Node::Mma` — byte-unchanged, the composition now type-checked.
+                            out.push(SlotVal::F32(
+                                b.mma_asm_of::<Mfma16x16x16Bf16, EDGE, EDGE, EDGE>(
+                                    a_vecs[i].tile::<EDGE, EDGE>(),
+                                    b_vecs[j].tile::<EDGE, EDGE>(),
+                                    reads[i * cj + j].f32().tile::<EDGE, EDGE>(),
+                                )
+                                .erase(),
+                            ));
                         }
                     }
                     out
@@ -442,11 +455,15 @@ pub fn matmul_lds_kblock_mw_clustered(m: usize, n: usize, k: usize, t: Tiling) -
             ksteps,
             &accs,
             &inited,
-            warp_row,
+            warp_row.map_or(WaveTopology::Disjoint, |wr| WaveTopology::PingPong {
+                warp_row: wr,
+                groups: wm as u8,
+                offset: 1,
+            }),
             Sched {
                 asm_gather: true,
                 resident: false,
-                commit_drain: CommitDrain::AsmDeferred,
+                commit_drain: Publication::AsmDeferred.drain(),
                 bare_seals: true,
                 pin_mfma: false,
             },

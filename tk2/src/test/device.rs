@@ -711,8 +711,8 @@ fn dump_streaming_isa() {
     println!("streaming ISA dumped: {dir}/streaming.ll ({} B), {dir}/streaming.co ({} B)", src.len(), bytes.len());
 }
 
-/// **FA-32 ISA/spill diagnostic** (§Phase-2 bottleneck probe) — dump the compiled FA-32's amdgcn source
-/// and report scratch (spill) bytes/thread, so the Phase-3 handoff knows whether the kernel is spill-bound.
+/// **FA-32 ISA/spill diagnostic** — dump the compiled FA-32's amdgcn source
+/// and report scratch (spill) bytes/thread, so a follow-up knows whether the kernel is spill-bound.
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk2 --lib -- --ignored device::dump_fa32_isa --nocapture`
 #[test]
 #[ignore]

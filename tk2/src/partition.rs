@@ -1,4 +1,4 @@
-//! `RowPartition` — a cuTile-style workgroup partition descriptor (DSL-simplification Phase 2).
+//! `RowPartition` — a cuTile-style workgroup partition descriptor.
 //!
 //! A row-major tensor whose rows are `slices` independent blocks of `rows_per_slice` rows each,
 //! tiled into `tile_rows`-row Q/output tiles: FA's `(batch·heads) × (seq/tile)` launch. The descriptor

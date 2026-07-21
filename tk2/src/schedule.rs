@@ -81,8 +81,11 @@ pub(crate) fn verify_v2(ir: &TileIr, roots: &[TileId]) {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
-    use crate::build::{Builder, F32};
+    use crate::build::{Builder, Edge, Effect, F32};
+    use crate::ir::FragMap;
 
     /// `verify_v2` REJECTS an unbalanced `s_setprio` (a prio-1 with no reachable prio-0) — the wave
     /// would stay at raised priority into the loop-back memory phase, starving its partner.
@@ -91,12 +94,60 @@ mod tests {
     fn verify_v2_rejects_unbalanced_setprio() {
         let mut b = Builder::new("t");
         let s = b.f32(0.0);
-        let frag = b.define_frag::<F32>(crate::ir::FragMap::gfx942_16x16(true));
+        let frag = b.define_frag::<F32>(FragMap::gfx942_16x16(true));
         let z: Vec<_> = (0..4).map(|_| b.f32(0.0)).collect();
         let zvec = b.vec_build(&z);
         let store = b.store_frag_vec(frag, zvec);
-        let p1 = b.set_prio(1, &[s.id]); // prio-1, no matching prio-0
+        let p1 = b.set_prio(1, &[Edge::anchor(s.id)]); // prio-1, no matching prio-0
         let root = b.combine(store, &[p1.dep()]);
-        verify_v2(&b.ir, &[root.dep()]);
+        verify_v2(&b.ir, &[root.dep().raw()]);
+    }
+
+    proptest! {
+        /// **Edge-threading invariant of the typed `Edge` conversion:** every ordering op must intern ALL
+        /// the edges it is handed as node children — none silently dropped. Each op is fed the SAME set of
+        /// `n_src` DISTINCT source effects as its ordering input; the constructed node's children must then
+        /// contain every source id. This directly exercises the drop-a-token failure mode the `&[Edge]`
+        /// conversion could regress (a truncated slice, a missed `.raw()`) — which plain reachability
+        /// cannot see, since a hint folded into the sink stays reachable even if it dropped its own inputs.
+        #[test]
+        fn ordering_ops_thread_every_input_edge(n_src in 2usize..6) {
+            let mut b = Builder::new("edge_thread_probe");
+            let frag = b.define_frag::<F32>(FragMap::gfx942_16x16(true));
+            // `n_src` DISTINCT stores (distinct payload values ⇒ distinct interned effects); their dep-edges
+            // are the ordering input every op below must thread into its node.
+            let sources: Vec<Effect> = (0..n_src)
+                .map(|i| {
+                    let vs: Vec<_> = (0..4).map(|j| b.f32((i * 4 + j) as f32)).collect();
+                    let v = b.vec_build(&vs);
+                    b.store_frag_vec(frag, v)
+                })
+                .collect();
+            let edges: Vec<Edge> = sources.iter().map(|e| e.dep()).collect();
+            let src_ids: Vec<TileId> = edges.iter().map(|e| e.raw()).collect();
+            // A body/val distinct from every source (for the ops whose first arg is separate from the deps).
+            let bv: Vec<_> = (0..4).map(|j| b.f32((1000 + j) as f32)).collect();
+            let bvec = b.vec_build(&bv);
+            let body = b.store_frag_vec(frag, bvec);
+            let wr = b.block_axis(64);
+
+            // One node per ordering-op kind, each fed `edges` as its ordering input.
+            let nodes: Vec<(&str, Edge)> = vec![
+                ("barrier", b.barrier(body, &edges).dep()),
+                ("bare_barrier", b.bare_barrier(body, &edges).dep()),
+                ("sched_fence", b.sched_fence(0, &edges).dep()),
+                ("sched_group", b.sched_group(Builder::SG_VALU, 1, 0, &edges).dep()),
+                ("set_prio", b.set_prio(1, &edges).dep()),
+                ("wave_barrier", b.wave_barrier(wr, 1, &edges).dep()),
+                ("combine", b.combine(body, &edges).dep()),
+            ];
+            for (name, node) in &nodes {
+                let children: std::collections::HashSet<TileId> =
+                    TileIr::children(b.ir.node(node.raw())).into_iter().collect();
+                for id in &src_ids {
+                    prop_assert!(children.contains(id), "{name} dropped input edge {} from its node children", id.0);
+                }
+            }
+        }
     }
 }

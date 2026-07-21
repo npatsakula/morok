@@ -26,7 +26,7 @@
 //! [`SharedTile::gather_view`]: crate::tile_move::SharedTile::gather_view
 //! [`SharedTile::stage_view`]: crate::tile_move::SharedTile::stage_view
 
-use crate::build::{BF16, Buf, Builder, Effect, Elem, F32, Frag, Idx, Lds, Val};
+use crate::build::{BF16, Buf, Builder, Edge, Effect, Elem, F32, Frag, Idx, Lds, Val};
 use crate::ir::{FragMap, TileId};
 use crate::kernels::{EDGE, add_opt, offset_by};
 use crate::shape::MfmaShape;
@@ -53,10 +53,10 @@ pub fn gather<E: Elem, L: RegLayout, S: MfmaShape>(
     tile_cols: usize,
     warp_off: Option<Idx>,
     lane: Idx,
-    deps: &[TileId],
+    deps: &[Edge],
     slice: usize,
     asm: bool,
-) -> (Vec<Val<E>>, Vec<TileId>) {
+) -> (Vec<Val<E>>, Vec<Edge>) {
     let map = L::frag::<S>().expect("gather: Src must fill an operand tile (ARow/BCol), not an accumulator");
     let n_frags = L::n_frags::<S>(tile_rows, tile_cols);
     let view = SharedTile::new(src, lds_cols).gather_view(map, n_frags, warp_off, lane, asm).slice(slice);
@@ -89,8 +89,8 @@ pub fn gather_run<E: Elem, Sw: Swizzle, S: MfmaShape>(
     col: Idx,
     parity: Idx,
     asm: bool,
-    raw: &[TileId],
-) -> (Vec<Val<E>>, Vec<TileId>) {
+    raw: &[Edge],
+) -> (Vec<Val<E>>, Vec<Edge>) {
     let map = S::a_map();
     assert!(tile_rows > 0 && tile_rows.is_multiple_of(S::M), "gather_run rows must tile the MFMA M extent");
     assert!(tile_cols > 0 && tile_cols.is_multiple_of(S::K), "gather_run cols must tile the MFMA K extent");
@@ -132,7 +132,7 @@ pub fn gather_run<E: Elem, Sw: Swizzle, S: MfmaShape>(
             let frag = b.define_frag::<E>(map);
             let st = b.store_frag_vec(frag, v).dep();
             if asm {
-                prev = Some(st);
+                prev = Some(st.raw());
             }
             gathers.push(st);
             vecs.push(b.load_frag_vec_after(frag, &[st]));
@@ -252,7 +252,7 @@ pub fn commit_transposed_run_asm(
         for j in 0..gvec {
             let value = b.vec_extract(vchunk, j);
             let write = b.ds_write_b16(base, (j * vt_pitch * 2) as i64, value, prev);
-            prev = Some(write.dep());
+            prev = Some(write.dep().raw());
             effects.push(write);
         }
     }
@@ -319,7 +319,7 @@ pub fn commit_run_asm<SwK: Swizzle>(
             let ptr = b.lds_ptr_as3(k_lds, dst, &[]);
             let addr = b.ptr_to_i32(ptr);
             let write = b.ds_write_b64_hk(addr, 0, value, prev);
-            prev = Some(write.dep());
+            prev = Some(write.dep().raw());
             effects.push(write);
         }
     }
@@ -350,7 +350,7 @@ pub fn commit_transposed_v4_asm(
         assert_eq!(width, 2, "packed V commit requires one bf16 dword per source row");
     }
     let ready_rows: Vec<Val<BF16>> = match prev {
-        Some(ready) => v_rows.iter().map(|&v| b.val_after(v, &[ready])).collect(),
+        Some(ready) => v_rows.iter().map(|&v| b.val_after(v, &[Edge::anchor(ready)])).collect(),
         None => v_rows.to_vec(),
     };
     let even01 = b.v_perm_bf16x2_asm(ready_rows[1], ready_rows[0], Builder::S50_LO_BF16);
@@ -379,7 +379,7 @@ pub fn commit_transposed_v4_asm(
     let even_ptr = b.lds_ptr_as3(vt_lds, dst_even, &[]);
     let even_addr = b.ptr_to_i32(even_ptr);
     let write_even = b.ds_write_b64_hk(even_addr, 0, even, prev);
-    prev = Some(write_even.dep());
+    prev = Some(write_even.dep().raw());
     let write_odd = b.ds_write_b64_hk(even_addr, (vt_pitch * BF16::dtype().bytes()) as i64, odd, prev);
     vec![write_even, write_odd]
 }
@@ -400,7 +400,7 @@ pub fn prefetch<E: Elem>(
     lane: Idx,
     origin: Idx,
     k_base: Idx,
-    order: &[TileId],
+    order: &[Edge],
 ) -> Vec<Val<E>> {
     SharedTile::new(dst, lds_cols)
         .stage_view(src, epl, lane, origin, grow_stride, Drain::Intrinsic)
@@ -423,7 +423,7 @@ pub fn commit<E: Elem>(
     lane: Idx,
     origin: Idx,
     chunks: &[Val<E>],
-    war: &[TileId],
+    war: &[Edge],
 ) -> Vec<Effect> {
     SharedTile::new(dst, lds_cols)
         .stage_view(src, epl, lane, origin, grow_stride, Drain::Intrinsic)
@@ -449,7 +449,7 @@ pub fn commit_asm<E: Elem>(
     lane: Idx,
     origin: Idx,
     chunks: &[Val<E>],
-    war: &[TileId],
+    war: &[Edge],
     prev0: Option<TileId>,
 ) -> Vec<Effect> {
     SharedTile::new(dst, lds_cols)
@@ -513,7 +513,7 @@ impl<E: Elem> LdsView<E> {
     /// RAW barrier / the carried `[raw_seed, range]`). Returns the operand `Val`s (one per fragment,
     /// the WMMA operands) and the store-fence tokens the WAR barrier consumes. Dispatches on the
     /// view's `asm`: the `ds_read_b64 offset:N` asm gather (gfx942) or the scalar intrinsic path.
-    pub(crate) fn gather(self, b: &mut Builder, raw: &[TileId]) -> (Vec<Val<E>>, Vec<TileId>) {
+    pub(crate) fn gather(self, b: &mut Builder, raw: &[Edge]) -> (Vec<Val<E>>, Vec<Edge>) {
         if self.asm { self.gather_asm(b, raw) } else { self.gather_scalar(b, raw) }
     }
 
@@ -522,7 +522,7 @@ impl<E: Elem> LdsView<E> {
     /// `load_frag_vec_after`. The per-element `LdsCol` is the composable hole `SwizzlePass` and
     /// `VectorizePass` refine (§5b).
     /// Subsumes `gather_frag_lds_run` (bit-for-bit — same nodes, same edges).
-    fn gather_scalar(self, b: &mut Builder, raw: &[TileId]) -> (Vec<Val<E>>, Vec<TileId>) {
+    fn gather_scalar(self, b: &mut Builder, raw: &[Edge]) -> (Vec<Val<E>>, Vec<Edge>) {
         let frags: Vec<Frag<E>> = (0..self.n_frags).map(|_| b.define_frag::<E>(self.map)).collect();
         self.gather_scalar_into(b, raw, &frags)
     }
@@ -536,16 +536,16 @@ impl<E: Elem> LdsView<E> {
     pub(crate) fn gather_scalar_into(
         self,
         b: &mut Builder,
-        raw: &[TileId],
+        raw: &[Edge],
         slots: &[Frag<E>],
-    ) -> (Vec<Val<E>>, Vec<TileId>) {
+    ) -> (Vec<Val<E>>, Vec<Edge>) {
         assert_eq!(slots.len(), self.n_frags, "TilePool slots must match the view's fragment count");
         let inner_c = b.idx_const(self.inner as i64);
         let mut gathers = Vec::new();
         let vecs = (0..self.n_frags)
             .map(|f| {
                 let frag = slots[f];
-                let stores: Vec<TileId> = (0..self.map.ept)
+                let stores: Vec<Edge> = (0..self.map.ept)
                     .map(|e| {
                         let e_idx = b.idx_const(e as i64);
                         let (frag_row, frag_col) = b.lane_rc(self.map, self.lane, e_idx);
@@ -586,7 +586,7 @@ impl<E: Elem> LdsView<E> {
     /// scalar 4-load gather — a `ds_read_b64` reads a contiguous run and cannot serve it (a perf, not a
     /// correctness, concern; Phase A is single-warp correctness). `self.map` must be the Col map so
     /// `lane_rc` yields `(spread, flat)`; `run` offsets the contraction (a kv-slice, 0 for a 16-row block).
-    pub(crate) fn gather_transposed(self, b: &mut Builder, raw: &[TileId]) -> (Vec<Val<E>>, Vec<TileId>) {
+    pub(crate) fn gather_transposed(self, b: &mut Builder, raw: &[Edge]) -> (Vec<Val<E>>, Vec<Edge>) {
         let inner_c = b.idx_const(self.inner as i64);
         let mut gathers = Vec::new();
         let vecs = (0..self.n_frags)
@@ -629,7 +629,7 @@ impl<E: Elem> LdsView<E> {
     /// `i` reads `ds_read_b64 $d, $base offset:(i·EDGE·inner·itemsize)`. ONE base VGPR + immediates
     /// replaces the per-fragment div/mod address the scalar path spills under the barrier walls.
     /// Subsumes `gather_frags_asm`.
-    fn gather_asm(self, b: &mut Builder, raw: &[TileId]) -> (Vec<Val<E>>, Vec<TileId>) {
+    fn gather_asm(self, b: &mut Builder, raw: &[Edge]) -> (Vec<Val<E>>, Vec<Edge>) {
         let frags: Vec<Frag<E>> = (0..self.n_frags).map(|_| b.define_frag::<E>(self.map)).collect();
         self.gather_asm_into(b, raw, &frags)
     }
@@ -640,12 +640,7 @@ impl<E: Elem> LdsView<E> {
     /// explicit and bounded: `raw` carries both the LDS-RAW carry AND the slot's recycle edge (the
     /// previous occupant's consuming MMA), so the base pointer — hence every `ds_read` — lands after
     /// the live operand it overwrites is drained. `slots.len()` must equal the view's `n_frags`.
-    pub(crate) fn gather_asm_into(
-        self,
-        b: &mut Builder,
-        raw: &[TileId],
-        slots: &[Frag<E>],
-    ) -> (Vec<Val<E>>, Vec<TileId>) {
+    pub(crate) fn gather_asm_into(self, b: &mut Builder, raw: &[Edge], slots: &[Frag<E>]) -> (Vec<Val<E>>, Vec<Edge>) {
         assert_eq!(slots.len(), self.n_frags, "TilePool slots must match the view's fragment count");
         // base LDS element offset at fragment 0, element 0: the lane's slot + the wave/run offset,
         // with the swizzle hole at `lds_col` (flat = `run`; SwizzlePass = `run ^ delta`).
@@ -664,13 +659,13 @@ impl<E: Elem> LdsView<E> {
         let itemsize = E::dtype().bytes() as i64;
         let step_bytes = EDGE as i64 * self.inner as i64 * itemsize; // fragment-row `offset:` step
         let mut vecs = Vec::with_capacity(slots.len());
-        let mut stores = Vec::with_capacity(slots.len());
+        let mut stores: Vec<Edge> = Vec::with_capacity(slots.len());
         let mut prev: Option<TileId> = None;
         for (i, &f) in slots.iter().enumerate() {
             let off_bytes = i as i64 * step_bytes;
             let v: Val<E> = b.ds_read_b64(base_ptr, off_bytes, self.map.ept, prev);
             let st = b.store_frag_vec(f, v);
-            prev = Some(st.dep());
+            prev = Some(st.dep().raw());
             stores.push(st.dep());
             vecs.push(b.load_frag_vec_after(f, &[st.dep()]));
         }
@@ -762,7 +757,7 @@ impl<E: Elem> LdsStage<E> {
     /// split back into VEC-wide b64 chunks (register-only; the b128 lands in adjacent VGPRs) so the
     /// swizzle-safe [`Self::commit`] stores them independently. Returns the chunks in commit order (the
     /// commit's `r`/`c` addressing hash-cons-shares this half's nodes).
-    pub(crate) fn prefetch(self, b: &mut Builder, k_base: Idx, order: &[TileId]) -> Vec<Val<E>> {
+    pub(crate) fn prefetch(self, b: &mut Builder, k_base: Idx, order: &[Edge]) -> Vec<Val<E>> {
         const VEC: usize = 4; // b64 = 4 elems: the LDS-store / swizzle granularity
         let gvec = if self.epl.is_multiple_of(8) { 8 } else { VEC };
         assert!(
@@ -817,7 +812,7 @@ impl<E: Elem> LdsStage<E> {
     /// `r·cols + LdsCol(r, c)` (swizzle-safe b64 granularity). `war` is the WAR barrier the writes must
     /// observe — ridden onto the LDS handle ONCE via `lds_after` (empty on the prologue block-0 commit,
     /// kept byte-identical). Returns the store effects the RAW barrier fences.
-    pub(crate) fn commit(self, b: &mut Builder, loaded: &[Val<E>], war: &[TileId]) -> Vec<Effect> {
+    pub(crate) fn commit(self, b: &mut Builder, loaded: &[Val<E>], war: &[Edge]) -> Vec<Effect> {
         match self.drain {
             Drain::Intrinsic => self.commit_intrinsic(b, loaded, war),
             Drain::Asm => self.commit_asm(b, loaded, war, None),
@@ -826,7 +821,7 @@ impl<E: Elem> LdsStage<E> {
 
     /// The compiler-visible commit (`store_lds_vec` → `ds_write`): an `s_barrier` auto-drains its
     /// `lgkmcnt(0)`. Returns the store effects the RAW barrier fences. Byte-identical to the original.
-    fn commit_intrinsic(self, b: &mut Builder, loaded: &[Val<E>], war: &[TileId]) -> Vec<Effect> {
+    fn commit_intrinsic(self, b: &mut Builder, loaded: &[Val<E>], war: &[Edge]) -> Vec<Effect> {
         const VEC: usize = 4;
         assert!(self.epl > 0 && self.epl.is_multiple_of(VEC), "intrinsic commit epl must tile b64 chunks");
         assert_eq!(loaded.len(), self.epl / VEC, "intrinsic commit chunk count does not match epl");
@@ -862,7 +857,7 @@ impl<E: Elem> LdsStage<E> {
         self,
         b: &mut Builder,
         loaded: &[Val<E>],
-        war: &[TileId],
+        war: &[Edge],
         prev0: Option<TileId>,
     ) -> Vec<Effect> {
         const VEC: usize = 4;
@@ -888,7 +883,7 @@ impl<E: Elem> LdsStage<E> {
                 let dst_off = b.idx_add(rc, col);
                 let base_ptr = b.lds_ptr_as3(lds, dst_off, &[]);
                 let w = b.ds_write_b64(base_ptr, 0, loaded[cc], prev);
-                prev = Some(w.dep());
+                prev = Some(w.dep().raw());
                 w
             })
             .collect()
