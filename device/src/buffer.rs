@@ -263,6 +263,49 @@ impl Buffer {
         })
     }
 
+    /// Fork the single storage shared by `views` into a fresh, unshared
+    /// allocation (same allocator, total size, [`BufferSpec`] and zero-init
+    /// flag) and re-mint every view onto it at its original
+    /// offset/size/dtype/shape, with fresh handle ids. When `copy_contents`
+    /// is set and the source storage is allocated, the entire allocation is
+    /// copied over first (on-device when possible).
+    pub fn fork_views(views: &[&Buffer], copy_contents: bool) -> Result<Vec<Buffer>> {
+        let Some(first) = views.first() else { return Ok(Vec::new()) };
+        let storage = first.storage_id();
+        for view in views {
+            snafu::ensure!(view.storage_id() == storage, UnsupportedSnafu { op: "fork_views across storages" });
+        }
+        let total_size = first.data.total_size;
+        let whole = |data: &Arc<BufferData>| Self {
+            id: BufferId(next_buffer_id()),
+            data: Arc::clone(data),
+            offset: 0,
+            size: total_size,
+            dtype: DType::UInt8,
+            shape: smallvec![total_size],
+        };
+        let fresh = Arc::new(BufferData::new(
+            Arc::clone(&first.data.allocator),
+            total_size,
+            first.data.options,
+            first.data.zero_init,
+        ));
+        if copy_contents && first.data.is_allocated() {
+            whole(&fresh).copy_from(&whole(&first.data))?;
+        }
+        Ok(views
+            .iter()
+            .map(|view| Self {
+                id: BufferId(next_buffer_id()),
+                data: Arc::clone(&fresh),
+                offset: view.offset,
+                size: view.size,
+                dtype: view.dtype.clone(),
+                shape: view.shape.clone(),
+            })
+            .collect())
+    }
+
     /// Ensure the underlying buffer is allocated.
     pub fn ensure_allocated(&self) -> Result<()> {
         self.data.ensure_allocated()

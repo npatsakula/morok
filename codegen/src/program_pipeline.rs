@@ -316,7 +316,7 @@ pub fn do_linearize(program: &Arc<UOp>) -> Result<Arc<UOp>> {
         if let Ok(mut f) = std::fs::File::create(&tree_path) {
             let topo = sink.toposort();
             for (i, u) in topo.iter().enumerate() {
-                let scope = u.in_scope_ranges().iter().map(|k| k.0.id.to_string()).collect::<Vec<_>>().join(",");
+                let scope = u.in_scope_ranges().iter().map(|k| k.to_string()).collect::<Vec<_>>().join(",");
                 let _ = writeln!(f, "[{i:4}] id={} {:?} scope={{{scope}}}", u.id, std::mem::discriminant(u.op()));
             }
         }
@@ -331,7 +331,7 @@ pub fn do_linearize(program: &Arc<UOp>) -> Result<Arc<UOp>> {
                     "[{i:4}] id={} {:?} scope={{{}}}",
                     u.id,
                     std::mem::discriminant(u.op()),
-                    u.in_scope_ranges().iter().map(|k| k.0.id.to_string()).collect::<Vec<_>>().join(",")
+                    u.in_scope_ranges().iter().map(|k| k.to_string()).collect::<Vec<_>>().join(",")
                 );
             }
         }

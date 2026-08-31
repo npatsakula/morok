@@ -314,3 +314,38 @@ fn test_unified_memory_zero_init() {
     // All values should be zero
     assert_eq!(output_data, vec![0f32; 10]);
 }
+
+#[test]
+fn test_fork_views_preserves_geometry_and_contents() {
+    let allocator = Arc::new(CpuAllocator);
+    let base = Buffer::allocate(allocator, DType::Float32, vec![8], BufferSpec::default()).unwrap();
+    let mut head = base.view(0, 16).unwrap();
+    let mut tail = base.view(16, 16).unwrap();
+    head.copyin(&[1u8; 16]).unwrap();
+    tail.copyin(&[2u8; 16]).unwrap();
+
+    // Snapshot fork: ONE fresh storage, every view re-minted at its offset
+    // with the original bytes.
+    let forked = Buffer::fork_views(&[&head, &tail], true).unwrap();
+    assert_eq!(forked.len(), 2);
+    assert_eq!(forked[0].storage_id(), forked[1].storage_id(), "views must land on one storage");
+    assert_ne!(forked[0].storage_id(), base.storage_id());
+    assert_eq!((forked[0].offset(), forked[1].offset()), (0, 16));
+    let mut bytes = [0u8; 16];
+    forked[1].copyout(&mut bytes).unwrap();
+    assert_eq!(bytes, [2u8; 16]);
+
+    // A bare fork shares nothing: writes to it never reach the original.
+    let mut bare = Buffer::fork_views(&[&head], false).unwrap();
+    bare[0].copyin(&[7u8; 16]).unwrap();
+    head.copyout(&mut bytes).unwrap();
+    assert_eq!(bytes, [1u8; 16]);
+}
+
+#[test]
+fn test_fork_views_rejects_mixed_storages() {
+    let allocator = Arc::new(CpuAllocator);
+    let left = Buffer::allocate(allocator.clone(), DType::Float32, vec![4], BufferSpec::default()).unwrap();
+    let right = Buffer::allocate(allocator, DType::Float32, vec![4], BufferSpec::default()).unwrap();
+    assert!(Buffer::fork_views(&[&left, &right], false).is_err());
+}

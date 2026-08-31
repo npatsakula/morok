@@ -98,7 +98,7 @@ fn shaped_register_store_preserves_outer_range() {
     let stores = result.toposort().into_iter().filter(|node| matches!(node.op(), Op::Store { .. }));
     let stores = stores.collect::<Vec<_>>();
     assert_eq!(stores.len(), 2);
-    assert!(stores.iter().all(|store| InScopeRangesProperty::get(store).iter().any(|range| range.0.id == outer.id)));
+    assert!(stores.iter().all(|store| InScopeRangesProperty::get(store).iter().any(|range| *range == outer.id)));
 }
 
 /// A memory address stays `INDEX(PARAM, flat_offset)` with a scalar offset; only a

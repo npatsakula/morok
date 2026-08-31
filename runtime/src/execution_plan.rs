@@ -365,14 +365,16 @@ pub struct ExecutionPlan {
     /// Indices of output buffers in `buffers` (matches SINK source order).
     output_buffer_indices: Vec<usize>,
 
+    /// Indices of buffers declared host-written inputs via
+    /// [`ExecutionPlan::declare_input`]. Drives the replicate fork policy and
+    /// carries over to replicas.
+    input_buffer_indices: HashSet<usize>,
+
     /// Primary device for this plan.
     device: DeviceSpec,
 
     /// Last dynamic variable bindings supplied through `execute_with_vars`.
     runtime_var_vals: HashMap<String, i64>,
-
-    /// Additional UOp IDs registered as aliases that need cleanup.
-    alias_ids: Vec<u64>,
 
     /// Captured replayable graph, built lazily on first `execute()`. `Some(None)`
     /// means the chain isn't graphable (mixed ops / non-graph device) → per-call
@@ -1565,45 +1567,105 @@ impl ExecutionPlan {
         &self.ast_to_buffer
     }
 
-    /// Release intermediate buffers from the global buffer registry.
-    ///
-    /// Call this after you're done executing the plan to free intermediate
-    /// buffers from the global registry. The output buffer is preserved.
-    pub fn release_intermediate_buffers<F>(&self, remove_fn: F)
-    where
-        F: Fn(u64),
-    {
-        self.release_buffers_impl(remove_fn, true);
-    }
-
-    /// Release ALL buffers from the global registry, including the output.
-    pub fn release_all_buffers<F>(&self, remove_fn: F)
-    where
-        F: Fn(u64),
-    {
-        self.release_buffers_impl(remove_fn, false);
-    }
-
-    fn release_buffers_impl<F>(&self, remove_fn: F, skip_output: bool)
-    where
-        F: Fn(u64),
-    {
-        let output_buf_ids: std::collections::HashSet<u64> = if skip_output {
-            self.output_buffer_indices.iter().filter_map(|&idx| self.buffers.get(idx).map(|b| b.id().0)).collect()
-        } else {
-            std::collections::HashSet::new()
-        };
-
-        for (&ast_id, &buf_idx) in &self.ast_to_buffer {
-            if skip_output && output_buf_ids.contains(&self.buffers[buf_idx].id().0) {
-                continue;
+    /// Storage ids this plan writes: kernel outputs, copy destinations,
+    /// custom-function arguments (no outs list — conservatively all written,
+    /// mirroring `hcq_operations`), and the plan's declared outputs.
+    fn written_storage_ids(&self) -> HashSet<BufferId> {
+        let storage = |index: &usize| self.buffers.get(*index).map(Buffer::storage_id);
+        let mut written: HashSet<BufferId> = self.output_buffer_indices.iter().filter_map(storage).collect();
+        for op in &self.ops {
+            match op {
+                PreparedOp::CompiledProgram(kernel) => written.extend(
+                    kernel
+                        .output_indices
+                        .iter()
+                        .filter_map(|&position| kernel.buffer_indices.get(position))
+                        .filter_map(storage),
+                ),
+                PreparedOp::BufferCopy(copy) => written.extend(copy.buffer_indices.first().and_then(storage)),
+                PreparedOp::CustomFunction(custom) => {
+                    written.extend(custom.buffer_indices.iter().filter_map(storage));
+                }
             }
-            remove_fn(ast_id);
+        }
+        written
+    }
+
+    /// Declare the buffer at `index` a host-written input: [`Self::replicate`]
+    /// forks its storage with a snapshot instead of sharing it. The plan's
+    /// write analysis only sees kernel/copy/custom-function writes — host
+    /// writes between executes (`copyin`, recurrent-state recycling) are
+    /// invisible, so the embedder performing them must declare them.
+    /// Idempotent; declarations carry over to replicas.
+    pub fn declare_input(&mut self, index: usize) -> Result<()> {
+        if index >= self.buffers.len() {
+            return Err(crate::error::Error::Execution {
+                reason: format!("declare_input: buffer index {index} out of range ({} buffers)", self.buffers.len()),
+            });
+        }
+        self.input_buffer_indices.insert(index);
+        Ok(())
+    }
+
+    /// Deep-copy the plan for concurrent execution. Fork policy per storage:
+    ///
+    /// - written by the plan (arena intermediates, outputs, copy
+    ///   destinations): forked *bare* — contents are re-derived on every
+    ///   execute, so a replica's outputs are meaningful only after it runs;
+    /// - declared via [`Self::declare_input`]: forked with a byte-exact
+    ///   snapshot of the current contents;
+    /// - everything else — model weights — shared with the original.
+    ///
+    /// Views are re-minted at their original offsets on one forked base per
+    /// storage, preserving arena aliasing. Compiled kernels are `Arc`-shared.
+    /// All lazy per-plan state (backend queue context, captured graph, HCQ
+    /// timelines) starts fresh, so the replica executes concurrently with the
+    /// original on its own queue. Replicate only while the plan is idle:
+    /// snapshotting reads buffer contents without synchronizing against
+    /// in-flight kernels.
+    pub fn replicate(&self) -> Result<ExecutionPlan> {
+        let snapshot: HashSet<BufferId> = self
+            .input_buffer_indices
+            .iter()
+            .filter_map(|&index| self.buffers.get(index).map(Buffer::storage_id))
+            .collect();
+        let mut fork = self.written_storage_ids();
+        fork.extend(snapshot.iter().copied());
+
+        // Group forked views per storage: every view of one allocation lands
+        // on ONE fresh base at its old offset, so arena aliasing survives.
+        let mut grouped: HashMap<BufferId, Vec<usize>> = HashMap::new();
+        for (index, buffer) in self.buffers.iter().enumerate() {
+            let storage = buffer.storage_id();
+            if fork.contains(&storage) {
+                grouped.entry(storage).or_default().push(index);
+            }
+        }
+        let mut buffers = self.buffers.clone();
+        for (storage, indices) in grouped {
+            let views: Vec<&Buffer> = indices.iter().map(|&index| &self.buffers[index]).collect();
+            let forked = Buffer::fork_views(&views, snapshot.contains(&storage))
+                .context(ExecSnafu { context: "fork replica storage" })?;
+            for (index, buffer) in indices.into_iter().zip(forked) {
+                buffers[index] = buffer;
+            }
         }
 
-        for &alias_id in &self.alias_ids {
-            remove_fn(alias_id);
-        }
+        // `build()` re-resolves buffer addresses/ids, recomputes the op order
+        // and levels, captures fresh HCQ timelines, and leaves the graph and
+        // plan context lazily unset — exactly the per-replica state.
+        let builder = ExecutionPlanBuilder {
+            ops: self.ops.clone(),
+            op_instance_dependencies: self.op_instance_dependencies.clone(),
+            buffers,
+            ast_to_buffer: self.ast_to_buffer.clone(),
+            output_buffer_indices: self.output_buffer_indices.clone(),
+            device: self.device.clone(),
+        };
+        let mut plan = builder.build()?;
+        plan.runtime_var_vals = self.runtime_var_vals.clone();
+        plan.input_buffer_indices = self.input_buffer_indices.clone();
+        Ok(plan)
     }
 }
 
@@ -1655,7 +1717,6 @@ pub struct ExecutionPlanBuilder {
     ast_to_buffer: HashMap<u64, usize>,
     output_buffer_indices: Vec<usize>,
     device: DeviceSpec,
-    alias_ids: Vec<u64>,
 }
 
 impl ExecutionPlanBuilder {
@@ -1668,13 +1729,7 @@ impl ExecutionPlanBuilder {
             ast_to_buffer: HashMap::new(),
             output_buffer_indices: Vec::new(),
             device,
-            alias_ids: Vec::new(),
         }
-    }
-
-    /// Add alias IDs that need cleanup.
-    pub fn add_alias_ids(&mut self, ids: impl IntoIterator<Item = u64>) {
-        self.alias_ids.extend(ids);
     }
 
     /// Add a buffer to the plan. Returns the buffer index.
@@ -1820,9 +1875,9 @@ impl ExecutionPlanBuilder {
             buffers: self.buffers,
             ast_to_buffer: self.ast_to_buffer,
             output_buffer_indices: self.output_buffer_indices,
+            input_buffer_indices: HashSet::new(),
             device: self.device,
             runtime_var_vals: HashMap::new(),
-            alias_ids: self.alias_ids,
             graph: std::sync::OnceLock::new(),
             plan_ctx: std::sync::OnceLock::new(),
             hcq_executor: Mutex::new(svod_device::hcq::CpuQueueExecutor::default()),

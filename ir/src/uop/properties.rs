@@ -10,9 +10,9 @@
 //! - [`InScopeRangesProperty`] - RANGE operations currently in scope
 //! - [`VminVmaxProperty`] - Range analysis (min/max values) for operations
 
+use crate::Op;
 use crate::cached_property;
 use crate::types::ConstValue;
-use crate::{Op, UOpKey};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -58,12 +58,15 @@ cached_property! {
         compute: |uop| {
             let mut seen = std::collections::HashSet::new();
             let mut result = Vec::new();
-            // Self first if RANGE (matches Tinygrad: {self:None} | self._ranges)
-            if matches!(uop.op, Op::Range { .. }) {
-                seen.insert(uop.id);
-                result.push(uop.clone());
-            }
+            // Deliberately EXCLUDES self for RANGE nodes: a self-`Arc` in the
+            // node's own cache is a refcount cycle that leaks the node (and
+            // everything it references) forever. `UOp::ranges()` chains self
+            // back on; parents add range-children explicitly below, so the
+            // Tinygrad self-first order is preserved at every level.
             uop.op.map_child(|src| {
+                if matches!(src.op, Op::Range { .. }) && seen.insert(src.id) {
+                    result.push(src.clone());
+                }
                 for r in RangesProperty::get(src) {
                     if seen.insert(r.id) {
                         result.push(r.clone());
@@ -93,23 +96,21 @@ cached_property! {
     ///
     /// This is O(N) total for the first access on a graph, then O(1) for
     /// subsequent accesses on overlapping subgraphs (cached per-node).
-    InScopeRangesProperty: HashSet<UOpKey> {
+    InScopeRangesProperty: HashSet<u64> {
         cache_field: in_scope_ranges_cache,
         compute: |uop| {
-            let mut result: HashSet<UOpKey> = HashSet::new();
+            let mut result: HashSet<u64> = HashSet::new();
 
             // Step 1: Merge from all sources' cached in_scope_ranges
             uop.op.map_child(|src| {
-                for r in InScopeRangesProperty::get(src).iter() {
-                    result.insert(r.clone());
-                }
+                result.extend(InScopeRangesProperty::get(src).iter().copied());
             });
 
             // Step 2: Remove ended ranges (using existing op.ended_ranges())
             for ended in uop.op.ended_ranges() {
                 match ended.op() {
                     Op::Range { .. } => {
-                        result.remove(&UOpKey(ended.clone()));
+                        result.remove(&ended.id);
                     }
                     _ => {
                         // Non-RANGE ended (like AFTER) — remove all its in-scope ranges
@@ -120,9 +121,11 @@ cached_property! {
                 }
             }
 
-            // Step 3: Add self if RANGE
+            // Step 3: Add self if RANGE. Stored as an id, not an `Arc` — a
+            // self-`Arc` in the node's own cache would be a refcount cycle
+            // (permanent leak); ids pin nothing.
             if matches!(uop.op, Op::Range { .. }) {
-                result.insert(UOpKey(uop.clone()));
+                result.insert(uop.id);
             }
 
             result

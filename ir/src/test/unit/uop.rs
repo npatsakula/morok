@@ -1093,3 +1093,36 @@ fn test_device_and_addrspace_are_memoised_on_diamond_dags() {
     let elapsed = start.elapsed();
     assert!(elapsed < std::time::Duration::from_secs(5), "20-level diamond took {elapsed:?}; memo is not working");
 }
+
+/// Querying `ranges()`/`in_scope_ranges()` on a RANGE node must not create a
+/// self-referential `Arc` cycle: once all external refs drop, the node dies.
+/// Guards the property caches against reintroducing the historical leak where
+/// a RANGE's own `ranges_cache` held a strong `Arc` to itself.
+#[test]
+fn range_property_caches_do_not_leak_the_node() {
+    let range = UOp::range(UOp::index_const(16), 42_000);
+    let value = range.add(&UOp::index_const(1));
+
+    // Populate both caches on every node, including the RANGE itself.
+    assert!(value.ranges().iter().any(|r| Arc::ptr_eq(r, &range)));
+    assert!(range.ranges().iter().any(|r| Arc::ptr_eq(r, &range)), "ranges() must still report self");
+    assert!(value.in_scope_ranges().contains(&range.id));
+    assert!(range.in_scope_ranges().contains(&range.id), "in_scope_ranges() must still report self");
+
+    let canary = Arc::downgrade(&range);
+    drop(value);
+    drop(range);
+    assert!(canary.upgrade().is_none(), "RANGE node leaked via its own property caches");
+}
+
+/// Dropping a deep graph must not overflow the stack: `Drop for UOp` (the
+/// buffer-lifetime hook) recurses through children like the compiler-generated
+/// glue before it, so a long dependency chain is the worst case.
+#[test]
+fn deep_graph_drop_does_not_overflow_stack() {
+    let mut node = UOp::index_const(0);
+    for i in 1..100_000 {
+        node = node.add(&UOp::index_const(i % 512));
+    }
+    drop(node);
+}

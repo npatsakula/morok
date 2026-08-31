@@ -832,9 +832,10 @@ fn run_count(uop: &Arc<UOp>) -> u64 {
 
     let in_scope = InScopeRangesProperty::get(uop);
 
-    in_scope
-        .iter()
-        .map(|key| match key.0.vmax() {
+    uop.ranges()
+        .into_iter()
+        .filter(|range| in_scope.contains(&range.id))
+        .map(|range| match range.vmax() {
             ConstValue::Int(v) => (v + 1) as u64,
             ConstValue::UInt(v) => v + 1,
             _ => 1,

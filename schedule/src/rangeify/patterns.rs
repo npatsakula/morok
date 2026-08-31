@@ -620,7 +620,7 @@ pub(crate) fn pm_reduce_unparented() -> &'static TypedPatternMatcher {
 /// appear in the UOp's dependency graph.
 fn references_any_reduce_range(uop: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> bool {
     let in_scope = uop.in_scope_ranges();
-    ranges.iter().any(|r| in_scope.contains(&UOpKey(r.clone())))
+    ranges.iter().any(|r| in_scope.contains(&r.id))
 }
 
 /// Split a UOp by multiplication into leaf factors.

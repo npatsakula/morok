@@ -24,13 +24,14 @@
 //!
 //! Buffers are stored in a separate map (`BUFFERS`) indexed by UOp ID.
 //! This is a lookup index for `collect_input_buffers()` during schedule creation.
-//! - Key is UOp ID (unique per buffer via `Op::Unique` monotonic counter)
-//! - Value is `Arc<Buffer>` (strong ref — kept alive for the duration of the computation)
-//! - Stale entries cleaned via `gc_dead_refs()` when the UOp is no longer alive
+//! - Key is UOp ID (unique per buffer via the `ParamArg.slot` unique counter)
+//! - Value is `Arc<Buffer>` (strong ref — kept alive while the BUFFER UOp lives)
+//! - Entries expire automatically when the BUFFER UOp is dropped, via
+//!   `svod_ir::uop::set_uop_drop_hook` (installed on first map access)
 //!
-//! Unlike Tinygrad (which stores buffers inline in UOps), Svod uses a separate
-//! index because UOps are immutable and hash-consed. Unique buffer IDs guarantee
-//! entries never collide, so stale entries are harmless — only a memory concern.
+//! Unlike Tinygrad (which stores buffers inline in a `WeakKeyDictionary` keyed
+//! on UOps), Svod uses a separate id-keyed index because UOps are immutable
+//! and hash-consed; the drop hook gives the same lifetime semantics.
 //!
 //! TensorEntry also caches the buffer for direct access via tensor.buffer().
 
@@ -101,7 +102,19 @@ fn tensors() -> &'static PapayaMap<u64, Weak<TensorEntry>> {
 }
 
 fn buffers() -> &'static PapayaMap<u64, Arc<Buffer>> {
-    BUFFERS.get_or_init(PapayaMap::new)
+    BUFFERS.get_or_init(|| {
+        // Expire entries automatically when their BUFFER UOp dies: uop ids are
+        // per-allocation and never reused, so once the node is dropped no
+        // live graph can look the id up again — the entry is unreachable
+        // garbage from that point. Lock-free removal; safe from Drop context.
+        svod_ir::uop::set_uop_drop_hook(|uop_id| {
+            if let Some(map) = BUFFERS.get() {
+                let guard = map.guard();
+                map.remove(&uop_id, &guard);
+            }
+        });
+        PapayaMap::new()
+    })
 }
 
 /// Register a new tensor without buffer (for lazy computation graphs).
@@ -204,9 +217,21 @@ pub fn register_buffer(uop_id: u64, tensor_id: u64, buffer: Arc<Buffer>) {
     let buf_guard = buffers().guard();
     buffers().insert(uop_id, buffer.clone(), &buf_guard);
 
-    // Also set buffer on the TensorEntry for direct tensor access
-    if let Some(entry) = get_tensor(tensor_id) {
-        entry.set_buffer(buffer);
+    // Also set buffer on the TensorEntry for direct tensor access. A lost
+    // `set_buffer` for the SAME buffer is a benign re-registration; a lost set
+    // for a DIFFERENT buffer means two realizes disagreed about this tensor's
+    // storage — an identity bug upstream that must never pass silently.
+    if let Some(entry) = get_tensor(tensor_id)
+        && !entry.set_buffer(buffer.clone())
+        && let Some(existing) = entry.buffer()
+        && existing.id() != buffer.id()
+    {
+        tracing::error!(
+            tensor_id,
+            existing = existing.id().0,
+            incoming = buffer.id().0,
+            "register_buffer: tensor already holds a different buffer — lost set indicates an identity bug"
+        );
     }
 }
 
@@ -227,30 +252,17 @@ pub fn get_tensor(id: u64) -> Option<Arc<TensorEntry>> {
     tensors().get(&id, &guard)?.upgrade()
 }
 
-/// Remove dead weak references and stale buffer entries from the registry.
+/// Remove dead weak references from the tensor registry.
 ///
-/// Tensors: removes entries whose `Weak<TensorEntry>` can no longer be upgraded.
-/// Buffers: removes entries whose UOp is no longer alive in the UOp cache.
-///
-/// This is optional — stale entries don't affect correctness (unique buffer IDs
-/// prevent collisions). Call this to reclaim registry memory in long-running programs.
+/// Tensors: removes entries whose `Weak<TensorEntry>` can no longer be
+/// upgraded. Buffer entries need no sweep — they expire automatically via the
+/// UOp drop hook installed in [`buffers`].
 pub fn gc_dead_refs() {
-    // Clean dead tensor weak refs
     let map = tensors();
     let guard = map.guard();
     let to_remove: Vec<u64> = map.iter(&guard).filter(|(_, weak)| weak.upgrade().is_none()).map(|(k, _)| *k).collect();
     for id in to_remove {
         map.remove(&id, &guard);
-    }
-
-    // Clean stale buffer entries (UOp no longer alive in the cache)
-    let live_uop_ids = svod_ir::uop::live_uop_ids();
-    let buf_map = buffers();
-    let buf_guard = buf_map.guard();
-    let stale_bufs: Vec<u64> =
-        buf_map.iter(&buf_guard).filter(|(uop_id, _)| !live_uop_ids.contains(uop_id)).map(|(id, _)| *id).collect();
-    for uop_id in stale_bufs {
-        buf_map.remove(&uop_id, &buf_guard);
     }
 }
 
@@ -327,11 +339,33 @@ fn apply_map_to_tensors_inner(becomes_map: &HashMap<UOpKey, Arc<UOp>>, walk: boo
     // Phase 3: Atomic substitution across all affected UOps
     let new_sink = if walk { sink.substitute_walk(becomes_map) } else { sink.substitute(becomes_map) };
 
-    // Phase 4: Update each tensor's UOp (acquires write locks)
+    // Phase 4: Update each tensor's UOp (acquires write locks). An entry may
+    // have been concurrently finalized (`set_uop` from another realize)
+    // between the Phase-2 snapshot and here; a blind store would lose that
+    // update — the historical cross-plan input-aliasing bug. Under the write
+    // lock the entry cannot move, so on a detected change re-apply the
+    // substitution to the CURRENT value instead of storing the stale batch
+    // result. Re-applying is idempotent: realize maps are `old → replacement`
+    // where the replacement no longer contains the old key, so an
+    // already-rewritten value comes back unchanged and is left alone.
     if let Op::Sink { sources: new_sources, .. } = new_sink.op() {
         for (entry, (old, new)) in affected.iter().zip(sources.iter().zip(new_sources.iter())) {
-            if !Arc::ptr_eq(old, new) {
-                *entry.uop.write() = new.clone();
+            if Arc::ptr_eq(old, new) {
+                continue;
+            }
+            let mut slot = entry.uop.write();
+            if Arc::ptr_eq(&slot, old) {
+                *slot = new.clone();
+                continue;
+            }
+            tracing::debug!(
+                tensor_id = entry.id,
+                "apply_map: entry changed concurrently; re-substituting its current value"
+            );
+            let current = slot.clone();
+            let updated = if walk { current.substitute_walk(becomes_map) } else { current.substitute(becomes_map) };
+            if !Arc::ptr_eq(&updated, &current) {
+                *slot = updated;
             }
         }
     }

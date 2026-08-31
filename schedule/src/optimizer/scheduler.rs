@@ -805,7 +805,7 @@ impl Scheduler {
         for store in stores {
             for range in store.ranges() {
                 if matches!(range.op(), Op::Range { axis_type, .. } if *axis_type != AxisType::Reduce)
-                    && !output_ranges.iter().any(|r| Arc::ptr_eq(r, range))
+                    && !output_ranges.iter().any(|r| Arc::ptr_eq(r, &range))
                 {
                     output_ranges.push(range.clone());
                 }

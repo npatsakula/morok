@@ -192,3 +192,34 @@ fn copy_tensor_to_buffer(tensor: &Tensor, dst: &mut svod_device::Buffer) {
     src_buf.copyout(&mut data).unwrap();
     dst.copyin(&data).unwrap();
 }
+
+#[test]
+fn test_jit_replicate_executes_independently() {
+    let read = |buffer: &svod_device::Buffer| {
+        let mut result = vec![0.0f32; 3];
+        buffer.copyout(unsafe { std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, 12) }).unwrap();
+        result
+    };
+
+    let mut jit = AddJit::new(AddModel);
+    jit.prepare(InputSpec::f32(&[3]), InputSpec::f32(&[3])).unwrap();
+    copy_tensor_to_buffer(&Tensor::from_slice([1.0f32, 2.0, 3.0]), jit.x_mut().unwrap());
+    copy_tensor_to_buffer(&Tensor::from_slice([10.0f32, 20.0, 30.0]), jit.y_mut().unwrap());
+    jit.execute().unwrap();
+
+    // The replica snapshots the original's inputs, then diverges.
+    let mut replica = jit.replicate().unwrap();
+    copy_tensor_to_buffer(&Tensor::from_slice([100.0f32, 200.0, 300.0]), replica.x_mut().unwrap());
+    copy_tensor_to_buffer(&Tensor::from_slice([1.0f32, 1.0, 1.0]), replica.y_mut().unwrap());
+    replica.execute().unwrap();
+    assert_eq!(read(replica.output().unwrap()), vec![101.0, 201.0, 301.0]);
+
+    // The original's inputs and output are untouched by the replica.
+    jit.execute().unwrap();
+    assert_eq!(read(jit.output().unwrap()), vec![11.0, 22.0, 33.0]);
+
+    // Replicas mint further replicas, snapshotting the replica's state.
+    let mut second = replica.replicate().unwrap();
+    second.execute().unwrap();
+    assert_eq!(read(second.output().unwrap()), vec![101.0, 201.0, 301.0]);
+}

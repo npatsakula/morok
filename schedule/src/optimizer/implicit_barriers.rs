@@ -69,9 +69,7 @@ fn add_war_barrier(end: &Arc<UOp>) -> Option<Arc<UOp>> {
     let loop_range_ids: HashSet<_> = loop_ranges.iter().map(|range| range.id).collect();
     let store_buffers: HashSet<_> = backward_slice
         .iter()
-        .filter(|uop| {
-            is_local_store(uop) && uop.in_scope_ranges().iter().any(|range| loop_range_ids.contains(&range.0.id))
-        })
+        .filter(|uop| is_local_store(uop) && uop.in_scope_ranges().iter().any(|id| loop_range_ids.contains(id)))
         .filter_map(|uop| match uop.op() {
             Op::Store { index, .. } => access_buffer(index).map(UOpKey),
             _ => None,

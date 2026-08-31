@@ -114,7 +114,6 @@ impl Tensor {
         }
 
         let old_uop = self.uop();
-        let input_buffer_ids: HashSet<u64> = collect_input_buffers(&old_uop).keys().copied().collect();
 
         let t_prep = std::time::Instant::now();
         let plan = self.prepare_plan_with(&PrepareConfig::from_env())?;
@@ -131,12 +130,6 @@ impl Tensor {
             let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
             crate::tensor_registry::apply_map_to_tensors(&becomes_map);
         }
-
-        plan.release_intermediate_buffers(|uop_id| {
-            if !input_buffer_ids.contains(&uop_id) {
-                crate::tensor_registry::remove_buffer(uop_id);
-            }
-        });
 
         Ok(())
     }
@@ -175,7 +168,6 @@ impl Tensor {
         }
 
         let old_uop = self.uop();
-        let input_buffer_ids: HashSet<u64> = collect_input_buffers(&old_uop).keys().copied().collect();
 
         let t_prep = std::time::Instant::now();
         let plan = self.prepare_plan_with(config)?;
@@ -192,12 +184,6 @@ impl Tensor {
             let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
             crate::tensor_registry::apply_map_to_tensors(&becomes_map);
         }
-
-        plan.release_intermediate_buffers(|uop_id| {
-            if !input_buffer_ids.contains(&uop_id) {
-                crate::tensor_registry::remove_buffer(uop_id);
-            }
-        });
 
         Ok(())
     }
@@ -224,7 +210,6 @@ impl Tensor {
         }
 
         let old_uop = self.uop();
-        let input_buffer_ids: HashSet<u64> = collect_input_buffers(&old_uop).keys().copied().collect();
 
         let plan = self.prepare_plan_with(&PrepareConfig::from_env())?;
         let report = plan.profile(opts).context(ExecutionSnafu)?;
@@ -235,11 +220,6 @@ impl Tensor {
             let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
             crate::tensor_registry::apply_map_to_tensors(&becomes_map);
         }
-        plan.release_intermediate_buffers(|uop_id| {
-            if !input_buffer_ids.contains(&uop_id) {
-                crate::tensor_registry::remove_buffer(uop_id);
-            }
-        });
         Ok(report)
     }
 
@@ -437,7 +417,6 @@ impl Tensor {
         for uop in &old_uops {
             all_input_buffers.extend(collect_input_buffers(uop));
         }
-        let input_ids: HashSet<u64> = all_input_buffers.keys().copied().collect();
 
         // Create merged SINK(CONTIGUOUS(t1), ..., CONTIGUOUS(tN))
         let contiguouses: Vec<Arc<UOp>> = old_uops.iter().map(|u| u.contiguous()).collect();
@@ -487,13 +466,6 @@ impl Tensor {
 
         // Single batched apply_map (one global walk instead of N)
         crate::tensor_registry::apply_map_to_tensors(&becomes_map);
-
-        // Cleanup intermediate buffers
-        plan.release_intermediate_buffers(|id| {
-            if !input_ids.contains(&id) {
-                crate::tensor_registry::remove_buffer(id);
-            }
-        });
 
         Ok(())
     }
@@ -1300,9 +1272,6 @@ fn prepare_execution_plan(
             };
             uop_id_to_idx.insert(uop_id, idx);
         }
-
-        // Collect alias IDs for cleanup
-        builder.add_alias_ids(item.alias_registered_ids.iter().copied());
     }
 
     // Alias-only outputs have no executable schedule item, but the plan still

@@ -1069,14 +1069,13 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut RangeifyBufferConte
 /// Partition ranges into parented and unparented.
 pub(crate) fn partition_reduce_ranges(
     ranges: &SmallVec<[Arc<UOp>; 4]>,
-    src_ranges: &HashSet<UOpKey>,
+    src_ranges: &HashSet<u64>,
 ) -> (SmallVec<[Arc<UOp>; 4]>, Vec<Arc<UOp>>) {
     let mut parented = SmallVec::new();
     let mut unparented = Vec::new();
 
     for range in ranges {
-        let key = UOpKey(Arc::clone(range));
-        if src_ranges.contains(&key) {
+        if src_ranges.contains(&range.id) {
             parented.push(Arc::clone(range));
         } else {
             unparented.push(Arc::clone(range));
@@ -1109,9 +1108,8 @@ fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPa
 
     for range in ranges {
         // 1. Gated toposort: find nodes "in scope" of this range
-        let range_key = UOpKey(range.clone());
         let in_scope: HashSet<UOpKey> =
-            u.toposort_filtered(|node| node.in_scope_ranges().contains(&range_key)).into_iter().map(UOpKey).collect();
+            u.toposort_filtered(|node| node.in_scope_ranges().contains(&range.id)).into_iter().map(UOpKey).collect();
 
         // Bail if nested REDUCE or STORE in scope (can't collapse through these)
         if in_scope.iter().any(|k| matches!(k.0.op(), Op::Reduce { .. } | Op::Store { .. })) {
@@ -1367,7 +1365,7 @@ fn mark_gated(ctx: &mut SimplifyRangesContext, idx: &Arc<UOp>) {
     if !indices.iter().any(is_gate) {
         // No gate anywhere: every range the access reaches is an ungated use.
         for range in idx.ranges() {
-            pin(ctx, range);
+            pin(ctx, &range);
         }
         return;
     }
