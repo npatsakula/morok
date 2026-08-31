@@ -105,3 +105,30 @@ fn buffer_entry_expires_when_uop_drops() {
     drop(uop);
     assert!(get_buffer(id).is_none(), "entry must expire with its UOp");
 }
+
+/// The realize-final broadcast is device-scoped: a device-less (pure)
+/// receiver sharing the realized graph must NOT be folded onto the realized
+/// device buffer — an `amd` variant realizing a shared constant must never
+/// turn a concurrent CPU variant's plan into an AMD plan. The pure receiver
+/// keeps its graph and realizes independently.
+#[test]
+fn realized_broadcast_skips_deviceless_receivers() {
+    crate::test::helpers::test_setup();
+    let mut a = crate::Tensor::zeros(&[3], DType::Float32).unwrap().contiguous();
+    let b = crate::Tensor::zeros(&[3], DType::Float32).unwrap().contiguous();
+    let shared = b.uop();
+
+    a.realize().unwrap();
+    assert!(a.uop().device_spec().is_some(), "realized tensor is device-anchored");
+    assert!(
+        Arc::ptr_eq(&b.uop(), &shared),
+        "pure receiver must keep its graph instead of adopting the realized device buffer"
+    );
+
+    // ...and still realizes correctly on its own.
+    let mut b = b;
+    b.realize().unwrap();
+    let local = b.buffer().expect("own buffer").id();
+    let via_uop = crate::tensor_registry::get_buffer(b.uop().base().id).expect("registry entry").id();
+    assert_eq!(local, via_uop);
+}

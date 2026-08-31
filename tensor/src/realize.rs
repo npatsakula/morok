@@ -143,7 +143,7 @@ impl Tensor {
         let realized_uop = self.uop();
         if !Arc::ptr_eq(&old_uop, &realized_uop) {
             let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
-            crate::tensor_registry::apply_map_to_tensors(&becomes_map);
+            crate::tensor_registry::apply_map_to_tensors_realized(&becomes_map);
         }
 
         Ok(())
@@ -200,7 +200,7 @@ impl Tensor {
         let realized_uop = self.uop();
         if !Arc::ptr_eq(&old_uop, &realized_uop) {
             let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
-            crate::tensor_registry::apply_map_to_tensors(&becomes_map);
+            crate::tensor_registry::apply_map_to_tensors_realized(&becomes_map);
         }
 
         Ok(())
@@ -236,7 +236,7 @@ impl Tensor {
         let realized_uop = self.uop();
         if !Arc::ptr_eq(&old_uop, &realized_uop) {
             let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
-            crate::tensor_registry::apply_map_to_tensors(&becomes_map);
+            crate::tensor_registry::apply_map_to_tensors_realized(&becomes_map);
         }
         Ok(report)
     }
@@ -483,7 +483,7 @@ impl Tensor {
         }
 
         // Single batched apply_map (one global walk instead of N)
-        crate::tensor_registry::apply_map_to_tensors(&becomes_map);
+        crate::tensor_registry::apply_map_to_tensors_realized(&becomes_map);
 
         Ok(())
     }

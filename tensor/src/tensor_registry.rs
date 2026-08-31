@@ -290,7 +290,20 @@ pub fn gc_unused_tensors() {
 /// This function acquires write locks on affected tensors during the update phase.
 /// Other tensors can still be read/written concurrently.
 pub fn apply_map_to_tensors(becomes_map: &HashMap<UOpKey, Arc<UOp>>) {
-    apply_map_to_tensors_inner(becomes_map, false);
+    apply_map_to_tensors_inner(becomes_map, false, None);
+}
+
+/// [`apply_map_to_tensors`] for the realize-final `{old → realized BUFFER}`
+/// broadcast. Device-scoped: the rewrite pulls a concrete device into the
+/// receiver's graph, so it only folds tensors already anchored to the SAME
+/// device. Device-less (pure) receivers keep their graphs and recompute on
+/// whatever device their own realize resolves — value identity must never
+/// move a tensor onto another device (an `amd` test variant realizing a
+/// constant must not turn the concurrent `clang` variant's plan into an AMD
+/// plan).
+pub fn apply_map_to_tensors_realized(becomes_map: &HashMap<UOpKey, Arc<UOp>>) {
+    let device = becomes_map.values().find_map(|new| new.device_spec());
+    apply_map_to_tensors_inner(becomes_map, false, device);
 }
 
 /// Walk variant: replacements are NOT re-traversed.
@@ -298,10 +311,14 @@ pub fn apply_map_to_tensors(becomes_map: &HashMap<UOpKey, Arc<UOp>>) {
 /// Use when a replacement may contain the original key, such as the
 /// view-assign case `Buffer → After(Buffer, [Store(...)])`.
 pub fn apply_map_to_tensors_walk(becomes_map: &HashMap<UOpKey, Arc<UOp>>) {
-    apply_map_to_tensors_inner(becomes_map, true);
+    apply_map_to_tensors_inner(becomes_map, true, None);
 }
 
-fn apply_map_to_tensors_inner(becomes_map: &HashMap<UOpKey, Arc<UOp>>, walk: bool) {
+fn apply_map_to_tensors_inner(
+    becomes_map: &HashMap<UOpKey, Arc<UOp>>,
+    walk: bool,
+    same_device: Option<svod_dtype::DeviceSpec>,
+) {
     if becomes_map.is_empty() {
         return;
     }
@@ -316,6 +333,13 @@ fn apply_map_to_tensors_inner(becomes_map: &HashMap<UOpKey, Arc<UOp>>, walk: boo
             let entry = weak.upgrade()?; // Skip dead entries
             let is_affected = {
                 let uop = entry.uop.read();
+                // Device scope (realize-final broadcasts): only fold tensors
+                // anchored to the realized buffer's device.
+                if let Some(device) = same_device.as_ref()
+                    && uop.device_spec().as_ref() != Some(device)
+                {
+                    return None;
+                }
                 // Cached backward-slice membership: O(|map|) per tensor once
                 // the slice cache is warm, instead of a fresh toposort of
                 // every live tensor's graph on every realize (the dominant
