@@ -51,8 +51,20 @@ pub(crate) fn shared_weight_buffer(key: WeightKey, bytes: &[u8]) -> Arc<Buffer> 
                 Some(buffer) => Some(buffer),
                 None => {
                     // Last owner died; prune so the map stays bounded by the
-                    // number of LIVE weights.
-                    map.remove(&key, &guard);
+                    // number of LIVE weights. Conditional remove: between our
+                    // dead read and this removal, a concurrent winner may have
+                    // inserted a FRESH entry under the same key — a blind
+                    // `remove(&key)` would delete it and silently defeat
+                    // sharing for the next loader.
+                    use papaya::{Compute, Operation};
+                    let _: Compute<_, _, ()> = map.compute(
+                        key.clone(),
+                        |entry| match entry {
+                            Some((_, weak)) if weak.upgrade().is_none() => Operation::Remove,
+                            _ => Operation::Abort(()),
+                        },
+                        &guard,
+                    );
                     None
                 }
             },
