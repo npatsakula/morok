@@ -9,8 +9,8 @@ use svod_dtype::ext::HasDType;
 
 use crate::allocator::{Allocator, BufferSpec, RawBuffer};
 use crate::error::{
-    InvalidViewSnafu, NdarrayShapeSnafu, NotCpuAccessibleSnafu, Result, SizeMismatchSnafu, TypeMismatchSnafu,
-    UnsupportedSnafu,
+    ImmutableBufferSnafu, InvalidViewSnafu, NdarrayShapeSnafu, NotCpuAccessibleSnafu, Result, SizeMismatchSnafu,
+    TypeMismatchSnafu, UnsupportedSnafu,
 };
 
 /// Global counter for unique buffer IDs.
@@ -54,6 +54,10 @@ struct BufferData {
     /// side argument rather than a `BufferSpec` field so it does not split the
     /// cache (see [`BufferSpec`]).
     zero_init: bool,
+    /// One-way immutability seal for shared weight storages: host writes
+    /// through any handle or view are refused once set (see
+    /// [`Buffer::mark_immutable`]).
+    immutable: std::sync::atomic::AtomicBool,
 }
 
 impl BufferData {
@@ -65,6 +69,7 @@ impl BufferData {
             total_size: size,
             options,
             zero_init,
+            immutable: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -306,6 +311,30 @@ impl Buffer {
             .collect())
     }
 
+    /// Whether the underlying storage was sealed immutable.
+    pub fn is_immutable(&self) -> bool {
+        self.data.immutable.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Seal the underlying storage against host writes (one-way). Used for
+    /// shared weight storages: a write through ANY handle or view would
+    /// corrupt every model reading it, so `copyin*`, `as_*_mut` and
+    /// copy-destination paths fail with `Error::ImmutableBuffer` afterwards.
+    /// Device-side kernel writes are not intercepted here — the planner and
+    /// replicate write-set analyses keep sealed storages out of kernel write
+    /// positions. Forking (`fork_views`) stays legal and yields fresh,
+    /// mutable storage.
+    pub fn mark_immutable(&self) {
+        self.data.immutable.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn ensure_mutable(&self, op: &'static str) -> Result<()> {
+        if self.is_immutable() {
+            return ImmutableBufferSnafu { op, storage: self.data.storage_id.0 }.fail();
+        }
+        Ok(())
+    }
+
     /// Ensure the underlying buffer is allocated.
     pub fn ensure_allocated(&self) -> Result<()> {
         self.data.ensure_allocated()
@@ -399,6 +428,7 @@ impl Buffer {
     /// - `NotCpuAccessible` for CUDA device buffers
     #[allow(clippy::mut_from_ref)] // interior mutability via UnsafeCell
     pub fn as_host_bytes_mut(&self) -> Result<&mut [u8]> {
+        self.ensure_mutable("as_host_bytes_mut")?;
         self.ensure_allocated()?;
         let raw = self.data.raw();
         match raw {
@@ -490,6 +520,7 @@ impl Buffer {
     /// Same as [`Self::as_array`].
     #[allow(clippy::mut_from_ref)]
     pub fn as_array_mut<T: HasDType>(&self) -> Result<ndarray::ArrayViewMutD<'_, T>> {
+        self.ensure_mutable("as_array_mut")?;
         self.ensure_allocated()?;
         if self.dtype != T::DTYPE {
             return TypeMismatchSnafu { expected: T::DTYPE, actual: self.dtype.clone() }.fail();
@@ -599,6 +630,7 @@ impl Buffer {
     /// Delegates to the allocator's `_copyin`. The per-backend logic lives on
     /// the allocator, not here.
     pub fn copyin(&mut self, src: &[u8]) -> Result<()> {
+        self.ensure_mutable("copyin")?;
         self.ensure_allocated()?;
 
         let expected = self.size;
@@ -613,6 +645,7 @@ impl Buffer {
     /// device-local buffer (e.g. one lane's KV-cache row) from host memory
     /// via the copy engine, without a host-visible mapping.
     pub fn copyin_at(&mut self, dst_off: usize, src: &[u8]) -> Result<()> {
+        self.ensure_mutable("copyin_at")?;
         self.ensure_allocated()?;
         let end = dst_off
             .checked_add(src.len())
@@ -654,6 +687,7 @@ impl Buffer {
     /// host). The source device is synchronized before the host read so async
     /// dispatch never races a still-running writer.
     pub fn copy_from(&mut self, src: &Buffer) -> Result<()> {
+        self.ensure_mutable("copy_from")?;
         self.ensure_allocated()?;
         src.ensure_allocated()?;
 
@@ -676,6 +710,7 @@ impl Buffer {
     /// `_transfer` path (SDMA when either side is device-local), so recurrent
     /// state rows can be recycled output→input without touching the host.
     pub fn copy_region_from(&mut self, dst_off: usize, src: &Buffer, src_off: usize, len: usize) -> Result<()> {
+        self.ensure_mutable("copy_region_from")?;
         self.ensure_allocated()?;
         src.ensure_allocated()?;
         let dst_end = dst_off
@@ -698,6 +733,7 @@ impl Buffer {
     /// lane compaction shifts a surviving lane to a new row. The regions must
     /// not overlap.
     pub fn copy_within(&mut self, dst_off: usize, src_off: usize, len: usize) -> Result<()> {
+        self.ensure_mutable("copy_within")?;
         self.ensure_allocated()?;
         let dst_end = dst_off
             .checked_add(len)

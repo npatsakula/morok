@@ -59,3 +59,33 @@ fn test_load_safetensors_fp8() {
     let loaded = crate::state::load_safetensors(&path).unwrap();
     assert_eq!(loaded["weight"].uop().dtype(), svod_dtype::DType::FP8E4M3);
 }
+
+/// Phase-3 acceptance: loading one checkpoint into two model instances
+/// uploads each weight once — the tensors share ONE sealed device storage,
+/// writes into it fail loudly, and computation through it stays correct.
+#[test]
+fn loading_same_checkpoint_twice_shares_immutable_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shared.safetensors");
+    let data = [1.0f32, 2.0, 3.0, 4.0];
+    let bytes: &[u8] = bytemuck::cast_slice(&data);
+    let tensors = std::collections::HashMap::from([(
+        "w".to_string(),
+        safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![4], bytes).unwrap(),
+    )]);
+    safetensors::serialize_to_file(&tensors, None::<std::collections::HashMap<String, String>>, &path).unwrap();
+
+    let sd1 = crate::state::load_safetensors(&path).unwrap();
+    let sd2 = crate::state::load_safetensors(&path).unwrap();
+    let b1 = sd1["w"].buffer().unwrap();
+    let b2 = sd2["w"].buffer().unwrap();
+    assert_eq!(b1.storage_id(), b2.storage_id(), "one checkpoint must upload each weight once");
+    assert!(b1.is_immutable());
+    let mut writable = b1.clone();
+    assert!(writable.copyin(&[0u8; 16]).is_err(), "shared weights must refuse host writes");
+
+    // Both instances still evaluate correctly through the shared storage.
+    let mut sum = &sd1["w"] + &sd2["w"];
+    sum.realize().unwrap();
+    assert_eq!(sum.as_vec::<f32>().unwrap(), vec![2.0, 4.0, 6.0, 8.0]);
+}

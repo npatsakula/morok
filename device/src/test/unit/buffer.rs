@@ -349,3 +349,22 @@ fn test_fork_views_rejects_mixed_storages() {
     let right = Buffer::allocate(allocator, DType::Float32, vec![4], BufferSpec::default()).unwrap();
     assert!(Buffer::fork_views(&[&left, &right], false).is_err());
 }
+
+#[test]
+fn test_mark_immutable_blocks_host_writes_but_not_forks() {
+    let allocator = Arc::new(CpuAllocator);
+    let mut buffer = Buffer::allocate(allocator, DType::Float32, vec![4], BufferSpec::default()).unwrap();
+    buffer.copyin(&[7u8; 16]).unwrap();
+    buffer.mark_immutable();
+
+    assert!(buffer.copyin(&[0u8; 16]).is_err());
+    assert!(buffer.copy_within(0, 8, 8).is_err());
+    let mut out = [0u8; 16];
+    buffer.copyout(&mut out).unwrap();
+    assert_eq!(out, [7u8; 16], "reads must stay legal after sealing");
+
+    // Forking mints fresh, MUTABLE storage — the way to get a private copy.
+    let mut fork = Buffer::fork_views(&[&buffer], true).unwrap().remove(0);
+    assert!(!fork.is_immutable());
+    fork.copyin(&[1u8; 16]).unwrap();
+}
