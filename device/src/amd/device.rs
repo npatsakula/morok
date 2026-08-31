@@ -115,8 +115,8 @@ pub(crate) struct ScratchState {
 /// The private-segment (scratch) fields the AQL packet processor reads from the
 /// `amd_queue_t` GART descriptor. On the PM4 dispatch path the same information
 /// is pushed via `COMPUTE_TMPRING_SIZE` / `COMPUTE_DISPATCH_SCRATCH_BASE` and
-/// the user-SGPR descriptor instead, so this is only consumed on multi-XCC
-/// CDNA (the lone AQL arch).
+/// the user-SGPR descriptor instead; every AQL queue — multi-XCC CDNA and any
+/// forced-AQL gfx11+ queue — consumes it from the descriptor.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct AqlScratchDesc {
     /// `amd_queue_t.scratch_backing_memory_location` — scratch buffer VA.
@@ -135,6 +135,13 @@ pub(crate) struct AqlScratchDesc {
 /// ADD_TID_ENABLE=1, TYPE=SQ_RSRC_BUF(0).
 const SCRATCH_RSRC_WORD3_GFX9: u32 = 0x00EA_4FAC;
 
+/// gfx11 SQ_BUF_RSRC WORD3 for a scratch buffer (ROCr
+/// `FillBufRsrcWord3_Gfx11`): DST_SEL=XYZW (4,5,6,7), FORMAT=32_UINT (0x14),
+/// INDEX_STRIDE=0 (filled in by the CP), ADD_TID_ENABLE=1, OOB_SELECT=2 (no
+/// bounds check in swizzle mode), TYPE=SQ_RSRC_BUF(0). The gfx12 layout only
+/// adds compression bits that stay zero, so the same value serves both.
+const SCRATCH_RSRC_WORD3_GFX11: u32 = 0x2081_4FAC;
+
 impl AqlScratchDesc {
     /// Build the gfx9 scratch descriptor. `size_per_xcc` goes in NUM_RECORDS
     /// (WORD2) — the per-XCC slice of the shared backing buffer — and the
@@ -150,6 +157,26 @@ impl AqlScratchDesc {
                 SCRATCH_RSRC_WORD3_GFX9,
             ],
             wave64_lane_byte_size: private_segment_size,
+        }
+    }
+
+    /// Build the gfx11/gfx12 scratch descriptor (ROCr `InitScratchSRD` case
+    /// 11): SWIZZLE_ENABLE moves to WORD1 bits [31:30] (value 1), NUM_RECORDS
+    /// carries the full backing size (one XCC on RDNA), and
+    /// `scratch_wave64_lane_byte_size` records the rounded per-thread stride.
+    /// Consumed by any gfx11+ AQL queue (`SVOD_AMD_AQL=1`), never by the PM4
+    /// path, which programs scratch via per-dispatch `SET_SH_REG`.
+    pub(crate) fn gfx11(scratch_va: u64, size: usize, tmpring_size: u32, size_per_thread: u32) -> Self {
+        Self {
+            backing_va: scratch_va,
+            tmpring_size,
+            resource_descriptor: [
+                scratch_va as u32,
+                ((scratch_va >> 32) as u32 & 0xFFFF) | 0x4000_0000,
+                size as u32,
+                SCRATCH_RSRC_WORD3_GFX11,
+            ],
+            wave64_lane_byte_size: size_per_thread,
         }
     }
 }
@@ -359,12 +386,24 @@ impl AmdDevice {
 
         debug!(node = node.node_id, gpu_id = node.gpu_id, arch = arch.mcpu(), backend = %backend, "AmdDevice opened");
 
-        // Bounded exclusive-lane pool: at most `SVOD_AMD_HW_QUEUES` distinct KFD
-        // compute queues (default 4, min 1).
+        // Bounded exclusive-lane pool: at most `SVOD_AMD_HW_QUEUES` distinct
+        // KFD compute queues. The default is scheduler-aware, mirroring where
+        // the ROCm stack itself ships multi-queue:
+        //   - multi-XCC CDNA (MI300-class): 4 — queues are HWS/MEC-runlist
+        //     scheduled and concurrent AQL queues are the validated production
+        //     configuration (HIP's own GPU_MAX_HW_QUEUES default is 4);
+        //   - single-XCC gfx11+ (MES-scheduled, RDNA3/3.5/4): 1 — feeding
+        //     several PM4 user queues concurrently parks CP micro-engines in
+        //     `WAIT_REG_MEM` spins that MES cannot preempt and wedges the
+        //     firmware into an unrecoverable reset (reproduced on gfx1151;
+        //     see HCQ_PORT_LEDGER.md), and gfx11 MEC firmware implements no
+        //     scheduler-visible timeline-wait packet to lower waits onto
+        //     (the AMD barrier-value vendor packet is an illegal opcode
+        //     there). The env override remains for validation experiments.
         let hw_queues = std::env::var("SVOD_AMD_HW_QUEUES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(4)
+            .unwrap_or(if node.num_xcc.max(1) > 1 { 4 } else { 1 })
             .clamp(1, u64::BITS as usize);
 
         let core = Arc::new(AmdDeviceCore {
@@ -908,12 +947,19 @@ pub(crate) fn alloc_scratch(
     let waves = (num_waves.min(max_scratch_waves) / se_cnt).max(1) * se_cnt;
     let tmpring_size = pack_tmpring(waves, wave_scratch, arch);
 
-    // The AQL descriptor is only consumed on multi-XCC CDNA; non-CDNA arches
-    // dispatch via PM4 and never read it, so leave it zero there.
-    let aql_desc = if arch.is_cdna() {
-        AqlScratchDesc::gfx9(va, size_per_xcc, tmpring_size, private_segment_size)
-    } else {
-        AqlScratchDesc::default()
+    // Every AQL queue reads the descriptor out of `amd_queue_t` — multi-XCC
+    // CDNA always, gfx11+ under `SVOD_AMD_AQL=1`. PM4 queues program scratch
+    // via per-dispatch `SET_SH_REG` instead and ignore it, but synthesizing
+    // it unconditionally is harmless and closes the forced-AQL gap where
+    // gfx11 kernels needing scratch read an all-zero SRD. Explicit per
+    // generation (ROCr `InitScratchSRD` switches the same way): a future arch
+    // must pick its own V# layout here, not inherit one from an else-bucket.
+    let aql_desc = match arch.gfx_major() {
+        9 => AqlScratchDesc::gfx9(va, size_per_xcc, tmpring_size, private_segment_size),
+        // gfx12's V# differs from gfx11 only in compression bits that stay
+        // zero; the TMPRING packing difference lives in `pack_tmpring`.
+        11 | 12 => AqlScratchDesc::gfx11(va, size_per_xcc, tmpring_size, size_per_thread),
+        major => unreachable!("no AQL scratch V# layout for gfx{major}"),
     };
 
     Ok((va, total, tmpring_size, size_per_thread, handle, aql_desc))

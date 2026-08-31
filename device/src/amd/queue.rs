@@ -969,6 +969,9 @@ unsafe impl Send for StagingBuf {}
 struct QueueInner {
     /// 16 MiB ring buffer; host-visible so we can write packets directly.
     ring_host: NonNull<u8>,
+    /// GPU VA of the ring — `AMDKFD_IOC_UPDATE_QUEUE` re-validates the ring
+    /// address on every call, so the descriptor-reload remap needs it.
+    ring_gpu: u64,
     ring_size: usize,
     /// Per-queue doorbell (`*mut u64` MMIO).
     doorbell: NonNull<u64>,
@@ -1888,6 +1891,34 @@ impl AmdComputeQueue {
     /// dispatch. The caller holds the queue idle (the connector drains its
     /// timeline before a scratch realloc), so no in-flight dispatch can observe
     /// a half-written descriptor.
+    /// Publish an AQL scratch descriptor so the CP firmware actually consumes
+    /// it. ROCr documents that CP FW caches its copy of `amd_queue_t` at
+    /// queue-connect and re-reads it only on a queue re-map
+    /// (`AqlQueue::Suspend/Resume`, `amd_aql_queue.cpp:795-800`), so an
+    /// in-place GART write alone is not guaranteed visible. Sequence mirrors
+    /// ROCr: unmap (`queue_percentage = 0`) → write the descriptor → remap
+    /// (`= 100`, FW re-reads). No-op on PM4 queues, whose scratch rides in
+    /// per-dispatch `SET_SH_REG` packets.
+    ///
+    /// The caller holds the exclusive lane lease with the queue drained. A
+    /// failed remap leaves the queue unmapped — unusable — so it poisons the
+    /// device rather than letting later timeline waits burn their deadline.
+    pub(crate) fn publish_aql_descriptor(&self, desc: &crate::amd::device::AqlScratchDesc) -> Result<()> {
+        if self.is_pm4 {
+            return Ok(());
+        }
+        let (queue_id, ring_gpu, ring_size) = {
+            let g = self.inner.lock();
+            (g.queue_id, g.ring_gpu, g.ring_size as u32)
+        };
+        self.core.iface().update_queue_percentage(queue_id, ring_gpu, ring_size, 0)?;
+        self.set_aql_scratch(desc);
+        self.core
+            .iface()
+            .update_queue_percentage(queue_id, ring_gpu, ring_size, kfd::KFD_MAX_QUEUE_PERCENTAGE)
+            .inspect_err(|e| self.core.poison(&format!("AQL descriptor remap failed; queue left unmapped: {e}")))
+    }
+
     pub(crate) fn set_aql_scratch(&self, desc: &crate::amd::device::AqlScratchDesc) {
         if self.is_pm4 {
             return;
@@ -2683,6 +2714,7 @@ fn create_queue(
 
     Ok(QueueInner {
         ring_host,
+        ring_gpu,
         ring_size,
         doorbell,
         doorbell_base,

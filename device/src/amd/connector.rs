@@ -457,8 +457,10 @@ impl PoolQueue {
             list.push(Arc::downgrade(&q));
         }
         // Publish the initial scratch descriptor into the AQL queue's GART page
-        // (no-op on PM4 queues). Must happen before the first dispatch.
-        q.queue().set_aql_scratch(&aql_desc);
+        // (no-op on PM4 queues). Must happen before the first dispatch, and
+        // must go through the unmap/remap cycle: the CP cached the descriptor
+        // at CREATE_QUEUE, before scratch existed.
+        q.queue().publish_aql_descriptor(&aql_desc)?;
         Ok(q)
     }
 
@@ -594,8 +596,9 @@ impl PoolQueue {
         };
         // The exclusive lane lease keeps the new host state and live AQL descriptor
         // atomic with respect to publication. The successful drain proves the
-        // old backing is no longer referenced.
-        self.queue.set_aql_scratch(&aql_desc);
+        // old backing is no longer referenced by this lane — scratch is
+        // lane-private, so no sibling lane can reference it either.
+        self.queue.publish_aql_descriptor(&aql_desc)?;
         self.core.iface().free_raw(old.0, old.1, old.2);
         Ok(())
     }

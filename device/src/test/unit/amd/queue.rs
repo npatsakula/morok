@@ -1095,10 +1095,11 @@ fn sdma_device_local_roundtrip() {
     alloc._free(buf2, &spec);
 }
 
-/// On real AQL hardware (multi-XCC CDNA), `set_aql_scratch` must land the
-/// scratch descriptor at the right `amd_queue_t` offsets in the GART page the
-/// firmware reads. PM4 queues program scratch via registers and own no
-/// descriptor, so there the write is a no-op.
+/// On real AQL hardware (multi-XCC CDNA, or gfx11+ under `SVOD_AMD_AQL=1`),
+/// `set_aql_scratch` must land the scratch descriptor at the right
+/// `amd_queue_t` offsets in the GART page the firmware reads. PM4 queues
+/// program scratch via registers and own no descriptor, so there the write is
+/// a no-op.
 #[test]
 fn set_aql_scratch_round_trips_through_gart() {
     let Some(alloc) = amd_alloc_or_skip() else { return };
@@ -1109,7 +1110,7 @@ fn set_aql_scratch_round_trips_through_gart() {
     let (va, size, tmpring, _rounded, handle, desc) =
         crate::amd::device::alloc_scratch(alloc.dev.core().iface(), &alloc.dev.node, &alloc.dev.arch, 256)
             .expect("alloc scratch");
-    assert_ne!(desc, crate::amd::device::AqlScratchDesc::default(), "CDNA must synthesize a descriptor");
+    assert_ne!(desc, crate::amd::device::AqlScratchDesc::default(), "every AQL arch must synthesize a descriptor");
     q.set_aql_scratch(&desc);
     assert_eq!(q.read_aql_scratch(), desc, "the GART descriptor must match what we wrote");
     assert_eq!((desc.backing_va, desc.tmpring_size), (va, tmpring));
