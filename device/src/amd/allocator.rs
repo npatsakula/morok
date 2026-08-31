@@ -117,13 +117,11 @@ impl Allocator for AmdAllocator {
 
     fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> Result<()> {
         match dest {
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
-                // Drain first: a recycled VA may still be referenced by an
-                // in-flight kernel (dispatch is async + the LRU recycles
-                // without syncing). Direct host writes aren't ordered on the
-                // GPU timeline, so synchronize. Matches the no-copy-queue
-                // `_copyin` contract.
-                self.dev.synchronize()?;
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, .. } => {
+                // Wait this storage's recorded producers AND readers (a host
+                // overwrite is a WAR hazard against in-flight readers). Direct
+                // host writes aren't ordered on the GPU timeline.
+                self.dev.core().wait_storage(*gpu_addr)?;
                 // SAFETY: BAR-backed VRAM mapping valid for the buffer's lifetime;
                 // scheduler exclusivity. `dest_off + src.len()` is bounded by the caller.
                 let dst = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr().add(dest_off), src.len()) };
@@ -134,14 +132,10 @@ impl Allocator for AmdAllocator {
                 Ok(())
             }
             RawBuffer::AmdDevice { host_ptr: None, gpu_addr, .. } => {
-                // Device-local VRAM: drain in-flight kernels on the recycled VA,
-                // then stage host→device through the SDMA copy queue.
-                // PERF: `synchronize()` drains every connector timeline, not just
-                // this buffer's producer (RawBuffer has no last-writer timeline).
-                // Fine today — final outputs stay host-visible, so the hot readback
-                // avoids this arm. Scope to the producing timeline if device-only
-                // intermediate transfers ever become hot (see review finding #10).
-                self.dev.synchronize()?;
+                // Device-local VRAM: wait this storage's recorded producers
+                // and readers, then stage host→device through the SDMA copy
+                // queue (which self-fences its own transfer).
+                self.dev.core().wait_storage(*gpu_addr)?;
                 self.copy_queue()?.host_to_device(gpu_addr + dest_off as u64, src)
             }
             other => unreachable!("AmdAllocator::_copyin on non-AMD buffer: {other:?}"),
@@ -150,19 +144,20 @@ impl Allocator for AmdAllocator {
 
     fn _copyout(&self, dest: &mut [u8], src: &RawBuffer, src_off: usize) -> Result<()> {
         match src {
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
-                // Dispatch is async (`AmdProgram::execute` does not block), so
-                // drain the device timeline before reading GPU-written results.
-                self.dev.synchronize()?;
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, .. } => {
+                // Dispatch is async: wait this storage's recorded producers
+                // before reading GPU-written results (scoped — other plans'
+                // lanes keep running).
+                self.dev.core().wait_storage(*gpu_addr)?;
                 let src_slice = unsafe { std::slice::from_raw_parts(ptr.as_ptr().add(src_off), dest.len()) };
                 dest.copy_from_slice(src_slice);
                 Ok(())
             }
             RawBuffer::AmdDevice { host_ptr: None, gpu_addr, .. } => {
-                // Drain the producing kernels, then stage device→host through
+                // Wait the producing kernels, then stage device→host through
                 // the SDMA copy queue (which host-waits each chunk before the
                 // memcpy out).
-                self.dev.synchronize()?;
+                self.dev.core().wait_storage(*gpu_addr)?;
                 self.copy_queue()?.device_to_host(dest, gpu_addr + src_off as u64)
             }
             other => unreachable!("AmdAllocator::_copyout on non-AMD buffer: {other:?}"),
@@ -172,15 +167,15 @@ impl Allocator for AmdAllocator {
     fn _transfer(&self, dest: &RawBuffer, dest_off: usize, src: &RawBuffer, src_off: usize, sz: usize) -> Result<()> {
         match (dest, src) {
             (
-                RawBuffer::AmdDevice { host_ptr: Some(dst_ptr), .. },
-                RawBuffer::AmdDevice { host_ptr: Some(src_ptr), .. },
+                RawBuffer::AmdDevice { host_ptr: Some(dst_ptr), gpu_addr: dst_gpu, .. },
+                RawBuffer::AmdDevice { host_ptr: Some(src_ptr), gpu_addr: src_gpu, .. },
             ) => {
-                // Drain before the host memmove: `src` may still be written by
-                // an in-flight kernel and `dst` may be an in-flight target.
-                // Host pointer access isn't ordered on any GPU timeline, so we
-                // fence the whole device first — same contract as `_copyin`/
-                // `_copyout`.
-                self.dev.synchronize()?;
+                // Wait both storages' recorded work before the host memmove:
+                // `src` may still be written and `dst` may be an in-flight
+                // read/write target. Host pointer access isn't ordered on any
+                // GPU timeline — same contract as `_copyin`/`_copyout`.
+                self.dev.core().wait_storage(*src_gpu)?;
+                self.dev.core().wait_storage(*dst_gpu)?;
                 // Memory-planned views may overlap. Tinygrad's no-SDMA path uses
                 // memmove, so retain those semantics instead of creating aliased
                 // slices and lowering to memcpy.
@@ -194,7 +189,8 @@ impl Allocator for AmdAllocator {
             (RawBuffer::AmdDevice { gpu_addr: dst_gpu, .. }, RawBuffer::AmdDevice { gpu_addr: src_gpu, .. }) => {
                 // At least one side is device-only VRAM (no host mapping):
                 // direct device→device SDMA copy (both VAs always exist).
-                self.dev.synchronize()?;
+                self.dev.core().wait_storage(*src_gpu)?;
+                self.dev.core().wait_storage(*dst_gpu)?;
                 self.copy_queue()?.device_to_device(dst_gpu + dest_off as u64, src_gpu + src_off as u64, sz)
             }
             _ => UnsupportedSnafu { op: "transfer" }.fail(),
@@ -227,6 +223,7 @@ impl Allocator for AmdAllocator {
         // The unmap + munmap + free (host or PROT_NONE reservation share the
         // same VA region) is the backend's job.
         let _ = host_ptr;
+        device.core().unregister_storage(gpu_addr);
         device.core().iface().free_raw(gpu_addr, size, handle);
     }
 
@@ -286,6 +283,9 @@ fn do_alloc_tagged(
     zero_init: bool,
 ) -> Result<RawBuffer> {
     let r = dev.core().iface().alloc_raw(size, kind, tag, cpu_accessible, zero_init)?;
+    if matches!(kind, AllocKind::DeviceVram { .. }) {
+        dev.core().register_storage(r.gpu_va);
+    }
     Ok(RawBuffer::AmdDevice {
         gpu_addr: r.gpu_va,
         host_ptr: r.host_ptr,

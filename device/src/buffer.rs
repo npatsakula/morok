@@ -385,10 +385,10 @@ impl Buffer {
                 Ok(bytes)
             }
             RawBuffer::Mmap { data, .. } => Ok(&data[self.offset..self.offset + self.size]),
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
-                device.synchronize()?;
+                device.core().wait_storage(*gpu_addr)?;
                 // SAFETY: same invariants as the CPU arm — scheduler ensures
                 // exclusivity, and the BAR-backed VRAM mapping is valid for
                 // the lifetime of the RawBuffer.
@@ -441,10 +441,10 @@ impl Buffer {
             }
             // Mmap is read-only — no mutable access
             RawBuffer::Mmap { .. } => NotCpuAccessibleSnafu.fail(),
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
-                device.synchronize()?;
+                device.core().wait_storage(*gpu_addr)?;
                 let base = unsafe { ptr.as_ptr().add(self.offset) };
                 Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
             }
@@ -482,10 +482,10 @@ impl Buffer {
                 let typed = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) };
                 ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
-                device.synchronize()?;
+                device.core().wait_storage(*gpu_addr)?;
                 let bytes_ptr = unsafe { ptr.as_ptr().add(self.offset) } as *const T;
                 let count = self.size / T::DTYPE.bytes();
                 let typed = unsafe { std::slice::from_raw_parts(bytes_ptr, count) };
@@ -533,10 +533,10 @@ impl Buffer {
                 let typed = unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut T, count) };
                 ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
-                device.synchronize()?;
+                device.core().wait_storage(*gpu_addr)?;
                 // SAFETY: BAR-backed VRAM mapping is valid for the buffer's
                 // lifetime; scheduler ensures no concurrent kernel writes.
                 let bytes_ptr = unsafe { ptr.as_ptr().add(self.offset) } as *mut T;
@@ -561,10 +561,10 @@ impl Buffer {
                 let count = bytes.len() / T::DTYPE.bytes();
                 Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) })
             }
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
-                device.synchronize()?;
+                device.core().wait_storage(*gpu_addr)?;
                 let bytes_ptr = unsafe { ptr.as_ptr().add(self.offset) } as *const T;
                 let count = self.size / T::DTYPE.bytes();
                 Ok(unsafe { std::slice::from_raw_parts(bytes_ptr, count) })
@@ -756,6 +756,16 @@ impl Buffer {
     /// Synchronize the device (wait for all operations to complete).
     pub fn synchronize(&self) -> Result<()> {
         self.data.allocator.synchronize()
+    }
+
+    /// Record `token` as an in-flight producer/reader of this buffer's
+    /// storage for scoped host synchronization (see the AMD backend's
+    /// `wait_storage`). No-op on non-AMD storage and on storage that was
+    /// never allocated (nothing can be in flight against it).
+    pub fn record_completion(&self, token: &Arc<dyn crate::sync::CompletionToken>) {
+        if let Some(RawBuffer::AmdDevice { gpu_addr, device, .. }) = self.data.raw.get() {
+            device.core().record_producer(*gpu_addr, token);
+        }
     }
 
     /// Get a raw pointer to the buffer data for kernel execution.

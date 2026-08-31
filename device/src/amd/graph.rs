@@ -424,6 +424,10 @@ impl AmdGraph {
 }
 
 impl Graph for AmdGraph {
+    fn completion_token(&self) -> Option<Arc<dyn crate::sync::CompletionToken>> {
+        self.owner.completion_token()
+    }
+
     fn replay(&self, buffers: &[u64], vals: &[i64]) -> Result<()> {
         if let Some(error) = self.owner.core().poison_error() {
             return Err(error);

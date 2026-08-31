@@ -809,6 +809,12 @@ impl Program for AmdProgram {
             owner.synchronize()?;
         } else {
             crate::device::PlanContext::finish_replay(&owner)?;
+            // Fire-and-forget with a throwaway owner (BEAM timing): nothing
+            // durable records this submission, so park its finalizer in the
+            // core's unattributed list for scoped host waits.
+            if let Some(token) = owner.completion_token() {
+                self.dev.core().record_unattributed(token);
+            }
         }
         Ok(())
     }

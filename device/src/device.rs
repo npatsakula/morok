@@ -121,6 +121,12 @@ pub trait Graph: Send + Sync {
     /// order; empty slices replay the captured values.
     fn replay(&self, buffers: &[u64], vals: &[i64]) -> Result<()>;
 
+    /// Completion token covering every replay this graph has made so far.
+    /// Backends without scoped sync return `None`.
+    fn completion_token(&self) -> Option<Arc<dyn crate::sync::CompletionToken>> {
+        None
+    }
+
     /// Replay a profiling-specific linked variant and return ready per-dispatch
     /// timestamps in capture order. Backends without graph timestamps return
     /// `None`, allowing the runtime to retain its per-call fallback.
@@ -163,6 +169,12 @@ pub trait PlanContext: Send + Sync {
         local_size: Option<[usize; 3]>,
         profile: bool,
     ) -> Result<Option<Arc<dyn crate::DispatchTimestamps>>>;
+
+    /// Completion token covering every submission this context has made so
+    /// far. Backends without scoped sync return `None`.
+    fn completion_token(&self) -> Option<Arc<dyn crate::sync::CompletionToken>> {
+        None
+    }
 
     /// Replay an execution plan's already-linked neutral topology. Hardware
     /// backends may lower/link it on the first call and patch only invocation

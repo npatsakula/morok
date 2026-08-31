@@ -370,6 +370,10 @@ pub struct ExecutionPlan {
     /// carries over to replicas.
     input_buffer_indices: HashSet<usize>,
 
+    /// One representative buffer index per distinct storage (arena views
+    /// share one storage), for scoped-sync completion-token recording.
+    distinct_storage_indices: Vec<usize>,
+
     /// Primary device for this plan.
     device: DeviceSpec,
 
@@ -1261,6 +1265,9 @@ impl ExecutionPlan {
             if graph.is_none()
                 && matches!(self.replay_native_linked_plan()?, svod_device::device::NativeReplayOutcome::Executed)
             {
+                self.record_completion_token(
+                    self.plan_ctx.get().and_then(|context| context.as_deref()).and_then(|c| c.completion_token()),
+                );
                 return Ok(());
             }
             let linked = self.hcq_linked.get().expect("HCQ plan linked by builder");
@@ -1301,6 +1308,15 @@ impl ExecutionPlan {
             if let Some(ctx) = self.plan_ctx.get().and_then(|context| context.as_deref()) {
                 ctx.finish_replay().context(ExecSnafu { context: "finish direct HCQ replay" })?;
             }
+            let token = if graph_replayed {
+                graph.and_then(|graph| graph.completion_token())
+            } else {
+                self.plan_ctx
+                    .get()
+                    .and_then(|context| context.as_deref())
+                    .and_then(|context| context.completion_token())
+            };
+            self.record_completion_token(token);
             Ok(())
         })();
         if result.is_err()
@@ -1607,6 +1623,18 @@ impl ExecutionPlan {
         Ok(())
     }
 
+    /// Scoped-sync: publish this epoch's completion token on every distinct
+    /// storage the plan touches (reads AND writes — a host overwrite races
+    /// in-flight readers too), so host access waits only this plan's work
+    /// instead of draining the whole device. No-op on backends without
+    /// tokens (CPU) and on plans whose context was never minted.
+    fn record_completion_token(&self, token: Option<std::sync::Arc<dyn svod_device::CompletionToken>>) {
+        let Some(token) = token else { return };
+        for &index in &self.distinct_storage_indices {
+            self.buffers[index].record_completion(&token);
+        }
+    }
+
     /// Deep-copy the plan for concurrent execution. Fork policy per storage:
     ///
     /// - written by the plan (arena intermediates, outputs, copy
@@ -1864,6 +1892,17 @@ impl ExecutionPlanBuilder {
             });
         }
 
+        // One representative buffer index per distinct storage, for scoped-sync
+        // token recording on execute.
+        let mut seen_storages = HashSet::new();
+        let distinct_storage_indices: Vec<usize> = self
+            .buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, buffer)| seen_storages.insert(buffer.storage_id()))
+            .map(|(index, _)| index)
+            .collect();
+
         let op_order = compute_mixed_op_order_with_instance_dependencies(&self.ops, &self.op_instance_dependencies)?;
         let op_levels = compute_execution_levels_with_instance_dependencies(&self.ops, &self.op_instance_dependencies)?;
 
@@ -1876,6 +1915,7 @@ impl ExecutionPlanBuilder {
             ast_to_buffer: self.ast_to_buffer,
             output_buffer_indices: self.output_buffer_indices,
             input_buffer_indices: HashSet::new(),
+            distinct_storage_indices,
             device: self.device,
             runtime_var_vals: HashMap::new(),
             graph: std::sync::OnceLock::new(),

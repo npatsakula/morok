@@ -165,7 +165,10 @@ impl AqlScratchDesc {
 /// teardown, event waits) route through `iface`. KFD-specific state (the kfd/
 /// drm fds, ABI version, event ids, event page) lives on the [`KfdIface`]
 /// implementor, not the core. `node` + `arch` stay here as the device identity.
-#[derive(Debug)]
+/// In-flight completion tokens for one storage (usually 0-2 concurrent
+/// plans touch a given storage).
+type StorageTokens = smallvec::SmallVec<[Arc<dyn crate::sync::CompletionToken>; 2]>;
+
 pub struct AmdDeviceCore {
     pub node: AmdNode,
     pub arch: AmdArch,
@@ -197,6 +200,16 @@ pub struct AmdDeviceCore {
     /// (`PoolQueue::drain_all`) reads only timeline signal slots and does not
     /// take publication locks.
     pub(crate) connectors: parking_lot::Mutex<Vec<Weak<crate::amd::connector::PoolQueue>>>,
+    /// Scoped-sync producer table: storage base VA → completion tokens of the
+    /// submissions that may still touch it (readers AND writers — a host
+    /// overwrite is a WAR hazard against in-flight readers too). Retired
+    /// tokens are pruned on insert and wait. A VA absent from the table falls
+    /// back to `synchronize_all` (unknown producer → conservative drain).
+    producers: parking_lot::Mutex<std::collections::HashMap<u64, StorageTokens>>,
+    /// Submissions with no durable owner (`Program::execute` fire-and-forget
+    /// fallback, e.g. BEAM timing) — waited by every scoped wait as a safety
+    /// net; normally empty.
+    unattributed: parking_lot::Mutex<Vec<Arc<dyn crate::sync::CompletionToken>>>,
     /// The device's single 16 MiB kernarg arena, shared by every lane (tinygrad
     /// has one `kernargs_buf` per device). `Weak` so the arena still dies with
     /// the last `PoolQueue` holding it — the core outlives every queue.
@@ -279,6 +292,8 @@ impl AmdDevice {
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
             connectors: parking_lot::Mutex::new(Vec::new()),
+            producers: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            unattributed: parking_lot::Mutex::new(Vec::new()),
             kernarg_arena: parking_lot::Mutex::new(Weak::new()),
             signal_pool: OnceLock::new(),
             copy_queue: OnceLock::new(),
@@ -362,6 +377,8 @@ impl AmdDevice {
             error_msg: OnceLock::new(),
             copy_queue: OnceLock::new(),
             connectors: parking_lot::Mutex::new(Vec::new()),
+            producers: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            unattributed: parking_lot::Mutex::new(Vec::new()),
             kernarg_arena: parking_lot::Mutex::new(Weak::new()),
             signal_pool: OnceLock::new(),
             queue_pool: crate::amd::connector::QueuePool::new(hw_queues),
@@ -383,6 +400,12 @@ impl AmdDevice {
     /// kernel's buffer.
     pub fn synchronize(&self) -> Result<()> {
         self.core.synchronize_all()
+    }
+}
+
+impl std::fmt::Debug for AmdDeviceCore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AmdDeviceCore").field("node", &self.node).field("arch", &self.arch).finish_non_exhaustive()
     }
 }
 
@@ -422,6 +445,77 @@ impl AmdDeviceCore {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Kill switch for storage-scoped host synchronization
+    /// (`SVOD_AMD_SCOPED_SYNC=0` → every wait falls back to
+    /// `synchronize_all`), for bisecting scoped-sync regressions.
+    fn scoped_sync_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("SVOD_AMD_SCOPED_SYNC").as_deref() != Ok("0"))
+    }
+
+    /// Pre-register a storage VA in the producer table so "known storage,
+    /// nothing in flight" is distinguishable from "unknown VA" (conservative
+    /// full drain).
+    pub(crate) fn register_storage(&self, base: u64) {
+        if Self::scoped_sync_enabled() {
+            self.producers.lock().entry(base).or_default();
+        }
+    }
+
+    pub(crate) fn unregister_storage(&self, base: u64) {
+        self.producers.lock().remove(&base);
+    }
+
+    /// Record `token` as an in-flight producer/reader of the storage at `base`.
+    pub(crate) fn record_producer(&self, base: u64, token: &Arc<dyn crate::sync::CompletionToken>) {
+        if !Self::scoped_sync_enabled() {
+            return;
+        }
+        let mut producers = self.producers.lock();
+        let tokens = producers.entry(base).or_default();
+        tokens.retain(|t| !t.retired());
+        tokens.push(Arc::clone(token));
+    }
+
+    /// Park an ownerless submission's token: waited by every scoped wait.
+    pub(crate) fn record_unattributed(&self, token: Arc<dyn crate::sync::CompletionToken>) {
+        let mut list = self.unattributed.lock();
+        list.retain(|t| !t.retired());
+        list.push(token);
+    }
+
+    /// Wait for every submission that may still touch the storage at `base`
+    /// — the scoped replacement for `synchronize_all` on host-visible buffer
+    /// operations. Unknown storages (and `SVOD_AMD_SCOPED_SYNC=0`) fall back
+    /// to the full drain.
+    pub(crate) fn wait_storage(&self, base: u64) -> Result<()> {
+        if !Self::scoped_sync_enabled() {
+            return self.synchronize_all();
+        }
+        if let Some(err) = self.poison_error() {
+            return Err(err);
+        }
+        let tokens = {
+            let mut producers = self.producers.lock();
+            match producers.get_mut(&base) {
+                Some(tokens) => {
+                    tokens.retain(|t| !t.retired());
+                    tokens.clone()
+                }
+                None => return self.synchronize_all(),
+            }
+        };
+        let unattributed: Vec<_> = {
+            let mut list = self.unattributed.lock();
+            list.retain(|t| !t.retired());
+            list.clone()
+        };
+        for token in tokens.iter().chain(unattributed.iter()) {
+            token.wait(30_000).inspect_err(|e| self.poison(&e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Borrow the backend seam — all KFD ioctls (alloc/free/ring/wait) route

@@ -368,6 +368,16 @@ impl SubmissionFinalizer {
     }
 }
 
+impl crate::sync::CompletionToken for SubmissionFinalizer {
+    fn wait(&self, timeout_ms: u64) -> Result<()> {
+        SubmissionFinalizer::wait(self, timeout_ms)
+    }
+
+    fn retired(&self) -> bool {
+        SubmissionFinalizer::retired(self)
+    }
+}
+
 impl PoolQueue {
     /// Link `lowered` against this lane, reusing the linked storage when the
     /// same packets and immutable addresses were linked here before.
@@ -679,6 +689,13 @@ impl OwnerCtx {
         *self.newest.lock() = Some(finalizer);
     }
 
+    /// This owner's newest finalizer as a scoped-sync completion token. A new
+    /// dispatch epoch retires the previous one first, so this token subsumes
+    /// every earlier submission of this owner.
+    pub fn completion_token(&self) -> Option<Arc<dyn crate::sync::CompletionToken>> {
+        self.newest.lock().clone().map(|finalizer| finalizer as Arc<dyn crate::sync::CompletionToken>)
+    }
+
     /// Owner-local drain: wait on ONLY this owner's last submitted work. AQL:
     /// wait its newest signal. PM4: wait the shared counter to reach this
     /// owner's high value. Polls the device poison latch and bails on fault.
@@ -775,6 +792,10 @@ impl crate::device::PlanContext for OwnerCtx {
             drop(session.take());
         }
         result
+    }
+
+    fn completion_token(&self) -> Option<Arc<dyn crate::sync::CompletionToken>> {
+        OwnerCtx::completion_token(self)
     }
 
     fn replay_linked_plan(
