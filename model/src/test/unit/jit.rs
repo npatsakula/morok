@@ -223,3 +223,45 @@ fn test_jit_replicate_executes_independently() {
     second.execute().unwrap();
     assert_eq!(read(second.output().unwrap()), vec![101.0, 201.0, 301.0]);
 }
+
+/// Phase-2 acceptance: multiple models preparing AND executing concurrently
+/// from several threads must not cross-talk (per-tensor input identities,
+/// winner-computes caches, per-plan queues).
+#[test]
+fn test_concurrent_multi_model_prepare_and_execute() {
+    let read3 = |buffer: &svod_device::Buffer| {
+        let mut result = vec![0.0f32; 3];
+        buffer.copyout(unsafe { std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, 12) }).unwrap();
+        result
+    };
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for worker in 0..4u32 {
+            let barrier = &barrier;
+            let read3 = &read3;
+            scope.spawn(move || {
+                for round in 0..8u32 {
+                    barrier.wait();
+                    let x = [(worker * 100 + round) as f32; 3];
+                    let y = [(worker + round * 10) as f32 + 0.5; 3];
+                    if worker % 2 == 0 {
+                        let mut jit = AddJit::new(AddModel);
+                        jit.prepare(InputSpec::f32(&[3]), InputSpec::f32(&[3])).unwrap();
+                        copy_tensor_to_buffer(&Tensor::from_slice(x), jit.x_mut().unwrap());
+                        copy_tensor_to_buffer(&Tensor::from_slice(y), jit.y_mut().unwrap());
+                        jit.execute().unwrap();
+                        assert_eq!(read3(jit.output().unwrap()), vec![x[0] + y[0]; 3]);
+                    } else {
+                        let mut jit = SplitJit::new(SplitModel);
+                        jit.prepare(InputSpec::f32(&[3]), InputSpec::f32(&[3])).unwrap();
+                        copy_tensor_to_buffer(&Tensor::from_slice(x), jit.x_mut().unwrap());
+                        copy_tensor_to_buffer(&Tensor::from_slice(y), jit.y_mut().unwrap());
+                        jit.execute().unwrap();
+                        assert_eq!(read3(jit.sum().unwrap()), vec![x[0] + y[0]; 3]);
+                        assert_eq!(read3(jit.diff().unwrap()), vec![x[0] - y[0]; 3]);
+                    }
+                }
+            });
+        }
+    });
+}

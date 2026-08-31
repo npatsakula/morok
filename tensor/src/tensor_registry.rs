@@ -316,13 +316,12 @@ fn apply_map_to_tensors_inner(becomes_map: &HashMap<UOpKey, Arc<UOp>>, walk: boo
             let entry = weak.upgrade()?; // Skip dead entries
             let is_affected = {
                 let uop = entry.uop.read();
-                // Check if tensor's root UOp is in map
-                if becomes_map.contains_key(&UOpKey(uop.clone())) {
-                    true
-                } else {
-                    // Check if any node in the graph is in map
-                    uop.toposort().iter().any(|n| becomes_map.contains_key(&UOpKey(n.clone())))
-                }
+                // Cached backward-slice membership: O(|map|) per tensor once
+                // the slice cache is warm, instead of a fresh toposort of
+                // every live tensor's graph on every realize (the dominant
+                // multi-model prepare cost).
+                let slice = uop.backward_slice_ids();
+                becomes_map.keys().any(|key| slice.contains(&key.0.id))
             }; // uop lock dropped here
             if is_affected { Some(entry) } else { None }
         })

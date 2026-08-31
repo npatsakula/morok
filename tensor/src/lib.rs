@@ -56,6 +56,7 @@ fn find_assign_identity(target: &Arc<UOp>, base: &Arc<UOp>) -> Arc<UOp> {
 pub mod error;
 #[macro_use]
 mod macros;
+mod singleflight;
 use error::*;
 
 pub mod activation;

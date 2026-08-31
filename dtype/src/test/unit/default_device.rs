@@ -65,3 +65,9 @@ fn nested_with_default_device_restores_each_layer() {
     assert_eq!(default_device(), DeviceSpec::Cpu, "outer scope restored");
     clear_default_device();
 }
+
+#[test]
+fn spawn_with_default_device_propagates_callers_device() {
+    let handle = with_default_device(DeviceSpec::Amd { device_id: 3 }, || spawn_with_default_device(default_device));
+    assert_eq!(handle.join().unwrap(), DeviceSpec::Amd { device_id: 3 });
+}

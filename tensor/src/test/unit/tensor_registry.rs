@@ -45,12 +45,15 @@ fn test_apply_map_updates_tensors() {
 }
 
 /// Regression: two threads realizing hash-cons-identical `zeros` graphs must
-/// keep distinct buffer AND graph identities. Before the Phase-4 CAS in
-/// `apply_map_to_tensors_inner`, one realize's broadcast could clobber the
-/// other tensor's just-finalized entry, converging both onto one buffer UOp
-/// (the model-JIT parallel-test flake).
+/// end up with COHERENT identities — the buffer a tensor's `buffer()` returns
+/// must be the buffer its `uop()` graph resolves to through the registry.
+/// Before the Phase-4 CAS in `apply_map_to_tensors_inner`, one realize's
+/// broadcast could clobber the other tensor's just-finalized entry, leaving
+/// `buffer()` and `uop()` pointing at DIFFERENT buffers (the model-JIT
+/// parallel-test flake). Convergence of both tensors onto ONE shared buffer
+/// is legitimate (value-identical pure graphs dedup); incoherence is not.
 #[test]
-fn concurrent_zeros_realizes_keep_distinct_identities() {
+fn concurrent_zeros_realizes_keep_coherent_identities() {
     crate::test::helpers::test_setup();
     let cfg = crate::PrepareConfig::default();
     // Warm the schedule cache so both threads race through apply_map together.
@@ -60,20 +63,26 @@ fn concurrent_zeros_realizes_keep_distinct_identities() {
     }
     for _ in 0..100 {
         let barrier = Arc::new(std::sync::Barrier::new(2));
-        let results = [(); 2]
-            .map(|()| {
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    let cfg = crate::PrepareConfig::default();
-                    let mut t = crate::Tensor::zeros(&[3], DType::Float32).unwrap();
-                    barrier.wait();
-                    t.realize_with(&cfg).unwrap();
-                    (t.buffer().unwrap().id().0, t.uop().base().id)
-                })
+        let handles = [(); 2].map(|()| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let cfg = crate::PrepareConfig::default();
+                let mut t = crate::Tensor::zeros(&[3], DType::Float32).unwrap();
+                barrier.wait();
+                t.realize_with(&cfg).unwrap();
+                let local = t.buffer().expect("realized tensor has a buffer").id();
+                let via_uop = crate::tensor_registry::get_buffer(t.uop().base().id)
+                    .expect("realized graph resolves through the registry")
+                    .id();
+                assert_eq!(local, via_uop, "buffer()/uop() identity channels must agree");
+                let mut bytes = [1u8; 12];
+                t.buffer().unwrap().copyout(&mut bytes).unwrap();
+                assert_eq!(bytes, [0u8; 12], "zeros must read back as zeros");
             })
-            .map(|handle| handle.join().unwrap());
-        assert_ne!(results[0].0, results[1].0, "device buffers must differ");
-        assert_ne!(results[0].1, results[1].1, "graph identities must not converge (apply_map clobber)");
+        });
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }
 

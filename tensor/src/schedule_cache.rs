@@ -49,6 +49,13 @@ pub(crate) fn schedule_cache() -> &'static HashMap<ScheduleCacheKey, Arc<CachedS
     SCHEDULE_CACHE.get_or_init(HashMap::new)
 }
 
+/// In-flight dedup for schedule-cache misses: rangeify takes seconds, so N
+/// threads preparing the same shape must not each pay it.
+pub(crate) fn schedule_flight() -> &'static crate::singleflight::Singleflight<ScheduleCacheKey> {
+    static FLIGHT: OnceLock<crate::singleflight::Singleflight<ScheduleCacheKey>> = OnceLock::new();
+    FLIGHT.get_or_init(crate::singleflight::Singleflight::new)
+}
+
 /// Compute the cache key for a tensor + config.
 ///
 /// Uses pre-schedule cache normalization (BUFFER->PARAM + strip BIND

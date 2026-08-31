@@ -99,6 +99,18 @@ impl Tensor {
     /// # Errors
     ///
     /// Returns error if preparation or execution fails.
+    /// A concurrent realize of a value-identical tensor can rewrite this
+    /// tensor's graph to its realized BUFFER (`apply_map_to_tensors`
+    /// broadcast) between the entry check and scheduling — the pipeline then
+    /// sees an empty schedule. That is success, not failure: adopt the buffer.
+    fn adopt_concurrently_realized(&mut self, error: crate::error::Error) -> Result<()> {
+        if matches!(error, crate::error::Error::NoKernelsFound) && self.uop().has_buffer_identity() {
+            self.ensure_buffer();
+            return Ok(());
+        }
+        Err(error)
+    }
+
     pub fn realize(&mut self) -> Result<()> {
         if self.uop().has_buffer_identity() {
             self.ensure_buffer();
@@ -116,7 +128,10 @@ impl Tensor {
         let old_uop = self.uop();
 
         let t_prep = std::time::Instant::now();
-        let plan = self.prepare_plan_with(&PrepareConfig::from_env())?;
+        let plan = match self.prepare_plan_with(&PrepareConfig::from_env()) {
+            Ok(plan) => plan,
+            Err(error) => return self.adopt_concurrently_realized(error),
+        };
         let prep_ms = t_prep.elapsed().as_millis();
         let t_exec = std::time::Instant::now();
         plan.execute().context(ExecutionSnafu)?;
@@ -170,7 +185,10 @@ impl Tensor {
         let old_uop = self.uop();
 
         let t_prep = std::time::Instant::now();
-        let plan = self.prepare_plan_with(config)?;
+        let plan = match self.prepare_plan_with(config) {
+            Ok(plan) => plan,
+            Err(error) => return self.adopt_concurrently_realized(error),
+        };
         let prep_ms = t_prep.elapsed().as_millis();
         let t_exec = std::time::Instant::now();
         plan.execute().context(ExecutionSnafu)?;
@@ -635,17 +653,15 @@ fn schedule_result_from_sink_with_cache(
     let sched_key = (crate::schedule_cache::content_hash(&normalization.normalized), codegen);
 
     let cache = crate::schedule_cache::schedule_cache();
-    let entry = {
-        let guard = cache.guard();
-        cache.get(&sched_key, &guard).cloned()
-    };
-
-    let entry = match entry {
-        Some(hit) => {
-            debug!("schedule cache hit");
-            hit
-        }
-        None => {
+    // Winner-computes: N threads missing the same key run rangeify once;
+    // losers park until the winner has inserted, then take the cache hit.
+    let entry = crate::schedule_cache::schedule_flight().run(
+        sched_key.clone(),
+        || {
+            let guard = cache.guard();
+            cache.get(&sched_key, &guard).cloned()
+        },
+        || {
             let rangeify_result =
                 svod_schedule::rangeify_with_map(normalization.normalized.clone()).context(RangeifySnafu)?;
             let (kernel_graph, _) =
@@ -653,10 +669,10 @@ fn schedule_result_from_sink_with_cache(
             let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph)?;
             let new_entry = Arc::new(crate::schedule_cache::CachedSchedule { pre_schedule: Arc::new(pre_schedule) });
             let guard = cache.guard();
-            cache.insert(sched_key, Arc::clone(&new_entry), &guard);
-            new_entry
-        }
-    };
+            cache.insert(sched_key.clone(), Arc::clone(&new_entry), &guard);
+            Ok(new_entry)
+        },
+    )?;
 
     let restored_pre_schedule = restore_post_schedule_pre_schedule(&entry.pre_schedule, &normalization);
     let schedule_input_buffers = build_schedule_input_buffers(&restored_pre_schedule);
@@ -1101,6 +1117,13 @@ struct OptCacheState {
     cap: usize,
 }
 
+/// In-flight dedup for OPT_CACHE misses: beam/heuristic optimization plus
+/// render can dominate prepare, so concurrent same-kernel misses run once.
+fn opt_flight() -> &'static crate::singleflight::Singleflight<OptKey> {
+    static FLIGHT: std::sync::OnceLock<crate::singleflight::Singleflight<OptKey>> = std::sync::OnceLock::new();
+    FLIGHT.get_or_init(crate::singleflight::Singleflight::new)
+}
+
 impl OptCacheState {
     const DEFAULT_CAP: usize = 4096;
 
@@ -1362,16 +1385,18 @@ fn prepare_execution_plan(
             optimizer_fingerprint,
         );
 
-        let cached = if let Some(cached) = opt_cache.get(&opt_key, &opt_guard) {
-            Arc::clone(cached)
-        } else {
-            // Author-supplied `opts_to_apply` short-circuits before beam: such
-            // kernels must go through the heuristic entry so `apply_explicit_opts`
-            // honors the exact opt list (empty = none).
-            let has_explicit_opts =
-                matches!(item.ast.op(), Op::Sink { info: Some(ki), .. } if ki.opts_to_apply.is_some());
-            let optimized_ast =
-                if !has_explicit_opts && matches!(config.optimizer.strategy, svod_schedule::OptStrategy::Beam { .. }) {
+        let cached = opt_flight().run(
+            opt_key.clone(),
+            || opt_cache.get(&opt_key, &opt_guard).map(Arc::clone),
+            || {
+                // Author-supplied `opts_to_apply` short-circuits before beam: such
+                // kernels must go through the heuristic entry so `apply_explicit_opts`
+                // honors the exact opt list (empty = none).
+                let has_explicit_opts =
+                    matches!(item.ast.op(), Op::Sink { info: Some(ki), .. } if ki.opts_to_apply.is_some());
+                let optimized_ast = if !has_explicit_opts
+                    && matches!(config.optimizer.strategy, svod_schedule::OptStrategy::Beam { .. })
+                {
                     beam_search_optimize(
                         item.ast.clone(),
                         &optimizer_renderer,
@@ -1384,39 +1409,40 @@ fn prepare_execution_plan(
                         .context(OptimizeSnafu)?
                 };
 
-            let program = svod_codegen::program_pipeline::program_from_sink_with_renderer(
-                optimized_ast,
-                item_device.renderer.as_ref(),
-            )
-            .context(RenderKernelSnafu)?;
+                let program = svod_codegen::program_pipeline::program_from_sink_with_renderer(
+                    optimized_ast,
+                    item_device.renderer.as_ref(),
+                )
+                .context(RenderKernelSnafu)?;
 
-            let result = svod_runtime::kernel_cache::get_or_compile_kernel(
-                crate::schedule_cache::content_hash(&program),
-                item_codegen,
-                || {
-                    let (spec, compiled) = compile_with_program_pipeline_components(
-                        program.clone(),
-                        item_device.renderer.as_ref(),
-                        item_device.compiler.as_ref(),
-                    )?;
-                    let program = (item_device.runtime)(&compiled).context(CreateProgramSnafu)?;
-                    Ok(svod_runtime::kernel_cache::CachedKernel {
-                        program,
-                        device: item_codegen.to_string(),
-                        code: spec.src.clone(),
-                        entry_point: spec.name.clone(),
-                        var_names: spec.var_names.clone(),
-                        globals: spec.globals.clone(),
-                        outs: spec.outs.clone(),
-                        ins: spec.ins.clone(),
-                        global_size: spec.global_size.clone(),
-                        local_size: spec.local_size.clone(),
-                    })
-                },
-            )?;
-            opt_state.insert(opt_key, Arc::clone(&result));
-            result
-        };
+                let result = svod_runtime::kernel_cache::get_or_compile_kernel(
+                    crate::schedule_cache::content_hash(&program),
+                    item_codegen,
+                    || {
+                        let (spec, compiled) = compile_with_program_pipeline_components(
+                            program.clone(),
+                            item_device.renderer.as_ref(),
+                            item_device.compiler.as_ref(),
+                        )?;
+                        let program = (item_device.runtime)(&compiled).context(CreateProgramSnafu)?;
+                        Ok(svod_runtime::kernel_cache::CachedKernel {
+                            program,
+                            device: item_codegen.to_string(),
+                            code: spec.src.clone(),
+                            entry_point: spec.name.clone(),
+                            var_names: spec.var_names.clone(),
+                            globals: spec.globals.clone(),
+                            outs: spec.outs.clone(),
+                            ins: spec.ins.clone(),
+                            global_size: spec.global_size.clone(),
+                            local_size: spec.local_size.clone(),
+                        })
+                    },
+                )?;
+                opt_state.insert(opt_key.clone(), Arc::clone(&result));
+                Ok(result)
+            },
+        )?;
 
         // Build buffer indices in compiled ABI order (`ProgramSpec.globals`), not necessarily CALL arg order.
         let buffer_indices = resolve_compiled_kernel_buffer_indices(item, &uop_id_to_idx, &cached.globals)?;
