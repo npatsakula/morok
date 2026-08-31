@@ -6,6 +6,9 @@
 //! uses), so the L (sequence) axis may be symbolic — `sum_with` carries a
 //! symbolic reduced-axis size through; only `mean()` needs the count, which we
 //! supply explicitly as `sum(mask)`. The batch dim `b` is symbolic as usual.
+//!
+//! [`pool_embed`] layers L2-normalization on top of [`masked_mean`] for finished
+//! embeddings (the sentence-transformers default for ModernBERT).
 
 use snafu::ResultExt;
 use svod_tensor::{Tensor, s};
@@ -15,6 +18,10 @@ use super::error::{Result, TensorSnafu};
 /// Numerical epsilon on the denominator so an all-padded row divides by ~0
 /// instead of erroring in `try_div` (which rejects a constant-zero divisor).
 const EPS: f64 = 1e-9;
+
+/// Numerical epsilon guarding the L2 norm in [`pool_embed`] — keeps an all-pad
+/// row (whose mean-pool is the zero vector) finite instead of dividing by zero.
+const NORM_EPS: f64 = 1e-12;
 
 /// Masked mean pooling over the sequence axis.
 ///
@@ -55,4 +62,23 @@ pub fn masked_mean(hidden_states: &Tensor, mask: &Tensor) -> Result<Tensor> {
 /// JIT path guarantees (seq_len is baked at `prepare`).
 pub fn cls(hidden_states: &Tensor) -> Result<Tensor> {
     hidden_states.getitem(s![.., 0, ..]).context(TensorSnafu)
+}
+
+/// Masked mean-pool + L2-normalize → finished `(B, D)` embeddings.
+///
+/// `hidden`: `(B, L, D)` (B symbolic/rebindable, L and D concrete at prepare);
+/// `attention_mask`: bool `(B, L)` where `true` = real token. Returns `(B, D)`,
+/// mean-pooled over real tokens then L2-normalized per row. Pooling delegates
+/// to [`masked_mean`]; the L2-normalize is an embedder-specific finishing step.
+pub fn pool_embed(hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+    let pooled = masked_mean(hidden, attention_mask)?;
+
+    // L2-normalize per row: norm = sqrt(sum(pooled^2, axis=D) + eps), shape
+    // (B, 1), broadcasts against pooled (B, D). EPS guards an all-pad zero row.
+    let dtype = pooled.uop().dtype();
+    let eps = Tensor::const_(NORM_EPS, dtype);
+    let sq = pooled.square().context(TensorSnafu)?;
+    let sq_sum = sq.sum_with().axes(-1isize).keepdim(true).call().context(TensorSnafu)?;
+    let norm = sq_sum.try_add(&eps).context(TensorSnafu)?.try_sqrt().context(TensorSnafu)?;
+    pooled.try_div(&norm).context(TensorSnafu)
 }

@@ -2,14 +2,14 @@
 //! `nn.Embedding` lookup followed by a LayerNorm. There are **no position
 //! embeddings** — position information enters via RoPE in attention.
 
-use snafu::{OptionExt, ResultExt};
+use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use super::error::{Result, TensorSnafu};
 use super::normalization::LayerNormWeights;
 
 #[derive(Clone)]
@@ -32,9 +32,6 @@ impl Embeddings {
 
     /// Forward. `input_ids`: `(B, L)` int64 → `(B, L, D)`.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let shape = input_ids.shape().context(TensorSnafu)?;
-        // The embedding op needs a concrete input shape to resolve the output.
-        let _l: usize = shape[1].as_const().context(SymbolicShapeSnafu { what: "embeddings" })?;
         let x = self.tok_embeddings.embedding(input_ids).context(TensorSnafu)?;
         self.norm.apply(&x)
     }

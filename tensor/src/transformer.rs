@@ -14,7 +14,7 @@ impl Tensor {
     /// Embedding lookup: `self` is the weight table `[vocab_size, embed_dim]`.
     /// Returns `self[indices]` with shape `[*indices.shape, embed_dim]`.
     ///
-    /// Mirrors tinygrad's `_embedding_fwd`: a one-hot mask
+    /// Mirrors tinygrad's `nn.Embedding.__call__`: a one-hot mask
     /// (`indices.unsqueeze(-1) == arange(vocab)`) selects rows via
     /// `where(weight, 0).sum(vocab)`. It operates on the index's natural shape
     /// — no flatten-to-`[-1]` — so a symbolic dim on `indices` (e.g. a JIT

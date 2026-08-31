@@ -95,6 +95,12 @@ pub struct RunOptions {
     pub profile: bool,
 }
 
+impl From<()> for RunOptions {
+    fn from(_: ()) -> Self {
+        Self::default()
+    }
+}
+
 // ─── Word crop / stitch (pure host machinery) ────────────────────────────────
 
 /// Crop decoded words back to a chunk's core and drop the rest.
@@ -423,16 +429,6 @@ pub trait Transcriber {
             chunk_results.iter().map(|c| c.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
         Ok(Transcription { text, chunks: chunk_results, profile: prof })
     }
-
-    /// [`transcribe_chunks`](Self::transcribe_chunks) with default
-    /// [`RunOptions`] (no words, segments, or profile).
-    fn transcribe_chunks_default(
-        &mut self,
-        waveform: &[f32],
-        chunks: &[AudioChunk],
-    ) -> Result<Transcription, Self::Error> {
-        self.transcribe_chunks(waveform, chunks, RunOptions::default())
-    }
 }
 
 /// Decode geometry for one chunk, derived from its [`AudioChunk`].
@@ -489,8 +485,9 @@ impl<S: Splitter, T: Transcriber> Asr<S, T> {
     pub fn transcribe(
         &mut self,
         waveform: &[f32],
-        opts: RunOptions,
+        opts: impl Into<RunOptions>,
     ) -> Result<Transcription, AsrError<S::Error, T::Error>> {
+        let opts = opts.into();
         let t = Instant::now();
         let chunks = self.splitter.split(waveform).context(SplitSnafu)?;
         let split_wall = t.elapsed();
@@ -505,12 +502,6 @@ impl<S: Splitter, T: Transcriber> Asr<S, T> {
             transcription.profile = Some(p);
         }
         Ok(transcription)
-    }
-
-    /// [`transcribe`](Self::transcribe) with default [`RunOptions`] (no words,
-    /// segments, or profile) — the common case, without spelling out the struct.
-    pub fn transcribe_default(&mut self, waveform: &[f32]) -> Result<Transcription, AsrError<S::Error, T::Error>> {
-        self.transcribe(waveform, RunOptions::default())
     }
 
     pub fn splitter_mut(&mut self) -> &mut S {

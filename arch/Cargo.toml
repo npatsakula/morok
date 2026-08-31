@@ -12,6 +12,7 @@ description = "Architecture-level algorithms for the Svod ML compiler"
 serde = { version = "1.0", features = ["derive"], optional = true }
 snafu = "0.9"
 svod-runtime = { version = "=0.1.0-alpha.4", path = "../runtime" }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 
 [dev-dependencies]
 proptest = "1.9"
@@ -19,5 +20,9 @@ serde_json = "1.0"
 test-case = "3.3.1"
 
 [features]
-default = ["serde"]
+default = ["serde", "hf-tokenizers"]
 serde = ["dep:serde"]
+# The HuggingFace `tokenizers` adapter (`HfTokenizer` / `Encoding::from_hf`).
+# The `Tokenizer` trait + `Encoding` struct stay always-available, so a downstream
+# user wiring their own tokenizer can opt out and skip the `onig` build.
+hf-tokenizers = ["dep:tokenizers"]

@@ -162,7 +162,7 @@ impl ModernBertForMaskedLm {
             api.repo(hf_hub::Repo::with_revision(model_id.to_string(), hf_hub::RepoType::Model, revision.to_string()));
         let cfg_path = repo.get("config.json").context(HubSnafu)?;
         let parsed = ModernBertConfig::from_json(&cfg_path)?;
-        config.merge_structural_from(&parsed);
+        config.apply_checkpoint(&parsed);
 
         let weights_path = repo.get("model.safetensors").context(HubSnafu)?;
         Self::from_safetensors(&weights_path, config.clone())

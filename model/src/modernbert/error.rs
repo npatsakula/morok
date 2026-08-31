@@ -21,4 +21,10 @@ pub enum Error {
     Config { message: String },
     #[snafu(display("{what} requires a concrete sequence length, got a symbolic dim"))]
     SymbolicShape { what: &'static str },
+    #[snafu(display("{what} requires an attention mask"))]
+    MissingMask { what: &'static str },
+    #[snafu(display("loading tokenizer failed: {source}"))]
+    Tokenizer { source: svod_arch::pipelines::text::HfTokenizerError },
+    #[snafu(display("building encoder head failed: {source}"))]
+    Head { source: super::head_jit::HeadError },
 }

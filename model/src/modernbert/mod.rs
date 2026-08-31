@@ -6,28 +6,55 @@
 //! out-of-band — the API takes pre-computed `input_ids`.
 
 mod attention;
+mod classifier;
+mod classifier_jit;
 mod config;
+mod embedder;
+mod embedder_jit;
 mod embeddings;
 mod encoder;
 mod encoder_layer;
 mod error;
 mod head;
+mod head_jit;
 mod jit;
 mod mlp;
 mod model;
 mod normalization;
+pub(crate) mod packing;
+mod pipeline;
 mod pooling;
 mod rotary;
+mod token_classifier;
+mod token_classifier_jit;
 
 pub use attention::ModernBertAttention;
-pub use config::ModernBertConfig;
+#[cfg(test)]
+pub(crate) use classifier::ClassifierHead;
+#[cfg(test)]
+pub(crate) use classifier::ModernBertClassificationModel;
+pub use classifier::ModernBertClassifier;
+pub use classifier_jit::ModernBertClassifierJit;
+pub use config::{ClassifierPooling, ModernBertConfig};
+pub use embedder::ModernBertEmbedder;
+pub use embedder_jit::ModernBertEmbedderJit;
 pub use encoder::Encoder;
 pub use encoder_layer::EncoderLayer;
 pub use error::{Error, Result};
 pub use head::{MlmHead, ModernBertForMaskedLm};
+pub use head_jit::HeadError;
 pub use jit::{ModernBertJit, ModernBertMlmJit};
 pub use mlp::ModernBertGlu;
 pub use model::ModernBert;
 pub use normalization::LayerNormWeights;
+pub use pipeline::{
+    ModernBertClassifierLoad, ModernBertTokenClassifierLoad, from_hub, from_hub_classifier,
+    from_hub_classifier_with_revision, from_hub_token_classification, from_hub_token_classification_with_revision,
+    from_hub_with_revision,
+};
 pub use pooling::{cls, masked_mean};
 pub use rotary::RotaryTable;
+#[cfg(test)]
+pub(crate) use token_classifier::ModernBertTokenClassificationModel;
+pub use token_classifier::ModernBertTokenClassifier;
+pub use token_classifier_jit::ModernBertTokenClassifierJit;

@@ -26,7 +26,7 @@ plans.
 | FireRedVAD (batch + streaming) | Voice activity | `firered_vad` | [FireRedTeam/FireRedVAD](https://github.com/FireRedTeam/FireRedVAD) | [`vpermilp/firered_vad`](https://huggingface.co/vpermilp/firered_vad) |
 | Silero VAD 16k | Voice activity | `silero_vad` | [snakers4/silero-vad](https://github.com/snakers4/silero-vad) | [`vpermilp/silero-vad`](https://huggingface.co/vpermilp/silero-vad) |
 | DiariZen segmentation (WavLM + Conformer) | Speaker diarization | `diarizen` | [BUT-FIT/DiariZen](https://github.com/BUTSpeechFIT/DiariZen) | [`BUT-FIT/diarizen-wavlm-large-s80-md-v2`](https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2) |
-| ModernBERT (base / large) | Text embeddings, fill-mask (MLM) | `modernbert` | [Answer.AI ModernBERT](https://github.com/AnswerDotAI/ModernBERT) | [`answerdotai/ModernBERT-base`](https://huggingface.co/answerdotai/ModernBERT-base) |
+| ModernBERT (base / large) | Text embeddings, sequence classification, token classification, fill-mask (MLM, model layer only) | `modernbert` | [Answer.AI ModernBERT](https://github.com/AnswerDotAI/ModernBERT) | [`answerdotai/ModernBERT-base`](https://huggingface.co/answerdotai/ModernBERT-base) |
 | BGE-M3 (dense / sparse / ColBERT) | Text embeddings, retrieval | `bgem3` | [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) (XLM-RoBERTa-large) | [`BAAI/bge-m3`](https://huggingface.co/BAAI/bge-m3) |
 | BGE-reranker-v2-m3 | Cross-encoder reranking | `bgem3` | [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) | [`BAAI/bge-reranker-v2-m3`](https://huggingface.co/BAAI/bge-reranker-v2-m3) |
 | Qwen3-Embedding-0.6B | Text embeddings, retrieval | `qwen3` | [Qwen team](https://huggingface.co/Qwen) (Qwen3 LLM) | [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) |
@@ -48,4 +48,9 @@ cargo run -p svod-model --release --example yolo_detect -- --hub
 cargo run -p svod-model --release --example yolo_detect -- --hub --scale small --image photo.bin --side 640
 cargo run -p svod-model --release --example whisper_infer -- audio.wav [--size tiny|base|small] [--profile]
 cargo run -p svod-model --release --example whisper_infer -- audio.wav --language auto --timestamps
+cargo run -p svod-model --release --example modernbert_embed_infer -- "hello world"            # embeddings (--window/--stride for long docs)
+cargo run -p svod-model --release --example modernbert_embed_batch_infer -- "one" "two"        # batched embeddings (multi-text throughput)
+cargo run -p svod-model --release --example modernbert_classify_infer -- "This movie was great!" # sentence classification
+cargo run -p svod-model --release --example modernbert_token_infer -- "Barack Obama was born in Hawaii" # token classification / NER
+cargo run -p svod-model --release --example modernbert_token_chunks_infer -- < long_doc.txt # long-doc NER via the chunk seam (group_spans_document)
 ```

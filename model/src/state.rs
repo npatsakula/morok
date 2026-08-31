@@ -112,13 +112,25 @@ pub fn get_tensor(sd: &StateDict, key: &str) -> Result<Tensor> {
 }
 
 /// Cast every tensor in a state dict to `dtype`, leaving any tensor that cannot
-/// be cast (e.g. an int embedding key) at its original dtype. Shared by the
-/// ModernBERT backbone and MLM loaders so weight casting stays in one place.
+/// be cast (e.g. an int embedding key) at its original dtype and logging a
+/// warning naming the key — tolerant of foreign checkpoints like the per-block
+/// loaders, but no longer failing silently (a kept-foreign tensor would
+/// otherwise surface as an opaque dtype error far downstream).
 pub fn cast_all(sd: &StateDict, dtype: DType) -> StateDict {
     sd.iter()
         .map(|(k, v)| {
-            let t =
-                if v.uop().dtype() == dtype { v.clone() } else { v.cast(dtype.clone()).unwrap_or_else(|_| v.clone()) };
+            let from = v.uop().dtype();
+            let t = if from == dtype {
+                v.clone()
+            } else {
+                match v.cast(dtype.clone()) {
+                    Ok(casted) => casted,
+                    Err(_) => {
+                        tracing::warn!(key = %k, from = ?from, to = ?dtype, "state-dict cast failed; keeping original dtype");
+                        v.clone()
+                    }
+                }
+            };
             (k.clone(), t)
         })
         .collect()

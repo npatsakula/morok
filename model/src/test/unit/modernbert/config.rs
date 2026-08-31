@@ -78,3 +78,25 @@ fn parse_norm_eps_alias() {
     let c = ModernBertConfig::from_json_str(json).expect("parse");
     assert!((c.layer_norm_eps - 1e-5).abs() < 1e-12);
 }
+
+/// `id2label` from `config.json` is parsed into a dense `Vec<String>`: sized to
+/// `max(id)+1`, gaps filled with `"LABEL_{id}"`. `num_labels` follows the dense
+/// length when `num_labels` is absent.
+#[test]
+fn parse_id2label_dense_with_gaps() {
+    let json = r#"{
+        "id2label": {"0": "O", "1": "B-PER", "2": "I-PER", "4": "B-LOC"}
+    }"#;
+    let c = ModernBertConfig::from_json_str(json).expect("parse");
+    // max(id)+1 = 5; gap at index 3 filled with "LABEL_3".
+    assert_eq!(c.id2label, vec!["O", "B-PER", "I-PER", "LABEL_3", "B-LOC"]);
+    assert_eq!(c.num_labels, 5, "num_labels follows dense id2label length");
+}
+
+/// An absent `id2label` yields an empty vec and the base `num_labels` default.
+#[test]
+fn parse_absent_id2label_is_empty() {
+    let c = ModernBertConfig::from_json_str("{}").expect("parse");
+    assert!(c.id2label.is_empty());
+    assert_eq!(c.num_labels, 2, "base default");
+}

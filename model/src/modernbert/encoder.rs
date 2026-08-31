@@ -7,7 +7,6 @@
 //! [`ModernBertConfig::rope_theta`].
 
 use snafu::{OptionExt, ResultExt};
-use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict};
@@ -39,11 +38,13 @@ impl Encoder {
         let head_dim = self.config.head_dim();
 
         // Build the SDPA key-axis mask once: bool (B,1,1,L), True = masked out.
+        // The mask arrives as `(B, L)`; we only unsqueeze (never reshape), so the
+        // symbolic/rebindable batch dim flows through untouched. (A reshape to
+        // `(B, L)` here would be a no-op on shape but trips the JIT's "-1
+        // inference" path, which rejects a symbolic leading dim.)
         let mask_4d = match padding_mask {
             Some(m) => {
-                let b_dim = shape[0].clone();
-                let m2 = m.try_reshape([b_dim, SInt::from(seq_len)]).context(TensorSnafu)?;
-                let inverted = m2.logical_not().context(TensorSnafu)?;
+                let inverted = m.logical_not().context(TensorSnafu)?;
                 Some(inverted.try_unsqueeze(1).context(TensorSnafu)?.try_unsqueeze(1).context(TensorSnafu)?)
             }
             None => None,
