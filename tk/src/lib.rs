@@ -72,7 +72,9 @@ pub use kernels::fa::{
 pub use kernels::kmeans::{kmeans_assign, kmeans_update};
 pub use kernels::knn::knn;
 pub use kernels::matmul::matmul;
-pub use kernels::sq_attention::{SqAttentionOpts, single_query_attention, single_query_attention_packed};
+pub use kernels::sq_attention::{
+    SqAttentionOpts, single_query_attention, single_query_attention_packed, single_query_attention_supported,
+};
 pub use launch::{Error as LaunchError, Result as LaunchResult};
 
 // ── Author your own kernel (the tile DSL) ───────────────────────────────────

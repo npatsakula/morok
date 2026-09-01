@@ -428,6 +428,17 @@ pub fn single_query_attention(
     single_query_attention_packed(q, k, v, 0, opts)
 }
 
+/// True when [`single_query_attention`] can run on `device` for head dim `d`:
+/// a supported arch whose wave size divides `d` (the kernel loads `d / wave`
+/// elements per lane). The launch itself treats a wrong `d` as a caller error
+/// (crate policy: bad sizes are `Err`, not a fallback trigger), so dispatch
+/// layers that own a generic fallback gate on this first — mirroring
+/// [`crate::flash_attention_supported`].
+pub fn single_query_attention_supported(device: &svod_dtype::DeviceSpec, d: usize) -> bool {
+    crate::target::resolve_supported_arch(device, SQ_ATTENTION_SUPPORTED_ARCHS)
+        .is_ok_and(|arch| d.is_multiple_of(arch.wave_size() as usize))
+}
+
 /// Graph-native FP32 single-query attention over selected heads in packed K/V.
 ///
 /// Q is `[B,1,H,D]`, K/V are `[B,N,H_total,D]`, and heads

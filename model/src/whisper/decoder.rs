@@ -597,7 +597,8 @@ impl TextDecoder {
             let full_k = Tensor::cat(&[&cached_k, &new_k_seq], 1).context(TensorSnafu)?;
             let full_v = Tensor::cat(&[&cached_v, &new_v_seq], 1).context(TensorSnafu)?;
 
-            let direct = if attention.custom_self {
+            let direct = if attention.custom_self && svod_tk::single_query_attention_supported(&q_seq.device(), d_head)
+            {
                 svod_tk::single_query_attention(
                     &q_seq.cast(DType::Float32).context(TensorSnafu)?,
                     &full_k,
@@ -647,19 +648,20 @@ impl TextDecoder {
             let cq = block.cross_attn.query.forward(&h)?;
             let cq_seq = cq.try_reshape([batch, 1, n_head, d_head]).context(TensorSnafu)?;
 
-            let direct = if attention.custom_cross {
-                svod_tk::single_query_attention_packed(
-                    &cq_seq.cast(DType::Float32).context(TensorSnafu)?,
-                    cross_k,
-                    cross_v,
-                    lh_start,
-                    svod_tk::SqAttentionOpts { split: cross_splits, ..Default::default() },
-                )
-                .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
-                .context(TensorSnafu)?
-            } else {
-                None
-            };
+            let direct =
+                if attention.custom_cross && svod_tk::single_query_attention_supported(&cq_seq.device(), d_head) {
+                    svod_tk::single_query_attention_packed(
+                        &cq_seq.cast(DType::Float32).context(TensorSnafu)?,
+                        cross_k,
+                        cross_v,
+                        lh_start,
+                        svod_tk::SqAttentionOpts { split: cross_splits, ..Default::default() },
+                    )
+                    .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
+                    .context(TensorSnafu)?
+                } else {
+                    None
+                };
             let cross_out = match direct {
                 Some(out) => out
                     .try_reshape([batch, 1, self.n_state])
