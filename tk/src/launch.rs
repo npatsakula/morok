@@ -553,15 +553,17 @@ where
 ///   a caller bug), or `build` failed.
 /// - `Ok(Some(out))` — the kernel ran, yielding the lazy output [`Tensor`].
 ///
-/// `validate` and `build` receive the resolved [`AmdArch`] for arch-specific
-/// constraints / configs; `applies` is a precomputed predicate (kept out of
-/// `validate` because failing it is a fallback trigger, not an error). Shared by
-/// [`crate::matmul`] and [`crate::flash_attention_with`].
+/// `validate`, `applies`, and `build` receive the resolved [`AmdArch`] for
+/// arch-specific constraints / configs; `applies` is a predicate (kept out of
+/// `validate` because failing it is a fallback trigger, not an error) — taking
+/// the arch lets arch-dependent fit rules (e.g. a head dim the wave size must
+/// divide) decline to `Ok(None)` instead of masquerading as caller bugs.
+/// Shared by [`crate::matmul`] and [`crate::flash_attention_with`].
 pub fn launch_custom(
     device: &DeviceSpec,
     archs: &'static [AmdArch],
     validate: impl FnOnce(AmdArch) -> Result<()>,
-    applies: bool,
+    applies: impl FnOnce(AmdArch) -> bool,
     build: impl FnOnce(AmdArch) -> Result<Tensor>,
 ) -> Result<Option<Tensor>> {
     // "Can this device run the kernel at all?" — wrong arch / missing toolchain is
@@ -572,7 +574,7 @@ pub fn launch_custom(
     // "Is the request structurally valid?" — a fixed-property violation is a caller bug.
     validate(arch)?;
     // "Does this runtime instance fit?" — if not, a fallback trigger, not an error.
-    if !applies {
+    if !applies(arch) {
         return Ok(None);
     }
     build(arch).map(Some)

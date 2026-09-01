@@ -428,17 +428,6 @@ pub fn single_query_attention(
     single_query_attention_packed(q, k, v, 0, opts)
 }
 
-/// True when [`single_query_attention`] can run on `device` for head dim `d`:
-/// a supported arch whose wave size divides `d` (the kernel loads `d / wave`
-/// elements per lane). The launch itself treats a wrong `d` as a caller error
-/// (crate policy: bad sizes are `Err`, not a fallback trigger), so dispatch
-/// layers that own a generic fallback gate on this first — mirroring
-/// [`crate::flash_attention_supported`].
-pub fn single_query_attention_supported(device: &svod_dtype::DeviceSpec, d: usize) -> bool {
-    crate::target::resolve_supported_arch(device, SQ_ATTENTION_SUPPORTED_ARCHS)
-        .is_ok_and(|arch| d.is_multiple_of(arch.wave_size() as usize))
-}
-
 /// Graph-native FP32 single-query attention over selected heads in packed K/V.
 ///
 /// Q is `[B,1,H,D]`, K/V are `[B,N,H_total,D]`, and heads
@@ -543,8 +532,7 @@ pub fn single_query_attention_packed(
     crate::launch_custom(
         &q.device(),
         SQ_ATTENTION_SUPPORTED_ARCHS,
-        move |arch| {
-            let wave = arch.wave_size() as usize;
+        move |_arch| {
             ensure!(
                 dtype == DType::Float32,
                 crate::launch::DtypeSnafu { kernel: "single-query attention", got: dtype.clone(), expected: "f32" }
@@ -557,18 +545,13 @@ pub fn single_query_attention_packed(
                 v.uop().dtype() == DType::Float32,
                 crate::launch::DtypeSnafu { kernel: "single-query attention", got: v.uop().dtype(), expected: "f32" }
             );
-            ensure!(
-                d.is_multiple_of(wave),
-                crate::launch::DimMultipleSnafu {
-                    kernel: "single-query attention",
-                    dim: "D",
-                    value: d,
-                    multiple: wave
-                }
-            );
             Ok(())
         },
-        true,
+        // The kernel loads `d / wave` elements per lane, so a head dim the
+        // arch's wave size does not divide is a fit failure of THIS runtime
+        // instance (wave is 32 or 64 by arch), not a caller bug: decline to
+        // `Ok(None)` and let the caller's generic attention path take over.
+        move |arch| d.is_multiple_of(arch.wave_size() as usize),
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
             if splits == 1 {

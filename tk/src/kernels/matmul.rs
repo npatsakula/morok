@@ -213,7 +213,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> crate::LaunchResult<Option<Tensor>> {
             );
             Ok(())
         },
-        true, // no runtime-applicability fallback — a bad size is an error, not `None`.
+        |_| true, // no runtime-applicability fallback — a bad size is an error, not `None`.
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
             let cfg = cfg_for_arch(arch, n);

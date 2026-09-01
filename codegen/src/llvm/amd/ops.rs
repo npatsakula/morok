@@ -33,6 +33,19 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         Op::Unary(op @ (UnaryOp::Sqrt | UnaryOp::Log2 | UnaryOp::Exp2), src) => {
             render_float_unary(uop, src, *op, ctx, kernel)
         }
+        // Sin must never reach the AMD renderer: the device excludes it from
+        // `supported_ops` so the scheduler always decomposes it (`xsin`) —
+        // `@llvm.sin.f32` lowers to `v_sin_f32` behind an f32 `1/(2π)`
+        // pre-scale that is wrong for large arguments, and `@llvm.sin.f64`
+        // is unselectable. Backstop here so a capability-list drift fails
+        // loudly at render time instead of silently emitting either form.
+        Op::Unary(UnaryOp::Sin, _) => {
+            ctx.set_invalid_graph(
+                "AMD renderer received an un-decomposed Sin; it must be excluded from supported_ops and lowered by \
+                 the scheduler's transcendental decomposition",
+            );
+            Some(())
+        }
         Op::Cast { src, .. } if is_fp8_cast(uop, src) => render_fp8_cast(uop, src, ctx, kernel),
         // ── Everything else: shared CPU path (ALU, INDEX, LOAD, STORE, …) ─
         _ => cpu::render_uop(uop, ctx, kernel),

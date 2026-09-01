@@ -344,7 +344,6 @@ impl<'k> Group<'k> {
         let ept = src.shape()[src.shape().len() - 1] as i64;
         let val_reg = self.ker.alloc_reg(1, velem.clone());
         let idx_reg = self.ker.alloc_reg(1, DType::Int32);
-        let laneid = self.laneid();
         let read0 = |buf: &Arc<UOp>| load_at(buf, &[1], &[Idx::Const(0)]);
 
         let outer = self.ker.raw_range(outer_end, AxisType::Loop);
@@ -382,7 +381,7 @@ impl<'k> Group<'k> {
 
         // Cross-lane fold via `ds_bpermute`: value and index each ride their own
         // shuffle, so the partner's winning index is transported, not re-derived.
-        let (vacc, iacc) = self.arg_cross_lane(dir, &val_reg, &idx_reg, &fold_grp, &laneid);
+        let (vacc, iacc) = self.arg_cross_lane(dir, &val_reg, &idx_reg, &fold_grp);
 
         // Re-seed the OUTPUT pair to `dir.init()`/`-1` once per outer trip AND per
         // enclosing tracked loop, so a reduce *inside* a rolled loop (the KNN corpus
@@ -442,7 +441,6 @@ impl<'k> Group<'k> {
         let ept = src.shape()[src.shape().len() - 1] as i64;
         let val_reg = self.ker.alloc_reg(1, velem.clone());
         let idx_reg = self.ker.alloc_reg(1, DType::Int32);
-        let laneid = self.laneid();
         let read0 = |buf: &Arc<UOp>| load_at(buf, &[1], &[Idx::Const(0)]);
 
         // Re-init both accumulators each enclosing tracked-loop iteration: the init
@@ -479,7 +477,7 @@ impl<'k> Group<'k> {
         let fold_grp = UOp::group(vec![v_fold, i_fold]).end(smallvec![frag, acc, inner]);
 
         // Cross-lane fold via `ds_bpermute` (shared with the single-fold path).
-        let (vacc, iacc) = self.arg_cross_lane(dir, &val_reg, &idx_reg, &fold_grp, &laneid);
+        let (vacc, iacc) = self.arg_cross_lane(dir, &val_reg, &idx_reg, &fold_grp);
 
         // The whole reduced axis collapsed to the single output slot 0. A single-trip
         // `out` `Loop` range scopes the lone output store (the single-fold path's
@@ -524,26 +522,20 @@ impl<'k> Group<'k> {
         val_reg: &Arc<UOp>,
         idx_reg: &Arc<UOp>,
         fold_grp: &Arc<UOp>,
-        laneid: &Arc<UOp>,
     ) -> (Arc<UOp>, Arc<UOp>) {
         let read0 = |buf: &Arc<UOp>| load_at(buf, &[1], &[Idx::Const(0)]);
         let v_partial = read0(&val_reg.after(smallvec![fold_grp.clone()]));
         let i_partial = read0(&idx_reg.after(smallvec![fold_grp.clone()]));
-        // Pin the lane index to THIS reduce's fold scope. The `ds_bpermute` lane
-        // address derives only from `laneid` (`threadIdx % wave_size`, a SPECIAL), so
-        // it is loop-invariant (run_count 1) and hash-cons-shared across every reduce
-        // in the kernel. A kernel with sibling reduces (kmeans/knn build two) would
-        // then place the one shared address inside the first reduce's block, where it
-        // does not dominate the second reduce's `ds_bpermute` uses ("instruction does
-        // not dominate all uses"). Materializing the lane through a per-reduce
-        // 1-element register makes the address distinct per reduce and co-locates it
-        // with the `ds_bpermute` calls it feeds. The register round-trip — not a bare
-        // `laneid.after(..)` — is the tinygrad discipline (`llm/kernels/amd.py`
-        // anchors ride register buffers): the pinned AFTER spec admits no ALU/SPECIAL
-        // passthrough, and a weak-dtyped AFTER is a fixpoint `pm_lower_index_dtype`
-        // never strengthens. The Int32 store also commits the WeakInt SPECIAL chain.
+        // Pin the `ds_bpermute` lane address to THIS reduce's fold scope by
+        // materializing `laneid` through a per-reduce 1-element register. The
+        // register round-trip — not a bare `laneid.after(fold_grp)` — is the
+        // tinygrad anchoring discipline (`llm/kernels/amd.py` anchors ride
+        // register buffers): the pinned AFTER spec admits no ALU/SPECIAL
+        // passthrough, and a weak-dtyped AFTER is a fixpoint `pm_lower_weak`
+        // never strengthens. The Int32 store also commits the WeakInt SPECIAL
+        // chain before the index arithmetic below.
         let lane_reg = self.ker.alloc_reg(1, DType::Int32);
-        let lane_store = flat_index(&lane_reg, &[1], &[Idx::Const(0)]).store(laneid.cast(DType::Int32));
+        let lane_store = flat_index(&lane_reg, &[1], &[Idx::Const(0)]).store(self.laneid().cast(DType::Int32));
         // Strong load, weak cast outside for the index arithmetic below — the
         // `pm_lower_weak` PARAM discipline.
         let laneid = read0(&lane_reg.after(smallvec![lane_store, fold_grp.clone()])).cast(DType::WeakInt);
