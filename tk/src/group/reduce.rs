@@ -529,18 +529,24 @@ impl<'k> Group<'k> {
         let read0 = |buf: &Arc<UOp>| load_at(buf, &[1], &[Idx::Const(0)]);
         let v_partial = read0(&val_reg.after(smallvec![fold_grp.clone()]));
         let i_partial = read0(&idx_reg.after(smallvec![fold_grp.clone()]));
-        // Anchor the lane index to THIS reduce's fold scope. The `ds_bpermute` lane
+        // Pin the lane index to THIS reduce's fold scope. The `ds_bpermute` lane
         // address derives only from `laneid` (`threadIdx % wave_size`, a SPECIAL), so
         // it is loop-invariant (run_count 1) and hash-cons-shared across every reduce
         // in the kernel. A kernel with sibling reduces (kmeans/knn build two) would
         // then place the one shared address inside the first reduce's block, where it
         // does not dominate the second reduce's `ds_bpermute` uses ("instruction does
-        // not dominate all uses"). Anchoring to `fold_grp` makes the address distinct
-        // per reduce and co-locates it with the `ds_bpermute` calls it feeds — the
-        // analog of upstream deriving the lane from a WARP-axis RANGE (scoped) rather
-        // than a SPECIAL (floating). `pm_lower_index_dtype` pushes the AFTER through
-        // the dtype cast, so the Index arithmetic still lowers.
-        let laneid = laneid.after(smallvec![fold_grp.clone()]);
+        // not dominate all uses"). Materializing the lane through a per-reduce
+        // 1-element register makes the address distinct per reduce and co-locates it
+        // with the `ds_bpermute` calls it feeds. The register round-trip — not a bare
+        // `laneid.after(..)` — is the tinygrad discipline (`llm/kernels/amd.py`
+        // anchors ride register buffers): the pinned AFTER spec admits no ALU/SPECIAL
+        // passthrough, and a weak-dtyped AFTER is a fixpoint `pm_lower_index_dtype`
+        // never strengthens. The Int32 store also commits the WeakInt SPECIAL chain.
+        let lane_reg = self.ker.alloc_reg(1, DType::Int32);
+        let lane_store = flat_index(&lane_reg, &[1], &[Idx::Const(0)]).store(laneid.cast(DType::Int32));
+        // Strong load, weak cast outside for the index arithmetic below — the
+        // `pm_lower_weak` PARAM discipline.
+        let laneid = read0(&lane_reg.after(smallvec![lane_store, fold_grp.clone()])).cast(DType::WeakInt);
         let (mut vacc, mut iacc) = (v_partial.clone(), i_partial.clone());
         for d in self.ker.caps.reduce_tree() {
             let src_lane = imod(&iadd(&laneid, &cidx(d)), self.group_threads() as i64);
