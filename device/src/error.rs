@@ -40,6 +40,10 @@ pub enum Error {
     #[snafu(display("invalid view: offset {offset} + size {size} exceeds buffer size {buffer_size}"))]
     InvalidView { offset: usize, size: usize, buffer_size: usize },
 
+    /// Write refused: the storage was sealed immutable (shared weights).
+    #[snafu(display("write to immutable buffer refused: {op} (storage id {storage})"))]
+    ImmutableBuffer { op: &'static str, storage: u64 },
+
     /// Runtime execution error. Free-form catch-all; prefer the structured
     /// variants below when the data is structured.
     #[snafu(display("runtime error: {message}"))]

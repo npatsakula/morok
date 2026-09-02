@@ -144,14 +144,14 @@ fn check_tree_scope(root: &Arc<UOp>) -> Result<(), String> {
             let v_scope = InScopeRangesProperty::get(v);
             let v_ended: HashSet<u64> = v.op().ended_ranges().iter().map(|r| r.id).collect();
             for r in u_scope.iter() {
-                if !v_scope.contains(r) && !v_ended.contains(&r.0.id) {
+                if !v_scope.contains(r) && !v_ended.contains(r) {
                     return Err(format!(
                         "tree-scope violation: {:?} (scope={{{:?}}}) → consumed by {:?} (scope={{{:?}}}) which doesn't end range {}",
                         u.op(),
-                        u_scope.iter().map(|k| k.0.id).collect::<Vec<_>>(),
+                        u_scope.iter().copied().collect::<Vec<_>>(),
                         v.op(),
-                        v_scope.iter().map(|k| k.0.id).collect::<Vec<_>>(),
-                        r.0.id
+                        v_scope.iter().copied().collect::<Vec<_>>(),
+                        r
                     ));
                 }
             }

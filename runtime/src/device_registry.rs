@@ -46,9 +46,13 @@ pub type DeviceFactory = Arc<dyn Fn(&DeviceSpec, &DeviceRegistry) -> DeviceResul
 ///     // Create custom device...
 /// }));
 /// ```
+/// Per-spec construction slot: the mutex serializes same-spec construction
+/// outside the map locks; `None` means not yet (or unsuccessfully) built.
+type DeviceSlot = Arc<parking_lot::Mutex<Option<Arc<Device>>>>;
+
 pub struct DeviceFactoryRegistry {
     /// Cached device instances (DeviceSpec -> Device)
-    devices: RwLock<HashMap<DeviceSpec, Arc<Device>>>,
+    devices: RwLock<HashMap<DeviceSpec, DeviceSlot>>,
     /// Registered factories (device type string -> factory function)
     factories: RwLock<HashMap<String, DeviceFactory>>,
 }
@@ -109,9 +113,11 @@ impl DeviceFactoryRegistry {
 
     /// Get or create a Device for the given specification.
     ///
-    /// This method uses double-checked locking for efficiency:
-    /// 1. Fast path: Read lock to check cache
-    /// 2. Slow path: Write lock to create and cache new device
+    /// Construction (KFD open, toolchain probe) runs OUTSIDE the map locks,
+    /// serialized per-spec on a slot mutex: concurrent first-touches of
+    /// different devices construct in parallel, same-spec racers construct
+    /// exactly once, and a failed construction leaves the slot empty so a
+    /// later call retries.
     ///
     /// # Arguments
     ///
@@ -122,20 +128,23 @@ impl DeviceFactoryRegistry {
     ///
     /// Arc-wrapped Device for the specification, or error if device type unsupported.
     pub fn device(&self, spec: &DeviceSpec, alloc_registry: &DeviceRegistry) -> Result<Arc<Device>> {
-        // Fast path: read lock to check cache
-        if let Some(dev) = self.devices.read().get(spec) {
-            return Ok(Arc::clone(dev));
+        let slot = {
+            let devices = self.devices.read();
+            devices.get(spec).cloned()
+        };
+        let slot = match slot {
+            Some(slot) => slot,
+            None => {
+                let mut devices = self.devices.write();
+                devices.entry(spec.clone()).or_default().clone()
+            }
+        };
+
+        let mut cell = slot.lock();
+        if let Some(device) = cell.as_ref() {
+            return Ok(Arc::clone(device));
         }
 
-        // Slow path: write lock to create
-        let mut devices = self.devices.write();
-
-        // Double-check after acquiring write lock (another thread may have created it)
-        if let Some(dev) = devices.get(spec) {
-            return Ok(Arc::clone(dev));
-        }
-
-        // Look up factory for this device type
         let device_type = spec.base_type();
         let factory = self
             .factories
@@ -144,11 +153,11 @@ impl DeviceFactoryRegistry {
             .cloned()
             .ok_or_else(|| UnsupportedDeviceSnafu { device: device_type.to_string() }.build())?;
 
-        // Create device via factory
-        let device = factory(spec, alloc_registry)?;
-        let arc = Arc::new(device);
-        devices.insert(spec.clone(), Arc::clone(&arc));
-        Ok(arc)
+        // Construct under the per-spec slot lock only; an error leaves the
+        // slot empty so the next caller retries.
+        let device = Arc::new(factory(spec, alloc_registry)?);
+        *cell = Some(Arc::clone(&device));
+        Ok(device)
     }
 }
 

@@ -34,7 +34,7 @@ fn is_mergeable_end(uop: &Arc<UOp>) -> bool {
 /// keys and are kept apart in the merge step — the inner group's RANGEs are
 /// cloned with fresh axis ids so each RANGE maps to exactly one END.
 fn end_context_ids(end: &Arc<UOp>) -> SmallVec<[u64; 4]> {
-    let mut ids: SmallVec<[u64; 4]> = end.in_scope_ranges().iter().map(|key| key.0.id).collect();
+    let mut ids: SmallVec<[u64; 4]> = end.in_scope_ranges().iter().copied().collect();
     ids.sort_unstable();
     ids
 }
@@ -151,7 +151,8 @@ fn build_end_merge_subs(
 
         let mut contexts: Vec<_> = by_ctx.into_iter().collect();
         contexts.sort_by_cached_key(|(_, group)| {
-            structural_node_keys(group[0].in_scope_ranges().iter().map(|key| key.0.clone()))
+            let scope = group[0].in_scope_ranges();
+            structural_node_keys(group[0].ranges().into_iter().filter(|r| scope.contains(&r.id)))
         });
         for (i, (_, group)) in contexts.into_iter().enumerate() {
             // First sub-group keeps original ranges; subsequent ones get clones

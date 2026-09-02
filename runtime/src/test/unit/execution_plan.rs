@@ -1245,3 +1245,123 @@ fn native_replay_validation_cost_is_flat_across_executes() {
         "{per_execute} device_spec calls for {ENDPOINTS} endpoints: the walk was not merged"
     );
 }
+
+// ── replicate ──────────────────────────────────────────────────────────────
+
+/// A `[out, in]` copy plan over `values`, plus its dispatch counter.
+fn copy_plan(values: &[f32]) -> (ExecutionPlan, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let out = builder.add_buffer(30_001, cpu_buffer(DType::Float32, 4));
+    let input = builder.add_buffer(30_002, f32_buffer(values));
+    builder.add_kernel(prepared(30_003, cached(copy4f32(&calls), 2), vec![out, input]));
+    builder.set_output_buffer(out);
+    (builder.build().unwrap(), calls)
+}
+
+fn f32_bytes(values: [f32; 4]) -> Vec<u8> {
+    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+}
+
+#[test]
+fn replicate_forks_written_storage_and_shares_read_only_inputs() {
+    let (plan, _) = copy_plan(&[1.0, 2.0, 3.0, 4.0]);
+    plan.execute().unwrap();
+
+    let replica = plan.replicate().unwrap();
+    assert_ne!(plan.buffers()[0].storage_id(), replica.buffers()[0].storage_id(), "output storage must fork");
+    assert_eq!(plan.buffers()[1].storage_id(), replica.buffers()[1].storage_id(), "read-only input stays shared");
+
+    // Written storages fork bare: the replica derives its output on its own
+    // execute, and neither plan's output storage sees the other's runs.
+    replica.execute().unwrap();
+    assert_eq!(read_f32(replica.output_buffer().unwrap()), [1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(read_f32(plan.output_buffer().unwrap()), [1.0, 2.0, 3.0, 4.0]);
+
+    // The shared input is genuinely shared: a write through either handle
+    // reaches BOTH plans' next execute. Host-written inputs that must
+    // diverge must be declared via `declare_input`.
+    replica.buffers()[1].clone().copyin(&f32_bytes([5.0, 6.0, 7.0, 8.0])).unwrap();
+    plan.execute().unwrap();
+    replica.execute().unwrap();
+    assert_eq!(read_f32(plan.output_buffer().unwrap()), [5.0, 6.0, 7.0, 8.0]);
+    assert_eq!(read_f32(replica.output_buffer().unwrap()), [5.0, 6.0, 7.0, 8.0]);
+}
+
+#[test]
+fn declared_input_forks_with_snapshot() {
+    let (mut plan, _) = copy_plan(&[1.0, 2.0, 3.0, 4.0]);
+    plan.declare_input(1).unwrap();
+
+    let mut replica = plan.replicate().unwrap();
+    assert_ne!(plan.buffers()[1].storage_id(), replica.buffers()[1].storage_id(), "declared input storage must fork");
+    assert_eq!(read_f32(&replica.buffers()[1]), [1.0, 2.0, 3.0, 4.0], "forked input snapshots contents");
+
+    replica.buffer_at_mut(1).unwrap().copyin(&f32_bytes([9.0, 8.0, 7.0, 6.0])).unwrap();
+    replica.execute().unwrap();
+    assert_eq!(read_f32(replica.output_buffer().unwrap()), [9.0, 8.0, 7.0, 6.0]);
+    assert_eq!(read_f32(&plan.buffers()[1]), [1.0, 2.0, 3.0, 4.0], "original input must not see the write");
+
+    // Declarations carry over: a second-generation replica forks its input
+    // from the first replica, not from the original.
+    let second = replica.replicate().unwrap();
+    assert_ne!(second.buffers()[1].storage_id(), replica.buffers()[1].storage_id());
+    assert_eq!(read_f32(&second.buffers()[1]), [9.0, 8.0, 7.0, 6.0]);
+}
+
+#[test]
+fn replicate_preserves_arena_view_aliasing() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let arena = cpu_buffer(DType::Float32, 8);
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let first = builder.add_buffer(31_001, arena.view(0, 16).unwrap());
+    let second = builder.add_buffer(31_002, arena.view(16, 16).unwrap());
+    let source = builder.add_buffer(31_003, f32_buffer(&[1.0, 2.0, 3.0, 4.0]));
+    builder.add_kernel(prepared(31_004, cached(copy4f32(&calls), 2), vec![first, source]));
+    let mut chained = prepared(31_005, cached(copy4f32(&calls), 2), vec![second, first]);
+    chained.dependencies = vec![31_004];
+    builder.add_kernel(chained);
+    builder.set_output_buffer(second);
+    let plan = builder.build().unwrap();
+
+    let replica = plan.replicate().unwrap();
+    let (head, tail) = (&replica.buffers()[0], &replica.buffers()[1]);
+    assert_eq!(head.storage_id(), tail.storage_id(), "arena views must land on one forked storage");
+    assert_ne!(head.storage_id(), plan.buffers()[0].storage_id());
+    assert_eq!((head.offset(), tail.offset()), (0, 16), "arena offsets must be preserved");
+
+    replica.execute().unwrap();
+    assert_eq!(read_f32(replica.output_buffer().unwrap()), [1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn replicate_executes_concurrently_with_the_original() {
+    let (mut plan, _) = copy_plan(&[1.0, 2.0, 3.0, 4.0]);
+    plan.declare_input(1).unwrap();
+    let mut replica = plan.replicate().unwrap();
+    replica.buffer_at_mut(1).unwrap().copyin(&f32_bytes([9.0, 8.0, 7.0, 6.0])).unwrap();
+
+    std::thread::scope(|scope| {
+        let original = scope.spawn(|| {
+            for _ in 0..100 {
+                plan.execute().unwrap();
+            }
+            read_f32(plan.output_buffer().unwrap())
+        });
+        let forked = scope.spawn(|| {
+            for _ in 0..100 {
+                replica.execute().unwrap();
+            }
+            read_f32(replica.output_buffer().unwrap())
+        });
+        assert_eq!(original.join().unwrap(), [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(forked.join().unwrap(), [9.0, 8.0, 7.0, 6.0]);
+    });
+}
+
+#[test]
+fn declare_input_rejects_out_of_range_index() {
+    let (mut plan, _) = copy_plan(&[1.0, 2.0, 3.0, 4.0]);
+    let err = plan.declare_input(99).expect_err("out-of-range input index must fail loud");
+    assert!(err.to_string().contains("out of range"), "{err}");
+}

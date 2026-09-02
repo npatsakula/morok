@@ -49,6 +49,18 @@ pub trait DispatchTimestamps: Send + Sync {
     }
 }
 
+/// Waitable completion token for a batch of submitted device work.
+///
+/// Held per storage by the AMD scoped-sync producer table
+/// (`AmdDeviceCore::wait_storage`) so host reads wait only the producing
+/// submissions instead of draining the whole device. `wait` must be safe to
+/// call from any thread, any number of times, without holding queue or lane
+/// references.
+pub trait CompletionToken: Send + Sync {
+    fn wait(&self, timeout_ms: u64) -> Result<()>;
+    fn retired(&self) -> bool;
+}
+
 /// Monotonic timeline signal for synchronization.
 ///
 /// Timeline signals provide a way to order operations across different execution

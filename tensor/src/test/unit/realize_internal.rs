@@ -123,7 +123,6 @@ fn param_call_item(count: usize) -> (crate::schedule::ScheduleItem, std::collect
         fixedvars: std::collections::HashMap::new(),
         dependencies: vec![],
         instance_dependencies: vec![],
-        alias_registered_ids: vec![],
         loop_var_names: std::collections::HashSet::new(),
     };
     (item, params.iter().enumerate().map(|(position, param)| (param.id, 10 + position)).collect())
@@ -347,7 +346,6 @@ fn test_collect_non_overridable_fixedvars_locks_loop_and_device_bindings() {
         ]),
         dependencies: vec![],
         instance_dependencies: vec![],
-        alias_registered_ids: vec![],
         loop_var_names: std::collections::HashSet::from(["outer_i".to_string()]),
     };
 
@@ -601,7 +599,6 @@ fn test_prepare_execution_plan_lowers_explicit_custom_function_op() {
             fixedvars: std::collections::HashMap::new(),
             dependencies: vec![],
             instance_dependencies: vec![],
-            alias_registered_ids: vec![],
             loop_var_names: std::collections::HashSet::new(),
         }],
         output_uop_ids: vec![1001],
@@ -661,7 +658,6 @@ fn alias_output_storage_is_protected_from_memory_planning() {
         fixedvars: std::collections::HashMap::new(),
         dependencies: vec![],
         instance_dependencies: vec![],
-        alias_registered_ids: vec![],
         loop_var_names: std::collections::HashSet::new(),
     };
     let protected = collect_output_buffer_ids(&vec![item], &[2001], std::iter::once(&alias));
@@ -692,7 +688,7 @@ fn test_realize_buffer_cleanup() {
     assert_eq!(data, vec![5.0, 7.0, 9.0]);
 }
 
-/// Test that prepare() + execute() pattern can clean up with release_intermediate_buffers().
+/// Test that prepare() + execute() buffers expire automatically once the plan and tensors drop.
 #[test]
 #[ignore = "Flaky under parallel global registry activity; run manually with --ignored --test-threads=1"]
 fn test_prepare_execute_cleanup() {
@@ -719,19 +715,19 @@ fn test_prepare_execute_cleanup() {
         .expect("copyout should succeed");
     assert_eq!(data, vec![5.0, 7.0, 9.0]);
 
-    // Now cleanup — count how many buffers were actually released
-    let count_before_cleanup = crate::tensor_registry::buffer_count();
-    plan.release_intermediate_buffers(crate::tensor_registry::remove_buffer);
-    let count_after_cleanup = crate::tensor_registry::buffer_count();
-
-    // release_intermediate_buffers should remove at least one buffer (the output buffer)
-    // or at minimum not increase the count. We check the immediate delta to avoid
-    // interference from parallel tests.
+    // Dropping the plan and tensors expires their registry entries
+    // automatically (UOp drop hook) — no manual release exists any more.
+    let count_before_drop = crate::tensor_registry::buffer_count();
+    drop(plan);
+    drop(c);
+    drop(a);
+    drop(b);
+    let count_after_drop = crate::tensor_registry::buffer_count();
     assert!(
-        count_after_cleanup <= count_before_cleanup,
-        "Cleanup should not increase buffer count: before={}, after={}",
-        count_before_cleanup,
-        count_after_cleanup
+        count_after_drop < count_before_drop,
+        "Dropping plan + tensors must expire registry entries: before={}, after={}",
+        count_before_drop,
+        count_after_drop
     );
 }
 
@@ -764,8 +760,12 @@ fn test_memory_growth_detection() {
         counts.push(crate::tensor_registry::buffer_count());
     }
 
-    // Cleanup after final execution
-    plan.release_intermediate_buffers(crate::tensor_registry::remove_buffer);
+    // Cleanup after final execution: dropping the plan and tensors expires
+    // their registry entries automatically.
+    drop(plan);
+    drop(c);
+    drop(a);
+    drop(b);
     let count_after_cleanup = crate::tensor_registry::buffer_count();
 
     // Key invariant: count should be STABLE during iterations (no growth between iterations)
@@ -805,4 +805,26 @@ fn test_memory_growth_realize_pattern() {
     // Verify result
     let result: ndarray::ArrayD<f32> = c.as_ndarray().expect("as_ndarray should succeed");
     assert_eq!(result.as_slice().unwrap(), &[6.0, 8.0, 10.0, 12.0]);
+}
+
+/// Phase-1 acceptance: registry entries expire automatically with their
+/// graphs — the output entry survives while the tensor lives and dies with it.
+#[test]
+fn buffers_expire_automatically_with_their_graphs() {
+    crate::test::helpers::test_setup();
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
+    let mut c = &a + &b;
+    c.realize().expect("realize");
+    let out_id = c.uop().base().id;
+    assert!(crate::tensor_registry::get_buffer(out_id).is_some());
+
+    // The output entry survives while the tensor lives...
+    drop(a);
+    drop(b);
+    assert!(crate::tensor_registry::get_buffer(out_id).is_some());
+
+    // ...and expires once the last graph referencing it is gone.
+    drop(c);
+    assert!(crate::tensor_registry::get_buffer(out_id).is_none(), "entry must expire with the tensor graph");
 }

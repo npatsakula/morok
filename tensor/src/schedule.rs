@@ -726,11 +726,6 @@ pub struct ScheduleItem {
     /// Used for ordering constraints that cannot be represented by callable ID
     /// after strict unrolling creates repeated callable IDs.
     pub instance_dependencies: Vec<usize>,
-
-    /// Additional UOp IDs registered as aliases in buffer index.
-    /// These are IDs where the same buffer was registered under a different key
-    /// for lookup convenience. They need to be cleaned up along with buffer_uop_ids.
-    pub alias_registered_ids: Vec<u64>,
 }
 
 /// Full execution schedule (list of callables in dependency order).
@@ -789,8 +784,6 @@ struct CallableBuffers {
     buffers: Vec<Buffer>,
     /// UOp IDs for each buffer.
     uop_ids: Vec<u64>,
-    /// Additional alias IDs for cleanup.
-    alias_ids: Vec<u64>,
 }
 
 /// Sort callables by dependencies (producers before consumers).
@@ -1100,7 +1093,6 @@ pub fn instantiate_schedule(
                 loop_var_names,
                 dependencies: dependencies.clone(),
                 instance_dependencies: instance_dependencies.clone(),
-                alias_registered_ids: kb.alias_ids.clone(),
             });
         }
         if expanded {
@@ -1207,22 +1199,15 @@ fn collect_callable_buffers(
 
     let mut buffers = Vec::new();
     let mut uop_ids = Vec::new();
-    let mut alias_ids = Vec::new();
 
     for src in sources {
         let canonical_src = canonicalize_callable_source(src);
-        if canonical_src.id != src.id {
-            alias_ids.push(src.id);
-        }
 
         match canonical_src.op() {
             Op::After { passthrough, .. } => {
                 // Shared buffer from producer kernel.
                 // Use buf_uop() to get underlying buffer ID (handles AFTER chains).
                 let buf_id = passthrough.buf_uop().id;
-                if buf_id != canonical_src.id {
-                    alias_ids.push(canonical_src.id);
-                }
 
                 // Look up from allocated_buffers or input_buffers
                 let existing = allocated_buffers.get(&buf_id).cloned().or_else(|| input_buffers.get(&buf_id).cloned());
@@ -1255,9 +1240,6 @@ fn collect_callable_buffers(
                     }
                     .fail();
                 };
-                if canonical_id != canonical_src.id {
-                    alias_ids.push(canonical_src.id);
-                }
 
                 let existing =
                     allocated_buffers.get(&canonical_id).cloned().or_else(|| input_buffers.get(&canonical_id).cloned());
@@ -1291,9 +1273,6 @@ fn collect_callable_buffers(
                     _ => unreachable!(),
                 };
                 let canonical_id = canonical_src.buf_uop().id;
-                if canonical_id != canonical_src.id {
-                    alias_ids.push(canonical_src.id);
-                }
 
                 // BUFFER/PARAM can be either input (from input_buffers) or output (needs allocation)
                 // Try input_buffers first, then allocated_buffers, then allocate new
@@ -1341,9 +1320,7 @@ fn collect_callable_buffers(
         }
     }
 
-    alias_ids.sort_unstable();
-    alias_ids.dedup();
-    Ok(CallableBuffers { buffers, uop_ids, alias_ids })
+    Ok(CallableBuffers { buffers, uop_ids })
 }
 
 #[derive(Clone)]

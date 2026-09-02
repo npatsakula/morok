@@ -30,8 +30,21 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         }
         Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => render_define_reg(uop, ctx, kernel),
         Op::Wmma { a, b, c, metadata } => wmma::render_wmma_amd(uop, a, b, c, metadata, arch, ctx, kernel),
-        Op::Unary(op @ (UnaryOp::Sqrt | UnaryOp::Log2 | UnaryOp::Exp2 | UnaryOp::Sin), src) => {
+        Op::Unary(op @ (UnaryOp::Sqrt | UnaryOp::Log2 | UnaryOp::Exp2), src) => {
             render_float_unary(uop, src, *op, ctx, kernel)
+        }
+        // Sin must never reach the AMD renderer: the device excludes it from
+        // `supported_ops` so the scheduler always decomposes it (`xsin`) —
+        // `@llvm.sin.f32` lowers to `v_sin_f32` behind an f32 `1/(2π)`
+        // pre-scale that is wrong for large arguments, and `@llvm.sin.f64`
+        // is unselectable. Backstop here so a capability-list drift fails
+        // loudly at render time instead of silently emitting either form.
+        Op::Unary(UnaryOp::Sin, _) => {
+            ctx.set_invalid_graph(
+                "AMD renderer received an un-decomposed Sin; it must be excluded from supported_ops and lowered by \
+                 the scheduler's transcendental decomposition",
+            );
+            Some(())
         }
         Op::Cast { src, .. } if is_fp8_cast(uop, src) => render_fp8_cast(uop, src, ctx, kernel),
         // ── Everything else: shared CPU path (ALU, INDEX, LOAD, STORE, …) ─
@@ -39,17 +52,20 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
     }
 }
 
-/// Lower `sqrt`/`log2`/`exp2`/`sin` to the LLVM intrinsic the AMDGPU backend
+/// Lower `sqrt`/`log2`/`exp2` to the LLVM intrinsic the AMDGPU backend
 /// selects itself, so the object needs no ROCm device library.
 ///
-/// Tinygrad renders these as `@llvm.{sqrt,log2,exp2}.<ty>`
-/// (`renderer/llvmir.py:226,236`) and drives amdgcn straight through LLVM with
-/// no device libs (`runtime/support/compiler_llvm.py:19-24`). The AMDGPU
-/// backend has no f64 lowering for `log2`/`exp2`/`sin` — it reports
-/// "no libcall available" / "cannot select f64 fsin", which is why tinygrad
-/// substitutes its `xlog2`/`xexp2` expansions there — so exactly those three
-/// keep the ROCm `__ocml_*` entry points. Their presence is what
-/// `amd_object_flags` keys `-nogpulib` off.
+/// Tinygrad renders exactly these as `@llvm.{sqrt,log2,exp2}.<ty>`
+/// (`renderer/llvmir.py` `llvm_intrinsics`) and drives amdgcn straight through
+/// LLVM with no device libs (`runtime/support/compiler_llvm.py:19-24`). `Sin`
+/// is deliberately NOT in this set: `@llvm.sin.f32` lowers to the hardware
+/// `v_sin_f32` behind an f32 `1/(2π)` pre-scale that is only accurate for
+/// small arguments, so `Sin` is excluded from the device's `supported_ops`
+/// and always decomposes (`xsin`, Payne-Hanek) in the scheduler. The AMDGPU
+/// backend also has no f64 lowering for `log2`/`exp2` — it reports "no
+/// libcall available", which is why tinygrad substitutes its `xlog2`/`xexp2`
+/// expansions there — so those keep the ROCm `__ocml_*` entry points. Their
+/// presence is what `amd_object_flags` keys `-nogpulib` off.
 fn render_float_unary(
     uop: &Arc<UOp>,
     src: &Arc<UOp>,
@@ -67,7 +83,6 @@ fn render_float_unary(
         UnaryOp::Sqrt => "sqrt",
         UnaryOp::Log2 => "log2",
         UnaryOp::Exp2 => "exp2",
-        UnaryOp::Sin => "sin",
         _ => unreachable!(),
     };
     let callee =

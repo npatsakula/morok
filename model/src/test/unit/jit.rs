@@ -192,3 +192,76 @@ fn copy_tensor_to_buffer(tensor: &Tensor, dst: &mut svod_device::Buffer) {
     src_buf.copyout(&mut data).unwrap();
     dst.copyin(&data).unwrap();
 }
+
+#[test]
+fn test_jit_replicate_executes_independently() {
+    let read = |buffer: &svod_device::Buffer| {
+        let mut result = vec![0.0f32; 3];
+        buffer.copyout(unsafe { std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, 12) }).unwrap();
+        result
+    };
+
+    let mut jit = AddJit::new(AddModel);
+    jit.prepare(InputSpec::f32(&[3]), InputSpec::f32(&[3])).unwrap();
+    copy_tensor_to_buffer(&Tensor::from_slice([1.0f32, 2.0, 3.0]), jit.x_mut().unwrap());
+    copy_tensor_to_buffer(&Tensor::from_slice([10.0f32, 20.0, 30.0]), jit.y_mut().unwrap());
+    jit.execute().unwrap();
+
+    // The replica snapshots the original's inputs, then diverges.
+    let mut replica = jit.replicate().unwrap();
+    copy_tensor_to_buffer(&Tensor::from_slice([100.0f32, 200.0, 300.0]), replica.x_mut().unwrap());
+    copy_tensor_to_buffer(&Tensor::from_slice([1.0f32, 1.0, 1.0]), replica.y_mut().unwrap());
+    replica.execute().unwrap();
+    assert_eq!(read(replica.output().unwrap()), vec![101.0, 201.0, 301.0]);
+
+    // The original's inputs and output are untouched by the replica.
+    jit.execute().unwrap();
+    assert_eq!(read(jit.output().unwrap()), vec![11.0, 22.0, 33.0]);
+
+    // Replicas mint further replicas, snapshotting the replica's state.
+    let mut second = replica.replicate().unwrap();
+    second.execute().unwrap();
+    assert_eq!(read(second.output().unwrap()), vec![101.0, 201.0, 301.0]);
+}
+
+/// Phase-2 acceptance: multiple models preparing AND executing concurrently
+/// from several threads must not cross-talk (per-tensor input identities,
+/// winner-computes caches, per-plan queues).
+#[test]
+fn test_concurrent_multi_model_prepare_and_execute() {
+    let read3 = |buffer: &svod_device::Buffer| {
+        let mut result = vec![0.0f32; 3];
+        buffer.copyout(unsafe { std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, 12) }).unwrap();
+        result
+    };
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for worker in 0..4u32 {
+            let barrier = &barrier;
+            let read3 = &read3;
+            scope.spawn(move || {
+                for round in 0..8u32 {
+                    barrier.wait();
+                    let x = [(worker * 100 + round) as f32; 3];
+                    let y = [(worker + round * 10) as f32 + 0.5; 3];
+                    if worker % 2 == 0 {
+                        let mut jit = AddJit::new(AddModel);
+                        jit.prepare(InputSpec::f32(&[3]), InputSpec::f32(&[3])).unwrap();
+                        copy_tensor_to_buffer(&Tensor::from_slice(x), jit.x_mut().unwrap());
+                        copy_tensor_to_buffer(&Tensor::from_slice(y), jit.y_mut().unwrap());
+                        jit.execute().unwrap();
+                        assert_eq!(read3(jit.output().unwrap()), vec![x[0] + y[0]; 3]);
+                    } else {
+                        let mut jit = SplitJit::new(SplitModel);
+                        jit.prepare(InputSpec::f32(&[3]), InputSpec::f32(&[3])).unwrap();
+                        copy_tensor_to_buffer(&Tensor::from_slice(x), jit.x_mut().unwrap());
+                        copy_tensor_to_buffer(&Tensor::from_slice(y), jit.y_mut().unwrap());
+                        jit.execute().unwrap();
+                        assert_eq!(read3(jit.sum().unwrap()), vec![x[0] + y[0]; 3]);
+                        assert_eq!(read3(jit.diff().unwrap()), vec![x[0] - y[0]; 3]);
+                    }
+                }
+            });
+        }
+    });
+}

@@ -115,8 +115,8 @@ pub(crate) struct ScratchState {
 /// The private-segment (scratch) fields the AQL packet processor reads from the
 /// `amd_queue_t` GART descriptor. On the PM4 dispatch path the same information
 /// is pushed via `COMPUTE_TMPRING_SIZE` / `COMPUTE_DISPATCH_SCRATCH_BASE` and
-/// the user-SGPR descriptor instead, so this is only consumed on multi-XCC
-/// CDNA (the lone AQL arch).
+/// the user-SGPR descriptor instead; every AQL queue — multi-XCC CDNA and any
+/// forced-AQL gfx11+ queue — consumes it from the descriptor.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct AqlScratchDesc {
     /// `amd_queue_t.scratch_backing_memory_location` — scratch buffer VA.
@@ -135,6 +135,13 @@ pub(crate) struct AqlScratchDesc {
 /// ADD_TID_ENABLE=1, TYPE=SQ_RSRC_BUF(0).
 const SCRATCH_RSRC_WORD3_GFX9: u32 = 0x00EA_4FAC;
 
+/// gfx11 SQ_BUF_RSRC WORD3 for a scratch buffer (ROCr
+/// `FillBufRsrcWord3_Gfx11`): DST_SEL=XYZW (4,5,6,7), FORMAT=32_UINT (0x14),
+/// INDEX_STRIDE=0 (filled in by the CP), ADD_TID_ENABLE=1, OOB_SELECT=2 (no
+/// bounds check in swizzle mode), TYPE=SQ_RSRC_BUF(0). The gfx12 layout only
+/// adds compression bits that stay zero, so the same value serves both.
+const SCRATCH_RSRC_WORD3_GFX11: u32 = 0x2081_4FAC;
+
 impl AqlScratchDesc {
     /// Build the gfx9 scratch descriptor. `size_per_xcc` goes in NUM_RECORDS
     /// (WORD2) — the per-XCC slice of the shared backing buffer — and the
@@ -152,6 +159,26 @@ impl AqlScratchDesc {
             wave64_lane_byte_size: private_segment_size,
         }
     }
+
+    /// Build the gfx11/gfx12 scratch descriptor (ROCr `InitScratchSRD` case
+    /// 11): SWIZZLE_ENABLE moves to WORD1 bits [31:30] (value 1), NUM_RECORDS
+    /// carries the full backing size (one XCC on RDNA), and
+    /// `scratch_wave64_lane_byte_size` records the rounded per-thread stride.
+    /// Consumed by any gfx11+ AQL queue (`SVOD_AMD_AQL=1`), never by the PM4
+    /// path, which programs scratch via per-dispatch `SET_SH_REG`.
+    pub(crate) fn gfx11(scratch_va: u64, size: usize, tmpring_size: u32, size_per_thread: u32) -> Self {
+        Self {
+            backing_va: scratch_va,
+            tmpring_size,
+            resource_descriptor: [
+                scratch_va as u32,
+                ((scratch_va >> 32) as u32 & 0xFFFF) | 0x4000_0000,
+                size as u32,
+                SCRATCH_RSRC_WORD3_GFX11,
+            ],
+            wave64_lane_byte_size: size_per_thread,
+        }
+    }
 }
 
 /// Immutable per-physical-AMD:N identity: KFD/DRM fds, topology, event-page
@@ -165,7 +192,10 @@ impl AqlScratchDesc {
 /// teardown, event waits) route through `iface`. KFD-specific state (the kfd/
 /// drm fds, ABI version, event ids, event page) lives on the [`KfdIface`]
 /// implementor, not the core. `node` + `arch` stay here as the device identity.
-#[derive(Debug)]
+/// In-flight completion tokens for one storage (usually 0-2 concurrent
+/// plans touch a given storage).
+type StorageTokens = smallvec::SmallVec<[Arc<dyn crate::sync::CompletionToken>; 2]>;
+
 pub struct AmdDeviceCore {
     pub node: AmdNode,
     pub arch: AmdArch,
@@ -197,6 +227,16 @@ pub struct AmdDeviceCore {
     /// (`PoolQueue::drain_all`) reads only timeline signal slots and does not
     /// take publication locks.
     pub(crate) connectors: parking_lot::Mutex<Vec<Weak<crate::amd::connector::PoolQueue>>>,
+    /// Scoped-sync producer table: storage base VA → completion tokens of the
+    /// submissions that may still touch it (readers AND writers — a host
+    /// overwrite is a WAR hazard against in-flight readers too). Retired
+    /// tokens are pruned on insert and wait. A VA absent from the table falls
+    /// back to `synchronize_all` (unknown producer → conservative drain).
+    producers: parking_lot::Mutex<std::collections::HashMap<u64, StorageTokens>>,
+    /// Submissions with no durable owner (`Program::execute` fire-and-forget
+    /// fallback, e.g. BEAM timing) — waited by every scoped wait as a safety
+    /// net; normally empty.
+    unattributed: parking_lot::Mutex<Vec<Arc<dyn crate::sync::CompletionToken>>>,
     /// The device's single 16 MiB kernarg arena, shared by every lane (tinygrad
     /// has one `kernargs_buf` per device). `Weak` so the arena still dies with
     /// the last `PoolQueue` holding it — the core outlives every queue.
@@ -279,6 +319,8 @@ impl AmdDevice {
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
             connectors: parking_lot::Mutex::new(Vec::new()),
+            producers: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            unattributed: parking_lot::Mutex::new(Vec::new()),
             kernarg_arena: parking_lot::Mutex::new(Weak::new()),
             signal_pool: OnceLock::new(),
             copy_queue: OnceLock::new(),
@@ -344,12 +386,24 @@ impl AmdDevice {
 
         debug!(node = node.node_id, gpu_id = node.gpu_id, arch = arch.mcpu(), backend = %backend, "AmdDevice opened");
 
-        // Bounded exclusive-lane pool: at most `SVOD_AMD_HW_QUEUES` distinct KFD
-        // compute queues (default 4, min 1).
+        // Bounded exclusive-lane pool: at most `SVOD_AMD_HW_QUEUES` distinct
+        // KFD compute queues. The default is scheduler-aware, mirroring where
+        // the ROCm stack itself ships multi-queue:
+        //   - multi-XCC CDNA (MI300-class): 4 — queues are HWS/MEC-runlist
+        //     scheduled and concurrent AQL queues are the validated production
+        //     configuration (HIP's own GPU_MAX_HW_QUEUES default is 4);
+        //   - single-XCC gfx11+ (MES-scheduled, RDNA3/3.5/4): 1 — feeding
+        //     several PM4 user queues concurrently parks CP micro-engines in
+        //     `WAIT_REG_MEM` spins that MES cannot preempt and wedges the
+        //     firmware into an unrecoverable reset (reproduced on gfx1151;
+        //     see the crate-level AMD notes), and gfx11 MEC firmware implements no
+        //     scheduler-visible timeline-wait packet to lower waits onto
+        //     (the AMD barrier-value vendor packet is an illegal opcode
+        //     there). The env override remains for validation experiments.
         let hw_queues = std::env::var("SVOD_AMD_HW_QUEUES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(4)
+            .unwrap_or(if node.num_xcc.max(1) > 1 { 4 } else { 1 })
             .clamp(1, u64::BITS as usize);
 
         let core = Arc::new(AmdDeviceCore {
@@ -362,6 +416,8 @@ impl AmdDevice {
             error_msg: OnceLock::new(),
             copy_queue: OnceLock::new(),
             connectors: parking_lot::Mutex::new(Vec::new()),
+            producers: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            unattributed: parking_lot::Mutex::new(Vec::new()),
             kernarg_arena: parking_lot::Mutex::new(Weak::new()),
             signal_pool: OnceLock::new(),
             queue_pool: crate::amd::connector::QueuePool::new(hw_queues),
@@ -383,6 +439,12 @@ impl AmdDevice {
     /// kernel's buffer.
     pub fn synchronize(&self) -> Result<()> {
         self.core.synchronize_all()
+    }
+}
+
+impl std::fmt::Debug for AmdDeviceCore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AmdDeviceCore").field("node", &self.node).field("arch", &self.arch).finish_non_exhaustive()
     }
 }
 
@@ -422,6 +484,77 @@ impl AmdDeviceCore {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Kill switch for storage-scoped host synchronization
+    /// (`SVOD_AMD_SCOPED_SYNC=0` → every wait falls back to
+    /// `synchronize_all`), for bisecting scoped-sync regressions.
+    fn scoped_sync_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("SVOD_AMD_SCOPED_SYNC").as_deref() != Ok("0"))
+    }
+
+    /// Pre-register a storage VA in the producer table so "known storage,
+    /// nothing in flight" is distinguishable from "unknown VA" (conservative
+    /// full drain).
+    pub(crate) fn register_storage(&self, base: u64) {
+        if Self::scoped_sync_enabled() {
+            self.producers.lock().entry(base).or_default();
+        }
+    }
+
+    pub(crate) fn unregister_storage(&self, base: u64) {
+        self.producers.lock().remove(&base);
+    }
+
+    /// Record `token` as an in-flight producer/reader of the storage at `base`.
+    pub(crate) fn record_producer(&self, base: u64, token: &Arc<dyn crate::sync::CompletionToken>) {
+        if !Self::scoped_sync_enabled() {
+            return;
+        }
+        let mut producers = self.producers.lock();
+        let tokens = producers.entry(base).or_default();
+        tokens.retain(|t| !t.retired());
+        tokens.push(Arc::clone(token));
+    }
+
+    /// Park an ownerless submission's token: waited by every scoped wait.
+    pub(crate) fn record_unattributed(&self, token: Arc<dyn crate::sync::CompletionToken>) {
+        let mut list = self.unattributed.lock();
+        list.retain(|t| !t.retired());
+        list.push(token);
+    }
+
+    /// Wait for every submission that may still touch the storage at `base`
+    /// — the scoped replacement for `synchronize_all` on host-visible buffer
+    /// operations. Unknown storages (and `SVOD_AMD_SCOPED_SYNC=0`) fall back
+    /// to the full drain.
+    pub(crate) fn wait_storage(&self, base: u64) -> Result<()> {
+        if !Self::scoped_sync_enabled() {
+            return self.synchronize_all();
+        }
+        if let Some(err) = self.poison_error() {
+            return Err(err);
+        }
+        let tokens = {
+            let mut producers = self.producers.lock();
+            match producers.get_mut(&base) {
+                Some(tokens) => {
+                    tokens.retain(|t| !t.retired());
+                    tokens.clone()
+                }
+                None => return self.synchronize_all(),
+            }
+        };
+        let unattributed: Vec<_> = {
+            let mut list = self.unattributed.lock();
+            list.retain(|t| !t.retired());
+            list.clone()
+        };
+        for token in tokens.iter().chain(unattributed.iter()) {
+            token.wait(30_000).inspect_err(|e| self.poison(&e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Borrow the backend seam — all KFD ioctls (alloc/free/ring/wait) route
@@ -814,12 +947,19 @@ pub(crate) fn alloc_scratch(
     let waves = (num_waves.min(max_scratch_waves) / se_cnt).max(1) * se_cnt;
     let tmpring_size = pack_tmpring(waves, wave_scratch, arch);
 
-    // The AQL descriptor is only consumed on multi-XCC CDNA; non-CDNA arches
-    // dispatch via PM4 and never read it, so leave it zero there.
-    let aql_desc = if arch.is_cdna() {
-        AqlScratchDesc::gfx9(va, size_per_xcc, tmpring_size, private_segment_size)
-    } else {
-        AqlScratchDesc::default()
+    // Every AQL queue reads the descriptor out of `amd_queue_t` — multi-XCC
+    // CDNA always, gfx11+ under `SVOD_AMD_AQL=1`. PM4 queues program scratch
+    // via per-dispatch `SET_SH_REG` instead and ignore it, but synthesizing
+    // it unconditionally is harmless and closes the forced-AQL gap where
+    // gfx11 kernels needing scratch read an all-zero SRD. Explicit per
+    // generation (ROCr `InitScratchSRD` switches the same way): a future arch
+    // must pick its own V# layout here, not inherit one from an else-bucket.
+    let aql_desc = match arch.gfx_major() {
+        9 => AqlScratchDesc::gfx9(va, size_per_xcc, tmpring_size, private_segment_size),
+        // gfx12's V# differs from gfx11 only in compression bits that stay
+        // zero; the TMPRING packing difference lives in `pack_tmpring`.
+        11 | 12 => AqlScratchDesc::gfx11(va, size_per_xcc, tmpring_size, size_per_thread),
+        major => unreachable!("no AQL scratch V# layout for gfx{major}"),
     };
 
     Ok((va, total, tmpring_size, size_per_thread, handle, aql_desc))

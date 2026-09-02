@@ -261,6 +261,9 @@ pub fn cached_patterns(input: TokenStream) -> TokenStream {
 /// - `input1_mut()` / `input2_mut()` — typed mutable buffer accessors
 /// - `output()` — output buffer accessor
 /// - `execute()` / `execute_with_vars()` — replay with zero allocation
+/// - `replicate()` — deep copy of the prepared JIT (`Result<Self>`): forked
+///   input/intermediate/output buffers, shared model/weights and compiled
+///   kernels, independent backend queue for concurrent execution
 #[proc_macro]
 pub fn jit_wrapper(input: TokenStream) -> TokenStream {
     let jit = parse_macro_input!(input as jit::JitWrapper);

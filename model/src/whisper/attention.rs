@@ -15,7 +15,7 @@ use svod_tensor::Tensor;
 use crate::state::{self, HasStateDict, StateDict, prefixed};
 
 use super::blocks::LinearWeights;
-use super::error::{Result, TensorSnafu};
+use super::error::{Result, TensorSnafu, tk_launch_error};
 
 const MIN_PADDED_FA_SEQUENCE: usize = 1024;
 const MAX_PADDED_FA_OVERHEAD_DIVISOR: usize = 16;
@@ -180,7 +180,7 @@ impl MultiHeadAttention {
 
         let direct = if (d / self.n_head).is_multiple_of(16) {
             svod_tk::flash_attention_with(&q_f, &k_f, &v_f, svod_tk::FaOpts { causal, key_lens })
-                .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
+                .map_err(tk_launch_error)
                 .context(TensorSnafu)?
         } else {
             None

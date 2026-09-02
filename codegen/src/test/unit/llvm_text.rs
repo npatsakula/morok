@@ -623,3 +623,33 @@ fn custom_void_hoists_and_deduplicates_declares_into_the_module_prefix() {
     );
     assert!(result.code.contains("call void @llvm.amdgcn.s.barrier()"), "missing call body line:\n{}", result.code);
 }
+
+/// Sin must never reach the AMD renderer: the device excludes it from
+/// `supported_ops` so the scheduler always decomposes it (`@llvm.sin.f32`
+/// lowers to `v_sin_f32` behind an f32 `1/(2π)` pre-scale that is wrong for
+/// large arguments). This simulates exactly the drift the backstop guards —
+/// an optimizer built with `RendererOps::all()`, so Sin survives to rendering
+/// — and asserts the render fails loudly instead of emitting `@llvm.sin`.
+#[test]
+fn amd_rejects_undecomposed_sin() {
+    let input = UOp::param(0, 1, DType::Float32, None);
+    let output = UOp::param(1, 1, DType::Float32, None);
+    let idx = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let input_idx = UOp::index().buffer(input).indices(vec![idx.clone()]).call().unwrap();
+    let output_idx = UOp::index().buffer(output).indices(vec![idx]).call().unwrap();
+    let value = UOp::load().index(input_idx).call();
+    let sink = UOp::sink(vec![output_idx.store(value.try_sin().unwrap())]);
+
+    let arch = AmdArch::Gfx1151;
+    let code_renderer = LlvmTextRenderer::amd(arch);
+    let optimizer_renderer = svod_schedule::OptimizerRenderer::for_amd_arch(arch).with_rewrite_capabilities(
+        svod_ir::RendererOps::all(),
+        code_renderer.decompositor(),
+        Some(crate::llvm::amd_extra_matcher()),
+    );
+    let lowered =
+        svod_schedule::apply_post_optimization_with_renderer(sink, &optimizer_renderer).expect("post optimization");
+    let linear = svod_ir::UOp::linear(svod_schedule::linearize_with_cfg(lowered).into());
+    let err = code_renderer.render(&linear, Some("amd_sin")).expect_err("un-decomposed Sin must fail the render");
+    assert!(err.to_string().contains("un-decomposed Sin"), "{err}");
+}

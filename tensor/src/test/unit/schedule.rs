@@ -91,7 +91,6 @@ fn test_schedule_item_creation() {
         loop_var_names: HashSet::new(),
         dependencies: vec![],
         instance_dependencies: vec![],
-        alias_registered_ids: vec![],
     };
 
     assert!(matches!(item.kernel.op(), Op::Call { .. }));
@@ -115,7 +114,6 @@ fn test_create_schedule_after_uses_canonical_buffer_id() {
     assert_eq!(item.buffer_uop_ids, vec![buffer_uop.id]);
     assert_eq!(item.buffers.len(), 1);
     assert_eq!(item.buffers[0].id(), input.id());
-    assert!(item.alias_registered_ids.contains(&after.id));
 }
 
 #[test]
@@ -137,7 +135,6 @@ fn test_create_schedule_mselect_uses_canonical_buffer_id() {
     assert_eq!(item.buffer_uop_ids, vec![buffer_uop.id]);
     assert_eq!(item.buffers.len(), 1);
     assert_eq!(item.buffers[0].id(), input.id());
-    assert!(item.alias_registered_ids.contains(&mselect.id));
 }
 
 fn lane_buffers(count: usize) -> Vec<Arc<UOp>> {

@@ -28,13 +28,22 @@ pub enum Error {
 type Result<T> = std::result::Result<T, Error>;
 
 pub fn load_safetensors(path: &Path) -> Result<StateDict> {
+    // Canonical path = the provenance key: loading the same checkpoint into
+    // N model instances shares each weight's immutable device storage
+    // instead of duplicating VRAM and upload bandwidth per instance.
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let data = std::fs::read(path).context(IoSnafu)?;
     let tensors = safetensors::SafeTensors::deserialize(&data).context(SafetensorsSnafu)?;
     let mut sd = StateDict::new();
     for (name, view) in tensors.tensors() {
-        let dtype = convert_dtype(view.dtype())?;
-        let shape: Vec<usize> = view.shape().to_vec();
-        let tensor = Tensor::from_raw_bytes(view.data(), &shape, dtype).context(TensorSnafu)?;
+        let key = svod_tensor::weight_cache::WeightKey {
+            path: canonical.clone(),
+            name: name.to_string(),
+            dtype: convert_dtype(view.dtype())?,
+            shape: view.shape().to_vec(),
+            device: svod_dtype::default_device::default_device(),
+        };
+        let tensor = Tensor::from_shared_weight(key, view.data()).context(TensorSnafu)?;
         sd.insert(name.to_string(), tensor);
     }
     Ok(sd)

@@ -11,7 +11,7 @@ use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 use super::attention::{MultiHeadAttention, causal_mask};
 use super::blocks::{LayerNormWeights, linear_with_bias};
 use super::config::ModelDimensions;
-use super::error::{Result, TensorSnafu};
+use super::error::{Result, TensorSnafu, tk_launch_error};
 
 #[derive(Clone, Copy)]
 struct StepAttentionConfig {
@@ -604,7 +604,7 @@ impl TextDecoder {
                     &full_v,
                     svod_tk::SqAttentionOpts { key_lens: Some(self_key_lens), include_last: true, split: 1 },
                 )
-                .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
+                .map_err(tk_launch_error)
                 .context(TensorSnafu)?
             } else {
                 None
@@ -655,7 +655,7 @@ impl TextDecoder {
                     lh_start,
                     svod_tk::SqAttentionOpts { split: cross_splits, ..Default::default() },
                 )
-                .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
+                .map_err(tk_launch_error)
                 .context(TensorSnafu)?
             } else {
                 None

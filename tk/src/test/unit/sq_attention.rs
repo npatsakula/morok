@@ -279,3 +279,19 @@ fn sq_attention_numerical_amd() {
     let max_abs = got.iter().zip(&expected).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
     assert!(max_abs < 2e-4, "production split 10 max abs error {max_abs}");
 }
+
+/// A head dim the arch's wave size does not divide is a fit failure, not a
+/// caller bug: the launch declines with `Ok(None)` so a dispatch layer (the
+/// whisper decoder) falls back to its generic attention path. Host-portable:
+/// off-AMD the arch resolution declines the same way, so the assertion holds
+/// on every runner, and on real AMD hardware it exercises the `applies`
+/// arm (no supported arch has a wave size dividing 4).
+#[test]
+fn undivisible_head_dim_declines_instead_of_erroring() {
+    let (b, n, h, d) = (1usize, 3usize, 2usize, 4usize);
+    let q = Tensor::zeros(&[b, 1, h, d], DType::Float32).expect("q");
+    let k = Tensor::zeros(&[b, n, h, d], DType::Float32).expect("k");
+    let v = Tensor::zeros(&[b, n, h, d], DType::Float32).expect("v");
+    let out = crate::single_query_attention(&q, &k, &v, SqAttentionOpts::default()).expect("declines, not errors");
+    assert!(out.is_none(), "head dim 4 divides no supported wave size (32/64); the launch must fall back");
+}

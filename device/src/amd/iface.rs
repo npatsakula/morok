@@ -82,6 +82,17 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     fn publication_checkpoint(&self, _stage: PublicationStage) -> Result<()> {
         Ok(())
     }
+
+    /// `AMDKFD_IOC_UPDATE_QUEUE` with the given `queue_percentage`: `0` unmaps
+    /// the queue from the hardware scheduler, `> 0` remaps it — and a remap is
+    /// the only event that makes CP firmware re-read the queue's `amd_queue_t`
+    /// descriptor (scratch SRD/TMPRING), which it caches at queue-connect
+    /// (ROCr `AqlQueue::Suspend/Resume`). KFD re-validates the ring on every
+    /// call, so the ring VA and size must be passed again. Backends without a
+    /// KFD queue scheduler (host mocks) accept the default no-op.
+    fn update_queue_percentage(&self, _queue_id: u32, _ring_gpu: u64, _ring_size: u32, _percentage: u32) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Address of a KFD event's mailbox slot plus the id written into it.
@@ -283,6 +294,16 @@ impl KfdIface {
             hw_fault_event_id = hw_event.event_id,
             "KfdIface opened"
         );
+        // ROCr's libhsakmt warns identically (`topology.c`): gfx1151 on a KFD
+        // ABI below 1.20 "may result in faults, crashes and other application
+        // instability". Surface it once here — MES wedges on this part are
+        // expensive to debug without this hint.
+        if node.gfx_target_version == 110501 && kfd_version < (1, 20) {
+            tracing::warn!(
+                kfd_version = ?kfd_version,
+                "gfx1151 recommends KFD ABI 1.20+; older ABIs are known to fault and destabilize applications"
+            );
+        }
 
         Ok(Self {
             kfd_fd,
@@ -516,6 +537,20 @@ impl AmdIface for KfdIface {
         };
         debug!(queue_id = args.queue_id, doorbell_offset = args.doorbell_offset, "AMD queue created");
         Ok(QueueHandle { queue_id: args.queue_id, doorbell_base, doorbell })
+    }
+
+    fn update_queue_percentage(&self, queue_id: u32, ring_gpu: u64, ring_size: u32, percentage: u32) -> Result<()> {
+        let mut args = kfd::kfd_ioctl_update_queue_args {
+            ring_base_address: ring_gpu,
+            queue_id,
+            ring_size,
+            queue_percentage: percentage,
+            queue_priority: 7,
+        };
+        // SAFETY: kfd_fd is alive; queue_id came from the matching create.
+        unsafe { ioctl::kfd_update_queue(self.kfd_fd.as_raw_fd(), &mut args as *mut _) }
+            .map_err(|errno| Error::AmdIoctl { ioctl: "AMDKFD_IOC_UPDATE_QUEUE", errno: errno as i32 })?;
+        Ok(())
     }
 
     fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) -> Result<QueueTeardown> {

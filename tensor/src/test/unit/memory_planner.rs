@@ -24,7 +24,6 @@ fn make_sink_item(id: u64, buffer: Buffer) -> ScheduleItem {
         fixedvars: HashMap::new(),
         dependencies: Vec::new(),
         instance_dependencies: Vec::new(),
-        alias_registered_ids: Vec::new(),
         loop_var_names: HashSet::new(),
     }
 }
@@ -39,7 +38,6 @@ fn make_nonsink_item(id: u64, buffer: Buffer) -> ScheduleItem {
         fixedvars: HashMap::new(),
         dependencies: Vec::new(),
         instance_dependencies: Vec::new(),
-        alias_registered_ids: Vec::new(),
         loop_var_names: HashSet::new(),
     }
 }
@@ -59,7 +57,6 @@ fn make_store_item(buffer_uop: &Arc<UOp>, buffer: Buffer, index: Arc<UOp>, gate:
         fixedvars: HashMap::new(),
         dependencies: Vec::new(),
         instance_dependencies: Vec::new(),
-        alias_registered_ids: Vec::new(),
         loop_var_names: HashSet::new(),
     }
 }

@@ -68,6 +68,22 @@ impl Drop for DefaultDeviceGuard {
     }
 }
 
+/// Spawn a thread that inherits the CALLER's effective default device.
+///
+/// `default_device()` is thread-local: a bare `std::thread::spawn` silently
+/// falls back to the process default (env var / CPU) even when the spawning
+/// thread has an override, so tensors built on the worker land on the wrong
+/// device. This captures the caller's effective default and installs it as a
+/// scoped override on the new thread.
+pub fn spawn_with_default_device<F, T>(f: F) -> std::thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let device = default_device();
+    std::thread::spawn(move || with_default_device(device, f))
+}
+
 /// Minimal `DeviceSpec` parser for the `SVOD_DEVICE` env var. We intentionally
 /// do NOT pull `svod_device::DeviceSpecExt` here — that crate depends on
 /// `svod-dtype`, not the other way around. Supports:

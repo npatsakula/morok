@@ -9,8 +9,8 @@ use svod_dtype::ext::HasDType;
 
 use crate::allocator::{Allocator, BufferSpec, RawBuffer};
 use crate::error::{
-    InvalidViewSnafu, NdarrayShapeSnafu, NotCpuAccessibleSnafu, Result, SizeMismatchSnafu, TypeMismatchSnafu,
-    UnsupportedSnafu,
+    ImmutableBufferSnafu, InvalidViewSnafu, NdarrayShapeSnafu, NotCpuAccessibleSnafu, Result, SizeMismatchSnafu,
+    TypeMismatchSnafu, UnsupportedSnafu,
 };
 
 /// Global counter for unique buffer IDs.
@@ -54,6 +54,10 @@ struct BufferData {
     /// side argument rather than a `BufferSpec` field so it does not split the
     /// cache (see [`BufferSpec`]).
     zero_init: bool,
+    /// One-way immutability seal for shared weight storages: host writes
+    /// through any handle or view are refused once set (see
+    /// [`Buffer::mark_immutable`]).
+    immutable: std::sync::atomic::AtomicBool,
 }
 
 impl BufferData {
@@ -65,6 +69,7 @@ impl BufferData {
             total_size: size,
             options,
             zero_init,
+            immutable: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -263,6 +268,73 @@ impl Buffer {
         })
     }
 
+    /// Fork the single storage shared by `views` into a fresh, unshared
+    /// allocation (same allocator, total size, [`BufferSpec`] and zero-init
+    /// flag) and re-mint every view onto it at its original
+    /// offset/size/dtype/shape, with fresh handle ids. When `copy_contents`
+    /// is set and the source storage is allocated, the entire allocation is
+    /// copied over first (on-device when possible).
+    pub fn fork_views(views: &[&Buffer], copy_contents: bool) -> Result<Vec<Buffer>> {
+        let Some(first) = views.first() else { return Ok(Vec::new()) };
+        let storage = first.storage_id();
+        for view in views {
+            snafu::ensure!(view.storage_id() == storage, UnsupportedSnafu { op: "fork_views across storages" });
+        }
+        let total_size = first.data.total_size;
+        let whole = |data: &Arc<BufferData>| Self {
+            id: BufferId(next_buffer_id()),
+            data: Arc::clone(data),
+            offset: 0,
+            size: total_size,
+            dtype: DType::UInt8,
+            shape: smallvec![total_size],
+        };
+        let fresh = Arc::new(BufferData::new(
+            Arc::clone(&first.data.allocator),
+            total_size,
+            first.data.options,
+            first.data.zero_init,
+        ));
+        if copy_contents && first.data.is_allocated() {
+            whole(&fresh).copy_from(&whole(&first.data))?;
+        }
+        Ok(views
+            .iter()
+            .map(|view| Self {
+                id: BufferId(next_buffer_id()),
+                data: Arc::clone(&fresh),
+                offset: view.offset,
+                size: view.size,
+                dtype: view.dtype.clone(),
+                shape: view.shape.clone(),
+            })
+            .collect())
+    }
+
+    /// Whether the underlying storage was sealed immutable.
+    pub fn is_immutable(&self) -> bool {
+        self.data.immutable.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Seal the underlying storage against host writes (one-way). Used for
+    /// shared weight storages: a write through ANY handle or view would
+    /// corrupt every model reading it, so `copyin*`, `as_*_mut` and
+    /// copy-destination paths fail with `Error::ImmutableBuffer` afterwards.
+    /// Device-side kernel writes are not intercepted here — the planner and
+    /// replicate write-set analyses keep sealed storages out of kernel write
+    /// positions. Forking (`fork_views`) stays legal and yields fresh,
+    /// mutable storage.
+    pub fn mark_immutable(&self) {
+        self.data.immutable.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn ensure_mutable(&self, op: &'static str) -> Result<()> {
+        if self.is_immutable() {
+            return ImmutableBufferSnafu { op, storage: self.data.storage_id.0 }.fail();
+        }
+        Ok(())
+    }
+
     /// Ensure the underlying buffer is allocated.
     pub fn ensure_allocated(&self) -> Result<()> {
         self.data.ensure_allocated()
@@ -313,10 +385,10 @@ impl Buffer {
                 Ok(bytes)
             }
             RawBuffer::Mmap { data, .. } => Ok(&data[self.offset..self.offset + self.size]),
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
-                device.synchronize()?;
+                device.core().wait_storage(*gpu_addr)?;
                 // SAFETY: same invariants as the CPU arm — scheduler ensures
                 // exclusivity, and the BAR-backed VRAM mapping is valid for
                 // the lifetime of the RawBuffer.
@@ -356,6 +428,7 @@ impl Buffer {
     /// - `NotCpuAccessible` for CUDA device buffers
     #[allow(clippy::mut_from_ref)] // interior mutability via UnsafeCell
     pub fn as_host_bytes_mut(&self) -> Result<&mut [u8]> {
+        self.ensure_mutable("as_host_bytes_mut")?;
         self.ensure_allocated()?;
         let raw = self.data.raw();
         match raw {
@@ -368,10 +441,10 @@ impl Buffer {
             }
             // Mmap is read-only — no mutable access
             RawBuffer::Mmap { .. } => NotCpuAccessibleSnafu.fail(),
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
-                device.synchronize()?;
+                device.core().wait_storage(*gpu_addr)?;
                 let base = unsafe { ptr.as_ptr().add(self.offset) };
                 Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
             }
@@ -409,10 +482,10 @@ impl Buffer {
                 let typed = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) };
                 ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
-                device.synchronize()?;
+                device.core().wait_storage(*gpu_addr)?;
                 let bytes_ptr = unsafe { ptr.as_ptr().add(self.offset) } as *const T;
                 let count = self.size / T::DTYPE.bytes();
                 let typed = unsafe { std::slice::from_raw_parts(bytes_ptr, count) };
@@ -447,6 +520,7 @@ impl Buffer {
     /// Same as [`Self::as_array`].
     #[allow(clippy::mut_from_ref)]
     pub fn as_array_mut<T: HasDType>(&self) -> Result<ndarray::ArrayViewMutD<'_, T>> {
+        self.ensure_mutable("as_array_mut")?;
         self.ensure_allocated()?;
         if self.dtype != T::DTYPE {
             return TypeMismatchSnafu { expected: T::DTYPE, actual: self.dtype.clone() }.fail();
@@ -459,10 +533,10 @@ impl Buffer {
                 let typed = unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut T, count) };
                 ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
-                device.synchronize()?;
+                device.core().wait_storage(*gpu_addr)?;
                 // SAFETY: BAR-backed VRAM mapping is valid for the buffer's
                 // lifetime; scheduler ensures no concurrent kernel writes.
                 let bytes_ptr = unsafe { ptr.as_ptr().add(self.offset) } as *mut T;
@@ -487,10 +561,10 @@ impl Buffer {
                 let count = bytes.len() / T::DTYPE.bytes();
                 Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) })
             }
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
-                device.synchronize()?;
+                device.core().wait_storage(*gpu_addr)?;
                 let bytes_ptr = unsafe { ptr.as_ptr().add(self.offset) } as *const T;
                 let count = self.size / T::DTYPE.bytes();
                 Ok(unsafe { std::slice::from_raw_parts(bytes_ptr, count) })
@@ -556,6 +630,7 @@ impl Buffer {
     /// Delegates to the allocator's `_copyin`. The per-backend logic lives on
     /// the allocator, not here.
     pub fn copyin(&mut self, src: &[u8]) -> Result<()> {
+        self.ensure_mutable("copyin")?;
         self.ensure_allocated()?;
 
         let expected = self.size;
@@ -570,6 +645,7 @@ impl Buffer {
     /// device-local buffer (e.g. one lane's KV-cache row) from host memory
     /// via the copy engine, without a host-visible mapping.
     pub fn copyin_at(&mut self, dst_off: usize, src: &[u8]) -> Result<()> {
+        self.ensure_mutable("copyin_at")?;
         self.ensure_allocated()?;
         let end = dst_off
             .checked_add(src.len())
@@ -611,6 +687,7 @@ impl Buffer {
     /// host). The source device is synchronized before the host read so async
     /// dispatch never races a still-running writer.
     pub fn copy_from(&mut self, src: &Buffer) -> Result<()> {
+        self.ensure_mutable("copy_from")?;
         self.ensure_allocated()?;
         src.ensure_allocated()?;
 
@@ -633,6 +710,7 @@ impl Buffer {
     /// `_transfer` path (SDMA when either side is device-local), so recurrent
     /// state rows can be recycled output→input without touching the host.
     pub fn copy_region_from(&mut self, dst_off: usize, src: &Buffer, src_off: usize, len: usize) -> Result<()> {
+        self.ensure_mutable("copy_region_from")?;
         self.ensure_allocated()?;
         src.ensure_allocated()?;
         let dst_end = dst_off
@@ -655,6 +733,7 @@ impl Buffer {
     /// lane compaction shifts a surviving lane to a new row. The regions must
     /// not overlap.
     pub fn copy_within(&mut self, dst_off: usize, src_off: usize, len: usize) -> Result<()> {
+        self.ensure_mutable("copy_within")?;
         self.ensure_allocated()?;
         let dst_end = dst_off
             .checked_add(len)
@@ -677,6 +756,16 @@ impl Buffer {
     /// Synchronize the device (wait for all operations to complete).
     pub fn synchronize(&self) -> Result<()> {
         self.data.allocator.synchronize()
+    }
+
+    /// Record `token` as an in-flight producer/reader of this buffer's
+    /// storage for scoped host synchronization (see the AMD backend's
+    /// `wait_storage`). No-op on non-AMD storage and on storage that was
+    /// never allocated (nothing can be in flight against it).
+    pub fn record_completion(&self, token: &Arc<dyn crate::sync::CompletionToken>) {
+        if let Some(RawBuffer::AmdDevice { gpu_addr, device, .. }) = self.data.raw.get() {
+            device.core().record_producer(*gpu_addr, token);
+        }
     }
 
     /// Get a raw pointer to the buffer data for kernel execution.

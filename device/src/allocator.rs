@@ -674,11 +674,11 @@ impl LruAllocator {
             // recycle ever routed here, a host memset through the read-only mmap
             // is impossible — surface it instead of panicking.
             RawBuffer::Mmap { .. } => UnsupportedSnafu { op: "zero-init read-only DISK mmap" }.fail(),
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), size, device, .. } => {
-                // Drain first: this VA was just recycled from the pool and its
-                // previous owner's async kernel may still be writing it. A host
-                // memset isn't ordered on the GPU timeline, so synchronize.
-                device.synchronize()?;
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), size, gpu_addr, device, .. } => {
+                // This VA was just recycled from the pool: wait its recorded
+                // producers (usually already retired via the pop fence) before
+                // the host memset, which isn't ordered on the GPU timeline.
+                device.core().wait_storage(*gpu_addr)?;
                 unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, *size) };
                 Ok(true)
             }
@@ -729,6 +729,16 @@ impl Allocator for LruAllocator {
         }; // Drop lock before any (re)allocation.
 
         if let Some(buffer) = buffer {
+            // A recycled VA may still be referenced by the previous owner's
+            // in-flight kernels (`free` never drains). Fence on the storage's
+            // recorded producers before handing it out — nearly free once
+            // everything has retired.
+            if let RawBuffer::AmdDevice { gpu_addr, device, .. } = &buffer
+                && let Err(error) = device.core().wait_storage(*gpu_addr)
+            {
+                self.inner.free(buffer, size, options);
+                return Err(error);
+            }
             if zero {
                 match self.zero_cached(&buffer) {
                     Ok(true) => {}

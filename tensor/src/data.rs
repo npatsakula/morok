@@ -96,6 +96,29 @@ impl Tensor {
         Self::with_buffer(entry, buffer_arc)
     }
 
+    /// Weight-loading constructor: weights with the same checkpoint
+    /// provenance share ONE immutable device storage across model instances
+    /// (see [`crate::weight_cache`]). The tensor still gets its own BUFFER
+    /// UOp identity; sharing is at the storage level, so the planner and
+    /// `replicate` treat it like any other pre-allocated read-only input.
+    pub fn from_shared_weight(key: crate::weight_cache::WeightKey, bytes: &[u8]) -> Result<Self> {
+        let numel: usize = key.shape.iter().product();
+        let expected = numel * key.dtype.bytes();
+        if bytes.len() != expected {
+            return Err(Error::IrConstruction {
+                details: format!("from_shared_weight: data length {} != expected {expected}", bytes.len()),
+            });
+        }
+        let ir_shape = Shape::from_iter(key.shape.iter().map(|&d| SInt::Const(d)));
+        let (device, dtype) = (key.device.clone(), key.dtype.clone());
+        let buffer_arc = crate::weight_cache::shared_weight_buffer(key, bytes);
+        let buffer_uop = UOp::new_buffer(device, numel, dtype);
+        let buffer_uop_id = buffer_uop.id;
+        let uop = buffer_uop.try_reshape(&ir_shape).expect("shape matches element count");
+        let entry = tensor_registry::register_tensor_with_buffer(uop, buffer_arc.clone(), buffer_uop_id);
+        Ok(Self::with_buffer(entry, buffer_arc))
+    }
+
     /// Create tensor from raw bytes with explicit dtype and shape.
     ///
     /// The bytes are interpreted as little-endian values of the given dtype.

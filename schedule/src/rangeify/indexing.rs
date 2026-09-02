@@ -1053,8 +1053,7 @@ fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp
     let sink = UOp::sink(rngs.to_vec());
     // Canonicalize only live/in-scope ranges.
     let in_scope = sink.in_scope_ranges();
-    let ranges_in_expr: Vec<Arc<UOp>> =
-        sink.ranges().iter().filter(|r| in_scope.contains(&UOpKey((*r).clone()))).cloned().collect();
+    let ranges_in_expr: Vec<Arc<UOp>> = sink.ranges().iter().filter(|r| in_scope.contains(&r.id)).cloned().collect();
 
     let mut sub_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     let mut reverse_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
@@ -1105,10 +1104,13 @@ fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp
     }
 
     debug_assert!(
-        !output.iter().any(|r| r
-            .in_scope_ranges()
-            .iter()
-            .any(|rng| matches!(rng.0.op(), Op::Range { axis_type: AxisType::Placeholder, .. }))),
+        !output.iter().any(|r| {
+            let scope = r.in_scope_ranges();
+            r.ranges()
+                .into_iter()
+                .filter(|rng| scope.contains(&rng.id))
+                .any(|rng| matches!(rng.op(), Op::Range { axis_type: AxisType::Placeholder, .. }))
+        }),
         "Placeholder-typed ranges leaked into output"
     );
 

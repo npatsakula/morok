@@ -47,7 +47,7 @@ pub use device::{
 };
 pub use error::{Error, Result};
 pub use profile::{CounterSet, KernelResources, PmcCounter};
-pub use sync::{CpuTimelineSignal, DispatchTimestamps, TimelineSignal};
+pub use sync::{CompletionToken, CpuTimelineSignal, DispatchTimestamps, TimelineSignal};
 
 #[cfg(test)]
 mod test;

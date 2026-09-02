@@ -535,3 +535,83 @@ impl UOp {
         })
     }
 }
+
+// ============================================================================
+// Drop hook (buffer lifetime tracking)
+// ============================================================================
+
+/// Hook fired with the node's id when an `Op::Buffer` UOp is dropped.
+///
+/// Installed once by the buffer-owning layer (`svod-tensor`'s registry) to
+/// expire its uop-id-keyed entries automatically: ids are per-allocation and
+/// never reused, so once the node is gone no live graph can look the id up
+/// again. The hook runs inside `Drop`, potentially deep in a graph teardown —
+/// it must not construct UOps and must not block (a lock-free map removal is
+/// the intended shape).
+static UOP_DROP_HOOK: std::sync::OnceLock<fn(u64)> = std::sync::OnceLock::new();
+
+/// Install the buffer-uop drop hook. First caller wins; later installs are
+/// ignored (install-once by design — the owning layer is a singleton).
+pub fn set_uop_drop_hook(hook: fn(u64)) {
+    let _ = UOP_DROP_HOOK.set(hook);
+}
+
+thread_local! {
+    /// Deferred-teardown queue: `.0` is true while a drain is active on this
+    /// thread; `.1` holds `Op` payloads taken from dying nodes encountered
+    /// during that drain (their child `Arc`s keep the subtree alive until the
+    /// drain reaches them).
+    static TEARDOWN: std::cell::RefCell<(bool, Vec<Op>)> = const { std::cell::RefCell::new((false, Vec::new())) };
+}
+
+impl Drop for UOp {
+    fn drop(&mut self) {
+        // Buffer nodes only: the hook exists for buffer-lifetime tracking, and
+        // graph rewriting churns millions of transient non-buffer nodes per
+        // prepare — their drop must stay allocation-free and branch-cheap.
+        // The intern table is deliberately NOT touched here: dead `Weak`
+        // tombstones are overwritten lazily by `new_tagged`, and rebuilding a
+        // `UOpKey` in every drop frame would allocate.
+        if matches!(self.op, Op::Buffer { .. })
+            && let Some(hook) = UOP_DROP_HOOK.get()
+        {
+            hook(self.id);
+        }
+
+        // Flatten the recursive teardown: a long dependency chain would
+        // otherwise recurse once per node in the drop glue and overflow the
+        // stack. When some child dies with this node, take ownership of the
+        // whole `Op` payload and route it through a thread-local queue: the
+        // outermost dying node drains the queue iteratively, and every nested
+        // `UOp::drop` re-entered from a drained `Op` merely enqueues its own
+        // payload and returns — so the glue recursion stays constant-depth
+        // and the total work stays linear in the number of dying nodes.
+        let mut has_dying = false;
+        self.op.map_child(|child| has_dying |= Arc::strong_count(child) == 1);
+        if !has_dying {
+            // Every child is shared: the glue only decrements refcounts.
+            return;
+        }
+
+        let op = std::mem::replace(&mut self.op, Op::Unique(usize::MAX));
+        let root_op = TEARDOWN.with(|state| {
+            let mut state = state.borrow_mut();
+            if state.0 {
+                state.1.push(op);
+                None
+            } else {
+                state.0 = true;
+                Some(op)
+            }
+        });
+        // Nested drop inside an active drain: the drainer owns `op` now.
+        let Some(root_op) = root_op else { return };
+        // Drop payloads OUTSIDE the RefCell borrow: each may re-enter
+        // `UOp::drop` for children, which locks TEARDOWN again to enqueue.
+        drop(root_op);
+        while let Some(op) = TEARDOWN.with(|state| state.borrow_mut().1.pop()) {
+            drop(op);
+        }
+        TEARDOWN.with(|state| state.borrow_mut().0 = false);
+    }
+}

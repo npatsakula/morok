@@ -268,9 +268,11 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // DEVICE ranges are launch lanes and remain open across a callable boundary.
     // Any computational range still makes this an interior STORE.
-    if x.in_scope_ranges()
-        .iter()
-        .any(|range| !matches!(range.0.op(), Op::Range { axis_type: svod_ir::AxisType::Device, .. }))
+    let scope = x.in_scope_ranges();
+    if x.ranges()
+        .into_iter()
+        .filter(|range| scope.contains(&range.id))
+        .any(|range| !matches!(range.op(), Op::Range { axis_type: svod_ir::AxisType::Device, .. }))
     {
         return None;
     }

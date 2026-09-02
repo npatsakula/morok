@@ -532,8 +532,7 @@ pub fn single_query_attention_packed(
     crate::launch_custom(
         &q.device(),
         SQ_ATTENTION_SUPPORTED_ARCHS,
-        move |arch| {
-            let wave = arch.wave_size() as usize;
+        move |_arch| {
             ensure!(
                 dtype == DType::Float32,
                 crate::launch::DtypeSnafu { kernel: "single-query attention", got: dtype.clone(), expected: "f32" }
@@ -546,18 +545,13 @@ pub fn single_query_attention_packed(
                 v.uop().dtype() == DType::Float32,
                 crate::launch::DtypeSnafu { kernel: "single-query attention", got: v.uop().dtype(), expected: "f32" }
             );
-            ensure!(
-                d.is_multiple_of(wave),
-                crate::launch::DimMultipleSnafu {
-                    kernel: "single-query attention",
-                    dim: "D",
-                    value: d,
-                    multiple: wave
-                }
-            );
             Ok(())
         },
-        true,
+        // The kernel loads `d / wave` elements per lane, so a head dim the
+        // arch's wave size does not divide is a fit failure of THIS runtime
+        // instance (wave is 32 or 64 by arch), not a caller bug: decline to
+        // `Ok(None)` and let the caller's generic attention path take over.
+        move |arch| d.is_multiple_of(arch.wave_size() as usize),
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
             if splits == 1 {

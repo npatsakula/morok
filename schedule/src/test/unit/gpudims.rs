@@ -15,7 +15,7 @@ fn local_range(end_value: i64, axis_id: usize) -> Arc<UOp> {
 }
 
 fn in_scope_ids(uop: &Arc<UOp>) -> HashSet<u64> {
-    uop.in_scope_ranges().iter().map(|key| key.0.id).collect()
+    uop.in_scope_ranges().iter().copied().collect()
 }
 
 #[test]

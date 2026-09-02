@@ -172,6 +172,13 @@ impl Renderer for AmdRendererWrapper {
         for op in [
             svod_ir::UnaryOp::Exp,
             svod_ir::UnaryOp::Log,
+            // Sin must decompose (tinygrad `llvmir.py` `llvm_intrinsics` is
+            // exactly {sqrt, log2, exp2}): `@llvm.sin.f32` lowers to the
+            // hardware `v_sin_f32` behind an f32 `1/(2π)` pre-scale, which is
+            // only accurate for small arguments — sin(±1e6) comes back as
+            // ±sin(π/8) because the reduction happens in f32 revolutions.
+            // `v_exp_f32`/`v_log_f32`/`v_sqrt_f32` are ~1-ulp and stay native.
+            svod_ir::UnaryOp::Sin,
             svod_ir::UnaryOp::Cos,
             svod_ir::UnaryOp::Tan,
             svod_ir::UnaryOp::Erf,

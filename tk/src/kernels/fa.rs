@@ -642,7 +642,7 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
         },
         // Runtime tiling (`None`) — `N` is the (audio) sequence length and may
         // legitimately not tile, so the caller falls back per-clip instead of padding.
-        n % (q_blk * NUM_WARPS) == 0,
+        move |_| n % (q_blk * NUM_WARPS) == 0,
         // Build for the resolved arch — caps track the real wave width.
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);

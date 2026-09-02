@@ -54,6 +54,12 @@ pub enum JitError {
     #[snafu(display("duplicate JIT input buffer: {name} aliases {duplicate_of} with {buffer_id:?}"))]
     DuplicateInputBuffer { name: &'static str, duplicate_of: &'static str, buffer_id: svod_device::BufferId },
 
+    /// The plan buffer an input resolved to is not the buffer that was
+    /// realized for it — cross-plan input aliasing (a concurrent prepare
+    /// corrupted this input's graph identity).
+    #[snafu(display("JIT input {name} resolved to a foreign plan buffer: expected {expected:?}, got {actual:?}"))]
+    InputAliased { name: &'static str, expected: svod_device::BufferId, actual: svod_device::BufferId },
+
     /// Wraps the user-supplied error type returned by a `jit_wrapper!` build
     /// closure. Genuine `Box<dyn>` because the closure's `E` is arbitrary.
     #[snafu(display("{source}"))]

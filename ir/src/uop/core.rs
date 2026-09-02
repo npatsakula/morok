@@ -34,7 +34,7 @@ impl Matcher<()> for SubstituteMatcher<'_> {
 /// - If a node's ranges don't overlap with substitution keys, gate (skip subtree).
 struct SubstituteGatedMatcher<'a> {
     map: &'a HashMap<UOpKey, Arc<UOp>>,
-    range_keys: &'a HashSet<UOpKey>,
+    range_ids: &'a HashSet<u64>,
 }
 
 impl Matcher<()> for SubstituteGatedMatcher<'_> {
@@ -46,7 +46,7 @@ impl Matcher<()> for SubstituteGatedMatcher<'_> {
             return RewriteResult::Rewritten(replacement.clone());
         }
         // Gate: skip subtrees whose ranges don't overlap with substitution keys.
-        if !uop.in_scope_ranges().iter().any(|r| self.range_keys.contains(r)) {
+        if !uop.in_scope_ranges().iter().any(|id| self.range_ids.contains(id)) {
             return RewriteResult::Gate(uop.clone());
         }
         RewriteResult::NoMatch
@@ -127,13 +127,16 @@ pub struct UOp {
     /// Cached list of RANGE operations in this UOp's graph.
     /// Computed lazily via toposort to collect all RANGE ops.
     #[debug(skip)]
+    // NOTE: never contains self (see `RangesProperty` — a cached self-`Arc`
+    // is a refcount cycle that leaks the node).
     pub(crate) ranges_cache: std::sync::OnceLock<Vec<Arc<UOp>>>,
-    /// Cached set of RANGE operations that are in scope at this UOp.
+    /// Cached set of RANGE operation *ids* that are in scope at this UOp.
     /// Unlike ranges_cache which contains ALL ranges in the graph,
-    /// this contains only the ranges that are currently "active" (not yet ended).
-    /// Uses UOpKey wrapper to enable Hash/Eq based on UOp ID.
+    /// this contains only the ranges that are currently "active" (not yet
+    /// ended). Ids rather than `Arc`s: a RANGE's own cache entry would
+    /// otherwise be a refcount cycle (permanent leak).
     #[debug(skip)]
-    pub(crate) in_scope_ranges_cache: std::sync::OnceLock<HashSet<UOpKey>>,
+    pub(crate) in_scope_ranges_cache: std::sync::OnceLock<HashSet<u64>>,
     /// Cached vmin/vmax range analysis values.
     /// Computed lazily via range propagation through the computation graph.
     /// Returns (vmin, vmax) as ConstValue types.
@@ -884,13 +887,21 @@ impl UOp {
         crate::uop::tree::render_tree_full(self)
     }
 
-    /// Get all RANGE operations in this UOp's computation graph.
+    /// Get all RANGE operations in this UOp's computation graph (self first
+    /// when self is a RANGE, matching Tinygrad's `{self} | self._ranges`).
     ///
-    /// Lazily computed and cached. Useful for rangeify pass to track loop variables.
-    pub fn ranges(self: &Arc<Self>) -> &Vec<Arc<Self>> {
+    /// Backed by a per-node cache that deliberately excludes self (a cached
+    /// self-`Arc` would be a refcount cycle), so the RANGE case chains self
+    /// lazily and the method returns an owned `Vec`.
+    pub fn ranges(self: &Arc<Self>) -> Vec<Arc<Self>> {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::RangesProperty;
-        RangesProperty::get(self)
+        let cached = RangesProperty::get(self);
+        if matches!(self.op, Op::Range { .. }) {
+            std::iter::once(self.clone()).chain(cached.iter().cloned()).collect()
+        } else {
+            cached.clone()
+        }
     }
 
     /// Get the RANGE operations that are in scope at this UOp.
@@ -903,8 +914,9 @@ impl UOp {
     ///
     /// # Returns
     ///
-    /// A HashSet of RANGE UOps that are in scope at this point in the graph.
-    /// The result is cached for performance.
+    /// A HashSet of RANGE UOp *ids* in scope at this point in the graph.
+    /// Ids, not `Arc`s: a RANGE storing a self-`Arc` in its own cache would
+    /// be a refcount cycle (permanent leak). The result is cached.
     ///
     /// # Examples
     ///
@@ -917,12 +929,12 @@ impl UOp {
     /// let end_op = value.end(vec![range.clone()]);
     ///
     /// // Value has range in scope
-    /// assert!(value.in_scope_ranges().contains(&range));
+    /// assert!(value.in_scope_ranges().contains(&range.id));
     ///
     /// // After END, range is no longer in scope
-    /// assert!(!end_op.in_scope_ranges().contains(&range));
+    /// assert!(!end_op.in_scope_ranges().contains(&range.id));
     /// ```
-    pub fn in_scope_ranges(self: &Arc<Self>) -> &HashSet<UOpKey> {
+    pub fn in_scope_ranges(self: &Arc<Self>) -> &HashSet<u64> {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::InScopeRangesProperty;
         InScopeRangesProperty::get(self)
@@ -1048,8 +1060,8 @@ impl UOp {
         if map.is_empty() {
             return self.clone();
         }
-        let range_keys: HashSet<UOpKey> = map.keys().cloned().collect();
-        let matcher = SubstituteGatedMatcher { map, range_keys: &range_keys };
+        let range_ids: HashSet<u64> = map.keys().map(|key| key.0.id).collect();
+        let matcher = SubstituteGatedMatcher { map, range_ids: &range_ids };
         crate::rewrite::graph_rewrite_bottom_up(&matcher, self.clone(), &mut ())
     }
 
@@ -1058,8 +1070,8 @@ impl UOp {
         if map.is_empty() {
             return self.clone();
         }
-        let range_keys: HashSet<UOpKey> = map.keys().cloned().collect();
-        let matcher = SubstituteGatedMatcher { map, range_keys: &range_keys };
+        let range_ids: HashSet<u64> = map.keys().map(|key| key.0.id).collect();
+        let matcher = SubstituteGatedMatcher { map, range_ids: &range_ids };
         crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&matcher, self.clone(), &mut ())
     }
 
