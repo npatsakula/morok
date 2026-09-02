@@ -10,12 +10,12 @@ description = "High-level lazy tensor API for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]
-svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.4" }
-svod-ir = { path = "../ir", version = "=0.1.0-alpha.4" }
-svod-device = { path = "../device", version = "=0.1.0-alpha.4" }
-svod-codegen = { path = "../codegen", version = "=0.1.0-alpha.4" }
-svod-runtime = { path = "../runtime", version = "=0.1.0-alpha.4" }
-svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.4" }
+svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.5" }
+svod-ir = { path = "../ir", version = "=0.1.0-alpha.5" }
+svod-device = { path = "../device", version = "=0.1.0-alpha.5" }
+svod-codegen = { path = "../codegen", version = "=0.1.0-alpha.5" }
+svod-runtime = { path = "../runtime", version = "=0.1.0-alpha.5" }
+svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.5" }
 once_cell = "1.21.3"
 snafu = "0.8.9"
 bon = "3.8"
@@ -40,7 +40,7 @@ tracing-verbose = []
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 test-case = "3.3.1"
-svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.4", features = [
+svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.5", features = [
   "testing",
 ] }
 proptest = "1.11.0"

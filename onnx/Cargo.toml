@@ -9,9 +9,9 @@ description = "ONNX model importer for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]
-svod-tensor = { path = "../tensor", version = "=0.1.0-alpha.4" }
-svod-ir = { path = "../ir", version = "=0.1.0-alpha.4" }
-svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.4" }
+svod-tensor = { path = "../tensor", version = "=0.1.0-alpha.5" }
+svod-ir = { path = "../ir", version = "=0.1.0-alpha.5" }
+svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.5" }
 prost = "0.14"
 snafu = "0.9"
 tracing = "0.1"
@@ -26,7 +26,7 @@ prost-build = "0.14"
 ndarray.workspace = true
 proptest = "1.11"
 test-case = "3.3.1"
-svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.4", features = [
+svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.5", features = [
   "testing",
 ] }
 svod-runtime = { path = "../runtime" }

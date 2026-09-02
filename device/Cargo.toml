@@ -10,8 +10,8 @@ description = "Device abstraction layer for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]
-svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.4", features = ["serde"] }
-svod-ir = { path = "../ir", version = "=0.1.0-alpha.4" }
+svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.5", features = ["serde"] }
+svod-ir = { path = "../ir", version = "=0.1.0-alpha.5" }
 
 ndarray.workspace = true
 enum_delegate.workspace = true

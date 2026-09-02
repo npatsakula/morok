@@ -9,15 +9,15 @@ description = "ThunderKittens-style tile DSL for authoring hand-tuned GPU kernel
 autobenches = false # explicit [[bench]] entries below; `benches/common.rs` is a shared module, not a bench
 
 [dependencies]
-svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.4" }
-svod-ir = { path = "../ir", version = "=0.1.0-alpha.4" }
-svod-tensor = { path = "../tensor", version = "=0.1.0-alpha.4" }
+svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.5" }
+svod-ir = { path = "../ir", version = "=0.1.0-alpha.5" }
+svod-tensor = { path = "../tensor", version = "=0.1.0-alpha.5" }
 smallvec = { workspace = true }
 snafu = "0.8.9"
-svod-codegen = { path = "../codegen", version = "=0.1.0-alpha.4" }
-svod-device = { path = "../device", version = "=0.1.0-alpha.4" }
-svod-runtime = { path = "../runtime", version = "=0.1.0-alpha.4" }
-svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.4" }
+svod-codegen = { path = "../codegen", version = "=0.1.0-alpha.5" }
+svod-device = { path = "../device", version = "=0.1.0-alpha.5" }
+svod-runtime = { path = "../runtime", version = "=0.1.0-alpha.5" }
+svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.5" }
 
 [dev-dependencies]
 svod-schedule = { path = "../schedule", features = ["testing"] }

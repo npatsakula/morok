@@ -9,10 +9,10 @@ description = "Backend code generation for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]
-svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.4" }
-svod-ir = { path = "../ir", version = "=0.1.0-alpha.4" }
-svod-device = { path = "../device", version = "=0.1.0-alpha.4" }
-svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.4" }
+svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.5" }
+svod-ir = { path = "../ir", version = "=0.1.0-alpha.5" }
+svod-device = { path = "../device", version = "=0.1.0-alpha.5" }
+svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.5" }
 snafu = "0.8.9"
 itertools = "0.14.0"
 tracing = "0.1"
