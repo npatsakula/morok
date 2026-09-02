@@ -396,7 +396,7 @@ impl AmdDevice {
         //     several PM4 user queues concurrently parks CP micro-engines in
         //     `WAIT_REG_MEM` spins that MES cannot preempt and wedges the
         //     firmware into an unrecoverable reset (reproduced on gfx1151;
-        //     see HCQ_PORT_LEDGER.md), and gfx11 MEC firmware implements no
+        //     see the crate-level AMD notes), and gfx11 MEC firmware implements no
         //     scheduler-visible timeline-wait packet to lower waits onto
         //     (the AMD barrier-value vendor packet is an illegal opcode
         //     there). The env override remains for validation experiments.
