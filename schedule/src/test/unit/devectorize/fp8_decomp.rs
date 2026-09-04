@@ -10,6 +10,7 @@ use svod_ir::{Op, UOp};
 use super::helpers::{create_bool_const, create_buffer_typed};
 use crate::devectorize::{Fp8DecompCtx, pm_float_decomp};
 use crate::optimizer::{Renderer, apply_dtype_decomps, get_dtype_decomps};
+use svod_ir::ops;
 
 fn decompose(from: ScalarDType, root: Arc<UOp>) -> Arc<UOp> {
     let mut ctx = Fp8DecompCtx { from, to: ScalarDType::Float16 };
@@ -20,7 +21,7 @@ fn store_value_dtypes(root: &Arc<UOp>) -> Vec<DType> {
     root.toposort()
         .into_iter()
         .filter_map(|node| match node.op() {
-            Op::Store { value, .. } => Some(value.dtype()),
+            Op::Store(ops::Store { value, .. }) => Some(value.dtype()),
             _ => None,
         })
         .collect()
@@ -42,10 +43,17 @@ fn fp8_decomp_preserves_alt_on_gated_load() {
 
     let decomposed = decompose(ScalarDType::FP8E5M2, load);
 
-    let gated: Vec<_> =
-        decomposed.toposort().into_iter().filter(|node| matches!(node.op(), Op::Load { gate: Some(_), .. })).collect();
+    let gated: Vec<_> = decomposed
+        .toposort()
+        .into_iter()
+        .filter(|node| matches!(node.op(), Op::Load(ops::Load { gate: Some(_), .. })))
+        .collect();
     assert!(!gated.is_empty(), "the gated load must survive decomposition");
-    assert!(gated.iter().all(|node| matches!(node.op(), Op::Load { alt: Some(_), .. })), "{}", decomposed.tree());
+    assert!(
+        gated.iter().all(|node| matches!(node.op(), Op::Load(ops::Load { alt: Some(_), .. }))),
+        "{}",
+        decomposed.tree()
+    );
 }
 
 #[test]
@@ -61,9 +69,9 @@ fn vector_fp8_load_decomposes_to_scalar_loads_and_stack() {
 
     let decomposed = decompose(ScalarDType::FP8E4M3, load);
 
-    assert!(matches!(decomposed.op(), Op::Stack { .. }), "{}", decomposed.tree());
+    assert!(matches!(decomposed.op(), Op::Stack(..)), "{}", decomposed.tree());
     assert_eq!(decomposed.dtype(), DType::Float16);
-    assert_eq!(decomposed.toposort().iter().filter(|u| matches!(u.op(), Op::Load { .. })).count(), 4);
+    assert_eq!(decomposed.toposort().iter().filter(|u| matches!(u.op(), Op::Load(..))).count(), 4);
 }
 
 /// Both directions are rewritten: the STORE narrows to the uint8 storage form and
@@ -84,7 +92,7 @@ fn fnuz_store_and_load_are_both_decomposed() {
 
     assert!(!decomposed.toposort().iter().any(|u| u.dtype().base() == ScalarDType::FP8E4M3FNUZ));
     assert!(store_value_dtypes(&decomposed).contains(&DType::UInt8), "{}", decomposed.tree());
-    assert!(decomposed.toposort().iter().any(|u| matches!(u.op(), Op::Load { .. }) && u.dtype() == DType::UInt8));
+    assert!(decomposed.toposort().iter().any(|u| matches!(u.op(), Op::Load(..)) && u.dtype() == DType::UInt8));
 }
 
 /// Which storage dtypes need decomposing is a property of the target, not of the AST.

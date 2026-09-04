@@ -15,11 +15,12 @@ use test_case::test_case;
 use crate::rangeify::indexing::IndexingContext;
 use crate::rangeify::patterns::{buffer_limit_patterns, extract_device_from_graph, is_elementwise};
 use crate::rewrite::graph_rewrite;
+use svod_ir::ops;
 
 fn test_buffer(size: usize, slot: usize) -> Arc<UOp> {
     let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![SInt::Const(size)]);
     let arg = svod_ir::ParamArg::buffer(slot, DType::Float32, AddrSpace::Global, Some(DeviceSpec::Cpu));
-    UOp::new(Op::Buffer { shape, arg: arg.into() }, DType::Float32)
+    UOp::new(Op::Buffer(ops::Buffer { shape, arg: arg.into() }), DType::Float32)
 }
 
 fn read(slot: usize, range: &Arc<UOp>) -> Arc<UOp> {
@@ -37,7 +38,7 @@ fn count_stages(uop: &Arc<UOp>) -> usize {
         if !visited.insert(UOpKey(current.clone())) {
             continue;
         }
-        count += usize::from(matches!(current.op(), Op::Stage { .. }));
+        count += usize::from(matches!(current.op(), Op::Stage(..)));
         stack.extend(current.op().sources());
     }
     count
@@ -110,8 +111,8 @@ fn a_collapsed_range_still_consumes_its_axis_id() {
         .toposort()
         .into_iter()
         .filter_map(|u| match u.op() {
-            Op::Stage { ranges, .. } => ranges.iter().find_map(|r| match r.op() {
-                Op::Range { axis_id, .. } => Some(axis_id.clone()),
+            Op::Stage(ops::Stage { ranges, .. }) => ranges.iter().find_map(|r| match r.op() {
+                Op::Range(ops::Range { axis_id, .. }) => Some(axis_id.clone()),
                 _ => None,
             }),
             _ => None,
@@ -139,17 +140,15 @@ fn a_device_range_is_carried_through_without_renumbering() {
         .toposort()
         .into_iter()
         .find_map(|u| match u.op() {
-            Op::Stage { ranges, .. } => Some(ranges.clone()),
+            Op::Stage(ops::Stage { ranges, .. }) => Some(ranges.clone()),
             _ => None,
         })
         .expect("buffer limit should materialize the mixed source");
 
     assert!(stage_ranges.iter().any(|r| Arc::ptr_eq(r, &launched)));
-    assert!(
-        stage_ranges.iter().any(|r| {
-            matches!(r.op(), Op::Range { axis_id: AxisId::Unrenumbered(2), axis_type: AxisType::Weak, .. })
-        })
-    );
+    assert!(stage_ranges.iter().any(|r| {
+        matches!(r.op(), Op::Range(ops::Range { axis_id: AxisId::Unrenumbered(2), axis_type: AxisType::Weak, .. }))
+    }));
     assert_eq!(ctx.range_counter(), 3);
 }
 

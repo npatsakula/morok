@@ -11,6 +11,7 @@
 //! universally to any UOp graph, not just during schedule transformation.
 
 use svod_dtype::{DType, ScalarDType};
+use svod_ir::ops;
 use svod_ir::types::{BinaryOp, ConstValue, ConstValueHash};
 use svod_ir::uop::cached_property::CachedProperty;
 use svod_ir::uop::comparison_analysis::ComparisonAnalyzer;
@@ -1133,7 +1134,7 @@ fn is_shift_32(value: ConstValue) -> bool {
 /// zero. Tinygrad spells this as a literal `uint32 → uint64` cast; morok's
 /// earlier cast folding can leave a signed-but-non-negative source instead.
 fn low_half_payload(value: &Arc<UOp>) -> Option<&Arc<UOp>> {
-    let Op::Cast { src, dtype } = value.op() else { return None };
+    let Op::Cast(ops::Cast { src, dtype }) = value.op() else { return None };
     (*dtype == DType::UInt64 && (src.dtype() == DType::UInt32 || fits_in_u32(src))).then_some(src)
 }
 
@@ -1450,7 +1451,7 @@ fn vmin_vmax_collapse_patterns_unchecked() -> &'static TypedPatternMatcher {
     // Collapse only computation nodes whose result is non-float (int/bool/index).
     // Structural nodes (Range, Buffer) and float arithmetic are excluded.
     fn is_collapsible(uop: &Arc<UOp>) -> bool {
-        matches!(uop.op(), Op::Binary(..) | Op::Param { .. } | Op::Special { .. }) && !uop.dtype().is_float()
+        matches!(uop.op(), Op::Binary(..) | Op::Param(..) | Op::Special(..)) && !uop.dtype().is_float()
     }
 
     fn try_collapse(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -1550,13 +1551,13 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
                 // Side-effecting operations survive dependency inlining.
                 if matches!(
                     dep.op(),
-                    Op::Range { .. }
-                        | Op::Store { .. }
-                        | Op::End { .. }
-                        | Op::Call { .. }
-                        | Op::Barrier { .. }
-                        | Op::Custom { .. }
-                        | Op::Function { .. }
+                    Op::Range(..)
+                        | Op::Store(..)
+                        | Op::End(..)
+                        | Op::Call(..)
+                        | Op::Barrier(..)
+                        | Op::Custom(..)
+                        | Op::Function(..)
                 ) {
                     new_deps.push(Arc::clone(dep));
                 } else {
@@ -1602,7 +1603,7 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
 fn is_noop_after_dep(u: &Arc<UOp>) -> bool {
     match u.op() {
         Op::Noop => true,
-        Op::End { computation, .. } => is_noop_after_dep(computation),
+        Op::End(ops::End { computation, .. }) => is_noop_after_dep(computation),
         _ => false,
     }
 }
@@ -1652,7 +1653,7 @@ pub fn pm_move_where_on_load() -> &'static TypedPatternMatcher {
 fn has_invalid(uop: &Arc<UOp>) -> bool {
     match uop.op() {
         Op::Const(ConstValueHash(ConstValue::Invalid)) => true,
-        Op::Stack { sources } => sources.iter().any(UOp::is_invalid_marker),
+        Op::Stack(ops::Stack { sources }) => sources.iter().any(UOp::is_invalid_marker),
         _ => false,
     }
 }
@@ -1703,10 +1704,10 @@ fn where_on_load_index_transform(
                 continue;
             }
             match node.op() {
-                Op::Range { .. } => {
+                Op::Range(..) => {
                     index_ranges.insert(node.id);
                 }
-                Op::Index { .. } => {
+                Op::Index(..) => {
                     idx_indices.insert(node.id);
                 }
                 _ => {}
@@ -1736,11 +1737,11 @@ fn where_on_load_index_transform(
                 continue;
             }
             match node.op() {
-                Op::Range { .. } if !index_ranges.contains(&node.id) => {
+                Op::Range(..) if !index_ranges.contains(&node.id) => {
                     ranges_in_scope = false;
                     break; // Out-of-scope range found, can't move
                 }
-                Op::Index { .. } if !idx_indices.contains(&node.id) => {
+                Op::Index(..) if !idx_indices.contains(&node.id) => {
                     has_index_deps = true;
                     break; // External INDEX dep found, can't move
                 }
@@ -2301,7 +2302,7 @@ fn reduce_mul_chain_sym(
 
 /// REMOVE_FROM_SINK_LIKE = {Ops.NOOP, Ops.STACK, Ops.SINK}
 fn is_remove_from_sink_like(u: &Arc<UOp>) -> bool {
-    matches!(u.op(), Op::Noop | Op::Stack { .. } | Op::Sink { .. })
+    matches!(u.op(), Op::Noop | Op::Stack(..) | Op::Sink(..))
 }
 
 /// Phase 3 symbolic patterns (full symbolic() only, not symbolic_simple()).
@@ -2331,9 +2332,9 @@ pub fn sym_phase3_patterns() -> &'static TypedPatternMatcher {
             Some(UOp::sink(new_srcs))
         },
         // GROUP also matches REMOVE_FROM_SINK_LIKE + GROUP itself
-        Group { sources } if sources.iter().any(|s| is_remove_from_sink_like(s) || matches!(s.op(), Op::Group { .. })) => {
+        Group { sources } if sources.iter().any(|s| is_remove_from_sink_like(s) || matches!(s.op(), Op::Group(..))) => {
             let new_srcs: Vec<Arc<UOp>> = sources.iter().flat_map(|s| {
-                if is_remove_from_sink_like(s) || matches!(s.op(), Op::Group { .. }) {
+                if is_remove_from_sink_like(s) || matches!(s.op(), Op::Group(..)) {
                     s.op().sources().to_vec()
                 } else { vec![Arc::clone(s)] }
             }).collect();

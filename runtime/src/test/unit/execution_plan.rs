@@ -7,6 +7,7 @@ use svod_device::device::Program;
 use svod_device::device::{CopyEndpoint, NativeReplayDecline, NativeReplayOutcome, PlanCall, PlanContext};
 use svod_device::hcq::QueueKind;
 use svod_dtype::DType;
+use svod_ir::ops;
 use svod_ir::{CustomFunctionKind, UOp};
 
 // ── fixtures ───────────────────────────────────────────────────────────────
@@ -517,7 +518,7 @@ fn launch_recorder_plan(
 
     let mut kernel = cached(Box::new(recorder.clone()), 1);
     kernel.var_names = vec![match var.op() {
-        svod_ir::Op::DefineVar { name, .. } => name.clone(),
+        svod_ir::Op::DefineVar(ops::DefineVar { name, .. }) => name.clone(),
         _ => "N".to_string(),
     }];
     kernel.global_size = [global_x.clone(), UOp::index_const(1), UOp::index_const(1)];

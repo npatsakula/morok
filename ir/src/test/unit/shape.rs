@@ -2,6 +2,7 @@ use smallvec::smallvec;
 
 use svod_dtype::{DType, DeviceSpec};
 
+use crate::ops;
 use crate::{ConstValue, SInt, UOp, shape::*};
 
 #[test]
@@ -161,7 +162,7 @@ fn test_infer_const_shape() {
 #[test]
 fn test_infer_vconst_shape() {
     let values = vec![ConstValue::Float(1.0), ConstValue::Float(2.0), ConstValue::Float(3.0), ConstValue::Float(4.0)];
-    let vec = UOp::new(crate::Op::VConst { values: values.clone() }, DType::Float32.vec(4).unwrap());
+    let vec = UOp::new(crate::Op::VConst(ops::VConst { values: values.clone() }), DType::Float32.vec(4).unwrap());
     // VConst is a kernel-level op and returns None (matches Tinygrad)
     assert!(vec.shape().unwrap().is_none(), "VConst should return None for shape");
 }
@@ -215,17 +216,17 @@ fn test_shape_to_uop() {
     assert_eq!(single.dtype(), DType::WeakInt);
 
     let empty = shape_to_uop(&smallvec![]);
-    assert!(matches!(empty.op(), Op::Stack { sources } if sources.is_empty()));
+    assert!(matches!(empty.op(), Op::Stack(ops::Stack { sources }) if sources.is_empty()));
     assert_eq!(empty.dtype(), DType::Void);
 
     let pair = shape_to_uop(&smallvec![SInt::from(3), SInt::from(4)]);
-    assert!(matches!(pair.op(), Op::Stack { sources } if sources.len() == 2));
+    assert!(matches!(pair.op(), Op::Stack(ops::Stack { sources }) if sources.len() == 2));
     assert_eq!(pair.dtype(), DType::WeakInt);
 
     // Mixed const/symbolic lanes are materialised at the promoted dtype, so the
     // constant dim survives the round trip instead of hiding behind a CAST.
     let mixed = smallvec![SInt::from(3), SInt::Symbolic(UOp::var("n", DType::Int32, 1, 8))];
-    let Op::Stack { sources } = shape_to_uop(&mixed).op().clone() else { panic!("expected STACK") };
+    let Op::Stack(ops::Stack { sources }) = shape_to_uop(&mixed).op().clone() else { panic!("expected STACK") };
     assert_eq!(SInt::from(&sources[0]), SInt::Const(3));
     assert_eq!(SInt::from(&sources[1]).as_symbolic().map(|dim| dim.dtype()), Some(DType::Int32));
 }

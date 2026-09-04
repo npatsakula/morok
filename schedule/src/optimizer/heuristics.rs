@@ -10,6 +10,7 @@ use svod_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, TernaryOp};
 
 use crate::optimizer::config::HeuristicsConfig;
 use crate::optimizer::{Opt, Scheduler, apply_opt};
+use svod_ir::ops;
 
 // ============================================================================
 // CONSTANTS
@@ -96,16 +97,16 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
 pub fn has_matmul_pattern(scheduler: &Scheduler) -> bool {
     let Some(reduceop) = scheduler.reduceop() else { return false };
 
-    if let Op::Reduce { src, reduce_op, .. } = reduceop.op() {
+    if let Op::Reduce(ops::Reduce { src, reduce_op, .. }) = reduceop.op() {
         if *reduce_op != ReduceOp::Add {
             return false;
         }
-        let src = if let Op::Cast { src, .. } = src.op() { src } else { src };
+        let src = if let Op::Cast(ops::Cast { src, .. }) = src.op() { src } else { src };
         if let Op::Binary(BinaryOp::Mul, left, right) = src.op() {
-            let left_is_index = matches!(left.op(), Op::Index { .. })
-                || matches!(left.op(), Op::Cast { src, .. } if matches!(src.op(), Op::Index { .. }));
-            let right_is_index = matches!(right.op(), Op::Index { .. })
-                || matches!(right.op(), Op::Cast { src, .. } if matches!(src.op(), Op::Index { .. }));
+            let left_is_index = matches!(left.op(), Op::Index(..))
+                || matches!(left.op(), Op::Cast(ops::Cast { src, .. }) if matches!(src.op(), Op::Index(..)));
+            let right_is_index = matches!(right.op(), Op::Index(..))
+                || matches!(right.op(), Op::Cast(ops::Cast { src, .. }) if matches!(src.op(), Op::Index(..)));
             return left_is_index && right_is_index;
         }
     }
@@ -146,7 +147,7 @@ pub fn has_broadcast_pattern(scheduler: &Scheduler, axis: usize) -> bool {
         if !reaches_target.contains(buf) {
             continue;
         }
-        if let Op::Index { indices, .. } = buf.op() {
+        if let Op::Index(ops::Index { indices, .. }) = buf.op() {
             let in_index = indices.iter().any(|idx| reaches_target.contains(idx));
             if !in_index {
                 return true;
@@ -172,7 +173,7 @@ pub fn count_strides(scheduler: &Scheduler, axis: usize) -> (usize, usize) {
     let mut reaches_target = reaching(target_rng);
 
     for buf in scheduler.bufs() {
-        if let Op::Index { indices, .. } = buf.op() {
+        if let Op::Index(ops::Index { indices, .. }) = buf.op() {
             // Get the combined linearized index and unwrap WHERE if present.
             let idx = indices.first().map(|i| i.get_idx()).unwrap_or_else(|| buf.clone());
 
@@ -219,7 +220,7 @@ pub fn apply_image_upcasts(scheduler: &mut Scheduler) -> bool {
     // Snapshot to avoid borrow conflicts while mutating scheduler.
     let bufs = scheduler.bufs().to_vec();
     for buf in bufs {
-        let Op::Index { buffer, indices, .. } = buf.op() else {
+        let Op::Index(ops::Index { buffer, indices, .. }) = buf.op() else {
             continue;
         };
         // The rank-3-with-4-channels shape is only an image when the buffer says so;
@@ -241,7 +242,7 @@ pub fn apply_image_upcasts(scheduler: &mut Scheduler) -> bool {
             .split_uop(BinaryOp::Add)
             .into_iter()
             .filter_map(|term| {
-                if !matches!(term.op(), Op::Range { end, .. } if end.divides(4).is_some()) {
+                if !matches!(term.op(), Op::Range(ops::Range { end, .. }) if end.divides(4).is_some()) {
                     return None;
                 }
                 scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, &term))
@@ -323,7 +324,7 @@ pub fn apply_unroll(scheduler: &mut Scheduler) -> bool {
     let last_unrollable = *unrollable.last().unwrap();
     let rngs = scheduler.rngs();
     let size = if last_unrollable < rngs.len()
-        && let Op::Range { end, .. } = rngs[last_unrollable].op()
+        && let Op::Range(ops::Range { end, .. }) = rngs[last_unrollable].op()
         && let Op::Const(cv) = end.op()
         && let svod_ir::ConstValue::Int(sz) = cv.0
     {
@@ -346,7 +347,7 @@ pub fn apply_unroll(scheduler: &mut Scheduler) -> bool {
                 if let Some(&last2) = unrollable2.last() {
                     let rngs2 = scheduler.rngs();
                     if last2 < rngs2.len()
-                        && let Op::Range { end, .. } = rngs2[last2].op()
+                        && let Op::Range(ops::Range { end, .. }) = rngs2[last2].op()
                         && let Op::Const(cv) = end.op()
                         && let svod_ir::ConstValue::Int(sz2) = cv.0
                         && sz2 <= 3
@@ -397,7 +398,7 @@ pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
             continue;
         }
         let rng = &rngs[axis_idx];
-        if let Op::Range { end, .. } = rng.op()
+        if let Op::Range(ops::Range { end, .. }) = rng.op()
             && let Op::Const(cv) = end.op()
             && let svod_ir::ConstValue::Int(size) = cv.0
             && size > 1
@@ -499,7 +500,7 @@ pub fn apply_matmul_tiling(scheduler: &mut Scheduler, config: &HeuristicsConfig)
         if axis_idx >= rngs.len() {
             continue;
         }
-        if let Op::Range { end, .. } = rngs[axis_idx].op()
+        if let Op::Range(ops::Range { end, .. }) = rngs[axis_idx].op()
             && let Op::Const(cv) = end.op()
             && let svod_ir::ConstValue::Int(size) = cv.0
             && size >= 4
@@ -535,7 +536,7 @@ pub fn apply_matmul_output_upcasting(scheduler: &mut Scheduler, config: &Heurist
 
 fn find_axis_by_axis_id(scheduler: &Scheduler, axis_id: AxisId) -> Option<usize> {
     scheduler.rngs().iter().enumerate().find_map(|(i, rng)| {
-        if let Op::Range { axis_id: id, .. } = rng.op()
+        if let Op::Range(ops::Range { axis_id: id, .. }) = rng.op()
             && id == &axis_id
         {
             return Some(i);
@@ -570,7 +571,7 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
     let Some(reduceop) = scheduler.reduceop() else {
         return false;
     };
-    let Op::Reduce { src, reduce_op, .. } = reduceop.op() else {
+    let Op::Reduce(ops::Reduce { src, reduce_op, .. }) = reduceop.op() else {
         return false;
     };
     if *reduce_op != ReduceOp::Add || scheduler.full_shape().len() < 2 {
@@ -581,7 +582,7 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
         return false;
     };
     let (idx0_src, idx1_src) = match (left.op(), right.op()) {
-        (Op::Index { indices: i0, .. }, Op::Index { indices: i1, .. }) => {
+        (Op::Index(ops::Index { indices: i0, .. }), Op::Index(ops::Index { indices: i1, .. })) => {
             let Some(i0) = i0.first() else {
                 return false;
             };
@@ -609,7 +610,8 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
         return false;
     }
 
-    if !matches!(first_reduce_rng.op(), Op::Range { end, .. } if end.divides(threads_per_row as i64).is_some()) {
+    if !matches!(first_reduce_rng.op(), Op::Range(ops::Range { end, .. }) if end.divides(threads_per_row as i64).is_some())
+    {
         return false;
     }
 
@@ -637,10 +639,9 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
         }
 
         let mut current_axis = global_idx;
-        let axis_id = trial
-            .rngs()
-            .get(current_axis)
-            .and_then(|rng| if let Op::Range { axis_id, .. } = rng.op() { Some(axis_id.clone()) } else { None });
+        let axis_id = trial.rngs().get(current_axis).and_then(|rng| {
+            if let Op::Range(ops::Range { axis_id, .. }) = rng.op() { Some(axis_id.clone()) } else { None }
+        });
 
         if block_size > 1 {
             if apply_opt(&mut trial, &Opt::local(current_axis, block_size), true).is_err() {
@@ -702,7 +703,8 @@ pub fn apply_threading(scheduler: &mut Scheduler, max_threads: usize) -> bool {
             if axis_idx >= rngs.len() {
                 continue;
             }
-            if matches!(rngs[axis_idx].op(), Op::Range { end, .. } if end.divides(threads as i64).is_some()) {
+            if matches!(rngs[axis_idx].op(), Op::Range(ops::Range { end, .. }) if end.divides(threads as i64).is_some())
+            {
                 thread_applied = apply_opt(scheduler, &Opt::thread(axis_idx, threads), true).is_ok();
                 if thread_applied {
                     debug!(axis = axis_idx, threads, "apply_threading: applied THREAD");
@@ -722,7 +724,7 @@ fn estimate_total_elements(scheduler: &Scheduler) -> i64 {
     let mut prod: i128 = 1;
     for rng in scheduler.rngs() {
         let extent = match rng.op() {
-            Op::Range { end, .. } => {
+            Op::Range(ops::Range { end, .. }) => {
                 if let Op::Const(cv) = end.op()
                     && let svod_ir::ConstValue::Int(sz) = cv.0
                     && sz > 0
@@ -772,7 +774,7 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
                 .iter()
                 .filter_map(|&idx| {
                     if idx < rngs.len()
-                        && let Op::Range { end, .. } = rngs[idx].op()
+                        && let Op::Range(ops::Range { end, .. }) = rngs[idx].op()
                         && let Op::Const(cv) = end.op()
                         && let svod_ir::ConstValue::Int(sz) = cv.0
                     {
@@ -807,7 +809,9 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
             let mut reach: Vec<_> = upcast_and_unroll_ranges.iter().map(reaching).collect();
             bufs.iter()
                 .map(|buf| match buf.op() {
-                    Op::Index { indices, .. } => reach.iter_mut().all(|r2| indices.iter().any(|idx| r2.contains(idx))),
+                    Op::Index(ops::Index { indices, .. }) => {
+                        reach.iter_mut().all(|r2| indices.iter().any(|idx| r2.contains(idx)))
+                    }
                     _ => false,
                 })
                 .collect()
@@ -830,7 +834,7 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
                 let mut reaches_rng = reaching(rng);
                 bufs.iter().zip(&all_upcast_in_idx).any(|(buf, &all_upcast)| {
                     all_upcast
-                        && matches!(buf.op(), Op::Index { indices, .. }
+                        && matches!(buf.op(), Op::Index(ops::Index { indices, .. })
                             if !indices.iter().any(|idx| reaches_rng.contains(idx)))
                 })
             };
@@ -840,7 +844,7 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
             }
 
             for &upcast_amount in &[3usize, 4] {
-                let size = if let Op::Range { end, .. } = rng.op()
+                let size = if let Op::Range(ops::Range { end, .. }) = rng.op()
                     && let Op::Const(cv) = end.op()
                     && let svod_ir::ConstValue::Int(sz) = cv.0
                 {
@@ -901,7 +905,7 @@ pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
             continue;
         }
         // Only CONST-end ranges (no symbolic dims)
-        if let Op::Range { end, .. } = rngs[axis].op() {
+        if let Op::Range(ops::Range { end, .. }) = rngs[axis].op() {
             if !matches!(end.op(), Op::Const(..)) {
                 continue;
             }
@@ -996,7 +1000,7 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         .in0_ranges
         .iter()
         .chain(pattern.in1_ranges.iter())
-        .any(|r| matches!(r.op(), Op::Range { axis_type: AxisType::Reduce, .. }));
+        .any(|r| matches!(r.op(), Op::Range(ops::Range { axis_type: AxisType::Reduce, .. })));
     if output_is_reduce {
         tracing::debug!(
             "try_tensor_cores: matmul output axis is a reduce axis (fused reduce-after-matmul); skipping TC"
@@ -1054,7 +1058,8 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
             // UPCAST M (dim=1) then N (dim=0) with factors [5,4,3,2]
             for tc_dim in [1usize, 0] {
                 for &sz in &[5usize, 4, 3, 2] {
-                    if matches!(tc_rngs[tc_dim].op(), Op::Range { end, .. } if end.divides(sz as i64).is_some()) {
+                    if matches!(tc_rngs[tc_dim].op(), Op::Range(ops::Range { end, .. }) if end.divides(sz as i64).is_some())
+                    {
                         if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[tc_dim]))
                             && let Ok((replaced, _)) =
                                 trial.shift_to(tc_rngs[tc_dim].clone(), sz, AxisType::Upcast, false, None)
@@ -1070,7 +1075,8 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
             // LOCAL N (dim=0) with factors [4,2]
             if trial.renderer().has_local {
                 for &sz in &[4usize, 2] {
-                    if matches!(tc_rngs[0].op(), Op::Range { end, .. } if end.divides(sz as i64).is_some()) {
+                    if matches!(tc_rngs[0].op(), Op::Range(ops::Range { end, .. }) if end.divides(sz as i64).is_some())
+                    {
                         if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[0]))
                             && trial.shift_to(tc_rngs[0].clone(), sz, AxisType::Local, false, None).is_ok()
                         {

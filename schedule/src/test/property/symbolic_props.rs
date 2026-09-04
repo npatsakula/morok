@@ -16,6 +16,7 @@ use svod_ir::{Op, UOp};
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::{symbolic, symbolic_simple};
 
+use svod_ir::ops;
 use svod_ir::test::property::generators::*;
 
 fn apply(op: BinaryOp, lhs: &Arc<UOp>, rhs: &Arc<UOp>) -> Arc<UOp> {
@@ -216,7 +217,7 @@ proptest! {
                 prop_assert!(Arc::ptr_eq(var, &a));
                 prop_assert!(matches!(subtrahend.op(), Op::Const(v) if v.0 == ConstValue::Int(-sum)));
             }
-            Op::DefineVar { .. } => {
+            Op::DefineVar(..) => {
                 prop_assert!(Arc::ptr_eq(&simplified, &a));
                 prop_assert_eq!(sum, 0, "a bare variable may only come out when the constants cancel");
             }
@@ -259,8 +260,8 @@ fn eval_uop(expr: &Arc<UOp>, vars: &HashMap<String, i64>) -> Option<i64> {
             ConstValue::Int(v) => Some(v),
             _ => None,
         },
-        Op::DefineVar { name, .. } => vars.get(name.as_str()).copied(),
-        Op::Bind { var, .. } => eval_uop(var, vars),
+        Op::DefineVar(ops::DefineVar { name, .. }) => vars.get(name.as_str()).copied(),
+        Op::Bind(ops::Bind { var, .. }) => eval_uop(var, vars),
         Op::Binary(op, a, b) => {
             let (a, b) = (eval_uop(a, vars)?, eval_uop(b, vars)?);
             match eval_binary_op(*op, ConstValue::Int(a), ConstValue::Int(b))? {
@@ -285,8 +286,8 @@ fn eval_uop(expr: &Arc<UOp>, vars: &HashMap<String, i64>) -> Option<i64> {
 fn eval_typed_uop(expr: &Arc<UOp>, variable: &str, value: ConstValue) -> Option<ConstValue> {
     match expr.op() {
         Op::Const(constant) => Some(constant.0),
-        Op::DefineVar { name, .. } if name == variable => Some(value),
-        Op::Bind { var, .. } => eval_typed_uop(var, variable, value),
+        Op::DefineVar(ops::DefineVar { name, .. }) if name == variable => Some(value),
+        Op::Bind(ops::Bind { var, .. }) => eval_typed_uop(var, variable, value),
         Op::Binary(op, lhs, rhs) => eval_binary_op_typed(
             *op,
             eval_typed_uop(lhs, variable, value)?,

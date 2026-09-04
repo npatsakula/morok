@@ -2,6 +2,7 @@ use smallvec::smallvec;
 use svod_ir::{CallInfo, DType, DeviceSpec, Error, KernelInfo, UOp};
 
 use super::fix_assign;
+use svod_ir::ops;
 
 #[test]
 fn test_fix_assign_cycle_returns_typed_error() {
@@ -31,7 +32,7 @@ fn test_fix_assign_cycle_returns_typed_error() {
 fn find_after_for_buffer(root: &std::sync::Arc<UOp>, buffer_id: u64) -> std::sync::Arc<UOp> {
     root.toposort()
         .into_iter()
-        .find(|u| matches!(u.op(), svod_ir::Op::After { .. }) && u.buf_uop().id == buffer_id)
+        .find(|u| matches!(u.op(), svod_ir::Op::After(..)) && u.buf_uop().id == buffer_id)
         .expect("expected AFTER for buffer")
 }
 
@@ -54,11 +55,11 @@ fn test_fix_assign_adds_war_dep_when_callable_differs_even_with_shared_dep() {
     let fixed = fix_assign(&root).expect("fix_assign should succeed");
 
     let updated_writer = find_after_for_buffer(&fixed, read_write_buf.id);
-    let svod_ir::Op::After { deps, .. } = updated_writer.op() else {
+    let svod_ir::Op::After(ops::After { deps, .. }) = updated_writer.op() else {
         panic!("expected AFTER op");
     };
     assert!(
-        deps.iter().any(|d| matches!(d.op(), svod_ir::Op::After { .. }) && d.buf_uop().id == output_buf.id),
+        deps.iter().any(|d| matches!(d.op(), svod_ir::Op::After(..)) && d.buf_uop().id == output_buf.id),
         "writer AFTER should depend on reader AFTER when callable differs"
     );
 }
@@ -78,7 +79,7 @@ fn test_fix_assign_skips_war_dep_for_same_callable_multi_output() {
     let fixed = fix_assign(&root).expect("fix_assign should succeed");
 
     let updated_writer = find_after_for_buffer(&fixed, shared_buf.id);
-    let svod_ir::Op::After { deps, .. } = updated_writer.op() else {
+    let svod_ir::Op::After(ops::After { deps, .. }) = updated_writer.op() else {
         panic!("expected AFTER op");
     };
     assert_eq!(deps.len(), 1, "same-callable outputs should not receive extra WAR deps");

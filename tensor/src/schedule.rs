@@ -23,17 +23,15 @@ use tracing::{debug, trace};
 use crate::error::*;
 use crate::{Error, Result};
 use snafu::ResultExt;
+use svod_ir::ops;
 
 fn canonicalize_callable_source(src: &Arc<UOp>) -> Arc<UOp> {
     let mut cur = src.clone();
     loop {
         match cur.op() {
-            Op::After { .. }
-            | Op::Buffer { .. }
-            | Op::Param { .. }
-            | Op::MSelect { .. }
-            | Op::MStack { .. }
-            | Op::Bind { .. } => return cur,
+            Op::After(..) | Op::Buffer(..) | Op::Param(..) | Op::MSelect(..) | Op::MStack(..) | Op::Bind(..) => {
+                return cur;
+            }
             _ => {
                 let sources = cur.op().sources();
                 let Some(next) = sources.first() else {
@@ -51,10 +49,10 @@ fn canonicalize_callable_source(src: &Arc<UOp>) -> Arc<UOp> {
 fn source_primary_buffer_id(src: &Arc<UOp>) -> Option<u64> {
     let src = canonicalize_callable_source(src);
     match src.op() {
-        Op::Buffer { .. } | Op::Param { .. } | Op::After { .. } => Some(src.buf_uop().id),
-        Op::Bind { .. } => None,
-        Op::MSelect { buffer, device_index } => {
-            if let Op::MStack { buffers } = buffer.op() {
+        Op::Buffer(..) | Op::Param(..) | Op::After(..) => Some(src.buf_uop().id),
+        Op::Bind(..) => None,
+        Op::MSelect(ops::MSelect { buffer, device_index }) => {
+            if let Op::MStack(ops::MStack { buffers }) = buffer.op() {
                 buffers.get(*device_index).map(|b| b.buf_uop().id)
             } else {
                 Some(src.buf_uop().id)
@@ -62,15 +60,15 @@ fn source_primary_buffer_id(src: &Arc<UOp>) -> Option<u64> {
         }
         // A bare MSTACK owns multiple buffers. Until schedule items carry that
         // ownership explicitly, resolving it to one shard would be incorrect.
-        Op::MStack { .. } => None,
+        Op::MStack(..) => None,
         _ => None,
     }
 }
 
 fn validate_mselect_bounds(call_id: u64, root: &Arc<UOp>) -> Result<()> {
     for node in root.toposort() {
-        let Op::MSelect { buffer, device_index } = node.op() else { continue };
-        let Op::MStack { buffers } = buffer.op() else {
+        let Op::MSelect(ops::MSelect { buffer, device_index }) = node.op() else { continue };
+        let Op::MStack(ops::MStack { buffers }) = buffer.op() else {
             return Err(Error::MultiUnsupportedForm {
                 call_id,
                 details: format!("MSELECT {} must select from an explicit MSTACK", node.id),
@@ -92,8 +90,10 @@ fn device_lane_binding(call_id: u64, ast: &Arc<UOp>, lane_count: Option<usize>) 
     let mut device_params = Vec::new();
     for node in ast.toposort() {
         match node.op() {
-            Op::Range { axis_type: svod_ir::AxisType::Device, .. } => device_ranges.push(node),
-            Op::Param { arg, .. } if arg.addrspace.is_none() && arg.name.as_deref() == Some("_device_num") => {
+            Op::Range(ops::Range { axis_type: svod_ir::AxisType::Device, .. }) => device_ranges.push(node),
+            Op::Param(ops::Param { arg, .. })
+                if arg.addrspace.is_none() && arg.name.as_deref() == Some("_device_num") =>
+            {
                 device_params.push(node)
             }
             _ => {}
@@ -118,7 +118,7 @@ fn device_lane_binding(call_id: u64, ast: &Arc<UOp>, lane_count: Option<usize>) 
     }
 
     let extent = if let Some(range) = device_ranges.first() {
-        let Op::Range { end, .. } = range.op() else { unreachable!() };
+        let Op::Range(ops::Range { end, .. }) = range.op() else { unreachable!() };
         let (Some(vmin), Some(vmax)) = (end.vmin().try_int(), end.vmax().try_int()) else {
             return Err(Error::MultiDeviceExtentNotStatic { call_id });
         };
@@ -127,7 +127,7 @@ fn device_lane_binding(call_id: u64, ast: &Arc<UOp>, lane_count: Option<usize>) 
         }
         vmin
     } else {
-        let Op::Param { arg, .. } = device_params[0].op() else { unreachable!() };
+        let Op::Param(ops::Param { arg, .. }) = device_params[0].op() else { unreachable!() };
         let Some((vmin, vmax)) = &arg.vmin_vmax else {
             return Err(Error::MultiDeviceExtentNotStatic { call_id });
         };
@@ -162,7 +162,7 @@ fn expand_multi_sources(call_id: u64, ast: &Arc<UOp>, sources: &[Arc<UOp>]) -> R
 
     let mut lane_count = None;
     for (source_index, source) in sources.iter().enumerate() {
-        let Op::MStack { buffers } = source.op() else { continue };
+        let Op::MStack(ops::MStack { buffers }) = source.op() else { continue };
         if buffers.is_empty() {
             return Err(Error::MultiEmptyLanes { call_id, source_index });
         }
@@ -180,10 +180,10 @@ fn expand_multi_sources(call_id: u64, ast: &Arc<UOp>, sources: &[Arc<UOp>]) -> R
         return Ok(MultiSourceExpansion { lanes: vec![sources.to_vec()], bind_device_num: false, is_multi: false });
     };
     let effect = match ast.op() {
-        Op::End { computation, .. } => computation,
+        Op::End(ops::End { computation, .. }) => computation,
         _ => ast,
     };
-    if matches!(effect.op(), Op::Slice { .. }) {
+    if matches!(effect.op(), Op::Slice(..)) {
         return Err(Error::MultiUnsupportedForm {
             call_id,
             details: "SLICE calls cannot be expanded across lanes".into(),
@@ -193,12 +193,12 @@ fn expand_multi_sources(call_id: u64, ast: &Arc<UOp>, sources: &[Arc<UOp>]) -> R
     let mut lanes = vec![Vec::with_capacity(sources.len()); lane_count];
     for (source_index, source) in sources.iter().enumerate() {
         match source.op() {
-            Op::MStack { buffers } => {
+            Op::MStack(ops::MStack { buffers }) => {
                 for (lane, buffer) in buffers.iter().enumerate() {
-                    if buffer.toposort().iter().any(|node| matches!(node.op(), Op::Slice { .. })) {
+                    if buffer.toposort().iter().any(|node| matches!(node.op(), Op::Slice(..))) {
                         return Err(Error::MultiLaneSliceAlias { call_id, source_index, lane });
                     }
-                    if matches!(buffer.op(), Op::MStack { .. }) {
+                    if matches!(buffer.op(), Op::MStack(..)) {
                         return Err(Error::MultiUnsupportedForm {
                             call_id,
                             details: format!("MSTACK source {source_index} lane {lane} is a nested MSTACK"),
@@ -207,7 +207,7 @@ fn expand_multi_sources(call_id: u64, ast: &Arc<UOp>, sources: &[Arc<UOp>]) -> R
                     lanes[lane].push(buffer.clone());
                 }
             }
-            Op::Bind { .. } => {
+            Op::Bind(..) => {
                 for lane_sources in &mut lanes {
                     lane_sources.push(source.clone());
                 }
@@ -228,12 +228,12 @@ fn expand_multi_sources(call_id: u64, ast: &Arc<UOp>, sources: &[Arc<UOp>]) -> R
 
 fn collect_callable_dep_ids(dep: &Arc<UOp>, out: &mut HashSet<u64>) -> Result<()> {
     match dep.op() {
-        Op::Call { .. } => {
+        Op::Call(..) => {
             out.insert(dep.id);
             Ok(())
         }
-        Op::End { computation, .. } => {
-            if matches!(computation.op(), Op::Call { .. }) {
+        Op::End(ops::End { computation, .. }) => {
+            if matches!(computation.op(), Op::Call(..)) {
                 out.insert(computation.id);
                 Ok(())
             } else {
@@ -243,8 +243,8 @@ fn collect_callable_dep_ids(dep: &Arc<UOp>, out: &mut HashSet<u64>) -> Result<()
                 .fail()
             }
         }
-        Op::Store { .. } => Ok(()),
-        Op::After { deps, .. } => {
+        Op::Store(..) => Ok(()),
+        Op::After(ops::After { deps, .. }) => {
             for nested in deps {
                 collect_callable_dep_ids(nested, out)?;
             }
@@ -260,7 +260,7 @@ fn collect_callable_dep_ids(dep: &Arc<UOp>, out: &mut HashSet<u64>) -> Result<()
 type AfterDependencySplit = (Vec<Arc<UOp>>, Vec<Arc<UOp>>);
 
 fn split_after_dependencies(after: &Arc<UOp>) -> Result<AfterDependencySplit> {
-    let Op::After { deps, .. } = after.op() else {
+    let Op::After(ops::After { deps, .. }) = after.op() else {
         return IrConstructionSnafu {
             details: format!("expected AFTER when splitting dependencies, got {:?}", after.op()),
         }
@@ -271,10 +271,12 @@ fn split_after_dependencies(after: &Arc<UOp>) -> Result<AfterDependencySplit> {
     let mut after_deps = Vec::new();
     for dep in deps {
         match dep.op() {
-            Op::Call { .. } => kernels.push(dep.clone()),
-            Op::End { computation, .. } if matches!(computation.op(), Op::Call { .. }) => kernels.push(dep.clone()),
-            Op::After { .. } => after_deps.push(dep.clone()),
-            Op::Store { .. } => {}
+            Op::Call(..) => kernels.push(dep.clone()),
+            Op::End(ops::End { computation, .. }) if matches!(computation.op(), Op::Call(..)) => {
+                kernels.push(dep.clone())
+            }
+            Op::After(..) => after_deps.push(dep.clone()),
+            Op::Store(..) => {}
             other => {
                 return IrConstructionSnafu {
                     details: format!("AFTER dependency must be CALL/END(CALL)/STORE/AFTER, got {other:?}"),
@@ -290,7 +292,7 @@ fn split_after_dependencies(after: &Arc<UOp>) -> Result<AfterDependencySplit> {
 fn collect_source_dependency_callable_ids(src: &Arc<UOp>, out: &mut HashSet<u64>) -> Result<()> {
     let src = canonicalize_callable_source(src);
     match src.op() {
-        Op::After { .. } => {
+        Op::After(..) => {
             let (kernels, after_deps) = split_after_dependencies(&src)?;
             for kernel in kernels {
                 collect_callable_dep_ids(&kernel, out)?;
@@ -300,14 +302,14 @@ fn collect_source_dependency_callable_ids(src: &Arc<UOp>, out: &mut HashSet<u64>
             }
             Ok(())
         }
-        Op::MStack { buffers } => {
+        Op::MStack(ops::MStack { buffers }) => {
             for buffer in buffers {
                 collect_source_dependency_callable_ids(buffer, out)?;
             }
             Ok(())
         }
-        Op::MSelect { buffer, .. } => collect_source_dependency_callable_ids(buffer, out),
-        Op::Buffer { .. } | Op::Param { .. } | Op::Bind { .. } => Ok(()),
+        Op::MSelect(ops::MSelect { buffer, .. }) => collect_source_dependency_callable_ids(buffer, out),
+        Op::Buffer(..) | Op::Param(..) | Op::Bind(..) => Ok(()),
         other => IrConstructionSnafu {
             details: format!("input to callable must resolve to AFTER/BUFFER/PARAM/MSELECT/MSTACK/BIND, got {other:?}"),
         }
@@ -317,7 +319,7 @@ fn collect_source_dependency_callable_ids(src: &Arc<UOp>, out: &mut HashSet<u64>
 
 fn callable_sources(callable: &Arc<UOp>) -> Option<Vec<Arc<UOp>>> {
     match callable.op() {
-        Op::Call { args, .. } => Some(args.iter().cloned().collect()),
+        Op::Call(ops::Call { args, .. }) => Some(args.iter().cloned().collect()),
         _ => None,
     }
 }
@@ -330,12 +332,12 @@ fn callable_sources(callable: &Arc<UOp>) -> Option<Vec<Arc<UOp>>> {
 fn collect_scheduled_range_ids(root: &Arc<UOp>, callable_ids: &HashSet<u64>) -> HashSet<u64> {
     let mut ids = HashSet::new();
     for node in root.toposort_call_aware(false) {
-        let Op::End { computation, ranges } = node.op() else { continue };
-        if !matches!(computation.op(), Op::Call { .. }) || !callable_ids.contains(&computation.id) {
+        let Op::End(ops::End { computation, ranges }) = node.op() else { continue };
+        if !matches!(computation.op(), Op::Call(..)) || !callable_ids.contains(&computation.id) {
             continue;
         }
         for r in ranges {
-            if matches!(r.op(), Op::Range { .. }) {
+            if matches!(r.op(), Op::Range(..)) {
                 ids.insert(r.id);
             }
         }
@@ -344,22 +346,22 @@ fn collect_scheduled_range_ids(root: &Arc<UOp>, callable_ids: &HashSet<u64>) -> 
 }
 
 fn collect_call_bound_ranges(callable: &Arc<UOp>, scheduled_range_ids: &HashSet<u64>) -> Result<Vec<BoundRangeRef>> {
-    let Op::Call { args, .. } = callable.op() else {
+    let Op::Call(ops::Call { args, .. }) = callable.op() else {
         return ExpectedCallableOpSnafu.fail();
     };
 
     let mut bound_ranges = Vec::new();
     for arg in args {
-        let Op::Bind { var, value } = arg.op() else {
+        let Op::Bind(ops::Bind { var, value }) = arg.op() else {
             continue;
         };
-        let Op::Range { .. } = value.op() else {
+        let Op::Range(..) = value.op() else {
             // User variable binds (`BIND(variable, CONST)`) are not schedule loops.
             continue;
         };
         let name = match var.op() {
-            Op::DefineVar { name, .. } => name,
-            Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.as_ref().ok_or_else(|| {
+            Op::DefineVar(ops::DefineVar { name, .. }) => name,
+            Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => arg.name.as_ref().ok_or_else(|| {
                 Error::IrConstruction { details: "CALL BIND scalar PARAM source must have a name".to_string() }
             })?,
             _ => {
@@ -388,18 +390,18 @@ fn collect_linear_sched_ops_internal(
 
     for node in root.toposort_call_aware(false) {
         match node.op() {
-            Op::Range { .. } if scheduled_range_ids.contains(&node.id) => {
+            Op::Range(..) if scheduled_range_ids.contains(&node.id) => {
                 linear_ops.push(LinearSchedOp::Range { range: node.clone() });
             }
-            Op::Call { .. } if callable_ids.contains(&node.id) => {
+            Op::Call(..) if callable_ids.contains(&node.id) => {
                 linear_ops.push(LinearSchedOp::Call { kernel_id: node.id });
             }
-            Op::End { computation, ranges } if matches!(computation.op(), Op::Call { .. }) => {
+            Op::End(ops::End { computation, ranges }) if matches!(computation.op(), Op::Call(..)) => {
                 if !callable_ids.contains(&computation.id) {
                     continue;
                 }
                 let wrapper_ranges: Vec<Arc<UOp>> =
-                    ranges.iter().filter(|r| matches!(r.op(), Op::Range { .. })).cloned().collect();
+                    ranges.iter().filter(|r| matches!(r.op(), Op::Range(..))).cloned().collect();
                 match wrapper_ranges.as_slice() {
                     [] => {}
                     [outer] => linear_ops.push(LinearSchedOp::End { range: outer.clone(), kernel_id: computation.id }),
@@ -599,15 +601,15 @@ fn analyze_callable_dependencies(callables: &[Arc<UOp>], root: &Arc<UOp>) -> Res
     // accumulator edges; those are the linearizer's concern, not callable
     // dependencies, and must not be validated by this grammar.
     for node in root.toposort_call_aware(false) {
-        let Op::After { .. } = node.op() else {
+        let Op::After(..) = node.op() else {
             continue;
         };
 
         let (kernels, after_deps) = split_after_dependencies(&node)?;
         for kernel in kernels {
             let callable = match kernel.op() {
-                Op::Call { .. } => kernel.clone(),
-                Op::End { computation, .. } => computation.clone(),
+                Op::Call(..) => kernel.clone(),
+                Op::End(ops::End { computation, .. }) => computation.clone(),
                 _ => unreachable!("split_after_dependencies only returns CALL/END(CALL) kernels"),
             };
 
@@ -866,7 +868,7 @@ pub fn create_pre_schedule(transformed: Arc<UOp>) -> Result<PreSchedule> {
     // Step 1: Find all callable wrappers (CALL) without descending into CALL bodies.
     let mut callables = Vec::new();
     for node in transformed.toposort_call_aware(false) {
-        if matches!(node.op(), Op::Call { .. }) {
+        if matches!(node.op(), Op::Call(..)) {
             callables.push(node);
         }
     }
@@ -887,7 +889,7 @@ pub fn create_pre_schedule(transformed: Arc<UOp>) -> Result<PreSchedule> {
     // Step 2: Build pre-schedule items (AST + sources + dependencies + bound ranges).
     let mut items = Vec::with_capacity(callables.len());
     for callable_uop in callables {
-        let Op::Call { body, args, .. } = callable_uop.op() else {
+        let Op::Call(ops::Call { body, args, .. }) = callable_uop.op() else {
             unreachable!("filtered to only call wrappers above")
         };
         let dependencies = dependency_ids_by_callable.get(&callable_uop.id).cloned().unwrap_or_default();
@@ -908,7 +910,7 @@ pub fn create_pre_schedule(transformed: Arc<UOp>) -> Result<PreSchedule> {
 
     // Output buffers in SINK source order.
     let output_buffer_uops: Vec<Arc<UOp>> = match transformed.op() {
-        Op::Sink { sources, .. } => sources.iter().map(|src| src.buf_uop()).collect(),
+        Op::Sink(ops::Sink { sources, .. }) => sources.iter().map(|src| src.buf_uop()).collect(),
         _ => vec![transformed.buf_uop()],
     };
 
@@ -954,11 +956,14 @@ pub fn instantiate_schedule(
         }
 
         let effect = match item.ast.op() {
-            Op::End { computation, .. } => computation,
+            Op::End(ops::End { computation, .. }) => computation,
             _ => &item.ast,
         };
-        let cross_device_effect = matches!(effect.op(), Op::Copy { .. })
-            || matches!(effect.op(), Op::CustomFunction { kind: CustomFunctionKind::AllReduce { .. }, .. });
+        let cross_device_effect = matches!(effect.op(), Op::Copy(..))
+            || matches!(
+                effect.op(),
+                Op::CustomFunction(ops::CustomFunction { kind: CustomFunctionKind::AllReduce { .. }, .. })
+            );
         if expansion.is_multi && !cross_device_effect {
             for (lane, kb) in lane_buffers.iter().enumerate() {
                 let mut expected: Option<svod_dtype::DeviceSpec> = None;
@@ -981,7 +986,7 @@ pub fn instantiate_schedule(
                 }
             }
         }
-        if let Op::Slice { offset, size, .. } = effect.op() {
+        if let Op::Slice(ops::Slice { offset, size, .. }) = effect.op() {
             let kb = lane_buffers.first_mut().expect("single-lane expansion always has one buffer set");
             let offset = match offset.op() {
                 Op::Const(value) => value.0.try_int().and_then(|value| usize::try_from(value).ok()),
@@ -1012,8 +1017,8 @@ pub fn instantiate_schedule(
             let ast_var_names: HashSet<&str> = nodes
                 .iter()
                 .filter_map(|n| match n.op() {
-                    Op::DefineVar { name, .. } => Some(name.as_str()),
-                    Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.as_deref(),
+                    Op::DefineVar(ops::DefineVar { name, .. }) => Some(name.as_str()),
+                    Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => arg.name.as_deref(),
                     _ => None,
                 })
                 .collect();
@@ -1204,7 +1209,7 @@ fn collect_callable_buffers(
         let canonical_src = canonicalize_callable_source(src);
 
         match canonical_src.op() {
-            Op::After { passthrough, .. } => {
+            Op::After(ops::After { passthrough, .. }) => {
                 // Shared buffer from producer kernel.
                 // Use buf_uop() to get underlying buffer ID (handles AFTER chains).
                 let buf_id = passthrough.buf_uop().id;
@@ -1229,7 +1234,7 @@ fn collect_callable_buffers(
                     return Err(Error::BufferNotFound { uop_id: buf_id });
                 }
             }
-            Op::MSelect { .. } | Op::MStack { .. } => {
+            Op::MSelect(..) | Op::MStack(..) => {
                 let Some(canonical_id) = source_primary_buffer_id(&canonical_src) else {
                     return IrConstructionSnafu {
                         details: format!(
@@ -1255,13 +1260,13 @@ fn collect_callable_buffers(
                 }
             }
             // LOCAL/REG BUFFERs are compiler-managed and never runtime arguments.
-            Op::Buffer { arg, .. } if arg.addrspace != Some(svod_ir::AddrSpace::Global) => {}
-            Op::Buffer { .. } | Op::Param { .. } => {
+            Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace != Some(svod_ir::AddrSpace::Global) => {}
+            Op::Buffer(..) | Op::Param(..) => {
                 let size = match canonical_src.op() {
-                    Op::Buffer { .. } => canonical_src.buffer_size().ok_or_else(|| Error::IrConstruction {
+                    Op::Buffer(..) => canonical_src.buffer_size().ok_or_else(|| Error::IrConstruction {
                         details: "BUFFER allocation requires a concrete shape".to_string(),
                     })?,
-                    Op::Param { .. } => canonical_src
+                    Op::Param(..) => canonical_src
                         .shape()
                         .ok()
                         .flatten()
@@ -1307,7 +1312,7 @@ fn collect_callable_buffers(
                     uop_ids.push(canonical_id);
                 }
             }
-            Op::Bind { .. } => {
+            Op::Bind(..) => {
                 // Variable binding - not a buffer, skip
                 continue;
             }
@@ -1347,7 +1352,7 @@ fn insert_fixedvar_checked(
 }
 
 fn schedule_range_bounds(range: &Arc<UOp>) -> Result<(i64, i64)> {
-    let Op::Range { .. } = range.op() else {
+    let Op::Range(..) = range.op() else {
         return IrConstructionSnafu {
             details: format!("expected RANGE for schedule loop control, got {:?}", range.op()),
         }

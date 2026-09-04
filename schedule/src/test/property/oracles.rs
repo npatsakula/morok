@@ -268,7 +268,7 @@ fn optimization_form(uop: &Arc<UOp>) -> (String, bool, bool, usize) {
 
     match uop.op() {
         Op::Const(_) => ("const".to_string(), true, false, 0),
-        Op::DefineVar { .. } => ("var".to_string(), false, true, 0),
+        Op::DefineVar(..) => ("var".to_string(), false, true, 0),
         Op::Unary(op, _) => (format!("unary_{:?}", op), false, false, 1),
         Op::Binary(op, _, _) => (format!("binary_{:?}", op), false, false, 2),
         Op::Ternary(op, _, _, _) => (format!("ternary_{:?}", op), false, false, 3),

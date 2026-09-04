@@ -17,6 +17,7 @@ use svod_ir::{BinaryOp, Op, UOp};
 use crate::arch::FragRole;
 use crate::tiles::TileLayout;
 use crate::{ArchCaps, Kernel, MoveIdx};
+use svod_ir::ops;
 
 const ROW: TileLayout = TileLayout::Row;
 
@@ -69,19 +70,16 @@ fn test_tile_add_graph_shape() {
     let topo = build_tile_add(&ker).toposort();
 
     assert!(
-        topo.iter().any(|u| matches!(u.op(), Op::Special { .. })),
+        topo.iter().any(|u| matches!(u.op(), Op::Special(..))),
         "a hand kernel mints a lane Special — it is a GPU kernel"
     );
     assert!(topo.iter().any(|u| matches!(u.op(), Op::Binary(BinaryOp::Add, ..))), "the elementwise add is present");
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Store { .. })), "the register→global store is present");
-    assert!(
-        !topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })),
-        "no matrix core: this is a plain elementwise kernel"
-    );
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::Store(..))), "the register→global store is present");
+    assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma(..))), "no matrix core: this is a plain elementwise kernel");
     assert!(
         !topo
             .iter()
-            .any(|u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
+            .any(|u| matches!(u.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
         "no LDS: the round-trip is register-only"
     );
 }

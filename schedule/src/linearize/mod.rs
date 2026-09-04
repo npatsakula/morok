@@ -55,6 +55,7 @@ use svod_ir::{DType, UOp};
 pub use cfg_context::CFGContext;
 pub use linearize::linearize;
 pub(crate) use linearize::{tinygrad_tuplize_cmp, tinygrad_weakint_expr};
+use svod_ir::ops;
 
 /// Split multi-range ENDs into nested single-range ENDs.
 ///
@@ -95,11 +96,11 @@ pub(crate) fn split_end_with_tag(
     // x.arg = (axis_id, axis_type, ...) -- tuple comparison gives lex ordering.
     sorted_ranges.sort_by(|a, b| {
         let (a_id, a_ty) = match a.op() {
-            Op::Range { axis_id, axis_type, .. } => (axis_id, axis_type.priority()),
+            Op::Range(ops::Range { axis_id, axis_type, .. }) => (axis_id, axis_type.priority()),
             _ => unreachable!("filtered to RANGEs only"),
         };
         let (b_id, b_ty) = match b.op() {
-            Op::Range { axis_id, axis_type, .. } => (axis_id, axis_type.priority()),
+            Op::Range(ops::Range { axis_id, axis_type, .. }) => (axis_id, axis_type.priority()),
             _ => unreachable!("filtered to RANGEs only"),
         };
         (b_id, b_ty).cmp(&(a_id, a_ty))
@@ -227,11 +228,11 @@ fn replace_sources_from_map(uop: &Arc<UOp>, replaced: &HashMap<u64, Arc<UOp>>) -
 ///
 /// The address may be INDEX/SHRINK or a Cast-wrapped INDEX/SHRINK.
 fn linearize_cleanup_pattern(uop: &Arc<UOp>, _replaced: &HashMap<u64, Arc<UOp>>) -> Option<(Arc<UOp>, Vec<Arc<UOp>>)> {
-    if matches!(uop.op(), Op::If { .. } | Op::EndIf { .. }) {
+    if matches!(uop.op(), Op::If(..) | Op::EndIf(..)) {
         panic!("if not allowed in graph");
     }
 
-    let Op::Store { index, value, gate: Some(gate) } = uop.op() else {
+    let Op::Store(ops::Store { index, value, gate: Some(gate) }) = uop.op() else {
         return None;
     };
     if gate.dtype() != svod_dtype::DType::Bool {
@@ -239,14 +240,15 @@ fn linearize_cleanup_pattern(uop: &Arc<UOp>, _replaced: &HashMap<u64, Arc<UOp>>)
     }
 
     let address_op = match index.op() {
-        Op::Cast { src, .. } => src.op(),
+        Op::Cast(ops::Cast { src, .. }) => src.op(),
         op => op,
     };
-    if !matches!(address_op, Op::Index { .. } | Op::Shrink { .. }) {
+    if !matches!(address_op, Op::Index(..) | Op::Shrink(..)) {
         return None;
     }
 
-    let ungated_store = UOp::new(Op::Store { index: index.clone(), value: value.clone(), gate: None }, uop.dtype());
+    let ungated_store =
+        UOp::new(Op::Store(ops::Store { index: index.clone(), value: value.clone(), gate: None }), uop.dtype());
     let if_op = UOp::if_(gate.clone(), smallvec![index.clone()]);
     let endif_op = UOp::endif(if_op.clone());
 

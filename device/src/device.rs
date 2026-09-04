@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
+use svod_ir::ops;
 use svod_ir::{
     BINARY_STAGE_IDENTITY_VERSION, BinaryOp, BinaryStageIdentity, ConstValue, Op, SOURCE_STAGE_IDENTITY_VERSION,
     SourceStageIdentity, StageAbiParam, StageAbiParamKind, StageDigest, TernaryOp, UOp, UnaryOp,
@@ -320,7 +321,7 @@ pub struct AbiParamDescriptor {
 
 impl AbiParamDescriptor {
     pub fn from_param(param: &Arc<UOp>) -> Result<Self> {
-        let Op::Param { arg, .. } = param.op() else {
+        let Op::Param(ops::Param { arg, .. }) = param.op() else {
             return Err(Error::ProgramAbiMismatch {
                 reason: format!("ABI descriptor source is non-PARAM {:?}", param.op()),
             });
@@ -430,7 +431,7 @@ pub fn binary_stage_identity(source: SourceStageIdentity, compiler_key: &str, by
 
 /// Validate a SOURCE UOp against an independently derived identity.
 pub fn validate_source_stage(source: &Arc<UOp>, expected: &SourceStageIdentity) -> Result<()> {
-    let Op::Source { code, identity } = source.op() else {
+    let Op::Source(ops::Source { code, identity }) = source.op() else {
         return Err(Error::ProgramStageMismatch {
             stage: "SOURCE",
             reason: format!("expected SOURCE, got {:?}", source.op()),
@@ -451,7 +452,7 @@ pub fn validate_source_stage(source: &Arc<UOp>, expected: &SourceStageIdentity) 
 
 /// Validate a BINARY UOp against an independently derived identity.
 pub fn validate_binary_stage(binary: &Arc<UOp>, expected: &BinaryStageIdentity) -> Result<Vec<u8>> {
-    let Op::ProgramBinary { bytes, identity } = binary.op() else {
+    let Op::ProgramBinary(ops::ProgramBinary { bytes, identity }) = binary.op() else {
         return Err(Error::ProgramStageMismatch {
             stage: "BINARY",
             reason: format!("expected BINARY, got {:?}", binary.op()),
@@ -843,7 +844,7 @@ fn checked_launch_ternary(op: TernaryOp, a: i64, b: i64, c: i64) -> Result<i64> 
 fn eval_launch_expr(expr: &Arc<UOp>, vars: &HashMap<&str, i64>) -> Result<i64> {
     match expr.op() {
         Op::Const(value) => const_value_to_i64(value.0),
-        Op::Param { arg, .. } if arg.addrspace.is_none() => {
+        Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => {
             let name = arg
                 .name
                 .as_deref()
@@ -858,9 +859,9 @@ fn eval_launch_expr(expr: &Arc<UOp>, vars: &HashMap<&str, i64>) -> Result<i64> {
             }
             Ok(value)
         }
-        Op::Bind { var, value } => {
+        Op::Bind(ops::Bind { var, value }) => {
             let bound = eval_launch_expr(value, vars)?;
-            if let Op::Param { arg, .. } = var.op()
+            if let Op::Param(ops::Param { arg, .. }) = var.op()
                 && let (Some(name), Some((min, max))) = (&arg.name, &arg.vmin_vmax)
                 && let (Some(min), Some(max)) = (min.0.try_int(), max.0.try_int())
             {
@@ -883,9 +884,9 @@ fn eval_launch_expr(expr: &Arc<UOp>, vars: &HashMap<&str, i64>) -> Result<i64> {
             eval_launch_expr(c, vars)?,
         ),
         Op::Unary(op, src) => checked_launch_unary(*op, eval_launch_expr(src, vars)?),
-        Op::Cast { src, .. } | Op::BitCast { src, .. } | Op::After { passthrough: src, .. } => {
-            eval_launch_expr(src, vars)
-        }
+        Op::Cast(ops::Cast { src, .. })
+        | Op::BitCast(ops::BitCast { src, .. })
+        | Op::After(ops::After { passthrough: src, .. }) => eval_launch_expr(src, vars),
         other => Err(Error::Runtime { message: format!("unsupported launch-size expression op: {other:?}") }),
     }
 }
@@ -1243,8 +1244,8 @@ impl ProgramSpec {
     fn same_param_semantics(actual: &Arc<UOp>, expected: &Arc<UOp>) -> bool {
         match (actual.op(), expected.op()) {
             (
-                Op::Param { shape: actual_shape, arg: actual_arg },
-                Op::Param { shape: expected_shape, arg: expected_arg },
+                Op::Param(ops::Param { shape: actual_shape, arg: actual_arg }),
+                Op::Param(ops::Param { shape: expected_shape, arg: expected_arg }),
             ) => {
                 actual.dtype() == expected.dtype()
                     && actual_arg == expected_arg
@@ -1263,17 +1264,17 @@ impl ProgramSpec {
         let executable_ids = executable.iter().map(|node| node.id).collect::<std::collections::HashSet<_>>();
 
         for node in &executable {
-            if let Op::Special { name, .. } = node.op()
+            if let Op::Special(ops::Special { name, .. }) = node.op()
                 && !matches!(name.chars().last().and_then(|axis| axis.to_digit(10)), Some(0..=2))
             {
                 return Err(Error::ProgramAbiMismatch { reason: format!("invalid SPECIAL axis name {name:?}") });
             }
             let body = match node.op() {
-                Op::Call { body, .. } | Op::Function { body, .. } => body,
+                Op::Call(ops::Call { body, .. }) | Op::Function(ops::Function { body, .. }) => body,
                 _ => continue,
             };
             for formal in body.toposort_call_aware(true) {
-                if matches!(formal.op(), Op::Param { .. }) && executable_ids.contains(&formal.id) {
+                if matches!(formal.op(), Op::Param(..)) && executable_ids.contains(&formal.id) {
                     return Err(Error::LeakedOpaqueProgramParam {
                         param: format!("UOp {} {:?}", formal.id, formal.op()),
                     });
@@ -1283,7 +1284,7 @@ impl ProgramSpec {
 
         let mut abi = Vec::new();
         for node in executable {
-            let Op::Param { arg, .. } = node.op() else { continue };
+            let Op::Param(ops::Param { arg, .. }) = node.op() else { continue };
             let descriptor = AbiParamDescriptor::from_param(&node)?;
             let class = format!("{:?} {:?}", descriptor.kind, descriptor.name);
             if let Some(first) = occupied.insert(arg.slot, class.clone()) {
@@ -1437,12 +1438,12 @@ impl ProgramSpec {
     ///
     /// Validates PROGRAM stage shape and derives metadata from PROGRAM itself.
     pub fn from_uop(program: &Arc<UOp>) -> Result<Self> {
-        let Op::Program { sink, info, linear, source, binary } = program.op() else {
+        let Op::Program(ops::Program { sink, info, linear, source, binary }) = program.op() else {
             return WrongStageSnafu { expected: "PROGRAM", got: format!("{:?}", program.op()) }.fail();
         };
 
         snafu::ensure!(
-            matches!(sink.op(), Op::Sink { .. }),
+            matches!(sink.op(), Op::Sink(..)),
             WrongStageSnafu { expected: "PROGRAM sink stage SINK", got: format!("{:?}", sink.op()) }
         );
 
@@ -1450,7 +1451,7 @@ impl ProgramSpec {
             .as_ref()
             .context(WrongStageSnafu { expected: "PROGRAM LINEAR stage", got: "missing".to_string() })?;
         snafu::ensure!(
-            matches!(linear.op(), Op::Linear { .. }),
+            matches!(linear.op(), Op::Linear(..)),
             WrongStageSnafu { expected: "PROGRAM linear stage LINEAR", got: format!("{:?}", linear.op()) }
         );
 
@@ -1458,7 +1459,7 @@ impl ProgramSpec {
             .as_ref()
             .context(WrongStageSnafu { expected: "PROGRAM SOURCE stage", got: "missing".to_string() })?;
         let source_code = match source.op() {
-            Op::Source { code, .. } => code.clone(),
+            Op::Source(ops::Source { code, .. }) => code.clone(),
             other => {
                 return WrongStageSnafu { expected: "PROGRAM source stage SOURCE", got: format!("{other:?}") }.fail();
             }
@@ -1469,7 +1470,7 @@ impl ProgramSpec {
         validate_source_stage(source, &expected_source)?;
 
         if let Some(binary) = binary {
-            let Op::ProgramBinary { bytes, identity } = binary.op() else {
+            let Op::ProgramBinary(ops::ProgramBinary { bytes, identity }) = binary.op() else {
                 return WrongStageSnafu {
                     expected: "PROGRAM binary stage ProgramBinary",
                     got: format!("{:?}", binary.op()),
@@ -1494,7 +1495,7 @@ impl ProgramSpec {
             .vars
             .iter()
             .filter_map(|u| match u.op() {
-                Op::Param { arg, .. } => Some(Variable::new(
+                Op::Param(ops::Param { arg, .. }) => Some(Variable::new(
                     arg.name.clone().unwrap_or_else(|| format!("p{}", arg.slot)),
                     arg.vmin_vmax
                         .as_ref()

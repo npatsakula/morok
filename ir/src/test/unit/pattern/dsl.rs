@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use crate::ops;
 use crate::pattern::RewriteResult;
 use crate::rewrite::graph_rewrite;
 use crate::types::{AddrSpace, BufferizeOpts, ReduceOp};
@@ -157,7 +158,7 @@ fn struct_patterns_bind_non_source_fields() {
     assert_no_match(matcher.rewrite(&x_int.cast(DType::Int64), &mut ()));
 
     let x = UOp::native_const(1.0f32);
-    let permute = |axes: Vec<usize>| UOp::new(Op::Permute { src: x.clone(), axes }, DType::Float32);
+    let permute = |axes: Vec<usize>| UOp::new(Op::Permute(ops::Permute { src: x.clone(), axes }), DType::Float32);
     assert_rewrites_to(matcher.rewrite(&permute(vec![1, 0]), &mut ()), &x);
     assert_no_match(matcher.rewrite(&permute(vec![2, 0, 1]), &mut ()));
 }
@@ -319,10 +320,10 @@ fn const_value_is_extracted_from_the_binding() {
 fn rest_pattern_matches_any_arity() {
     let matcher = patterns! {
         end_op @ End(_, ..) ~> {
-            let Op::End { computation, .. } = end_op.op() else { unreachable!() };
+            let Op::End(ops::End { computation, .. }) = end_op.op() else { unreachable!() };
             Arc::clone(computation)
         },
-        reduce_op @ Reduce(_, ..) if matches!(reduce_op.op(), Op::Reduce { reduce_op: ReduceOp::Add, .. })
+        reduce_op @ Reduce(_, ..) if matches!(reduce_op.op(), Op::Reduce(ops::Reduce { reduce_op: ReduceOp::Add, .. }))
             ~> UOp::const_(reduce_op.dtype(), ConstValue::Int(99)),
     };
 

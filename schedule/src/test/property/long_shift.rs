@@ -17,6 +17,7 @@ use svod_ir::{Op, UOp};
 
 use crate::devectorize::pm_long_decomp;
 use crate::test::unit::devectorize::helpers::create_buffer_typed;
+use svod_ir::ops;
 
 /// Fold a fully constant word expression, mirroring what the backend would compute.
 fn eval_word(expr: &Arc<UOp>) -> Option<ConstValue> {
@@ -26,7 +27,9 @@ fn eval_word(expr: &Arc<UOp>) -> Option<ConstValue> {
         Op::Unary(op, src) => eval_unary_op_typed(*op, eval_word(src)?, dtype),
         Op::Binary(op, lhs, rhs) => eval_binary_op_typed(*op, eval_word(lhs)?, eval_word(rhs)?, dtype),
         Op::Ternary(op, a, b, c) => eval_ternary_op_typed(*op, eval_word(a)?, eval_word(b)?, eval_word(c)?, dtype),
-        Op::Cast { src, .. } | Op::BitCast { src, .. } => Some(reinterpret(eval_word(src)?, dtype)),
+        Op::Cast(ops::Cast { src, .. }) | Op::BitCast(ops::BitCast { src, .. }) => {
+            Some(reinterpret(eval_word(src)?, dtype))
+        }
         _ => None,
     }
 }
@@ -80,8 +83,8 @@ pub fn split_store(from: ScalarDType, at: i64, value: Arc<UOp>) -> [(u32, i64); 
 
     let mut words = [None; 2];
     for node in decomposed.toposort() {
-        let Op::Store { index, value, .. } = node.op() else { continue };
-        let Op::Index { indices, .. } = index.op() else { panic!("a split store addresses an INDEX") };
+        let Op::Store(ops::Store { index, value, .. }) = node.op() else { continue };
+        let Op::Index(ops::Index { indices, .. }) = index.op() else { panic!("a split store addresses an INDEX") };
         let address = eval_word(indices.last().expect("INDEX carries an index")).expect("address must fold");
         let word = node.tag().as_ref().expect("split store is word-tagged")[1];
         words[word] = Some((

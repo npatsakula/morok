@@ -6,6 +6,7 @@ use std::f64::consts::PI;
 
 use svod_dtype::DType;
 
+use crate::ops;
 use crate::{ReduceOp, UOp};
 
 // =========================================================================
@@ -66,7 +67,7 @@ fn test_reduce_axis_full_reduction_is_leading_tensor_reduce() {
     let result = shaped.try_reduce_axis(ReduceOp::Add, vec![0, 1]).unwrap();
 
     assert_eq!(result.dtype(), shaped.dtype());
-    assert!(matches!(result.op(), crate::Op::Reduce { src, ranges, num_axes: 2, .. }
+    assert!(matches!(result.op(), crate::Op::Reduce(ops::Reduce { src, ranges, num_axes: 2, .. })
         if std::sync::Arc::ptr_eq(src, &shaped) && ranges.is_empty()));
     assert!(result.shape().unwrap().unwrap().is_empty());
 }
@@ -85,7 +86,9 @@ fn test_reduce_axis_size_one_dims_filtered() {
     let result = shaped.try_reduce_axis(ReduceOp::Add, vec![0, 2]).unwrap();
 
     assert_eq!(result.dtype(), shaped.dtype());
-    assert!(matches!(result.op(), crate::Op::Reshape { src, .. } if std::sync::Arc::ptr_eq(src, &shaped)));
+    assert!(
+        matches!(result.op(), crate::Op::Reshape(ops::Reshape { src, .. }) if std::sync::Arc::ptr_eq(src, &shaped))
+    );
     assert_eq!(result.shape().unwrap().unwrap().as_slice(), &[SInt::Const(3), SInt::Const(4)]);
 }
 
@@ -103,10 +106,14 @@ fn test_reduce_axis_mixed_size_dims() {
 
     let result = shaped.try_reduce_axis(ReduceOp::Add, vec![0, 1, 2]).unwrap();
 
-    let Op::Reshape { src: reduced, .. } = result.op() else { panic!("expected singleton-removing RESHAPE") };
-    let Op::Reduce { src: permuted, ranges, num_axes: 1, .. } = reduced.op() else { panic!("expected tensor REDUCE") };
+    let Op::Reshape(ops::Reshape { src: reduced, .. }) = result.op() else {
+        panic!("expected singleton-removing RESHAPE")
+    };
+    let Op::Reduce(ops::Reduce { src: permuted, ranges, num_axes: 1, .. }) = reduced.op() else {
+        panic!("expected tensor REDUCE")
+    };
     assert!(ranges.is_empty());
-    assert!(matches!(permuted.op(), Op::Permute { src, axes }
+    assert!(matches!(permuted.op(), Op::Permute(ops::Permute { src, axes })
         if std::sync::Arc::ptr_eq(src, &shaped) && axes == &[1, 0, 2, 3]));
     assert_eq!(result.shape().unwrap().unwrap().as_slice(), &[SInt::Const(4)]);
 }

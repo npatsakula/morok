@@ -18,7 +18,7 @@ fn count_kernels(t: &Tensor) -> usize {
     let sink = UOp::sink(vec![t.uop().contiguous()]);
     let rangeified = svod_schedule::rangeify_with_map(sink).expect("rangeify");
     let (kernels, _) = svod_schedule::try_get_kernel_graph(rangeified.sink).expect("kernel graph");
-    kernels.toposort_call_aware(false).iter().filter(|n| matches!(n.op(), Op::Call { .. })).count()
+    kernels.toposort_call_aware(false).iter().filter(|n| matches!(n.op(), Op::Call(..))).count()
 }
 
 fn f32_in(shape: &[usize]) -> Tensor {

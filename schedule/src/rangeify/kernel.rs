@@ -19,6 +19,7 @@ use svod_ir::{CallInfo, Op, SInt, UOp, UOpKey};
 use tracing::{debug, trace};
 
 pub use svod_ir::KernelInfo;
+use svod_ir::ops;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -138,7 +139,7 @@ impl RangeifyBufferContext {
     /// Track a bound variable UOp and its concrete value.
     pub fn add_var(&mut self, var: Arc<UOp>, value: Option<i64>) {
         let name = match var.op() {
-            Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.clone(),
+            Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => arg.name.clone(),
             _ => None,
         };
         if let Some(name) = name {
@@ -204,7 +205,7 @@ impl LocalAddBufferContext {
     /// Track a bound variable and its binding source.
     pub fn add_var(&mut self, binding: Arc<UOp>, var: Arc<UOp>, value: Option<i64>) {
         let var_name = |uop: &Arc<UOp>| match uop.op() {
-            Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.clone(),
+            Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => arg.name.clone(),
             _ => None,
         };
         if let Some(name) = var_name(&var) {
@@ -239,9 +240,9 @@ impl LocalAddBufferContext {
 /// the entire subgraph.
 fn extract_stored_value(ret: &Arc<UOp>) -> &Arc<UOp> {
     match ret.op() {
-        Op::Store { value, .. } => value,
-        Op::End { computation, .. } => match computation.op() {
-            Op::Store { value, .. } => value,
+        Op::Store(ops::Store { value, .. }) => value,
+        Op::End(ops::End { computation, .. }) => match computation.op() {
+            Op::Store(ops::Store { value, .. }) => value,
             _ => ret,
         },
         _ => ret,
@@ -250,8 +251,8 @@ fn extract_stored_value(ret: &Arc<UOp>) -> &Arc<UOp> {
 
 fn extract_after_callable(deps: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
     deps.iter().find_map(|d| match d.op() {
-        Op::Call { .. } => Some(d.clone()),
-        Op::End { computation, .. } if matches!(computation.op(), Op::Call { .. }) => Some(computation.clone()),
+        Op::Call(..) => Some(d.clone()),
+        Op::End(ops::End { computation, .. }) if matches!(computation.op(), Op::Call(..)) => Some(computation.clone()),
         _ => None,
     })
 }
@@ -272,15 +273,15 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     if x.ranges()
         .into_iter()
         .filter(|range| scope.contains(&range.id))
-        .any(|range| !matches!(range.op(), Op::Range { axis_type: svod_ir::AxisType::Device, .. }))
+        .any(|range| !matches!(range.op(), Op::Range(ops::Range { axis_type: svod_ir::AxisType::Device, .. })))
     {
         return None;
     }
 
     // Verify operation type (only STORE and END(STORE) are valid)
     let is_valid = match x.op() {
-        Op::Store { .. } => true,
-        Op::End { computation, .. } => matches!(computation.op(), Op::Store { .. }),
+        Op::Store(..) => true,
+        Op::End(ops::End { computation, .. }) => matches!(computation.op(), Op::Store(..)),
         _ => false,
     };
     if !is_valid {
@@ -303,14 +304,14 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
         graph_rewrite_bottom_up(&*PM_CTX_DEP, x.clone(), &mut lctx)
     };
     let closed_ranges = match ret.op() {
-        Op::End { ranges, .. } if !ranges.is_empty() => Some(ranges.clone()),
+        Op::End(ops::End { ranges, .. }) if !ranges.is_empty() => Some(ranges.clone()),
         _ => None,
     };
 
     // Check for COPY/SLICE directly on the stored value.
     // No graph traversal needed — just walk the STORE/END structure.
     let stored = extract_stored_value(&ret);
-    let ast = if matches!(stored.op(), Op::Copy { .. } | Op::Slice { .. }) {
+    let ast = if matches!(stored.op(), Op::Copy(..) | Op::Slice(..)) {
         // Keep host-side effects as direct call bodies.
         if let Some(ranges) = &closed_ranges { stored.end(ranges.clone()) } else { stored.clone() }
     } else {
@@ -344,14 +345,14 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// compiles for one device and is handed the other device's pointer.
 fn validate_normal_kernel_devices(root: &Arc<UOp>) -> svod_ir::Result<()> {
     for node in root.toposort() {
-        let Op::Call { body, args, .. } = node.op() else { continue };
-        if !matches!(body.op(), Op::Sink { .. }) {
+        let Op::Call(ops::Call { body, args, .. }) = node.op() else { continue };
+        if !matches!(body.op(), Op::Sink(..)) {
             continue;
         }
 
         let mut devices: Vec<svod_dtype::DeviceSpec> = Vec::new();
         for arg in args {
-            if matches!(arg.op(), Op::Bind { .. }) {
+            if matches!(arg.op(), Op::Bind(..)) {
                 continue;
             }
             let Some(device) = arg.device_spec() else { continue };
@@ -379,17 +380,17 @@ fn fix_assign(root: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
     let mut kernel_assign: HashMap<u64, Arc<UOp>> = HashMap::new();
     let mut assign_rep: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
-    let afters: Vec<Arc<UOp>> = root.toposort().into_iter().filter(|u| matches!(u.op(), Op::After { .. })).collect();
+    let afters: Vec<Arc<UOp>> = root.toposort().into_iter().filter(|u| matches!(u.op(), Op::After(..))).collect();
 
     for u in &afters {
-        let Op::After { passthrough, .. } = u.op() else {
+        let Op::After(ops::After { passthrough, .. }) = u.op() else {
             continue;
         };
         kernel_assign.insert(passthrough.buf_uop().id, u.clone());
     }
 
     for u in afters {
-        let Op::After { passthrough, deps } = u.op() else {
+        let Op::After(ops::After { passthrough, deps }) = u.op() else {
             continue;
         };
 
@@ -401,14 +402,14 @@ fn fix_assign(root: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
             continue;
         };
 
-        let Op::Call { args, .. } = callable.op() else {
+        let Op::Call(ops::Call { args, .. }) = callable.op() else {
             continue;
         };
         let sources: SmallVec<[Arc<UOp>; 4]> = args.clone();
 
         for s in &sources {
             // Check kernel sources for buffer dependencies
-            if !matches!(s.op(), Op::Buffer { .. } | Op::Param { .. }) {
+            if !matches!(s.op(), Op::Buffer(..) | Op::Param(..)) {
                 continue;
             }
             let s_buf_id = s.buf_uop().id;
@@ -422,7 +423,7 @@ fn fix_assign(root: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
             // Same-kernel check by callable identity. Skip if both AFTERs
             // belong to the same callable — avoids spurious WAR deps between
             // outputs of the same multi-output kernel.
-            if let Op::After { deps: a_deps, .. } = a.op()
+            if let Op::After(ops::After { deps: a_deps, .. }) = a.op()
                 && let Some(a_callable) = extract_after_callable(a_deps)
                 && Arc::ptr_eq(&a_callable, &callable)
             {
@@ -430,7 +431,7 @@ fn fix_assign(root: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
             }
 
             // Cycle detection
-            if u.any_in_subtree(|x| matches!(x.op(), Op::After { .. }) && x.buf_uop().id == s_buf_id) {
+            if u.any_in_subtree(|x| matches!(x.op(), Op::After(..)) && x.buf_uop().id == s_buf_id) {
                 return Err(svod_ir::Error::KernelSplitDependencyCycle {
                     writer_buffer: buf_id,
                     read_buffer: s_buf_id,
@@ -438,7 +439,7 @@ fn fix_assign(root: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
             }
 
             // Add dependency: a.replace(src=a.src+(u,))
-            if let Op::After { passthrough: a_passthrough, deps: a_deps } = a.op() {
+            if let Op::After(ops::After { passthrough: a_passthrough, deps: a_deps }) = a.op() {
                 let mut new_deps = a_deps.clone();
                 new_deps.push(u.clone());
                 let new_a = a_passthrough.after(new_deps);
@@ -483,7 +484,7 @@ pub fn try_get_kernel_graph(root: Arc<UOp>) -> Result<(Arc<UOp>, RangeifyBufferC
             let mut matcher = pm_add_buffers_patterns().clone();
             // Skip the SINK subtree of an already-formed kernel AST.
             matcher.add(&[OpKey::Sink], |node, _ctx| {
-                if matches!(node.op(), Op::Sink { info: Some(_), .. }) {
+                if matches!(node.op(), Op::Sink(ops::Sink { info: Some(_), .. })) {
                     RewriteResult::Gate(node.clone())
                 } else {
                     RewriteResult::NoMatch
@@ -544,12 +545,12 @@ fn split_all_stores(root: &Arc<UOp>) -> Arc<UOp> {
         @context Vec<Arc<UOp>>;
         node @ Store { index: _, value: _ } => |node, ctx| split_store(ctx, node),
         node @ End { computation, .. }
-            if matches!(computation.op(), Op::Store { .. } | Op::End { .. })
+            if matches!(computation.op(), Op::Store(..) | Op::End(..))
             => |node, ctx| split_store(ctx, node),
     };
     // Skip the SINK subtree of an already-formed kernel AST.
     matcher.add(&[OpKey::Sink], |node, _ctx| {
-        if matches!(node.op(), Op::Sink { info: Some(_), .. }) {
+        if matches!(node.op(), Op::Sink(ops::Sink { info: Some(_), .. })) {
             RewriteResult::Gate(node.clone())
         } else {
             RewriteResult::NoMatch
@@ -569,7 +570,9 @@ pub fn collect_range_ids(indexed: &Arc<UOp>) -> Vec<usize> {
     let mut range_ids: Vec<usize> = indexed
         .toposort()
         .into_iter()
-        .filter_map(|node| if let Op::Range { axis_id, .. } = node.op() { Some(axis_id.value()) } else { None })
+        .filter_map(
+            |node| if let Op::Range(ops::Range { axis_id, .. }) = node.op() { Some(axis_id.value()) } else { None },
+        )
         .collect();
 
     range_ids.sort_unstable();
@@ -630,7 +633,7 @@ fn find_split_candidates(
     is_expanded: &[bool],
     config: &SplitReduceOpConfig,
 ) -> Vec<SplitCandidate> {
-    let Op::Reduce { num_axes, .. } = reduce.op() else {
+    let Op::Reduce(ops::Reduce { num_axes, .. }) = reduce.op() else {
         return vec![];
     };
 
@@ -677,7 +680,7 @@ fn apply_split_transformation(
     candidate: &SplitCandidate,
     input_shape: &[SInt],
 ) -> Option<Arc<UOp>> {
-    let Op::Reduce { reduce_op, num_axes, .. } = reduce.op() else {
+    let Op::Reduce(ops::Reduce { reduce_op, num_axes, .. }) = reduce.op() else {
         return None;
     };
 
@@ -723,7 +726,7 @@ pub fn split_reduceop(reduce: &Arc<UOp>, config: &SplitReduceOpConfig) -> Option
         return None;
     }
 
-    let Op::Reduce { src: source, ranges, num_axes, .. } = reduce.op() else {
+    let Op::Reduce(ops::Reduce { src: source, ranges, num_axes, .. }) = reduce.op() else {
         return None;
     };
     if *num_axes == 0 || !ranges.is_empty() {

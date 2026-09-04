@@ -10,6 +10,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use svod_dtype::{AddrSpace, DType, ImageKind, ScalarDType};
 
+use crate::ops;
 use crate::{AxisId, BinaryOp, ConstValue, Op, SInt, TernaryOp, UOp};
 
 /// Version of the canonical graph schema.
@@ -277,7 +278,7 @@ impl CanonicalGraph {
                     tag: format!("{:?}", node.tag()),
                     backend_dtype: format!("{:?}", node.dtype()),
                     content_xxh64: match node.op() {
-                        Op::ProgramBinary { bytes, .. } => {
+                        Op::ProgramBinary(ops::ProgramBinary { bytes, .. }) => {
                             Some(format!("0x{:016x}", xxhash_rust::xxh64::xxh64(bytes, 0)))
                         }
                         _ => None,
@@ -303,7 +304,7 @@ fn canonical_dependencies(node: &Arc<UOp>) -> crate::Result<Vec<Arc<UOp>>> {
             SInt::Const(_) | SInt::Infer => None,
         }));
     }
-    if let Op::Program { info, .. } = node.op() {
+    if let Op::Program(ops::Program { info, .. }) = node.op() {
         dependencies.extend(info.global_size.iter().filter(|value| !matches!(value.op(), Op::Const(_))).cloned());
         dependencies
             .extend(info.local_size.iter().flatten().filter(|value| !matches!(value.op(), Op::Const(_))).cloned());
@@ -317,7 +318,7 @@ fn canonical_sources(op: &Op) -> Vec<Arc<UOp>> {
         // PAD's other two UOps are representation-specific metadata: Svod
         // stores begin/end padding while Tinygrad stores begin/output extent.
         // The logical values are retained in CanonicalArg::Pad below.
-        Op::Pad { src, .. } => vec![src.clone()],
+        Op::Pad(ops::Pad { src, .. }) => vec![src.clone()],
         _ => op.sources().into_vec(),
     }
 }
@@ -537,7 +538,7 @@ fn canonical_param_slot(slot: usize) -> i128 {
 
 fn canonical_padding_values(value: &Arc<UOp>) -> crate::Result<Vec<usize>> {
     let values: Vec<_> = match value.op() {
-        Op::Stack { sources } => sources.iter().collect(),
+        Op::Stack(ops::Stack { sources }) => sources.iter().collect(),
         _ => vec![value],
     };
     values
@@ -577,20 +578,22 @@ fn canonical_arg(node: &Arc<UOp>, ids: &HashMap<u64, usize>, verbose: bool) -> c
                 detail: "UNIQUE/LUNIQUE allocation identities have no pinned Tinygrad semantic equivalent".into(),
             });
         }
-        Op::Sink { info: None, .. } => CanonicalArg::None,
-        Op::Sink { info: Some(info), .. } => CanonicalArg::Sink {
+        Op::Sink(ops::Sink { info: None, .. }) => CanonicalArg::None,
+        Op::Sink(ops::Sink { info: Some(info), .. }) => CanonicalArg::Sink {
             name: info.name.clone(),
             opts_to_apply: info.opts_to_apply.clone(),
             applied_opts: info.applied_opts.clone(),
             dont_use_locals: info.dont_use_locals,
         },
-        Op::Cast { dtype, .. } | Op::BitCast { dtype, .. } => CanonicalArg::DType { value: canonical_dtype(dtype) },
-        Op::MSelect { device_index, .. } => CanonicalArg::Index { value: *device_index },
-        Op::Special { name, .. } => CanonicalArg::Name { value: name.clone() },
-        Op::GetAddr { device, .. } => CanonicalArg::Device { name: device.canonicalize() },
-        Op::Copy { device, .. } => CanonicalArg::Device { name: device.canonicalize() },
-        Op::Param { arg, .. } | Op::Buffer { arg, .. } => CanonicalArg::Param {
-            slot: if matches!(node.op(), Op::Buffer { .. })
+        Op::Cast(ops::Cast { dtype, .. }) | Op::BitCast(ops::BitCast { dtype, .. }) => {
+            CanonicalArg::DType { value: canonical_dtype(dtype) }
+        }
+        Op::MSelect(ops::MSelect { device_index, .. }) => CanonicalArg::Index { value: *device_index },
+        Op::Special(ops::Special { name, .. }) => CanonicalArg::Name { value: name.clone() },
+        Op::GetAddr(ops::GetAddr { device, .. }) => CanonicalArg::Device { name: device.canonicalize() },
+        Op::Copy(ops::Copy { device, .. }) => CanonicalArg::Device { name: device.canonicalize() },
+        Op::Param(ops::Param { arg, .. }) | Op::Buffer(ops::Buffer { arg, .. }) => CanonicalArg::Param {
+            slot: if matches!(node.op(), Op::Buffer(..))
                 && node.tag().as_ref().is_some_and(|tags| tags.contains(&TAG_SCHEDULE_LOCAL_BUFFER))
             {
                 (arg.slot & (usize::MAX >> 1)) as i128
@@ -606,40 +609,40 @@ fn canonical_arg(node: &Arc<UOp>, ids: &HashMap<u64, usize>, verbose: bool) -> c
             device: arg.device.as_ref().map(|device| device.canonicalize()),
             volatile: arg.volatile,
         },
-        Op::Slice { size, .. } => CanonicalArg::Size { value: *size },
-        Op::Stage { opts, .. } => CanonicalArg::Stage {
+        Op::Slice(ops::Slice { size, .. }) => CanonicalArg::Size { value: *size },
+        Op::Stage(ops::Stage { opts, .. }) => CanonicalArg::Stage {
             device: opts.device.as_ref().map(|device| device.canonicalize()),
             local_axis: opts.local_axis.as_ref().map(canonical_axis),
             address_space: address_space_name(opts.addrspace),
             removable: opts.removable,
         },
-        Op::Permute { axes, .. } => CanonicalArg::Axes { values: axes.clone() },
-        Op::Flip { axes, .. } => CanonicalArg::BoolAxes { values: axes.clone() },
-        Op::Pad { begin_pads, end_pads, .. } => {
+        Op::Permute(ops::Permute { axes, .. }) => CanonicalArg::Axes { values: axes.clone() },
+        Op::Flip(ops::Flip { axes, .. }) => CanonicalArg::BoolAxes { values: axes.clone() },
+        Op::Pad(ops::Pad { begin_pads, end_pads, .. }) => {
             CanonicalArg::Pad { begin: canonical_padding_values(begin_pads)?, end: canonical_padding_values(end_pads)? }
         }
-        Op::Multi { axis, .. } => CanonicalArg::Index { value: *axis },
-        Op::ReduceAxis { reduce_op, axes, .. } => {
+        Op::Multi(ops::Multi { axis, .. }) => CanonicalArg::Index { value: *axis },
+        Op::ReduceAxis(ops::ReduceAxis { reduce_op, axes, .. }) => {
             CanonicalArg::Reduce { op: reduce_name(*reduce_op).to_string(), axes: Some(axes.clone()), num_axes: None }
         }
-        Op::Reduce { reduce_op, num_axes, .. } => {
+        Op::Reduce(ops::Reduce { reduce_op, num_axes, .. }) => {
             CanonicalArg::Reduce { op: reduce_name(*reduce_op).to_string(), axes: None, num_axes: Some(*num_axes) }
         }
-        Op::AllReduce { reduce_op, device, .. } => {
+        Op::AllReduce(ops::AllReduce { reduce_op, device, .. }) => {
             CanonicalArg::AllReduce { op: reduce_name(*reduce_op).to_string(), device: device.canonicalize() }
         }
-        Op::Range { axis_id, axis_type, .. } => CanonicalArg::Range {
+        Op::Range(ops::Range { axis_id, axis_type, .. }) => CanonicalArg::Range {
             axis: axis_id.path().to_vec(),
             renumbered: axis_id.is_renumbered(),
             axis_type: format!("{axis_type:?}").to_ascii_uppercase(),
         },
-        Op::VConst { values } => {
+        Op::VConst(ops::VConst { values }) => {
             CanonicalArg::Constants { values: values.iter().copied().map(canonical_const).collect() }
         }
-        Op::DefineVar { name, min_val, max_val } => {
+        Op::DefineVar(ops::DefineVar { name, min_val, max_val }) => {
             CanonicalArg::DefineVar { name: name.clone(), min: *min_val, max: *max_val }
         }
-        Op::Wmma { metadata, .. } => CanonicalArg::Wmma {
+        Op::Wmma(ops::Wmma { metadata, .. }) => CanonicalArg::Wmma {
             dims: metadata.dims,
             dtype_in: canonical_dtype(&metadata.dtype_in),
             dtype_out: canonical_dtype(&metadata.dtype_out),
@@ -649,7 +652,7 @@ fn canonical_arg(node: &Arc<UOp>, ids: &HashMap<u64, usize>, verbose: bool) -> c
             upcast_b: metadata.upcast_axes.as_ref().map_or_else(Vec::new, |axes| canonical_axis_extents(&axes.b)),
             upcast_c: metadata.upcast_axes.as_ref().map_or_else(Vec::new, |axes| canonical_axis_extents(&axes.c)),
         },
-        Op::Call { info, .. } | Op::Function { info, .. } => {
+        Op::Call(ops::Call { info, .. }) | Op::Function(ops::Function { info, .. }) => {
             if info.grad_tag.is_some() {
                 return Err(crate::Error::CanonicalSerialization {
                     detail: "Svod CallInfo.grad_tag has no pinned Tinygrad field".into(),
@@ -663,24 +666,30 @@ fn canonical_arg(node: &Arc<UOp>, ids: &HashMap<u64, usize>, verbose: bool) -> c
                 precompile_backward: info.precompile_backward,
             }
         }
-        Op::GetTuple { index, .. } => CanonicalArg::Index { value: *index },
-        Op::Source { code, .. } if verbose => CanonicalArg::Source { code: code.clone() },
-        Op::Source { .. } => {
+        Op::GetTuple(ops::GetTuple { index, .. }) => CanonicalArg::Index { value: *index },
+        Op::Source(ops::Source { code, .. }) if verbose => CanonicalArg::Source { code: code.clone() },
+        Op::Source(..) => {
             return Err(crate::Error::CanonicalSerialization {
                 detail: "SOURCE stage identity is not part of canonical v6; use verbose diagnostics".into(),
             });
         }
-        Op::ProgramBinary { bytes, .. } if verbose => CanonicalArg::Binary { length: bytes.len() },
-        Op::ProgramBinary { .. } => {
+        Op::ProgramBinary(ops::ProgramBinary { bytes, .. }) if verbose => CanonicalArg::Binary { length: bytes.len() },
+        Op::ProgramBinary(..) => {
             return Err(crate::Error::CanonicalSerialization {
                 detail: "BINARY content is diagnostics-only; use verbose canonical serialization".into(),
             });
         }
-        Op::Ins { arg, .. } => CanonicalArg::Ins { opcode: arg.opcode.clone(), attributes: arg.attributes.clone() },
-        Op::Contiguous { opts, .. } => CanonicalArg::Hints { values: opts.to_vec() },
-        Op::Custom { code, .. } | Op::CustomI { code, .. } => CanonicalArg::Code { value: code.clone() },
-        Op::CustomFunction { kind, .. } => CanonicalArg::CustomFunction { kind_name: format!("{kind:?}") },
-        Op::Program { info, .. } => CanonicalArg::Program {
+        Op::Ins(ops::Ins { arg, .. }) => {
+            CanonicalArg::Ins { opcode: arg.opcode.clone(), attributes: arg.attributes.clone() }
+        }
+        Op::Contiguous(ops::Contiguous { opts, .. }) => CanonicalArg::Hints { values: opts.to_vec() },
+        Op::Custom(ops::Custom { code, .. }) | Op::CustomI(ops::CustomI { code, .. }) => {
+            CanonicalArg::Code { value: code.clone() }
+        }
+        Op::CustomFunction(ops::CustomFunction { kind, .. }) => {
+            CanonicalArg::CustomFunction { kind_name: format!("{kind:?}") }
+        }
+        Op::Program(ops::Program { info, .. }) => CanonicalArg::Program {
             name: info.name.clone(),
             global_size: info
                 .global_size
@@ -710,26 +719,26 @@ fn canonical_arg(node: &Arc<UOp>, ids: &HashMap<u64, usize>, verbose: bool) -> c
         | Op::Unary(..)
         | Op::Binary(..)
         | Op::Ternary(..)
-        | Op::Group { .. }
-        | Op::Index { .. }
-        | Op::MStack { .. }
-        | Op::Stack { .. }
-        | Op::Reshape { .. }
-        | Op::Expand { .. }
-        | Op::Shrink { .. }
-        | Op::If { .. }
-        | Op::EndIf { .. }
-        | Op::End { .. }
-        | Op::Barrier { .. }
-        | Op::Bind { .. }
-        | Op::Tuple { .. }
-        | Op::Linear { .. }
-        | Op::Detach { .. }
-        | Op::ContiguousBackward { .. }
-        | Op::After { .. }
-        | Op::Precast { .. }
-        | Op::Load { .. }
-        | Op::Store { .. } => CanonicalArg::None,
+        | Op::Group(..)
+        | Op::Index(..)
+        | Op::MStack(..)
+        | Op::Stack(..)
+        | Op::Reshape(..)
+        | Op::Expand(..)
+        | Op::Shrink(..)
+        | Op::If(..)
+        | Op::EndIf(..)
+        | Op::End(..)
+        | Op::Barrier(..)
+        | Op::Bind(..)
+        | Op::Tuple(..)
+        | Op::Linear(..)
+        | Op::Detach(..)
+        | Op::ContiguousBackward(..)
+        | Op::After(..)
+        | Op::Precast(..)
+        | Op::Load(..)
+        | Op::Store(..) => CanonicalArg::None,
     })
 }
 
@@ -743,59 +752,59 @@ fn canonical_op_name(op: &Op) -> String {
             Op::Unique(_) => "UNIQUE",
             Op::LUnique(_) => "LUNIQUE",
             Op::Noop => "NOOP",
-            Op::Sink { .. } => "SINK",
-            Op::Group { .. } => "GROUP",
-            Op::Cast { .. } => "CAST",
-            Op::BitCast { .. } => "BITCAST",
-            Op::MSelect { .. } => "MSELECT",
-            Op::Special { .. } => "SPECIAL",
-            Op::Param { .. } => "PARAM",
-            Op::Buffer { .. } => "BUFFER",
-            Op::Slice { .. } => "SLICE",
-            Op::Stage { .. } => "STAGE",
-            Op::Index { .. } => "INDEX",
-            Op::GetAddr { .. } => "GETADDR",
-            Op::Copy { .. } => "COPY",
-            Op::MStack { .. } => "MSTACK",
-            Op::Stack { .. } => "STACK",
-            Op::Reshape { .. } => "RESHAPE",
-            Op::Permute { .. } => "PERMUTE",
-            Op::Expand { .. } => "EXPAND",
-            Op::Pad { .. } => "PAD",
-            Op::Shrink { .. } => "SHRINK",
-            Op::Flip { .. } => "FLIP",
-            Op::Multi { .. } => "MULTI",
-            Op::ReduceAxis { .. } => "REDUCE_AXIS",
-            Op::Reduce { .. } => "REDUCE",
-            Op::AllReduce { .. } => "ALLREDUCE",
-            Op::If { .. } => "IF",
-            Op::EndIf { .. } => "ENDIF",
-            Op::Range { .. } => "RANGE",
-            Op::End { .. } => "END",
-            Op::Barrier { .. } => "BARRIER",
-            Op::VConst { .. } => "VCONST",
-            Op::DefineVar { .. } => "DEFINE_VAR",
-            Op::Bind { .. } => "BIND",
-            Op::Wmma { .. } => "WMMA",
-            Op::Call { .. } => "CALL",
-            Op::Function { .. } => "FUNCTION",
-            Op::Tuple { .. } => "TUPLE",
-            Op::GetTuple { .. } => "GETTUPLE",
-            Op::Program { .. } => "PROGRAM",
-            Op::Linear { .. } => "LINEAR",
-            Op::Source { .. } => "SOURCE",
-            Op::ProgramBinary { .. } => "BINARY",
-            Op::Ins { .. } => "INS",
-            Op::Detach { .. } => "DETACH",
-            Op::Contiguous { .. } => "CONTIGUOUS",
-            Op::ContiguousBackward { .. } => "CONTIGUOUS_BACKWARD",
-            Op::After { .. } => "AFTER",
-            Op::Precast { .. } => "PRECAST",
-            Op::Custom { .. } => "CUSTOM",
-            Op::CustomFunction { .. } => "CUSTOM_FUNCTION",
-            Op::CustomI { .. } => "CUSTOMI",
-            Op::Load { .. } => "LOAD",
-            Op::Store { .. } => "STORE",
+            Op::Sink(..) => "SINK",
+            Op::Group(..) => "GROUP",
+            Op::Cast(..) => "CAST",
+            Op::BitCast(..) => "BITCAST",
+            Op::MSelect(..) => "MSELECT",
+            Op::Special(..) => "SPECIAL",
+            Op::Param(..) => "PARAM",
+            Op::Buffer(..) => "BUFFER",
+            Op::Slice(..) => "SLICE",
+            Op::Stage(..) => "STAGE",
+            Op::Index(..) => "INDEX",
+            Op::GetAddr(..) => "GETADDR",
+            Op::Copy(..) => "COPY",
+            Op::MStack(..) => "MSTACK",
+            Op::Stack(..) => "STACK",
+            Op::Reshape(..) => "RESHAPE",
+            Op::Permute(..) => "PERMUTE",
+            Op::Expand(..) => "EXPAND",
+            Op::Pad(..) => "PAD",
+            Op::Shrink(..) => "SHRINK",
+            Op::Flip(..) => "FLIP",
+            Op::Multi(..) => "MULTI",
+            Op::ReduceAxis(..) => "REDUCE_AXIS",
+            Op::Reduce(..) => "REDUCE",
+            Op::AllReduce(..) => "ALLREDUCE",
+            Op::If(..) => "IF",
+            Op::EndIf(..) => "ENDIF",
+            Op::Range(..) => "RANGE",
+            Op::End(..) => "END",
+            Op::Barrier(..) => "BARRIER",
+            Op::VConst(..) => "VCONST",
+            Op::DefineVar(..) => "DEFINE_VAR",
+            Op::Bind(..) => "BIND",
+            Op::Wmma(..) => "WMMA",
+            Op::Call(..) => "CALL",
+            Op::Function(..) => "FUNCTION",
+            Op::Tuple(..) => "TUPLE",
+            Op::GetTuple(..) => "GETTUPLE",
+            Op::Program(..) => "PROGRAM",
+            Op::Linear(..) => "LINEAR",
+            Op::Source(..) => "SOURCE",
+            Op::ProgramBinary(..) => "BINARY",
+            Op::Ins(..) => "INS",
+            Op::Detach(..) => "DETACH",
+            Op::Contiguous(..) => "CONTIGUOUS",
+            Op::ContiguousBackward(..) => "CONTIGUOUS_BACKWARD",
+            Op::After(..) => "AFTER",
+            Op::Precast(..) => "PRECAST",
+            Op::Custom(..) => "CUSTOM",
+            Op::CustomFunction(..) => "CUSTOM_FUNCTION",
+            Op::CustomI(..) => "CUSTOMI",
+            Op::Load(..) => "LOAD",
+            Op::Store(..) => "STORE",
             Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) => unreachable!(),
         }
         .to_string(),

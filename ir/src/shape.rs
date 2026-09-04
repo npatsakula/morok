@@ -16,6 +16,7 @@ use std::sync::Arc;
 use smallvec::{SmallVec, smallvec};
 use snafu::ensure;
 
+use crate::ops;
 use crate::{ConstValue, Op, Result, SInt, UOp, UOpKey, error::*};
 
 /// Shape type - sequence of symbolic integers.
@@ -314,13 +315,13 @@ fn extract_shape_from_uop(shape_uop: &Arc<UOp>) -> Option<Shape> {
         // A cast around an aggregate shape payload is representation-only. A
         // cast around a scalar expression is itself the symbolic dimension,
         // matching Tinygrad's shape_to_shape_arg/marg behavior.
-        Op::Cast { src, .. } | Op::BitCast { src, .. }
-            if matches!(src.op(), Op::Stack { .. } | Op::VConst { .. } | Op::Const(_)) =>
+        Op::Cast(ops::Cast { src, .. }) | Op::BitCast(ops::BitCast { src, .. })
+            if matches!(src.op(), Op::Stack(..) | Op::VConst(..) | Op::Const(_)) =>
         {
             extract_shape_from_uop(src)
         }
 
-        Op::Stack { sources } => Some(sources.iter().cloned().map(SInt::from).collect()),
+        Op::Stack(ops::Stack { sources }) => Some(sources.iter().cloned().map(SInt::from).collect()),
 
         // Single CONST value (for 1D shapes)
         Op::Const(const_hash) => match const_hash.0 {
@@ -330,7 +331,7 @@ fn extract_shape_from_uop(shape_uop: &Arc<UOp>) -> Option<Shape> {
         },
 
         // VConst for multiple concrete dimensions
-        Op::VConst { values } => {
+        Op::VConst(ops::VConst { values }) => {
             let mut dims = SmallVec::with_capacity(values.len());
             for val in values {
                 match val {
@@ -369,14 +370,14 @@ fn actual_for_formal(slot: usize, args: &[Arc<UOp>]) -> crate::Result<&Arc<UOp>>
 pub fn function_param_substitutions(body: &Arc<UOp>, args: &[Arc<UOp>]) -> crate::Result<HashMap<UOpKey, Arc<UOp>>> {
     let mut substitutions = HashMap::new();
     for formal in body.toposort_call_aware(false) {
-        let Op::Param { arg, .. } = formal.op() else { continue };
+        let Op::Param(ops::Param { arg, .. }) = formal.op() else { continue };
         if arg.slot == usize::MAX {
             continue;
         }
 
         let actual = actual_for_formal(arg.slot, args)?;
         let actual_axis = match actual.op() {
-            Op::Param { arg, .. } | Op::Buffer { arg, .. } => arg.axis,
+            Op::Param(ops::Param { arg, .. }) | Op::Buffer(ops::Buffer { arg, .. }) => arg.axis,
             _ => None,
         };
         if arg.axis != actual_axis {
@@ -419,7 +420,7 @@ pub fn substitute_selected_shape(shape: &Shape, _function: &Arc<UOp>, args: &[Ar
     for dim in shape {
         let SInt::Symbolic(expr) = dim else { continue };
         for formal in expr.toposort_call_aware(false) {
-            let Op::Param { arg, .. } = formal.op() else { continue };
+            let Op::Param(ops::Param { arg, .. }) = formal.op() else { continue };
             let actual = actual_for_formal(arg.slot, args)?;
             if actual.dtype() == svod_dtype::DType::Void {
                 return Err(crate::Error::CallShapeSubstitutionUnsupported {
@@ -434,7 +435,7 @@ pub fn substitute_selected_shape(shape: &Shape, _function: &Arc<UOp>, args: &[Ar
     let formal_ids: HashMap<u64, isize> = substitutions
         .keys()
         .map(|key| {
-            let Op::Param { arg, .. } = key.0.op() else { unreachable!("substitution key must be PARAM") };
+            let Op::Param(ops::Param { arg, .. }) = key.0.op() else { unreachable!("substitution key must be PARAM") };
             (key.0.id, display_slot(arg.slot))
         })
         .collect();
@@ -575,9 +576,9 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         // =====================================================================
         Op::Const(_) => Some(SmallVec::new()), // Scalar has empty shape
 
-        Op::VConst { .. } => None,
+        Op::VConst(..) => None,
 
-        Op::Stack { sources } => {
+        Op::Stack(ops::Stack { sources }) => {
             if sources.is_empty() {
                 Some(SmallVec::new())
             } else {
@@ -623,12 +624,12 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         // =====================================================================
         // Type operations
         // =====================================================================
-        Op::Cast { src, .. } => src.shape()?.cloned(),
+        Op::Cast(ops::Cast { src, .. }) => src.shape()?.cloned(),
         // BitCast: byte-reinterpretation. Same itemsize → same shape.
         // Different itemsize → adjust last dimension (Tinygrad tensor.py:3549-3568).
         // BitCast: byte-reinterpretation (Tinygrad ops.py:240-245).
         // Same itemsize → same shape. Different itemsize → adjust last dimension.
-        Op::BitCast { src, dtype } => {
+        Op::BitCast(ops::BitCast { src, dtype }) => {
             let src_shape = src.shape()?;
             match src_shape {
                 Some(shape) if !shape.is_empty() => {
@@ -652,23 +653,23 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         // =====================================================================
         // Movement operations
         // =====================================================================
-        Op::Reshape { new_shape, .. } => {
+        Op::Reshape(ops::Reshape { new_shape, .. }) => {
             // Extract shape from STACK/VCONST/CONST UOps.
             extract_shape_from_uop(new_shape)
         }
 
-        Op::Permute { axes, src } => {
+        Op::Permute(ops::Permute { axes, src }) => {
             let src_shape = src.shape()?.ok_or_else(|| crate::Error::VoidTypeInOp)?;
             // Reorder dimensions according to permutation
             Some(axes.iter().map(|&i| src_shape[i].clone()).collect())
         }
 
-        Op::Expand { new_shape, .. } => {
+        Op::Expand(ops::Expand { new_shape, .. }) => {
             // Extract shape from STACK/VCONST/CONST UOps.
             extract_shape_from_uop(new_shape)
         }
 
-        Op::Pad { src, begin_pads, end_pads } => {
+        Op::Pad(ops::Pad { src, begin_pads, end_pads }) => {
             let src_shape = src.shape()?.ok_or_else(|| crate::Error::VoidTypeInOp)?;
             let ranges = extract_ranges_from_uops(begin_pads, end_pads).ok_or_else(|| crate::Error::VoidTypeInOp)?;
 
@@ -686,7 +687,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             )
         }
 
-        Op::Shrink { src, offsets, sizes } => {
+        Op::Shrink(ops::Shrink { src, offsets, sizes }) => {
             let src_shape = src.shape()?.ok_or_else(|| crate::Error::VoidTypeInOp)?;
             let ranges = extract_ranges_from_uops(offsets, sizes).ok_or_else(|| crate::Error::VoidTypeInOp)?;
 
@@ -697,12 +698,12 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             Some(ranges.into_iter().map(|(_, size)| size).collect())
         }
 
-        Op::Flip { src, .. } => {
+        Op::Flip(ops::Flip { src, .. }) => {
             // Flip preserves shape
             src.shape()?.cloned()
         }
 
-        Op::Multi { src, .. } => {
+        Op::Multi(ops::Multi { src, .. }) => {
             // Multi scales the specified axis by device count
             // TODO: Need device count from somewhere - for now preserve shape
             // Tinygrad: tuple(s*len(self.device) if a == self.axis else s for a,s in enumerate(ps))
@@ -712,7 +713,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         // =====================================================================
         // Reduction operations
         // =====================================================================
-        Op::ReduceAxis { axes, src, .. } => {
+        Op::ReduceAxis(ops::ReduceAxis { axes, src, .. }) => {
             let src_shape = src.shape()?.ok_or_else(|| crate::Error::VoidTypeInOp)?;
             // Set reduced axes to 1 (don't remove them - matches Tinygrad)
             Some(
@@ -724,7 +725,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             )
         }
 
-        Op::Reduce { src, num_axes, .. } => {
+        Op::Reduce(ops::Reduce { src, num_axes, .. }) => {
             let src_shape = src.shape()?.ok_or_else(|| crate::Error::VoidTypeInOp)?;
             if *num_axes > src_shape.len() {
                 return Err(crate::Error::ReduceInvalidNumAxes { num_axes: *num_axes, shape_dims: src_shape.len() });
@@ -732,7 +733,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             Some(src_shape.iter().skip(*num_axes).cloned().collect())
         }
 
-        Op::AllReduce { src, .. } => {
+        Op::AllReduce(ops::AllReduce { src, .. }) => {
             // AllReduce preserves shape
             src.shape()?.cloned()
         }
@@ -740,23 +741,23 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         // =====================================================================
         // Buffer and memory operations - shape depends on buffer
         // =====================================================================
-        Op::Buffer { shape, .. } | Op::Param { shape, .. } => extract_shape_from_uop(shape),
-        Op::Slice { size, .. } => Some(smallvec![SInt::from(*size)]),
+        Op::Buffer(ops::Buffer { shape, .. }) | Op::Param(ops::Param { shape, .. }) => extract_shape_from_uop(shape),
+        Op::Slice(ops::Slice { size, .. }) => Some(smallvec![SInt::from(*size)]),
 
         // Passthrough operations
-        Op::Copy { src, .. } => src.shape()?.cloned(),
-        Op::MStack { buffers } => match buffers.first() {
+        Op::Copy(ops::Copy { src, .. }) => src.shape()?.cloned(),
+        Op::MStack(ops::MStack { buffers }) => match buffers.first() {
             Some(b) => b.shape()?.cloned(),
             None => None,
         },
 
         // STAGE prepends its closed range extents to the compute shape.
-        Op::Stage { compute, ranges, .. } => {
+        Op::Stage(ops::Stage { compute, ranges, .. }) => {
             let mut dims: Shape = SmallVec::new();
             for range in ranges.iter() {
                 match range.op() {
                     // Range: shape dim = end (the upper bound)
-                    Op::Range { end, .. } => {
+                    Op::Range(ops::Range { end, .. }) => {
                         // Try to get constant value from end
                         if let Op::Const(val) = end.op() {
                             match val.0 {
@@ -797,7 +798,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             Some(dims)
         }
 
-        Op::Index { buffer, indices } => {
+        Op::Index(ops::Index { buffer, indices }) => {
             let mut shape = Shape::new();
             for index in indices {
                 let Some(index_shape) = index.shape()? else { return Ok(None) };
@@ -807,33 +808,33 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             shape.extend(buffer_shape.iter().skip(indices.len()).cloned());
             Some(shape)
         }
-        Op::Load { index, .. } | Op::Store { index, .. } => index.shape()?.cloned(),
+        Op::Load(ops::Load { index, .. }) | Op::Store(ops::Store { index, .. }) => index.shape()?.cloned(),
 
         // =====================================================================
         // Control flow - no static shape
         // =====================================================================
-        Op::Range { .. } => Some(SmallVec::new()),
-        Op::If { .. } | Op::EndIf { .. } | Op::Barrier { .. } => None,
+        Op::Range(..) => Some(SmallVec::new()),
+        Op::If(..) | Op::EndIf(..) | Op::Barrier(..) => None,
 
         // End passes through the computation shape
-        Op::End { computation, .. } => computation.shape()?.cloned(),
+        Op::End(ops::End { computation, .. }) => computation.shape()?.cloned(),
 
         // =====================================================================
         // Special operations
         // =====================================================================
         // MSelect passes through buffer shape
-        Op::MSelect { buffer, .. } => buffer.shape()?.cloned(),
+        Op::MSelect(ops::MSelect { buffer, .. }) => buffer.shape()?.cloned(),
 
-        Op::Special { .. } => Some(SmallVec::new()),
+        Op::Special(..) => Some(SmallVec::new()),
 
-        Op::DefineVar { .. } => Some(SmallVec::new()), // Variable is scalar
+        Op::DefineVar(..) => Some(SmallVec::new()), // Variable is scalar
 
-        Op::Bind { value, .. } => value.shape()?.cloned(),
+        Op::Bind(ops::Bind { value, .. }) => value.shape()?.cloned(),
 
         // =====================================================================
         // Advanced operations
         // =====================================================================
-        Op::Wmma { a, b, c, .. } => {
+        Op::Wmma(ops::Wmma { a, b, c, .. }) => {
             let (Some(a_shape), Some(b_shape), Some(c_shape)) = (a.shape()?, b.shape()?, c.shape()?) else {
                 return Ok(None);
             };
@@ -846,26 +847,26 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             shape.push(c_width.clone());
             Some(shape)
         }
-        Op::Program { .. } | Op::Linear { .. } | Op::Source { .. } | Op::ProgramBinary { .. } => None,
+        Op::Program(..) | Op::Linear(..) | Op::Source(..) | Op::ProgramBinary(..) => None,
         // INS shape is scalar; vector width is part of the target encoding.
-        Op::Ins { .. } => (uop.dtype() != svod_dtype::DType::Void).then(SmallVec::new),
+        Op::Ins(..) => (uop.dtype() != svod_dtype::DType::Void).then(SmallVec::new),
         // FUNCTION is a void tuple-producing wrapper. A void CALL has no
         // shape; typed instruction-style CALLs are scalar, independent of the
         // opaque implementation body.
-        Op::Function { .. } => None,
-        Op::Call { .. } => (uop.dtype() != svod_dtype::DType::Void).then(SmallVec::new),
+        Op::Function(..) => None,
+        Op::Call(..) => (uop.dtype() != svod_dtype::DType::Void).then(SmallVec::new),
         // TUPLE is a void-typed grouping; it has no shape itself.
-        Op::Tuple { .. } => None,
+        Op::Tuple(..) => None,
         // GETTUPLE returns the shape of its inner element when the source is a TUPLE
         // (or a FUNCTION whose body is a TUPLE).
-        Op::GetTuple { src, index } => match src.op() {
-            Op::Tuple { src: tuple_src } => tuple_src
+        Op::GetTuple(ops::GetTuple { src, index }) => match src.op() {
+            Op::Tuple(ops::Tuple { src: tuple_src }) => tuple_src
                 .get(*index)
                 .ok_or(crate::Error::GetTupleIndexOutOfBounds { index: *index, len: tuple_src.len(), kind: "TUPLE" })?
                 .shape()?
                 .cloned(),
-            Op::Function { body, args, .. } => match body.op() {
-                Op::Tuple { src: tuple_src } => tuple_src
+            Op::Function(ops::Function { body, args, .. }) => match body.op() {
+                Op::Tuple(ops::Tuple { src: tuple_src }) => tuple_src
                     .get(*index)
                     .ok_or(crate::Error::GetTupleIndexOutOfBounds {
                         index: *index,
@@ -880,17 +881,18 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             _ => None,
         },
 
-        Op::Detach { src } | Op::Contiguous { src, .. } | Op::ContiguousBackward { src } | Op::Precast { src } => {
-            src.shape()?.cloned()
-        }
+        Op::Detach(ops::Detach { src })
+        | Op::Contiguous(ops::Contiguous { src, .. })
+        | Op::ContiguousBackward(ops::ContiguousBackward { src })
+        | Op::Precast(ops::Precast { src }) => src.shape()?.cloned(),
 
-        Op::After { passthrough, .. } => passthrough.shape()?.cloned(),
+        Op::After(ops::After { passthrough, .. }) => passthrough.shape()?.cloned(),
 
-        Op::Custom { .. } | Op::CustomI { .. } | Op::CustomFunction { .. } => None,
+        Op::Custom(..) | Op::CustomI(..) | Op::CustomFunction(..) => None,
 
         // Graph organization operations have no shape
-        Op::Sink { .. } | Op::Group { .. } => None,
+        Op::Sink(..) | Op::Group(..) => None,
 
-        Op::GetAddr { .. } => Some(smallvec![]),
+        Op::GetAddr(..) => Some(smallvec![]),
     })
 }

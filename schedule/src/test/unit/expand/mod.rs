@@ -5,6 +5,7 @@ use svod_ir::{AxisId, AxisType, Op, ReduceOp, RendererDevice, SInt, UOp, WmmaMet
 use crate::devectorize::pm_expand_broadcast;
 use crate::expand::{build_range_map, pm_group_for_reduce, pre_expand};
 use crate::rewrite::graph_rewrite;
+use svod_ir::ops;
 
 fn wmma_metadata(name: &str, upcast_axes: Option<WmmaUpcastAxes>) -> WmmaMetadata {
     WmmaMetadata {
@@ -42,7 +43,7 @@ fn upcast_and_unroll_ranges_become_shaped_coordinates() {
     let first = UOp::range_axis(UOp::index_const(2), AxisId::Renumbered(7), AxisType::Upcast);
     let second = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(9), AxisType::Unroll);
     let result = pre_expand(&UOp::sink(vec![first, second]));
-    let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK") };
+    let Op::Sink(ops::Sink { sources, .. }) = result.op() else { panic!("expected SINK") };
     assert_eq!(sources[0].shape().unwrap().unwrap().as_slice(), &[SInt::Const(2), SInt::Const(1)]);
     assert_eq!(sources[1].shape().unwrap().unwrap().as_slice(), &[SInt::Const(1), SInt::Const(3)]);
 }
@@ -51,15 +52,15 @@ fn upcast_and_unroll_ranges_become_shaped_coordinates() {
 fn expansion_runs_movement_cleanup_in_the_same_fixpoint() {
     let range = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(7), AxisType::Upcast);
     let result = pre_expand(&UOp::sink(vec![range]));
-    let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK") };
-    assert!(matches!(sources[0].op(), Op::Stack { .. }), "{}", sources[0].tree());
+    let Op::Sink(ops::Sink { sources, .. }) = result.op() else { panic!("expected SINK") };
+    assert!(matches!(sources[0].op(), Op::Stack(..)), "{}", sources[0].tree());
 
     let buffer = UOp::param(0, 4, DType::Float32, None);
     let indexed = (0..4)
         .map(|index| UOp::index().buffer(buffer.clone()).indices(vec![UOp::index_const(index)]).call().unwrap())
         .collect();
     let result = pre_expand(&UOp::sink(vec![UOp::stack(indexed)]));
-    let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK") };
+    let Op::Sink(ops::Sink { sources, .. }) = result.op() else { panic!("expected SINK") };
     assert!(std::sync::Arc::ptr_eq(&sources[0], &buffer), "{}", sources[0].tree());
 }
 
@@ -79,10 +80,10 @@ fn wmma_shapes_operands_independently_and_reconstructs_output() {
     );
     let accumulator = UOp::stack(smallvec![UOp::native_const(0.0f32); 2]);
     let result = pre_expand(&UOp::sink(vec![first, second, UOp::wmma(a_lanes, b_lanes, accumulator, metadata)]));
-    let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK") };
+    let Op::Sink(ops::Sink { sources, .. }) = result.op() else { panic!("expected SINK") };
     assert_eq!(sources[2].shape().unwrap().unwrap().as_slice(), &[SInt::Const(2), SInt::Const(1)]);
-    let expanded = sources[2].toposort().into_iter().find(|u| matches!(u.op(), Op::Wmma { .. })).unwrap();
-    let Op::Wmma { a, b, metadata, .. } = expanded.op() else { unreachable!() };
+    let expanded = sources[2].toposort().into_iter().find(|u| matches!(u.op(), Op::Wmma(..))).unwrap();
+    let Op::Wmma(ops::Wmma { a, b, metadata, .. }) = expanded.op() else { unreachable!() };
     assert_eq!(a.shape().unwrap().unwrap().as_slice(), &[SInt::Const(1), SInt::Const(2)]);
     assert_eq!(b.shape().unwrap().unwrap().as_slice(), &[SInt::Const(1), SInt::Const(3)]);
     assert!(metadata.upcast_axes.is_none());
@@ -105,10 +106,10 @@ fn nested_split_axis_survives_wmma_contract_and_output_unroll() {
         scalar_range,
         UOp::wmma(lanes.clone(), lanes, accumulator, metadata),
     ]));
-    let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK") };
+    let Op::Sink(ops::Sink { sources, .. }) = result.op() else { panic!("expected SINK") };
     assert_eq!(sources[2].shape().unwrap().unwrap().as_slice(), &[SInt::Const(2), SInt::Const(3)]);
-    let expanded = sources[2].toposort().into_iter().find(|u| matches!(u.op(), Op::Wmma { .. })).unwrap();
-    let Op::Wmma { a, b, metadata, .. } = expanded.op() else { unreachable!() };
+    let expanded = sources[2].toposort().into_iter().find(|u| matches!(u.op(), Op::Wmma(..))).unwrap();
+    let Op::Wmma(ops::Wmma { a, b, metadata, .. }) = expanded.op() else { unreachable!() };
     assert_eq!(a.shape().unwrap().unwrap().as_slice(), &[SInt::Const(3), SInt::Const(2)]);
     assert_eq!(b.shape().unwrap().unwrap().as_slice(), &[SInt::Const(3), SInt::Const(2)]);
     assert!(metadata.upcast_axes.is_none());
@@ -121,8 +122,8 @@ fn wmma_broadcast_stacks_fragments_before_reshape() {
     let result = graph_rewrite(pm_expand_broadcast(), wmma, &mut ());
 
     assert_eq!(result.shape().unwrap().unwrap().as_slice(), &[SInt::Const(4), SInt::Const(4), SInt::Const(8)]);
-    let Op::Reshape { src, .. } = result.op() else { panic!("expected STACK reshape") };
-    assert!(matches!(src.op(), Op::Stack { sources } if sources.len() == 16));
+    let Op::Reshape(ops::Reshape { src, .. }) = result.op() else { panic!("expected STACK reshape") };
+    assert!(matches!(src.op(), Op::Stack(ops::Stack { sources }) if sources.len() == 16));
 }
 
 #[test]
@@ -141,7 +142,7 @@ fn shaped_reduce_axes_are_expanded_before_reduction_lowering() {
     let reduce = source.reduce(smallvec![loop_range, upcast], ReduceOp::Add);
     let result = pre_expand(&reduce);
     assert_eq!(result.shape().unwrap().unwrap().as_slice(), &[SInt::Const(1)]);
-    assert!(result.toposort().iter().any(|node| matches!(node.op(), Op::Reduce { num_axes: 1, .. })));
+    assert!(result.toposort().iter().any(|node| matches!(node.op(), Op::Reduce(ops::Reduce { num_axes: 1, .. }))));
 }
 
 #[test]
@@ -151,19 +152,19 @@ fn grouped_reduce_loop_keeps_nested_axis_identity_and_range_dependencies() {
     let after = UOp::index_const(1).after(smallvec![ended]);
     let grouped_axis = AxisId::Renumbered(7).child(1).child(0);
     let grouped = UOp::new(
-        Op::Range {
+        Op::Range(ops::Range {
             end: UOp::index_const(4),
             axis_id: grouped_axis.clone(),
             axis_type: AxisType::GroupReduce,
             deps: smallvec![after.clone()],
-        },
+        }),
         DType::WeakInt,
     );
     let reduce = grouped.cast(DType::Float32).reduce(smallvec![grouped], ReduceOp::Add);
 
     let lowered = graph_rewrite(pm_group_for_reduce(), reduce, &mut ());
     assert!(lowered.toposort().iter().any(|node| {
-        matches!(node.op(), Op::Stage { opts, .. } if opts.local_axis.as_ref() == Some(&grouped_axis))
+        matches!(node.op(), Op::Stage(ops::Stage { opts, .. }) if opts.local_axis.as_ref() == Some(&grouped_axis))
     }));
     let loop_range = lowered
         .toposort()
@@ -171,12 +172,12 @@ fn grouped_reduce_loop_keeps_nested_axis_identity_and_range_dependencies() {
         .find(|node| {
             matches!(
                 node.op(),
-                Op::Range { axis_id, axis_type: AxisType::Reduce, .. }
+                Op::Range(ops::Range { axis_id, axis_type: AxisType::Reduce, .. })
                     if axis_id == &grouped_axis.group_reduce_loop()
             )
         })
         .expect("derived grouped-reduce loop");
-    let Op::Range { deps, .. } = loop_range.op() else { unreachable!() };
+    let Op::Range(ops::Range { deps, .. }) = loop_range.op() else { unreachable!() };
     assert_eq!(deps.len(), 1);
     assert!(std::sync::Arc::ptr_eq(&deps[0], &after));
     assert_eq!(grouped_axis.group_reduce_loop().path(), &[7, 1, 0, 2]);
@@ -201,10 +202,10 @@ fn grouped_reduce_loop_does_not_collide_with_offset_axis_or_range_map_parent() {
     let reduce = grouped.cast(DType::Float32).reduce(smallvec![grouped], ReduceOp::Add);
     let lowered = graph_rewrite(pm_group_for_reduce(), reduce, &mut ());
     assert!(lowered.toposort().iter().any(|node| {
-        matches!(node.op(), Op::Range { axis_id, axis_type: AxisType::Reduce, .. }
+        matches!(node.op(), Op::Range(ops::Range { axis_id, axis_type: AxisType::Reduce, .. })
             if axis_id == &grouped_axis.group_reduce_loop())
     }));
     assert!(!lowered.toposort().iter().any(|node| {
-        matches!(node.op(), Op::Range { axis_id: AxisId::Renumbered(100), axis_type: AxisType::Reduce, .. })
+        matches!(node.op(), Op::Range(ops::Range { axis_id: AxisId::Renumbered(100), axis_type: AxisType::Reduce, .. }))
     }));
 }

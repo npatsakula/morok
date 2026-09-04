@@ -5,6 +5,7 @@ use svod_dtype::{DType, DeviceSpec};
 use svod_ir::{CallInfo, ConstValue, KernelInfo, Op, SInt, UOp, shape::Shape};
 
 use crate::{CpuBackend, PrepareConfig, Tensor, test::helpers::*};
+use svod_ir::ops;
 
 #[test]
 fn test_tensor_custom_kernel_builds_after_call_outputs() {
@@ -21,12 +22,12 @@ fn test_tensor_custom_kernel_builds_after_call_outputs() {
     assert_eq!(outputs.len(), 2);
     for out in outputs {
         match out.uop().op() {
-            Op::After { passthrough, deps } => {
+            Op::After(ops::After { passthrough, deps }) => {
                 assert!(passthrough.has_buffer_identity());
                 assert_eq!(deps.len(), 1);
                 match deps[0].op() {
-                    Op::Call { body, args, info } => {
-                        assert!(matches!(body.op(), Op::Sink { .. }));
+                    Op::Call(ops::Call { body, args, info }) => {
+                        assert!(matches!(body.op(), Op::Sink(..)));
                         assert_eq!(args.len(), 2);
                         assert_eq!(**info, CallInfo::default());
                     }
@@ -50,10 +51,10 @@ fn test_tensor_custom_kernel_with_call_info() {
 
     assert_eq!(outputs.len(), 1);
     match outputs[0].uop().op() {
-        Op::After { deps, .. } => {
+        Op::After(ops::After { deps, .. }) => {
             assert_eq!(deps.len(), 1);
             match deps[0].op() {
-                Op::Call { info: call_info, .. } => assert_eq!(**call_info, info),
+                Op::Call(ops::Call { info: call_info, .. }) => assert_eq!(**call_info, info),
                 op => panic!("expected CALL dep, got {op:?}"),
             }
         }

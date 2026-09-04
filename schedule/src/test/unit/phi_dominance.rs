@@ -17,6 +17,7 @@ use crate::optimizer::tc;
 use crate::optimizer::{
     OptimizerConfig, Renderer, Scheduler, apply_post_optimization_with_renderer, optimize_kernel_with_config,
 };
+use svod_ir::ops;
 
 /// `C[n,k] = Σ_d A[n,d] · B[d,k]`, optionally followed by `MIN_k` — the kmeans
 /// baseline `x @ cᵀ → min(1)`. BFloat16 inputs keep RDNA4 WMMA (bf16→f32)
@@ -54,7 +55,7 @@ fn check_phi_dominance(linear: &[Arc<UOp>]) -> Result<(), String> {
 
     for (idx, uop) in linear.iter().enumerate() {
         match uop.op() {
-            Op::Range { .. } => {
+            Op::Range(..) => {
                 open_ranges.insert(uop.id);
                 let mut deps = HashSet::from([uop.id]);
                 for src in uop.op().sources() {
@@ -63,7 +64,7 @@ fn check_phi_dominance(linear: &[Arc<UOp>]) -> Result<(), String> {
                 range_deps.insert(uop.id, deps);
             }
 
-            Op::End { ranges, .. } => {
+            Op::End(ops::End { ranges, .. }) => {
                 let mut deps = HashSet::new();
                 for src in uop.op().sources() {
                     deps.extend(range_deps.get(&src.id).cloned().unwrap_or_default());
@@ -79,14 +80,14 @@ fn check_phi_dominance(linear: &[Arc<UOp>]) -> Result<(), String> {
                 }
             }
 
-            Op::After { .. } => {
+            Op::After(..) => {
                 let mut deps = HashSet::new();
                 for src in uop.op().sources() {
                     deps.extend(range_deps.get(&src.id).cloned().unwrap_or_default());
                 }
                 for ended in uop.op().ended_ranges() {
                     match ended.op() {
-                        Op::Range { .. } => {
+                        Op::Range(..) => {
                             deps.remove(&ended.id);
                         }
                         _ => {
@@ -138,7 +139,7 @@ fn check_tree_scope(root: &Arc<UOp>) -> Result<(), String> {
             continue;
         }
         for v in &topo {
-            if !v.op().sources().iter().any(|s| s.id == u.id) || matches!(v.op(), Op::After { .. }) {
+            if !v.op().sources().iter().any(|s| s.id == u.id) || matches!(v.op(), Op::After(..)) {
                 continue;
             }
             let v_scope = InScopeRangesProperty::get(v);
@@ -188,7 +189,7 @@ fn tensor_cores_keep_phi_dominance_on_rdna4(min_over_k: bool) {
     tc::apply(&mut scheduler, -1, 0, 1).expect("TC apply");
 
     let ast = scheduler.get_optimized_ast(None);
-    assert!(ast.toposort().iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "TC apply did not produce WMMA");
+    assert!(ast.toposort().iter().any(|u| matches!(u.op(), Op::Wmma(..))), "TC apply did not produce WMMA");
 
     let post = apply_post_optimization_with_renderer(ast, &renderer).expect("post optimization");
     check_tree_scope(&post).unwrap();

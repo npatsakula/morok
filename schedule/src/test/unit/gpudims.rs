@@ -30,7 +30,7 @@ fn ranges_stay_in_scope_until_they_are_ended() {
     assert!(!in_scope.contains(&ended_range.id), "ended range must leave scope");
     assert!(in_scope.contains(&open_range.id), "un-ended range must stay in scope");
     assert!(
-        downstream.toposort().iter().any(|u| matches!(u.op(), Op::Range { .. }) && u.id == ended_range.id),
+        downstream.toposort().iter().any(|u| matches!(u.op(), Op::Range(..)) && u.id == ended_range.id),
         "the ended range is still reachable by toposort — that is why the mask cannot use it",
     );
 }

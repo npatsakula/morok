@@ -8,6 +8,7 @@ use smallvec::smallvec;
 
 use svod_dtype::DType;
 
+use crate::ops;
 use crate::{ConstValue, Op, SInt, UOp, error::Error, shape::Shape};
 
 // =========================================================================
@@ -120,7 +121,7 @@ fn test_shrink_stores_offset_and_independent_size() {
     let src = UOp::stack((0..6).map(UOp::index_const).collect());
     let result = src.try_shrink(&[(SInt::from(2), SInt::from(5))]).unwrap();
 
-    let Op::Shrink { offsets, sizes, .. } = result.op() else { panic!("expected SHRINK") };
+    let Op::Shrink(ops::Shrink { offsets, sizes, .. }) = result.op() else { panic!("expected SHRINK") };
     assert!(matches!(offsets.op(), Op::Const(value) if value.0 == ConstValue::Int(2)));
     assert!(matches!(sizes.op(), Op::Const(value) if value.0 == ConstValue::Int(3)));
     assert_eq!(result.shape().unwrap().unwrap()[0].as_const(), Some(3));

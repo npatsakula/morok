@@ -1,5 +1,6 @@
 //! Unit tests for provenance tracking.
 
+use crate::ops;
 use crate::provenance::{
     OnnxNodeInfo, PROVENANCE_TRACKER, PassName, ProvenanceEvent, ProvenanceTracker, SourceLocation,
     get_relative_location,
@@ -25,7 +26,7 @@ fn enable_tracking() {
 fn fresh_uop() -> Arc<UOp> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    UOp::new(Op::DefineVar { name: format!("prov_test_{n}"), min_val: 0, max_val: 100 }, DType::Int32)
+    UOp::new(Op::DefineVar(ops::DefineVar { name: format!("prov_test_{n}"), min_val: 0, max_val: 100 }), DType::Int32)
 }
 
 #[test]

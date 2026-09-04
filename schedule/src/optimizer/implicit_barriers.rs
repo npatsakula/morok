@@ -3,25 +3,28 @@ use std::sync::{Arc, LazyLock};
 
 use smallvec::{SmallVec, smallvec};
 use svod_dtype::AddrSpace;
+use svod_ir::ops;
 use svod_ir::{AxisType, ConstValue, Op, TypedPatternMatcher, UOp, UOpKey};
 
 fn access_buffer(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     match uop.op() {
-        Op::Param { .. } | Op::Buffer { .. } | Op::MSelect { .. } | Op::MStack { .. } => Some(uop.clone()),
-        Op::Index { buffer, .. } | Op::After { passthrough: buffer, .. } => access_buffer(buffer),
-        Op::Cast { src, .. }
-        | Op::Reshape { src, .. }
-        | Op::Permute { src, .. }
-        | Op::Expand { src, .. }
-        | Op::Pad { src, .. }
-        | Op::Shrink { src, .. }
-        | Op::Flip { src, .. } => access_buffer(src),
+        Op::Param(..) | Op::Buffer(..) | Op::MSelect(..) | Op::MStack(..) => Some(uop.clone()),
+        Op::Index(ops::Index { buffer, .. }) | Op::After(ops::After { passthrough: buffer, .. }) => {
+            access_buffer(buffer)
+        }
+        Op::Cast(ops::Cast { src, .. })
+        | Op::Reshape(ops::Reshape { src, .. })
+        | Op::Permute(ops::Permute { src, .. })
+        | Op::Expand(ops::Expand { src, .. })
+        | Op::Pad(ops::Pad { src, .. })
+        | Op::Shrink(ops::Shrink { src, .. })
+        | Op::Flip(ops::Flip { src, .. }) => access_buffer(src),
         _ => None,
     }
 }
 
 fn is_local_store(uop: &Arc<UOp>) -> bool {
-    matches!(uop.op(), Op::Store { .. }) && uop.addrspace() == Some(AddrSpace::Local)
+    matches!(uop.op(), Op::Store(..)) && uop.addrspace() == Some(AddrSpace::Local)
 }
 
 fn barrier_from_sources(sources: &[Arc<UOp>]) -> Option<Arc<UOp>> {
@@ -30,14 +33,14 @@ fn barrier_from_sources(sources: &[Arc<UOp>]) -> Option<Arc<UOp>> {
 }
 
 fn add_raw_barrier(after: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::After { passthrough, deps } = after.op() else { return None };
+    let Op::After(ops::After { passthrough, deps }) = after.op() else { return None };
     if after.addrspace() != Some(AddrSpace::Local) {
         return None;
     }
 
     // Match Tinygrad's single gated toposort over SINK(*after.src[1:]).
     let dependency_sink = UOp::sink(deps.iter().cloned().collect());
-    let dependency_toposort = dependency_sink.toposort_filtered(|uop| !matches!(uop.op(), Op::Barrier { .. }));
+    let dependency_toposort = dependency_sink.toposort_filtered(|uop| !matches!(uop.op(), Op::Barrier(..)));
     if !dependency_toposort.iter().any(is_local_store) {
         return None;
     }
@@ -46,16 +49,18 @@ fn add_raw_barrier(after: &Arc<UOp>) -> Option<Arc<UOp>> {
 }
 
 fn add_war_barrier(end: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::End { computation, ranges } = end.op() else { return None };
-    if matches!(computation.op(), Op::Barrier { .. }) {
+    let Op::End(ops::End { computation, ranges }) = end.op() else { return None };
+    if matches!(computation.op(), Op::Barrier(..)) {
         return None;
     }
 
     let loop_ranges: Vec<_> = ranges
         .iter()
         .filter(|range| {
-            matches!(range.op(), Op::Range { axis_type: AxisType::Reduce | AxisType::Weak | AxisType::Loop, .. })
-                && matches!(range.vmax(), ConstValue::Int(vmax) if *vmax > 0)
+            matches!(
+                range.op(),
+                Op::Range(ops::Range { axis_type: AxisType::Reduce | AxisType::Weak | AxisType::Loop, .. })
+            ) && matches!(range.vmax(), ConstValue::Int(vmax) if *vmax > 0)
         })
         .cloned()
         .collect();
@@ -71,7 +76,7 @@ fn add_war_barrier(end: &Arc<UOp>) -> Option<Arc<UOp>> {
         .iter()
         .filter(|uop| is_local_store(uop) && uop.in_scope_ranges().iter().any(|id| loop_range_ids.contains(id)))
         .filter_map(|uop| match uop.op() {
-            Op::Store { index, .. } => access_buffer(index).map(UOpKey),
+            Op::Store(ops::Store { index, .. }) => access_buffer(index).map(UOpKey),
             _ => None,
         })
         .collect();
@@ -79,7 +84,7 @@ fn add_war_barrier(end: &Arc<UOp>) -> Option<Arc<UOp>> {
     let loads: SmallVec<[Arc<UOp>; 4]> = backward_slice
         .iter()
         .filter(|uop| match uop.op() {
-            Op::Load { index, .. } => {
+            Op::Load(ops::Load { index, .. }) => {
                 access_buffer(index).is_some_and(|buffer| store_buffers.contains(&UOpKey(buffer)))
             }
             _ => false,

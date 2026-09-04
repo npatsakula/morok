@@ -1,5 +1,6 @@
 use crate::test::helpers::*;
 use ndarray::{Array4, array};
+use svod_ir::ops;
 use svod_schedule::testing::setup_test_tracing;
 
 svod_tensor::codegen_tests! {
@@ -246,7 +247,7 @@ fn test_rnnt_encoder_kernel_count() {
         .expect("kernel split pipeline should succeed for RNNT kernel count");
 
     let kernels: Vec<_> =
-        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), svod_ir::Op::Call { .. })).collect();
+        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), svod_ir::Op::Call(..))).collect();
 
     eprintln!("Svod rangeify kernels: {}", kernels.len());
 
@@ -255,11 +256,11 @@ fn test_rnnt_encoder_kernel_count() {
     let mut type_counts: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
     for k in &kernels {
         let ast = match k.op() {
-            svod_ir::Op::Call { body, .. } => body,
+            svod_ir::Op::Call(ops::Call { body, .. }) => body,
             _ => continue,
         };
         let nodes = ast.toposort();
-        let nr = nodes.iter().filter(|n| matches!(n.op(), svod_ir::Op::Reduce { .. })).count();
+        let nr = nodes.iter().filter(|n| matches!(n.op(), svod_ir::Op::Reduce(..))).count();
         *type_counts.entry((nodes.len(), nr)).or_insert(0) += 1;
     }
 

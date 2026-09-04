@@ -51,6 +51,7 @@ use snafu::{OptionExt, ResultExt};
 use std::sync::Arc;
 use std::time::Duration;
 use svod_device::{Buffer, device::Device};
+use svod_ir::ops;
 use svod_ir::pattern::is_any_const;
 use svod_ir::{DeviceSpec, Op, UOp, UOpKey};
 use svod_runtime::{
@@ -614,13 +615,13 @@ fn merge_var_vals_checked(dst: &mut HashMap<String, i64>, src: &HashMap<String, 
 fn extract_var_vals(root: &Arc<UOp>) -> Result<HashMap<String, i64>> {
     let mut var_vals = HashMap::new();
     for node in root.toposort() {
-        if let Op::Bind { var, value } = node.op()
+        if let Op::Bind(ops::Bind { var, value }) = node.op()
             && let Op::Const(cv) = value.op()
             && let Some(val) = cv.0.try_int()
         {
             let name = match var.op() {
-                Op::DefineVar { name, .. } => Some(name.as_str()),
-                Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.as_deref(),
+                Op::DefineVar(ops::DefineVar { name, .. }) => Some(name.as_str()),
+                Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => arg.name.as_deref(),
                 _ => None,
             };
             if let Some(name) = name {
@@ -748,7 +749,7 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
     // Global BUFFER -> PARAM (erase runtime buffer identity in cache key).
     // REG/LOCAL allocations are kernel-internal storage, not CALL arguments.
     matcher.add(&[OpKey::Buffer], |node, ctx| {
-        let Op::Buffer { arg, .. } = node.op() else {
+        let Op::Buffer(ops::Buffer { arg, .. }) = node.op() else {
             return RewriteResult::NoMatch;
         };
         if arg.addrspace != Some(svod_ir::AddrSpace::Global) {
@@ -771,12 +772,12 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
     // Replaced with PARAM(device=Some) so restoration stays reversible and
     // distinguishable from internal PARAM(device=None) nodes created by rangeify.
     matcher.add(&[OpKey::Bind], |node, ctx| {
-        let Op::Bind { var, value } = node.op() else {
+        let Op::Bind(ops::Bind { var, value }) = node.op() else {
             return RewriteResult::NoMatch;
         };
         let name = match var.op() {
-            Op::DefineVar { name, .. } => Some(name.as_str()),
-            Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.as_deref(),
+            Op::DefineVar(ops::DefineVar { name, .. }) => Some(name.as_str()),
+            Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => arg.name.as_deref(),
             _ => None,
         };
         let Some(name) = name else { return RewriteResult::NoMatch };
@@ -855,7 +856,7 @@ pub(crate) fn restore_post_schedule_cache(root: &Arc<UOp>, normalization: &Sched
 
     for node in root.toposort() {
         match node.op() {
-            Op::Param { arg, .. }
+            Op::Param(ops::Param { arg, .. })
                 if node
                     .tag()
                     .as_ref()
@@ -866,7 +867,7 @@ pub(crate) fn restore_post_schedule_cache(root: &Arc<UOp>, normalization: &Sched
                     subs.insert(UOpKey(node.clone()), restored_original);
                 }
             }
-            Op::Buffer { arg, .. } => {
+            Op::Buffer(ops::Buffer { arg, .. }) => {
                 let schedule_local = node
                     .tag()
                     .as_ref()
@@ -923,7 +924,7 @@ pub(crate) fn restore_post_schedule_pre_schedule(
     }
 
     let restored_flat = match restore_post_schedule_cache(&UOp::sink(flat_buf_uops), normalization).op() {
-        Op::Sink { sources, .. } => sources.iter().cloned().collect::<Vec<_>>(),
+        Op::Sink(ops::Sink { sources, .. }) => sources.iter().cloned().collect::<Vec<_>>(),
         _ => unreachable!("sink substitution must preserve SINK root"),
     };
 
@@ -976,7 +977,7 @@ fn build_schedule_input_buffers(pre_schedule: &crate::schedule::PreSchedule) -> 
 fn collect_input_buffers(root: &Arc<UOp>) -> crate::schedule::InputBuffers {
     let mut inputs = HashMap::new();
     for node in root.toposort() {
-        if let Op::Buffer { .. } = node.op() {
+        if let Op::Buffer(..) = node.op() {
             // Buffers are registered in from_slice_on() and realize()
             if let Some(buf) = crate::tensor_registry::get_buffer(node.id) {
                 inputs.insert(node.id, buf);
@@ -1154,7 +1155,7 @@ impl OptCacheState {
 
 pub(crate) fn runtime_effect_ast(ast: &Arc<UOp>) -> &Arc<UOp> {
     match ast.op() {
-        Op::End { computation, .. } if matches!(computation.op(), Op::Copy { .. } | Op::CustomFunction { .. }) => {
+        Op::End(ops::End { computation, .. }) if matches!(computation.op(), Op::Copy(..) | Op::CustomFunction(..)) => {
             computation
         }
         _ => ast,
@@ -1333,7 +1334,7 @@ fn prepare_execution_plan(
         // No compilation needed — register as PreparedOp for runtime execution.
         let runtime_ast = runtime_effect_ast(&item.ast);
 
-        if matches!(runtime_ast.op(), Op::Copy { .. }) {
+        if matches!(runtime_ast.op(), Op::Copy(..)) {
             let buffer_indices = resolve_item_buffer_indices(item, &uop_id_to_idx)?;
             builder.add_op_with_instance_dependencies(
                 PreparedOp::BufferCopy(PreparedCopy {
@@ -1350,7 +1351,7 @@ fn prepare_execution_plan(
         // PreparedOp::CustomFunction with typed dispatch. Match against the
         // unwrapped runtime AST so END(CustomFunction) reaches this branch
         // consistently with Copy above.
-        if let Op::CustomFunction { kind, attrs } = runtime_ast.op() {
+        if let Op::CustomFunction(ops::CustomFunction { kind, attrs }) = runtime_ast.op() {
             let buffer_indices = resolve_item_buffer_indices(item, &uop_id_to_idx)?;
             let runtime_vars = attrs.iter().flat_map(svod_runtime::execution_plan::collect_runtime_vars).collect();
             builder.add_op_with_instance_dependencies(
@@ -1393,7 +1394,7 @@ fn prepare_execution_plan(
                 // kernels must go through the heuristic entry so `apply_explicit_opts`
                 // honors the exact opt list (empty = none).
                 let has_explicit_opts =
-                    matches!(item.ast.op(), Op::Sink { info: Some(ki), .. } if ki.opts_to_apply.is_some());
+                    matches!(item.ast.op(), Op::Sink(ops::Sink { info: Some(ki), .. }) if ki.opts_to_apply.is_some());
                 let optimized_ast = if !has_explicit_opts
                     && matches!(config.optimizer.strategy, svod_schedule::OptStrategy::Beam { .. })
                 {
@@ -1563,10 +1564,10 @@ fn initial_kernel_var_values(item: &ScheduleItem, var_names: &[String]) -> Resul
     let mut bounds = HashMap::new();
     for node in item.ast.toposort() {
         match node.op() {
-            Op::DefineVar { name, min_val, max_val } => {
+            Op::DefineVar(ops::DefineVar { name, min_val, max_val }) => {
                 bounds.insert(name.clone(), (*min_val, *max_val));
             }
-            Op::Param { arg, .. }
+            Op::Param(ops::Param { arg, .. })
                 if arg.addrspace.is_none()
                     && let Some(name) = arg.name.as_deref()
                     && let Some((min, max)) = &arg.vmin_vmax
@@ -1603,7 +1604,7 @@ fn compile_with_program_pipeline_components(
     compiler: &dyn svod_device::device::Compiler,
 ) -> Result<(svod_device::device::ProgramSpec, svod_device::device::CompiledSpec)> {
     let mut program = match kernel_ast.op() {
-        Op::Program { .. } => kernel_ast,
+        Op::Program(..) => kernel_ast,
         other => {
             return IrConstructionSnafu {
                 details: format!("compile_with_program_pipeline_components expects PROGRAM input, got {other:?}"),
@@ -1643,7 +1644,7 @@ pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &Prepar
         })
         .or_else(|| {
             param_buffers.iter().find_map(|(_, u)| {
-                let Op::Buffer { arg, .. } = u.op() else {
+                let Op::Buffer(ops::Buffer { arg, .. }) = u.op() else {
                     return None;
                 };
                 arg.device.as_ref().filter(|spec| !spec.is_disk()).cloned()

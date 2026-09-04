@@ -63,7 +63,7 @@ cached_property! {
             // back on; parents add range-children explicitly below, so the
             // Tinygrad self-first order is preserved at every level.
             uop.op.map_child(|src| {
-                if matches!(src.op, Op::Range { .. }) && seen.insert(src.id) {
+                if matches!(src.op, Op::Range(..)) && seen.insert(src.id) {
                     result.push(src.clone());
                 }
                 for r in RangesProperty::get(src) {
@@ -109,7 +109,7 @@ cached_property! {
             // Step 2: Remove ended ranges (using existing op.ended_ranges())
             for ended in uop.op.ended_ranges() {
                 match ended.op() {
-                    Op::Range { .. } => result.retain(|id| *id != ended.id),
+                    Op::Range(..) => result.retain(|id| *id != ended.id),
                     // Non-RANGE ended (like AFTER) — remove all its in-scope ranges
                     _ => {
                         let ended_scope = InScopeRangesProperty::get(ended);
@@ -121,7 +121,7 @@ cached_property! {
             // Step 3: Add self if RANGE. Stored as an id, not an `Arc` — a
             // self-`Arc` in the node's own cache would be a refcount cycle
             // (permanent leak); ids pin nothing.
-            if matches!(uop.op, Op::Range { .. }) {
+            if matches!(uop.op, Op::Range(..)) {
                 result.push(uop.id);
             }
 

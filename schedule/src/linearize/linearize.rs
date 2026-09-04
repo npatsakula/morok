@@ -5,6 +5,7 @@
 //! 2. Heap toposort respecting data dependencies
 
 use std::cmp::Ordering;
+use svod_ir::ops;
 
 /// WMMA `(upcast, reduce, hidden)` axis lists, `None` when the sort key carries no WMMA.
 type WmmaAxes = Option<(Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<(usize, usize)>)>;
@@ -22,31 +23,31 @@ const TUPLE_ORDER: bool = true;
 /// extensions and are deliberately kept outside the pinned enum's range.
 fn op_value(op: &Op) -> u16 {
     match op {
-        Op::Bind { .. } => 1,
-        Op::Special { .. } => 2,
-        Op::Buffer { .. } => 3,
+        Op::Bind(..) => 1,
+        Op::Special(..) => 2,
+        Op::Buffer(..) => 3,
         Op::Noop => 4,
-        Op::Param { .. } => 6,
-        Op::Function { .. } => 7,
-        Op::Call { .. } => 8,
-        Op::Program { .. } => 9,
-        Op::Linear { .. } => 10,
-        Op::Source { .. } => 11,
-        Op::ProgramBinary { .. } => 12,
-        Op::Sink { .. } => 13,
-        Op::After { .. } => 14,
-        Op::Group { .. } => 15,
-        Op::Stack { .. } | Op::VConst { .. } => 16,
-        Op::Tuple { .. } => 17,
-        Op::GetTuple { .. } => 18,
-        Op::GetAddr { .. } => 19,
-        Op::Index { .. } => 20,
-        Op::Shrink { .. } => 21,
-        Op::Load { .. } => 22,
-        Op::Store { .. } => 23,
-        Op::Wmma { .. } => 24,
-        Op::Cast { .. } => 25,
-        Op::BitCast { .. } => 26,
+        Op::Param(..) => 6,
+        Op::Function(..) => 7,
+        Op::Call(..) => 8,
+        Op::Program(..) => 9,
+        Op::Linear(..) => 10,
+        Op::Source(..) => 11,
+        Op::ProgramBinary(..) => 12,
+        Op::Sink(..) => 13,
+        Op::After(..) => 14,
+        Op::Group(..) => 15,
+        Op::Stack(..) | Op::VConst(..) => 16,
+        Op::Tuple(..) => 17,
+        Op::GetTuple(..) => 18,
+        Op::GetAddr(..) => 19,
+        Op::Index(..) => 20,
+        Op::Shrink(..) => 21,
+        Op::Load(..) => 22,
+        Op::Store(..) => 23,
+        Op::Wmma(..) => 24,
+        Op::Cast(..) => 25,
+        Op::BitCast(..) => 26,
         Op::Unary(kind, _) => match kind {
             UnaryOp::Exp2 => 27,
             UnaryOp::Log2 => 28,
@@ -96,37 +97,37 @@ fn op_value(op: &Op) -> u16 {
         },
         Op::Ternary(TernaryOp::Where, _, _, _) => 53,
         Op::Ternary(TernaryOp::MulAcc, _, _, _) => 54,
-        Op::Barrier { .. } => 55,
-        Op::Range { .. } => 56,
-        Op::If { .. } => 57,
-        Op::End { .. } => 58,
-        Op::EndIf { .. } => 59,
+        Op::Barrier(..) => 55,
+        Op::Range(..) => 56,
+        Op::If(..) => 57,
+        Op::End(..) => 58,
+        Op::EndIf(..) => 59,
         Op::Const(_) => 61,
-        Op::Custom { .. } => 62,
-        Op::CustomI { .. } => 63,
-        Op::Ins { .. } => 64,
-        Op::Contiguous { .. } => 65,
-        Op::ContiguousBackward { .. } => 66,
-        Op::Detach { .. } => 67,
-        Op::Stage { .. } => 68,
-        Op::Copy { .. } => 69,
-        Op::MSelect { .. } => 71,
-        Op::MStack { .. } => 72,
-        Op::CustomFunction { .. } => 73,
-        Op::Reshape { .. } => 74,
-        Op::Permute { .. } => 75,
-        Op::Expand { .. } => 76,
-        Op::Pad { .. } => 77,
-        Op::Flip { .. } => 78,
-        Op::ReduceAxis { .. } | Op::Reduce { .. } => 80,
-        Op::AllReduce { .. } => 81,
-        Op::Slice { .. } => 70,
+        Op::Custom(..) => 62,
+        Op::CustomI(..) => 63,
+        Op::Ins(..) => 64,
+        Op::Contiguous(..) => 65,
+        Op::ContiguousBackward(..) => 66,
+        Op::Detach(..) => 67,
+        Op::Stage(..) => 68,
+        Op::Copy(..) => 69,
+        Op::MSelect(..) => 71,
+        Op::MStack(..) => 72,
+        Op::CustomFunction(..) => 73,
+        Op::Reshape(..) => 74,
+        Op::Permute(..) => 75,
+        Op::Expand(..) => 76,
+        Op::Pad(..) => 77,
+        Op::Flip(..) => 78,
+        Op::ReduceAxis(..) | Op::Reduce(..) => 80,
+        Op::AllReduce(..) => 81,
+        Op::Slice(..) => 70,
         // Svod-only IR nodes, after the pinned PYLITERAL=82.
         Op::Unique(_) => 99,
         Op::LUnique(_) => 100,
-        Op::Multi { .. } => 103,
-        Op::DefineVar { .. } => 106,
-        Op::Precast { .. } => 109,
+        Op::Multi(..) => 103,
+        Op::DefineVar(..) => 106,
+        Op::Precast(..) => 109,
     }
 }
 
@@ -426,10 +427,10 @@ impl PartialTuplizeRef {
 
     fn arg(&self) -> ArgKey {
         match self {
-            Self::Node(node) if matches!(node.op(), Op::VConst { .. }) => ArgKey::None,
+            Self::Node(node) if matches!(node.op(), Op::VConst(..)) => ArgKey::None,
             Self::Node(node) => arg_key(node.op()),
             Self::VConstLane { parent, index } => {
-                let Op::VConst { values } = parent.op() else { unreachable!() };
+                let Op::VConst(ops::VConst { values }) = parent.op() else { unreachable!() };
                 ArgKey::Const(const_key(values[*index]))
             }
         }
@@ -437,7 +438,7 @@ impl PartialTuplizeRef {
 
     fn dtype(&self) -> DType {
         match self {
-            Self::Node(node) if matches!(node.op(), Op::VConst { .. }) || tinygrad_weakint_expr(node) => {
+            Self::Node(node) if matches!(node.op(), Op::VConst(..)) || tinygrad_weakint_expr(node) => {
                 node.dtype().scalar_dtype()
             }
             Self::Node(node) => node.dtype(),
@@ -448,7 +449,7 @@ impl PartialTuplizeRef {
     fn sources(&self) -> Vec<Self> {
         match self {
             Self::Node(node) => match node.op() {
-                Op::VConst { values } => {
+                Op::VConst(ops::VConst { values }) => {
                     (0..values.len()).map(|index| Self::VConstLane { parent: node.clone(), index }).collect()
                 }
                 op => op.sources().into_iter().map(Self::Node).collect(),
@@ -636,47 +637,55 @@ fn tinygrad_renderer_device(device: svod_ir::RendererDevice) -> &'static str {
 fn arg_key(op: &Op) -> ArgKey {
     match op {
         Op::Const(v) => ArgKey::Const(const_key(v.0)),
-        Op::VConst { values } => ArgKey::Constants(values.iter().copied().map(const_key).collect()),
-        Op::Param { arg, .. } | Op::Buffer { arg, .. } => ArgKey::Param(param_key(arg)),
-        Op::Special { name, .. }
-        | Op::Source { code: name, .. }
-        | Op::Custom { code: name, .. }
-        | Op::CustomI { code: name, .. } => ArgKey::Text(name.clone()),
+        Op::VConst(ops::VConst { values }) => ArgKey::Constants(values.iter().copied().map(const_key).collect()),
+        Op::Param(ops::Param { arg, .. }) | Op::Buffer(ops::Buffer { arg, .. }) => ArgKey::Param(param_key(arg)),
+        Op::Special(ops::Special { name, .. })
+        | Op::Source(ops::Source { code: name, .. })
+        | Op::Custom(ops::Custom { code: name, .. })
+        | Op::CustomI(ops::CustomI { code: name, .. }) => ArgKey::Text(name.clone()),
         Op::Unique(v)
         | Op::LUnique(v)
-        | Op::MSelect { device_index: v, .. }
-        | Op::Multi { axis: v, .. }
-        | Op::GetTuple { index: v, .. } => ArgKey::Index(*v),
-        Op::Slice { size, .. } => ArgKey::Index(*size),
-        Op::Permute { axes, .. } => ArgKey::Indices(axes.clone()),
-        Op::Flip { axes, .. } => ArgKey::Bools(axes.clone()),
-        Op::Range { axis_id, axis_type, .. } => ArgKey::Range(axis_id.path().to_vec(), axis_type_value(*axis_type)),
-        Op::DefineVar { name, min_val, max_val } => ArgKey::DefineVar(name.clone(), *min_val, *max_val),
-        Op::Ins { arg, .. } => ArgKey::Ins(arg.opcode.clone(), arg.attributes.clone()),
-        Op::Cast { dtype, .. } | Op::BitCast { dtype, .. } => ArgKey::DType(dtype_key(dtype)),
-        Op::GetAddr { device, .. } | Op::Copy { device, .. } => ArgKey::Text(device.canonicalize()),
-        Op::ReduceAxis { reduce_op, axes, .. } => ArgKey::Reduce(reduce_value(*reduce_op), axes.clone(), None),
-        Op::Reduce { reduce_op, num_axes, .. } => ArgKey::Reduce(reduce_value(*reduce_op), vec![], Some(*num_axes)),
-        Op::AllReduce { reduce_op, device, .. } => {
+        | Op::MSelect(ops::MSelect { device_index: v, .. })
+        | Op::Multi(ops::Multi { axis: v, .. })
+        | Op::GetTuple(ops::GetTuple { index: v, .. }) => ArgKey::Index(*v),
+        Op::Slice(ops::Slice { size, .. }) => ArgKey::Index(*size),
+        Op::Permute(ops::Permute { axes, .. }) => ArgKey::Indices(axes.clone()),
+        Op::Flip(ops::Flip { axes, .. }) => ArgKey::Bools(axes.clone()),
+        Op::Range(ops::Range { axis_id, axis_type, .. }) => {
+            ArgKey::Range(axis_id.path().to_vec(), axis_type_value(*axis_type))
+        }
+        Op::DefineVar(ops::DefineVar { name, min_val, max_val }) => ArgKey::DefineVar(name.clone(), *min_val, *max_val),
+        Op::Ins(ops::Ins { arg, .. }) => ArgKey::Ins(arg.opcode.clone(), arg.attributes.clone()),
+        Op::Cast(ops::Cast { dtype, .. }) | Op::BitCast(ops::BitCast { dtype, .. }) => ArgKey::DType(dtype_key(dtype)),
+        Op::GetAddr(ops::GetAddr { device, .. }) | Op::Copy(ops::Copy { device, .. }) => {
+            ArgKey::Text(device.canonicalize())
+        }
+        Op::ReduceAxis(ops::ReduceAxis { reduce_op, axes, .. }) => {
+            ArgKey::Reduce(reduce_value(*reduce_op), axes.clone(), None)
+        }
+        Op::Reduce(ops::Reduce { reduce_op, num_axes, .. }) => {
+            ArgKey::Reduce(reduce_value(*reduce_op), vec![], Some(*num_axes))
+        }
+        Op::AllReduce(ops::AllReduce { reduce_op, device, .. }) => {
             ArgKey::ReduceDevice(reduce_value(*reduce_op), device.canonicalize())
         }
-        Op::Call { info, .. } | Op::Function { info, .. } => ArgKey::Call(
+        Op::Call(ops::Call { info, .. }) | Op::Function(ops::Function { info, .. }) => ArgKey::Call(
             info.grad_tag.clone(),
             info.metadata.clone(),
             info.name.clone(),
             info.precompile,
             info.precompile_backward,
         ),
-        Op::Contiguous { opts, .. } => {
+        Op::Contiguous(ops::Contiguous { opts, .. }) => {
             ArgKey::Hints(opts.iter().map(|hint| (hint.op.clone(), hint.axis, hint.arg)).collect())
         }
-        Op::ProgramBinary { bytes, .. } => ArgKey::Bytes(bytes.clone()),
-        Op::CustomFunction { kind, .. } => ArgKey::Index(match kind {
+        Op::ProgramBinary(ops::ProgramBinary { bytes, .. }) => ArgKey::Bytes(bytes.clone()),
+        Op::CustomFunction(ops::CustomFunction { kind, .. }) => ArgKey::Index(match kind {
             svod_ir::CustomFunctionKind::EncDec => 0,
             svod_ir::CustomFunctionKind::Graph => 1,
             svod_ir::CustomFunctionKind::AllReduce { reduce_op } => 2 + usize::from(reduce_value(*reduce_op)),
         }),
-        Op::Wmma { metadata, .. } => ArgKey::Wmma(
+        Op::Wmma(ops::Wmma { metadata, .. }) => ArgKey::Wmma(
             metadata.dims,
             dtype_key(&metadata.dtype_in),
             tinygrad_renderer_device(metadata.device).into(),
@@ -789,7 +798,7 @@ fn compute_tuplize(nodes: &[Arc<UOp>]) -> HashMap<u64, Arc<TuplizeKey>> {
     for node in nodes {
         let (arg, dtype, src) = match node.op() {
             // Svod's compact VCONST is pinned Tinygrad's STACK(CONST...).
-            Op::VConst { values } => {
+            Op::VConst(ops::VConst { values }) => {
                 let dtype = DType::Scalar(node.dtype().base());
                 let src = values
                     .iter()
@@ -858,13 +867,13 @@ fn run_count(uop: &Arc<UOp>) -> u64 {
 ///   would regress against the pin.
 fn priority(uop: &Arc<UOp>) -> (i32, Option<i64>) {
     match uop.op() {
-        Op::Param { arg, .. } => (-20, Some(arg.slot as i64)),
-        Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local) => (-17, None),
-        Op::Buffer { .. } => (-18, None),
-        Op::Load { .. } => (-1, None),
-        Op::Store { .. } => (1, None),
-        Op::Range { .. } => (5, None),
-        Op::End { .. } => (-5, None),
+        Op::Param(ops::Param { arg, .. }) => (-20, Some(arg.slot as i64)),
+        Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local) => (-17, None),
+        Op::Buffer(..) => (-18, None),
+        Op::Load(..) => (-1, None),
+        Op::Store(..) => (1, None),
+        Op::Range(..) => (5, None),
+        Op::End(..) => (-5, None),
         _ => (0, None),
     }
 }

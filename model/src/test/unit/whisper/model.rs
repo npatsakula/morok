@@ -11,6 +11,7 @@ use crate::whisper::{
     DecodeOptions, DecodeResult, DecodeStrategy, FallbackPolicy, ModelDimensions, Whisper, WhisperAlignmentJit,
     WhisperAlignmentModel, WhisperCrossKvJit, WhisperDecoderJit, WhisperPlan, WhisperPrefillJit, WhisperSize,
 };
+use svod_ir::ops;
 
 fn make_dims() -> ModelDimensions {
     ModelDimensions::for_size(WhisperSize::Tiny)
@@ -232,7 +233,7 @@ fn prepared_cross_kv_materializes_each_projection_before_packing() {
                 .ast
                 .toposort()
                 .into_iter()
-                .filter(|uop| matches!(uop.op(), Op::Range { axis_type: AxisType::Reduce, .. }))
+                .filter(|uop| matches!(uop.op(), Op::Range(ops::Range { axis_type: AxisType::Reduce, .. })))
                 .count()
         })
         .collect();

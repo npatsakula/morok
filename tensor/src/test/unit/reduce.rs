@@ -4,6 +4,7 @@ use crate::*;
 use ndarray::array;
 use svod_dtype::DType;
 use svod_ir::Op;
+use svod_ir::ops;
 
 #[test]
 fn test_axis_spec_all() {
@@ -66,10 +67,10 @@ fn test_keepdim_wraps_squeezed_tensor_reduce_in_reshape() {
     let squeezed = tensor.sum(1).unwrap();
     let kept = tensor.sum_with().axes(1).keepdim(true).call().unwrap();
 
-    assert!(matches!(squeezed.uop().op(), Op::Reduce { ranges, num_axes: 1, .. } if ranges.is_empty()));
+    assert!(matches!(squeezed.uop().op(), Op::Reduce(ops::Reduce { ranges, num_axes: 1, .. }) if ranges.is_empty()));
     assert_eq!(squeezed.shape().unwrap().as_slice(), &[SInt::Const(2)]);
-    assert!(matches!(kept.uop().op(), Op::Reshape { src, .. }
-        if matches!(src.op(), Op::Reduce { ranges, num_axes: 1, .. } if ranges.is_empty())));
+    assert!(matches!(kept.uop().op(), Op::Reshape(ops::Reshape { src, .. })
+        if matches!(src.op(), Op::Reduce(ops::Reduce { ranges, num_axes: 1, .. }) if ranges.is_empty())));
     assert_eq!(kept.shape().unwrap().as_slice(), &[SInt::Const(2), SInt::Const(1)]);
 }
 

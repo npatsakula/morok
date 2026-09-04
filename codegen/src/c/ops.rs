@@ -12,6 +12,7 @@ use svod_ir::{BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
 
 use super::types::{c_cast, c_dtype, c_math_fn};
 use crate::common::{access_dtype, format_custom_template_strict, shaped_dtype};
+use svod_ir::ops;
 
 /// Context for C code generation, tracking variable names and SSA inlining.
 pub struct CContext {
@@ -201,17 +202,17 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
     match uop.op() {
         // Meta-ops: no code emitted
         Op::Const(_)
-        | Op::VConst { .. }
-        | Op::Param { .. }
-        | Op::DefineVar { .. }
+        | Op::VConst(..)
+        | Op::Param(..)
+        | Op::DefineVar(..)
         | Op::Noop
-        | Op::Sink { .. }
-        | Op::Group { .. }
+        | Op::Sink(..)
+        | Op::Group(..)
         | Op::Unique(_)
-        | Op::Call { .. }
-        | Op::Barrier { .. } => None,
+        | Op::Call(..)
+        | Op::Barrier(..) => None,
 
-        Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => {
+        Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => {
             let base_dtype = arg.dtype.clone();
             let alloc_size = uop.buffer_size().unwrap_or(1);
             let name = ctx.next_name("reg");
@@ -221,9 +222,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Buffer { .. } => None,
+        Op::Buffer(..) => None,
 
-        Op::Index { buffer, indices, .. } => {
+        Op::Index(ops::Index { buffer, indices, .. }) => {
             let buf = ctx.get(buffer).to_string();
 
             if indices.is_empty() {
@@ -249,13 +250,13 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Shrink { src, offsets, sizes: _ } => {
+        Op::Shrink(ops::Shrink { src, offsets, sizes: _ }) => {
             let expr = format!("{} + {}", ctx.get(src), ctx.get(offsets));
             ctx.emit_address(uop, expr, kernel);
             Some(())
         }
 
-        Op::Load { index, alt, gate } => {
+        Op::Load(ops::Load { index, alt, gate }) => {
             // Defense-in-depth: `UOp::new` (ir hash_consing.rs `new_tagged`) already
             // asserts the alt/gate pairing, the bool gate and the alt dtype, so no
             // legal construction path reaches these branches.
@@ -300,7 +301,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Store { index, value, gate } => {
+        Op::Store(ops::Store { index, value, gate }) => {
             if gate.is_some() {
                 ctx.set_invalid_graph(format!(
                     "gated STORE on uop {} reached C codegen; linear cleanup must rewrite it to IF/STORE/ENDIF",
@@ -356,7 +357,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Cast { src, dtype } => {
+        Op::Cast(ops::Cast { src, dtype }) => {
             let s = ctx.get(src).to_string();
             if is_address_value(src) {
                 let target = c_dtype(dtype);
@@ -379,7 +380,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::BitCast { src, dtype: _ } => {
+        Op::BitCast(ops::BitCast { src, dtype: _ }) => {
             let s = ctx.get(src).to_string();
             let from_type = c_dtype(&shaped_dtype(src));
             let rendered_dtype = shaped_dtype(uop);
@@ -393,13 +394,13 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Reshape { src, .. } => {
+        Op::Reshape(ops::Reshape { src, .. }) => {
             let s = ctx.get(src).to_string();
             ctx.register(uop.id, s);
             Some(())
         }
 
-        Op::Range { end, axis_id, .. } => {
+        Op::Range(ops::Range { end, axis_id, .. }) => {
             let end_val = ctx.get(end).to_string();
             let id = axis_id.name();
             let range_dtype = c_dtype(&uop.dtype());
@@ -411,9 +412,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::End { ranges, .. } => {
+        Op::End(ops::End { ranges, .. }) => {
             for range in ranges.iter() {
-                if let Op::Range { .. } = range.op() {
+                if let Op::Range(..) = range.op() {
                     ctx.pop_indent();
                     let indent = ctx.indent();
                     kernel.push(format!("{indent}}}"));
@@ -432,7 +433,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Reduce { src, ranges, reduce_op, .. } => {
+        Op::Reduce(ops::Reduce { src, ranges, reduce_op, .. }) => {
             let src_val = ctx.get(src).to_string();
             let dtype = &uop.dtype();
 
@@ -453,7 +454,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Stack { sources } => {
+        Op::Stack(ops::Stack { sources }) => {
             if sources.is_empty() {
                 return None;
             }
@@ -471,7 +472,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Wmma { a, b, c, metadata } => {
+        Op::Wmma(ops::Wmma { a, b, c, metadata }) => {
             let a_val = ctx.get(a).to_string();
             let b_val = ctx.get(b).to_string();
             let c_val = ctx.get(c).to_string();
@@ -481,7 +482,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::CustomI { deps, code } => {
+        Op::CustomI(ops::CustomI { deps, code }) => {
             let args: Vec<String> = deps.iter().map(|dep| ctx.get(dep).to_string()).collect();
             let expr = match format_custom_template_strict(code, &args) {
                 Ok(s) => s,
@@ -495,7 +496,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Custom { deps, code } => {
+        Op::Custom(ops::Custom { deps, code }) => {
             let args: Vec<String> = deps.iter().map(|dep| ctx.get(dep).to_string()).collect();
             let rendered = match format_custom_template_strict(code, &args) {
                 Ok(s) => s,
@@ -524,15 +525,15 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Detach { src } => {
+        Op::Detach(ops::Detach { src }) => {
             let s = ctx.get(src).to_string();
             ctx.register(uop.id, s);
             None
         }
 
-        Op::After { passthrough, .. } => {
+        Op::After(ops::After { passthrough, .. }) => {
             assert!(
-                !matches!(passthrough.op(), Op::Group { .. }),
+                !matches!(passthrough.op(), Op::Group(..)),
                 "BUG: AFTER passthrough is GROUP (id={}). AFTER tree:\n{}",
                 passthrough.id,
                 uop.tree()
@@ -542,13 +543,13 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             None
         }
 
-        Op::Bind { var, value } => {
+        Op::Bind(ops::Bind { var, value }) => {
             let v = ctx.get(value).to_string();
             ctx.register(var.id, v);
             None
         }
 
-        Op::If { condition, .. } => {
+        Op::If(ops::If { condition, .. }) => {
             let cond = ctx.get(condition).to_string();
             let indent = ctx.indent();
             kernel.push(format!("{indent}if ({cond}) {{"));
@@ -556,7 +557,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::EndIf { .. } => {
+        Op::EndIf(..) => {
             ctx.pop_indent();
             let indent = ctx.indent();
             kernel.push(format!("{indent}}}"));
@@ -576,9 +577,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
 /// Direct equivalent of Tinygrad CStyleLanguage.render_access.
 fn render_access(index: &Arc<UOp>, access_dtype: &DType, address: &str) -> String {
     let source_dtype = match index.op() {
-        Op::Index { buffer, .. } => buffer.dtype(),
-        Op::Shrink { src, .. } => src.dtype(),
-        Op::Cast { src, .. } => src.dtype(),
+        Op::Index(ops::Index { buffer, .. }) => buffer.dtype(),
+        Op::Shrink(ops::Shrink { src, .. }) => src.dtype(),
+        Op::Cast(ops::Cast { src, .. }) => src.dtype(),
         _ => index.dtype(),
     };
     if access_dtype.vcount() > 1 || *access_dtype != source_dtype {
@@ -711,12 +712,13 @@ fn render_reduce_accumulate(op: ReduceOp, acc: &str, val: &str, dtype: &DType) -
 
 fn is_address_value(uop: &Arc<UOp>) -> bool {
     match uop.op() {
-        Op::Param { arg, .. } | Op::Buffer { arg, .. } => arg.addrspace.is_some(),
-        Op::Slice { .. } => true,
-        Op::Index { buffer, .. } => is_address_value(buffer),
-        Op::Shrink { src, .. } | Op::Cast { src, .. } | Op::After { passthrough: src, .. } | Op::Precast { src } => {
-            is_address_value(src)
-        }
+        Op::Param(ops::Param { arg, .. }) | Op::Buffer(ops::Buffer { arg, .. }) => arg.addrspace.is_some(),
+        Op::Slice(..) => true,
+        Op::Index(ops::Index { buffer, .. }) => is_address_value(buffer),
+        Op::Shrink(ops::Shrink { src, .. })
+        | Op::Cast(ops::Cast { src, .. })
+        | Op::After(ops::After { passthrough: src, .. })
+        | Op::Precast(ops::Precast { src }) => is_address_value(src),
         _ => false,
     }
 }

@@ -9,6 +9,7 @@ use svod_ir::Op;
 use crate::arch::FragRole;
 use crate::tiles::{RT_16X16, TileLayout};
 use crate::{ArchCaps, Kernel, MoveIdx, SwapDir};
+use svod_ir::ops;
 
 const ROW: TileLayout = TileLayout::Row;
 
@@ -27,18 +28,18 @@ fn test_shuffle_xor_graph_shape() {
     for (caps, block) in [(ArchCaps::GFX942, 64), (ArchCaps::for_arch(AmdArch::Gfx1151), 32)] {
         let topo = build(caps, block);
         assert!(
-            topo.iter().any(|u| matches!(u.op(), Op::Custom { .. })),
+            topo.iter().any(|u| matches!(u.op(), Op::Custom(..))),
             "{:?}: shuffle_xor emits a ds_bpermute Op::Custom",
             caps.arch
         );
         assert!(
             !topo
                 .iter()
-                .any(|u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
+                .any(|u| matches!(u.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
             "{:?}: no LDS scratch",
             caps.arch
         );
-        assert!(!topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "{:?}: no barrier", caps.arch);
+        assert!(!topo.iter().any(|u| matches!(u.op(), Op::Barrier(..))), "{:?}: no barrier", caps.arch);
     }
 }
 
@@ -51,15 +52,15 @@ fn test_compare_exchange_graph_shape() {
     let src = warp.zero(ker.rt((16, 16), DType::Float32, ROW, RT_16X16));
     let dst = ker.rt((16, 16), DType::Float32, ROW, RT_16X16);
     let topo = warp.compare_exchange(dst, &src, 1, SwapDir::ByLaneBit(2)).uop().toposort();
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Custom { .. })), "ds_bpermute gather present");
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::Custom(..))), "ds_bpermute gather present");
     assert!(topo.iter().any(|u| matches!(u.op(), Op::Ternary(..))), "min/max select (where) present");
     assert!(
         !topo
             .iter()
-            .any(|u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
+            .any(|u| matches!(u.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
         "no LDS scratch"
     );
-    assert!(!topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "no barrier");
+    assert!(!topo.iter().any(|u| matches!(u.op(), Op::Barrier(..))), "no barrier");
 }
 
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib shuffle::test_shuffle_xor_allreduce_amd -- --ignored`.

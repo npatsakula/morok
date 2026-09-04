@@ -6,6 +6,7 @@ use svod_ir::{AxisId, AxisType, ConstValue, Op, ParamArg, ReduceOp, UOp, WmmaMet
 
 use crate::c::render;
 use crate::c::types::c_const;
+use svod_ir::ops;
 
 fn render_linearized(root: &std::sync::Arc<UOp>, name: Option<&str>) -> crate::Result<crate::RenderedKernel> {
     let linear = UOp::linear(svod_schedule::linearize_with_cfg(root.clone()).into());
@@ -14,30 +15,33 @@ fn render_linearized(root: &std::sync::Arc<UOp>, name: Option<&str>) -> crate::R
 
 fn concrete_range(end: i64, axis_type: AxisType) -> std::sync::Arc<UOp> {
     let end = UOp::const_(DType::Int32, ConstValue::Int(end));
-    UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type, deps: SmallVec::new() }, DType::Int32)
+    UOp::new(
+        Op::Range(ops::Range { end, axis_id: AxisId::Renumbered(0), axis_type, deps: SmallVec::new() }),
+        DType::Int32,
+    )
 }
 
 fn slotted_var(name: &str, slot: usize) -> std::sync::Arc<UOp> {
     let var = UOp::variable(name.to_string(), 0, 16, DType::Int32);
-    let Op::Param { shape, arg } = var.op() else { unreachable!() };
+    let Op::Param(ops::Param { shape, arg }) = var.op() else { unreachable!() };
     let mut arg = arg.clone();
     arg.slot = slot;
-    UOp::new(Op::Param { shape: shape.clone(), arg }, DType::Int32)
+    UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg }), DType::Int32)
 }
 
 fn volatile_param(slot: usize, size: usize) -> std::sync::Arc<UOp> {
     let mut arg = ParamArg::buffer(slot, DType::Float32, AddrSpace::Global, None);
     arg.volatile = true;
-    UOp::new(Op::Param { shape: UOp::index_const(size as i64), arg: arg.into() }, DType::Float32)
+    UOp::new(Op::Param(ops::Param { shape: UOp::index_const(size as i64), arg: arg.into() }), DType::Float32)
 }
 
 fn shrink4(src: std::sync::Arc<UOp>, dtype: DType) -> std::sync::Arc<UOp> {
     UOp::new(
-        Op::Shrink {
+        Op::Shrink(ops::Shrink {
             src,
             offsets: UOp::const_(DType::Int32, ConstValue::Int(0)),
             sizes: UOp::const_(DType::Int32, ConstValue::Int(4)),
-        },
+        }),
         dtype,
     )
 }

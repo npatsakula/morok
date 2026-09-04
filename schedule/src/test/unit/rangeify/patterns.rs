@@ -14,6 +14,7 @@ use crate::pattern::RewriteResult;
 use crate::rangeify::IndexingContext;
 use crate::rangeify::patterns;
 use crate::rewrite::graph_rewrite;
+use svod_ir::ops;
 
 fn rewritten(result: RewriteResult) -> Arc<UOp> {
     match result {
@@ -63,7 +64,7 @@ fn empty_reduction_folds_to_a_shaped_identity() {
     assert_eq!(identity.shape().expect("shape").expect("static").as_slice(), &[SInt::Const(3)]);
     assert!(matches!(
         identity.op(),
-        Op::Expand { src, .. } if matches!(src.op(), Op::Const(value) if value.0.try_float() == Some(0.0))
+        Op::Expand(ops::Expand { src, .. }) if matches!(src.op(), Op::Const(value) if value.0.try_float() == Some(0.0))
     ));
 }
 
@@ -81,8 +82,8 @@ fn a_copy_source_is_materialised_only_when_the_view_resizes_it() {
         .try_expand(&smallvec![SInt::Const(4), SInt::Const(8)])
         .expect("expand");
     let rewritten = graph_rewrite(&patterns::early_rewrites(), expanded.copy_to_device(amd.clone()), &mut ());
-    let Op::Copy { src, .. } = rewritten.op() else { panic!("expected COPY, got {}", rewritten.tree()) };
-    assert!(matches!(src.op(), Op::Contiguous { .. }), "resized copy source must be materialised");
+    let Op::Copy(ops::Copy { src, .. }) = rewritten.op() else { panic!("expected COPY, got {}", rewritten.tree()) };
+    assert!(matches!(src.op(), Op::Contiguous(..)), "resized copy source must be materialised");
 
     let flat = source.try_reshape(&smallvec![SInt::Const(2), SInt::Const(2)]).expect("reshape").copy_to_device(amd);
     assert!(Arc::ptr_eq(&graph_rewrite(&patterns::early_rewrites(), flat.clone(), &mut ()), &flat));
@@ -106,13 +107,15 @@ fn unread_ranges_are_stripped_from_the_stage(extents: &[i64]) {
 
     let result = rewritten(patterns::dead_axis_removal().rewrite(&stage, &mut ()));
     let reshape = match result.op() {
-        Op::Expand { src, .. } => src,
-        Op::Reshape { .. } => &result,
+        Op::Expand(ops::Expand { src, .. }) => src,
+        Op::Reshape(..) => &result,
         _ => panic!("expected EXPAND or RESHAPE, got {}", result.tree()),
     };
-    let Op::Reshape { src: shrunk, .. } = reshape.op() else { panic!("expected RESHAPE, got {}", result.tree()) };
+    let Op::Reshape(ops::Reshape { src: shrunk, .. }) = reshape.op() else {
+        panic!("expected RESHAPE, got {}", result.tree())
+    };
     assert!(
-        matches!(shrunk.op(), Op::Stage { ranges, .. } if ranges.is_empty()),
+        matches!(shrunk.op(), Op::Stage(ops::Stage { ranges, .. }) if ranges.is_empty()),
         "the STAGE must survive with no ranges, got {}",
         result.tree()
     );
@@ -132,17 +135,17 @@ fn always_run_sources_keep_their_dead_axes() {
 // ===== movement-op removal =====
 
 fn permute(src: Arc<UOp>) -> Arc<UOp> {
-    UOp::new(Op::Permute { src, axes: vec![1, 0] }, DType::Float32)
+    UOp::new(Op::Permute(ops::Permute { src, axes: vec![1, 0] }), DType::Float32)
 }
 
 fn reshape(src: Arc<UOp>) -> Arc<UOp> {
     let new_shape = UOp::stack(smallvec![UOp::index_const(4), UOp::index_const(8)]);
-    UOp::new(Op::Reshape { src, new_shape }, DType::Float32)
+    UOp::new(Op::Reshape(ops::Reshape { src, new_shape }), DType::Float32)
 }
 
 fn expand(src: Arc<UOp>) -> Arc<UOp> {
     let new_shape = UOp::stack(smallvec![UOp::index_const(4), UOp::index_const(8)]);
-    UOp::new(Op::Expand { src, new_shape }, DType::Float32)
+    UOp::new(Op::Expand(ops::Expand { src, new_shape }), DType::Float32)
 }
 
 /// Once ranges are assigned the movement op has been absorbed into the index

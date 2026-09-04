@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use svod_ir::ops;
 use svod_ir::{Op, UOp, UOpKey};
 
 /// Context used by Tinygrad's pre-isel pass: fresh temporaries count downward
@@ -48,11 +49,11 @@ impl IselContext {
         }
 
         let mut func_args: Vec<_> =
-            topo.into_iter().filter(|u| matches!(u.op(), Op::Param { .. } | Op::Special { .. })).collect();
+            topo.into_iter().filter(|u| matches!(u.op(), Op::Param(..) | Op::Special(..))).collect();
         func_args.sort_by_key(|u| match u.op() {
-            Op::Param { arg, .. } if arg.addrspace.is_some() => (0u8, arg.slot as u64, String::new()),
-            Op::Param { .. } => (1, u.content_hash, String::new()),
-            Op::Special { name, .. } => (2, 0, name.clone()),
+            Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_some() => (0u8, arg.slot as u64, String::new()),
+            Op::Param(..) => (1, u.content_hash, String::new()),
+            Op::Special(ops::Special { name, .. }) => (2, 0, name.clone()),
             _ => unreachable!(),
         });
 

@@ -8,6 +8,7 @@ use smallvec::{SmallVec, smallvec};
 
 use svod_dtype::DType;
 
+use crate::ops;
 use crate::{AxisId, AxisType, ConstValue, Op, UOp};
 
 type Body = SmallVec<[Arc<UOp>; 4]>;
@@ -89,8 +90,10 @@ fn range_and_special_explicit_dtype_preserve_concrete_end() {
 
     assert_eq!(range.dtype(), DType::Int32);
     assert_eq!(special.dtype(), DType::Int32);
-    assert!(matches!(range.op(), Op::Range { end: range_end, .. } if Arc::ptr_eq(range_end, &end)));
-    assert!(matches!(special.op(), Op::Special { end: special_end, .. } if Arc::ptr_eq(special_end, &end)));
+    assert!(matches!(range.op(), Op::Range(ops::Range { end: range_end, .. }) if Arc::ptr_eq(range_end, &end)));
+    assert!(
+        matches!(special.op(), Op::Special(ops::Special { end: special_end, .. }) if Arc::ptr_eq(special_end, &end))
+    );
 }
 
 /// `Weak` sorts with `Loop` but keeps its own serialized name.

@@ -9,6 +9,7 @@ use svod_ir::{BinaryOp, Op, TernaryOp, UOp, UnaryOp};
 use test_case::test_case;
 
 use super::helpers::*;
+use svod_ir::ops;
 
 #[derive(Clone, Copy, Debug)]
 enum Alu {
@@ -52,7 +53,7 @@ fn is_lane_of(alu: Alu, uop: &Arc<UOp>) -> bool {
     match (alu, uop.op()) {
         (Alu::Binary(op), Op::Binary(got, ..)) => *got == op,
         (Alu::Unary(op), Op::Unary(got, ..)) => *got == op,
-        (Alu::Cast, Op::Cast { .. }) => true,
+        (Alu::Cast, Op::Cast(..)) => true,
         (Alu::Where, Op::Ternary(TernaryOp::Where, ..)) => true,
         (Alu::MulAcc, Op::Ternary(TernaryOp::MulAcc, ..)) => true,
         _ => false,
@@ -74,7 +75,7 @@ fn is_lane_of(alu: Alu, uop: &Arc<UOp>) -> bool {
 fn vector_alu_becomes_a_stack_of_scalar_lanes(alu: Alu, width: usize, elem: ScalarDType) {
     let result = apply_no_vectorized_alu(&build(alu, width, elem));
 
-    let Op::Stack { sources } = result.op() else { panic!("expected a STACK of lanes: {}", result.tree()) };
+    let Op::Stack(ops::Stack { sources }) = result.op() else { panic!("expected a STACK of lanes: {}", result.tree()) };
     assert_eq!(sources.len(), width);
     assert!(sources.iter().all(|lane| is_lane_of(alu, lane) && lane.dtype().vcount() == 1), "{}", result.tree());
 }
@@ -102,7 +103,7 @@ fn broadcast_operand_is_scalarized_with_its_vector_partner() {
 
     let result = apply_no_vectorized_alu(&add);
 
-    let Op::Stack { sources } = result.op() else { panic!("expected a STACK of lanes: {}", result.tree()) };
+    let Op::Stack(ops::Stack { sources }) = result.op() else { panic!("expected a STACK of lanes: {}", result.tree()) };
     assert_eq!(sources.len(), 4);
     assert!(sources.iter().all(|lane| matches!(lane.op(), Op::Binary(BinaryOp::Add, ..))));
 }
@@ -129,12 +130,12 @@ fn shaped_load_lanes_go_through_index_extraction() {
 
     let result = apply_no_vectorized_alu(&load.add(&load));
 
-    let Op::Stack { sources } = result.op() else { panic!("expected shaped result to become STACK") };
+    let Op::Stack(ops::Stack { sources }) = result.op() else { panic!("expected shaped result to become STACK") };
     assert_eq!(sources.len(), 2);
     for source in sources {
         let Op::Binary(BinaryOp::Add, lhs, rhs) = source.op() else { panic!("expected scalar ADD") };
-        assert!(matches!(lhs.op(), Op::Index { buffer, indices }
-            if matches!(buffer.op(), Op::Load { .. }) && indices.len() == 1 && matches!(indices[0].op(), Op::Const(_))));
+        assert!(matches!(lhs.op(), Op::Index(ops::Index { buffer, indices })
+            if matches!(buffer.op(), Op::Load(..)) && indices.len() == 1 && matches!(indices[0].op(), Op::Const(_))));
         assert!(Arc::ptr_eq(lhs, rhs));
         assert_eq!(lhs.dtype(), DType::Float32);
     }
@@ -151,7 +152,7 @@ fn shaped_invalid_is_indexed_lane_by_lane() {
 
     let result = apply_no_vectorized_alu(&where_op);
 
-    let Op::Stack { sources } = result.op() else { panic!("expected scalarized WHERE lanes") };
+    let Op::Stack(ops::Stack { sources }) = result.op() else { panic!("expected scalarized WHERE lanes") };
     for element in sources {
         let Op::Ternary(TernaryOp::Where, _, invalid, _) = element.op() else { panic!("expected WHERE lane") };
         assert!(UOp::is_invalid_marker(invalid), "STACK indexing must select the corresponding Invalid lane");

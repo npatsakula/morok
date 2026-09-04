@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
 
+use crate::ops;
 use crate::{
     AxisId, AxisType, CallInfo, DType, DeviceSpec, KernelInfo, Op, Opt, OptimizerWireGraph, ParamArg, ReduceOp,
     RendererDevice, UOp, WmmaMetadata, WmmaUpcastAxes,
@@ -13,31 +14,37 @@ fn tagged(op: Op, dtype: DType, tag: &[usize]) -> Arc<UOp> {
 
 #[test]
 fn optimizer_wire_roundtrips_reduce_symbolic_wmma_multi_and_calls() {
-    let symbol = UOp::new(Op::DefineVar { name: "n".into(), min_val: 1, max_val: 4096 }, DType::Index);
-    let shape = UOp::new(Op::Stack { sources: smallvec![symbol.clone(), UOp::index_const(16)] }, DType::Index);
+    let symbol = UOp::new(Op::DefineVar(ops::DefineVar { name: "n".into(), min_val: 1, max_val: 4096 }), DType::Index);
+    let shape =
+        UOp::new(Op::Stack(ops::Stack { sources: smallvec![symbol.clone(), UOp::index_const(16)] }), DType::Index);
     let param = UOp::new(
-        Op::Param {
+        Op::Param(ops::Param {
             shape: shape.clone(),
             arg: ParamArg::buffer(0, DType::Float16, crate::AddrSpace::Global, Some(DeviceSpec::Cpu)).into(),
-        },
+        }),
         DType::Float16,
     );
     let range = tagged(
-        Op::Range {
+        Op::Range(ops::Range {
             end: symbol,
             axis_id: AxisId::RenumberedPath(smallvec![2, 1]),
             axis_type: AxisType::Reduce,
             deps: smallvec![],
-        },
+        }),
         DType::Index,
         &[7, 9],
     );
     let reduce = UOp::new(
-        Op::Reduce { src: param.clone(), ranges: smallvec![range.clone()], reduce_op: ReduceOp::Add, num_axes: 1 },
+        Op::Reduce(ops::Reduce {
+            src: param.clone(),
+            ranges: smallvec![range.clone()],
+            reduce_op: ReduceOp::Add,
+            num_axes: 1,
+        }),
         DType::Float16,
     );
     let wmma = UOp::new(
-        Op::Wmma {
+        Op::Wmma(ops::Wmma {
             a: reduce.clone(),
             b: reduce.clone(),
             c: reduce.clone(),
@@ -56,31 +63,31 @@ fn optimizer_wire_roundtrips_reduce_symbolic_wmma_multi_and_calls() {
                 reduce_axes: vec![AxisId::RenumberedPath(smallvec![2, 1])],
                 tile_grid: (2, 2),
             }),
-        },
+        }),
         DType::Float32,
     );
     let function = UOp::new(
-        Op::Function {
-            body: UOp::new(Op::Tuple { src: smallvec![wmma.clone(), reduce] }, DType::Void),
+        Op::Function(ops::Function {
+            body: UOp::new(Op::Tuple(ops::Tuple { src: smallvec![wmma.clone(), reduce] }), DType::Void),
             args: smallvec![param.clone()],
             info: Box::new(CallInfo {
                 name: Some("inner".into()),
                 metadata: vec!["exact".into()],
                 ..Default::default()
             }),
-        },
+        }),
         DType::Void,
     );
     let call = UOp::new(
-        Op::Call {
+        Op::Call(ops::Call {
             body: function,
-            args: smallvec![UOp::new(Op::Multi { src: param, axis: 1 }, DType::Float16)],
+            args: smallvec![UOp::new(Op::Multi(ops::Multi { src: param, axis: 1 }), DType::Float16)],
             info: Box::new(CallInfo { name: Some("outer".into()), precompile: true, ..Default::default() }),
-        },
+        }),
         DType::Void,
     );
     let root = tagged(
-        Op::Sink {
+        Op::Sink(ops::Sink {
             sources: smallvec![call],
             info: Some(Box::new(KernelInfo {
                 opts_to_apply: Some(vec![Opt::upcast(0, 4)]),
@@ -88,7 +95,7 @@ fn optimizer_wire_roundtrips_reduce_symbolic_wmma_multi_and_calls() {
                 dont_use_locals: true,
                 name: Some("wire_kernel".into()),
             })),
-        },
+        }),
         DType::Void,
         &[11],
     );
@@ -102,7 +109,7 @@ fn optimizer_wire_roundtrips_reduce_symbolic_wmma_multi_and_calls() {
     let decoded = wire.decode_root().unwrap();
     assert_eq!(decoded.content_hash, expected_hash);
     assert_eq!(decoded.tag(), &expected_tag);
-    let decoded_range = decoded.toposort().into_iter().find(|node| matches!(node.op(), Op::Range { .. })).unwrap();
+    let decoded_range = decoded.toposort().into_iter().find(|node| matches!(node.op(), Op::Range(..))).unwrap();
     assert_eq!(decoded_range.tag().as_deref(), Some(&[7, 9][..]));
     assert_eq!(
         crate::CanonicalGraph::from_root("wire", &decoded).unwrap().to_pretty_json().unwrap(),

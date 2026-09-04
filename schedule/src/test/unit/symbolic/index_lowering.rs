@@ -9,6 +9,7 @@ use test_case::test_case;
 
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::index_lowering::{WeakMemo, pm_commit_weak, pm_lower_index_dtype, pm_lower_weak};
+use svod_ir::ops;
 
 fn lower_weak(graph: Arc<UOp>) -> Arc<UOp> {
     graph_rewrite(&pm_lower_weak(), graph, &mut ())
@@ -43,7 +44,9 @@ fn index_of(buffer: Arc<UOp>, index: Arc<UOp>) -> Arc<UOp> {
     "stacked weak casts resolve at the outer default")]
 fn weak_leaf_commits_to_the_default_width(weak: Arc<UOp>, expected_weak: DType, expected_source: DType) {
     let lowered = lower_weak(weak);
-    let Op::Cast { src, dtype } = lowered.op() else { panic!("expected a weak cast, got {}", lowered.tree()) };
+    let Op::Cast(ops::Cast { src, dtype }) = lowered.op() else {
+        panic!("expected a weak cast, got {}", lowered.tree())
+    };
     assert_eq!(*dtype, expected_weak);
     assert_eq!(src.dtype(), expected_source);
 }
@@ -53,7 +56,7 @@ fn weak_leaf_commits_to_the_default_width(weak: Arc<UOp>, expected_weak: DType, 
 fn weak_vconst_commits_lanewise_to_the_default_width(dtype: DType, values: Vec<ConstValue>, expected: DType) {
     let lanes = values.len();
     let lowered = lower_weak(UOp::vconst(values, dtype.clone()));
-    let Op::Cast { src, dtype: cast_dtype } = lowered.op() else { panic!("expected a weak vector cast") };
+    let Op::Cast(ops::Cast { src, dtype: cast_dtype }) = lowered.op() else { panic!("expected a weak vector cast") };
     assert_eq!(*cast_dtype, dtype.vec(lanes).unwrap());
     assert_eq!(src.dtype(), expected.vec(lanes).unwrap());
 }
@@ -69,9 +72,9 @@ fn weak_vconst_commit_rounds_lanes_and_keeps_invalid() {
 
     let lowered = lower_index(UOp::sink(vec![weak]));
 
-    let Op::Sink { sources, .. } = lowered.op() else { panic!("expected a sink") };
+    let Op::Sink(ops::Sink { sources, .. }) = lowered.op() else { panic!("expected a sink") };
     assert_eq!(sources[0].dtype(), DType::Float32.vec(3).unwrap());
-    assert!(matches!(sources[0].op(), Op::VConst { values }
+    assert!(matches!(sources[0].op(), Op::VConst(ops::VConst { values })
         if values == &vec![ConstValue::Float(1.0), ConstValue::Invalid, ConstValue::Float(2.0)]));
 }
 
@@ -157,7 +160,7 @@ fn concrete_cast_is_a_width_floor() {
 
     let lowered = lower_index(weak_add.cast(DType::Int32));
 
-    let Op::Cast { src, dtype } = lowered.op() else { panic!("expected a concrete cast") };
+    let Op::Cast(ops::Cast { src, dtype }) = lowered.op() else { panic!("expected a concrete cast") };
     assert_eq!(*dtype, DType::Int32);
     assert!(src.op().sources().iter().all(|source| source.dtype() == DType::Int64));
 }
@@ -207,18 +210,18 @@ fn only_the_alu_weak_param_is_lowered() {
             device: None,
             volatile: false,
         };
-        UOp::new(Op::Param { shape: shape.clone(), arg: arg.into() }, DType::WeakInt)
+        UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg: arg.into() }), DType::WeakInt)
     };
 
     let alu = lower_weak(make_param(None));
     assert!(
-        matches!(alu.op(), Op::Cast { src, dtype } if *dtype == DType::WeakInt && !src.dtype().is_weak()),
+        matches!(alu.op(), Op::Cast(ops::Cast { src, dtype }) if *dtype == DType::WeakInt && !src.dtype().is_weak()),
         "{}",
         alu.tree()
     );
 
     let buffer = lower_weak(make_param(Some(AddrSpace::Global)));
-    assert!(matches!(buffer.op(), Op::Param { arg, .. } if arg.dtype == DType::WeakInt));
+    assert!(matches!(buffer.op(), Op::Param(ops::Param { arg, .. }) if arg.dtype == DType::WeakInt));
 }
 
 /// Extracting one element of a shaped LOAD must not collapse the LOAD to a scalar: the
@@ -235,11 +238,11 @@ fn lowering_a_weak_index_preserves_the_shaped_load_under_extraction() {
     let shaped_load = lowered
         .toposort()
         .into_iter()
-        .find(|node| matches!(node.op(), Op::Load { .. }))
+        .find(|node| matches!(node.op(), Op::Load(..)))
         .expect("shaped LOAD must remain under extraction");
     assert_eq!(shaped_load.dtype(), DType::BFloat16);
     assert_eq!(shaped_load.shape().unwrap().unwrap().as_slice(), &[svod_ir::SInt::Const(8)]);
-    assert!(matches!(lowered.op(), Op::Index { buffer, .. } if Arc::ptr_eq(buffer, &shaped_load)));
+    assert!(matches!(lowered.op(), Op::Index(ops::Index { buffer, .. }) if Arc::ptr_eq(buffer, &shaped_load)));
     assert_no_weak(&lowered);
 }
 
@@ -250,7 +253,7 @@ fn weak_lowering_preserves_the_invalid_marker() {
     let gate = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let lowered = lower_weak(weak_int(7).valid(gate.clone()));
 
-    let Op::Cast { src, dtype } = lowered.op() else { panic!("expected a weak cast") };
+    let Op::Cast(ops::Cast { src, dtype }) = lowered.op() else { panic!("expected a weak cast") };
     assert_eq!(*dtype, DType::WeakInt);
     let Op::Ternary(TernaryOp::Where, condition, value, invalid) = src.op() else { panic!("expected a WHERE") };
     assert!(Arc::ptr_eq(condition, &gate));
@@ -263,7 +266,7 @@ fn weak_lowering_preserves_the_invalid_marker() {
 
     assert_eq!(lowered.dtype(), DType::Int32);
     assert_eq!(lowered.shape().unwrap().unwrap().as_slice(), &[svod_ir::SInt::Const(2)]);
-    let Op::Stack { sources: lanes } = lowered.op() else { panic!("expected a STACK") };
+    let Op::Stack(ops::Stack { sources: lanes }) = lowered.op() else { panic!("expected a STACK") };
     assert_eq!(lanes[0].dtype(), DType::Int32);
     assert!(Arc::ptr_eq(&lanes[1], &invalid));
 }
@@ -273,8 +276,10 @@ fn weak_lowering_preserves_the_invalid_marker() {
 #[test]
 fn invalid_removal_leaves_gated_addresses_alone() {
     let address = UOp::var("i", DType::Index, 0, 16).valid(UOp::var("gate", DType::Bool, 0, 1));
-    let stacked =
-        UOp::new(Op::Stack { sources: [address.clone(), UOp::invalid_marker()].into_iter().collect() }, DType::Index);
+    let stacked = UOp::new(
+        Op::Stack(ops::Stack { sources: [address.clone(), UOp::invalid_marker()].into_iter().collect() }),
+        DType::Index,
+    );
 
     for gated in [address, stacked] {
         let result = graph_rewrite(crate::symbolic::patterns::pm_remove_invalid(), gated.clone(), &mut ());
@@ -291,7 +296,7 @@ fn store_commits_its_weak_value_to_the_destination() {
 
     let lowered = graph_rewrite(&pm_commit_weak(), store, &mut ());
 
-    let Op::Store { index: lowered_index, value, .. } = lowered.op() else { panic!("expected a store") };
+    let Op::Store(ops::Store { index: lowered_index, value, .. }) = lowered.op() else { panic!("expected a store") };
     assert_eq!(value.dtype(), DType::Float32);
     assert_eq!(index.dtype(), DType::Float32, "INDEX exposes the adopted buffer dtype");
     assert!(Arc::ptr_eq(lowered_index, &index));
@@ -310,7 +315,7 @@ fn gated_long_index_narrows_only_for_small_buffers(size: usize, narrowed: bool) 
 
     let lowered = lower_index(index);
 
-    let Op::Index { indices, .. } = lowered.op() else { panic!("expected an index") };
+    let Op::Index(ops::Index { indices, .. }) = lowered.op() else { panic!("expected an index") };
     let Op::Ternary(TernaryOp::Where, _, idx, invalid) = indices[0].op() else { panic!("expected a gated index") };
     assert_eq!(idx.dtype() == DType::Int32, narrowed);
     assert!(UOp::is_invalid_marker(invalid));

@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use snafu::Snafu;
 use svod_dtype::{AddrSpace, DType, DeviceSpec};
+use svod_ir::ops;
 use svod_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
 
 #[derive(Debug, Clone, PartialEq, Eq, Snafu)]
@@ -87,10 +88,10 @@ fn verification_sources(node: &Arc<UOp>, include_call_bodies: bool) -> Vec<(usiz
     }
     match node.op() {
         // Source zero is the opaque body; retain the real source indices in diagnostics.
-        Op::Call { args, .. } | Op::Function { args, .. } => {
+        Op::Call(ops::Call { args, .. }) | Op::Function(ops::Function { args, .. }) => {
             args.iter().cloned().enumerate().map(|(index, arg)| (index + 1, arg)).collect()
         }
-        Op::Program { .. } => Vec::new(),
+        Op::Program(..) => Vec::new(),
         _ => node.op().sources().into_iter().enumerate().collect(),
     }
 }
@@ -211,16 +212,18 @@ fn is_invalid_index_value(value: &Arc<UOp>) -> bool {
     }
     match value.op() {
         Op::Const(cvh) => cvh.0 == ConstValue::Invalid,
-        Op::VConst { values } => !values.is_empty() && values.iter().all(|value| *value == ConstValue::Invalid),
-        Op::Stack { sources } => !sources.is_empty() && sources.iter().all(is_invalid_index_value),
+        Op::VConst(ops::VConst { values }) => {
+            !values.is_empty() && values.iter().all(|value| *value == ConstValue::Invalid)
+        }
+        Op::Stack(ops::Stack { sources }) => !sources.is_empty() && sources.iter().all(is_invalid_index_value),
         _ => false,
     }
 }
 
 fn legal_address(address: &Arc<UOp>) -> bool {
     match address.op() {
-        Op::Index { .. } | Op::Shrink { .. } => true,
-        Op::Cast { src, .. } => matches!(src.op(), Op::Index { .. } | Op::Shrink { .. }),
+        Op::Index(..) | Op::Shrink(..) => true,
+        Op::Cast(ops::Cast { src, .. }) => matches!(src.op(), Op::Index(..) | Op::Shrink(..)),
         _ => false,
     }
 }
@@ -229,7 +232,7 @@ fn legal_address(address: &Arc<UOp>) -> bool {
 // enabled-independent early exits; Svod has no dynamic CHECK_OOB context or
 // validate_index_with_z3 equivalent.
 fn validate_index(address: &Arc<UOp>) -> bool {
-    let Op::Index { indices, .. } = address.op() else { return true };
+    let Op::Index(ops::Index { indices, .. }) = address.op() else { return true };
     if indices.len() != 1 {
         return true;
     }
@@ -256,7 +259,7 @@ fn rule_const() -> SpecRule {
             };
             Some(ok_if(valid, "CONST value type does not match its dtype"))
         }
-        Op::VConst { values } => {
+        Op::VConst(ops::VConst { values }) => {
             let valid = values.len() == u.dtype().vcount()
                 && values.iter().all(|value| match value {
                     ConstValue::Invalid | ConstValue::Bool(_) => u.dtype().is_bool(),
@@ -265,7 +268,7 @@ fn rule_const() -> SpecRule {
                 });
             Some(ok_if(valid, "VCONST value types do not match its dtype"))
         }
-        Op::Stack { .. } if is_invalid_index_value(u) => Some(Ok(())),
+        Op::Stack(..) if is_invalid_index_value(u) => Some(Ok(())),
         _ => None,
     })
 }
@@ -332,10 +335,10 @@ fn rule_alu() -> SpecRule {
 /// same-shaped values matching the promoted scalar result dtype.
 fn rule_stack() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Stack { sources } if sources.is_empty() => {
+        Op::Stack(ops::Stack { sources }) if sources.is_empty() => {
             Some(ok_if(u.dtype() == DType::Void, "empty STACK must have void dtype"))
         }
-        Op::Stack { sources } => {
+        Op::Stack(ops::Stack { sources }) => {
             let first_shape = sources[0].shape().ok().flatten();
             Some(ok_if(
                 sources.iter().all(|source| {
@@ -353,7 +356,7 @@ fn rule_stack() -> SpecRule {
 /// `spec.py:67` — RANGE dtype matches its bound's dtype.
 fn rule_range() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Range { end, axis_id, .. } => Some(ok_if(
+        Op::Range(ops::Range { end, axis_id, .. }) => Some(ok_if(
             !axis_id.path().is_empty() && matches_dtype(end, &u.dtype()),
             "RANGE requires a non-empty integer axis path and matching bound dtype",
         )),
@@ -364,7 +367,7 @@ fn rule_range() -> SpecRule {
 /// `spec.py:82` — every `INDEX` address operand must be integer.
 fn rule_index_integer() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Index { indices, .. } => Some(ok_if(
+        Op::Index(ops::Index { indices, .. }) => Some(ok_if(
             indices.iter().all(|idx| idx.dtype().is_int() || is_invalid_index_value(idx)),
             "non-integer value reached a memory INDEX operand",
         )),
@@ -376,19 +379,23 @@ fn rule_index_integer() -> SpecRule {
 /// layouts and use INDEX/SHRINK addresses (optionally cast).
 fn rule_memory() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Load { index, alt: None, gate: None } if legal_address(index) => {
+        Op::Load(ops::Load { index, alt: None, gate: None }) if legal_address(index) => {
             Some(ok_if(validate_index(index), "invalid ungated LOAD"))
         }
-        Op::Load { index, alt: Some(alt), gate: Some(gate) } if legal_address(index) && gate.dtype() == DType::Bool => {
+        Op::Load(ops::Load { index, alt: Some(alt), gate: Some(gate) })
+            if legal_address(index) && gate.dtype() == DType::Bool =>
+        {
             Some(ok_if(
                 matches_dtype(alt, &u.dtype()) && validate_index(index),
                 "gated LOAD requires a matching alt and valid index",
             ))
         }
-        Op::Store { index, gate: None, .. } if legal_address(index) => {
+        Op::Store(ops::Store { index, gate: None, .. }) if legal_address(index) => {
             Some(ok_if(validate_index(index), "invalid ungated STORE"))
         }
-        Op::Store { index, gate: Some(gate), .. } if legal_address(index) && gate.dtype() == DType::Bool => {
+        Op::Store(ops::Store { index, gate: Some(gate), .. })
+            if legal_address(index) && gate.dtype() == DType::Bool =>
+        {
             Some(ok_if(validate_index(index), "invalid gated STORE"))
         }
         _ => None,
@@ -407,8 +414,10 @@ fn rule_memory() -> SpecRule {
 /// shape instead.
 fn rule_end() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::End { ranges, .. } if ranges.iter().all(|r| matches!(r.op(), Op::Range { .. })) => Some(Ok(())),
-        Op::End { ranges, .. } if ranges.iter().all(|r| r.dtype() == DType::Void || r.dtype() == DType::Bool) => {
+        Op::End(ops::End { ranges, .. }) if ranges.iter().all(|r| matches!(r.op(), Op::Range(..))) => Some(Ok(())),
+        Op::End(ops::End { ranges, .. })
+            if ranges.iter().all(|r| r.dtype() == DType::Void || r.dtype() == DType::Bool) =>
+        {
             Some(Ok(()))
         }
         _ => None,
@@ -419,7 +428,7 @@ fn rule_end() -> SpecRule {
 fn rule_param() -> SpecRule {
     Box::new(|u| match u.op() {
         // ParamArg is statically present in Svod's PARAM variant.
-        Op::Param { .. } => Some(Ok(())),
+        Op::Param(..) => Some(Ok(())),
         _ => None,
     })
 }
@@ -429,14 +438,14 @@ fn rule_param() -> SpecRule {
 fn rule_getaddr() -> SpecRule {
     fn storage_source(source: &Arc<UOp>) -> bool {
         match source.op() {
-            Op::Buffer { arg, .. } | Op::Param { arg, .. } => arg.addrspace.is_some(),
-            Op::After { passthrough, .. } => storage_source(passthrough),
+            Op::Buffer(ops::Buffer { arg, .. }) | Op::Param(ops::Param { arg, .. }) => arg.addrspace.is_some(),
+            Op::After(ops::After { passthrough, .. }) => storage_source(passthrough),
             _ => false,
         }
     }
 
     Box::new(|u| match u.op() {
-        Op::GetAddr { src, device } => Some(ok_if(
+        Op::GetAddr(ops::GetAddr { src, device }) => Some(ok_if(
             u.dtype() == DType::UInt64 && storage_source(src) && is_device(device),
             "GETADDR requires BUFFER/PARAM storage, uint64 result, and a concrete device",
         )),
@@ -459,7 +468,7 @@ fn is_device(device: &DeviceSpec) -> bool {
 /// ParamArg metadata, and only REG/LOCAL BUFFERs are legal in programs.
 fn rule_program_buffer() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Buffer { arg, .. } => Some(ok_if(
+        Op::Buffer(ops::Buffer { arg, .. }) => Some(ok_if(
             matches!(arg.addrspace, Some(AddrSpace::Reg | AddrSpace::Local))
                 && arg.device.is_none()
                 && u.dtype() == arg.dtype,
@@ -472,11 +481,11 @@ fn rule_program_buffer() -> SpecRule {
 /// `spec.py:78` — a GROUP holds stores, groups, or noops.
 fn rule_group() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Group { sources } => Some(ok_if(
+        Op::Group(ops::Group { sources }) => Some(ok_if(
             u.dtype() == DType::Void
-                && sources.iter().all(|s| {
-                    matches!(s.op(), Op::Store { .. } | Op::Group { .. } | Op::Noop | Op::Ins { .. } | Op::End { .. })
-                }),
+                && sources
+                    .iter()
+                    .all(|s| matches!(s.op(), Op::Store(..) | Op::Group(..) | Op::Noop | Op::Ins(..) | Op::End(..))),
             "GROUP must be void and may only hold GROUP/STORE/NOOP/INS/END",
         )),
         _ => None,
@@ -485,17 +494,17 @@ fn rule_group() -> SpecRule {
 
 fn rule_after() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::After { passthrough, .. }
+        Op::After(ops::After { passthrough, .. })
             if passthrough.op().is_movement()
                 || matches!(
                     passthrough.op(),
-                    Op::Param { .. }
-                        | Op::Buffer { .. }
-                        | Op::Index { .. }
-                        | Op::After { .. }
-                        | Op::BitCast { .. }
-                        | Op::Contiguous { .. }
-                        | Op::Ins { .. }
+                    Op::Param(..)
+                        | Op::Buffer(..)
+                        | Op::Index(..)
+                        | Op::After(..)
+                        | Op::BitCast(..)
+                        | Op::Contiguous(..)
+                        | Op::Ins(..)
                 ) =>
         {
             Some(ok_if(matches_dtype(passthrough, &u.dtype()), "AFTER passthrough dtype mismatch"))
@@ -506,25 +515,25 @@ fn rule_after() -> SpecRule {
 
 fn rule_shared_structural() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Sink { .. } => Some(ok_if(u.dtype() == DType::Void, "SINK must be void")),
+        Op::Sink(..) => Some(ok_if(u.dtype() == DType::Void, "SINK must be void")),
         Op::Noop => Some(Ok(())),
-        Op::Cast { dtype, .. } | Op::BitCast { dtype, .. } => {
+        Op::Cast(ops::Cast { dtype, .. }) | Op::BitCast(ops::BitCast { dtype, .. }) => {
             Some(ok_if(*dtype == u.dtype(), "CAST arg dtype must equal result dtype"))
         }
-        Op::Custom { .. } | Op::CustomI { .. } => Some(Ok(())),
-        Op::Call { body, .. } if body.dtype() != DType::Void => {
+        Op::Custom(..) | Op::CustomI(..) => Some(Ok(())),
+        Op::Call(ops::Call { body, .. }) if body.dtype() != DType::Void => {
             Some(ok_if(matches_dtype(body, &DType::UInt64), "non-void CALL target must be uint64"))
         }
-        Op::Barrier { .. } => Some(ok_if(u.dtype() == DType::Void, "BARRIER must be void")),
-        Op::Wmma { .. } => Some(Ok(())),
-        Op::Ins { .. } => Some(Ok(())),
+        Op::Barrier(..) => Some(ok_if(u.dtype() == DType::Void, "BARRIER must be void")),
+        Op::Wmma(..) => Some(Ok(())),
+        Op::Ins(..) => Some(Ok(())),
         _ => None,
     })
 }
 
 fn rule_tensor_store() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Store { gate: None, .. } => Some(ok_if(u.dtype() == DType::Void, "tensor STORE must be void")),
+        Op::Store(ops::Store { gate: None, .. }) => Some(ok_if(u.dtype() == DType::Void, "tensor STORE must be void")),
         _ => None,
     })
 }
@@ -573,7 +582,7 @@ fn rule_canonical_const() -> SpecRule {
     Box::new(|u| {
         let values: &[ConstValue] = match u.op() {
             Op::Const(value) if value.0 != ConstValue::Invalid => std::slice::from_ref(&value.0),
-            Op::VConst { values } => values,
+            Op::VConst(ops::VConst { values }) => values,
             _ => return None,
         };
         let scalar_dtype = u.dtype().scalar_dtype();
@@ -589,8 +598,8 @@ fn rule_canonical_const() -> SpecRule {
 /// before the general movement rejection.
 fn rule_special_shrink() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Shrink { src, sizes, .. }
-            if matches!(src.op(), Op::Param { .. } | Op::Buffer { .. } | Op::After { .. })
+        Op::Shrink(ops::Shrink { src, sizes, .. })
+            if matches!(src.op(), Op::Param(..) | Op::Buffer(..) | Op::After(..))
                 && matches!(sizes.op(), Op::Const(_)) =>
         {
             Some(Ok(()))
@@ -613,7 +622,7 @@ fn rule_no_invalid() -> SpecRule {
 
 fn rule_no_tensor_reduce() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Reduce { num_axes, .. } if *num_axes != 0 => {
+        Op::Reduce(ops::Reduce { num_axes, .. }) if *num_axes != 0 => {
             Some(Err("tensor-form REDUCE must be rangeified before a program"))
         }
         _ => None,
@@ -623,15 +632,15 @@ fn rule_no_tensor_reduce() -> SpecRule {
 /// `spec.py:219-220` — IF has a bool gate; ENDIF closes an IF.
 fn rule_if() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::If { condition, body } => Some(ok_if(
+        Op::If(ops::If { condition, body }) => Some(ok_if(
             u.dtype() == DType::Void
                 && condition.dtype() == DType::Bool
                 && body.len() == 1
-                && matches!(body[0].op(), Op::Cast { .. } | Op::Index { .. } | Op::Shrink { .. }),
+                && matches!(body[0].op(), Op::Cast(..) | Op::Index(..) | Op::Shrink(..)),
             "IF must be void with a bool condition and one CAST/INDEX/SHRINK dedup source",
         )),
-        Op::EndIf { if_op } => Some(ok_if(
-            u.dtype() == DType::Void && matches!(if_op.op(), Op::If { .. }),
+        Op::EndIf(ops::EndIf { if_op }) => Some(ok_if(
+            u.dtype() == DType::Void && matches!(if_op.op(), Op::If(..)),
             "ENDIF must be void and close an IF",
         )),
         _ => None,
@@ -642,7 +651,7 @@ fn rule_if() -> SpecRule {
 /// lowering. Its name is statically represented as a String in Svod's schema.
 fn rule_program_special() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Special { end, .. } => Some(ok_if(
+        Op::Special(ops::Special { end, .. }) => Some(ok_if(
             u.dtype() == DType::Int32 && end.dtype() == DType::Int32,
             "SPECIAL bound and result must be int32 after index lowering",
         )),
@@ -698,7 +707,7 @@ fn rule_tensor_unary() -> SpecRule {
 /// Pinned `spec.py:140-142`: tensor BUFFERs are GLOBAL storage with a device.
 fn rule_tensor_buffer() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Buffer { shape, arg } if arg.addrspace == Some(AddrSpace::Global) => Some(ok_if(
+        Op::Buffer(ops::Buffer { shape, arg }) if arg.addrspace == Some(AddrSpace::Global) => Some(ok_if(
             arg.device.is_some() && u.dtype() == arg.dtype && matches_dtype(shape, &DType::WeakInt),
             "tensor BUFFER must be structured GLOBAL storage with a device",
         )),
@@ -708,10 +717,10 @@ fn rule_tensor_buffer() -> SpecRule {
 
 fn rule_tensor_slice() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Slice { buffer, offset, .. } => Some(ok_if(
+        Op::Slice(ops::Slice { buffer, offset, .. }) => Some(ok_if(
             matches!(offset.op(), Op::Const(_))
                 && offset.dtype() == DType::WeakInt
-                && matches!(buffer.base().op(), Op::Buffer { .. } | Op::Param { .. } | Op::Stage { .. }),
+                && matches!(buffer.base().op(), Op::Buffer(..) | Op::Param(..) | Op::Stage(..)),
             "SLICE requires buffer-backed storage and a constant weakint offset",
         )),
         _ => None,
@@ -720,13 +729,13 @@ fn rule_tensor_slice() -> SpecRule {
 
 /// STAGE is an intermediate tensor operation transformed to BUFFER before lowering.
 fn rule_tensor_stage() -> SpecRule {
-    Box::new(|u| matches!(u.op(), Op::Stage { .. }).then_some(Ok(())))
+    Box::new(|u| matches!(u.op(), Op::Stage(..)).then_some(Ok(())))
 }
 
 fn rule_tensor_bind() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Bind { var, value } => Some(ok_if(
-            matches!(var.op(), Op::Param { .. })
+        Op::Bind(ops::Bind { var, value }) => Some(ok_if(
+            matches!(var.op(), Op::Param(..))
                 && [DType::Int32, DType::Int64, DType::WeakInt].contains(&u.dtype())
                 && matches!(value.op(), Op::Const(_))
                 && value.dtype() == u.dtype(),
@@ -740,31 +749,31 @@ fn rule_tensor_call_function_tuple() -> SpecRule {
     Box::new(|u| match u.op() {
         // CustomFunctionKind is a closed enum, so the Python `isinstance(arg,
         // str)` construction check is enforced by the Rust schema.
-        Op::CustomFunction { .. } => Some(Ok(())),
-        Op::Call { body, .. }
+        Op::CustomFunction(..) => Some(Ok(())),
+        Op::Call(ops::Call { body, .. })
             if u.dtype() == DType::Void
                 && matches!(
                     body.op(),
-                    Op::Sink { .. }
-                        | Op::Linear { .. }
-                        | Op::Program { .. }
-                        | Op::Copy { .. }
-                        | Op::Slice { .. }
-                        | Op::CustomFunction { .. }
+                    Op::Sink(..)
+                        | Op::Linear(..)
+                        | Op::Program(..)
+                        | Op::Copy(..)
+                        | Op::Slice(..)
+                        | Op::CustomFunction(..)
                 ) =>
         {
             Some(Ok(()))
         }
-        Op::Function { body, .. } => Some(ok_if(
-            u.dtype() == DType::Void && matches!(body.op(), Op::Tuple { .. }),
+        Op::Function(ops::Function { body, .. }) => Some(ok_if(
+            u.dtype() == DType::Void && matches!(body.op(), Op::Tuple(..)),
             "FUNCTION must be void and start with TUPLE",
         )),
-        Op::Tuple { .. } => Some(ok_if(u.dtype() == DType::Void, "TUPLE must be void")),
-        Op::GetTuple { src, index } => {
+        Op::Tuple(..) => Some(ok_if(u.dtype() == DType::Void, "TUPLE must be void")),
+        Op::GetTuple(ops::GetTuple { src, index }) => {
             let tuple = match src.op() {
-                Op::Tuple { src } => Some(src),
-                Op::Function { body, .. } => match body.op() {
-                    Op::Tuple { src } => Some(src),
+                Op::Tuple(ops::Tuple { src }) => Some(src),
+                Op::Function(ops::Function { body, .. }) => match body.op() {
+                    Op::Tuple(ops::Tuple { src }) => Some(src),
                     _ => None,
                 },
                 _ => None,
@@ -780,17 +789,18 @@ fn rule_tensor_call_function_tuple() -> SpecRule {
 
 fn rule_tensor_special_movement_reduce() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Special { end, .. } => Some(ok_if(
+        Op::Special(ops::Special { end, .. }) => Some(ok_if(
             end.dtype() == DType::WeakInt && matches_dtype(end, &u.dtype()),
             "tensor SPECIAL must preserve weakint dtype",
         )),
-        Op::Reshape { .. } | Op::Expand { .. } => Some(Ok(())),
-        Op::Pad { begin_pads, end_pads, .. } | Op::Shrink { offsets: begin_pads, sizes: end_pads, .. } => Some(ok_if(
+        Op::Reshape(..) | Op::Expand(..) => Some(Ok(())),
+        Op::Pad(ops::Pad { begin_pads, end_pads, .. })
+        | Op::Shrink(ops::Shrink { offsets: begin_pads, sizes: end_pads, .. }) => Some(ok_if(
             begin_pads.shape().ok().flatten() == end_pads.shape().ok().flatten(),
             "PAD/SHRINK bound shapes must match",
         )),
-        Op::Permute { .. } | Op::Flip { .. } => Some(Ok(())),
-        Op::Reduce { ranges, .. } => Some(ok_if(
+        Op::Permute(..) | Op::Flip(..) => Some(Ok(())),
+        Op::Reduce(ops::Reduce { ranges, .. }) => Some(ok_if(
             ranges.iter().all(|r| [DType::WeakInt, DType::Int32].contains(&r.dtype())),
             "REDUCE ranges must be weakint/int32",
         )),
@@ -801,27 +811,27 @@ fn rule_tensor_special_movement_reduce() -> SpecRule {
 fn rule_tensor_copy_multi_contiguous() -> SpecRule {
     fn mstack_len(source: &Arc<UOp>) -> Option<usize> {
         match source.op() {
-            Op::MStack { buffers } => Some(buffers.len()),
+            Op::MStack(ops::MStack { buffers }) => Some(buffers.len()),
             op if op.is_movement() => op.sources().first().and_then(mstack_len),
             _ => None,
         }
     }
 
     Box::new(|u| match u.op() {
-        Op::Copy { src, device } => {
+        Op::Copy(ops::Copy { src, device }) => {
             Some(ok_if(matches_dtype(src, &u.dtype()) && is_device(device), "COPY dtype/device mismatch"))
         }
-        Op::AllReduce { src, device, .. } => {
+        Op::AllReduce(ops::AllReduce { src, device, .. }) => {
             Some(ok_if(matches_dtype(src, &u.dtype()) && is_device(device), "ALLREDUCE dtype/device mismatch"))
         }
         // Svod represents the supported tuple-device subset explicitly as
         // MSTACK. Keep this strict: arbitrary MSELECT sources are not target
         // tensor forms and must not reach multi_pm.
-        Op::MSelect { buffer, device_index } => Some(ok_if(
+        Op::MSelect(ops::MSelect { buffer, device_index }) => Some(ok_if(
             mstack_len(buffer).is_some_and(|len| *device_index < len) && matches_dtype(buffer, &u.dtype()),
             "MSELECT requires an in-range MSTACK source with matching dtype",
         )),
-        Op::MStack { buffers } => Some(ok_if(
+        Op::MStack(ops::MStack { buffers }) => Some(ok_if(
             !buffers.is_empty()
                 && buffers.iter().all(|s| matches_dtype(s, &u.dtype()))
                 && (buffers.iter().all(|s| s.device_spec().is_some())
@@ -831,15 +841,15 @@ fn rule_tensor_copy_multi_contiguous() -> SpecRule {
             "MSTACK device/source mismatch",
         )),
         // Op::Multi is Svod's single-axis representation of tensor UNSHARD.
-        Op::Multi { src, axis } => Some(ok_if(
+        Op::Multi(ops::Multi { src, axis }) => Some(ok_if(
             matches_dtype(src, &u.dtype()) && src.shape().ok().flatten().is_some_and(|shape| *axis < shape.len()),
             "MULTI must preserve dtype and shard an existing source axis",
         )),
-        Op::Contiguous { src, opts } => Some(ok_if(
+        Op::Contiguous(ops::Contiguous { src, opts }) => Some(ok_if(
             opts.is_empty() && matches_dtype(src, &u.dtype()),
             "CONTIGUOUS must have no arg and preserve dtype",
         )),
-        Op::Detach { src } | Op::ContiguousBackward { src } => {
+        Op::Detach(ops::Detach { src }) | Op::ContiguousBackward(ops::ContiguousBackward { src }) => {
             Some(ok_if(matches_dtype(src, &u.dtype()), "contiguous/detach dtype mismatch"))
         }
         _ => None,
@@ -848,15 +858,15 @@ fn rule_tensor_copy_multi_contiguous() -> SpecRule {
 
 fn rule_tensor_codegen() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Linear { .. } => Some(ok_if(u.dtype() == DType::Void, "LINEAR must be void")),
-        Op::Source { .. } => Some(ok_if(u.dtype() == DType::Void, "SOURCE must be void")),
-        Op::ProgramBinary { .. } => Some(ok_if(u.dtype() == DType::UInt8, "BINARY must be uint8")),
-        Op::Program { sink, linear, source, binary, .. } => Some(ok_if(
+        Op::Linear(..) => Some(ok_if(u.dtype() == DType::Void, "LINEAR must be void")),
+        Op::Source(..) => Some(ok_if(u.dtype() == DType::Void, "SOURCE must be void")),
+        Op::ProgramBinary(..) => Some(ok_if(u.dtype() == DType::UInt8, "BINARY must be uint8")),
+        Op::Program(ops::Program { sink, linear, source, binary, .. }) => Some(ok_if(
             u.dtype() == DType::Void
-                && matches!(sink.op(), Op::Sink { .. })
-                && source.as_ref().is_none_or(|x| matches!(x.op(), Op::Source { .. }))
-                && binary.as_ref().is_none_or(|x| matches!(x.op(), Op::ProgramBinary { .. }))
-                && linear.as_ref().is_none_or(|x| matches!(x.op(), Op::Linear { .. }))
+                && matches!(sink.op(), Op::Sink(..))
+                && source.as_ref().is_none_or(|x| matches!(x.op(), Op::Source(..)))
+                && binary.as_ref().is_none_or(|x| matches!(x.op(), Op::ProgramBinary(..)))
+                && linear.as_ref().is_none_or(|x| matches!(x.op(), Op::Linear(..)))
                 && !(source.is_some() && linear.is_none())
                 && !(binary.is_some() && source.is_none()),
             "invalid progressive PROGRAM sources",
@@ -885,7 +895,7 @@ pub fn spec_tensor() -> Spec {
 fn call_arguments_match_body(body: &Arc<UOp>, args: &[Arc<UOp>]) -> bool {
     let mut slots = HashSet::new();
     for formal in body.toposort_call_aware(false) {
-        let Op::Param { arg, .. } = formal.op() else { continue };
+        let Op::Param(ops::Param { arg, .. }) = formal.op() else { continue };
         if arg.slot == usize::MAX {
             continue;
         }
@@ -894,9 +904,9 @@ fn call_arguments_match_body(body: &Arc<UOp>, args: &[Arc<UOp>]) -> bool {
         }
         let Some(actual) = args.get(arg.slot) else { return false };
         let actual_axis = match actual.op() {
-            Op::Param { arg, .. } | Op::Buffer { arg, .. } => arg.axis,
-            Op::After { passthrough, .. } => match passthrough.buf_uop().op() {
-                Op::Param { arg, .. } | Op::Buffer { arg, .. } => arg.axis,
+            Op::Param(ops::Param { arg, .. }) | Op::Buffer(ops::Buffer { arg, .. }) => arg.axis,
+            Op::After(ops::After { passthrough, .. }) => match passthrough.buf_uop().op() {
+                Op::Param(ops::Param { arg, .. }) | Op::Buffer(ops::Buffer { arg, .. }) => arg.axis,
                 _ => None,
             },
             _ => None,
@@ -910,36 +920,31 @@ fn call_arguments_match_body(body: &Arc<UOp>, args: &[Arc<UOp>]) -> bool {
 
 fn supported_kernel_call_body(body: &Arc<UOp>) -> bool {
     match body.op() {
-        Op::Sink { .. }
-        | Op::Linear { .. }
-        | Op::Program { .. }
-        | Op::Copy { .. }
-        | Op::Slice { .. }
-        | Op::CustomFunction { .. } => true,
-        Op::End { computation, .. } => matches!(computation.op(), Op::Copy { .. } | Op::Slice { .. }),
+        Op::Sink(..) | Op::Linear(..) | Op::Program(..) | Op::Copy(..) | Op::Slice(..) | Op::CustomFunction(..) => true,
+        Op::End(ops::End { computation, .. }) => matches!(computation.op(), Op::Copy(..) | Op::Slice(..)),
         _ => false,
     }
 }
 
 fn rule_kernel_graph() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Sink { .. } => Some(ok_if(u.dtype() == DType::Void, "kernel-graph SINK must be void")),
-        Op::Bind { .. } => Some(Ok(())),
+        Op::Sink(..) => Some(ok_if(u.dtype() == DType::Void, "kernel-graph SINK must be void")),
+        Op::Bind(..) => Some(Ok(())),
         Op::Const(_) => Some(Ok(())),
-        Op::Stack { sources } => Some(ok_if(
+        Op::Stack(ops::Stack { sources }) => Some(ok_if(
             sources.is_empty()
-                || sources
-                    .iter()
-                    .all(|source| matches!(source.op(), Op::Const(_) | Op::Bind { .. } | Op::Param { .. })),
+                || sources.iter().all(|source| matches!(source.op(), Op::Const(_) | Op::Bind(..) | Op::Param(..))),
             "kernel-graph STACK may only contain CONST/BIND/PARAM sources",
         )),
-        Op::Param { arg, .. } => Some(ok_if(u.dtype() == arg.dtype, "kernel-graph PARAM metadata dtype mismatch")),
-        Op::Buffer { arg, .. } => Some(ok_if(
+        Op::Param(ops::Param { arg, .. }) => {
+            Some(ok_if(u.dtype() == arg.dtype, "kernel-graph PARAM metadata dtype mismatch"))
+        }
+        Op::Buffer(ops::Buffer { arg, .. }) => Some(ok_if(
             arg.addrspace == Some(AddrSpace::Global) && u.dtype() == arg.dtype,
             "kernel-graph BUFFER must be GLOBAL with matching metadata dtype",
         )),
-        Op::Reshape { .. } | Op::BitCast { .. } => Some(Ok(())),
-        Op::MStack { buffers } => Some(ok_if(
+        Op::Reshape(..) | Op::BitCast(..) => Some(Ok(())),
+        Op::MStack(ops::MStack { buffers }) => Some(ok_if(
             !buffers.is_empty()
                 && buffers.iter().all(|source| matches_dtype(source, &u.dtype()))
                 && (buffers.iter().all(|source| source.device_spec().is_some())
@@ -947,29 +952,29 @@ fn rule_kernel_graph() -> SpecRule {
                         && buffers[0].device_spec().is_none())),
             "kernel-graph MSTACK requires a non-empty concrete-device layout or one repeated device-free source",
         )),
-        Op::MSelect { buffer, device_index } => Some(ok_if(
-            matches!(buffer.op(), Op::MStack { buffers }
+        Op::MSelect(ops::MSelect { buffer, device_index }) => Some(ok_if(
+            matches!(buffer.op(), Op::MStack(ops::MStack { buffers })
                 if *device_index < buffers.len() && matches_dtype(buffer, &u.dtype())),
             "kernel-graph MSELECT requires an in-range MSTACK source with matching dtype",
         )),
-        Op::Call { body, args, .. } => Some(ok_if(
+        Op::Call(ops::Call { body, args, .. }) => Some(ok_if(
             u.dtype() == DType::Void && supported_kernel_call_body(body) && call_arguments_match_body(body, args),
             "kernel-graph CALL requires a supported opaque body and positional arguments matching its PARAM slots",
         )),
-        Op::After { passthrough, deps } => Some(ok_if(
+        Op::After(ops::After { passthrough, deps }) => Some(ok_if(
             matches_dtype(passthrough, &u.dtype())
                 && (passthrough.op().is_movement()
                     || matches!(
                         passthrough.op(),
-                        Op::Param { .. }
-                            | Op::After { .. }
-                            | Op::Buffer { .. }
-                            | Op::MStack { .. }
-                            | Op::MSelect { .. }
-                            | Op::BitCast { .. }
-                            | Op::Reshape { .. }
+                        Op::Param(..)
+                            | Op::After(..)
+                            | Op::Buffer(..)
+                            | Op::MStack(..)
+                            | Op::MSelect(..)
+                            | Op::BitCast(..)
+                            | Op::Reshape(..)
                     ))
-                && deps.iter().all(|dep| matches!(dep.op(), Op::Call { .. } | Op::After { .. })),
+                && deps.iter().all(|dep| matches!(dep.op(), Op::Call(..) | Op::After(..))),
             "kernel-graph AFTER requires a storage/view passthrough, matching dtype, and CALL/AFTER dependencies",
         )),
         _ => None,

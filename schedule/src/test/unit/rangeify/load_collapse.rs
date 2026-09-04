@@ -40,7 +40,7 @@ fn test_bounded_sum_below() {
 
     if let RewriteResult::Rewritten(collapsed) = result {
         // Should be: 5 * val = 5.0
-        assert!(!matches!(collapsed.op(), Op::Reduce { .. }), "Should have eliminated REDUCE");
+        assert!(!matches!(collapsed.op(), Op::Reduce(..)), "Should have eliminated REDUCE");
     } else {
         // Pattern may not match if implementation differs
         // This is acceptable for initial implementation
@@ -65,7 +65,7 @@ fn test_bounded_sum_above() {
     let result = matcher.rewrite(&reduce, &mut ());
 
     if let RewriteResult::Rewritten(collapsed) = result {
-        assert!(!matches!(collapsed.op(), Op::Reduce { .. }), "Should have eliminated REDUCE");
+        assert!(!matches!(collapsed.op(), Op::Reduce(..)), "Should have eliminated REDUCE");
     }
 }
 
@@ -158,7 +158,7 @@ fn test_two_sided_bounds() {
     let result = matcher.rewrite(&reduce, &mut ());
 
     if let RewriteResult::Rewritten(collapsed) = result {
-        assert!(!matches!(collapsed.op(), Op::Reduce { .. }), "Should have eliminated REDUCE for two-sided bounds");
+        assert!(!matches!(collapsed.op(), Op::Reduce(..)), "Should have eliminated REDUCE for two-sided bounds");
     }
 }
 
@@ -228,7 +228,7 @@ fn test_two_sided_bounds_lower_gt_upper() {
 
     // Should collapse to a multiplication by 0 (or constant 0)
     if let RewriteResult::Rewritten(collapsed) = result {
-        assert!(!matches!(collapsed.op(), Op::Reduce { .. }), "Should have eliminated REDUCE");
+        assert!(!matches!(collapsed.op(), Op::Reduce(..)), "Should have eliminated REDUCE");
     }
 }
 
@@ -254,7 +254,7 @@ fn test_two_sided_bounds_ge_form() {
     let result = matcher.rewrite(&reduce, &mut ());
 
     if let RewriteResult::Rewritten(collapsed) = result {
-        assert!(!matches!(collapsed.op(), Op::Reduce { .. }), "Should have eliminated REDUCE with GE form");
+        assert!(!matches!(collapsed.op(), Op::Reduce(..)), "Should have eliminated REDUCE with GE form");
     }
 }
 
@@ -280,6 +280,6 @@ fn test_two_sided_bounds_at_range_edges() {
     let result = matcher.rewrite(&reduce, &mut ());
 
     if let RewriteResult::Rewritten(collapsed) = result {
-        assert!(!matches!(collapsed.op(), Op::Reduce { .. }), "Should have eliminated REDUCE for full range");
+        assert!(!matches!(collapsed.op(), Op::Reduce(..)), "Should have eliminated REDUCE for full range");
     }
 }

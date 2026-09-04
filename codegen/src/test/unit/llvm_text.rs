@@ -4,13 +4,14 @@ use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, RendererDevice, WmmaMe
 use super::*;
 use crate::Renderer;
 use crate::llvm::LlvmTextRenderer;
+use svod_ir::ops;
 
 fn slotted_var(name: &str, slot: usize) -> std::sync::Arc<UOp> {
     let var = UOp::variable(name.to_string(), 0, 16, DType::Int32);
-    let Op::Param { shape, arg } = var.op() else { unreachable!() };
+    let Op::Param(ops::Param { shape, arg }) = var.op() else { unreachable!() };
     let mut arg = arg.clone();
     arg.slot = slot;
-    UOp::new(Op::Param { shape: shape.clone(), arg }, DType::Int32)
+    UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg }), DType::Int32)
 }
 
 fn render_linearized(root: std::sync::Arc<UOp>, name: &str) -> crate::RenderedKernel {
@@ -420,7 +421,7 @@ fn f32_param(slot: usize) -> std::sync::Arc<UOp> {
 }
 
 fn shrink4(src: std::sync::Arc<UOp>, dtype: DType) -> std::sync::Arc<UOp> {
-    UOp::new(Op::Shrink { src, offsets: UOp::native_const(0i32), sizes: UOp::native_const(4i32) }, dtype)
+    UOp::new(Op::Shrink(ops::Shrink { src, offsets: UOp::native_const(0i32), sizes: UOp::native_const(4i32) }), dtype)
 }
 
 fn element(buffer: std::sync::Arc<UOp>, lane: i64) -> std::sync::Arc<UOp> {

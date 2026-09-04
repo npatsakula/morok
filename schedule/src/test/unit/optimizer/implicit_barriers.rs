@@ -6,15 +6,16 @@ use crate::optimizer::implicit_barriers::pm_implicit_barriers;
 use smallvec::{SmallVec, smallvec};
 use std::sync::Arc;
 use svod_dtype::{AddrSpace, DType};
+use svod_ir::ops;
 use svod_ir::rewrite::graph_rewrite;
 use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ParamArg, RendererOps, UOp};
 
 fn buffer(slot: usize, addrspace: AddrSpace) -> Arc<UOp> {
     UOp::new(
-        Op::Param {
+        Op::Param(ops::Param {
             shape: svod_ir::shape::shape_to_uop(&smallvec::smallvec![8usize.into()]),
             arg: ParamArg::buffer(slot, DType::Float32, addrspace, None).into(),
-        },
+        }),
         DType::Float32,
     )
 }
@@ -41,8 +42,8 @@ fn renderer_extra_matcher_local_dependency_precedes_barrier_inference() {
     let result = crate::optimizer::finish_final_rewrite(rewritten);
 
     assert!(
-        matches!(result.op(), Op::After { deps, .. }
-        if matches!(deps.as_slice(), [barrier] if matches!(barrier.op(), Op::Barrier { .. }))),
+        matches!(result.op(), Op::After(ops::After { deps, .. })
+        if matches!(deps.as_slice(), [barrier] if matches!(barrier.op(), Op::Barrier(..)))),
         "{}",
         result.tree()
     );
@@ -78,10 +79,10 @@ fn local_after_store_gets_raw_barrier() {
     let store = index(local.clone(), UOp::index_const(0)).store_value(UOp::native_const(1.0f32));
     let result = rewrite(local.after(smallvec![store.clone()]));
 
-    let Op::After { passthrough, deps } = result.op() else { panic!("expected AFTER") };
+    let Op::After(ops::After { passthrough, deps }) = result.op() else { panic!("expected AFTER") };
     assert!(Arc::ptr_eq(passthrough, &local));
     assert!(matches!(deps.as_slice(), [barrier]
-        if matches!(barrier.op(), Op::Barrier { src, deps } if Arc::ptr_eq(src, &store) && deps.is_empty())));
+        if matches!(barrier.op(), Op::Barrier(ops::Barrier { src, deps }) if Arc::ptr_eq(src, &store) && deps.is_empty())));
 }
 
 #[test]
@@ -90,7 +91,7 @@ fn global_after_store_does_not_get_barrier() {
     let store = index(global.clone(), UOp::index_const(0)).store_value(UOp::native_const(1.0f32));
     let result = rewrite(global.after(smallvec![store.clone()]));
 
-    assert!(matches!(result.op(), Op::After { deps, .. }
+    assert!(matches!(result.op(), Op::After(ops::After { deps, .. })
         if matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, &store))));
 }
 
@@ -103,8 +104,8 @@ fn local_store_and_load_get_war_barrier_for_all_loop_axes() {
         let store = index(local, range.clone()).store_value(load.clone());
         let result = rewrite(store.end(smallvec![range.clone()]));
 
-        let Op::End { computation, ranges } = result.op() else { panic!("expected END") };
-        assert!(matches!(computation.op(), Op::Barrier { src, deps }
+        let Op::End(ops::End { computation, ranges }) = result.op() else { panic!("expected END") };
+        assert!(matches!(computation.op(), Op::Barrier(ops::Barrier { src, deps })
             if Arc::ptr_eq(src, &store) && matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, &load))));
         assert!(matches!(ranges.as_slice(), [closed] if Arc::ptr_eq(closed, &range)));
     }
@@ -119,9 +120,9 @@ fn end_computation_load_participates_in_war_detection() {
     let result = rewrite(load.end(smallvec![range]));
 
     assert!(
-        matches!(result.op(), Op::End { computation, .. }
-        if matches!(computation.op(), Op::Barrier { src, deps }
-            if matches!(src.op(), Op::Load { .. })
+        matches!(result.op(), Op::End(ops::End { computation, .. })
+        if matches!(computation.op(), Op::Barrier(ops::Barrier { src, deps })
+            if matches!(src.op(), Op::Load(..))
                 && matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, src)))),
         "{}",
         result.tree()
@@ -139,7 +140,7 @@ fn no_war_barrier_without_a_local_cross_iteration_hazard(addrspace: AddrSpace, e
     let store = index(memory, range.clone()).store_value(load);
     let result = rewrite(store.clone().end(smallvec![range]));
 
-    assert!(matches!(result.op(), Op::End { computation, .. } if Arc::ptr_eq(computation, &store)));
+    assert!(matches!(result.op(), Op::End(ops::End { computation, .. }) if Arc::ptr_eq(computation, &store)));
 }
 
 #[test]
@@ -152,7 +153,9 @@ fn unrelated_global_load_does_not_match_local_store() {
     let computation = UOp::sink(vec![store, load]);
     let result = rewrite(computation.clone().end(smallvec![range]));
 
-    assert!(matches!(result.op(), Op::End { computation: rewritten, .. } if Arc::ptr_eq(rewritten, &computation)));
+    assert!(
+        matches!(result.op(), Op::End(ops::End { computation: rewritten, .. }) if Arc::ptr_eq(rewritten, &computation))
+    );
 }
 
 #[test]
@@ -162,6 +165,6 @@ fn existing_barrier_is_not_reinferred() {
     let explicit = store.barrier(SmallVec::new());
     let result = rewrite(local.after(smallvec![explicit.clone()]));
 
-    assert!(matches!(result.op(), Op::After { deps, .. }
+    assert!(matches!(result.op(), Op::After(ops::After { deps, .. })
         if matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, &explicit))));
 }

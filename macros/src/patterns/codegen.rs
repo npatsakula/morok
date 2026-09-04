@@ -242,6 +242,9 @@ const OP_CHILD_FIELDS: &[(&str, &[&str])] = &[
     ("Wmma", &["a", "b", "c"]),
 ];
 
+/// Unit variants of `Op`: matched without a payload.
+const UNIT_OPS: &[&str] = &["Noop"];
+
 /// Get child field names for an operation.
 ///
 /// Returns the field names from OP_CHILD_FIELDS, or &["src"] for single-source ops.
@@ -646,7 +649,7 @@ fn generate_inline_match(
             let uop_ident = Ident::new(&actual_name, uop_name.span());
             Ok(InlineMatchOutput::simple(
                 quote! {
-                    let svod_ir::Op::VConst { values: __vconst_values } = #tree_var.op() else {
+                    let svod_ir::Op::VConst(svod_ir::ops::VConst { values: __vconst_values }) = #tree_var.op() else {
                         return svod_ir::pattern::RewriteResult::NoMatch;
                     };
                     let #values_name = __vconst_values.clone();
@@ -663,7 +666,7 @@ fn generate_inline_match(
                 quote! {
                     let #values_name: Vec<svod_ir::ConstValue> = match #tree_var.op() {
                         svod_ir::Op::Const(cv) => vec![cv.0.clone()],
-                        svod_ir::Op::VConst { values } => values.clone(),
+                        svod_ir::Op::VConst(svod_ir::ops::VConst { values }) => values.clone(),
                         _ => return svod_ir::pattern::RewriteResult::NoMatch,
                     };
                 },
@@ -886,7 +889,7 @@ fn generate_inline_single_source_match(
     let src_var = format_ident!("{}_src", tree_var);
 
     let match_code = quote! {
-        let svod_ir::Op::#op_ident { src: #src_var, .. } = #tree_var.op() else {
+        let svod_ir::Op::#op_ident(svod_ir::ops::#op_ident { src: #src_var, .. }) = #tree_var.op() else {
             return svod_ir::pattern::RewriteResult::NoMatch;
         };
     };
@@ -930,8 +933,13 @@ fn generate_inline_special_op_match(
 
     // Handle zero-argument case: match any op of this type
     if args.is_empty() {
+        let payload = if UNIT_OPS.contains(&op_name) {
+            quote! {}
+        } else {
+            quote! { (..) }
+        };
         let match_code = quote! {
-            let svod_ir::Op::#op_ident { .. } = #tree_var.op() else {
+            let svod_ir::Op::#op_ident #payload = #tree_var.op() else {
                 return svod_ir::pattern::RewriteResult::NoMatch;
             };
         };
@@ -980,7 +988,7 @@ fn generate_inline_special_op_match(
 
     // Generate the match code
     let match_code = quote! {
-        let svod_ir::Op::#op_ident { #(#field_bindings,)* .. } = #tree_var.op() else {
+        let svod_ir::Op::#op_ident(svod_ir::ops::#op_ident { #(#field_bindings,)* .. }) = #tree_var.op() else {
             return svod_ir::pattern::RewriteResult::NoMatch;
         };
     };
@@ -1073,7 +1081,7 @@ fn generate_inline_op_struct_match(
         .collect();
 
     let match_code = quote! {
-        let svod_ir::Op::#op_ident { #(#field_bindings,)* .. } = #tree_var.op() else {
+        let svod_ir::Op::#op_ident(svod_ir::ops::#op_ident { #(#field_bindings,)* .. }) = #tree_var.op() else {
             return svod_ir::pattern::RewriteResult::NoMatch;
         };
     };

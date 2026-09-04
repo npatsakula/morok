@@ -11,6 +11,7 @@ use smallvec::{SmallVec, smallvec};
 use svod_ir::{AxisId, AxisType, ConstValue, Op, SInt, UOp};
 
 use crate::TypedPatternMatcher;
+use svod_ir::ops;
 
 pub type RangeMap = HashMap<AxisId, usize>;
 
@@ -18,7 +19,7 @@ pub type RangeMap = HashMap<AxisId, usize>;
 pub fn build_range_map(sink: &Arc<UOp>) -> RangeMap {
     let mut ranges = HashMap::new();
     for node in sink.toposort() {
-        if let Op::Range { axis_id, axis_type: AxisType::Upcast | AxisType::Unroll, .. } = node.op() {
+        if let Op::Range(ops::Range { axis_id, axis_type: AxisType::Upcast | AxisType::Unroll, .. }) = node.op() {
             let next = ranges.len();
             ranges.entry(axis_id.clone()).or_insert(next);
         }
@@ -35,7 +36,7 @@ fn static_extent(value: &ConstValue) -> Option<usize> {
 }
 
 fn expand_range(ctx: &RangeMap, range: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Range { end, axis_id, .. } = range.op() else { return None };
+    let Op::Range(ops::Range { end, axis_id, .. }) = range.op() else { return None };
     let position = *ctx.get(axis_id)?;
     let Op::Const(value) = end.op() else { return None };
     let extent = static_extent(&value.0)?;
@@ -115,14 +116,14 @@ fn expand_wmma(
 
 /// Convert shaped non-range REDUCE inputs into leading horizontal axes.
 fn expand_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Reduce { src, ranges, reduce_op, num_axes } = reduce.op() else { return None };
+    let Op::Reduce(ops::Reduce { src, ranges, reduce_op, num_axes }) = reduce.op() else { return None };
     if *num_axes != 0 {
         return None;
     }
     let mut loop_ranges = SmallVec::new();
     let mut horizontal_axes = Vec::new();
     for range in ranges {
-        if matches!(range.op(), Op::Range { .. }) {
+        if matches!(range.op(), Op::Range(..)) {
             loop_ranges.push(range.clone());
         } else {
             let shape = range.shape().ok().flatten()?;
@@ -151,7 +152,12 @@ fn expand_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         .collect();
     let permuted = src.try_permute(permutation).ok()?;
     let reduced = UOp::new(
-        Op::Reduce { src: permuted, ranges: loop_ranges, reduce_op: *reduce_op, num_axes: horizontal_axes.len() },
+        Op::Reduce(ops::Reduce {
+            src: permuted,
+            ranges: loop_ranges,
+            reduce_op: *reduce_op,
+            num_axes: horizontal_axes.len(),
+        }),
         reduce.dtype(),
     );
     let output_shape: svod_ir::shape::Shape = source_shape
@@ -185,36 +191,37 @@ pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
 }
 
 fn fix_group_for_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Reduce { src, reduce_op, ranges, num_axes } = reduce.op() else { return None };
-    let (grouped, other): (Vec<_>, Vec<_>) =
-        ranges.iter().partition(|range| matches!(range.op(), Op::Range { axis_type: AxisType::GroupReduce, .. }));
+    let Op::Reduce(ops::Reduce { src, reduce_op, ranges, num_axes }) = reduce.op() else { return None };
+    let (grouped, other): (Vec<_>, Vec<_>) = ranges
+        .iter()
+        .partition(|range| matches!(range.op(), Op::Range(ops::Range { axis_type: AxisType::GroupReduce, .. })));
     if grouped.is_empty() {
         return None;
     }
     let locals: Vec<_> = reduce
         .toposort()
         .into_iter()
-        .filter(|node| matches!(node.op(), Op::Range { axis_type: AxisType::Local, .. }))
+        .filter(|node| matches!(node.op(), Op::Range(ops::Range { axis_type: AxisType::Local, .. })))
         .collect();
     let partial = UOp::new(
-        Op::Reduce {
+        Op::Reduce(ops::Reduce {
             src: src.clone(),
             ranges: other.into_iter().cloned().collect(),
             reduce_op: *reduce_op,
             num_axes: *num_axes,
-        },
+        }),
         reduce.dtype(),
     );
     let loops: Vec<_> = grouped
         .iter()
         .filter_map(|range| match range.op() {
-            Op::Range { end, axis_id, deps, .. } => Some(UOp::new(
-                Op::Range {
+            Op::Range(ops::Range { end, axis_id, deps, .. }) => Some(UOp::new(
+                Op::Range(ops::Range {
                     end: end.clone(),
                     axis_id: axis_id.group_reduce_loop(),
                     axis_type: AxisType::Reduce,
                     deps: deps.clone(),
-                },
+                }),
                 range.dtype(),
             )),
             _ => None,
@@ -222,7 +229,7 @@ fn fix_group_for_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         .collect();
     let buffer_ranges = locals.iter().cloned().chain(grouped.iter().map(|range| (*range).clone())).collect();
     let grouped_axis = match grouped[0].op() {
-        Op::Range { axis_id, .. } => axis_id.clone(),
+        Op::Range(ops::Range { axis_id, .. }) => axis_id.clone(),
         _ => unreachable!("grouped reductions contain RANGE sources"),
     };
     let buffer = UOp::stage(partial, buffer_ranges, svod_ir::BufferizeOpts::local_for_axis(grouped_axis));

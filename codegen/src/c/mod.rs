@@ -47,7 +47,7 @@ impl crate::Renderer for CRenderer {
         let kernel_name = name.unwrap_or("kernel");
 
         let nodes: Vec<Arc<UOp>> = match uop.op() {
-            Op::Linear { ops } => ops.iter().cloned().collect(),
+            Op::Linear(svod_ir::ops::Linear { ops }) => ops.iter().cloned().collect(),
             other => {
                 return Err(Error::InvalidGraph { reason: format!("C renderer expects LINEAR input, got {other:?}") });
             }
@@ -57,7 +57,7 @@ impl crate::Renderer for CRenderer {
         for (i, node) in nodes.iter().enumerate() {
             tracing::trace!(position = i, op = node.op().as_ref(), id = node.id, "c linearized node");
             match node.op() {
-                Op::Custom { deps, code } | Op::CustomI { deps, code } => {
+                Op::Custom(svod_ir::ops::Custom { deps, code }) | Op::CustomI(svod_ir::ops::CustomI { deps, code }) => {
                     validate_custom_template_strict(code, deps.len())?;
                 }
                 _ => {}
@@ -68,10 +68,11 @@ impl crate::Renderer for CRenderer {
 
         // Build buffer args metadata
         let mut buffer_args: Vec<BufferArg> = Vec::new();
-        for buf in
-            abi_params.iter().filter(|param| matches!(param.op(), Op::Param { arg, .. } if arg.addrspace.is_some()))
+        for buf in abi_params
+            .iter()
+            .filter(|param| matches!(param.op(), Op::Param(svod_ir::ops::Param { arg, .. }) if arg.addrspace.is_some()))
         {
-            if let Op::Param { arg, .. } = buf.op() {
+            if let Op::Param(svod_ir::ops::Param { arg, .. }) = buf.op() {
                 let is_output = is_output_buffer(buf, &nodes);
                 buffer_args.push(BufferArg {
                     index: arg.slot,
@@ -84,11 +85,12 @@ impl crate::Renderer for CRenderer {
 
         // Build var_names
         let mut var_names: Vec<String> = Vec::new();
-        for var in
-            abi_params.iter().filter(|param| matches!(param.op(), Op::Param { arg, .. } if arg.addrspace.is_none()))
+        for var in abi_params
+            .iter()
+            .filter(|param| matches!(param.op(), Op::Param(svod_ir::ops::Param { arg, .. }) if arg.addrspace.is_none()))
         {
             let name = match var.op() {
-                Op::Param { arg, .. } => arg.name.as_ref().ok_or_else(|| Error::InvalidGraph {
+                Op::Param(svod_ir::ops::Param { arg, .. }) => arg.name.as_ref().ok_or_else(|| Error::InvalidGraph {
                     reason: format!("scalar PARAM in slot {} has no name", arg.slot),
                 })?,
                 other => return Err(Error::InvalidGraph { reason: format!("non-PARAM in ABI list: {other:?}") }),
@@ -129,7 +131,7 @@ impl crate::Renderer for CRenderer {
         let mut params: Vec<String> = Vec::new();
 
         for param in &abi_params {
-            let Op::Param { arg, .. } = param.op() else {
+            let Op::Param(svod_ir::ops::Param { arg, .. }) = param.op() else {
                 return Err(Error::InvalidGraph { reason: "non-PARAM in ABI list".into() });
             };
             let source_name = format!("data{}", arg.slot);
@@ -152,7 +154,7 @@ impl crate::Renderer for CRenderer {
 
         // Local memory allocations (stack arrays on CPU)
         for node in &nodes {
-            if let Op::Buffer { arg, .. } = node.op()
+            if let Op::Buffer(svod_ir::ops::Buffer { arg, .. }) = node.op()
                 && arg.addrspace == Some(svod_ir::AddrSpace::Local)
             {
                 let base = c_dtype(&arg.dtype);
@@ -167,7 +169,7 @@ impl crate::Renderer for CRenderer {
 
         // Reduction accumulator declarations (need to be in outer scope)
         for node in &nodes {
-            if let Op::Reduce { reduce_op, ranges, .. } = node.op() {
+            if let Op::Reduce(svod_ir::ops::Reduce { reduce_op, ranges, .. }) = node.op() {
                 if ranges.is_empty() {
                     continue;
                 }
@@ -188,7 +190,7 @@ impl crate::Renderer for CRenderer {
                     let val = c_const(&cv.0, &node.dtype());
                     ctx.register(node.id, val);
                 }
-                Op::VConst { values } => {
+                Op::VConst(svod_ir::ops::VConst { values }) => {
                     let val = c_vconst(values, &node.dtype());
                     ctx.register(node.id, val);
                 }
@@ -198,7 +200,7 @@ impl crate::Renderer for CRenderer {
 
         // Pre-register range variable names
         for node in &nodes {
-            if let Op::Range { axis_id, .. } = node.op() {
+            if let Op::Range(svod_ir::ops::Range { axis_id, .. }) = node.op() {
                 let name = format!("ridx{}", axis_id.name());
                 ctx.register(node.id, name);
             }
@@ -208,7 +210,7 @@ impl crate::Renderer for CRenderer {
         // Skip NOOP and GROUP — they are structural no-ops (Tinygrad cstyle.py:175)
         let mut kernel_body: Vec<String> = Vec::new();
         for node in &nodes {
-            if matches!(node.op(), Op::Noop | Op::Group { .. }) {
+            if matches!(node.op(), Op::Noop | Op::Group(..)) {
                 // Register with an empty string for downstream control nodes.
                 // Matches LLVM backend behavior — these are structural no-ops.
                 ctx.register(node.id, String::new());
@@ -273,7 +275,7 @@ fn find_scope_escaping_vars(nodes: &[Arc<UOp>], ref_counts: &HashMap<u64, usize>
     for node in nodes {
         // Track scope depth changes
         match node.op() {
-            Op::Range { .. } | Op::If { .. } => {
+            Op::Range(..) | Op::If(..) => {
                 // Definition of this node is at current depth (before entering)
                 if ref_counts.get(&node.id).copied().unwrap_or(0) > 1 {
                     def_depth.entry(node.id).or_insert(depth);
@@ -285,7 +287,7 @@ fn find_scope_escaping_vars(nodes: &[Arc<UOp>], ref_counts: &HashMap<u64, usize>
                 depth += 1;
                 continue;
             }
-            Op::End { .. } | Op::EndIf { .. } => {
+            Op::End(..) | Op::EndIf(..) => {
                 depth = depth.saturating_sub(1);
             }
             _ => {}

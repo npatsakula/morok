@@ -24,6 +24,7 @@ use papaya::{Equivalent, HashMap};
 use smallvec::SmallVec;
 
 use crate::op::Op;
+use crate::ops;
 use crate::uop::core::UOp;
 use svod_dtype::DType;
 
@@ -207,7 +208,7 @@ impl UOp {
     pub fn new_tagged(op: Op, dtype: DType, tag: Tag) -> Arc<Self> {
         use papaya::{Compute, Operation};
 
-        if let Op::Load { index, alt, gate } = &op {
+        if let Op::Load(ops::Load { index, alt, gate }) = &op {
             assert_eq!(dtype, index.dtype(), "LOAD dtype must match its address dtype");
             assert_eq!(alt.is_some(), gate.is_some(), "LOAD requires either index only or index, alt, and gate");
             if let (Some(alt), Some(gate)) = (alt, gate) {
@@ -330,7 +331,7 @@ impl Drop for UOp {
         // Buffer nodes only: the hook exists for buffer-lifetime tracking, and
         // graph rewriting churns millions of transient non-buffer nodes per
         // prepare — their drop must stay allocation-free and branch-cheap.
-        if matches!(self.op, Op::Buffer { .. })
+        if matches!(self.op, Op::Buffer(..))
             && let Some(hook) = UOP_DROP_HOOK.get()
         {
             hook(self.id);

@@ -19,6 +19,7 @@ use svod_ir::UOp;
 use crate::kernels::fa::{FaConfig, build_fa_mw_rdb};
 use crate::kernels::matmul::{M1_CFG, build_matmul_cfg};
 use crate::{ArchCaps, Kernel, kernel_fingerprint};
+use svod_ir::ops;
 
 fn matmul_sink() -> Arc<UOp> {
     let n = 512usize;
@@ -132,10 +133,12 @@ fn local_slots_and_reg_ids(sink: &Arc<UOp>) -> (Vec<usize>, Vec<usize>) {
     let (mut locals, mut regs) = (Vec::new(), Vec::new());
     for u in sink.toposort() {
         match u.op() {
-            svod_ir::Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
+            svod_ir::Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
                 locals.push(arg.slot)
             }
-            svod_ir::Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => regs.push(arg.slot),
+            svod_ir::Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => {
+                regs.push(arg.slot)
+            }
             _ => {}
         }
     }

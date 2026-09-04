@@ -10,6 +10,7 @@ use svod_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 use test_case::test_case;
 
 use crate::rangeify::{RangeifyBufferContext, patterns::to_param_patterns};
+use svod_ir::ops;
 
 fn apply(uop: &Arc<UOp>, ctx: &mut RangeifyBufferContext) -> Option<Arc<UOp>> {
     match to_param_patterns().rewrite(uop, ctx) {
@@ -34,7 +35,7 @@ fn buffers_are_numbered_into_dense_param_slots() {
         let buffer = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 100 * (slot + 1), DType::Float32);
         let param = apply(&buffer, &mut ctx).expect("a BUFFER becomes a PARAM");
 
-        assert!(matches!(param.op(), Op::Param { arg, .. }
+        assert!(matches!(param.op(), Op::Param(ops::Param { arg, .. })
             if arg.slot == slot && arg.device == Some(svod_device::DeviceSpec::Cpu)));
         assert_eq!(ctx.global_counter, slot + 1);
         assert!(Arc::ptr_eq(ctx.get_buffer(&buffer).expect("mapped"), &param));
@@ -51,7 +52,7 @@ fn a_bound_variable_becomes_a_scalar_param_and_a_launch_value() {
 
     let param = apply(&bind, &mut ctx).expect("a BIND unbinds");
 
-    assert!(matches!(param.op(), Op::Param { arg, .. } if arg.addrspace.is_none()));
+    assert!(matches!(param.op(), Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none()));
     let (_, bound) = ctx.vars.get("x").expect("the value is recorded for launch");
     assert_eq!(*bound, Some(5));
 }
@@ -69,12 +70,12 @@ fn unrenumbered_ranges_are_numbered_sequentially() {
         let original = range(10 * (i as i64 + 1), AxisId::Unrenumbered(i + 5), axis_type);
         let renumbered = apply(&original, &mut ctx).expect("an unrenumbered range is renumbered");
 
-        let Op::Range { axis_id, axis_type: kept, end, .. } = renumbered.op() else {
+        let Op::Range(ops::Range { axis_id, axis_type: kept, end, .. }) = renumbered.op() else {
             panic!("expected RANGE, got {}", renumbered.tree())
         };
         assert_eq!(*axis_id, AxisId::Renumbered(i));
         assert_eq!(*kept, axis_type, "renumbering must not change the axis type");
-        let Op::Range { end: original_end, .. } = original.op() else { unreachable!() };
+        let Op::Range(ops::Range { end: original_end, .. }) = original.op() else { unreachable!() };
         assert!(Arc::ptr_eq(end, original_end), "the extent node is preserved");
     }
     assert_eq!(ctx.range_counter, axis_types.len());
@@ -141,12 +142,12 @@ fn after_unwraps_to_its_storage_and_tracks_only_global(build: fn() -> Arc<UOp>, 
 
 fn mstack(first: Arc<UOp>, second: Arc<UOp>) -> Arc<UOp> {
     let dtype = first.dtype();
-    UOp::new(Op::MStack { buffers: smallvec![first, second] }, dtype)
+    UOp::new(Op::MStack(ops::MStack { buffers: smallvec![first, second] }), dtype)
 }
 
 fn mselect(buffer: Arc<UOp>) -> Arc<UOp> {
     let dtype = buffer.dtype();
-    UOp::new(Op::MSelect { buffer, device_index: 0 }, dtype)
+    UOp::new(Op::MSelect(ops::MSelect { buffer, device_index: 0 }), dtype)
 }
 
 /// Multi-device wrappers resolve to a single representative buffer — the first of
@@ -162,11 +163,11 @@ fn after_sees_through_multi_device_wrappers() {
     ] {
         let mut ctx = RangeifyBufferContext::new();
         let representative = match wrap.op() {
-            Op::MStack { buffers } => buffers[0].clone(),
-            Op::MSelect { buffer, .. } => buffer.clone(),
+            Op::MStack(ops::MStack { buffers }) => buffers[0].clone(),
+            Op::MSelect(ops::MSelect { buffer, .. }) => buffer.clone(),
             _ => unreachable!(),
         };
-        let is_local = matches!(representative.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(AddrSpace::Local));
+        let is_local = matches!(representative.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(AddrSpace::Local));
         let after = wrap.after(smallvec![UOp::noop()]);
 
         let unwrapped = apply(&after, &mut ctx).expect("AFTER unwraps the wrapper");
@@ -184,7 +185,8 @@ fn after_sees_through_multi_device_wrappers() {
 fn an_after_with_no_deps_still_tracks_its_mstack() {
     let mut ctx = RangeifyBufferContext::new();
     let buf1 = UOp::buffer_id(Some(1));
-    let stack = UOp::new(Op::MStack { buffers: smallvec![buf1.clone(), UOp::buffer_id(Some(2))] }, DType::Float32);
+    let stack =
+        UOp::new(Op::MStack(ops::MStack { buffers: smallvec![buf1.clone(), UOp::buffer_id(Some(2))] }), DType::Float32);
     let after = stack.clone().after(smallvec::SmallVec::new());
 
     let unwrapped = apply(&after, &mut ctx).expect("AFTER unwraps");

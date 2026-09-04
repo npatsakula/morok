@@ -7,5 +7,7 @@
 mod analyze;
 mod codegen;
 mod parse;
+mod typed;
 
 pub use codegen::generate;
+pub use typed::expand as expand_op_enum;

@@ -7,6 +7,7 @@ use svod_ir::{AxisType, ConstValue, KernelInfo, Op, Opt, UOp};
 
 use crate::optimizer::config::{OptStrategy, OptimizerConfig};
 use crate::optimizer::{Renderer, optimize_kernel_with_config};
+use svod_ir::ops;
 
 /// Build a hand-ranged `out[i] = in[i] + 1` SINK over PARAM buffers, marked
 /// with the given `opts_to_apply`. Mirrors a `Tensor::custom_kernel` body.
@@ -24,7 +25,10 @@ fn hand_ranged_sink(n: i64, opts_to_apply: Option<Vec<Opt>>) -> std::sync::Arc<U
 }
 
 fn count_axis_type(ast: &std::sync::Arc<UOp>, axis_type: AxisType) -> usize {
-    ast.toposort().iter().filter(|u| matches!(u.op(), Op::Range { axis_type: at, .. } if *at == axis_type)).count()
+    ast.toposort()
+        .iter()
+        .filter(|u| matches!(u.op(), Op::Range(ops::Range { axis_type: at, .. }) if *at == axis_type))
+        .count()
 }
 
 /// `opts_to_apply = Some(vec![])` (the tinygrad `()` analog): the optimizer must
@@ -63,5 +67,5 @@ fn test_opts_to_apply_empty_with_special_uses_the_shared_pipeline() {
     let optimized = optimize_kernel_with_config(sink, &renderer, &config).expect("optimize");
 
     assert_eq!(count_axis_type(&optimized, AxisType::Upcast), 0);
-    assert!(optimized.toposort().iter().any(|u| matches!(u.op(), Op::Special { .. })), "{}", optimized.tree());
+    assert!(optimized.toposort().iter().any(|u| matches!(u.op(), Op::Special(..))), "{}", optimized.tree());
 }

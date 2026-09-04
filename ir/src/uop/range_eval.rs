@@ -4,6 +4,7 @@
 //! based on their semantics and input ranges. The analysis is conservative -
 //! when in doubt, it returns the full dtype bounds to avoid incorrect optimizations.
 
+use crate::ops;
 use crate::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
 use crate::{Op, UOp};
 use std::cmp::Ordering;
@@ -21,19 +22,23 @@ pub fn compute_vmin_vmax(uop: &Arc<UOp>) -> Option<(ConstValue, ConstValue)> {
 
     match &uop.op {
         Op::Const(c) => Some((c.0, c.0)),
-        Op::VConst { values } => sources_range_values(values, &uop.dtype),
-        Op::DefineVar { min_val, max_val, .. } => Some(declared_bounds(*min_val, *max_val, &uop.dtype)?),
-        Op::Param { arg, .. } if arg.addrspace.is_none() => {
+        Op::VConst(ops::VConst { values }) => sources_range_values(values, &uop.dtype),
+        Op::DefineVar(ops::DefineVar { min_val, max_val, .. }) => {
+            Some(declared_bounds(*min_val, *max_val, &uop.dtype)?)
+        }
+        Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => {
             arg.vmin_vmax.as_ref().and_then(|(min, max)| normalize_declared_bounds(min.0, max.0, &uop.dtype))
         }
 
         // [0, end-1] ranges: Range, Special (Tinygrad ops.py:763)
-        Op::Range { end, .. } | Op::Special { end, .. } => Some(zero_to_end_minus_one(end, &uop.dtype)),
+        Op::Range(ops::Range { end, .. }) | Op::Special(ops::Special { end, .. }) => {
+            Some(zero_to_end_minus_one(end, &uop.dtype))
+        }
 
-        Op::Bind { var: src, .. } => Some(*VminVmaxProperty::get(src)),
+        Op::Bind(ops::Bind { var: src, .. }) => Some(*VminVmaxProperty::get(src)),
 
         // Union of element ranges: Stack is sound only if all sources are sound.
-        Op::Stack { sources } => sources_range(sources),
+        Op::Stack(ops::Stack { sources }) => sources_range(sources),
 
         // Unary: Tinygrad has no explicit unary rules — all fall through to dtype bounds.
         // Our analysis is more aggressive but some ops (Exp2, Log2, Reciprocal on floats)
@@ -126,7 +131,7 @@ pub fn compute_vmin_vmax(uop: &Arc<UOp>) -> Option<(ConstValue, ConstValue)> {
         }
 
         // Cast: only for monotone targets (Tinygrad ops.py:770-771)
-        Op::Cast { src, .. } => {
+        Op::Cast(ops::Cast { src, .. }) => {
             let (src_min, src_max) = *VminVmaxProperty::get(src);
             cast_range(src_min, src_max, &src.dtype(), &uop.dtype)
         }
@@ -150,23 +155,23 @@ pub fn compute_sound_vmin_vmax(uop: &Arc<UOp>) -> Option<(ConstValue, ConstValue
     let sound = |src: &Arc<UOp>| *SoundVminVmaxProperty::get(src);
     match &uop.op {
         Op::Const(c) => ordered_value(c.0).then_some((c.0, c.0)),
-        Op::VConst { values } => sound_values_range(values),
-        Op::DefineVar { min_val, max_val, .. } => {
+        Op::VConst(ops::VConst { values }) => sound_values_range(values),
+        Op::DefineVar(ops::DefineVar { min_val, max_val, .. }) => {
             let bounds = declared_bounds(*min_val, *max_val, &uop.dtype)?;
             ordered_range(bounds.0, bounds.1).then_some(bounds)
         }
-        Op::Param { arg, .. } if arg.addrspace.is_none() => {
+        Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => {
             let (min, max) = arg.vmin_vmax.as_ref()?;
             let bounds = normalize_declared_bounds(min.0, max.0, &uop.dtype)?;
             ordered_range(bounds.0, bounds.1).then_some(bounds)
         }
-        Op::Range { end, .. } | Op::Special { end, .. } => {
+        Op::Range(ops::Range { end, .. }) | Op::Special(ops::Special { end, .. }) => {
             let (_, end_max) = sound(end)?;
             let bounds = zero_to_typed_end_minus_one(end_max, &uop.dtype)?;
             ordered_range(bounds.0, bounds.1).then_some(bounds)
         }
-        Op::Bind { var, .. } => sound(var),
-        Op::Stack { sources } => sound_sources_range(sources),
+        Op::Bind(ops::Bind { var, .. }) => sound(var),
+        Op::Stack(ops::Stack { sources }) => sound_sources_range(sources),
         Op::Unary(op, src) => {
             let (min, max) = sound(src)?;
             if uop.dtype.is_float() {
@@ -242,7 +247,7 @@ pub fn compute_sound_vmin_vmax(uop: &Arc<UOp>) -> Option<(ConstValue, ConstValue
                 TernaryOp::MulAcc => None,
             }
         }
-        Op::Cast { src, .. } => sound_cast_range(src, &uop.dtype),
+        Op::Cast(ops::Cast { src, .. }) => sound_cast_range(src, &uop.dtype),
         _ => None,
     }
 }

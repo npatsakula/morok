@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use svod_dtype::{DType, DeviceSpec};
 
+use crate::ops;
 use crate::{
     AxisId, AxisType, BinaryOp, BufferizeOpts, CallInfo, ConstValue, ConstValueHash, ContiguousHint,
     CustomFunctionKind, InsArg, KernelInfo, Op, ParamArg, ReduceOp, TernaryOp, UOp, UnaryOp, WmmaMetadata,
@@ -127,10 +128,7 @@ impl OptimizerWireGraph {
                     node.op()
                 )));
             }
-            if matches!(
-                node.op(),
-                Op::Program { .. } | Op::Linear { .. } | Op::Source { .. } | Op::ProgramBinary { .. }
-            ) {
+            if matches!(node.op(), Op::Program(..) | Op::Linear(..) | Op::Source(..) | Op::ProgramBinary(..)) {
                 return Err(wire_error(format!("executable-stage op {:?} is not a legal optimizer input", node.op())));
             }
             stack.push((node.clone(), true));
@@ -206,64 +204,66 @@ impl OptimizerWireOp {
             Op::Unique(value) => Self::Unique(*value),
             Op::LUnique(value) => Self::LUnique(*value),
             Op::Noop => Self::Noop,
-            Op::Sink { info, .. } => Self::Sink(info.as_deref().cloned()),
-            Op::Group { .. } => Self::Group,
+            Op::Sink(ops::Sink { info, .. }) => Self::Sink(info.as_deref().cloned()),
+            Op::Group(..) => Self::Group,
             Op::Unary(op, ..) => Self::Unary(*op),
             Op::Binary(op, ..) => Self::Binary(*op),
             Op::Ternary(op, ..) => Self::Ternary(*op),
-            Op::Cast { dtype, .. } => Self::Cast(dtype.clone()),
-            Op::BitCast { dtype, .. } => Self::BitCast(dtype.clone()),
-            Op::MSelect { device_index, .. } => Self::MSelect(*device_index),
-            Op::Special { name, .. } => Self::Special(name.clone()),
-            Op::Param { arg, .. } => Self::Param(arg.as_ref().clone()),
-            Op::Buffer { arg, .. } => Self::Buffer(arg.as_ref().clone()),
-            Op::Slice { size, .. } => Self::Slice(*size),
-            Op::Stage { opts, .. } => Self::Stage(opts.as_ref().clone()),
-            Op::Index { .. } => Self::Index,
-            Op::GetAddr { device, .. } => Self::GetAddr(device.clone()),
-            Op::Copy { device, .. } => Self::Copy(device.clone()),
-            Op::MStack { .. } => Self::MStack,
-            Op::Reshape { .. } => Self::Reshape,
-            Op::Permute { axes, .. } => Self::Permute(axes.clone()),
-            Op::Expand { .. } => Self::Expand,
-            Op::Pad { .. } => Self::Pad,
-            Op::Shrink { .. } => Self::Shrink,
-            Op::Flip { axes, .. } => Self::Flip(axes.clone()),
-            Op::Multi { axis, .. } => Self::Multi(*axis),
-            Op::ReduceAxis { reduce_op, axes, .. } => Self::ReduceAxis(*reduce_op, axes.clone()),
-            Op::Reduce { reduce_op, num_axes, .. } => Self::Reduce(*reduce_op, *num_axes),
-            Op::AllReduce { device, reduce_op, .. } => Self::AllReduce(device.clone(), *reduce_op),
-            Op::If { .. } => Self::If,
-            Op::EndIf { .. } => Self::EndIf,
-            Op::Range { axis_id, axis_type, .. } => Self::Range(axis_id.clone(), *axis_type),
-            Op::End { .. } => Self::End,
-            Op::Barrier { .. } => Self::Barrier,
-            Op::Stack { .. } => Self::Stack,
-            Op::VConst { values } => Self::VConst(values.clone()),
-            Op::DefineVar { name, min_val, max_val } => Self::DefineVar(name.clone(), *min_val, *max_val),
-            Op::Bind { .. } => Self::Bind,
-            Op::Wmma { metadata, .. } => Self::Wmma(metadata.as_ref().clone()),
-            Op::Call { info, .. } => Self::Call(info.as_ref().clone()),
-            Op::Function { info, .. } => Self::Function(info.as_ref().clone()),
-            Op::Tuple { .. } => Self::Tuple,
-            Op::GetTuple { index, .. } => Self::GetTuple(*index),
-            Op::Detach { .. } => Self::Detach,
-            Op::Contiguous { opts, .. } => Self::Contiguous(opts.to_vec()),
-            Op::ContiguousBackward { .. } => Self::ContiguousBackward,
-            Op::After { .. } => Self::After,
-            Op::Precast { .. } => Self::Precast,
-            Op::Custom { code, .. } => Self::Custom(code.clone()),
-            Op::CustomFunction { kind, .. } => Self::CustomFunction(kind.clone()),
-            Op::CustomI { code, .. } => Self::CustomI(code.clone()),
-            Op::Load { alt, gate, .. } => {
+            Op::Cast(ops::Cast { dtype, .. }) => Self::Cast(dtype.clone()),
+            Op::BitCast(ops::BitCast { dtype, .. }) => Self::BitCast(dtype.clone()),
+            Op::MSelect(ops::MSelect { device_index, .. }) => Self::MSelect(*device_index),
+            Op::Special(ops::Special { name, .. }) => Self::Special(name.clone()),
+            Op::Param(ops::Param { arg, .. }) => Self::Param(arg.as_ref().clone()),
+            Op::Buffer(ops::Buffer { arg, .. }) => Self::Buffer(arg.as_ref().clone()),
+            Op::Slice(ops::Slice { size, .. }) => Self::Slice(*size),
+            Op::Stage(ops::Stage { opts, .. }) => Self::Stage(opts.as_ref().clone()),
+            Op::Index(..) => Self::Index,
+            Op::GetAddr(ops::GetAddr { device, .. }) => Self::GetAddr(device.clone()),
+            Op::Copy(ops::Copy { device, .. }) => Self::Copy(device.clone()),
+            Op::MStack(..) => Self::MStack,
+            Op::Reshape(..) => Self::Reshape,
+            Op::Permute(ops::Permute { axes, .. }) => Self::Permute(axes.clone()),
+            Op::Expand(..) => Self::Expand,
+            Op::Pad(..) => Self::Pad,
+            Op::Shrink(..) => Self::Shrink,
+            Op::Flip(ops::Flip { axes, .. }) => Self::Flip(axes.clone()),
+            Op::Multi(ops::Multi { axis, .. }) => Self::Multi(*axis),
+            Op::ReduceAxis(ops::ReduceAxis { reduce_op, axes, .. }) => Self::ReduceAxis(*reduce_op, axes.clone()),
+            Op::Reduce(ops::Reduce { reduce_op, num_axes, .. }) => Self::Reduce(*reduce_op, *num_axes),
+            Op::AllReduce(ops::AllReduce { device, reduce_op, .. }) => Self::AllReduce(device.clone(), *reduce_op),
+            Op::If(..) => Self::If,
+            Op::EndIf(..) => Self::EndIf,
+            Op::Range(ops::Range { axis_id, axis_type, .. }) => Self::Range(axis_id.clone(), *axis_type),
+            Op::End(..) => Self::End,
+            Op::Barrier(..) => Self::Barrier,
+            Op::Stack(..) => Self::Stack,
+            Op::VConst(ops::VConst { values }) => Self::VConst(values.clone()),
+            Op::DefineVar(ops::DefineVar { name, min_val, max_val }) => {
+                Self::DefineVar(name.clone(), *min_val, *max_val)
+            }
+            Op::Bind(..) => Self::Bind,
+            Op::Wmma(ops::Wmma { metadata, .. }) => Self::Wmma(metadata.as_ref().clone()),
+            Op::Call(ops::Call { info, .. }) => Self::Call(info.as_ref().clone()),
+            Op::Function(ops::Function { info, .. }) => Self::Function(info.as_ref().clone()),
+            Op::Tuple(..) => Self::Tuple,
+            Op::GetTuple(ops::GetTuple { index, .. }) => Self::GetTuple(*index),
+            Op::Detach(..) => Self::Detach,
+            Op::Contiguous(ops::Contiguous { opts, .. }) => Self::Contiguous(opts.to_vec()),
+            Op::ContiguousBackward(..) => Self::ContiguousBackward,
+            Op::After(..) => Self::After,
+            Op::Precast(..) => Self::Precast,
+            Op::Custom(ops::Custom { code, .. }) => Self::Custom(code.clone()),
+            Op::CustomFunction(ops::CustomFunction { kind, .. }) => Self::CustomFunction(kind.clone()),
+            Op::CustomI(ops::CustomI { code, .. }) => Self::CustomI(code.clone()),
+            Op::Load(ops::Load { alt, gate, .. }) => {
                 if alt.is_some() != gate.is_some() {
                     return Err(wire_error("LOAD has mismatched alt/gate presence"));
                 }
                 Self::Load { gated: alt.is_some() }
             }
-            Op::Store { gate, .. } => Self::Store { gated: gate.is_some() },
-            Op::Ins { arg, .. } => Self::Ins(arg.clone()),
-            Op::Program { .. } | Op::Linear { .. } | Op::Source { .. } | Op::ProgramBinary { .. } => {
+            Op::Store(ops::Store { gate, .. }) => Self::Store { gated: gate.is_some() },
+            Op::Ins(ops::Ins { arg, .. }) => Self::Ins(arg.clone()),
+            Op::Program(..) | Op::Linear(..) | Op::Source(..) | Op::ProgramBinary(..) => {
                 return Err(wire_error(format!("executable-stage op {op:?} is not a legal optimizer input")));
             }
         })
@@ -296,8 +296,10 @@ impl OptimizerWireOp {
                 exact(0)?;
                 Op::Noop
             }
-            Self::Sink(info) => Op::Sink { sources: src.into_iter().collect(), info: info.clone().map(Box::new) },
-            Self::Group => Op::Group { sources: src.into_iter().collect() },
+            Self::Sink(info) => {
+                Op::Sink(ops::Sink { sources: src.into_iter().collect(), info: info.clone().map(Box::new) })
+            }
+            Self::Group => Op::Group(ops::Group { sources: src.into_iter().collect() }),
             Self::Unary(op) => {
                 exact(1)?;
                 Op::Unary(*op, one())
@@ -312,181 +314,204 @@ impl OptimizerWireOp {
             }
             Self::Cast(dtype) => {
                 exact(1)?;
-                Op::Cast { src: one(), dtype: dtype.clone() }
+                Op::Cast(ops::Cast { src: one(), dtype: dtype.clone() })
             }
             Self::BitCast(dtype) => {
                 exact(1)?;
-                Op::BitCast { src: one(), dtype: dtype.clone() }
+                Op::BitCast(ops::BitCast { src: one(), dtype: dtype.clone() })
             }
             Self::MSelect(index) => {
                 exact(1)?;
-                Op::MSelect { buffer: one(), device_index: *index }
+                Op::MSelect(ops::MSelect { buffer: one(), device_index: *index })
             }
             Self::Special(name) => {
                 exact(1)?;
-                Op::Special { end: one(), name: name.clone() }
+                Op::Special(ops::Special { end: one(), name: name.clone() })
             }
             Self::Param(arg) => {
                 exact(1)?;
-                Op::Param { shape: one(), arg: arg.clone().into() }
+                Op::Param(ops::Param { shape: one(), arg: arg.clone().into() })
             }
             Self::Buffer(arg) => {
                 exact(1)?;
-                Op::Buffer { shape: one(), arg: arg.clone().into() }
+                Op::Buffer(ops::Buffer { shape: one(), arg: arg.clone().into() })
             }
             Self::Slice(size) => {
                 exact(2)?;
-                Op::Slice { buffer: src[0].clone(), offset: src[1].clone(), size: *size }
+                Op::Slice(ops::Slice { buffer: src[0].clone(), offset: src[1].clone(), size: *size })
             }
             Self::Stage(opts) => {
                 nonempty()?;
-                Op::Stage { compute: one(), ranges: src[1..].iter().cloned().collect(), opts: opts.clone().into() }
+                Op::Stage(ops::Stage {
+                    compute: one(),
+                    ranges: src[1..].iter().cloned().collect(),
+                    opts: opts.clone().into(),
+                })
             }
             Self::Index => {
                 nonempty()?;
-                Op::Index { buffer: one(), indices: src[1..].iter().cloned().collect() }
+                Op::Index(ops::Index { buffer: one(), indices: src[1..].iter().cloned().collect() })
             }
             Self::GetAddr(device) => {
                 exact(1)?;
-                Op::GetAddr { src: one(), device: device.clone() }
+                Op::GetAddr(ops::GetAddr { src: one(), device: device.clone() })
             }
             Self::Copy(device) => {
                 exact(1)?;
-                Op::Copy { src: one(), device: device.clone() }
+                Op::Copy(ops::Copy { src: one(), device: device.clone() })
             }
-            Self::MStack => Op::MStack { buffers: src.into_iter().collect() },
+            Self::MStack => Op::MStack(ops::MStack { buffers: src.into_iter().collect() }),
             Self::Reshape => {
                 exact(2)?;
-                Op::Reshape { src: src[0].clone(), new_shape: src[1].clone() }
+                Op::Reshape(ops::Reshape { src: src[0].clone(), new_shape: src[1].clone() })
             }
             Self::Permute(axes) => {
                 exact(1)?;
-                Op::Permute { src: one(), axes: axes.clone() }
+                Op::Permute(ops::Permute { src: one(), axes: axes.clone() })
             }
             Self::Expand => {
                 exact(2)?;
-                Op::Expand { src: src[0].clone(), new_shape: src[1].clone() }
+                Op::Expand(ops::Expand { src: src[0].clone(), new_shape: src[1].clone() })
             }
             Self::Pad => {
                 exact(3)?;
-                Op::Pad { src: src[0].clone(), begin_pads: src[1].clone(), end_pads: src[2].clone() }
+                Op::Pad(ops::Pad { src: src[0].clone(), begin_pads: src[1].clone(), end_pads: src[2].clone() })
             }
             Self::Shrink => {
                 exact(3)?;
-                Op::Shrink { src: src[0].clone(), offsets: src[1].clone(), sizes: src[2].clone() }
+                Op::Shrink(ops::Shrink { src: src[0].clone(), offsets: src[1].clone(), sizes: src[2].clone() })
             }
             Self::Flip(axes) => {
                 exact(1)?;
-                Op::Flip { src: one(), axes: axes.clone() }
+                Op::Flip(ops::Flip { src: one(), axes: axes.clone() })
             }
             Self::Multi(axis) => {
                 exact(1)?;
-                Op::Multi { src: one(), axis: *axis }
+                Op::Multi(ops::Multi { src: one(), axis: *axis })
             }
             Self::ReduceAxis(op, axes) => {
                 exact(1)?;
-                Op::ReduceAxis { src: one(), reduce_op: *op, axes: axes.clone() }
+                Op::ReduceAxis(ops::ReduceAxis { src: one(), reduce_op: *op, axes: axes.clone() })
             }
             Self::Reduce(op, num_axes) => {
                 nonempty()?;
-                Op::Reduce {
+                Op::Reduce(ops::Reduce {
                     src: one(),
                     ranges: src[1..].iter().cloned().collect(),
                     reduce_op: *op,
                     num_axes: *num_axes,
-                }
+                })
             }
             Self::AllReduce(device, op) => {
                 exact(1)?;
-                Op::AllReduce { src: one(), device: device.clone(), reduce_op: *op }
+                Op::AllReduce(ops::AllReduce { src: one(), device: device.clone(), reduce_op: *op })
             }
             Self::If => {
                 nonempty()?;
-                Op::If { condition: one(), body: src[1..].iter().cloned().collect() }
+                Op::If(ops::If { condition: one(), body: src[1..].iter().cloned().collect() })
             }
             Self::EndIf => {
                 exact(1)?;
-                Op::EndIf { if_op: one() }
+                Op::EndIf(ops::EndIf { if_op: one() })
             }
             Self::Range(axis, ty) => {
                 nonempty()?;
-                Op::Range {
+                Op::Range(ops::Range {
                     end: one(),
                     axis_id: axis.clone(),
                     axis_type: *ty,
                     deps: src[1..].iter().cloned().collect(),
-                }
+                })
             }
             Self::End => {
                 nonempty()?;
-                Op::End { computation: one(), ranges: src[1..].iter().cloned().collect() }
+                Op::End(ops::End { computation: one(), ranges: src[1..].iter().cloned().collect() })
             }
             Self::Barrier => {
                 nonempty()?;
-                Op::Barrier { src: one(), deps: src[1..].iter().cloned().collect() }
+                Op::Barrier(ops::Barrier { src: one(), deps: src[1..].iter().cloned().collect() })
             }
-            Self::Stack => Op::Stack { sources: src.into_iter().collect() },
+            Self::Stack => Op::Stack(ops::Stack { sources: src.into_iter().collect() }),
             Self::VConst(values) => {
                 exact(0)?;
-                Op::VConst { values: values.clone() }
+                Op::VConst(ops::VConst { values: values.clone() })
             }
             Self::DefineVar(name, min, max) => {
                 exact(0)?;
-                Op::DefineVar { name: name.clone(), min_val: *min, max_val: *max }
+                Op::DefineVar(ops::DefineVar { name: name.clone(), min_val: *min, max_val: *max })
             }
             Self::Bind => {
                 exact(2)?;
-                Op::Bind { var: src[0].clone(), value: src[1].clone() }
+                Op::Bind(ops::Bind { var: src[0].clone(), value: src[1].clone() })
             }
             Self::Wmma(metadata) => {
                 exact(3)?;
-                Op::Wmma { a: src[0].clone(), b: src[1].clone(), c: src[2].clone(), metadata: metadata.clone().into() }
+                Op::Wmma(ops::Wmma {
+                    a: src[0].clone(),
+                    b: src[1].clone(),
+                    c: src[2].clone(),
+                    metadata: metadata.clone().into(),
+                })
             }
             Self::Call(info) => {
                 nonempty()?;
-                Op::Call { body: one(), args: src[1..].iter().cloned().collect(), info: info.clone().into() }
+                Op::Call(ops::Call { body: one(), args: src[1..].iter().cloned().collect(), info: info.clone().into() })
             }
             Self::Function(info) => {
                 nonempty()?;
-                Op::Function { body: one(), args: src[1..].iter().cloned().collect(), info: info.clone().into() }
+                Op::Function(ops::Function {
+                    body: one(),
+                    args: src[1..].iter().cloned().collect(),
+                    info: info.clone().into(),
+                })
             }
-            Self::Tuple => Op::Tuple { src: src.into_iter().collect() },
+            Self::Tuple => Op::Tuple(ops::Tuple { src: src.into_iter().collect() }),
             Self::GetTuple(index) => {
                 exact(1)?;
-                Op::GetTuple { src: one(), index: *index }
+                Op::GetTuple(ops::GetTuple { src: one(), index: *index })
             }
             Self::Detach => {
                 exact(1)?;
-                Op::Detach { src: one() }
+                Op::Detach(ops::Detach { src: one() })
             }
             Self::Contiguous(opts) => {
                 exact(1)?;
-                Op::Contiguous { src: one(), opts: opts.to_vec() }
+                Op::Contiguous(ops::Contiguous { src: one(), opts: opts.to_vec() })
             }
             Self::ContiguousBackward => {
                 exact(1)?;
-                Op::ContiguousBackward { src: one() }
+                Op::ContiguousBackward(ops::ContiguousBackward { src: one() })
             }
             Self::After => {
                 nonempty()?;
-                Op::After { passthrough: one(), deps: src[1..].iter().cloned().collect() }
+                Op::After(ops::After { passthrough: one(), deps: src[1..].iter().cloned().collect() })
             }
             Self::Precast => {
                 exact(1)?;
-                Op::Precast { src: one() }
+                Op::Precast(ops::Precast { src: one() })
             }
-            Self::Custom(code) => Op::Custom { deps: src.into_iter().collect(), code: code.clone() },
-            Self::CustomFunction(kind) => Op::CustomFunction { kind: kind.clone(), attrs: src.into_iter().collect() },
-            Self::CustomI(code) => Op::CustomI { deps: src.into_iter().collect(), code: code.clone() },
+            Self::Custom(code) => Op::Custom(ops::Custom { deps: src.into_iter().collect(), code: code.clone() }),
+            Self::CustomFunction(kind) => {
+                Op::CustomFunction(ops::CustomFunction { kind: kind.clone(), attrs: src.into_iter().collect() })
+            }
+            Self::CustomI(code) => Op::CustomI(ops::CustomI { deps: src.into_iter().collect(), code: code.clone() }),
             Self::Load { gated } => {
                 exact(if *gated { 3 } else { 1 })?;
-                Op::Load { index: one(), alt: gated.then(|| src[1].clone()), gate: gated.then(|| src[2].clone()) }
+                Op::Load(ops::Load {
+                    index: one(),
+                    alt: gated.then(|| src[1].clone()),
+                    gate: gated.then(|| src[2].clone()),
+                })
             }
             Self::Store { gated } => {
                 exact(if *gated { 3 } else { 2 })?;
-                Op::Store { index: src[0].clone(), value: src[1].clone(), gate: gated.then(|| src[2].clone()) }
+                Op::Store(ops::Store {
+                    index: src[0].clone(),
+                    value: src[1].clone(),
+                    gate: gated.then(|| src[2].clone()),
+                })
             }
-            Self::Ins(arg) => Op::Ins { sources: src.into_iter().collect(), arg: arg.clone() },
+            Self::Ins(arg) => Op::Ins(ops::Ins { sources: src.into_iter().collect(), arg: arg.clone() }),
         })
     }
 }

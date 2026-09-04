@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::DType;
 use crate::op::Op;
+use crate::ops;
 use crate::types::{AxisType, BinaryOp, ConstValue, ConstValueHash};
 use crate::uop::UOp;
 
@@ -26,7 +27,7 @@ impl UOp {
                 _ => 1,
             },
             // VCONST: GCD of all elements
-            Op::VConst { values } => {
+            Op::VConst(ops::VConst { values }) => {
                 let mut factor = None;
                 for value in values {
                     let value = match value {
@@ -79,7 +80,7 @@ impl UOp {
                 }
             }
             // VCONST: divide each element if all are divisible
-            Op::VConst { values } => {
+            Op::VConst(ops::VConst { values }) => {
                 let divided: Option<Vec<ConstValue>> = values
                     .iter()
                     .map(|val| match val {
@@ -326,7 +327,7 @@ impl UOp {
     /// // global_range has same size and axis_id, but different axis type
     /// ```
     pub fn with_axis_type(self: &Arc<Self>, new_type: AxisType) -> Arc<Self> {
-        if let Op::Range { end, axis_id, .. } = self.op() {
+        if let Op::Range(ops::Range { end, axis_id, .. }) = self.op() {
             Self::range_axis(end.clone(), axis_id.clone(), new_type)
         } else {
             panic!("with_axis_type() called on non-RANGE operation: {:?}", self.op);
@@ -415,15 +416,17 @@ impl UOp {
     pub fn is_invalid_marker(uop: &Arc<Self>) -> bool {
         match uop.op() {
             Op::Const(ConstValueHash(ConstValue::Invalid)) => true,
-            Op::Reshape { src, .. }
-            | Op::Permute { src, .. }
-            | Op::Expand { src, .. }
-            | Op::Pad { src, .. }
-            | Op::Shrink { src, .. }
-            | Op::Flip { src, .. }
-            | Op::Detach { src } => Self::is_invalid_marker(src),
-            Op::VConst { values } => !values.is_empty() && values.iter().all(|value| *value == ConstValue::Invalid),
-            Op::Stack { sources } => !sources.is_empty() && sources.iter().all(Self::is_invalid_marker),
+            Op::Reshape(ops::Reshape { src, .. })
+            | Op::Permute(ops::Permute { src, .. })
+            | Op::Expand(ops::Expand { src, .. })
+            | Op::Pad(ops::Pad { src, .. })
+            | Op::Shrink(ops::Shrink { src, .. })
+            | Op::Flip(ops::Flip { src, .. })
+            | Op::Detach(ops::Detach { src }) => Self::is_invalid_marker(src),
+            Op::VConst(ops::VConst { values }) => {
+                !values.is_empty() && values.iter().all(|value| *value == ConstValue::Invalid)
+            }
+            Op::Stack(ops::Stack { sources }) => !sources.is_empty() && sources.iter().all(Self::is_invalid_marker),
             _ => false,
         }
     }
@@ -479,7 +482,7 @@ impl UOp {
     pub fn is_increasing(self: &Arc<Self>) -> bool {
         match self.op() {
             // Irreducible: RANGE, CONST, DEFINE_VAR, SPECIAL
-            Op::Range { .. } | Op::Const(_) | Op::DefineVar { .. } | Op::Special { .. } => true,
+            Op::Range(..) | Op::Const(_) | Op::DefineVar(..) | Op::Special(..) => true,
 
             // ADD: both operands must be increasing
             Op::Binary(BinaryOp::Add, a, b) => a.is_increasing() && b.is_increasing(),

@@ -161,7 +161,7 @@ pub fn flat_offset(shape: &[usize], idxs: &[Idx]) -> Arc<UOp> {
 /// PARAM directly rather than the multi-dim reshape view.
 pub fn flat_ptr(placeholder: &Arc<UOp>) -> (Arc<UOp>, DType) {
     let buf = match placeholder.op() {
-        Op::Reshape { src, .. } => src.clone(),
+        Op::Reshape(svod_ir::ops::Reshape { src, .. }) => src.clone(),
         _ => placeholder.clone(),
     };
     let elem = match buf.dtype() {

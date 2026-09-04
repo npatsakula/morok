@@ -400,7 +400,7 @@ fn test_tc_rejects_divisible_symbolic_dim(tc_opt: usize) {
 
     let result = apply(&mut scheduler, -1, tc_opt, 1);
     assert!(result.is_err(), "16*ts must be rejected (tc_opt={tc_opt})");
-    let has_wmma = scheduler.ast().toposort().iter().any(|u| matches!(u.op(), svod_ir::Op::Wmma { .. }));
+    let has_wmma = scheduler.ast().toposort().iter().any(|u| matches!(u.op(), svod_ir::Op::Wmma(..)));
     assert!(!has_wmma, "AST must not contain WMMA for a symbolic axis");
 }
 
@@ -683,12 +683,12 @@ fn test_apply_tc_amx() {
     let axes = result.unwrap();
     // axes should be [N_range, M_range, K_range] — all valid UOps
     for (i, ax) in axes.iter().enumerate() {
-        assert!(matches!(ax.op(), svod_ir::Op::Range { .. }), "axes[{i}] should be a RANGE");
+        assert!(matches!(ax.op(), svod_ir::Op::Range(..)), "axes[{i}] should be a RANGE");
     }
 
     // Verify WMMA is present in the resulting AST
     let ast = scheduler.ast();
-    let has_wmma = ast.toposort().iter().any(|u| matches!(u.op(), svod_ir::Op::Wmma { .. }));
+    let has_wmma = ast.toposort().iter().any(|u| matches!(u.op(), svod_ir::Op::Wmma(..)));
     assert!(has_wmma, "AST should contain WMMA after TC apply");
 }
 

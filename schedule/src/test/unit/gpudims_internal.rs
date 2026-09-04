@@ -1,4 +1,5 @@
 use super::*;
+use svod_ir::ops;
 use test_case::test_case;
 
 /// Build a Vec<Arc<UOp>> of concrete `index_const` dims for tests that only
@@ -22,7 +23,7 @@ fn thread_extent_maps_to_exact_core_id_cardinality() {
     let core_id = lowered
         .toposort()
         .into_iter()
-        .find(|u| matches!(u.op(), Op::Param { arg, .. } if arg.name.as_deref() == Some("core_id")))
+        .find(|u| matches!(u.op(), Op::Param(ops::Param { arg, .. }) if arg.name.as_deref() == Some("core_id")))
         .expect("lowered graph should contain core_id");
 
     assert_eq!(core_id.vmin(), &ConstValue::Int(0));
@@ -61,7 +62,7 @@ fn global_special_extents(renderer: &Renderer, global_extents: &[i64], local_ext
         .toposort()
         .into_iter()
         .filter_map(|uop| match uop.op() {
-            Op::Special { end, name } if name.starts_with("gidx") => Some(dim_max(end)),
+            Op::Special(ops::Special { end, name }) if name.starts_with("gidx") => Some(dim_max(end)),
             _ => None,
         })
         .collect();
@@ -86,11 +87,11 @@ fn device_range_becomes_device_num_and_its_end_drops_all_params(dtype: DType, ex
     let ended = computation.end(smallvec::smallvec![device, other]);
     let lowered = crate::rewrite::graph_rewrite(&pm_lower_device_ranges(), ended, &mut ());
 
-    let Op::End { ranges, .. } = lowered.op() else { panic!("target keeps an empty END") };
+    let Op::End(ops::End { ranges, .. }) = lowered.op() else { panic!("target keeps an empty END") };
     assert!(ranges.is_empty(), "Tinygrad removes every PARAM when _device_num is present");
     let device_num =
         lowered.toposort().into_iter().find(is_device_num).expect("DEVICE range should become _device_num");
-    assert!(matches!(device_num.op(), Op::Param { arg, .. } if arg.name.as_deref() == Some("_device_num")));
+    assert!(matches!(device_num.op(), Op::Param(ops::Param { arg, .. }) if arg.name.as_deref() == Some("_device_num")));
     assert_eq!(device_num.dtype(), dtype);
     assert_eq!(device_num.vmin().try_int(), Some(0));
     assert_eq!(device_num.vmax().try_int(), Some(extent - 1));
@@ -123,10 +124,15 @@ fn missing_group_reduce_masks_a_structured_global_param_store(buffer: Arc<UOp>) 
     let masked_index = lowered
         .toposort()
         .into_iter()
-        .find(|u| matches!(u.op(), Op::Index { indices, .. } if matches!(indices[0].op(), Op::Ternary(..))))
+        .find(|u| matches!(u.op(), Op::Index(ops::Index { indices, .. }) if matches!(indices[0].op(), Op::Ternary(..))))
         .expect("global store index should carry missing GroupReduce validity");
-    let Op::Index { indices, .. } = masked_index.op() else { unreachable!() };
-    assert!(indices[0].toposort().iter().any(|u| matches!(u.op(), Op::Special { name, .. } if name == "lidx0")));
+    let Op::Index(ops::Index { indices, .. }) = masked_index.op() else { unreachable!() };
+    assert!(
+        indices[0]
+            .toposort()
+            .iter()
+            .any(|u| matches!(u.op(), Op::Special(ops::Special { name, .. }) if name == "lidx0"))
+    );
 }
 
 #[test_case(|| d(&[4, 4]), &[16, 16, 16], Some(&[4, 4][..]); "two dims already fit")]
@@ -173,7 +179,7 @@ fn symbolic_identity_dims_return_bare_specials() {
     let names: Vec<&str> = out
         .iter()
         .map(|u| match u.op() {
-            Op::Special { name, .. } => name.as_str(),
+            Op::Special(ops::Special { name, .. }) => name.as_str(),
             _ => panic!("an ungrouped, unsplit shape must not leave a symbolic FloorDiv/FloorMod: {}", u.tree()),
         })
         .collect();

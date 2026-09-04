@@ -9,6 +9,7 @@ use test_case::test_case;
 
 use crate::rangeify::indexing::{no_range, range_size_as_i64};
 use crate::rangeify::transforms::reduce_collapse as reduce_collapse_inner;
+use svod_ir::ops;
 
 fn reduce_unparented(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     match crate::rangeify::patterns::pm_reduce_simplify().rewrite(reduce, &mut ()) {
@@ -18,7 +19,7 @@ fn reduce_unparented(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
 }
 
 fn reduce_collapse(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Reduce { src, ranges, .. } = reduce.op() else { return None };
+    let Op::Reduce(ops::Reduce { src, ranges, .. }) = reduce.op() else { return None };
     reduce_collapse_inner(src, ranges)
 }
 
@@ -27,11 +28,11 @@ fn reduce_range(end: i64, axis_id: usize) -> Arc<UOp> {
 }
 
 fn has_reduce(uop: &Arc<UOp>) -> bool {
-    uop.toposort().iter().any(|n| matches!(n.op(), Op::Reduce { .. } | Op::ReduceAxis { .. }))
+    uop.toposort().iter().any(|n| matches!(n.op(), Op::Reduce(..) | Op::ReduceAxis(..)))
 }
 
 fn has_range(uop: &Arc<UOp>) -> bool {
-    uop.toposort().iter().any(|n| matches!(n.op(), Op::Range { .. }))
+    uop.toposort().iter().any(|n| matches!(n.op(), Op::Range(..)))
 }
 
 // ===== reduce_unparented =====
@@ -86,7 +87,9 @@ fn a_parented_range_stays_inside_the_reduce() {
 
     let result = reduce_unparented(&reduce).expect("the unparented range must fold");
     let Op::Binary(BinaryOp::Mul, inner, _) = result.op() else { panic!("expected MUL, got {}", result.tree()) };
-    let Op::Reduce { ranges, .. } = inner.op() else { panic!("expected an inner REDUCE, got {}", result.tree()) };
+    let Op::Reduce(ops::Reduce { ranges, .. }) = inner.op() else {
+        panic!("expected an inner REDUCE, got {}", result.tree())
+    };
     assert_eq!(ranges.as_slice().len(), 1);
     assert!(Arc::ptr_eq(&ranges[0], &parented));
 }

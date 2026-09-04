@@ -10,6 +10,7 @@ use svod_ir::{ConstValue, Op, UOp};
 use crate::index::{Idx, cidx};
 use crate::tiles::TileLayout;
 use crate::{ArchCaps, Kernel};
+use svod_ir::ops;
 
 /// Whether the toposort contains a `BinaryOp::Mul` whose rhs is `Const(Int(val))`.
 fn has_mul_by_const(topo: &[Arc<UOp>], val: i64) -> bool {
@@ -84,7 +85,7 @@ fn test_mask_where_emits_ternary() {
 fn test_map_position_block_offset() {
     let topo0 = map_position_topo(ArchCaps::GFX942, Idx::Const(0));
     assert!(
-        !topo0.iter().any(|u| matches!(u.op(), Op::Special { name, .. } if name.contains("gidx"))),
+        !topo0.iter().any(|u| matches!(u.op(), Op::Special(ops::Special { name, .. }) if name.contains("gidx"))),
         "zero row_blk: no block index in the graph"
     );
 
@@ -97,7 +98,7 @@ fn test_map_position_block_offset() {
     });
     let topo = tile.uop().toposort();
     assert!(
-        topo.iter().any(|u| matches!(u.op(), Op::Special { name, .. } if name.contains("gidx0"))),
+        topo.iter().any(|u| matches!(u.op(), Op::Special(ops::Special { name, .. }) if name.contains("gidx0"))),
         "non-zero row_blk: block_idx[0] present"
     );
     assert!(has_mul_by_const(&topo, 16), "row_blk * total_rows (=16) product present");
@@ -114,7 +115,7 @@ fn tracked_loop_anchors_tile_reads_in_rolled_kernels() {
     let lp = ker.loop_static(4);
 
     let anchored = warp.anchor(tile.uop());
-    let Op::After { passthrough, deps } = anchored.op() else {
+    let Op::After(ops::After { passthrough, deps }) = anchored.op() else {
         panic!("tracked tile read must be wrapped in AFTER");
     };
     assert!(Arc::ptr_eq(passthrough, tile.uop()));

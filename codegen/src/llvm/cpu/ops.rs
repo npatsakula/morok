@@ -10,6 +10,7 @@ use svod_ir::{BinaryOp, Op, TernaryOp, UnaryOp, prelude::*};
 
 use crate::common::{access_dtype, shaped_dtype, value_width};
 use crate::llvm::common::{RenderContext, lcast, ldt};
+use svod_ir::ops;
 
 /// LLVM type of a value, honouring the lane count carried in its shape.
 /// Tinygrad spells this `ldt(u.dtype, u.max_numel())` (`llvmir.py`).
@@ -25,17 +26,17 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
 
     match uop.op() {
         Op::Const(_)
-        | Op::VConst { .. }
-        | Op::Param { .. }
-        | Op::DefineVar { .. }
+        | Op::VConst(..)
+        | Op::Param(..)
+        | Op::DefineVar(..)
         | Op::Noop
-        | Op::Sink { .. }
-        | Op::Group { .. }
+        | Op::Sink(..)
+        | Op::Group(..)
         | Op::Unique(_)
-        | Op::Call { .. }
-        | Op::Barrier { .. } => None,
+        | Op::Call(..)
+        | Op::Barrier(..) => None,
 
-        Op::Buffer { arg, .. }
+        Op::Buffer(ops::Buffer { arg, .. })
             if matches!(arg.addrspace, Some(svod_ir::AddrSpace::Local | svod_ir::AddrSpace::Reg)) =>
         {
             let base_dtype = arg.dtype.clone();
@@ -46,9 +47,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::Buffer { .. } => None,
+        Op::Buffer(..) => None,
 
-        Op::Index { buffer, indices, .. } => {
+        Op::Index(ops::Index { buffer, indices, .. }) => {
             let buf = ctx.get(buffer).to_string();
 
             // An INDEX with no indices is the buffer pointer itself; under opaque
@@ -87,7 +88,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::Shrink { src, offsets, sizes: _ } => {
+        Op::Shrink(ops::Shrink { src, offsets, sizes: _ }) => {
             let buf = ctx.get(src);
             let idx = ctx.get(offsets);
             kernel.push(format!(
@@ -98,7 +99,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::Load { index, alt, gate } => {
+        Op::Load(ops::Load { index, alt, gate }) => {
             // Defense-in-depth: `UOp::new` (ir hash_consing.rs `new_tagged`) already
             // asserts the alt/gate pairing, the bool gate and the alt dtype, so no
             // legal construction path reaches these branches.
@@ -166,7 +167,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::Store { index, value, gate } => {
+        Op::Store(ops::Store { index, value, gate }) => {
             if gate.is_some() {
                 ctx.set_invalid_graph(format!(
                     "gated STORE on uop {} reached LLVM codegen; linear cleanup must rewrite it to IF/STORE/ENDIF",
@@ -359,7 +360,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::Cast { src, dtype } => {
+        Op::Cast(ops::Cast { src, dtype }) => {
             let src_llvm_type = lshaped(src);
             let dst_llvm_type = lshaped(uop);
 
@@ -382,13 +383,13 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::BitCast { src, dtype: _ } => {
+        Op::BitCast(ops::BitCast { src, dtype: _ }) => {
             let s = ctx.get(src);
             kernel.push(format!("  {dst} = bitcast {} {s} to {}", lshaped(src), lshaped(uop)));
             Some(())
         }
 
-        Op::Range { axis_id, end, .. } => {
+        Op::Range(ops::Range { axis_id, end, .. }) => {
             let id = axis_id.name();
             let dtype = ldt(&uop.dtype());
             let end_val = ctx.get(end).to_string();
@@ -412,11 +413,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::End { ranges, .. } => {
+        Op::End(ops::End { ranges, .. }) => {
             // After pm_split_ends each END closes the exact RANGE it names,
             // matching Tinygrad's END renderer rather than an anonymous stack pop.
             for range in ranges {
-                let Op::Range { axis_id, .. } = range.op() else { continue };
+                let Op::Range(ops::Range { axis_id, .. }) = range.op() else { continue };
                 let id = axis_id.name();
                 if !ctx.close_range(&id) {
                     return Some(());
@@ -430,7 +431,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::Stack { sources } => {
+        Op::Stack(ops::Stack { sources }) => {
             if sources.is_empty() {
                 return None;
             }
@@ -438,13 +439,13 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::Detach { src } => {
+        Op::Detach(ops::Detach { src }) => {
             let s = ctx.get(src);
             ctx.alias(uop.id, s.to_string());
             None
         }
 
-        Op::Wmma { a, b, c, metadata } => {
+        Op::Wmma(ops::Wmma { a, b, c, metadata }) => {
             // Apple AMX matmul.
             //
             // Stack slots `wmma_<id>_amx{0,1,2}` were pre-allocated in the
@@ -521,9 +522,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::After { passthrough, .. } => {
+        Op::After(ops::After { passthrough, .. }) => {
             #[cfg(debug_assertions)]
-            if matches!(passthrough.op(), Op::Range { .. }) {
+            if matches!(passthrough.op(), Op::Range(..)) {
                 panic!("AFTER passthrough is Range (id={}), this violates Tinygrad semantics", passthrough.id);
             }
             let s = ctx.get(passthrough);
@@ -531,13 +532,13 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             None
         }
 
-        Op::Bind { var, value } => {
+        Op::Bind(ops::Bind { var, value }) => {
             let v = ctx.get(value);
             ctx.alias(var.id, v.to_string());
             None
         }
 
-        Op::If { condition, .. } => {
+        Op::If(ops::If { condition, .. }) => {
             let cond = ctx.get(condition);
             let if_id = uop.id;
             kernel.push(format!("  br i1 {cond}, label %if_then_{if_id}, label %if_end_{if_id}"));
@@ -545,7 +546,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::EndIf { if_op } => {
+        Op::EndIf(ops::EndIf { if_op }) => {
             let if_id = if_op.id;
             kernel.push(format!("  br label %if_end_{if_id}"));
             kernel.push(format!("if_end_{if_id}:"));
@@ -558,7 +559,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         // must format to a single valid operand (a constant, a constexpr like
         // `bitcast`/`getelementptr`, or an existing SSA value). For anything
         // that needs its own instruction, use a typed `Custom` statement.
-        Op::CustomI { deps, code } => {
+        Op::CustomI(ops::CustomI { deps, code }) => {
             let args: Vec<String> = deps.iter().map(|dep| ctx.get(dep).to_string()).collect();
             let expr = match crate::common::format_custom_template_strict(code, &args) {
                 Ok(s) => s,
@@ -578,7 +579,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         // a single instruction whose rendered text is the assignment RHS
         // (e.g. `fmul float {0}, 2.0` → `%vN = fmul float %op, 2.0`) — the LLVM
         // type lives in the RHS, so unlike C there is no separate declaration.
-        Op::Custom { deps, code } => {
+        Op::Custom(ops::Custom { deps, code }) => {
             let args: Vec<String> = deps.iter().map(|dep| ctx.get(dep).to_string()).collect();
             let rendered = match crate::common::format_custom_template_strict(code, &args) {
                 Ok(s) => s,
@@ -649,17 +650,17 @@ fn is_volatile_access(index: &Arc<UOp>) -> bool {
     let mut current = index;
     loop {
         match current.op() {
-            Op::Param { arg, .. } => return arg.volatile,
-            Op::Index { buffer, .. } => current = buffer,
-            Op::Shrink { src, .. }
-            | Op::Cast { src, .. }
-            | Op::After { passthrough: src, .. }
-            | Op::Reshape { src, .. }
-            | Op::Permute { src, .. }
-            | Op::Expand { src, .. }
-            | Op::Pad { src, .. }
-            | Op::Flip { src, .. } => current = src,
-            Op::MSelect { buffer, .. } => current = buffer,
+            Op::Param(ops::Param { arg, .. }) => return arg.volatile,
+            Op::Index(ops::Index { buffer, .. }) => current = buffer,
+            Op::Shrink(ops::Shrink { src, .. })
+            | Op::Cast(ops::Cast { src, .. })
+            | Op::After(ops::After { passthrough: src, .. })
+            | Op::Reshape(ops::Reshape { src, .. })
+            | Op::Permute(ops::Permute { src, .. })
+            | Op::Expand(ops::Expand { src, .. })
+            | Op::Pad(ops::Pad { src, .. })
+            | Op::Flip(ops::Flip { src, .. }) => current = src,
+            Op::MSelect(ops::MSelect { buffer, .. }) => current = buffer,
             _ => return false,
         }
     }

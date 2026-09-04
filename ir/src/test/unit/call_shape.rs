@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
 
+use crate::ops;
 use crate::{CallInfo, DType, Error, Op, SInt, UOp};
 
 fn symbolic_buffer(slot: usize, shape: SmallVec<[SInt; 4]>) -> Arc<UOp> {
@@ -84,7 +85,7 @@ fn function_shape_keeps_nested_opaque_call_body_untouched() {
     let function = output.try_function(smallvec![actual], CallInfo::default()).unwrap();
 
     assert_eq!(function.try_gettuple(0).unwrap().shape().unwrap().unwrap().as_slice(), &[SInt::Const(8)]);
-    let Op::Function { body, .. } = function.op() else { panic!("expected FUNCTION") };
+    let Op::Function(ops::Function { body, .. }) = function.op() else { panic!("expected FUNCTION") };
     assert!(body.toposort().iter().any(|node| Arc::ptr_eq(node, &opaque_body)));
 }
 

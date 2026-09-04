@@ -9,11 +9,12 @@ use svod_ir::{AddrSpace, BufferizeOpts, Op, UOp};
 use crate::rangeify::{RangeifyBufferContext, bufferize_to_store, try_get_kernel_graph};
 
 use super::helpers::extract_kernel;
+use svod_ir::ops;
 
 fn scalar_stage() -> Arc<UOp> {
     let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
     UOp::new(
-        Op::Stage { compute: UOp::native_const(42.0f32), ranges: SmallVec::new(), opts: opts.into() },
+        Op::Stage(ops::Stage { compute: UOp::native_const(42.0f32), ranges: SmallVec::new(), opts: opts.into() }),
         DType::Float32,
     )
 }
@@ -23,17 +24,19 @@ fn rangeless_stage_stores_without_an_end_wrapper() {
     let stage = scalar_stage();
     let result = bufferize_to_store(&stage, &mut RangeifyBufferContext::new()).expect("scalar STAGE converts");
 
-    let Op::After { passthrough, deps } = result.op() else { panic!("expected AFTER, got {}", result.tree()) };
-    assert!(matches!(passthrough.op(), Op::Buffer { .. }));
+    let Op::After(ops::After { passthrough, deps }) = result.op() else {
+        panic!("expected AFTER, got {}", result.tree())
+    };
+    assert!(matches!(passthrough.op(), Op::Buffer(..)));
     let [store] = deps.as_slice() else { panic!("expected exactly one dep") };
-    let Op::Store { value, .. } = store.op() else { panic!("no ranges means STORE is not wrapped in END") };
+    let Op::Store(ops::Store { value, .. }) = store.op() else { panic!("no ranges means STORE is not wrapped in END") };
     assert!(matches!(value.op(), Op::Const(_)));
 }
 
 #[test]
 fn rangeless_stage_still_produces_a_kernel() {
     let (result, _ctx) = try_get_kernel_graph(scalar_stage()).expect("kernel split");
-    assert!(matches!(extract_kernel(&result).expect("CALL").op(), Op::Call { .. }));
+    assert!(matches!(extract_kernel(&result).expect("CALL").op(), Op::Call(..)));
 }
 
 /// Tinygrad's `assert size > 0`: an empty range cannot back a buffer.
@@ -42,7 +45,10 @@ fn rangeless_stage_still_produces_a_kernel() {
 fn zero_sized_range_cannot_be_allocated() {
     let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
     let ranges = smallvec::smallvec![UOp::range_const(0, 0)];
-    let stage = UOp::new(Op::Stage { compute: UOp::native_const(1.0f32), ranges, opts: opts.into() }, DType::Float32);
+    let stage = UOp::new(
+        Op::Stage(ops::Stage { compute: UOp::native_const(1.0f32), ranges, opts: opts.into() }),
+        DType::Float32,
+    );
 
     bufferize_to_store(&stage, &mut RangeifyBufferContext::new());
 }

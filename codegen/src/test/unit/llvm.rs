@@ -6,6 +6,7 @@ use svod_ir::{AxisId, AxisType, ConstValue, Op, ParamArg, UOp};
 
 use crate::llvm::common::lconst;
 use crate::llvm::text::render;
+use svod_ir::ops;
 
 fn render_linearized(root: &std::sync::Arc<UOp>, name: Option<&str>) -> crate::Result<crate::RenderedKernel> {
     let linear = UOp::linear(svod_schedule::linearize_with_cfg(root.clone()).into());
@@ -15,11 +16,14 @@ fn render_linearized(root: &std::sync::Arc<UOp>, name: Option<&str>) -> crate::R
 fn volatile_param(slot: usize, size: usize) -> std::sync::Arc<UOp> {
     let mut arg = ParamArg::buffer(slot, DType::Float32, AddrSpace::Global, None);
     arg.volatile = true;
-    UOp::new(Op::Param { shape: UOp::native_const(size as i32), arg: arg.into() }, DType::Float32)
+    UOp::new(Op::Param(ops::Param { shape: UOp::native_const(size as i32), arg: arg.into() }), DType::Float32)
 }
 
 fn shrink4(src: std::sync::Arc<UOp>) -> std::sync::Arc<UOp> {
-    UOp::new(Op::Shrink { src, offsets: UOp::native_const(0i32), sizes: UOp::native_const(4i32) }, DType::Float32)
+    UOp::new(
+        Op::Shrink(ops::Shrink { src, offsets: UOp::native_const(0i32), sizes: UOp::native_const(4i32) }),
+        DType::Float32,
+    )
 }
 
 #[test]
@@ -91,7 +95,7 @@ fn test_render_rejects_non_linear_inputs() {
 fn test_range_end_basic() {
     let end = UOp::const_(DType::Int64, ConstValue::Int(10));
     let range = UOp::new(
-        Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop, deps: SmallVec::new() },
+        Op::Range(ops::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop, deps: SmallVec::new() }),
         DType::Int64,
     );
     let ranges: SmallVec<[_; 4]> = smallvec::smallvec![range];
@@ -180,11 +184,11 @@ fn llvm_gated_load_phis_the_shaped_load_type(lanes: usize, expected: &str) {
                 .unwrap()
         } else {
             UOp::new(
-                Op::Shrink {
+                Op::Shrink(ops::Shrink {
                     src: UOp::param(slot, 8, DType::Float32, None),
                     offsets: UOp::native_const(0i32),
                     sizes: UOp::native_const(lanes as i32),
-                },
+                }),
                 DType::Float32,
             )
         }

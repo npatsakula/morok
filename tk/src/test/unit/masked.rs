@@ -15,6 +15,7 @@ use svod_ir::{Op, TernaryOp, UOp};
 use crate::arch::FragRole;
 use crate::tiles::{RT_16X16, TileLayout};
 use crate::{ArchCaps, Kernel, MoveIdx};
+use svod_ir::ops;
 
 const ROW: TileLayout = TileLayout::Row;
 
@@ -37,7 +38,7 @@ fn test_masked_load_graph_shape() {
         t.iter().any(|u| {
             matches!(
                 u.op(),
-                Op::Index { indices, .. }
+                Op::Index(ops::Index { indices, .. })
                     if indices.iter().any(|idx| matches!(idx.op(), Op::Ternary(TernaryOp::Where, _, _, invalid) if UOp::is_invalid_marker(invalid)))
             )
         })
@@ -71,7 +72,7 @@ fn test_masked_store_graph_shape() {
         topo.iter().any(|u| {
             matches!(
                 u.op(),
-                Op::Index { indices, .. }
+                Op::Index(ops::Index { indices, .. })
                     if indices.iter().any(|idx| matches!(idx.op(), Op::Ternary(TernaryOp::Where, _, _, invalid) if UOp::is_invalid_marker(invalid)))
             )
         }),

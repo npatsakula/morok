@@ -42,6 +42,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use papaya::HashMap as PapayaMap;
 use parking_lot::RwLock;
 use svod_device::Buffer;
+use svod_ir::ops;
 use svod_ir::uop::SubtreeMemo;
 use svod_ir::{Op, UOp, UOpKey};
 
@@ -374,7 +375,7 @@ fn apply_map_to_tensors_inner(
     // result. Re-applying is idempotent: realize maps are `old → replacement`
     // where the replacement no longer contains the old key, so an
     // already-rewritten value comes back unchanged and is left alone.
-    if let Op::Sink { sources: new_sources, .. } = new_sink.op() {
+    if let Op::Sink(ops::Sink { sources: new_sources, .. }) = new_sink.op() {
         for (entry, (old, new)) in affected.iter().zip(sources.iter().zip(new_sources.iter())) {
             if Arc::ptr_eq(old, new) {
                 continue;

@@ -673,7 +673,7 @@ fn test_densenet_two_layer_kernel_count() {
         .expect("kernel split pipeline should succeed for dense layer kernel count");
 
     let kernels: Vec<_> =
-        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), svod_ir::Op::Call { .. })).collect();
+        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), svod_ir::Op::Call(..))).collect();
 
     // 6 kernels matching Tinygrad: BN+ReLU, Conv1x1+BN+ReLU, Conv3x3+Cat (×2 layers)
     assert_eq!(kernels.len(), 6, "Expected 6 kernels for 2 dense layers, got {}", kernels.len());

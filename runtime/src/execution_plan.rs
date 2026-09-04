@@ -42,6 +42,7 @@ use crate::kernel_cache::CachedKernel;
 use crate::profiler::{
     KernelProfile, KernelStaticInfo, ProfileOptions, RunProfile, StageProfile, SubmissionProfileFinalizer,
 };
+use svod_ir::ops;
 
 type RuntimeLaunchSizes = (Option<[usize; 3]>, Option<[usize; 3]>);
 
@@ -211,8 +212,8 @@ pub fn collect_runtime_vars(root: &Arc<UOp>) -> Vec<RuntimeVar> {
     let mut seen = std::collections::HashSet::new();
     for node in root.toposort() {
         let bounds = match node.op() {
-            Op::DefineVar { name, min_val, max_val } => Some((name.clone(), *min_val, *max_val)),
-            Op::Param { arg, .. }
+            Op::DefineVar(ops::DefineVar { name, min_val, max_val }) => Some((name.clone(), *min_val, *max_val)),
+            Op::Param(ops::Param { arg, .. })
                 if arg.addrspace.is_none()
                     && let Some(name) = arg.name.as_deref()
                     && let Some((min, max)) = &arg.vmin_vmax

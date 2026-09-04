@@ -67,6 +67,7 @@ pub use renderer::{Renderer, TcOpt, TensorCore};
 pub use scheduler::Scheduler;
 #[cfg(test)]
 pub use scheduler::clear_kernel_name_counts;
+use svod_ir::ops;
 pub use types::{AxisType, Opt, OptArg, OptArgExt, OptOps};
 
 use crate::devectorize::{
@@ -122,7 +123,7 @@ impl LocalBufferContext {
 }
 
 pub(crate) fn add_local_buffer(stage: &Arc<UOp>, ctx: &mut LocalBufferContext) -> Option<Arc<UOp>> {
-    let Op::Stage { compute, ranges, opts } = stage.op() else { return None };
+    let Op::Stage(ops::Stage { compute, ranges, opts }) = stage.op() else { return None };
     let shape = stage.shape().ok().flatten()?.clone();
     let max_shape =
         shape.iter().map(|dim| dim.vmax().map(svod_ir::SInt::Const)).collect::<Option<svod_ir::shape::Shape>>()?;
@@ -595,13 +596,13 @@ fn assert_target_renderer_boundary(root: &Arc<UOp>) {
     }
     for node in root.toposort() {
         match node.op() {
-            Op::Index { buffer, indices } if indices.len() > 1 => {
+            Op::Index(ops::Index { buffer, indices }) if indices.len() > 1 => {
                 let static_tensor_index = buffer.shape().ok().flatten().is_some_and(|shape| {
                     shape.len() == indices.len() && shape.iter().all(|dim| dim.as_const().is_some())
                 });
                 assert!(!static_tensor_index, "static multi-index INDEX survived rangeify/indexing: {}", node.tree());
             }
-            Op::Reshape { src, .. } => {
+            Op::Reshape(ops::Reshape { src, .. }) => {
                 let source_shape = src.shape().ok().flatten();
                 let target_shape = node.shape().ok().flatten();
                 let residual = source_shape.zip(target_shape).is_some_and(|(source, target)| {
@@ -611,7 +612,8 @@ fn assert_target_renderer_boundary(root: &Arc<UOp>) {
                 });
                 assert!(!residual, "singleton-prefix broadcast survived devectorize: {}", node.tree());
             }
-            Op::Expand { src, .. } if matches!(src.op(), Op::Stack { sources } if sources.len() == 1) => {
+            Op::Expand(ops::Expand { src, .. }) if matches!(src.op(), Op::Stack(ops::Stack { sources }) if sources.len() == 1) =>
+            {
                 let source_shape = src.shape().ok().flatten();
                 let target_shape = node.shape().ok().flatten();
                 let residual = source_shape
@@ -620,7 +622,7 @@ fn assert_target_renderer_boundary(root: &Arc<UOp>) {
                 assert!(!residual, "singleton STACK broadcast survived devectorize: {}", node.tree());
             }
             Op::Binary(..) | Op::Ternary(..)
-                if node.op().sources().iter().any(|src| matches!(src.op(), Op::Stack { .. }))
+                if node.op().sources().iter().any(|src| matches!(src.op(), Op::Stack(..)))
                     && (node.dtype().vcount() > 1
                         || node.op().sources().iter().any(|src| src.dtype().vcount() > 1)) =>
             {
@@ -1047,7 +1049,7 @@ pub(crate) fn apply_late_rewrites(
 /// carries an explicit list.
 fn kernel_opts_to_apply(ast: &Arc<svod_ir::UOp>) -> Option<Vec<Opt>> {
     match ast.op() {
-        svod_ir::Op::Sink { info: Some(ki), .. } => ki.opts_to_apply.clone(),
+        svod_ir::Op::Sink(ops::Sink { info: Some(ki), .. }) => ki.opts_to_apply.clone(),
         _ => None,
     }
 }

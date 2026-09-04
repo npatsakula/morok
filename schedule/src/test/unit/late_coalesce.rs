@@ -10,6 +10,7 @@ use crate::graph_rewrite;
 use crate::late::{AddImageContext, indexing_simplify, memory_coalescing, pm_simplify_add_image};
 use crate::optimizer::Renderer;
 use crate::symbolic::patterns::sym;
+use svod_ir::ops;
 
 fn weak(value: i64) -> Arc<UOp> {
     UOp::const_(DType::WeakInt, ConstValue::Int(value))
@@ -22,11 +23,11 @@ fn x() -> Arc<UOp> {
 fn image_param() -> Arc<UOp> {
     let shape = svod_ir::shape::shape_to_uop(&smallvec![1usize.into(), 4usize.into(), 4usize.into()]);
     let arg = ParamArg::buffer(0, DType::Float32, AddrSpace::Global, None);
-    UOp::new(Op::Param { shape, arg: arg.into() }, DType::Float32)
+    UOp::new(Op::Param(ops::Param { shape, arg: arg.into() }), DType::Float32)
 }
 
 fn gated_index(index: &Arc<UOp>) -> (&Arc<UOp>, &Arc<UOp>) {
-    let Op::Index { indices, .. } = index.op() else { panic!("expected INDEX, got {}", index.tree()) };
+    let Op::Index(ops::Index { indices, .. }) = index.op() else { panic!("expected INDEX, got {}", index.tree()) };
     let Op::Ternary(TernaryOp::Where, valid, idx, invalid) = indices[0].op() else {
         panic!("expected gated index, got {}", index.tree())
     };
@@ -72,7 +73,7 @@ fn image_clause_is_dropped_only_when_wrong_side_is_out_of_bounds() {
         .unwrap();
 
     let result = graph_rewrite(indexing_simplify(), index, &mut ());
-    let Op::Index { indices, .. } = result.op() else { panic!("expected INDEX") };
+    let Op::Index(ops::Index { indices, .. }) = result.op() else { panic!("expected INDEX") };
     assert_eq!(indices.len(), 2);
     assert!(indices.iter().all(|idx| !matches!(idx.op(), Op::Ternary(TernaryOp::Where, ..))));
     assert!(matches!(indices[0].op(), Op::Const(value) if value.0 == ConstValue::Int(0)));
@@ -84,15 +85,15 @@ fn load_at(buffer: &Arc<UOp>, index: Arc<UOp>) -> Arc<UOp> {
 }
 
 fn loads(root: &Arc<UOp>) -> Vec<Arc<UOp>> {
-    root.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::Load { .. })).collect()
+    root.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::Load(..))).collect()
 }
 
 fn stores(root: &Arc<UOp>) -> Vec<Arc<UOp>> {
-    root.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::Store { .. })).collect()
+    root.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::Store(..))).collect()
 }
 
 fn shrink_count(root: &Arc<UOp>) -> usize {
-    root.toposort().iter().filter(|uop| matches!(uop.op(), Op::Shrink { .. })).count()
+    root.toposort().iter().filter(|uop| matches!(uop.op(), Op::Shrink(..))).count()
 }
 
 fn no_float4() -> Renderer {
@@ -111,8 +112,8 @@ fn target_coalesce(sink: Arc<UOp>, renderer: &Renderer) -> Arc<UOp> {
 fn shaped_load(offsets: &[i64]) -> Arc<UOp> {
     let buffer = UOp::param(0, 16, DType::Float32, None);
     let indices = UOp::stack(offsets.iter().copied().map(UOp::index_const).collect());
-    let index = UOp::new(Op::Index { buffer, indices: smallvec![indices] }, DType::Float32);
-    UOp::sink(vec![UOp::new(Op::Load { index, alt: None, gate: None }, DType::Float32)])
+    let index = UOp::new(Op::Index(ops::Index { buffer, indices: smallvec![indices] }), DType::Float32);
+    UOp::sink(vec![UOp::new(Op::Load(ops::Load { index, alt: None, gate: None }), DType::Float32)])
 }
 
 /// Devectorization turns a shaped access into lanes; coalescing regroups them
@@ -134,16 +135,16 @@ fn a_shaped_load_splits_into_target_width_groups(
     assert_eq!(folded.len(), groups, "{}", result.tree());
     assert!(folded.iter().all(|load| load.dtype() == DType::Float32), "memory dtype must stay scalar");
     assert_eq!(folded[0].shape().unwrap().unwrap()[0].as_const(), Some(group_width));
-    let Op::Load { index, .. } = folded[0].op() else { unreachable!() };
+    let Op::Load(ops::Load { index, .. }) = folded[0].op() else { unreachable!() };
     assert_eq!(index.dtype(), DType::Float32);
 }
 
 fn shaped_store() -> Arc<UOp> {
     let buffer = UOp::param(0, 16, DType::Float32, None);
     let indices = UOp::stack((0..4).map(UOp::index_const).collect());
-    let index = UOp::new(Op::Index { buffer, indices: smallvec![indices] }, DType::Float32);
+    let index = UOp::new(Op::Index(ops::Index { buffer, indices: smallvec![indices] }), DType::Float32);
     let value = UOp::stack((0..4).map(|v| UOp::const_(DType::Float32, ConstValue::Float(v as f64))).collect());
-    UOp::sink(vec![UOp::new(Op::Store { index, value, gate: None }, DType::Void)])
+    UOp::sink(vec![UOp::new(Op::Store(ops::Store { index, value, gate: None }), DType::Void)])
 }
 
 fn scalar_stores() -> Arc<UOp> {
@@ -169,10 +170,10 @@ fn contiguous_stores_fold_to_one_shaped_scalar_store(sink: Arc<UOp>) {
 
     let folded = stores(&result);
     assert_eq!(folded.len(), 1, "{}", result.tree());
-    let Op::Store { index, value, .. } = folded[0].op() else { unreachable!() };
+    let Op::Store(ops::Store { index, value, .. }) = folded[0].op() else { unreachable!() };
     assert_eq!(index.dtype(), DType::Float32);
     assert_eq!(value.dtype(), DType::Float32);
-    assert!(matches!(value.op(), Op::Stack { sources } if sources.len() == 4));
+    assert!(matches!(value.op(), Op::Stack(ops::Stack { sources }) if sources.len() == 4));
 }
 
 fn contiguous_loads(buffer: Arc<UOp>) -> Arc<UOp> {
@@ -228,9 +229,9 @@ fn grouped_weak_index_offsets_match_tinygrad_for_widths_four_five_and_eight() {
         let mut grouped_widths = Vec::new();
         let mut scalar_offsets = Vec::new();
         for load in folded {
-            let Op::Load { index, .. } = load.op() else { unreachable!() };
+            let Op::Load(ops::Load { index, .. }) = load.op() else { unreachable!() };
             match index.op() {
-                Op::Shrink { offsets, sizes, .. } => {
+                Op::Shrink(ops::Shrink { offsets, sizes, .. }) => {
                     assert_eq!(offsets.dtype(), DType::WeakInt);
                     assert_eq!(sizes.dtype(), DType::WeakInt);
                     assert_eq!(offsets.shape().unwrap().unwrap().as_slice(), &[]);
@@ -238,7 +239,7 @@ fn grouped_weak_index_offsets_match_tinygrad_for_widths_four_five_and_eight() {
                     let Op::Const(value) = sizes.op() else { panic!("width must be CONST") };
                     grouped_widths.push(value.0);
                 }
-                Op::Index { indices, .. } => {
+                Op::Index(ops::Index { indices, .. }) => {
                     assert_eq!(indices[0].dtype(), DType::WeakInt);
                     let Op::Binary(BinaryOp::Add, _, offset) = indices[0].op() else {
                         panic!("scalar offset must preserve its base")
@@ -263,14 +264,16 @@ fn a_shaped_load_with_shared_validity_keeps_one_group_gate() {
     let buffer = UOp::param(0, 16, DType::Float32, None);
     let valid = x().lt(&weak(4));
     let indices = UOp::stack((0..4).map(|offset| UOp::index_const(offset).valid(valid.clone())).collect());
-    let index = UOp::new(Op::Index { buffer, indices: smallvec![indices] }, DType::Float32);
-    let load = UOp::new(Op::Load { index, alt: None, gate: None }, DType::Float32);
+    let index = UOp::new(Op::Index(ops::Index { buffer, indices: smallvec![indices] }), DType::Float32);
+    let load = UOp::new(Op::Load(ops::Load { index, alt: None, gate: None }), DType::Float32);
 
     let result = target_coalesce(UOp::sink(vec![load]), &Renderer::cpu());
     let folded = loads(&result);
     assert_eq!(folded.len(), 1, "shared validity should produce one shaped access: {}", result.tree());
-    let Op::Load { index, .. } = folded[0].op() else { unreachable!() };
-    let Op::Shrink { offsets, sizes, .. } = index.op() else { panic!("expected SHRINK: {}", index.tree()) };
+    let Op::Load(ops::Load { index, .. }) = folded[0].op() else { unreachable!() };
+    let Op::Shrink(ops::Shrink { offsets, sizes, .. }) = index.op() else {
+        panic!("expected SHRINK: {}", index.tree())
+    };
     assert!(Arc::ptr_eq(&offsets.get_valid(), &valid));
     assert!(matches!(offsets.get_idx().op(), Op::Const(value) if value.0 == ConstValue::Int(0)));
     assert!(matches!(sizes.op(), Op::Const(value) if value.0 == ConstValue::Int(4)));
@@ -305,8 +308,8 @@ fn wmma_output_stores_stay_distinct_through_coalescing() {
     assert_eq!(
         after_stores
             .iter()
-            .filter(|store| matches!(store.op(), Op::Store { index, .. }
-                if matches!(index.op(), Op::Index { indices, .. }
+            .filter(|store| matches!(store.op(), Op::Store(ops::Store { index, .. })
+                if matches!(index.op(), Op::Index(ops::Index { indices, .. })
                     if Arc::ptr_eq(&indices[0].get_valid(), &valid))))
             .count(),
         1,
@@ -330,11 +333,11 @@ fn a_gated_load_is_skipped_rather_than_aborting_the_pass() {
     let buffer = UOp::param(0, 16, DType::Float32, None);
     let index = UOp::index().buffer(buffer).indices(vec![UOp::index_const(0)]).call().unwrap();
     let gated = UOp::new(
-        Op::Load {
+        Op::Load(ops::Load {
             index,
             alt: Some(UOp::const_(DType::Float32, ConstValue::Float(0.0))),
             gate: Some(UOp::const_(DType::Bool, ConstValue::Bool(true))),
-        },
+        }),
         DType::Float32,
     );
 

@@ -8,6 +8,7 @@ use svod_dtype::DType;
 use svod_ir::{ConstValue, ConstValueHash, Op, TernaryOp, UOp};
 
 use crate::TypedPatternMatcher;
+use svod_ir::ops;
 
 fn valid_index(index: &Arc<UOp>) -> Option<(&Arc<UOp>, &Arc<UOp>)> {
     let Op::Ternary(TernaryOp::Where, gate, index, invalid) = index.op() else {
@@ -30,11 +31,11 @@ fn image_gate(buffer: &Arc<UOp>, indices: &[Arc<UOp>]) -> Option<(Arc<UOp>, Vec<
 }
 
 fn move_image_load(load: &Arc<UOp>, index: &Arc<UOp>, buffer: &Arc<UOp>, indices: &[Arc<UOp>]) -> Option<Arc<UOp>> {
-    let Op::Load { alt: None, gate: None, .. } = load.op() else {
+    let Op::Load(ops::Load { alt: None, gate: None, .. }) = load.op() else {
         return None;
     };
     let (gate, indices) = image_gate(buffer, indices)?;
-    let index = UOp::new(Op::Index { buffer: buffer.clone(), indices: indices.into() }, index.dtype());
+    let index = UOp::new(Op::Index(ops::Index { buffer: buffer.clone(), indices: indices.into() }), index.dtype());
     let result = UOp::load().index(index.clone()).alt(load.vconst_like(0)).gate(gate).call();
     Some(if result.dtype() == load.dtype() { result } else { result.cast(load.dtype()) })
 }
@@ -50,7 +51,7 @@ fn move_image_store(
         return None;
     }
     let (gate, indices) = image_gate(buffer, indices)?;
-    let index = UOp::new(Op::Index { buffer: buffer.clone(), indices: indices.into() }, index.dtype());
+    let index = UOp::new(Op::Index(ops::Index { buffer: buffer.clone(), indices: indices.into() }), index.dtype());
     Some(index.store_gated(value.clone(), gate))
 }
 
@@ -61,12 +62,14 @@ fn move_shrink_load(
     offsets: &Arc<UOp>,
     sizes: &Arc<UOp>,
 ) -> Option<Arc<UOp>> {
-    let Op::Load { alt: None, gate: None, .. } = load.op() else {
+    let Op::Load(ops::Load { alt: None, gate: None, .. }) = load.op() else {
         return None;
     };
     let (gate, offsets) = valid_index(offsets)?;
-    let shrink =
-        UOp::new(Op::Shrink { src: src.clone(), offsets: offsets.clone(), sizes: sizes.clone() }, shrink.dtype());
+    let shrink = UOp::new(
+        Op::Shrink(ops::Shrink { src: src.clone(), offsets: offsets.clone(), sizes: sizes.clone() }),
+        shrink.dtype(),
+    );
     Some(UOp::load().index(shrink).alt(load.vconst_like(0)).gate(gate.clone()).call())
 }
 
@@ -82,19 +85,21 @@ fn move_shrink_store(
         return None;
     }
     let (gate, offsets) = valid_index(offsets)?;
-    let shrink =
-        UOp::new(Op::Shrink { src: src.clone(), offsets: offsets.clone(), sizes: sizes.clone() }, shrink.dtype());
+    let shrink = UOp::new(
+        Op::Shrink(ops::Shrink { src: src.clone(), offsets: offsets.clone(), sizes: sizes.clone() }),
+        shrink.dtype(),
+    );
     Some(shrink.store_gated(value.clone(), gate.clone()))
 }
 
 fn move_load(load: &Arc<UOp>, index: &Arc<UOp>, buffer: &Arc<UOp>, indices: &[Arc<UOp>]) -> Option<Arc<UOp>> {
-    let Op::Load { alt: None, gate: None, .. } = load.op() else {
+    let Op::Load(ops::Load { alt: None, gate: None, .. }) = load.op() else {
         return None;
     };
     let (gate, clean_index) = valid_index(indices.first()?)?;
     let mut indices = indices.to_vec();
     indices[0] = clean_index.clone();
-    let index = UOp::new(Op::Index { buffer: buffer.clone(), indices: indices.into() }, index.dtype());
+    let index = UOp::new(Op::Index(ops::Index { buffer: buffer.clone(), indices: indices.into() }), index.dtype());
     Some(UOp::load().index(index).alt(load.vconst_like(0)).gate(gate.clone()).call())
 }
 
@@ -111,7 +116,7 @@ fn move_store(
     let (gate, clean_index) = valid_index(indices.first()?)?;
     let mut indices = indices.to_vec();
     indices[0] = clean_index.clone();
-    let index = UOp::new(Op::Index { buffer: buffer.clone(), indices: indices.into() }, index.dtype());
+    let index = UOp::new(Op::Index(ops::Index { buffer: buffer.clone(), indices: indices.into() }), index.dtype());
     Some(index.store_gated(value.clone(), gate.clone()))
 }
 
@@ -120,10 +125,10 @@ fn gated_load<'a>(value: &'a Arc<UOp>, gate: &Arc<UOp>, inverted: bool) -> Optio
         return None;
     }
     let value = match value.op() {
-        Op::Cast { src, .. } => src,
+        Op::Cast(ops::Cast { src, .. }) => src,
         _ => value,
     };
-    let Op::Load { alt: Some(_), gate: Some(load_gate), .. } = value.op() else {
+    let Op::Load(ops::Load { alt: Some(_), gate: Some(load_gate), .. }) = value.op() else {
         return None;
     };
     let matches = if inverted {
@@ -142,12 +147,12 @@ fn move_where_load(
     inverted: bool,
 ) -> Option<Arc<UOp>> {
     let load = gated_load(value, gate, inverted)?;
-    let Op::Load { index, gate: Some(load_gate), .. } = load.op() else {
+    let Op::Load(ops::Load { index, gate: Some(load_gate), .. }) = load.op() else {
         return None;
     };
     let alt = if matches!(alt.op(), Op::Const(ConstValueHash(ConstValue::Invalid))) {
         load.vconst_like(0)
-    } else if let Op::Cast { src, .. } = alt.op() {
+    } else if let Op::Cast(ops::Cast { src, .. }) = alt.op() {
         if src.dtype() == load.dtype() { src.clone() } else { alt.cast(load.dtype()) }
     } else {
         alt.cast(load.dtype())

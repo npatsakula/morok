@@ -34,6 +34,7 @@ use svod_dtype::DType;
 use svod_ir::{Op, UOp};
 
 use crate::llvm::common::LlvmTarget;
+use svod_ir::ops;
 
 /// Sentinel prefix identifying a [`pipeline`] marker in an `Op::Custom` body. It is
 /// a valid LLVM line comment, so an un-lowered marker (non-CDNA target, or the pass
@@ -111,7 +112,7 @@ fn sched_barrier(mask: i64) -> Arc<UOp> {
 /// Recognize a [`pipeline`] marker node and recover its kind.
 fn marker_kind(node: &Arc<UOp>) -> Option<SchedKind> {
     match node.op() {
-        Op::Custom { code, .. } => code.strip_prefix(PIPELINE_PREFIX).map(SchedKind::parse),
+        Op::Custom(ops::Custom { code, .. }) => code.strip_prefix(PIPELINE_PREFIX).map(SchedKind::parse),
         _ => None,
     }
 }

@@ -29,6 +29,7 @@ use super::config::BeamConfig;
 use super::error::*;
 use super::opts::apply_opt;
 use super::types::{Opt, OptArg, OptOps};
+use svod_ir::ops;
 
 // ============================================================================
 // ACTION SPACE
@@ -344,7 +345,7 @@ fn product_of_axes(scheduler: &Scheduler, types: &[AxisType]) -> usize {
         .rngs()
         .iter()
         .filter_map(|rng| {
-            if let Op::Range { axis_type, end, .. } = rng.op()
+            if let Op::Range(ops::Range { axis_type, end, .. }) = rng.op()
                 && types.contains(axis_type)
                 && let Op::Const(cv) = end.op()
                 && let ConstValue::Int(sz) = cv.0

@@ -9,6 +9,7 @@ use crate::optimizer::heuristics::{
     apply_default_upcast, apply_image_upcasts, apply_matvec_fast_path, try_tensor_cores,
 };
 use crate::optimizer::{OptOps, Renderer, Scheduler};
+use svod_ir::ops;
 
 fn create_matvec_like_pattern(rows: i64, cols: i64) -> Arc<UOp> {
     let row = UOp::range_axis(UOp::index_const(rows), AxisId::Renumbered(0), AxisType::Global);
@@ -66,7 +67,7 @@ fn test_apply_image_upcasts_non_stub_behavior(dtype: DType, expected: bool) {
     let g = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Global);
     let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![2usize.into(), 8usize.into(), 4usize.into()]);
     let arg = ParamArg::buffer(0, dtype.clone(), AddrSpace::Global, Some(DeviceSpec::Cpu));
-    let img = UOp::new(Op::Buffer { shape, arg: arg.into() }, dtype);
+    let img = UOp::new(Op::Buffer(ops::Buffer { shape, arg: arg.into() }), dtype);
     let indexed = UOp::index().buffer(img).indices(vec![g.clone()]).call().expect("image index should build");
     let sink = UOp::sink(vec![indexed, g]);
 

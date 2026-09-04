@@ -12,6 +12,7 @@ use svod_ir::uop::properties::VminVmaxProperty;
 use svod_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UOpKey};
 
 use crate::TypedPatternMatcher;
+use svod_ir::ops;
 
 /// Loads/stores of one buffer grouped by constant byte offset.
 type OffsetGroups = BTreeMap<i64, Vec<Arc<UOp>>>;
@@ -43,7 +44,7 @@ fn split_and(expr: &Arc<UOp>) -> Vec<Arc<UOp>> {
 }
 
 fn is_irreducible(uop: &Arc<UOp>) -> bool {
-    matches!(uop.op(), Op::Const(..) | Op::Param { .. } | Op::Special { .. } | Op::Range { .. })
+    matches!(uop.op(), Op::Const(..) | Op::Param(..) | Op::Special(..) | Op::Range(..))
 }
 
 fn int_bounds(uop: &Arc<UOp>) -> Option<(i64, i64)> {
@@ -62,7 +63,7 @@ fn int_bounds(uop: &Arc<UOp>) -> Option<(i64, i64)> {
 
 fn coordinates(idx: &Arc<UOp>) -> Option<Vec<Arc<UOp>>> {
     match idx.op() {
-        Op::Stack { sources } if sources.len() == 2 => Some(sources.to_vec()),
+        Op::Stack(ops::Stack { sources }) if sources.len() == 2 => Some(sources.to_vec()),
         _ => None,
     }
 }
@@ -222,7 +223,7 @@ pub fn pm_simplify_add_image() -> TypedPatternMatcher<AddImageContext> {
         Store { index, value, gate }
             if index.dtype() == DType::Float32 && value.dtype() == DType::Float16
             => Some(UOp::new(
-                Op::Store { index: index.clone(), value: value.cast(DType::Float32), gate: gate.clone() },
+                Op::Store(ops::Store { index: index.clone(), value: value.cast(DType::Float32), gate: gate.clone() }),
                 DType::Void,
             )),
 
@@ -317,15 +318,15 @@ pub fn memory_coalescing(sink: Arc<UOp>, ctx: &Renderer) -> Arc<UOp> {
         // load/store that still carries its gate as a separate source is simply
         // left alone.
         let (op, index) = match uop.op() {
-            Op::Load { index, alt, gate } if alt.is_none() && gate.is_none() => (MemoryOp::Load, index),
-            Op::Store { index, gate, .. } if gate.is_none() => (MemoryOp::Store, index),
-            Op::Load { .. } | Op::Store { .. } => {
+            Op::Load(ops::Load { index, alt, gate }) if alt.is_none() && gate.is_none() => (MemoryOp::Load, index),
+            Op::Store(ops::Store { index, gate, .. }) if gate.is_none() => (MemoryOp::Store, index),
+            Op::Load(..) | Op::Store(..) => {
                 tracing::warn!("memory coalescing skips a gated load/store");
                 continue;
             }
             _ => continue,
         };
-        let Op::Index { buffer, indices } = index.op() else { continue };
+        let Op::Index(ops::Index { buffer, indices }) = index.op() else { continue };
         assert_eq!(indices.len(), 1, "memory coalescing requires one flat INDEX");
         if buffer.addrspace() == Some(AddrSpace::Reg) {
             continue;
@@ -395,10 +396,10 @@ pub fn memory_coalescing(sink: Arc<UOp>, ctx: &Renderer) -> Arc<UOp> {
                 let first = run[pos];
                 let first_access = &offsets[&first][0];
                 let first_index = match first_access.op() {
-                    Op::Load { index, .. } | Op::Store { index, .. } => index,
+                    Op::Load(ops::Load { index, .. }) | Op::Store(ops::Store { index, .. }) => index,
                     _ => unreachable!(),
                 };
-                let Op::Index { indices, .. } = first_index.op() else { unreachable!() };
+                let Op::Index(ops::Index { indices, .. }) = first_index.op() else { unreachable!() };
                 let offset = indices[0].get_idx();
                 let length = lengths
                     .iter()
@@ -413,7 +414,10 @@ pub fn memory_coalescing(sink: Arc<UOp>, ctx: &Renderer) -> Arc<UOp> {
                     scalar_index(buffer.clone(), offset)
                 } else {
                     let width = offset.const_like(group.len() as i64);
-                    UOp::new(Op::Shrink { src: buffer.clone(), offsets: offset, sizes: width }, buffer.dtype())
+                    UOp::new(
+                        Op::Shrink(ops::Shrink { src: buffer.clone(), offsets: offset, sizes: width }),
+                        buffer.dtype(),
+                    )
                 };
 
                 match key.op {
@@ -422,7 +426,7 @@ pub fn memory_coalescing(sink: Arc<UOp>, ctx: &Renderer) -> Arc<UOp> {
                             .iter()
                             .map(|lane| match offsets[lane].as_slice() {
                                 [store] => match store.op() {
-                                    Op::Store { value, .. } => Some(value.clone()),
+                                    Op::Store(ops::Store { value, .. }) => Some(value.clone()),
                                     _ => None,
                                 },
                                 _ => None,
@@ -494,11 +498,11 @@ pub fn pm_lower_grouped_shrink() -> &'static TypedPatternMatcher {
             if grouped_width(sizes) == Some(sources.len()) => |src, offsets, sources, gate| {
                 Some(UOp::group(sources.iter().enumerate().map(|(lane, value)| {
                     UOp::new(
-                        Op::Store {
+                        Op::Store(ops::Store {
                             index: grouped_lane_index(src, offsets, lane),
                             value: value.clone(),
                             gate: gate.clone(),
-                        },
+                        }),
                         DType::Void,
                     )
                 }).collect()))

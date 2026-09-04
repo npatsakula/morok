@@ -17,11 +17,11 @@ use crate::rangeify::indexing::no_range;
 use crate::rangeify::patterns::no_load;
 
 fn no_range_oracle(u: &Arc<UOp>) -> bool {
-    !u.any_in_subtree(|x| matches!(x.op(), Op::Range { .. }))
+    !u.any_in_subtree(|x| matches!(x.op(), Op::Range(..)))
 }
 
 fn no_load_oracle(u: &Arc<UOp>) -> bool {
-    !u.any_in_subtree(|x| matches!(x.op(), Op::Index { .. }))
+    !u.any_in_subtree(|x| matches!(x.op(), Op::Index(..)))
 }
 
 fn range() -> Arc<UOp> {

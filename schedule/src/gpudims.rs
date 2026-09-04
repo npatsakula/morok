@@ -31,6 +31,7 @@ use svod_ir::{Op, UOp, UOpKey};
 
 use crate::optimizer::Renderer;
 use crate::pattern::TypedPatternMatcher;
+use svod_ir::ops;
 
 /// Pattern matcher for GPU dimension injection.
 ///
@@ -62,7 +63,7 @@ pub fn pm_lower_device_ranges() -> TypedPatternMatcher {
 }
 
 fn is_device_num(uop: &Arc<UOp>) -> bool {
-    matches!(uop.op(), Op::Param { arg, .. } if arg.name.as_deref() == Some("_device_num"))
+    matches!(uop.op(), Op::Param(ops::Param { arg, .. }) if arg.name.as_deref() == Some("_device_num"))
 }
 
 fn lower_device_range(range: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -70,12 +71,12 @@ fn lower_device_range(range: &Arc<UOp>) -> Option<Arc<UOp>> {
 }
 
 fn cleanup_device_end(end: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::End { computation, ranges } = end.op() else { return None };
+    let Op::End(ops::End { computation, ranges }) = end.op() else { return None };
     Some(UOp::new(
-        Op::End {
+        Op::End(ops::End {
             computation: computation.clone(),
-            ranges: ranges.iter().filter(|uop| !matches!(uop.op(), Op::Param { .. })).cloned().collect(),
-        },
+            ranges: ranges.iter().filter(|uop| !matches!(uop.op(), Op::Param(..))).cloned().collect(),
+        }),
         end.dtype(),
     ))
 }
@@ -89,7 +90,7 @@ fn cleanup_device_end(end: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// 4. Create SPECIAL indices with dimension limiting
 /// 5. Substitute RANGE ops with computed indices
 fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Sink { .. } = sink.op() else {
+    let Op::Sink(..) = sink.op() else {
         return None;
     };
 
@@ -97,7 +98,7 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     let topo = sink.toposort();
 
     // Check for existing SPECIAL ops - if found, gpudims already applied
-    if topo.iter().any(|u| matches!(u.op(), Op::Special { .. })) {
+    if topo.iter().any(|u| matches!(u.op(), Op::Special(..))) {
         return None;
     }
 
@@ -105,7 +106,7 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     // We exclude axis_type from the key matching for categorization, but track it
     let mut all_ranges: HashMap<(svod_ir::AxisId, AxisType), Arc<UOp>> = HashMap::new();
     for u in &topo {
-        if let Op::Range { axis_id, axis_type, .. } = u.op() {
+        if let Op::Range(ops::Range { axis_id, axis_type, .. }) = u.op() {
             all_ranges.insert((axis_id.clone(), *axis_type), u.clone());
         }
     }
@@ -156,7 +157,7 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
         ranges
             .iter()
             .filter_map(|r| match r.op() {
-                Op::Range { end, .. } => Some(end.clone()),
+                Op::Range(ops::Range { end, .. }) => Some(end.clone()),
                 _ => None,
             })
             .collect()
@@ -253,7 +254,7 @@ fn hardware_local_extents(local_idxs: &[Arc<UOp>]) -> Vec<usize> {
         .iter()
         .flat_map(|idx| idx.toposort())
         .filter_map(|u| match u.op() {
-            Op::Special { end, name } if name.starts_with("lidx") => Some((name.clone(), dim_max(end))),
+            Op::Special(ops::Special { end, name }) if name.starts_with("lidx") => Some((name.clone(), dim_max(end))),
             _ => None,
         })
         .collect::<std::collections::BTreeMap<_, _>>()
@@ -302,7 +303,7 @@ fn compute_store_masks(
     let mut masks: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
     for uop in topo {
-        let Op::Store { index, .. } = uop.op() else {
+        let Op::Store(ops::Store { index, .. }) = uop.op() else {
             continue;
         };
 
@@ -311,7 +312,7 @@ fn compute_store_masks(
         // agrees across the sources of a STACK. Matching PARAM/BUFFER one level
         // deep instead missed every wrapped target — a STACK of params, or a
         // param behind an AFTER — and silently dropped the store mask.
-        let Op::Index { buffer, .. } = index.op() else { continue };
+        let Op::Index(ops::Index { buffer, .. }) = index.op() else { continue };
         if buffer.addrspace() != Some(svod_dtype::AddrSpace::Global) {
             continue;
         }
@@ -348,7 +349,7 @@ fn compute_store_masks(
 
         // Keep validity in the index expression so RANGE substitution carries it
         // to the corresponding hardware index.
-        if let (Some(mask), Op::Index { buffer, indices }) = (mask, index.op()) {
+        if let (Some(mask), Op::Index(ops::Index { buffer, indices })) = (mask, index.op()) {
             assert_eq!(indices.len(), 1, "gpudims: index must have one index source");
             let new_index = UOp::index()
                 .buffer(buffer.clone())

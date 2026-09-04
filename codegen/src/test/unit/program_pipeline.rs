@@ -8,6 +8,7 @@ use crate::program_pipeline::{
     ProgramTarget, do_compile, do_linearize, do_render, executable_params, get_program, number_params,
     program_from_sink, program_from_sink_with_renderer,
 };
+use svod_ir::ops;
 
 fn committed_sink(sources: Vec<Arc<UOp>>) -> Arc<UOp> {
     let sink = UOp::sink(sources);
@@ -31,17 +32,17 @@ fn linear_of(sink: &Arc<UOp>) -> Arc<UOp> {
 
 fn scalar_param(name: &str, slot: usize) -> Arc<UOp> {
     let var = UOp::variable(name.to_string(), 0, 16, DType::Int32);
-    let Op::Param { shape, arg } = var.op() else { unreachable!() };
+    let Op::Param(ops::Param { shape, arg }) = var.op() else { unreachable!() };
     let mut arg = arg.clone();
     arg.slot = slot;
-    UOp::new(Op::Param { shape: shape.clone(), arg }, DType::Int32)
+    UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg }), DType::Int32)
 }
 
 fn param_slot(root: &Arc<UOp>, name: &str) -> usize {
     root.toposort()
         .into_iter()
         .find_map(|u| match u.op() {
-            Op::Param { arg, .. } if arg.name.as_deref() == Some(name) => Some(arg.slot),
+            Op::Param(ops::Param { arg, .. }) if arg.name.as_deref() == Some(name) => Some(arg.slot),
             _ => None,
         })
         .unwrap_or_else(|| panic!("missing PARAM {name}"))
@@ -51,7 +52,7 @@ fn var_slots(info: &svod_ir::ProgramInfo) -> Vec<usize> {
     info.vars
         .iter()
         .map(|var| match var.op() {
-            Op::Param { arg, .. } => arg.slot,
+            Op::Param(ops::Param { arg, .. }) => arg.slot,
             _ => unreachable!("ProgramInfo.vars must be PARAMs"),
         })
         .collect()
@@ -159,7 +160,7 @@ impl Renderer for LinearOnlyRenderer {
     }
 
     fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> svod_device::Result<ProgramSpec> {
-        assert!(matches!(ast.op(), Op::Linear { .. }), "renderer should receive LINEAR stage");
+        assert!(matches!(ast.op(), Op::Linear(..)), "renderer should receive LINEAR stage");
         Ok(ProgramSpec::new(
             name.unwrap_or("kernel").to_string(),
             "// linear source".to_string(),
@@ -232,11 +233,11 @@ impl Renderer for MockIsaRenderer {
     }
 
     fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> svod_device::Result<ProgramSpec> {
-        let Op::Linear { ops } = ast.op() else { panic!("ISA renderer must receive LINEAR") };
+        let Op::Linear(ops::Linear { ops }) = ast.op() else { panic!("ISA renderer must receive LINEAR") };
         let source = ops
             .iter()
             .filter_map(|u| match u.op() {
-                Op::Ins { arg, .. } => Some(arg.opcode.as_str()),
+                Op::Ins(ops::Ins { arg, .. }) => Some(arg.opcode.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -265,7 +266,7 @@ impl Renderer for MockIsaRenderer {
         let mut matcher: TypedPatternMatcher<svod_device::isa::IselContext> = TypedPatternMatcher::new();
         matcher.add(&[svod_ir::op::pattern_derived::OpKey::Binary(BinaryOp::Add)], move |u, ctx| {
             let Op::Binary(BinaryOp::Add, lhs, rhs) = u.op() else { return RewriteResult::NoMatch };
-            assert!(matches!(lhs.op(), Op::Ins { .. }) && matches!(rhs.op(), Op::Ins { .. }));
+            assert!(matches!(lhs.op(), Op::Ins(..)) && matches!(rhs.op(), Op::Ins(..)));
             assert_eq!(ctx.uses(lhs).len(), 1);
             assert_eq!(ctx.uses(rhs).len(), 1);
             let vreg = ctx.next_vreg();
@@ -284,7 +285,10 @@ impl Renderer for MockIsaRenderer {
 
 fn storage_param(slot: usize, addrspace: svod_ir::AddrSpace) -> Arc<UOp> {
     let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![16usize.into()]);
-    UOp::new(Op::Param { shape, arg: ParamArg::buffer(slot, DType::Float32, addrspace, None).into() }, DType::Float32)
+    UOp::new(
+        Op::Param(ops::Param { shape, arg: ParamArg::buffer(slot, DType::Float32, addrspace, None).into() }),
+        DType::Float32,
+    )
 }
 
 fn global(slot: usize) -> Arc<UOp> {
@@ -334,7 +338,7 @@ fn abi_slots_are_assigned_after_authored_storage(
     scalar_slots: Vec<usize>,
 ) {
     let program = program_from_sink(committed_sink(sources), DeviceSpec::Cpu).expect("final target graph");
-    let Op::Program { sink, info, .. } = program.op() else { panic!("expected PROGRAM") };
+    let Op::Program(ops::Program { sink, info, .. }) = program.op() else { panic!("expected PROGRAM") };
 
     assert_eq!(info.globals, globals);
     assert_eq!(var_slots(info), scalar_slots);
@@ -346,7 +350,7 @@ fn abi_slots_are_assigned_after_authored_storage(
 fn renderers_emit_the_sparse_abi_verbatim() {
     let program =
         program_from_sink(committed_sink(sparse_globals_two_scalars()), DeviceSpec::Cpu).expect("sparse slots");
-    let Op::Program { sink, .. } = program.op() else { panic!("expected PROGRAM") };
+    let Op::Program(ops::Program { sink, .. }) = program.op() else { panic!("expected PROGRAM") };
     let linear = linear_of(sink);
 
     let c = crate::c::render(&linear, Some("sparse_abi")).expect("sparse C ABI");
@@ -372,7 +376,7 @@ fn reused_param_is_one_abi_argument() {
     let global = global(0);
     let program = program_from_sink(committed_sink(vec![global.clone(), global]), DeviceSpec::Cpu)
         .expect("the same PARAM reused is not a duplicate definition");
-    let Op::Program { info, .. } = program.op() else { panic!("PROGRAM") };
+    let Op::Program(ops::Program { info, .. }) = program.op() else { panic!("PROGRAM") };
     assert_eq!(info.globals, vec![0]);
 }
 
@@ -398,7 +402,7 @@ fn conflicting_and_unassigned_abi_slots_are_typed_errors() {
 fn unnamed_scalar_and_non_param_program_info_var_are_typed_errors() {
     let mut arg = ParamArg::variable("n".into(), DType::Int32, 0, 16);
     arg.name = None;
-    let unnamed = UOp::new(Op::Param { shape: UOp::index_const(1), arg: arg.into() }, DType::Int32);
+    let unnamed = UOp::new(Op::Param(ops::Param { shape: UOp::index_const(1), arg: arg.into() }), DType::Int32);
     let err = program_from_sink(committed_sink(vec![unnamed]), DeviceSpec::Cpu).expect_err("unnamed scalar must fail");
     assert!(matches!(err, svod_device::Error::ProgramAbiMismatch { .. }), "{err:?}");
 
@@ -422,10 +426,10 @@ fn unnamed_scalar_and_non_param_program_info_var_are_typed_errors() {
 fn prebuilt_program_rejects_descriptor_equivalent_var_forgery(forge: fn(&mut ParamArg)) {
     let sink = committed_sink(vec![scalar_param("n", 0)]);
     let mut info = svod_ir::ProgramInfo::from_sink(&sink, DeviceSpec::Cpu);
-    let Op::Param { shape, arg } = info.vars[0].op() else { unreachable!() };
+    let Op::Param(ops::Param { shape, arg }) = info.vars[0].op() else { unreachable!() };
     let mut forged = arg.clone();
     forge(&mut forged);
-    info.vars[0] = UOp::new(Op::Param { shape: shape.clone(), arg: forged }, DType::Int32);
+    info.vars[0] = UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg: forged }), DType::Int32);
 
     let prebuilt = UOp::program(sink.clone(), info.clone(), None, None, None);
     let staged = UOp::program(
@@ -481,7 +485,7 @@ fn opaque_function_formals_stay_out_of_the_outer_abi() {
         .toposort_call_aware(true)
         .into_iter()
         .find_map(|node| match node.op() {
-            Op::Param { arg, .. } if arg.name.as_deref() == Some("formal") => Some(arg.slot),
+            Op::Param(ops::Param { arg, .. }) if arg.name.as_deref() == Some("formal") => Some(arg.slot),
             _ => None,
         })
         .expect("formal PARAM remains in opaque body");
@@ -499,8 +503,8 @@ fn repeated_program_construction_has_identical_slots_and_identity() {
     let sink = committed_sink(vec![global(0), var("first").add(&var("second"))]);
     let a = program_from_sink(sink.clone(), DeviceSpec::Cpu).expect("first PROGRAM");
     let b = program_from_sink(sink, DeviceSpec::Cpu).expect("second PROGRAM");
-    let Op::Program { info: ai, .. } = a.op() else { unreachable!() };
-    let Op::Program { info: bi, .. } = b.op() else { unreachable!() };
+    let Op::Program(ops::Program { info: ai, .. }) = a.op() else { unreachable!() };
+    let Op::Program(ops::Program { info: bi, .. }) = b.op() else { unreachable!() };
     assert_eq!(ai, bi);
     assert_eq!(a.content_hash, b.content_hash);
 }
@@ -515,7 +519,7 @@ fn symbolic_program_render_compile_and_runtime_binding_share_canonical_abi() {
     let index = UOp::index().buffer(output).indices(vec![UOp::index_const(0)]).call().expect("output index");
     let sink = committed_sink(vec![index.store(n.cast(DType::Float32))]);
     let program = program_from_sink(sink, DeviceSpec::Cpu).expect("PROGRAM");
-    let Op::Program { info, .. } = program.op() else { unreachable!() };
+    let Op::Program(ops::Program { info, .. }) = program.op() else { unreachable!() };
     assert_eq!(info.globals, vec![0]);
     assert_eq!(param_slot(&program, "n"), 1);
 
@@ -528,7 +532,7 @@ fn symbolic_program_render_compile_and_runtime_binding_share_canonical_abi() {
     let (compiled_program, compiled) = do_compile(&rendered, &MockCompiler).expect("compile");
     assert_eq!(compiled.buf_count, 1);
     assert_eq!(compiled.var_names, vec!["n"]);
-    assert!(matches!(compiled_program.op(), Op::Program { binary: Some(_), .. }));
+    assert!(matches!(compiled_program.op(), Op::Program(ops::Program { binary: Some(_), .. })));
 
     let mut kernargs = [0u8; 12];
     let written = svod_device::hcq::ClikeKernargLayout::pack_program(
@@ -558,33 +562,33 @@ fn number_params_uses_walk_after_control_flow_insertion() {
     assert_eq!(var_slots(&premature), vec![usize::MAX, usize::MAX], "fixture must expose premature slots");
 
     let prepared = svod_schedule::add_control_flow(raw.clone());
-    assert!(prepared.toposort().iter().any(|u| matches!(u.op(), Op::Range { deps, .. } if !deps.is_empty())));
+    assert!(
+        prepared.toposort().iter().any(|u| matches!(u.op(), Op::Range(ops::Range { deps, .. }) if !deps.is_empty()))
+    );
     let expected_names: Vec<String> = prepared
         .toposort()
         .into_iter()
         .filter_map(|u| match u.op() {
-            Op::Param { arg, .. } if arg.slot == usize::MAX && arg.addrspace.is_none() => arg.name.clone(),
+            Op::Param(ops::Param { arg, .. }) if arg.slot == usize::MAX && arg.addrspace.is_none() => arg.name.clone(),
             _ => None,
         })
         .collect();
 
     let program = program_from_sink(raw, DeviceSpec::Cpu).expect("final target graph");
-    let Op::Program { sink, info, .. } = program.op() else { panic!("expected PROGRAM") };
+    let Op::Program(ops::Program { sink, info, .. }) = program.op() else { panic!("expected PROGRAM") };
     let actual_names: Vec<String> = info
         .vars
         .iter()
         .map(|u| match u.op() {
-            Op::Param { arg, .. } => arg.name.clone().unwrap(),
+            Op::Param(ops::Param { arg, .. }) => arg.name.clone().unwrap(),
             _ => unreachable!(),
         })
         .collect();
     assert_eq!(actual_names, expected_names);
     assert_eq!(var_slots(info), vec![0, 1]);
-    assert!(
-        sink.toposort()
-            .iter()
-            .all(|u| !matches!(u.op(), Op::Param { arg, .. } if arg.addrspace.is_none() && arg.slot == usize::MAX))
-    );
+    assert!(sink.toposort().iter().all(
+        |u| !matches!(u.op(), Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() && arg.slot == usize::MAX)
+    ));
 }
 
 // ── staging ────────────────────────────────────────────────────────────────
@@ -599,10 +603,10 @@ fn test_program_pipeline_sets_all_stages() {
 
     let sources = program.op().children();
     assert_eq!(sources.len(), 4, "Tinygrad PROGRAM sources are SINK, LINEAR, SOURCE, BINARY");
-    assert!(matches!(sources[0].op(), Op::Sink { .. }));
-    assert!(matches!(sources[1].op(), Op::Linear { .. }));
-    assert!(matches!(sources[2].op(), Op::Source { .. }));
-    assert!(matches!(sources[3].op(), Op::ProgramBinary { .. }));
+    assert!(matches!(sources[0].op(), Op::Sink(..)));
+    assert!(matches!(sources[1].op(), Op::Linear(..)));
+    assert!(matches!(sources[2].op(), Op::Source(..)));
+    assert!(matches!(sources[3].op(), Op::ProgramBinary(..)));
 
     assert_eq!(rendered_spec.name, "test");
     assert_eq!(spec.name, "test");
@@ -624,8 +628,8 @@ fn test_do_render_uses_linear_stage_input() {
         do_render(&program, &LinearOnlyRenderer { device: DeviceSpec::Cpu }).expect("render stage should succeed");
 
     assert_eq!(spec.name, "test");
-    assert!(matches!(spec.ast.op(), Op::Sink { .. }));
-    let Op::Program { linear: Some(_), source: Some(_), .. } = rendered_program.op() else {
+    assert!(matches!(spec.ast.op(), Op::Sink(..)));
+    let Op::Program(ops::Program { linear: Some(_), source: Some(_), .. }) = rendered_program.op() else {
         panic!("expected PROGRAM with LINEAR and SOURCE stages, got {:?}", rendered_program.op())
     };
 }
@@ -678,19 +682,22 @@ fn gated_store_linearizes_to_a_verified_if_block() {
     let program = program_from_sink(committed_sink(vec![store]), DeviceSpec::Cpu).expect("final target graph");
 
     let linearized = do_linearize(&program).expect("linearize stage should succeed");
-    let Op::Program { linear: Some(linear), .. } = linearized.op() else { panic!("expected LINEAR stage") };
-    let Op::Linear { ops } = linear.op() else { panic!("expected LINEAR payload") };
+    let Op::Program(ops::Program { linear: Some(linear), .. }) = linearized.op() else {
+        panic!("expected LINEAR stage")
+    };
+    let Op::Linear(ops::Linear { ops }) = linear.op() else { panic!("expected LINEAR payload") };
 
-    assert!(ops.iter().any(|u| matches!(u.op(), Op::If { .. })), "cleanup must inject IF");
-    assert!(ops.iter().any(|u| matches!(u.op(), Op::EndIf { .. })), "cleanup must inject ENDIF");
+    assert!(ops.iter().any(|u| matches!(u.op(), Op::If(..))), "cleanup must inject IF");
+    assert!(ops.iter().any(|u| matches!(u.op(), Op::EndIf(..))), "cleanup must inject ENDIF");
     assert!(
-        ops.iter()
-            .any(|u| matches!(u.op(), Op::Store { index, gate: None, .. } if matches!(index.op(), Op::Index { .. }))),
+        ops.iter().any(
+            |u| matches!(u.op(), Op::Store(ops::Store { index, gate: None, .. }) if matches!(index.op(), Op::Index(..)))
+        ),
         "the gate must move onto the IF, off the STORE"
     );
 
     let bare_if = UOp::new(
-        Op::If { condition: UOp::native_const(true), body: smallvec::smallvec![UOp::native_const(0i32)] },
+        Op::If(ops::If { condition: UOp::native_const(true), body: smallvec::smallvec![UOp::native_const(0i32)] }),
         DType::Void,
     );
     assert!(svod_schedule::spec::type_verify_list(&[bare_if], &svod_schedule::spec::spec_program()).is_err());
@@ -730,8 +737,10 @@ fn test_hand_lowered_final_rewrite_stays_invalid_free_through_linearize() {
 
     let program = program_from_sink(optimized, DeviceSpec::Amd { device_id: 0 }).expect("final target graph");
     let linearized = do_linearize(&program).expect("PROGRAM -> LINEAR");
-    let Op::Program { linear: Some(linear), .. } = linearized.op() else { panic!("expected LINEAR stage") };
-    let Op::Linear { ops } = linear.op() else { panic!("expected LINEAR op") };
+    let Op::Program(ops::Program { linear: Some(linear), .. }) = linearized.op() else {
+        panic!("expected LINEAR stage")
+    };
+    let Op::Linear(ops::Linear { ops }) = linear.op() else { panic!("expected LINEAR op") };
     assert!(
         ops.iter().all(|u| !UOp::is_invalid_marker(u)),
         "stage-20-clean input must remain Invalid-free through PROGRAM -> LINEAR"
@@ -753,7 +762,7 @@ fn test_structured_custom_name_wins_over_optimizer_shape_name() {
     .with_metadata(svod_schedule::optimizer::KernelInfo::new("E_L2L48", vec![], false));
 
     let program = program_from_sink(sink, DeviceSpec::Cpu).expect("program");
-    let Op::Program { info, .. } = program.op() else { panic!("expected PROGRAM") };
+    let Op::Program(ops::Program { info, .. }) = program.op() else { panic!("expected PROGRAM") };
     assert_eq!(info.name, "flash_attention");
 }
 
@@ -772,7 +781,7 @@ fn test_structured_symbolic_name_is_sanitized_at_renderer_boundary() {
 
     for renderer in [&CAbiRenderer as &dyn Renderer, &LlvmAbiRenderer as &dyn Renderer] {
         let program = program_from_sink_with_renderer(sink.clone(), renderer).expect("program");
-        let Op::Program { info, .. } = program.op() else { panic!("expected PROGRAM") };
+        let Op::Program(ops::Program { info, .. }) = program.op() else { panic!("expected PROGRAM") };
         assert_eq!(info.name, "E_\x1b[31mL?\x1b[0mn6");
         assert_eq!(info.function_name(), "E_L3Fn6");
 
@@ -792,7 +801,7 @@ fn test_structured_symbolic_name_is_sanitized_at_renderer_boundary() {
 fn semantic_stage_identity_defeats_preinterned_children_and_parent_programs() {
     let initial = program_from_sink(committed_sink(vec![UOp::native_const(11.0f32)]), DeviceSpec::Cpu).unwrap();
     let linearized = do_linearize(&initial).unwrap();
-    let Op::Program { sink, info, linear: Some(linear), .. } = linearized.op() else { unreachable!() };
+    let Op::Program(ops::Program { sink, info, linear: Some(linear), .. }) = linearized.op() else { unreachable!() };
 
     let raw_source = UOp::source("// mock source".into());
     let raw_source_parent =
@@ -807,12 +816,12 @@ fn semantic_stage_identity_defeats_preinterned_children_and_parent_programs() {
         UOp::program(sink.clone(), info.clone(), Some(linear.clone()), Some(different_source.clone()), None);
 
     let (rendered, _) = do_render(&initial, &mock()).unwrap();
-    let Op::Program { source: Some(rendered_source), .. } = rendered.op() else { unreachable!() };
+    let Op::Program(ops::Program { source: Some(rendered_source), .. }) = rendered.op() else { unreachable!() };
     assert!(!Arc::ptr_eq(rendered_source, &raw_source));
     assert!(!Arc::ptr_eq(rendered_source, &different_source));
     assert!(!Arc::ptr_eq(&rendered, &raw_source_parent));
     assert!(!Arc::ptr_eq(&rendered, &different_source_parent));
-    assert!(matches!(rendered_source.op(), Op::Source { identity: Some(_), .. }));
+    assert!(matches!(rendered_source.op(), Op::Source(ops::Source { identity: Some(_), .. })));
 
     let raw_binary = UOp::binary(vec![1, 2, 3]);
     let raw_binary_parent = UOp::program(
@@ -822,7 +831,7 @@ fn semantic_stage_identity_defeats_preinterned_children_and_parent_programs() {
         Some(rendered_source.clone()),
         Some(raw_binary.clone()),
     );
-    let Op::Source { identity: Some(source_identity), .. } = rendered_source.op() else { unreachable!() };
+    let Op::Source(ops::Source { identity: Some(source_identity), .. }) = rendered_source.op() else { unreachable!() };
     let different_binary = UOp::binary_with_identity(
         vec![1, 2, 3],
         svod_device::device::binary_stage_identity(source_identity.as_ref().clone(), "other", &[1, 2, 3]),
@@ -836,12 +845,12 @@ fn semantic_stage_identity_defeats_preinterned_children_and_parent_programs() {
     );
 
     let (compiled, _) = do_compile(&rendered, &MockCompiler).unwrap();
-    let Op::Program { binary: Some(compiled_binary), .. } = compiled.op() else { unreachable!() };
+    let Op::Program(ops::Program { binary: Some(compiled_binary), .. }) = compiled.op() else { unreachable!() };
     assert!(!Arc::ptr_eq(compiled_binary, &raw_binary));
     assert!(!Arc::ptr_eq(compiled_binary, &different_binary));
     assert!(!Arc::ptr_eq(&compiled, &raw_binary_parent));
     assert!(!Arc::ptr_eq(&compiled, &different_binary_parent));
-    assert!(matches!(compiled_binary.op(), Op::ProgramBinary { identity: Some(_), .. }));
+    assert!(matches!(compiled_binary.op(), Op::ProgramBinary(ops::ProgramBinary { identity: Some(_), .. })));
 }
 
 /// An unauthenticated SOURCE is rejected whether it was staged before rendering
@@ -855,7 +864,7 @@ fn source_stages_without_a_matching_identity_are_rejected() {
 
     let initial = program_from_sink(committed_sink(vec![UOp::native_const(4.0f32)]), DeviceSpec::Cpu).unwrap();
     let (rendered, _) = do_render(&initial, &mock()).unwrap();
-    let Op::Program { sink, info, linear, .. } = rendered.op() else { unreachable!() };
+    let Op::Program(ops::Program { sink, info, linear, .. }) = rendered.op() else { unreachable!() };
     let tampered = UOp::program(
         sink.clone(),
         info.clone(),
@@ -882,8 +891,8 @@ fn binary_stages_from_another_signature_or_compiler_are_rejected() {
         UOp::param(5, 4, DType::Float32, None),
     ]));
     let (second, _) = do_compile(&second, &MockCompiler).unwrap();
-    let Op::Program { binary: Some(other_binary), .. } = second.op() else { unreachable!() };
-    let Op::Program { sink, info, linear, source, .. } = first.op() else { unreachable!() };
+    let Op::Program(ops::Program { binary: Some(other_binary), .. }) = second.op() else { unreachable!() };
+    let Op::Program(ops::Program { sink, info, linear, source, .. }) = first.op() else { unreachable!() };
     let mismatched =
         UOp::program(sink.clone(), info.clone(), linear.clone(), source.clone(), Some(other_binary.clone()));
 
@@ -978,7 +987,7 @@ fn get_program_advances_any_staged_program_to_a_reusable_binary() {
     for staged in [stage1, stage2] {
         let advanced = get_program(&staged, &mock(), &MockCompiler, ProgramTarget::Binary)
             .expect("staged PROGRAM should advance to BINARY");
-        let Op::Program { linear: Some(_), source: Some(_), binary: Some(_), .. } = advanced.op() else {
+        let Op::Program(ops::Program { linear: Some(_), source: Some(_), binary: Some(_), .. }) = advanced.op() else {
             panic!("expected a fully staged PROGRAM, got {:?}", advanced.op())
         };
         let (_, compiled) =
@@ -1007,9 +1016,11 @@ fn isa_selection_is_bottom_up_after_program_info_and_renders_program_source() {
         svod_ir::ProgramInfo::from_sink(&svod_schedule::add_control_flow(sink.clone()), DeviceSpec::Cpu);
 
     let program = program_from_sink_with_renderer(sink, &renderer).expect("ISA PROGRAM");
-    let Op::Program { sink: selected, info, .. } = program.op() else { panic!("expected PROGRAM") };
+    let Op::Program(ops::Program { sink: selected, info, .. }) = program.op() else { panic!("expected PROGRAM") };
     assert_eq!(info.as_ref(), &expected_info, "ProgramInfo must be discovered before instruction selection");
-    assert!(selected.toposort().iter().any(|u| matches!(u.op(), Op::Ins { arg, .. } if arg.opcode == "mock.add")));
+    assert!(
+        selected.toposort().iter().any(|u| matches!(u.op(), Op::Ins(ops::Ins { arg, .. }) if arg.opcode == "mock.add"))
+    );
     svod_schedule::spec::type_verify(selected, &svod_schedule::spec::spec_program()).expect("INS is target-spec legal");
     assert_eq!(
         *events.lock().unwrap(),
@@ -1019,6 +1030,8 @@ fn isa_selection_is_bottom_up_after_program_info_and_renders_program_source() {
 
     let (rendered, spec) = do_render(&program, &renderer).expect("render selected instructions");
     assert_eq!(spec.src, "imm.Int(1)\nimm.Int(2)\nmock.add");
-    let Op::Program { source: Some(source), .. } = rendered.op() else { panic!("expected PROGRAM SOURCE") };
-    assert!(matches!(source.op(), Op::Source { code, .. } if code == &spec.src));
+    let Op::Program(ops::Program { source: Some(source), .. }) = rendered.op() else {
+        panic!("expected PROGRAM SOURCE")
+    };
+    assert!(matches!(source.op(), Op::Source(ops::Source { code, .. }) if code == &spec.src));
 }

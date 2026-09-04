@@ -4,6 +4,7 @@ use svod_dtype::{AddrSpace, DType, DeviceSpec};
 use svod_ir::types::{AxisId, AxisType, ConstValue, InsArg, RendererDevice, WmmaMetadata};
 
 use crate::linearize::line_rewrite_cleanups;
+use svod_ir::ops;
 use test_case::test_case;
 
 #[test]
@@ -16,10 +17,10 @@ fn tinygrad_partial_range_comparison_rejects_path_prefixes() {
 
 #[test]
 fn tinygrad_partial_param_comparison_stops_at_first_difference() {
-    let projected = arg_key(&Op::Param {
+    let projected = arg_key(&Op::Param(ops::Param {
         shape: UOp::index_const(1),
         arg: ParamArg::variable("projected".to_string(), DType::WeakInt, 0, 8).into(),
-    });
+    }));
     assert!(matches!(projected, ArgKey::Param(ParamKey { addrspace: Some(4), .. })));
 
     let mut left = param_key(&ParamArg::variable("a".to_string(), DType::WeakInt, 0, 8));
@@ -74,8 +75,9 @@ fn tinygrad_wmma_key_omits_svod_only_metadata() {
     right.reduce_axes.clear();
     right.tile_grid = (1, 1);
 
-    let make_op =
-        |metadata| Op::Wmma { a: value.clone(), b: value.clone(), c: value.clone(), metadata: Box::new(metadata) };
+    let make_op = |metadata| {
+        Op::Wmma(ops::Wmma { a: value.clone(), b: value.clone(), c: value.clone(), metadata: Box::new(metadata) })
+    };
     assert_eq!(arg_key(&make_op(left.clone())), arg_key(&make_op(right.clone())));
 
     right.device = RendererDevice::CudaSm89;
@@ -147,8 +149,8 @@ fn deep_precast_chain_linearizes_in_tuplize_order() {
     let mut low = UOp::const_(DType::Int32, ConstValue::Int(1));
     let mut high = UOp::const_(DType::Int32, ConstValue::Int(2));
     for _ in 0..140 {
-        low = UOp::new(Op::Precast { src: low }, DType::Int32);
-        high = UOp::new(Op::Precast { src: high }, DType::Int32);
+        low = UOp::new(Op::Precast(ops::Precast { src: low }), DType::Int32);
+        high = UOp::new(Op::Precast(ops::Precast { src: high }), DType::Int32);
     }
     let sink = UOp::sink(vec![high.clone(), low.clone()]);
     let keys = compute_tuplize(&sink.toposort());
@@ -161,8 +163,9 @@ fn deep_precast_chain_linearizes_in_tuplize_order() {
 #[test]
 fn equal_dependency_side_effects_use_full_arg_order() {
     let dependency = UOp::native_const(0i32);
-    let later = UOp::new(Op::CustomI { deps: smallvec![dependency.clone()], code: "z".into() }, DType::Void);
-    let earlier = UOp::new(Op::CustomI { deps: smallvec![dependency], code: "a".into() }, DType::Void);
+    let later =
+        UOp::new(Op::CustomI(ops::CustomI { deps: smallvec![dependency.clone()], code: "z".into() }), DType::Void);
+    let earlier = UOp::new(Op::CustomI(ops::CustomI { deps: smallvec![dependency], code: "a".into() }), DType::Void);
     let order = linearize(UOp::sink(vec![later.clone(), earlier.clone()]));
 
     assert!(order.iter().position(|u| Arc::ptr_eq(u, &earlier)) < order.iter().position(|u| Arc::ptr_eq(u, &later)));
@@ -177,17 +180,17 @@ fn nested_axis_and_ins_arguments_participate_in_tuplize() {
 
     let source = UOp::native_const(1i32);
     let ins_a = UOp::new(
-        Op::Ins {
+        Op::Ins(ops::Ins {
             sources: smallvec![source.clone()],
             arg: InsArg::with_attributes("v_add", vec![("axis".into(), "1".into())]),
-        },
+        }),
         DType::Int32,
     );
     let ins_b = UOp::new(
-        Op::Ins {
+        Op::Ins(ops::Ins {
             sources: smallvec![source],
             arg: InsArg::with_attributes("v_add", vec![("axis".into(), "2".into())]),
-        },
+        }),
         DType::Int32,
     );
     assert!(arg_key(ins_a.op()) < arg_key(ins_b.op()));
@@ -203,11 +206,11 @@ fn linearize_cleanup_expands_a_gated_store_into_if_endif() {
 
     let result = line_rewrite_cleanups(vec![store]);
     assert_eq!(result.len(), 3);
-    let Op::If { condition, body } = result[0].op() else { panic!("expected IF") };
+    let Op::If(ops::If { condition, body }) = result[0].op() else { panic!("expected IF") };
     assert!(Arc::ptr_eq(condition, &gate));
     assert_eq!(body.len(), 1);
-    assert!(matches!(result[1].op(), Op::Store { gate: None, .. }));
-    let Op::EndIf { if_op } = result[2].op() else { panic!("expected ENDIF") };
+    assert!(matches!(result[1].op(), Op::Store(ops::Store { gate: None, .. })));
+    let Op::EndIf(ops::EndIf { if_op }) = result[2].op() else { panic!("expected ENDIF") };
     assert!(Arc::ptr_eq(if_op, &result[0]));
 }
 
@@ -221,8 +224,8 @@ fn tuplize_comparison_survives_a_forty_thousand_deep_chain() {
             let mut low = UOp::const_(DType::Int32, ConstValue::Int(1));
             let mut high = UOp::const_(DType::Int32, ConstValue::Int(2));
             for _ in 0..40_000 {
-                low = UOp::new(Op::Precast { src: low }, DType::Int32);
-                high = UOp::new(Op::Precast { src: high }, DType::Int32);
+                low = UOp::new(Op::Precast(ops::Precast { src: low }), DType::Int32);
+                high = UOp::new(Op::Precast(ops::Precast { src: high }), DType::Int32);
             }
             let topo = UOp::sink(vec![high.clone(), low.clone()]).toposort();
             let keys = compute_tuplize(&topo);

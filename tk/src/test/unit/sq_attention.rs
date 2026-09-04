@@ -9,6 +9,7 @@ use crate::kernels::sq_attention::{
     build_single_query_attention_merge, build_single_query_attention_partial,
 };
 use crate::{ArchCaps, Kernel};
+use svod_ir::ops;
 
 fn buffers(b: usize, n: usize, h: usize, d: usize, masked: bool) -> Vec<Arc<UOp>> {
     let mut bufs = vec![
@@ -72,28 +73,28 @@ fn sq_attention_graph_shape_both_arches() {
     for caps in [ArchCaps::GFX942, ArchCaps::for_arch(AmdArch::Gfx1151)] {
         for masked in [false, true] {
             let topo = sink(caps, masked).toposort();
-            let shuffles = topo.iter().filter(|u| matches!(u.op(), Op::Custom { .. })).count();
+            let shuffles = topo.iter().filter(|u| matches!(u.op(), Op::Custom(..))).count();
             assert_eq!(shuffles, caps.wave_size.ilog2() as usize, "{:?}: one XOR reduction", caps.arch);
             assert!(
                 topo.iter().any(|u| matches!(u.op(), Op::Unary(svod_ir::UnaryOp::Exp2, ..))),
                 "{:?}: exp2",
                 caps.arch
             );
-            assert!(topo.iter().any(|u| matches!(u.op(), Op::Range { .. })), "{:?}: streamed N loop", caps.arch);
+            assert!(topo.iter().any(|u| matches!(u.op(), Op::Range(..))), "{:?}: streamed N loop", caps.arch);
             assert!(
                 !topo.iter().any(
-                    |u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local))
+                    |u| matches!(u.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local))
                 ),
                 "{:?}: no LDS",
                 caps.arch
             );
-            assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "{:?}: no MFMA/WMMA", caps.arch);
-            assert!(!topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "{:?}: no barrier", caps.arch);
+            assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma(..))), "{:?}: no MFMA/WMMA", caps.arch);
+            assert!(!topo.iter().any(|u| matches!(u.op(), Op::Barrier(..))), "{:?}: no barrier", caps.arch);
         }
         for d in [64, 128] {
             let (partial, merge) = split_sinks(caps, 4, d);
             let partial_topo = partial.toposort();
-            let partial_shuffles = partial_topo.iter().filter(|u| matches!(u.op(), Op::Custom { .. })).count();
+            let partial_shuffles = partial_topo.iter().filter(|u| matches!(u.op(), Op::Custom(..))).count();
             let groups = caps.wave_size / 8;
             let expected = 3 + 2 * caps.wave_size.ilog2() as usize + groups;
             assert_eq!(
@@ -103,21 +104,21 @@ fn sq_attention_graph_shape_both_arches() {
             );
             for (name, graph) in [("partial", partial), ("merge", merge)] {
                 let topo = graph.toposort();
-                assert!(topo.iter().any(|u| matches!(u.op(), Op::Range { .. })), "{:?}: split {name} loop", caps.arch);
+                assert!(topo.iter().any(|u| matches!(u.op(), Op::Range(..))), "{:?}: split {name} loop", caps.arch);
                 assert!(
                     !topo.iter().any(
-                        |u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local))
+                        |u| matches!(u.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local))
                     ),
                     "{:?}: split {name} no LDS",
                     caps.arch
                 );
                 assert!(
-                    !topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })),
+                    !topo.iter().any(|u| matches!(u.op(), Op::Wmma(..))),
                     "{:?}: split {name} no MFMA/WMMA",
                     caps.arch
                 );
                 assert!(
-                    !topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })),
+                    !topo.iter().any(|u| matches!(u.op(), Op::Barrier(..))),
                     "{:?}: split {name} no barrier",
                     caps.arch
                 );
@@ -147,8 +148,7 @@ fn sq_attention_renders_both_arches() {
             let program = svod_codegen::program_pipeline::program_from_sink(optimized, DeviceSpec::Cpu)
                 .expect("final target graph");
             let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("linearize");
-            let linear =
-                linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear { .. })).expect("LINEAR");
+            let linear = linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear(..))).expect("LINEAR");
             let code = svod_codegen::traits::Renderer::render(&renderer, &linear, Some(name)).expect("render").code;
             assert_eq!(code.contains("llvm.amdgcn.ds.bpermute"), shuffle, "{arch:?}: {name} shuffle rendering");
             assert!(!code.contains("@local"), "{arch:?}: {name} no LDS allocation");

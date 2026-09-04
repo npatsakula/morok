@@ -11,6 +11,7 @@ use svod_ir::{Op, UOp};
 
 use crate::tiles::{RT_16X16, TileLayout};
 use crate::{ArchCaps, Kernel};
+use svod_ir::ops;
 
 fn deps_contain(deps: &[Arc<UOp>], needle: &Arc<UOp>) -> bool {
     deps.iter().any(|d| Arc::ptr_eq(d, needle))
@@ -23,12 +24,12 @@ fn deps_contain(deps: &[Arc<UOp>], needle: &Arc<UOp>) -> bool {
 fn reinit_wraps_tile_after_loop_range() {
     let ker = Kernel::new("lp", [1, 1, 1], 64, vec![], ArchCaps::GFX942);
     let lp = ker.loop_static(4);
-    assert!(matches!(lp.index().op(), Op::Range { .. }), "index() is the loop RANGE");
+    assert!(matches!(lp.index().op(), Op::Range(..)), "index() is the loop RANGE");
 
     let rt = ker.rt((16, 16), DType::Float32, TileLayout::Col, RT_16X16);
     let r = lp.reinit(rt);
     match r.uop().op() {
-        Op::After { deps, .. } => assert!(deps_contain(deps, lp.index()), "reinit dep is the loop range"),
+        Op::After(ops::After { deps, .. }) => assert!(deps_contain(deps, lp.index()), "reinit dep is the loop range"),
         other => panic!("reinit must wrap the tile in After([range]), got {other:?}"),
     }
 }
@@ -46,7 +47,7 @@ fn close_returns_loop_closing_end() {
     let _acc = warp.zero(ker.rt((16, 16), DType::Float32, TileLayout::Col, RT_16X16));
     let end = lp.close();
     match end.op() {
-        Op::End { ranges, .. } => assert!(deps_contain(ranges, &range), "close ends this loop's range"),
+        Op::End(ops::End { ranges, .. }) => assert!(deps_contain(ranges, &range), "close ends this loop's range"),
         other => panic!("close must return an END, got {other:?}"),
     }
 }
@@ -62,8 +63,8 @@ fn close_carry_rebinds_tile_after_end() {
     let acc = warp.zero(ker.rt((16, 16), DType::Float32, TileLayout::Col, RT_16X16));
     let acc = lp.close_carry(acc);
     match acc.uop().op() {
-        Op::After { deps, .. } => {
-            assert!(deps.iter().any(|d| matches!(d.op(), Op::End { .. })), "close_carry deps on the loop END");
+        Op::After(ops::After { deps, .. }) => {
+            assert!(deps.iter().any(|d| matches!(d.op(), Op::End(..))), "close_carry deps on the loop END");
         }
         other => panic!("close_carry must rewrap the tile in After([END]), got {other:?}"),
     }

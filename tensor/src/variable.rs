@@ -27,6 +27,7 @@ use svod_ir::{ConstValue, Op, SInt, UOp};
 
 use crate::error::{Result, VariableOutOfRangeSnafu};
 use snafu::ensure;
+use svod_ir::ops;
 
 /// A symbolic variable for dynamic tensor dimensions.
 ///
@@ -77,7 +78,7 @@ impl Variable {
     /// Variable name.
     pub fn name(&self) -> &str {
         match self.uop.op() {
-            Op::Param { arg, .. } => arg.name.as_deref().expect("variable PARAM has a name"),
+            Op::Param(ops::Param { arg, .. }) => arg.name.as_deref().expect("variable PARAM has a name"),
             _ => unreachable!("Variable always wraps Param"),
         }
     }
@@ -85,7 +86,7 @@ impl Variable {
     /// Inclusive bounds `(min_val, max_val)`.
     pub fn bounds(&self) -> (i64, i64) {
         match self.uop.op() {
-            Op::Param { arg, .. } => {
+            Op::Param(ops::Param { arg, .. }) => {
                 let (min, max) = arg.vmin_vmax.as_ref().expect("variable PARAM has bounds");
                 let ConstValue::Int(min) = min.0 else { unreachable!("integer variable minimum") };
                 let ConstValue::Int(max) = max.0 else { unreachable!("integer variable maximum") };

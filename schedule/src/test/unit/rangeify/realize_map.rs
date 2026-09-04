@@ -10,6 +10,7 @@ use svod_ir::{AxisId, AxisType, CallInfo, Op, UOp};
 
 use crate::rangeify::IndexingContext;
 use crate::rangeify::indexing::pm_generate_realize_map;
+use svod_ir::ops;
 
 fn run(root: Arc<UOp>, ctx: &mut IndexingContext) {
     crate::rewrite::graph_rewrite_bottom_up_preserve_calls(pm_generate_realize_map(), root, ctx);
@@ -22,7 +23,10 @@ fn buffer(size: usize) -> Arc<UOp> {
 /// `CALL(SINK, args...)` — a hand-written kernel over `args`.
 fn call_with(args: Vec<Arc<UOp>>) -> Arc<UOp> {
     let body = UOp::sink(vec![UOp::param(0, 4, DType::Float32, Some(DeviceSpec::Cpu))]);
-    UOp::new(Op::Call { body, args: args.into_iter().collect(), info: CallInfo::default().into() }, DType::Void)
+    UOp::new(
+        Op::Call(ops::Call { body, args: args.into_iter().collect(), info: CallInfo::default().into() }),
+        DType::Void,
+    )
 }
 
 /// `STORE(INDEX(dest, r), value)` — `dest` is indexed without any movement op.
@@ -88,7 +92,7 @@ fn slice_source_keeps_its_realize_entry_behind_a_movement_op() {
         .expect("reshape")
         .try_permute(vec![1, 0])
         .expect("permute");
-    assert!(matches!(dest.op(), Op::Permute { .. }), "the test needs a real PERMUTE on the destination");
+    assert!(matches!(dest.op(), Op::Permute(..)), "the test needs a real PERMUTE on the destination");
     let index = UOp::index().buffer(dest).indices(vec![r]).call().expect("INDEX");
     let store = index.store(Arc::clone(&slice));
 

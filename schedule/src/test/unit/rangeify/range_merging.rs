@@ -8,6 +8,7 @@ use svod_ir::{AxisType, BinaryOp, Op, SInt, TernaryOp, UOp, UOpKey};
 
 use crate::rangeify::indexing::{IndexingContext, all_ranges_same};
 use crate::rangeify::merge_consumer_ranges;
+use svod_ir::ops;
 
 fn buffer(size: usize) -> Arc<UOp> {
     UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, DType::Float32)
@@ -16,7 +17,7 @@ fn buffer(size: usize) -> Arc<UOp> {
 fn reshaped_2d(dims: &[usize]) -> Arc<UOp> {
     let src = buffer(dims.iter().product());
     let new_shape = UOp::stack(dims.iter().map(|&d| UOp::index_const(d as i64)).collect());
-    UOp::new(Op::Reshape { src, new_shape }, DType::Float32)
+    UOp::new(Op::Reshape(ops::Reshape { src, new_shape }), DType::Float32)
 }
 
 /// A range gated by `i < bound`, as a consumer with padding produces.

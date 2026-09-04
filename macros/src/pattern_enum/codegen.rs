@@ -55,7 +55,7 @@ fn generate_op_key(variants: &[AnalyzedVariant], _groups: &VariantGroups, enum_n
             // For skipped variants, return their OpKey (no patterns are indexed under these keys)
             if v.kind == VariantKind::Skipped {
                 if v.is_struct {
-                    return quote! { #enum_name::#name { .. } => OpKey::#name };
+                    return quote! { #enum_name::#name(..) => OpKey::#name };
                 } else {
                     return quote! { #enum_name::#name => OpKey::#name };
                 }
@@ -64,14 +64,14 @@ fn generate_op_key(variants: &[AnalyzedVariant], _groups: &VariantGroups, enum_n
             match v.kind {
                 VariantKind::Grouped => {
                     if v.is_struct {
-                        quote! { #enum_name::#name { .. } => unreachable!() }
+                        quote! { #enum_name::#name(..) => unreachable!() }
                     } else {
                         quote! { #enum_name::#name(op, ..) => OpKey::#name(*op) }
                     }
                 }
                 _ => {
                     if v.is_struct {
-                        quote! { #enum_name::#name { .. } => OpKey::#name }
+                        quote! { #enum_name::#name(..) => OpKey::#name }
                     } else if v.children.is_empty() && v.filters.is_empty() && v.variadic.is_none() {
                         // Unit variant with no fields
                         quote! { #enum_name::#name => OpKey::#name }

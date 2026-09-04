@@ -13,6 +13,7 @@ use svod_ir::uop::properties::SoundVminVmaxProperty;
 use svod_ir::{Op, UOp, UOpKey};
 
 use crate::TypedPatternMatcher;
+use svod_ir::ops;
 
 /// Parse a validity clause into (expr, is_upper, bound).
 ///
@@ -66,7 +67,7 @@ pub(crate) fn parse_valid(v: &Arc<UOp>) -> Option<(Arc<UOp>, bool, i64)> {
 
 /// Check if a UOp is irreducible (upstream: GroupOp.Irreducible = {CONST, DEFINE_VAR, SPECIAL, RANGE}).
 fn is_irreducible(op: &Op) -> bool {
-    matches!(op, Op::Const(..) | Op::Param { .. } | Op::Special { .. } | Op::Range { .. })
+    matches!(op, Op::Const(..) | Op::Param(..) | Op::Special(..) | Op::Range(..))
 }
 
 /// Split an ADD-chain into individual addends.
@@ -241,18 +242,18 @@ pub(crate) fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: boo
                 // If all branches produce the same result, accept it
                 if simplified.windows(2).all(|w| w[0].id == w[1].id) {
                     uop = simplified[0].clone();
-                } else if let Op::Stack { sources } = uop.op()
+                } else if let Op::Stack(ops::Stack { sources }) = uop.op()
                     && sources.len() == 2
                     && simplified
                         .iter()
-                        .all(|new_uop| matches!(new_uop.op(), Op::Stack { sources } if sources.len() == 2))
+                        .all(|new_uop| matches!(new_uop.op(), Op::Stack(ops::Stack { sources }) if sources.len() == 2))
                 {
                     let mut new_sources = sources.clone();
                     for lane in 0..2 {
                         let lane_sources: Vec<_> = simplified
                             .iter()
                             .filter_map(|new_uop| match new_uop.op() {
-                                Op::Stack { sources } => Some(sources[lane].clone()),
+                                Op::Stack(ops::Stack { sources }) => Some(sources[lane].clone()),
                                 _ => None,
                             })
                             .collect();
@@ -293,9 +294,9 @@ pub(crate) fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: boo
 fn simplify(uop: Arc<UOp>) -> Arc<UOp> {
     let settled = match uop.op() {
         Op::Const(_) => true,
-        Op::Sink { sources, .. } => sources.iter().all(|s| match s.op() {
+        Op::Sink(ops::Sink { sources, .. }) => sources.iter().all(|s| match s.op() {
             Op::Const(_) => true,
-            Op::Stack { sources } => sources.is_empty(),
+            Op::Stack(ops::Stack { sources }) => sources.is_empty(),
             _ => false,
         }),
         _ => false,

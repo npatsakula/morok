@@ -9,6 +9,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use crate::op::Op;
+use crate::ops;
 use crate::uop::UOp;
 
 /// Symbolic estimate of compute ops in a kernel.
@@ -27,7 +28,7 @@ pub fn compute_ops_estimate(uop: &Arc<UOp>) -> u64 {
     let mut range_sizes: Vec<u64> = Vec::new();
     let mut range_bit: FxHashMap<u64, usize> = FxHashMap::default();
     for node in &topo {
-        if let Op::Range { end, .. } | Op::Special { end, .. } = node.op() {
+        if let Op::Range(ops::Range { end, .. }) | Op::Special(ops::Special { end, .. }) = node.op() {
             range_bit.insert(node.id, range_sizes.len());
             range_sizes.push(range_size_estimate(end));
         }
@@ -53,7 +54,7 @@ pub fn compute_ops_estimate(uop: &Arc<UOp>) -> u64 {
         }
 
         // Each ALU/Reduce/WMMA accumulates `prod(enclosing range sizes)`.
-        if matches!(node.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::Reduce { .. } | Op::Wmma { .. }) {
+        if matches!(node.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::Reduce(..) | Op::Wmma(..)) {
             let mut weight: u64 = 1;
             for (w, word) in mask.iter().enumerate() {
                 let mut bits = *word;

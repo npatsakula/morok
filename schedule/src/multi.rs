@@ -12,6 +12,7 @@ use svod_dtype::{DType, ScalarDType};
 use svod_ir::{CallInfo, ConstValue, CustomFunctionKind, Op, ReduceOp, UOp, UOpKey};
 
 use crate::TypedPatternMatcher;
+use svod_ir::ops;
 
 /// Hardware-independent subset supported before range assignment.
 ///
@@ -32,7 +33,7 @@ enum MultiLayout {
 
 fn multi_axis(uop: &Arc<UOp>) -> Option<(Arc<UOp>, usize)> {
     match uop.op() {
-        Op::Multi { src, axis } => Some((src.clone(), *axis)),
+        Op::Multi(ops::Multi { src, axis }) => Some((src.clone(), *axis)),
         _ => None,
     }
 }
@@ -63,11 +64,7 @@ fn passthrough_unary_wrapper(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UO
     let (local, axis) = multi_axis(multi)?;
     if !matches!(
         root.op(),
-        Op::Cast { .. }
-            | Op::BitCast { .. }
-            | Op::Contiguous { .. }
-            | Op::Detach { .. }
-            | Op::ContiguousBackward { .. }
+        Op::Cast(..) | Op::BitCast(..) | Op::Contiguous(..) | Op::Detach(..) | Op::ContiguousBackward(..)
     ) {
         return None;
     }
@@ -75,7 +72,7 @@ fn passthrough_unary_wrapper(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UO
 }
 
 fn reduce_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Reduce { ranges, reduce_op, num_axes, .. } = root.op() else { return None };
+    let Op::Reduce(ops::Reduce { ranges, reduce_op, num_axes, .. }) = root.op() else { return None };
     let (local, axis) = multi_axis(multi)?;
     if *num_axes == 0 || !ranges.is_empty() {
         return None;
@@ -90,9 +87,9 @@ fn reduce_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
     if !matches!(reduce_op, ReduceOp::Add | ReduceOp::Max) {
         return None;
     }
-    let mstacks: Vec<_> = local.toposort().into_iter().filter(|node| matches!(node.op(), Op::MStack { .. })).collect();
+    let mstacks: Vec<_> = local.toposort().into_iter().filter(|node| matches!(node.op(), Op::MStack(..))).collect();
     let [mstack] = mstacks.as_slice() else { return None };
-    let Op::MStack { buffers } = mstack.op() else { unreachable!() };
+    let Op::MStack(ops::MStack { buffers }) = mstack.op() else { unreachable!() };
     if buffers.len() < 2 {
         return None;
     }
@@ -109,7 +106,9 @@ fn reduce_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
     let widen_dtype = buffers
         .iter()
         .map(|shard| match shard.op() {
-            Op::Cast { src, .. } if [DType::Float16, DType::BFloat16].contains(&src.dtype()) => Some(src.dtype()),
+            Op::Cast(ops::Cast { src, .. }) if [DType::Float16, DType::BFloat16].contains(&src.dtype()) => {
+                Some(src.dtype())
+            }
             _ => None,
         })
         .collect::<Option<Vec<_>>>()
@@ -131,11 +130,11 @@ fn reduce_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
 }
 
 fn lower_host_allreduce(root: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::AllReduce { src, device, reduce_op } = root.op() else { return None };
+    let Op::AllReduce(ops::AllReduce { src, device, reduce_op }) = root.op() else { return None };
     if !matches!(reduce_op, ReduceOp::Add | ReduceOp::Max) {
         return None;
     }
-    let Op::MStack { buffers } = src.op() else { return None };
+    let Op::MStack(ops::MStack { buffers }) = src.op() else { return None };
     if buffers.len() < 2 || buffers.iter().any(|buffer| buffer.device_spec().is_none()) {
         return None;
     }
@@ -185,14 +184,14 @@ fn host_allreduce_dtype_supported(dtype: &DType) -> bool {
 }
 
 fn permute_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Permute { axes, .. } = root.op() else { return None };
+    let Op::Permute(ops::Permute { axes, .. }) = root.op() else { return None };
     let (local, axis) = multi_axis(multi)?;
     let new_axis = axes.iter().position(|&candidate| candidate == axis)?;
     Some(UOp::multi(root.with_sources(vec![local]), new_axis).rtag(root.tag().clone()))
 }
 
 fn flip_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Flip { axes, .. } = root.op() else { return None };
+    let Op::Flip(ops::Flip { axes, .. }) = root.op() else { return None };
     let (local, axis) = multi_axis(multi)?;
     if axes.get(axis).copied().unwrap_or(true) {
         return None;
@@ -202,11 +201,11 @@ fn flip_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 fn const_at(uop: &Arc<UOp>, axis: usize) -> Option<ConstValue> {
     match uop.op() {
-        Op::Stack { sources } => match sources.get(axis)?.op() {
+        Op::Stack(ops::Stack { sources }) => match sources.get(axis)?.op() {
             Op::Const(value) => Some(value.0),
             _ => None,
         },
-        Op::VConst { values } => values.get(axis).copied(),
+        Op::VConst(ops::VConst { values }) => values.get(axis).copied(),
         _ if axis == 0 => match uop.op() {
             Op::Const(value) => Some(value.0),
             _ => None,
@@ -216,7 +215,7 @@ fn const_at(uop: &Arc<UOp>, axis: usize) -> Option<ConstValue> {
 }
 
 fn pad_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Pad { begin_pads, end_pads, .. } = root.op() else { return None };
+    let Op::Pad(ops::Pad { begin_pads, end_pads, .. }) = root.op() else { return None };
     let (local, axis) = multi_axis(multi)?;
     if !matches!(const_at(begin_pads, axis), Some(ConstValue::Int(0) | ConstValue::UInt(0)))
         || !matches!(const_at(end_pads, axis), Some(ConstValue::Int(0) | ConstValue::UInt(0)))
@@ -242,13 +241,13 @@ pub fn multi_pm() -> TypedPatternMatcher {
     crate::patterns! {
         selected @ MSelect { buffer: MStack { buffers }, device_index: _ }
             => |selected, buffers| {
-                let Op::MSelect { device_index, .. } = selected.op() else { unreachable!() };
+                let Op::MSelect(ops::MSelect { device_index, .. }) = selected.op() else { unreachable!() };
                 buffers.get(*device_index).cloned()
             },
         selected @ MSelect { buffer, device_index: _ }
             if buffer.op().is_movement()
             => |selected, buffer| {
-                let Op::MSelect { device_index, .. } = selected.op() else { unreachable!() };
+                let Op::MSelect(ops::MSelect { device_index, .. }) = selected.op() else { unreachable!() };
                 move_mselect_before_movement(selected, buffer, *device_index)
             },
         root @ Reduce { src: multi @ Multi { src: _ }, ranges: _, reduce_op: _, num_axes: _ }
@@ -287,28 +286,28 @@ fn operation_name(op: &Op) -> &'static str {
         Op::Unary(..) => "unary ALU",
         Op::Binary(..) => "binary ALU",
         Op::Ternary(..) => "ternary ALU",
-        Op::ReduceAxis { .. } | Op::Reduce { .. } => "reduction",
-        Op::Reshape { .. } => "RESHAPE",
-        Op::Permute { .. } => "PERMUTE",
-        Op::Expand { .. } => "EXPAND",
-        Op::Pad { .. } => "PAD",
-        Op::Shrink { .. } => "SHRINK",
-        Op::Flip { .. } => "FLIP",
-        Op::MSelect { .. } => "MSELECT",
+        Op::ReduceAxis(..) | Op::Reduce(..) => "reduction",
+        Op::Reshape(..) => "RESHAPE",
+        Op::Permute(..) => "PERMUTE",
+        Op::Expand(..) => "EXPAND",
+        Op::Pad(..) => "PAD",
+        Op::Shrink(..) => "SHRINK",
+        Op::Flip(..) => "FLIP",
+        Op::MSelect(..) => "MSELECT",
         _ => "operation",
     }
 }
 
 fn source_layout(source: &Arc<UOp>) -> MultiLayout {
     match source.op() {
-        Op::Multi { axis, .. } => MultiLayout::Axis(*axis),
+        Op::Multi(ops::Multi { axis, .. }) => MultiLayout::Axis(*axis),
         _ => MultiLayout::None,
     }
 }
 
 fn classify_supported_form(node: &Arc<UOp>) -> svod_ir::Result<()> {
-    if let Op::Multi { src, axis } = node.op() {
-        if src.toposort().iter().any(|inner| matches!(inner.op(), Op::Multi { .. })) {
+    if let Op::Multi(ops::Multi { src, axis }) = node.op() {
+        if src.toposort().iter().any(|inner| matches!(inner.op(), Op::Multi(..))) {
             return Err(svod_ir::Error::MultiNested { axis: *axis });
         }
         let shape = src.shape()?.ok_or(svod_ir::Error::MultiUnsupported {
@@ -321,7 +320,7 @@ fn classify_supported_form(node: &Arc<UOp>) -> svod_ir::Result<()> {
                 reason: "shard axis is outside the source shape",
             });
         }
-        if let Op::MStack { buffers } = src.op()
+        if let Op::MStack(ops::MStack { buffers }) = src.op()
             && let Some(first) = buffers.first()
         {
             let expected_dtype = first.dtype();
@@ -340,15 +339,15 @@ fn classify_supported_form(node: &Arc<UOp>) -> svod_ir::Result<()> {
         return Ok(());
     }
 
-    if let Op::MSelect { .. } = node.op() {
+    if let Op::MSelect(..) = node.op() {
         return Err(svod_ir::Error::MultiUnsupported {
             operation: "MSELECT",
             reason: "selection did not resolve to an in-range MSTACK shard",
         });
     }
 
-    if let Op::AllReduce { src, device, reduce_op } = node.op() {
-        let Op::MStack { buffers } = src.op() else {
+    if let Op::AllReduce(ops::AllReduce { src, device, reduce_op }) = node.op() {
+        let Op::MStack(ops::MStack { buffers }) = src.op() else {
             return Err(svod_ir::Error::MultiUnsupported {
                 operation: "ALLREDUCE",
                 reason: "collective source must be an explicit MSTACK",
@@ -405,7 +404,7 @@ fn classify_supported_form(node: &Arc<UOp>) -> svod_ir::Result<()> {
     }
 
     // Graph containers do not combine their independent source layouts.
-    if matches!(node.op(), Op::Sink { .. } | Op::Group { .. } | Op::Tuple { .. }) {
+    if matches!(node.op(), Op::Sink(..) | Op::Group(..) | Op::Tuple(..)) {
         return Ok(());
     }
     axes.sort_unstable();
@@ -429,7 +428,7 @@ fn classify_supported_form(node: &Arc<UOp>) -> svod_ir::Result<()> {
                 reason: "supported per-shard ALU did not normalize before rangeification",
             })
         }
-        Op::ReduceAxis { axes, .. } => {
+        Op::ReduceAxis(ops::ReduceAxis { axes, .. }) => {
             if axes.contains(&axis) {
                 Err(svod_ir::Error::MultiReductionAcrossShardAxis { axis })
             } else {
@@ -439,7 +438,7 @@ fn classify_supported_form(node: &Arc<UOp>) -> svod_ir::Result<()> {
                 })
             }
         }
-        Op::Reduce { num_axes, .. } => {
+        Op::Reduce(ops::Reduce { num_axes, .. }) => {
             if axis < *num_axes {
                 Err(svod_ir::Error::MultiReductionAcrossShardAxis { axis })
             } else {
@@ -449,7 +448,7 @@ fn classify_supported_form(node: &Arc<UOp>) -> svod_ir::Result<()> {
                 })
             }
         }
-        Op::Reshape { .. } => Err(svod_ir::Error::MultiMovementUnsupported {
+        Op::Reshape(..) => Err(svod_ir::Error::MultiMovementUnsupported {
             operation,
             axis,
             reason: "the shard boundary cannot be mapped without shard-count metadata",
@@ -476,7 +475,7 @@ pub fn validate_supported_subset(root: &Arc<UOp>) -> svod_ir::Result<()> {
 
 /// Final scheduling boundary: collectives must have become opaque runtime calls.
 pub fn validate_no_unresolved_allreduce(root: &Arc<UOp>) -> svod_ir::Result<()> {
-    if root.toposort_call_aware(true).iter().any(|node| matches!(node.op(), Op::AllReduce { .. })) {
+    if root.toposort_call_aware(true).iter().any(|node| matches!(node.op(), Op::AllReduce(..))) {
         return Err(svod_ir::Error::MultiUnsupported {
             operation: "ALLREDUCE",
             reason: "collective did not lower to an executable host schedule item",

@@ -11,6 +11,7 @@ use smallvec::SmallVec;
 
 use crate::Result;
 use crate::op::Op;
+use crate::ops;
 use crate::types::ReduceOp;
 use crate::uop::UOp;
 
@@ -62,12 +63,12 @@ impl UOp {
         num_axes: usize,
     ) -> Arc<Self> {
         let dtype = self.dtype();
-        Self::new(Op::Reduce { src: self.clone(), ranges, reduce_op, num_axes }, dtype)
+        Self::new(Op::Reduce(ops::Reduce { src: self.clone(), ranges, reduce_op, num_axes }), dtype)
     }
 
     /// All-reduce across multiple devices.
     pub fn allreduce(src: Arc<Self>, device: svod_dtype::DeviceSpec, reduce_op: ReduceOp) -> Arc<Self> {
         let dtype = src.dtype();
-        Self::new(Op::AllReduce { src, device, reduce_op }, dtype)
+        Self::new(Op::AllReduce(ops::AllReduce { src, device, reduce_op }), dtype)
     }
 }

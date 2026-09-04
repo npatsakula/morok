@@ -62,7 +62,7 @@ fn test_sub_rv_broadcast_is_add_neg() {
     // sub = add(neg): the neg is MUL(-1); the combine is an Add.
     assert!(topo.iter().any(|u| matches!(u.op(), Op::Binary(BinaryOp::Add, _, _))), "sub_rv combines with Add");
     // The RV buffer is loaded (broadcast) inside the map body.
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Load { .. })), "sub_rv loads the broadcast vector element");
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::Load(..))), "sub_rv loads the broadcast vector element");
 }
 
 /// `maximum` on same-shape tiles emits a `Max`.

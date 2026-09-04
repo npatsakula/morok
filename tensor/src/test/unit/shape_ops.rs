@@ -100,7 +100,7 @@ fn test_reshape_basic() {
     let reshaped = t.try_reshape([2, 3]).unwrap();
 
     assert_eq!(get_shape(&reshaped), vec![2, 3]);
-    if let Op::Reshape { .. } = reshaped.uop().op() {
+    if let Op::Reshape(..) = reshaped.uop().op() {
         // Correct operation type
     } else {
         panic!("Expected Reshape operation");
@@ -726,8 +726,8 @@ fn equal_size_cat_uses_stack_not_pad() {
 
     let nodes = c.uop().toposort();
     let has = |f: fn(&Op) -> bool| nodes.iter().any(|u| f(u.op()));
-    assert!(!has(|op| matches!(op, Op::Pad { .. })), "equal-size cat must not pad:\n{}", c.uop().tree());
-    assert!(has(|op| matches!(op, Op::Stack { .. })), "equal-size cat must stack:\n{}", c.uop().tree());
+    assert!(!has(|op| matches!(op, Op::Pad(..))), "equal-size cat must not pad:\n{}", c.uop().tree());
+    assert!(has(|op| matches!(op, Op::Stack(..))), "equal-size cat must stack:\n{}", c.uop().tree());
 }
 
 #[test]

@@ -11,6 +11,7 @@ use svod_ir::{Op, UnaryOp, prelude::*};
 use crate::llvm::amd::wmma;
 use crate::llvm::common::{LlvmTarget, RenderContext, ldt};
 use crate::llvm::cpu;
+use svod_ir::ops;
 
 /// Render a UOp to LLVM IR for the AMD target.
 ///
@@ -23,13 +24,15 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
 
     match uop.op() {
         // ── AMD-specific overrides ───────────────────────────────────────
-        Op::Special { name, .. } => render_special(uop, name, ctx, kernel),
-        Op::Barrier { .. } => render_barrier(kernel),
-        Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
+        Op::Special(ops::Special { name, .. }) => render_special(uop, name, ctx, kernel),
+        Op::Barrier(..) => render_barrier(kernel),
+        Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
             render_define_local(uop, ctx, kernel)
         }
-        Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => render_define_reg(uop, ctx, kernel),
-        Op::Wmma { a, b, c, metadata } => wmma::render_wmma_amd(uop, a, b, c, metadata, arch, ctx, kernel),
+        Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => {
+            render_define_reg(uop, ctx, kernel)
+        }
+        Op::Wmma(ops::Wmma { a, b, c, metadata }) => wmma::render_wmma_amd(uop, a, b, c, metadata, arch, ctx, kernel),
         Op::Unary(op @ (UnaryOp::Sqrt | UnaryOp::Log2 | UnaryOp::Exp2), src) => {
             render_float_unary(uop, src, *op, ctx, kernel)
         }
@@ -46,7 +49,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             );
             Some(())
         }
-        Op::Cast { src, .. } if is_fp8_cast(uop, src) => render_fp8_cast(uop, src, ctx, kernel),
+        Op::Cast(ops::Cast { src, .. }) if is_fp8_cast(uop, src) => render_fp8_cast(uop, src, ctx, kernel),
         // ── Everything else: shared CPU path (ALU, INDEX, LOAD, STORE, …) ─
         _ => cpu::render_uop(uop, ctx, kernel),
     }
@@ -156,7 +159,9 @@ fn render_barrier(kernel: &mut Vec<String>) -> Option<()> {
 fn render_define_local(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<String>) -> Option<()> {
     let dst = ctx.name(uop); // e.g. "%local42"
     let (id, base_dtype) = match uop.op() {
-        Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local) => (arg.slot, arg.dtype.clone()),
+        Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
+            (arg.slot, arg.dtype.clone())
+        }
         _ => unreachable!(),
     };
     let size = uop.buffer_size().unwrap_or(1);
@@ -187,7 +192,7 @@ fn render_define_local(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec
 fn render_define_reg(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<String>) -> Option<()> {
     let dst = ctx.name(uop);
     let (alloc_size, base) = match uop.op() {
-        Op::Buffer { arg, .. } => (uop.buffer_size().unwrap_or(1), ldt(&arg.dtype)),
+        Op::Buffer(ops::Buffer { arg, .. }) => (uop.buffer_size().unwrap_or(1), ldt(&arg.dtype)),
         _ => unreachable!(),
     };
     let raw = format!("{dst}.raw");

@@ -25,6 +25,7 @@ use svod_device::Buffer;
 use svod_device::device::{Device, Program, ProgramSpec};
 use svod_dtype::{AmdArch, DType, DeviceSpec};
 use svod_ir::UOp;
+use svod_ir::ops;
 use svod_tensor::Tensor;
 
 /// Result type for the launch path.
@@ -678,7 +679,7 @@ pub fn realize_buffer(t: &Tensor) -> Result<Buffer> {
     // No backing buffer: allocate one sized to the tensor's logical shape on its
     // BUFFER UOp's device, then register it so `t.buffer()` resolves it.
     let base = t.uop().base();
-    let svod_ir::Op::Buffer { arg, .. } = base.op() else {
+    let svod_ir::Op::Buffer(ops::Buffer { arg, .. }) = base.op() else {
         return Err(RealizeSnafu.into_error(svod_tensor::error::Error::NoBuffer));
     };
     let Some(spec) = arg.device.as_ref() else {

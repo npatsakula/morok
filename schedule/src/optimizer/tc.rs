@@ -39,7 +39,7 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
         None => return Ok(None),
     };
 
-    let Op::Reduce { reduce_op: reduce_type, ranges: _, src, .. } = reduce_op.op() else {
+    let Op::Reduce(svod_ir::ops::Reduce { reduce_op: reduce_type, ranges: _, src, .. }) = reduce_op.op() else {
         return Ok(None);
     };
 
@@ -48,7 +48,8 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
     }
 
     // Extract MUL operation (possibly under CAST)
-    let mul = if let Op::Cast { src: cast_src, .. } = src.op() { cast_src.clone() } else { src.clone() };
+    let mul =
+        if let Op::Cast(svod_ir::ops::Cast { src: cast_src, .. }) = src.op() { cast_src.clone() } else { src.clone() };
 
     let Op::Binary(BinaryOp::Mul, a, b) = mul.op() else {
         return Ok(None);
@@ -58,8 +59,11 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
     let in0_all_ranges = get_ranges(&in0);
     let in1_all_ranges = get_ranges(&in1);
 
-    let red_ranges: Vec<_> =
-        if let Op::Reduce { ranges, .. } = reduce_op.op() { ranges.iter().cloned().collect() } else { vec![] };
+    let red_ranges: Vec<_> = if let Op::Reduce(svod_ir::ops::Reduce { ranges, .. }) = reduce_op.op() {
+        ranges.iter().cloned().collect()
+    } else {
+        vec![]
+    };
 
     // Find unique ranges (M and N dimensions)
     let in0_ranges: Vec<_> =
@@ -94,16 +98,18 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
 }
 
 fn get_ranges(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
-    uop.backward_slice().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect()
+    uop.backward_slice().into_iter().filter(|node| matches!(node.op(), Op::Range(..))).collect()
 }
 
 fn get_axis_id(range: &Arc<UOp>) -> AxisId {
-    let Op::Range { axis_id, .. } = range.op() else { unreachable!("range list contains non-RANGE") };
+    let Op::Range(svod_ir::ops::Range { axis_id, .. }) = range.op() else {
+        unreachable!("range list contains non-RANGE")
+    };
     axis_id.clone()
 }
 
 fn get_range_size(range: &Arc<UOp>) -> Option<i64> {
-    if let Op::Range { end, .. } = range.op()
+    if let Op::Range(svod_ir::ops::Range { end, .. }) = range.op()
         && let Op::Const(cv) = end.op()
         && let ConstValue::Int(size) = cv.0
     {
@@ -405,11 +411,11 @@ fn apply_axis_choice_impl(
 
         // Validate that the REDUCE still contains MUL pattern after shift_to
         let (reduce_src, updated_reduce_ranges) = match updated_reduce.op() {
-            Op::Reduce { src, ranges, .. } => (src.clone(), ranges.clone()),
+            Op::Reduce(svod_ir::ops::Reduce { src, ranges, .. }) => (src.clone(), ranges.clone()),
             _ => unreachable!(),
         };
         let mul = match reduce_src.op() {
-            Op::Cast { src, .. } => src.clone(),
+            Op::Cast(svod_ir::ops::Cast { src, .. }) => src.clone(),
             _ => reduce_src.clone(),
         };
         if !matches!(mul.op(), Op::Binary(BinaryOp::Mul, ..)) {
@@ -435,11 +441,11 @@ fn apply_axis_choice_impl(
 
         // Re-extract sources from substituted REDUCE
         let ret_src = match ret.op() {
-            Op::Reduce { src, .. } => src.clone(),
+            Op::Reduce(svod_ir::ops::Reduce { src, .. }) => src.clone(),
             _ => unreachable!(),
         };
         let ret_mul = match ret_src.op() {
-            Op::Cast { src, .. } => src.clone(),
+            Op::Cast(svod_ir::ops::Cast { src, .. }) => src.clone(),
             _ => ret_src.clone(),
         };
         let (ret_a, ret_b) = match ret_mul.op() {
@@ -474,7 +480,7 @@ fn apply_axis_choice_impl(
         let base_upcast_axes: Vec<(AxisId, usize)> = base_upcast_ne
             .iter()
             .map(|rng| match rng.op() {
-                Op::Range { axis_id, .. } => (axis_id.clone(), 2),
+                Op::Range(svod_ir::ops::Range { axis_id, .. }) => (axis_id.clone(), 2),
                 _ => unreachable!(),
             })
             .collect();
@@ -500,7 +506,7 @@ fn apply_axis_choice_impl(
         let tc_reduce_aids: Vec<AxisId> = ne[tc.opts.len()..]
             .iter()
             .filter_map(|r| match r.op() {
-                Op::Range { axis_id, .. } => Some(axis_id.clone()),
+                Op::Range(svod_ir::ops::Range { axis_id, .. }) => Some(axis_id.clone()),
                 _ => None,
             })
             .collect();
@@ -545,7 +551,7 @@ fn apply_axis_choice_impl(
         let mut extra: SmallVec<[Arc<UOp>; 4]> = UOp::sink(updated_reduce_ranges.into_vec())
             .toposort()
             .into_iter()
-            .filter(|r| matches!(r.op(), Op::Range { axis_id, .. } if !tc_reduce_aids.contains(axis_id)))
+            .filter(|r| matches!(r.op(), Op::Range(svod_ir::ops::Range { axis_id, .. }) if !tc_reduce_aids.contains(axis_id)))
             .collect();
         // Deterministic nesting (outer = lowest axis_id); slice may list a range once.
         extra.sort_by_key(get_axis_id);

@@ -27,7 +27,7 @@ mod pipeline_composition {
 
         let result = postopt_symbolic(reduce);
 
-        assert!(!result.toposort().iter().any(|u| matches!(u.op(), Op::Reduce { .. })));
+        assert!(!result.toposort().iter().any(|u| matches!(u.op(), Op::Reduce(..))));
         assert!(matches!(result.op(), Op::Const(value) if value.0 == ConstValue::Int(0)));
     }
 
@@ -38,7 +38,7 @@ mod pipeline_composition {
 
         let result = postopt_symbolic(reduce);
 
-        assert!(matches!(result.op(), Op::Reduce { ranges, .. } if ranges.len() == 1));
+        assert!(matches!(result.op(), Op::Reduce(svod_ir::ops::Reduce { ranges, .. }) if ranges.len() == 1));
     }
 
     #[test]
@@ -73,7 +73,7 @@ mod pipeline_composition {
         let result = graph_rewrite(pm_split_ends(), original, &mut ());
 
         assert_eq!(result.tag().as_deref(), Some(&[17, 23][..]));
-        let Op::End { computation: range_ends, ranges: backedges } = result.op() else {
+        let Op::End(svod_ir::ops::End { computation: range_ends, ranges: backedges }) = result.op() else {
             panic!("expected outer backedge END, got {}", result.tree());
         };
         assert_eq!(backedges.len(), 2);
@@ -81,12 +81,12 @@ mod pipeline_composition {
         assert!(Arc::ptr_eq(&backedges[1], &void_backedge));
         assert_eq!(range_ends.tag(), &None);
 
-        let Op::End { computation: inner_end, ranges: outer_ranges } = range_ends.op() else {
+        let Op::End(svod_ir::ops::End { computation: inner_end, ranges: outer_ranges }) = range_ends.op() else {
             panic!("expected outer range END, got {}", result.tree());
         };
         assert_eq!(outer_ranges.len(), 1);
         assert!(Arc::ptr_eq(&outer_ranges[0], &outer_range));
-        let Op::End { computation: leaf, ranges: inner_ranges } = inner_end.op() else {
+        let Op::End(svod_ir::ops::End { computation: leaf, ranges: inner_ranges }) = inner_end.op() else {
             panic!("expected inner range END, got {}", result.tree());
         };
         assert!(Arc::ptr_eq(leaf, &computation));
@@ -122,7 +122,7 @@ mod pipeline_composition {
 
         let mut cursor = result.clone();
         for expected in [&parent_range, &child_zero, &child_one] {
-            let Op::End { computation: next, ranges } = cursor.op() else {
+            let Op::End(svod_ir::ops::End { computation: next, ranges }) = cursor.op() else {
                 panic!("expected nested END chain, got {}", result.tree());
             };
             assert_eq!(ranges.len(), 1);
@@ -130,7 +130,7 @@ mod pipeline_composition {
             cursor = next.clone();
         }
         assert!(Arc::ptr_eq(&cursor, &computation));
-        let Op::Range { deps, .. } = child_one.op() else { unreachable!() };
+        let Op::Range(svod_ir::ops::Range { deps, .. }) = child_one.op() else { unreachable!() };
         assert_eq!(deps.len(), 1);
         assert!(Arc::ptr_eq(&deps[0], &dependency));
 
@@ -150,10 +150,14 @@ mod pipeline_composition {
         let sink = UOp::sink(vec![computation.end(smallvec![range])]);
 
         let result = apply_pre_optimization(sink).unwrap();
-        let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK, got {:?}", result.op()) };
-        let Op::End { ranges, .. } = sources[0].op() else { panic!("expected END, got {:?}", sources[0].op()) };
+        let Op::Sink(svod_ir::ops::Sink { sources, .. }) = result.op() else {
+            panic!("expected SINK, got {:?}", result.op())
+        };
+        let Op::End(svod_ir::ops::End { ranges, .. }) = sources[0].op() else {
+            panic!("expected END, got {:?}", sources[0].op())
+        };
         assert_eq!(ranges.len(), 2, "split RANGE dependencies must be flattened into the END");
-        assert!(ranges.iter().all(|range| matches!(range.op(), Op::Range { .. })));
+        assert!(ranges.iter().all(|range| matches!(range.op(), Op::Range(..))));
     }
 
     #[test]
@@ -167,9 +171,9 @@ mod pipeline_composition {
         let range = result
             .toposort()
             .into_iter()
-            .find(|u| matches!(u.op(), Op::Range { .. }))
+            .find(|u| matches!(u.op(), Op::Range(..)))
             .expect("range must survive pre-optimization");
-        let Op::Range { end, .. } = range.op() else { unreachable!() };
+        let Op::Range(svod_ir::ops::Range { end, .. }) = range.op() else { unreachable!() };
         assert!(
             matches!(end.op(), Op::Const(value) if value.0 == ConstValue::Int(4)),
             "range end was not folded: {:?}",

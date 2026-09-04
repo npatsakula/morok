@@ -57,6 +57,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 use std::sync::Arc;
 
+use crate::ops;
 use crate::pattern::{Matcher, RewriteResult};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,9 +77,11 @@ fn traversal_children<'a>(node: &'a Arc<UOp>, mode: TraversalMode) -> (Children<
     }
 
     match node.op() {
-        Op::Call { body, args, .. } | Op::Function { body, args, .. } => (args.iter().collect(), smallvec![body]),
+        Op::Call(ops::Call { body, args, .. }) | Op::Function(ops::Function { body, args, .. }) => {
+            (args.iter().collect(), smallvec![body])
+        }
         // PROGRAM is opaque when preserving call bodies.
-        Op::Program { sink, linear, source, binary, .. } => {
+        Op::Program(ops::Program { sink, linear, source, binary, .. }) => {
             let mut skipped: Children<'a> = smallvec![sink];
             skipped.extend(linear.iter().chain(source.iter()).chain(binary.iter()));
             (SmallVec::new(), skipped)

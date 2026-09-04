@@ -22,6 +22,7 @@ use crate::llvm::amd;
 use crate::llvm::common::{LlvmTarget, RenderContext, ldt};
 use crate::llvm::cpu;
 use crate::{BufferArg, Error, RenderedKernel, RenderedOperation, Renderer, Result};
+use svod_ir::ops;
 
 /// Text-based LLVM IR renderer.
 ///
@@ -65,7 +66,7 @@ impl Renderer for LlvmTextRenderer {
         let kernel_name = name.unwrap_or("kernel");
 
         let nodes: Vec<Arc<UOp>> = match uop.op() {
-            Op::Linear { ops } => ops.iter().cloned().collect(),
+            Op::Linear(ops::Linear { ops }) => ops.iter().cloned().collect(),
             other => {
                 return Err(Error::InvalidGraph {
                     reason: format!("LLVM text renderer expects LINEAR input, got {other:?}"),
@@ -91,10 +92,11 @@ impl Renderer for LlvmTextRenderer {
 
         let abi_params = collect_abi_params(&nodes)?;
 
-        for buf in
-            abi_params.iter().filter(|param| matches!(param.op(), Op::Param { arg, .. } if arg.addrspace.is_some()))
+        for buf in abi_params
+            .iter()
+            .filter(|param| matches!(param.op(), Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_some()))
         {
-            if let Op::Param { arg, .. } = buf.op() {
+            if let Op::Param(ops::Param { arg, .. }) = buf.op() {
                 let is_output = is_output_buffer(buf, &nodes);
                 buffer_args.push(BufferArg {
                     index: arg.slot,
@@ -105,11 +107,12 @@ impl Renderer for LlvmTextRenderer {
             }
         }
 
-        for var in
-            abi_params.iter().filter(|param| matches!(param.op(), Op::Param { arg, .. } if arg.addrspace.is_none()))
+        for var in abi_params
+            .iter()
+            .filter(|param| matches!(param.op(), Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none()))
         {
             let name = match var.op() {
-                Op::Param { arg, .. } => arg.name.as_ref().ok_or_else(|| Error::InvalidGraph {
+                Op::Param(ops::Param { arg, .. }) => arg.name.as_ref().ok_or_else(|| Error::InvalidGraph {
                     reason: format!("scalar PARAM in slot {} has no name", arg.slot),
                 })?,
                 other => return Err(Error::InvalidGraph { reason: format!("non-PARAM in ABI list: {other:?}") }),
@@ -120,7 +123,7 @@ impl Renderer for LlvmTextRenderer {
         let mut inner_params: Vec<String> = Vec::new();
 
         for param in &abi_params {
-            let Op::Param { arg, .. } = param.op() else {
+            let Op::Param(ops::Param { arg, .. }) = param.op() else {
                 return Err(Error::InvalidGraph { reason: "non-PARAM in ABI list".into() });
             };
             let source_name = format!("%data{}", arg.slot);
@@ -143,11 +146,11 @@ impl Renderer for LlvmTextRenderer {
         // to `llvm.amdgcn.wmma.*` intrinsics over SSA vectors (see `amd::wmma`),
         // so emitting these allocas there is dead IR. Matches tinygrad's
         // `AMDLLVMRenderer`, which only preallocates on the `tc.amx` path.
-        let wmma_count = nodes.iter().filter(|n| matches!(n.op(), Op::Wmma { .. })).count();
+        let wmma_count = nodes.iter().filter(|n| matches!(n.op(), Op::Wmma(..))).count();
         if wmma_count > 0 && matches!(self.target, LlvmTarget::Cpu) {
             kernel.push("  ; WMMA AMX scratch buffers".to_string());
             for node in &nodes {
-                if let Op::Wmma { a, b, c, .. } = node.op() {
+                if let Op::Wmma(ops::Wmma { a, b, c, .. }) = node.op() {
                     for (i, src) in [a, b, c].iter().enumerate() {
                         let dtype = ldt(&src.dtype());
                         let base = format!("%wmma_{}_amx{}", node.id, i);
@@ -162,7 +165,7 @@ impl Renderer for LlvmTextRenderer {
         kernel.push("".to_string());
 
         for node in &nodes {
-            if matches!(node.op(), Op::Noop | Op::Group { .. }) {
+            if matches!(node.op(), Op::Noop | Op::Group(..)) {
                 ctx.register(node.id, String::new());
                 continue;
             }
@@ -506,7 +509,7 @@ fn build_function_attributes(target: &LlvmTarget, nodes: &[Arc<UOp>]) -> String 
             let max_l = nodes
                 .iter()
                 .filter_map(|n| match n.op() {
-                    Op::Special { name, end } if name.starts_with('l') => match end.vmax() {
+                    Op::Special(ops::Special { name, end }) if name.starts_with('l') => match end.vmax() {
                         svod_ir::ConstValue::Int(v) => Some(*v as u64),
                         svod_ir::ConstValue::UInt(v) => Some(*v),
                         _ => None,

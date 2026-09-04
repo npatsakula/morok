@@ -10,6 +10,7 @@ use svod_dtype::ScalarDType;
 use svod_ir::{Op, UOp, WmmaMetadata};
 
 use super::types::c_dtype;
+use svod_ir::ops;
 
 /// Bit 62: Z output is f32 (for f16->f32 mixed-precision FMA).
 const AMX_FMA_Z_F32: u64 = 1 << 62;
@@ -25,7 +26,7 @@ const AMX_LOAD_PAIR_BIT: u64 = 1 << 62;
 pub fn collect_wmma_defines(nodes: &[Arc<UOp>]) -> Vec<String> {
     let mut seen = BTreeSet::new();
     for node in nodes {
-        if let Op::Wmma { metadata, .. } = node.op() {
+        if let Op::Wmma(ops::Wmma { metadata, .. }) = node.op() {
             seen.insert(metadata.name.clone());
         }
     }
@@ -40,7 +41,7 @@ pub fn collect_wmma_defines(nodes: &[Arc<UOp>]) -> Vec<String> {
     lines.push(r#"#define AMX(op, gpr, btf) __asm(".word (0x201000+(%0 << 5)+0%1-((0%1>>4)*6))" : : "i"(op), "r"((unsigned long long)(gpr)+(btf)) : "memory")"#.to_string());
 
     for node in nodes {
-        if let Op::Wmma { metadata, .. } = node.op()
+        if let Op::Wmma(ops::Wmma { metadata, .. }) = node.op()
             && seen.remove(&metadata.name)
         {
             lines.push(render_amx_wmma_function(metadata));

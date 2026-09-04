@@ -1,5 +1,6 @@
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ImageKind};
 
+use crate::ops;
 use crate::uop::canonical::CanonicalAxis;
 use crate::{
     AxisId, AxisType, BinaryOp, BufferizeOpts, CallInfo, CanonicalArg, CanonicalConst, CanonicalDType, CanonicalGraph,
@@ -337,11 +338,11 @@ fn canonical_call_sink_and_allreduce_metadata_are_typed() {
         },
     );
     let allreduce = UOp::new(
-        Op::AllReduce {
+        Op::AllReduce(ops::AllReduce {
             src: UOp::native_const(2.0f32),
             device: DeviceSpec::Cuda { device_id: 2 },
             reduce_op: ReduceOp::Max,
-        },
+        }),
         DType::Float32,
     );
     let sink = UOp::sink_with_info(
@@ -391,12 +392,12 @@ fn canonical_wmma_metadata_preserves_axes_and_target() {
         tile_grid: (2, 1),
     };
     let wmma = UOp::new(
-        Op::Wmma {
+        Op::Wmma(ops::Wmma {
             a: UOp::const_(DType::Float16, ConstValue::Float(1.0)),
             b: UOp::const_(DType::Float16, ConstValue::Float(2.0)),
             c: UOp::native_const(0.0f32),
             metadata: metadata.into(),
-        },
+        }),
         DType::Float32,
     );
     let graph = CanonicalGraph::from_root("wmma", &wmma).unwrap();
@@ -579,7 +580,7 @@ fn canonical_reduce_records_and_hash_conses_leading_shaped_axis_count() {
     assert!(!std::sync::Arc::ptr_eq(&scalar, &horizontal));
     let rebuilt = horizontal.with_sources(horizontal.op().sources().into_vec());
     assert!(std::sync::Arc::ptr_eq(&horizontal, &rebuilt));
-    assert!(matches!(rebuilt.op(), Op::Reduce { num_axes: 1, .. }));
+    assert!(matches!(rebuilt.op(), Op::Reduce(ops::Reduce { num_axes: 1, .. })));
 
     let too_many = src.reduce_with_num_axes(smallvec::smallvec![], ReduceOp::Add, 2);
     assert!(matches!(too_many.shape(), Err(crate::Error::ReduceInvalidNumAxes { num_axes: 2, shape_dims: 1 })));

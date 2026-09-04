@@ -10,6 +10,7 @@ use svod_ir::{AxisId, AxisType, Op, ReduceOp, UOp};
 use crate::devectorize::{bool_storage_patterns, devectorize, no_vectorized_alu};
 use crate::optimizer::Renderer;
 use crate::rewrite::graph_rewrite;
+use svod_ir::ops;
 
 pub fn apply_devectorize(uop: &Arc<UOp>) -> Arc<UOp> {
     devectorize(uop, &Renderer::cpu())
@@ -64,7 +65,10 @@ pub fn create_vector_index(buffer: Arc<UOp>, offsets: impl IntoIterator<Item = i
         offsets.into_iter().map(|offset| UOp::const_(DType::Index, ConstValue::Int(offset))).collect();
     let idx_dtype = buffer.dtype().base();
     let define = buffer_to_define(&buffer);
-    UOp::new(Op::Index { buffer: define, indices: smallvec::smallvec![UOp::stack(indices)] }, DType::Scalar(idx_dtype))
+    UOp::new(
+        Op::Index(ops::Index { buffer: define, indices: smallvec::smallvec![UOp::stack(indices)] }),
+        DType::Scalar(idx_dtype),
+    )
 }
 
 pub fn create_vector_index_iota(buffer: Arc<UOp>, count: usize) -> Arc<UOp> {
@@ -129,11 +133,11 @@ pub fn assert_vcount(uop: &Arc<UOp>, expected: usize) {
 }
 
 pub fn assert_is_load(uop: &Arc<UOp>) {
-    assert!(matches!(uop.op(), Op::Load { .. }), "Expected LOAD, got {:?}", uop.op());
+    assert!(matches!(uop.op(), Op::Load(..)), "Expected LOAD, got {:?}", uop.op());
 }
 
 pub fn assert_is_index(uop: &Arc<UOp>) {
-    assert!(matches!(uop.op(), Op::Index { .. }), "Expected INDEX, got {:?}", uop.op());
+    assert!(matches!(uop.op(), Op::Index(..)), "Expected INDEX, got {:?}", uop.op());
 }
 
 pub fn count_ops<F>(uop: &Arc<UOp>, predicate: F) -> usize
@@ -144,17 +148,17 @@ where
 }
 
 pub fn count_loads(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |u| matches!(u.op(), Op::Load { .. }))
+    count_ops(uop, |u| matches!(u.op(), Op::Load(..)))
 }
 
 pub fn count_stores(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |u| matches!(u.op(), Op::Store { .. }))
+    count_ops(uop, |u| matches!(u.op(), Op::Store(..)))
 }
 
 pub fn count_define_regs(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(AddrSpace::Reg)))
+    count_ops(uop, |u| matches!(u.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(AddrSpace::Reg)))
 }
 
 pub fn count_ends(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |u| matches!(u.op(), Op::End { .. }))
+    count_ops(uop, |u| matches!(u.op(), Op::End(..)))
 }

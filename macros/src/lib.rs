@@ -83,6 +83,23 @@ pub fn derive_pattern_enum(input: TokenStream) -> TokenStream {
     }
 }
 
+/// Attribute macro giving every struct-like variant of the `Op` enum its own struct.
+///
+/// Write the enum with named fields as usual; the macro rewrites each such variant
+/// to wrap a struct of the same name in a sibling `ops` module, adds
+/// `From<ops::X> for Op` and `Op::as_x()` accessors, and derives the same
+/// pattern-matching infrastructure as [`PatternEnum`] from the original field
+/// layout. Must precede `#[derive(...)]` so the derives see the rewritten enum;
+/// `#[pattern(...)]` attributes are consumed.
+#[proc_macro_attribute]
+pub fn op_enum(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let item = parse_macro_input!(item as syn::ItemEnum);
+    match pattern_enum::expand_op_enum(item) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
 /// Proc-macro for declarative pattern rewrite rules.
 ///
 /// Generates a `SimplifiedPatternMatcher` (in `svod_ir::pattern`) from a list

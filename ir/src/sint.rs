@@ -15,6 +15,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::ops;
 use crate::{BinaryOp, Op, UOp};
 
 fn const_to_i128(v: &crate::ConstValue) -> Option<i128> {
@@ -51,7 +52,7 @@ fn symbolic_contains_max_term(expr: &Arc<UOp>, needle: &Arc<UOp>) -> bool {
 ///
 /// // Symbolic dimension - use DefineVar for truly dynamic dimensions
 /// let batch_size = UOp::new(
-///     Op::DefineVar { name: "batch".to_string(), min_val: 1, max_val: 1024 },
+///     Op::DefineVar(ops::DefineVar { name: "batch".to_string(), min_val: 1, max_val: 1024 }),
 ///     DType::Int32,
 /// );
 /// let dynamic_dim = SInt::from(batch_size);
@@ -199,7 +200,7 @@ impl SInt {
                 // A cast around a constant is representation-only; STACK lane
                 // unification is one source of them.
                 let mut node = uop;
-                while let crate::Op::Cast { src, .. } = node.op() {
+                while let crate::Op::Cast(ops::Cast { src, .. }) = node.op() {
                     node = src;
                 }
                 match node.op() {

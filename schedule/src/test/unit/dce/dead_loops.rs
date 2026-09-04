@@ -14,6 +14,7 @@ use test_case::test_case;
 use crate::rewrite::graph_rewrite;
 
 use super::helpers::{assert_const_value, get_matcher};
+use svod_ir::ops;
 
 fn zero_trip() -> Arc<UOp> {
     UOp::native_const(0i32)
@@ -39,7 +40,7 @@ fn symbolically_empty() -> Arc<UOp> {
 fn dead_range_folds_to_zero(end: Arc<UOp>) {
     let dtype = end.dtype();
     let range = UOp::new(
-        Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop, deps: smallvec![] },
+        Op::Range(ops::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop, deps: smallvec![] }),
         dtype,
     );
 
