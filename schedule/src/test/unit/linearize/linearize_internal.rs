@@ -81,13 +81,11 @@ fn tinygrad_wmma_key_omits_svod_only_metadata() {
         threads: 32,
         upcast_axes: None,
         reduce_axes: vec![AxisId::Renumbered(3)],
-        tile_grid: (2, 2),
     };
     let mut right = left.clone();
     right.name = "a_svod_name".to_string();
     right.dtype_out = DType::Int32;
     right.reduce_axes.clear();
-    right.tile_grid = (1, 1);
 
     let make_op = |metadata| {
         Op::Wmma(ops::Wmma { a: value.clone(), b: value.clone(), c: value.clone(), metadata: Box::new(metadata) })
@@ -116,7 +114,6 @@ fn tinygrad_wmma_key_omits_svod_only_metadata() {
             threads: 32,
             upcast_axes: None,
             reduce_axes: vec![],
-            tile_grid: (1, 1),
         }))
     );
 }

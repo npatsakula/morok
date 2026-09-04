@@ -282,7 +282,7 @@ fn generate_actions(scheduler: &Scheduler, config: &BeamConfig) -> Vec<Scheduler
 ///
 /// The `tc_up` divisor accounts for the TC tile's contribution to the
 /// total UPCAST/UNROLL product — without it, applying TC immediately
-/// saturates `max_upcast` (e.g. APPLE_AMX `prod((16,16,1))/1 = 256`),
+/// saturates `max_upcast` (e.g. `METAL_888` `prod((8,8,8))/32 = 16`),
 /// blocking any post-TC UPCAST composition.
 fn validate_limits(scheduler: &Scheduler, config: &BeamConfig) -> bool {
     let upcast_sz = product_of_axes(scheduler, &[AxisType::Upcast, AxisType::Unroll]);

@@ -78,9 +78,6 @@ fn test_apply_image_upcasts_non_stub_behavior(dtype: DType, expected: bool) {
 
 #[test]
 fn test_try_tensor_cores_retries_axis_choices() {
-    // Use a non-AMX renderer so a successful trial commits — on AMX
-    // `try_tensor_cores` discards the TC'd copy (see
-    // `test_try_tensor_cores_amx_discards_trial`).
     let sink = create_tc_retry_pattern();
     let mut scheduler = Scheduler::new(sink, Renderer::metal());
 
@@ -90,24 +87,6 @@ fn test_try_tensor_cores_retries_axis_choices() {
 
     let tc_opt = scheduler.applied_opts.iter().find(|opt| opt.op == OptOps::TC).expect("TC opt should be recorded");
     assert_eq!(tc_opt.axis, Some(1), "retry should commit the passing axis choice");
-}
-
-#[test]
-fn test_try_tensor_cores_amx_discards_trial() {
-    // On AMX, even when TC would apply successfully, the trial copy is
-    // discarded so the heuristic falls through to the regular
-    // UPCAST/THREAD/LOCAL chain on the untouched scheduler.
-    let sink = create_tc_retry_pattern();
-    let mut scheduler = Scheduler::new(sink, Renderer::apple_amx());
-    let snapshot_opts_before = scheduler.applied_opts.clone();
-
-    let config = HeuristicsConfig::builder().tc_opt(TcOpt::Relaxed).build();
-    let applied = try_tensor_cores(&mut scheduler, &config);
-    assert!(!applied, "try_tensor_cores must return false on AMX (TC is intentionally discarded)");
-    assert_eq!(
-        scheduler.applied_opts, snapshot_opts_before,
-        "AMX path must leave the scheduler's applied_opts untouched (no TC commit)"
-    );
 }
 
 /// Elementwise SINK with one WEAK axis plus an optional extra axis of `extra`

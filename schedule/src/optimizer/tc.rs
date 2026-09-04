@@ -1,7 +1,7 @@
 //! Tensor Core (TC) optimization - Hardware-accelerated matrix multiplication.
 //!
 //! Implements pattern matching, selection, swizzle, and application for tensor core ops.
-//! Supports NVIDIA (WMMA), AMD (Matrix Cores), Intel, and Apple (AMX) hardware.
+//! Supports NVIDIA (WMMA), AMD (Matrix Cores), Intel Xe, and Apple Metal hardware.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -527,7 +527,6 @@ fn apply_axis_choice_impl(
             threads: tc.threads,
             upcast_axes: Some(WmmaUpcastAxes { a: a_axes, b: b_axes, c: c_axes.clone() }),
             reduce_axes: tc_reduce_aids.clone(),
-            tile_grid: tc.tile_grid,
         };
 
         // The WMMA C/accumulator operand carries the full per-thread D-register

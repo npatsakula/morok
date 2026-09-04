@@ -18,7 +18,6 @@
 //!   cargo run -p svod-model --release --example gigaam_infer -- audio.wav --rnnt --profile
 //!
 //! Env knobs (all optional):
-//!   SVOD_AMX=1                 Enable AMX renderer (Apple Silicon).
 //!   SVOD_VAD_THRESHOLD=f       FireRedVAD speech threshold (default 0.4).
 
 use std::path::PathBuf;

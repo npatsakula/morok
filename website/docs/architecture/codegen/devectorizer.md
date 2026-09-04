@@ -160,7 +160,6 @@ the widths supported by the target, while preserving contiguous memory accesses.
 | Device | Fold Lengths | Notes |
 |--------|--------------|-------|
 | GPU (standard) | 4, 2, 1 | Standard GPU vectorization |
-| GPU (AMX) | 16, 8, 4, 2, 1 | Apple AMX support |
 | Image | 4, 1 | Fixed for image textures |
 | No-fold | 1 | Scalar fallback (forced) |
 

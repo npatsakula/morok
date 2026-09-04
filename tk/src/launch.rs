@@ -319,13 +319,7 @@ impl CompiledLaunch {
 /// used as indexes into this vector.
 pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<CompiledLaunch> {
     let optimizer_renderer = match device.device {
-        DeviceSpec::Cpu => {
-            if std::env::var("SVOD_AMX").as_deref() == Ok("1") {
-                svod_schedule::OptimizerRenderer::apple_amx()
-            } else {
-                svod_schedule::OptimizerRenderer::cpu()
-            }
-        }
+        DeviceSpec::Cpu => svod_schedule::OptimizerRenderer::cpu(),
         DeviceSpec::Cuda { .. } => svod_schedule::OptimizerRenderer::cuda(),
         DeviceSpec::Metal { .. } => svod_schedule::OptimizerRenderer::metal(),
         DeviceSpec::Amd { .. } => device

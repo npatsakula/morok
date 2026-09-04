@@ -15,14 +15,8 @@
 //!   - beam_w2    (beam width 2)
 //!   - beam_w4    (beam width 4)
 //!
-//! AMX is opt-in via the `SVOD_AMX=1` env var (it switches the optimizer
-//! renderer from `cpu` to `apple_amx`, which exposes AMX TensorCore tiles
-//! to beam search). Heuristic + AMX won't fire AMX kernels by design — only
-//! beam search applies the TC ops.
-//!
 //! Run with:
 //!   `cargo bench -p svod-tensor --bench conformer_ffn`
-//!   `SVOD_AMX=1 cargo bench -p svod-tensor --bench conformer_ffn`
 
 use std::time::Duration;
 
@@ -93,12 +87,7 @@ fn make_configs() -> Vec<(&'static str, PrepareConfig)> {
 
 fn bench_ffn(c: &mut Criterion) {
     let shape = FfnShape { bt: parse_env("BT", 2750), d: parse_env("D", 768), ff: parse_env("FF", 3072) };
-    let amx = std::env::var("SVOD_AMX").as_deref() == Ok("1");
-
-    eprintln!(
-        "\n=== Conformer FFN bench  shape: B*T={} D={} FF={} dtype=f32 amx={} ===",
-        shape.bt, shape.d, shape.ff, amx
-    );
+    eprintln!("\n=== Conformer FFN bench  shape: B*T={} D={} FF={} dtype=f32 ===", shape.bt, shape.d, shape.ff);
     eprintln!("Per-iter FLOPs: {:.2} G", shape.flops() as f64 / 1e9);
 
     let mut group = c.benchmark_group("conformer_ffn");

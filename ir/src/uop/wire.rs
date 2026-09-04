@@ -16,7 +16,7 @@ use crate::{
     CustomFunctionKind, InsArg, KernelInfo, Op, ParamArg, ReduceOp, TernaryOp, UOp, UnaryOp, WmmaMetadata,
 };
 
-pub const OPTIMIZER_WIRE_SCHEMA_VERSION: u32 = 1;
+pub const OPTIMIZER_WIRE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptimizerWireGraph {

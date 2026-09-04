@@ -136,32 +136,6 @@ impl Renderer for LlvmTextRenderer {
         }
 
         // -- Build function body --
-        // WMMA scratch buffers — one alloca + ptrtoint per (A, B, C) operand.
-        // Allocas placed in the entry block so LLVM's mem2reg can promote them
-        // to vector registers across loop iterations. Without this, the WMMA
-        // accumulator is materialized to memory every K iteration.
-        //
-        // CPU/AMX only: the AMX tensor cores can only load operands from memory,
-        // so they need these scratch slots. The AMDGPU path lowers WMMA straight
-        // to `llvm.amdgcn.wmma.*` intrinsics over SSA vectors (see `amd::wmma`),
-        // so emitting these allocas there is dead IR. Matches tinygrad's
-        // `AMDLLVMRenderer`, which only preallocates on the `tc.amx` path.
-        let wmma_count = nodes.iter().filter(|n| matches!(n.op(), Op::Wmma(..))).count();
-        if wmma_count > 0 && matches!(self.target, LlvmTarget::Cpu) {
-            kernel.push("  ; WMMA AMX scratch buffers".to_string());
-            for node in &nodes {
-                if let Op::Wmma(ops::Wmma { a, b, c, .. }) = node.op() {
-                    for (i, src) in [a, b, c].iter().enumerate() {
-                        let dtype = ldt(&src.dtype());
-                        let base = format!("%wmma_{}_amx{}", node.id, i);
-                        let ptr_name = format!("%wmma_{}_ptr_amx{}", node.id, i);
-                        let align = src.dtype().bytes();
-                        kernel.push(format!("  {base} = alloca {dtype}, align {align}"));
-                        kernel.push(format!("  {ptr_name} = ptrtoint ptr {base} to i64"));
-                    }
-                }
-            }
-        }
         kernel.push("".to_string());
 
         for node in &nodes {

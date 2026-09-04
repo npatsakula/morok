@@ -410,7 +410,6 @@ fn canonical_wmma_metadata_preserves_axes_and_target() {
             c: vec![(AxisId::Unrenumbered(5), 8)],
         }),
         reduce_axes: vec![axis],
-        tile_grid: (2, 1),
     };
     let wmma = UOp::new(
         Op::Wmma(ops::Wmma {

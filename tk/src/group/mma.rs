@@ -17,7 +17,7 @@ use crate::tile::RT;
 /// single source of truth — `schedule::optimizer::renderer`) into the IR
 /// [`WmmaMetadata`] that a hand-built [`Op::Wmma`](svod_ir::Op::Wmma) consumes.
 ///
-/// `dims`/`dtype_in`/`dtype_out`/`threads`/`tile_grid` copy straight across. The
+/// `dims`/`dtype_in`/`dtype_out`/`threads` copy straight across. The
 /// `upcast_axes` are `log2(elements_per_thread)` size-2 entries per operand
 /// (mirrors the optimizer's `tc.rs` construction, where every upcast/reduce split
 /// is by 2). The direct TK path has no RANGE nodes, so these are stable structural
@@ -41,7 +41,6 @@ fn wmma_from_tc(tc: &TensorCore, device: RendererDevice) -> WmmaMetadata {
             c: axes(tc.elements_per_thread.2),
         }),
         reduce_axes: vec![],
-        tile_grid: tc.tile_grid,
     }
 }
 

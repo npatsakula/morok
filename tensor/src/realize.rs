@@ -1730,13 +1730,7 @@ pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &Prepar
 /// Get the optimizer renderer for a device.
 pub(crate) fn get_optimizer_renderer(device: &Device) -> svod_schedule::OptimizerRenderer {
     let renderer = match device.device {
-        DeviceSpec::Cpu => {
-            if std::env::var("SVOD_AMX").as_deref() == Ok("1") {
-                svod_schedule::OptimizerRenderer::apple_amx()
-            } else {
-                svod_schedule::OptimizerRenderer::cpu()
-            }
-        }
+        DeviceSpec::Cpu => svod_schedule::OptimizerRenderer::cpu(),
         DeviceSpec::Cuda { .. } => svod_schedule::OptimizerRenderer::cuda(),
         DeviceSpec::Metal { .. } => svod_schedule::OptimizerRenderer::metal(),
         // AMD picks the profile (wave size, LDS, WMMA/MFMA tensor cores) from

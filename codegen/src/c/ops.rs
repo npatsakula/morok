@@ -472,16 +472,6 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Wmma(ops::Wmma { a, b, c, metadata }) => {
-            let a_val = ctx.get(a).to_string();
-            let b_val = ctx.get(b).to_string();
-            let c_val = ctx.get(c).to_string();
-            let expr = format!("__{name}({a_val}, {b_val}, {c_val})", name = metadata.name);
-            let dtype = shaped_dtype(uop);
-            ctx.emit_expr_dtype(uop, expr, "wmma", kernel, &dtype, false);
-            Some(())
-        }
-
         Op::CustomI(ops::CustomI { deps, code }) => {
             let args: Vec<String> = deps.iter().map(|dep| ctx.get(dep).to_string()).collect();
             let expr = match format_custom_template_strict(code, &args) {

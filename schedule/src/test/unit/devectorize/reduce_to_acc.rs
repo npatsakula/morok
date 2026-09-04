@@ -27,7 +27,6 @@ fn test_wmma(c: Arc<UOp>) -> Arc<UOp> {
             threads: 32,
             upcast_axes: None,
             reduce_axes: vec![],
-            tile_grid: (1, 1),
         },
     )
 }

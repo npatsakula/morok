@@ -122,7 +122,6 @@ fn shaped_load(offsets: &[i64]) -> Arc<UOp> {
 #[test_case(&[0, 1, 2, 3], Renderer::cpu(), 1, 4; "width four is one group")]
 #[test_case(&[0, 1, 2, 3, 4, 5, 6, 7], Renderer::cpu(), 2, 4; "width eight is two float4 groups")]
 #[test_case(&[0, 1, 2, 3, 8, 9, 10, 11], Renderer::cpu(), 2, 4; "a gap is not bridged into one access")]
-#[test_case(&(0..16).collect::<Vec<_>>(), Renderer::apple_amx(), 1, 16; "amx folds a whole sixteen lane register")]
 fn a_shaped_load_splits_into_target_width_groups(
     offsets: &[i64],
     renderer: Renderer,

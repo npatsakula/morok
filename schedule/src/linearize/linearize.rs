@@ -621,7 +621,7 @@ fn partial_wmma_axes_cmp(left: &WmmaAxes, right: &WmmaAxes) -> Option<Ordering> 
 
 fn tinygrad_renderer_device(device: svod_ir::RendererDevice) -> &'static str {
     match device {
-        svod_ir::RendererDevice::Cpu | svod_ir::RendererDevice::AppleAmx => "CPU",
+        svod_ir::RendererDevice::Cpu => "CPU",
         svod_ir::RendererDevice::CudaSm75 | svod_ir::RendererDevice::CudaSm80 | svod_ir::RendererDevice::CudaSm89 => {
             "CUDA"
         }

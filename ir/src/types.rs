@@ -1360,15 +1360,12 @@ impl WmmaUpcastAxes {
 
 /// Identifies which renderer / TC backend a kernel or WMMA op was generated for.
 ///
-/// More granular than [`DeviceSpec`] (which describes the runtime target) — a
-/// CPU+AMX kernel runs on `DeviceSpec::Cpu` but its renderer is
-/// `RendererDevice::AppleAmx`, and the distinction matters for codegen
-/// gating (e.g., wider load/store folds only apply to AMX TC accumulators).
+/// More granular than [`DeviceSpec`] (which describes the runtime target): the
+/// renderer selects the tensor-core table and codegen gating for that target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum RendererDevice {
     Cpu,
-    AppleAmx,
     CudaSm75,
     CudaSm80,
     CudaSm89,
@@ -1386,7 +1383,6 @@ impl RendererDevice {
     pub const fn canonical(&self) -> &'static str {
         match self {
             Self::Cpu => "CPU",
-            Self::AppleAmx => "AppleAMX",
             Self::CudaSm75 => "CUDA_SM75",
             Self::CudaSm80 => "CUDA_SM80",
             Self::CudaSm89 => "CUDA_SM89",
@@ -1400,13 +1396,9 @@ impl RendererDevice {
         }
     }
 
-    pub const fn is_apple_amx(&self) -> bool {
-        matches!(self, Self::AppleAmx)
-    }
-
     /// True if the device exposes a hardware cache-invalidation primitive.
     /// Only NV CUDA and AMD runtimes implement `invalidate_caches`; Metal,
-    /// IntelXe, WebGpu, CPU, and Apple AMX have no such primitive and must
+    /// IntelXe, WebGpu, and CPU have no such primitive and must
     /// rely on the software fallback (or run warm-cache).
     pub const fn has_hardware_cache_invalidate(&self) -> bool {
         matches!(
@@ -1449,11 +1441,6 @@ pub struct WmmaMetadata {
     pub upcast_axes: Option<WmmaUpcastAxes>,
     /// TC reduce axis IDs (used for exclude_args in expansion).
     pub reduce_axes: Vec<AxisId>,
-    /// Tile grid for multi-FMA batching (tile_y_count, tile_x_count).
-    ///
-    /// When > (1, 1), uses load-pair mode and emits multiple FMAs per K iteration
-    /// to compute a 2×2 grid of output tiles. Default is (1, 1).
-    pub tile_grid: (usize, usize),
 }
 
 /// Wrapper for ConstValue that implements Eq and Hash.

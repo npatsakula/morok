@@ -567,7 +567,6 @@ Wmma {
 | `threads` | `usize` | Потоков на warp (обычно 32) |
 | `upcast_axes` | `WmmaUpcastAxes` | Векторизация для каждого операнда (поля: `a`, `b`, `c`) |
 | `reduce_axes` | `Vec<(usize, usize)>` | Оси свёртки |
-| `tile_grid` | `(usize, usize)` | Грид для мульти-FMA батчинга (по умолчанию (1,1)) |
 
 **Пример:**
 ```mermaid

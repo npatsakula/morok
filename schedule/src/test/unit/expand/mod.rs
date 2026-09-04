@@ -17,7 +17,6 @@ fn wmma_metadata(name: &str, upcast_axes: Option<WmmaUpcastAxes>) -> WmmaMetadat
         threads: 32,
         upcast_axes,
         reduce_axes: vec![],
-        tile_grid: (1, 1),
     }
 }
 

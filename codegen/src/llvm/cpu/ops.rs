@@ -445,83 +445,6 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             None
         }
 
-        Op::Wmma(ops::Wmma { a, b, c, metadata }) => {
-            // Apple AMX matmul.
-            //
-            // Stack slots `wmma_<id>_amx{0,1,2}` were pre-allocated in the
-            // function entry block (see `llvm/text/mod.rs`); LLVM's mem2reg
-            // pass promotes them to registers across loop iterations, which
-            // is the whole reason for using LLVM here over the C backend.
-            //
-            // Per call: store the 3 src vectors into their allocas, then
-            // `ldz×16 + ldx + ldy + fma + stz×16` via AMX inline asm. The C
-            // operand is a flat 256-elem accumulator; A and B are 16-elem
-            // input vectors. The AMX(op, gpr) macro encodes the row index
-            // and byte offset into the gpr for ldz/stz.
-            let a_val = ctx.get(a);
-            let b_val = ctx.get(b);
-            let c_val = ctx.get(c);
-            let a_dtype = ldt(&a.dtype());
-            let b_dtype = ldt(&b.dtype());
-            let c_dtype = ldt(&c.dtype());
-            let a_align = a.dtype().bytes();
-            let b_align = b.dtype().bytes();
-            let c_align = c.dtype().bytes();
-
-            let id = uop.id;
-            let amx0 = format!("%wmma_{id}_amx0");
-            let amx1 = format!("%wmma_{id}_amx1");
-            let amx2 = format!("%wmma_{id}_amx2");
-            let ptr0 = format!("%wmma_{id}_ptr_amx0");
-            let ptr1 = format!("%wmma_{id}_ptr_amx1");
-            let ptr2 = format!("%wmma_{id}_ptr_amx2");
-
-            // 1. Store A, B, C into their pre-allocated stack slots.
-            kernel.push(format!("  store {a_dtype} {a_val}, ptr {amx0}, align {a_align}"));
-            kernel.push(format!("  store {b_dtype} {b_val}, ptr {amx1}, align {b_align}"));
-            kernel.push(format!("  store {c_dtype} {c_val}, ptr {amx2}, align {c_align}"));
-
-            // 2. AMX_SET(0): enable the AMX coprocessor on this thread.
-            // Without this, every subsequent AMX instruction traps with
-            // SIGILL because the coprocessor is in disabled state.
-            // Encoding: `nop;nop;nop;.word (0x201000 + (17 << 5) + 0)`
-            // = `0x201220`.
-            kernel.push(amx_set_inline_asm(0));
-
-            // 3. ldz × N rows of the C accumulator into Z registers.
-            // AMX `ldz` op = 4. Each row is 64 bytes; row index is encoded in bits 56-59 (i*4<<56),
-            // byte offset is bits 0-9 (i*64). The bytes_per_elem in the encoding is fixed at
-            // 4 because AMX TC is fp32-only.
-            let n_rows = metadata.dims.0; // typically 16 for fp32
-            for i in 0..n_rows {
-                let off = ((i as u64 * 4) << 56) | (i as u64 * 64);
-                let ld_name = format!("%wmma_{id}_ld{i}");
-                kernel.push(format!("  {ld_name} = add i64 {ptr2}, {off}"));
-                kernel.push(amx_inline_asm(4, &ld_name));
-            }
-
-            // 4. ldx (A → X), ldy (B → Y), fma32.
-            kernel.push(amx_inline_asm(0, &ptr1));
-            kernel.push(amx_inline_asm(1, &ptr0));
-            kernel.push(amx_inline_asm_imm(12, 0));
-
-            // 5. stz × N rows of Z back into the C accumulator's stack slot.
-            for i in 0..n_rows {
-                let off = ((i as u64 * 4) << 56) | (i as u64 * 64);
-                let st_name = format!("%wmma_{id}_st{i}");
-                kernel.push(format!("  {st_name} = add i64 {ptr2}, {off}"));
-                kernel.push(amx_inline_asm(5, &st_name));
-            }
-
-            // 6. AMX_SET(1): disable the AMX coprocessor. Pairs with the
-            // enable above.
-            kernel.push(amx_set_inline_asm(1));
-
-            // 7. Load the WMMA result back from the C accumulator stack slot.
-            kernel.push(format!("  {dst} = load {c_dtype}, ptr {amx2}, align {c_align}"));
-            Some(())
-        }
-
         Op::After(ops::After { passthrough, .. }) => {
             #[cfg(debug_assertions)]
             if matches!(passthrough.op(), Op::Range(..)) {
@@ -684,46 +607,6 @@ fn splat_or_literal(scalar_lit: &str, dtype: &DType, kernel: &mut Vec<String>, n
          <1 x {scalar_ty}> poison, <{n} x i32> zeroinitializer"
     ));
     splat_v
-}
-
-/// Emit an `AMX_SET` instruction that toggles the AMX coprocessor's
-/// per-thread state. `imm5 = 0` enables AMX (must run before any other
-/// AMX instruction); `imm5 = 1` disables it (must run when leaving the
-/// AMX block to release the corruption surface).
-///
-/// Encoding: three NOP cycles to drain the pipeline, then a fixed 32-bit
-/// word at `0x201000 + (17 << 5) + imm5`. `17` is the AMX_SET op slot.
-/// Same encoding as the `AMX_SET` macro in svod's C backend
-/// (`codegen/src/c/amx.rs:39`).
-fn amx_set_inline_asm(imm5: u32) -> String {
-    let opcode = 0x201000u32 + (17 << 5) + imm5;
-    format!(
-        "  tail call void asm sideeffect \"nop\\0Anop\\0Anop\\0A.word ({opcode})\", \
-         \"~{{memory}}\"()"
-    )
-}
-
-/// Emit an Apple AMX inline asm instruction that takes a 64-bit register
-/// operand.
-///
-/// The `.word` directive emits the AMX-encoded instruction; the encoding
-/// `0x201000+(op<<5)+gpr-...` selects the AMX op and which AArch64 GPR
-/// carries the operand. `sideeffect` is required so LLVM doesn't DCE the
-/// AMX state-mutating instruction.
-fn amx_inline_asm(op: u32, gpr_name: &str) -> String {
-    format!(
-        "  tail call void asm sideeffect \".word (0x201000+($0<<5)+0$1-((0$1>>4)*6))\", \
-         \"i,r,~{{memory}}\"(i32 {op}, i64 {gpr_name})"
-    )
-}
-
-/// Emit an AMX inline asm instruction with an immediate operand instead of a
-/// register (used for `fma32` where the operand encoding is `0`).
-fn amx_inline_asm_imm(op: u32, imm: u64) -> String {
-    format!(
-        "  tail call void asm sideeffect \".word (0x201000+($0<<5)+0$1-((0$1>>4)*6))\", \
-         \"i,r,~{{memory}}\"(i32 {op}, i64 {imm})"
-    )
 }
 
 fn binary_instr(op: BinaryOp, dtype: &DType) -> &'static str {

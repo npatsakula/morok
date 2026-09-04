@@ -11,7 +11,6 @@
 //! void kernel(float* restrict data0, const int N) { /* body */ }
 //! ```
 
-mod amx;
 pub mod ops;
 pub mod types;
 
@@ -115,15 +114,6 @@ impl crate::Renderer for CRenderer {
             code_lines.push(td.clone());
         }
         if !typedefs.is_empty() {
-            code_lines.push("".to_string());
-        }
-
-        // WMMA (AMX) defines and static functions
-        let wmma_defines = amx::collect_wmma_defines(&nodes);
-        for def in &wmma_defines {
-            code_lines.push(def.clone());
-        }
-        if !wmma_defines.is_empty() {
             code_lines.push("".to_string());
         }
 

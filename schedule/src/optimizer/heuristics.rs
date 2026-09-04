@@ -42,9 +42,7 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     debug!("hand_coded_optimizations: starting");
 
     // 1. Tensor cores (skip other opts if applied). Try TC first; return on
-    // success on non-AMX (with post-TC UPCAST/LOCAL extras), or fall through
-    // on AMX to the regular UPCAST → THREAD → LOCAL chain. The "skip post-TC
-    // on AMX" branch is implemented inside `try_tensor_cores`.
+    // success (with post-TC UPCAST/LOCAL extras).
     if try_tensor_cores(scheduler, config) {
         debug!("hand_coded_optimizations: tensor cores applied, skipping remaining opts");
         return;
@@ -963,7 +961,7 @@ pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
 ///
 /// - Guard: skip when >1 reduce axis unless tc_opt >= 1
 /// - Apply TC opts via tc::apply, capturing returned axes `[N, M, K]`
-/// - Post-TC (non-AMX only): UPCAST M then N with `[5,4,3,2]`, LOCAL N with `[4,2]`
+/// - Post-TC: UPCAST M then N with `[5,4,3,2]`, LOCAL N with `[4,2]`
 pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     use crate::optimizer::config::TcUsage;
     use crate::optimizer::tc;
@@ -1042,16 +1040,7 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         );
         trial.applied_opts.push(opt);
 
-        // On AMX, discard the TC'd `trial` and fall through to the regular
-        // UPCAST → THREAD → LOCAL chain on the untouched scheduler.
-        // Previously svod committed the TC'd trial back into the scheduler
-        // on AMX, producing kernels with TC + 8 internal `U(0)/U(1)` upcasts
-        // and bloated LLVM IR.
-        if trial.renderer().is_amx() {
-            return false;
-        }
-
-        // Non-AMX post-TC extras: UPCAST M/N then LOCAL N.
+        // Post-TC extras: UPCAST M/N then LOCAL N.
         {
             let mut tc_rngs = [axes[0].clone(), axes[1].clone()];
 

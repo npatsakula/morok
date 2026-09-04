@@ -107,7 +107,6 @@ fn fixture(name: &str) -> std::sync::Arc<UOp> {
                     threads: 1,
                     upcast_axes: None,
                     reduce_axes: vec![],
-                    tile_grid: (1, 1),
                 },
             )
         }

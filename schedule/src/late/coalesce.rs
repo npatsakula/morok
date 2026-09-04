@@ -368,12 +368,6 @@ pub fn memory_coalescing(sink: Arc<UOp>, ctx: &Renderer) -> Arc<UOp> {
         } else if ctx.supports_float4 {
             if buffer.dtype() == DType::Float16 && env_enabled("ALLOW_HALF8") {
                 lengths.extend_from_slice(&[8, 4, 2]);
-            } else if ctx.is_amx() {
-                // The Apple matrix coprocessor loads a full 16-lane register in
-                // one access (tinygrad 1f8b24a6b `devectorizer.py:140-152`; the
-                // arm went away at the current pin only because the AMX backend
-                // did).
-                lengths.extend_from_slice(&[16, 8, 4, 2]);
             } else {
                 lengths.extend_from_slice(&[4, 2]);
             }

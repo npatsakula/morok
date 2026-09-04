@@ -61,7 +61,6 @@ fn optimizer_wire_roundtrips_reduce_symbolic_wmma_multi_and_calls() {
                     c: vec![(AxisId::Renumbered(2), 4)],
                 }),
                 reduce_axes: vec![AxisId::RenumberedPath(smallvec![2, 1])],
-                tile_grid: (2, 2),
             }),
         }),
         DType::Float32,

@@ -170,7 +170,6 @@ PTRCAT consecutive pointer accesses ग्रुप करता है:
 | डिवाइस | Fold Lengths | नोट्स |
 |---------|-------------|-------|
 | GPU (standard) | 4, 2, 1 | स्टैंडर्ड GPU वेक्टराइज़ेशन |
-| GPU (AMX) | 16, 8, 4, 2, 1 | Apple AMX सपोर्ट |
 | Image | 4, 1 | Image textures के लिए फ़िक्स्ड |
 | No-fold | 1 | स्केलर फ़ॉलबैक (forced) |
 
