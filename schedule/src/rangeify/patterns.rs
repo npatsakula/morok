@@ -107,14 +107,19 @@ pub fn is_elementwise(uop: &Arc<UOp>) -> bool {
 // EARLY CLEANUP PATTERNS
 // ============================================================================
 
-/// Both `Mul` operands are sized integers that `wide` (a sized integer) holds
-/// exactly, so forming the product at `wide` cannot wrap.
+/// Both `Mul` operands are non-constant sized integers that `wide` (a sized
+/// integer) holds exactly, so forming the product at `wide` cannot wrap. A
+/// constant operand is excluded: `neg(x)` is `x * -1`, and a `-1` already
+/// materialised in the narrow type (255 for uint8) must keep wrapping.
 fn widens_int_product(a: &Arc<UOp>, b: &Arc<UOp>, wide: &DType) -> bool {
     let sized_int = |dtype: &DType| dtype.scalar().is_some_and(|s| s.is_signed() || s.is_unsigned());
     sized_int(wide)
         && [a, b].iter().all(|operand| {
             let dtype = operand.dtype();
-            sized_int(&dtype) && dtype != *wide && DType::can_safe_cast(dtype, wide.clone())
+            !matches!(operand.base().op(), Op::Const(..) | Op::VConst(..))
+                && sized_int(&dtype)
+                && dtype != *wide
+                && DType::can_safe_cast(dtype, wide.clone())
         })
 }
 

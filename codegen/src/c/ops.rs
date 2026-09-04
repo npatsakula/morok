@@ -579,27 +579,36 @@ fn render_access(index: &Arc<UOp>, access_dtype: &DType, address: &str) -> Strin
     }
 }
 
+/// C evaluates scalar arithmetic on types narrower than `int` at `int` width,
+/// and an inlined expression never rounds back down. Cast such results to the
+/// IR dtype so `int8` wraps like every other backend.
+fn narrow_int(expr: String, dtype: &DType) -> String {
+    let narrow =
+        matches!(dtype.base(), ScalarDType::Int8 | ScalarDType::UInt8 | ScalarDType::Int16 | ScalarDType::UInt16);
+    if narrow && dtype.vcount() == 1 { format!("(({}){expr})", c_dtype(dtype)) } else { expr }
+}
+
 /// Render a binary operation as a C expression.
 fn render_binary(op: BinaryOp, l: &str, r: &str, dtype: &DType) -> String {
     match op {
         BinaryOp::FloorDiv | BinaryOp::FloorMod => unreachable!("floor div/mod must be decomposed before C rendering"),
-        BinaryOp::Add => format!("({l} + {r})"),
-        BinaryOp::Sub => format!("({l} - {r})"),
-        BinaryOp::Mul => format!("({l} * {r})"),
+        BinaryOp::Add => narrow_int(format!("({l} + {r})"), dtype),
+        BinaryOp::Sub => narrow_int(format!("({l} - {r})"), dtype),
+        BinaryOp::Mul => narrow_int(format!("({l} * {r})"), dtype),
         BinaryOp::Fdiv => format!("({l} / {r})"),
-        BinaryOp::CDiv => format!("({l} / {r})"),
+        BinaryOp::CDiv => narrow_int(format!("({l} / {r})"), dtype),
         BinaryOp::CMod => {
             if dtype.is_float() {
                 format!("{}({l}, {r})", c_math_fn("__builtin_fmod", dtype))
             } else {
-                format!("({l} % {r})")
+                narrow_int(format!("({l} % {r})"), dtype)
             }
         }
         BinaryOp::Max => {
             if dtype.is_float() {
                 format!("{}({l}, {r})", c_math_fn("__builtin_fmax", dtype))
             } else {
-                format!("({l} > {r} ? {l} : {r})")
+                narrow_int(format!("({l} > {r} ? {l} : {r})"), dtype)
             }
         }
         BinaryOp::Lt => format!("({l} < {r})"),
@@ -608,11 +617,11 @@ fn render_binary(op: BinaryOp, l: &str, r: &str, dtype: &DType) -> String {
         BinaryOp::Ge => format!("({l} >= {r})"),
         BinaryOp::Eq => format!("({l} == {r})"),
         BinaryOp::Ne => format!("({l} != {r})"),
-        BinaryOp::And => format!("({l} & {r})"),
-        BinaryOp::Or => format!("({l} | {r})"),
-        BinaryOp::Xor => format!("({l} ^ {r})"),
-        BinaryOp::Shl => format!("({l} << {r})"),
-        BinaryOp::Shr => format!("({l} >> {r})"),
+        BinaryOp::And => narrow_int(format!("({l} & {r})"), dtype),
+        BinaryOp::Or => narrow_int(format!("({l} | {r})"), dtype),
+        BinaryOp::Xor => narrow_int(format!("({l} ^ {r})"), dtype),
+        BinaryOp::Shl => narrow_int(format!("({l} << {r})"), dtype),
+        BinaryOp::Shr => narrow_int(format!("({l} >> {r})"), dtype),
         BinaryOp::Pow => {
             if dtype.is_float() {
                 format!("{}({l}, {r})", c_math_fn("__builtin_pow", dtype))
@@ -621,28 +630,26 @@ fn render_binary(op: BinaryOp, l: &str, r: &str, dtype: &DType) -> String {
                 format!("(({})__builtin_pow((double){l}, (double){r}))", c_dtype(&DType::Scalar(dtype.base())))
             }
         }
-        BinaryOp::Threefry => format!("({l} ^ {r})"),
+        BinaryOp::Threefry => narrow_int(format!("({l} ^ {r})"), dtype),
     }
 }
 
 /// Render a unary operation as a C expression.
 fn render_unary(op: UnaryOp, s: &str, dtype: &DType) -> String {
     match op {
-        UnaryOp::Neg => {
-            format!("(-{s})")
-        }
+        UnaryOp::Neg => narrow_int(format!("(-{s})"), dtype),
         UnaryOp::Not => {
             if dtype.is_bool() {
                 format!("(!{s})")
             } else {
-                format!("(~{s})")
+                narrow_int(format!("(~{s})"), dtype)
             }
         }
         UnaryOp::Abs => {
             if dtype.is_float() {
                 format!("{}({s})", c_math_fn("__builtin_fabs", dtype))
             } else {
-                format!("({s} < 0 ? -{s} : {s})")
+                narrow_int(format!("({s} < 0 ? -{s} : {s})"), dtype)
             }
         }
         UnaryOp::Sqrt => format!("{}({s})", c_math_fn("__builtin_sqrt", dtype)),

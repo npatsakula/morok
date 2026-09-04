@@ -383,6 +383,23 @@ crate::codegen_tests! {
         assert_eq!(c.as_vec::<i32>().unwrap(), vec![318]);
     }
 
+    /// Narrow integer arithmetic wraps at its own width on every backend before
+    /// a widening cast sees it: `neg` is a product with a wrapped `-1`, and C
+    /// evaluates `signed char` arithmetic at `int` width unless told otherwise.
+    fn test_narrow_int_arithmetic_wraps_before_widening(config) {
+        let realized = |t: Tensor| {
+            let mut t = t.cast(DType::Int32).unwrap();
+            t.realize_with(&config).unwrap();
+            t.as_vec::<i32>().unwrap()
+        };
+        let u8s = Tensor::from_slice([1u8, 2, 200]);
+        assert_eq!(realized(u8s.try_neg().unwrap()), vec![255, 254, 56]);
+        assert_eq!(realized(u8s.try_sub(&Tensor::from_slice([2u8, 1, 100])).unwrap()), vec![255, 1, 100]);
+        assert_eq!(realized(u8s.lshift(&Tensor::from_slice([4u8, 4, 4])).unwrap()), vec![16, 32, 128]);
+        let i8s = Tensor::from_slice([100i8, -128, 127]);
+        assert_eq!(realized(i8s.try_add(&i8s).unwrap()), vec![-56, 0, -2]);
+    }
+
     /// The same widening reaches `conv`: an int8 1x1 convolution with an int32
     /// accumulator forms int32 products.
     fn test_conv_int8_products_do_not_wrap(config) {
