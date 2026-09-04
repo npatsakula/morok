@@ -98,11 +98,12 @@ const REWRITE_STACK_LIMIT: usize = 500_000;
 /// - `n`: the original node (used as key in `replace` dict)
 /// - `stage`: 0 (PushChildren), 1 (ApplyPatterns), or 2 (Link)
 /// - `new_n`: the working copy (may differ from `n` after bpm rewrites or reconstruction)
-#[derive(Clone)]
 struct Entry {
     n: Arc<UOp>,
     stage: u8,
-    new_n: Arc<UOp>,
+    /// The working copy when it differs from `n`; `None` means "same as `n`",
+    /// which saves a refcount pair on every child push and every unchanged node.
+    new_n: Option<Arc<UOp>>,
 }
 
 /// Internal rewrite engine.
@@ -216,23 +217,23 @@ where
 
     /// Record a result in the replace map, with provenance tracking.
     #[inline]
-    fn record_replace(&mut self, original: &Arc<UOp>, result: Arc<UOp>) {
-        if !Arc::ptr_eq(original, &result) {
-            crate::provenance::record_transformed(result.id, original.id, crate::provenance::PassName::RewritePattern);
+    fn record_replace(&mut self, original_id: u64, result: Arc<UOp>) {
+        if result.id != original_id {
+            crate::provenance::record_transformed(result.id, original_id, crate::provenance::PassName::RewritePattern);
         }
-        self.replace.insert(original.id, result);
+        self.replace.insert(original_id, result);
     }
 
     /// Main rewrite method — stack-based 3-stage traversal.
     fn rewrite(&mut self, root: Arc<UOp>) -> Arc<UOp> {
-        let mut stack: Vec<Entry> = vec![Entry { n: root.clone(), stage: 0, new_n: root.clone() }];
+        let mut stack: Vec<Entry> = vec![Entry { n: root.clone(), stage: 0, new_n: None }];
 
         // All UOps either on the stack or in self.replace — don't have to be placed again.
         let mut on_stack: FxHashSet<u64> = FxHashSet::default();
         on_stack.insert(root.id);
 
         // UOps waiting on a dependency to be in self.replace.
-        let mut waitlist: FxHashMap<u64, Vec<Entry>> = FxHashMap::default();
+        let mut waitlist: FxHashMap<u64, SmallVec<[Entry; 1]>> = FxHashMap::default();
 
         while let Some(Entry { n, stage, new_n }) = stack.pop() {
             if stack.len() > REWRITE_STACK_LIMIT {
@@ -263,21 +264,20 @@ where
                     self.bpm_seen.clear();
                     let mut gated = false;
                     loop {
-                        if !self.bpm_seen.insert(working.id) {
+                        let cur = working.as_ref().unwrap_or(&n);
+                        if !self.bpm_seen.insert(cur.id) {
                             panic!(
                                 "infinite loop in fixed_point_rewrite: node {:?} (id={}) seen twice",
-                                working.op().as_ref(),
-                                working.id
+                                cur.op().as_ref(),
+                                cur.id
                             );
                         }
-                        match self.cached_bpm_rewrite(&working) {
-                            Ok(Some(rewritten)) => {
-                                working = rewritten;
-                            }
+                        match self.cached_bpm_rewrite(cur) {
+                            Ok(Some(rewritten)) => working = Some(rewritten),
                             Ok(None) => break,
                             Err(gate_node) => {
                                 // Gate: done with this node, don't descend into children
-                                self.record_replace(&n, gate_node);
+                                self.record_replace(n_key, gate_node);
                                 if let Some(entries) = waitlist.remove(&n_key) {
                                     stack.extend(entries);
                                 }
@@ -291,91 +291,91 @@ where
                     }
                 }
 
-                stack.push(Entry { n: n.clone(), stage: 1, new_n: working.clone() });
-
-                let (sources, skipped) = traversal_children(&working, self.traversal_mode);
-                for skipped_child in skipped {
-                    self.replace.entry(skipped_child.id).or_insert_with(|| skipped_child.clone());
-                }
-
-                for child in sources.into_iter().rev() {
-                    let child_key = child.id;
-                    if on_stack.contains(&child_key) {
-                        continue;
+                // Children are collected before `n`/`working` move into the stage-1 entry.
+                let kids: SmallVec<[Arc<UOp>; 4]> = {
+                    let cur = working.as_ref().unwrap_or(&n);
+                    let (sources, skipped) = traversal_children(cur, self.traversal_mode);
+                    for skipped_child in skipped {
+                        self.replace.entry(skipped_child.id).or_insert_with(|| skipped_child.clone());
                     }
-                    stack.push(Entry { n: child.clone(), stage: 0, new_n: child.clone() });
-                    on_stack.insert(child_key);
-                }
+                    sources.into_iter().rev().filter(|child| on_stack.insert(child.id)).cloned().collect()
+                };
+                stack.push(Entry { n, stage: 1, new_n: working });
+                stack.extend(kids.into_iter().map(|child| Entry { n: child, stage: 0, new_n: None }));
             } else if stage == 1 {
-                // Stage 1: ApplyPatterns
-                // Scoped so the borrow of `new_n`'s children ends before `new_n` is consumed.
-                let (tmp, waiting, sources_changed) = {
-                    let sources = new_n.op().children();
-                    let mut tmp: Vec<Arc<UOp>> = Vec::with_capacity(sources.len());
-                    let mut waiting = false;
+                // Stage 1: ApplyPatterns. Sources are resolved by reference: the
+                // common unchanged case allocates nothing and touches no refcounts.
+                let cur = new_n.as_ref().unwrap_or(&n);
+                let (rebuilt, missing) = {
+                    let sources = cur.op().children();
+                    let mut resolved: SmallVec<[&Arc<UOp>; 4]> = SmallVec::with_capacity(sources.len());
                     let mut changed = false;
-
-                    for src in sources {
-                        let src_key = src.id;
-                        if let Some(rx) = self.replace.get(&src_key) {
-                            changed |= !Arc::ptr_eq(rx, src);
-                            tmp.push(rx.clone());
-                        } else {
-                            // Source not ready: register in waitlist
-                            waitlist.entry(src_key).or_default().push(Entry {
-                                n: n.clone(),
-                                stage: 1,
-                                new_n: new_n.clone(),
-                            });
-                            waiting = true;
-                            break;
+                    let mut missing = None;
+                    for src in &sources {
+                        match self.replace.get(&src.id) {
+                            Some(rx) => {
+                                changed |= !Arc::ptr_eq(rx, src);
+                                resolved.push(rx);
+                            }
+                            None => {
+                                missing = Some(src.id);
+                                break;
+                            }
                         }
                     }
-                    (tmp, waiting, changed)
+                    // Hash consing may collapse reconstruction to the same node even when
+                    // sources logically changed; that is treated as unchanged below.
+                    let rebuilt = if missing.is_none() && changed {
+                        Some(cur.with_sources(resolved.iter().map(|r| (*r).clone()).collect()))
+                    } else {
+                        None
+                    };
+                    (rebuilt, missing)
                 };
 
-                if waiting {
+                if let Some(src_key) = missing {
+                    // Source not ready: register in waitlist
+                    waitlist.entry(src_key).or_default().push(Entry { n, stage: 1, new_n });
                     continue;
                 }
 
-                // Hash consing may collapse reconstruction to same node even when
-                // sources logically changed. Detect this and treat as unchanged.
-                let node = if sources_changed {
-                    let reconstructed = new_n.with_sources(tmp);
-                    if Arc::ptr_eq(&reconstructed, &new_n) { new_n.clone() } else { reconstructed }
-                } else {
-                    new_n.clone()
-                };
-
-                if Arc::ptr_eq(&node, &new_n) {
-                    // Sources effectively unchanged: try pm rewrite
-                    if let Some(new_src_n) = self.pm_rewrite(&new_n) {
-                        stack.push(Entry { n: n.clone(), stage: 2, new_n: new_src_n.clone() });
-                        stack.push(Entry { n: new_src_n.clone(), stage: 0, new_n: new_src_n });
-                    } else {
-                        // No pm match — done with this node
-                        self.record_replace(&n, new_n);
-                        if let Some(entries) = waitlist.remove(&n_key) {
-                            stack.extend(entries);
+                match rebuilt {
+                    Some(node) if !Arc::ptr_eq(&node, cur) => {
+                        // Reconstruction produced a new node — process it, then link back
+                        stack.push(Entry { n, stage: 2, new_n: Some(node.clone()) });
+                        stack.push(Entry { n: node, stage: 0, new_n: None });
+                    }
+                    _ => {
+                        // Sources effectively unchanged: try pm rewrite
+                        if let Some(new_src_n) = self.pm_rewrite(cur) {
+                            stack.push(Entry { n, stage: 2, new_n: Some(new_src_n.clone()) });
+                            stack.push(Entry { n: new_src_n, stage: 0, new_n: None });
+                        } else {
+                            // No pm match — done with this node
+                            let result = match new_n {
+                                Some(w) => w,
+                                None => n,
+                            };
+                            self.record_replace(n_key, result);
+                            if let Some(entries) = waitlist.remove(&n_key) {
+                                stack.extend(entries);
+                            }
                         }
                     }
-                } else {
-                    // Reconstruction produced a new node — process it, then link back
-                    stack.push(Entry { n: n.clone(), stage: 2, new_n: node.clone() });
-                    stack.push(Entry { n: node.clone(), stage: 0, new_n: node });
                 }
             } else {
                 // Stage 2: Link
+                let new_n = new_n.expect("stage 2 entries always carry the rewritten node");
                 let new_n_key = new_n.id;
 
                 if let Some(replaced_new_n) = self.replace.get(&new_n_key).cloned() {
-                    self.record_replace(&n, replaced_new_n);
+                    self.record_replace(n_key, replaced_new_n);
                     if let Some(entries) = waitlist.remove(&n_key) {
                         stack.extend(entries);
                     }
                 } else {
                     // Not ready: register in waitlist
-                    waitlist.entry(new_n_key).or_default().push(Entry { n, stage: 2, new_n });
+                    waitlist.entry(new_n_key).or_default().push(Entry { n, stage: 2, new_n: Some(new_n) });
                 }
             }
         }
@@ -417,11 +417,11 @@ where
                 if self.bpm.is_some() {
                     match self.cached_bpm_rewrite(&n) {
                         Ok(Some(rewritten)) => {
-                            self.record_replace(&n, rewritten);
+                            self.record_replace(n.id, rewritten);
                             continue;
                         }
                         Err(gated) => {
-                            self.record_replace(&n, gated);
+                            self.record_replace(n.id, gated);
                             continue;
                         }
                         Ok(None) => {}
@@ -451,7 +451,7 @@ where
                 // Apply pm exactly once on the rebuilt node — replacement is used as-is.
                 let final_n = if self.pm.is_some() { self.pm_rewrite(&rebuilt).unwrap_or(rebuilt) } else { rebuilt };
 
-                self.record_replace(&n, final_n);
+                self.record_replace(n.id, final_n);
             }
         }
 
