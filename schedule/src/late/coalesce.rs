@@ -488,14 +488,14 @@ fn grouped_lane_index(src: &Arc<UOp>, offsets: &Arc<UOp>, lane: usize) -> Arc<UO
 pub fn pm_lower_grouped_shrink() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         Load { index: Shrink { src, offsets, sizes }, alt: None, gate: None }
-            if grouped_width(sizes).is_some() => |src, offsets, sizes| {
+            if grouped_width(sizes).is_some() => {
                 let lanes = (0..grouped_width(sizes)?)
                     .map(|lane| UOp::load().index(grouped_lane_index(src, offsets, lane)).call())
                     .collect();
                 Some(UOp::stack(lanes))
             },
         Store { index: Shrink { src, offsets, sizes }, value: Stack { sources }, gate }
-            if grouped_width(sizes) == Some(sources.len()) => |src, offsets, sources, gate| {
+            if grouped_width(sizes) == Some(sources.len()) => {
                 Some(UOp::group(sources.iter().enumerate().map(|(lane, value)| {
                     UOp::new(
                         Op::Store(ops::Store {
@@ -509,7 +509,7 @@ pub fn pm_lower_grouped_shrink() -> &'static TypedPatternMatcher {
             },
         Index { buffer: Stack { sources }, indices }
             if indices.len() == 1 && integer_constant(&indices[0]).is_some()
-            => |sources, indices| {
+            => {
                 let lane = usize::try_from(integer_constant(&indices[0])?).ok()?;
                 sources.get(lane).cloned()
             },

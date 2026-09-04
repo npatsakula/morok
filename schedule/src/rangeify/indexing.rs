@@ -348,7 +348,7 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
         // reads its inputs through PARAM slots, so each one must already be a
         // buffer — and must stay one, hence non-removable.
         _c @ Call { body, args, info: _ }
-            if matches!(body.op(), Op::Sink(..) | Op::Program(..)) => |_c, args, ctx| {
+            if matches!(body.op(), Op::Sink(..) | Op::Program(..)) => {
             for arg in args {
                 let mut src = Arc::clone(arg);
                 while let Op::Reshape(ops::Reshape { src: inner, .. }) = src.op() {
@@ -365,7 +365,7 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
         // same base buffer (WAR hazard: without the temp, overlapping
         // self-assigns can read a value that an earlier loop iteration
         // already overwrote).
-        x @ Store { index, value } => |x, index, value, ctx| {
+        x @ Store { index, value } => {
             ctx.mark_realize_pending(x);
             // `realize_store_after_src` (indexing.py:37-40): a SLICE that is the
             // direct source of the STORE needs no buffer of its own — the store
@@ -385,8 +385,8 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
             }
             None
         },
-        x @ Contiguous { src: _ } => |x, ctx| { ctx.mark_realize_all(x).ok(); None },
-        x @ Copy { src, .. } => |x, src, ctx| {
+        x @ Contiguous { src: _ } => { ctx.mark_realize_all(x).ok(); None },
+        x @ Copy { src, .. } => {
             ctx.mark_realize_all(x).ok();
             if !is_always_contiguous(&src.base()) {
                 ctx.mark_realize_all(src).ok();
@@ -394,7 +394,7 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
             None
         },
         // MStack/MSelect → realize sources
-        x @ MStack { buffers: _ } => |x, ctx| {
+        x @ MStack { buffers: _ } => {
             for src in x.op().sources() {
                 // realize_srcs: guard on src.base.op, realize src.
                 if !is_always_contiguous(&src.base()) {
@@ -403,7 +403,7 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
             }
             None
         },
-        x @ MSelect { device_index: _ } => |x, ctx| {
+        x @ MSelect { device_index: _ } => {
             for src in x.op().sources() {
                 // realize_srcs: guard on src.base.op, realize src.
                 if !is_always_contiguous(&src.base()) {

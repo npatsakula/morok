@@ -25,7 +25,6 @@ let matcher = patterns! {
 
 The right-hand side may evaluate to `Arc<UOp>`, `Option<Arc<UOp>>` (`None` declines),
 or a `RewriteResult` (so `Gate` is expressible); `?` works inside a block body.
-`~>` is accepted as an alias of `=>` and means the same thing.
 
 ### Variable Binding
 
@@ -81,7 +80,6 @@ Add(x, @zero) => x                       // bare binding: clone of it
 Neg(x) => UOp::neg(x)                    // expression
 Mul(x, y) => x.try_mul(y).ok()           // Option declines with None
 Mul(x, y) => { let r = x.try_mul(y).ok()?; Some(r) }
-Mul(x, y) => |x, y| x.try_mul(y).ok()    // closure form: the parameter list is documentation only
 ```
 
 ### Context-Aware Patterns
@@ -131,9 +129,10 @@ for-blocks; there is no `(Add | Mul)(x, y)` form.
 
 ### Removed forms (do not use)
 
-`Const(0)` literal shorthand, bare `@const`, `(A | B)(..)` alternatives, tuple
-positional form for struct ops (`Store(idx, val)`, `Range(_)`, `Noop()`), and
-`reduce_op: Add | Max` bare-name alternatives. Use the Rust-pattern forms above.
+`~>`, `=> |x, y| body` closure parameter lists, `Const(0)` literal shorthand, bare
+`@const`, `(A | B)(..)` alternatives, tuple positional form for struct ops
+(`Store(idx, val)`, `Range(_)`, `Noop()`), and `reduce_op: Add | Max` bare-name
+alternatives. Use the Rust-pattern forms above.
 
 ## Rewrite Engine API
 
@@ -347,7 +346,7 @@ The rewrite engine semantics match Tinygrad's `unified_rewrite` (ops.py:1177-123
 
 ### Common Pitfalls
 
-1. **Arrows**: `=>` accepts `Arc<UOp>`, `Option<Arc<UOp>>` or `RewriteResult`; `~>` is only an alias
+1. **Arrow**: `=>` accepts `Arc<UOp>`, `Option<Arc<UOp>>` or `RewriteResult`; there is no `~>`
 2. **Wildcard performance**: `x if condition` checked for EVERY op - use specific OpKey patterns
 3. **Commutative**: `Add[x, y]` tries both orderings - use `Add(x, y)` when ordering matters
 4. **Duplicate detection**: `Add(x, x)` auto-generates `Arc::ptr_eq` - only identical variable names

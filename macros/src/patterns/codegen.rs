@@ -319,30 +319,12 @@ fn expand(prefix: Candidate, sites: &[PermuteSite]) -> Result<Vec<Candidate>> {
 fn rewrite_expr(rhs: &RewriteExpr) -> TokenStream2 {
     let body = match rhs {
         RewriteExpr::Var(name) => quote! { std::sync::Arc::clone(#name) },
-        RewriteExpr::Closure(closure) => {
-            let body = &closure.body;
-            quote! { #body }
-        }
         RewriteExpr::Expr(expr) => quote! { #expr },
     };
     quote! { svod_ir::pattern::IntoRewriteResult::into_rewrite_result((|| #body)()) }
 }
 
-fn validate_closure_params(rule: &PatternRule, has_context: bool) -> Result<()> {
-    let RewriteExpr::Closure(closure) = &rule.rhs else { return Ok(()) };
-    for param in &closure.inputs {
-        if !has_context && matches!(param, Pat::Ident(ident) if ident.ident == "ctx") {
-            return Err(Error::new_spanned(
-                param,
-                "`ctx` requires a `@context Type;` declaration at the start of patterns!",
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn generate_rule(rule: &PatternRule, has_context: bool) -> Result<TokenStream2> {
-    validate_closure_params(rule, has_context)?;
     let tree = format_ident!("__tree");
     let no_match = no_match();
     let mut emitter = Emitter::new(Some(quote! { return #no_match; }), DuplicateTracker::default(), Vec::new());

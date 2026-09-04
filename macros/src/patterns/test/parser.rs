@@ -15,20 +15,21 @@ fn alu_args(pattern: &Pattern) -> &[Pattern] {
 }
 
 #[test]
-fn both_arrows_parse_to_the_same_rule() {
-    let tilde: PatternList = syn::parse_quote! { Add(x, @zero) ~> x };
-    let fat: PatternList = syn::parse_quote! { Add(x, @zero) => Some(x.clone()) };
-    for list in [&tilde, &fat] {
+fn bare_binding_and_expression_rewrites() {
+    let bare: PatternList = syn::parse_quote! { Add(x, @zero) => x };
+    let expr: PatternList = syn::parse_quote! { Add(x, @zero) => Some(x.clone()) };
+    for list in [&bare, &expr] {
         assert_eq!(list.items.len(), 1);
         assert!(matches!(rule(list, 0).lhs, Pattern::Alu { op: OpRef::Named(_), commutative: false, .. }));
     }
-    assert!(matches!(rule(&tilde, 0).rhs, RewriteExpr::Var(_)));
-    assert!(matches!(rule(&fat, 0).rhs, RewriteExpr::Expr(_)));
+    assert!(matches!(rule(&bare, 0).rhs, RewriteExpr::Var(_)));
+    assert!(matches!(rule(&expr, 0).rhs, RewriteExpr::Expr(_)));
+    assert!(syn::parse_str::<PatternList>("Add(x, @zero) ~> x").is_err());
 }
 
 #[test]
 fn binding_and_wildcard_arguments() {
-    let input: PatternList = syn::parse_quote! { Mul(_, zero @ @zero) ~> zero };
+    let input: PatternList = syn::parse_quote! { Mul(_, zero @ @zero) => zero };
     let args = alu_args(&rule(&input, 0).lhs);
     assert!(matches!(args[0], Pattern::Wildcard));
     assert!(
@@ -38,22 +39,22 @@ fn binding_and_wildcard_arguments() {
 
 #[test]
 fn special_constants() {
-    let input: PatternList = syn::parse_quote! { Add(x, @zero) ~> x, Mul(x, @one) ~> x };
+    let input: PatternList = syn::parse_quote! { Add(x, @zero) => x, Mul(x, @one) => x };
     assert!(matches!(alu_args(&rule(&input, 0).lhs)[1], Pattern::Zero));
     assert!(matches!(alu_args(&rule(&input, 1).lhs)[1], Pattern::One));
 }
 
 #[test]
 fn unknown_at_form_is_rejected() {
-    assert!(syn::parse_str::<PatternList>("Add(x, @const) ~> x").is_err());
+    assert!(syn::parse_str::<PatternList>("Add(x, @const) => x").is_err());
 }
 
 #[test]
 fn const_takes_a_rust_pattern() {
     let input: PatternList = syn::parse_quote! {
-        Add(x, Const(_)) ~> x,
-        Add(x, Const(ConstValue::Int(0))) ~> x,
-        Add(x, c @ Const(v)) ~> x,
+        Add(x, Const(_)) => x,
+        Add(x, Const(ConstValue::Int(0))) => x,
+        Add(x, c @ Const(v)) => x,
     };
     assert!(matches!(alu_args(&rule(&input, 0).lhs)[1], Pattern::Const(syn::Pat::Wild(_))));
     assert!(matches!(alu_args(&rule(&input, 1).lhs)[1], Pattern::Const(syn::Pat::TupleStruct(_))));
@@ -66,9 +67,9 @@ fn const_takes_a_rust_pattern() {
 #[test]
 fn value_extractors() {
     let input: PatternList = syn::parse_quote! {
-        Neg(c@const(cv)) ~> c,
-        Neg(_c @vconst(vs)) ~> v,
-        Neg(a @anyconst(vals)) ~> a,
+        Neg(c@const(cv)) => c,
+        Neg(_c @vconst(vs)) => v,
+        Neg(a @anyconst(vals)) => a,
     };
     assert!(
         matches!(&alu_args(&rule(&input, 0).lhs)[0], Pattern::ConstValue { uop, value } if uop == "c" && value == "cv")
@@ -83,14 +84,14 @@ fn value_extractors() {
 
 #[test]
 fn commutative_uses_brackets() {
-    let input: PatternList = syn::parse_quote! { Add[x, @zero] ~> x, Sub(x, @zero) ~> x };
+    let input: PatternList = syn::parse_quote! { Add[x, @zero] => x, Sub(x, @zero) => x };
     assert!(matches!(rule(&input, 0).lhs, Pattern::Alu { commutative: true, .. }));
     assert!(matches!(rule(&input, 1).lhs, Pattern::Alu { commutative: false, .. }));
 }
 
 #[test]
 fn unit_op_versus_variable() {
-    let input: PatternList = syn::parse_quote! { noop @ Noop ~> noop, x if cond(x) ~> x };
+    let input: PatternList = syn::parse_quote! { noop @ Noop => noop, x if cond(x) => x };
     assert!(matches!(&rule(&input, 0).lhs, Pattern::Binding { pattern, .. } if matches!(**pattern, Pattern::Unit(_))));
     assert!(matches!(rule(&input, 1).lhs, Pattern::Var(_)));
     assert!(rule(&input, 1).guard.is_some());
@@ -101,9 +102,9 @@ fn unit_op_versus_variable() {
 #[test]
 fn struct_fields_split_into_child_and_verbatim() {
     let input: PatternList = syn::parse_quote! {
-        Load { index: Index { buffer, .. }, alt: None, gate: Some(g) } ~> g,
-        Range { end, axis_type: AxisType::Upcast, axis_id: id @ AxisId::Renumbered(_), .. } ~> end,
-        Reduce { .. } ~> x,
+        Load { index: Index { buffer, .. }, alt: None, gate: Some(g) } => g,
+        Range { end, axis_type: AxisType::Upcast, axis_id: id @ AxisId::Renumbered(_), .. } => end,
+        Reduce { .. } => x,
     };
     let Pattern::Struct { op, fields } = &rule(&input, 0).lhs else { panic!("expected struct") };
     assert_eq!(op.to_string(), "Load");
@@ -123,7 +124,7 @@ fn struct_fields_split_into_child_and_verbatim() {
 #[test]
 fn guards_end_at_the_arrow() {
     let input: PatternList = syn::parse_quote! {
-        Lt(x, x2) if Rc::ptr_eq(x, x2) && !x.dtype().is_float() ~> UOp::const_(DType::Bool, false),
+        Lt(x, x2) if Rc::ptr_eq(x, x2) && !x.dtype().is_float() => UOp::const_(DType::Bool, false),
         Cast { src: x, dtype } if x.dtype() == dtype => Some(x.clone()),
     };
     assert!(rule(&input, 0).guard.is_some());
@@ -133,13 +134,13 @@ fn guards_end_at_the_arrow() {
 #[test]
 fn for_blocks() {
     let input: PatternList = syn::parse_quote! {
-        Add(x, @zero) ~> x,
+        Add(x, @zero) => x,
         for op in unary [Neg, Sqrt] {
-            op(c @ Const(_)) ~> c
+            op(c @ Const(_)) => c
         },
         for op in binary [*] {
-            op(x, @zero) ~> x,
-            op(@zero, x) ~> x,
+            op(x, @zero) => x,
+            op(@zero, x) => x,
         },
     };
     assert_eq!(input.items.len(), 3);
@@ -157,24 +158,24 @@ fn for_blocks() {
 
 #[test]
 fn for_block_rejects_unknown_kind() {
-    assert!(syn::parse_str::<PatternList>("for op in quaternary [A] { op(x) ~> x }").is_err());
+    assert!(syn::parse_str::<PatternList>("for op in quaternary [A] { op(x) => x }").is_err());
 }
 
 #[test]
 fn context_declaration() {
     let input: PatternList = syn::parse_quote! {
         @context MyCtx;
-        Add(x, y) => |x, y, ctx| { ctx.stats += 1; x.clone() }
+        Add(x, y) => { ctx.stats += 1; x.clone() }
     };
     assert!(input.context_type.is_some());
-    assert!(matches!(rule(&input, 0).rhs, RewriteExpr::Closure(_)));
+    assert!(matches!(rule(&input, 0).rhs, RewriteExpr::Expr(syn::Expr::Block(_))));
 }
 
 #[test]
 fn rewrite_expression_forms() {
     let input: PatternList = syn::parse_quote! {
-        Add(x, @zero) ~> x,
-        Mul(a, Add(b, c)) ~> |a, b, c| a.try_mul(&b),
+        Add(x, @zero) => x,
+        Mul(a, Add(b, c)) => a.try_mul(&b),
         Where(cond, t, f) => {
             match vmin_vmax(cond) {
                 (true, true) => Some(t.clone()),
@@ -184,7 +185,7 @@ fn rewrite_expression_forms() {
         FloorDiv(x, x2) => Rc::ptr_eq(x, x2).then(|| one()),
     };
     assert!(matches!(rule(&input, 0).rhs, RewriteExpr::Var(_)));
-    assert!(matches!(&rule(&input, 1).rhs, RewriteExpr::Closure(closure) if closure.inputs.len() == 3));
+    assert!(matches!(rule(&input, 1).rhs, RewriteExpr::Expr(syn::Expr::MethodCall(_))));
     assert!(matches!(rule(&input, 2).rhs, RewriteExpr::Expr(syn::Expr::Block(_))));
     assert!(matches!(rule(&input, 3).rhs, RewriteExpr::Expr(syn::Expr::MethodCall(_))));
 }

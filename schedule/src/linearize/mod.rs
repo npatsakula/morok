@@ -69,7 +69,7 @@ use svod_ir::ops;
 ///
 pub fn pm_split_ends() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        end @ End { computation, ranges } => |end, computation, ranges| {
+        end @ End { computation, ranges } => {
             split_end(end, computation, ranges)
         },
     }

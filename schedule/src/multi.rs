@@ -240,36 +240,36 @@ fn move_mselect_before_movement(root: &Arc<UOp>, buffer: &Arc<UOp>, device_index
 pub fn multi_pm() -> TypedPatternMatcher {
     crate::patterns! {
         selected @ MSelect { buffer: MStack { buffers }, device_index: _ }
-            => |selected, buffers| {
+            => {
                 let Op::MSelect(ops::MSelect { device_index, .. }) = selected.op() else { unreachable!() };
                 buffers.get(*device_index).cloned()
             },
         selected @ MSelect { buffer, device_index: _ }
             if buffer.op().is_movement()
-            => |selected, buffer| {
+            => {
                 let Op::MSelect(ops::MSelect { device_index, .. }) = selected.op() else { unreachable!() };
                 move_mselect_before_movement(selected, buffer, *device_index)
             },
         root @ Reduce { src: multi @ Multi { src: _ }, ranges: _, reduce_op: _, num_axes: _ }
-            => |root, multi| reduce_multi(root, multi),
+            => reduce_multi(root, multi),
         root @ Permute { src: multi @ Multi { src: _ }, axes: _ }
-            => |root, multi| permute_multi(root, multi),
+            => permute_multi(root, multi),
         root @ Flip { src: multi @ Multi { src: _ }, axes: _ }
-            => |root, multi| flip_multi(root, multi),
+            => flip_multi(root, multi),
         root @ Pad { src: multi @ Multi { src: _ }, begin_pads: _, end_pads: _ }
-            => |root, multi| pad_multi(root, multi),
+            => pad_multi(root, multi),
         root @ Cast { src: multi @ Multi { src: _ }, dtype: _ }
-            => |root, multi| passthrough_unary_wrapper(root, multi),
+            => passthrough_unary_wrapper(root, multi),
         root @ BitCast { src: multi @ Multi { src: _ }, dtype: _ }
-            => |root, multi| passthrough_unary_wrapper(root, multi),
+            => passthrough_unary_wrapper(root, multi),
         root @ Contiguous { src: multi @ Multi { src: _ }, opts: _ }
-            => |root, multi| passthrough_unary_wrapper(root, multi),
+            => passthrough_unary_wrapper(root, multi),
         root @ Detach { src: multi @ Multi { src: _ } }
-            => |root, multi| passthrough_unary_wrapper(root, multi),
+            => passthrough_unary_wrapper(root, multi),
         root @ ContiguousBackward { src: multi @ Multi { src: _ } }
-            => |root, multi| passthrough_unary_wrapper(root, multi),
+            => passthrough_unary_wrapper(root, multi),
         root if matches!(root.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..))
-            => |root| rewrite_per_shard_alu(root),
+            => rewrite_per_shard_alu(root),
     }
 }
 
@@ -277,7 +277,7 @@ pub fn multi_pm() -> TypedPatternMatcher {
 /// formation. The call body is never sent through `spec_program`.
 pub fn lower_allreduce_pm() -> TypedPatternMatcher {
     crate::patterns! {
-        root @ AllReduce { src: _, device: _, reduce_op: _ } => |root| lower_host_allreduce(root),
+        root @ AllReduce { src: _, device: _, reduce_op: _ } => lower_host_allreduce(root),
     }
 }
 

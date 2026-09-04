@@ -543,10 +543,10 @@ fn split_all_stores(root: &Arc<UOp>) -> Arc<UOp> {
     // Combined gate + split in bpm (pm_gate_kernel_sink + split_kernels, bottom_up=True)
     let mut matcher = crate::patterns! {
         @context Vec<Arc<UOp>>;
-        node @ Store { index: _, value: _ } => |node, ctx| split_store(ctx, node),
+        node @ Store { index: _, value: _ } => split_store(ctx, node),
         node @ End { computation, .. }
             if matches!(computation.op(), Op::Store(..) | Op::End(..))
-            => |node, ctx| split_store(ctx, node),
+            => split_store(ctx, node),
     };
     // Skip the SINK subtree of an already-formed kernel AST.
     matcher.add(&[OpKey::Sink], |node, _ctx| {

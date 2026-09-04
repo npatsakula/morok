@@ -1178,14 +1178,14 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
 #[allow(unused_variables)]
 pub fn pm_long_decomp() -> crate::TypedPatternMatcher {
     crate::patterns! {
-        x @ Param { shape, arg } => |x, shape, arg| { let _ = (shape, arg); decompose_long_node(x) },
-        x @ Buffer { shape, arg } => |x, shape, arg| { let _ = (shape, arg); decompose_long_node(x) },
-        x @ Index { buffer, indices } => |x, buffer, indices| { let _ = (buffer, indices); decompose_long_node(x) },
-        x @ Store { index, value, gate } => |x, index, value, gate| { let _ = (index, value, gate); decompose_long_node(x) },
-        x @ Load { index, alt, gate } => |x, index, alt, gate| { let _ = (index, alt, gate); decompose_long_node(x) },
+        x @ Param { shape, arg } => { let _ = (shape, arg); decompose_long_node(x) },
+        x @ Buffer { shape, arg } => { let _ = (shape, arg); decompose_long_node(x) },
+        x @ Index { buffer, indices } => { let _ = (buffer, indices); decompose_long_node(x) },
+        x @ Store { index, value, gate } => { let _ = (index, value, gate); decompose_long_node(x) },
+        x @ Load { index, alt, gate } => { let _ = (index, alt, gate); decompose_long_node(x) },
         x @ Const(_) => decompose_long_node(x),
-        x @ Cast { src, dtype } => |x, src, dtype| { let _ = (src, dtype); decompose_long_node(x) },
-        x @ BitCast { src, dtype } => |x, src, dtype| { let _ = (src, dtype); decompose_long_node(x) },
+        x @ Cast { src, dtype } => { let _ = (src, dtype); decompose_long_node(x) },
+        x @ BitCast { src, dtype } => { let _ = (src, dtype); decompose_long_node(x) },
         for op in unary [Neg] { x @ op(_) => decompose_long_node(x), }
         for op in binary [Add, Sub, Mul, CDiv, CMod, Max, Lt, Eq, Ne, And, Or, Xor, Shl, Shr] {
             x @ op(_, _) => decompose_long_node(x),
@@ -1758,7 +1758,7 @@ fn maybe_load(value: &Arc<UOp>) -> Arc<UOp> {
 /// leaves the WMMA unfused instead of aborting.
 pub fn pm_wmma_add() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        Add[wmma @ Wmma { a, b, c, metadata }, add] => |wmma, a, b, c, metadata, add| {
+        Add[wmma @ Wmma { a, b, c, metadata }, add] => {
             Some(UOp::new(
                 Op::Wmma(ops::Wmma { a: a.clone(), b: b.clone(), c: c.try_add(add).ok()?, metadata: metadata.clone() }),
                 wmma.dtype(),

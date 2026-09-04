@@ -101,8 +101,8 @@ fn add_war_barrier(end: &Arc<UOp>) -> Option<Arc<UOp>> {
 pub(crate) fn pm_implicit_barriers() -> &'static TypedPatternMatcher {
     static PM: LazyLock<TypedPatternMatcher> = LazyLock::new(|| {
         crate::patterns! {
-            after @ After { passthrough: _, deps: _ } => |after| add_raw_barrier(after),
-            end @ End { computation: _, ranges: _ } => |end| add_war_barrier(end),
+            after @ After { passthrough: _, deps: _ } => add_raw_barrier(after),
+            end @ End { computation: _, ranges: _ } => add_war_barrier(end),
         }
     });
     &PM

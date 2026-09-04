@@ -333,11 +333,11 @@ pub fn pm_simplify_valid() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // Simplify AND chains of validity clauses
         valid @ And(_, _) if valid.dtype() == DType::Bool
-            => |valid| simplify_valid(valid),
+            => simplify_valid(valid),
 
         // Simplify WHERE(cond, x, Invalid) using bounds from cond
         Where(cond, x, inv) if UOp::is_invalid_marker(inv)
-            => |cond, x, inv| gated_given_valid(cond, x, inv),
+            => gated_given_valid(cond, x, inv),
     }
 }
 
@@ -399,6 +399,6 @@ fn drop_and_clauses(cond: &Arc<UOp>, x: &Arc<UOp>, invalid: &Arc<UOp>) -> Option
 pub fn pm_drop_and_clauses() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         Where(cond, x, inv) if UOp::is_invalid_marker(inv)
-            => |cond, x, inv| drop_and_clauses(cond, x, inv),
+            => drop_and_clauses(cond, x, inv),
     }
 }

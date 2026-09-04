@@ -15,8 +15,8 @@
 //!
 //! ```ignore
 //! let matcher = patterns! {
-//!     Add(x, @zero) ~> x,              // bucket Binary(Add)
-//!     Mul(x, @one) ~> x,               // bucket Binary(Mul)
+//!     Add(x, @zero) => x,              // bucket Binary(Add)
+//!     Mul(x, @one) => x,               // bucket Binary(Mul)
 //!     x if is_const(x) => fold(x),     // wildcard: every bucket
 //! };
 //! ```

@@ -139,7 +139,7 @@ fn pm_add_local_buffers() -> &'static crate::TypedPatternMatcher<LocalBufferCont
     static PM: LazyLock<crate::TypedPatternMatcher<LocalBufferContext>> = LazyLock::new(|| {
         let add_local_buffers = crate::patterns! {
             @context LocalBufferContext;
-            stage @ Stage { compute: _ } => |stage, ctx| add_local_buffer(stage, ctx),
+            stage @ Stage { compute: _ } => add_local_buffer(stage, ctx),
         };
         add_local_buffers + crate::rangeify::patterns::movement_op_patterns().with_context::<LocalBufferContext>()
     });
@@ -721,7 +721,7 @@ fn pm_dtype_decomps() -> crate::TypedPatternMatcher<DTypeDecompCtx> {
             | svod_dtype::ScalarDType::Float16
             | svod_dtype::ScalarDType::BFloat16
             | svod_dtype::ScalarDType::Int64
-            | svod_dtype::ScalarDType::UInt64) => |x, ctx| {
+            | svod_dtype::ScalarDType::UInt64) => {
                 let dtype = if x.dtype().base() == svod_dtype::ScalarDType::UInt64 {
                     svod_dtype::ScalarDType::Int64
                 } else {
@@ -731,7 +731,7 @@ fn pm_dtype_decomps() -> crate::TypedPatternMatcher<DTypeDecompCtx> {
                 None
             },
 
-        sink @ Sink { sources: _ } if ctx.selected.iter().any(|dtype| ctx.should_emulate(*dtype)) => |sink, ctx| {
+        sink @ Sink { sources: _ } if ctx.selected.iter().any(|dtype| ctx.should_emulate(*dtype)) => {
             use svod_dtype::ScalarDType;
             let selected = std::mem::take(&mut ctx.selected);
             let mut result = sink.clone();

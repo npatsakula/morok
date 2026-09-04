@@ -120,13 +120,13 @@ fn derived(matcher: &TypedPatternMatcher<()>, key: OpKey) -> OpMask {
 fn derived_requirement_is_the_union_of_single_kind_sources() {
     let mul = mask(&[OpKey::Binary(BinaryOp::Mul)]);
 
-    assert_eq!(derived(&patterns! { Add(Mul(a, b), c) ~> a.mul(&b.add(c)) }, OpKey::Binary(BinaryOp::Add)), mul);
+    assert_eq!(derived(&patterns! { Add(Mul(a, b), c) => a.mul(&b.add(c)) }, OpKey::Binary(BinaryOp::Add)), mul);
     assert_eq!(
-        derived(&patterns! { Add[Mul(a, b), c] ~> a.mul(&b.add(c)) }, OpKey::Binary(BinaryOp::Add)),
+        derived(&patterns! { Add[Mul(a, b), c] => a.mul(&b.add(c)) }, OpKey::Binary(BinaryOp::Add)),
         mul,
         "permuted sources"
     );
-    assert_eq!(derived(&patterns! { Add(x, @zero) ~> x }, OpKey::Binary(BinaryOp::Add)), mask(&[OpKey::Const]));
+    assert_eq!(derived(&patterns! { Add(x, @zero) => x }, OpKey::Binary(BinaryOp::Add)), mask(&[OpKey::Const]));
     assert_eq!(
         derived(
             &patterns! { Reshape { src: Cast { src: inner, dtype: _d }, new_shape: _s } => Some(inner.clone()) },
@@ -156,7 +156,7 @@ fn derived_requirement_is_the_union_of_single_kind_sources() {
 /// Bare-variable sources constrain nothing, so the rule stays dispatchable everywhere.
 #[test]
 fn wildcard_sources_are_never_rejected() {
-    let matcher = patterns! { Add(x, y) ~> y.add(x), Neg(x) ~> x.clone() };
+    let matcher = patterns! { Add(x, y) => y.add(x), Neg(x) => x.clone() };
     for node in [Node::AddMulConst, Node::AddConstConst, Node::AddVarVar, Node::NegVar] {
         assert!(matcher.early_rejects(&node.key()).iter().all(|reject| reject.is_empty()), "{node:?}");
         assert!(!matches!(matcher.rewrite(&node.build(), &mut ()), RewriteResult::NoMatch), "{node:?}");
@@ -185,13 +185,13 @@ fn wildcard_rule_runs_on_childless_node() {
 #[test]
 fn early_reject_preserves_rewrite_results() {
     let matcher = patterns! {
-        Add(x, @zero) ~> x,
-        Mul(x, @one) ~> x,
+        Add(x, @zero) => x,
+        Mul(x, @one) => x,
         Add[Mul(a, b), Mul(c, d)] if Arc::ptr_eq(a, c) => Some(a.mul(&b.add(d))),
         Sub(Add(a, b), c) if Arc::ptr_eq(b, c) => Some(a.clone()),
-        Neg(Neg(x)) ~> x,
-        Cast { src: Cast { src: inner, dtype: _d }, dtype: outer } ~> inner.cast(outer.clone()),
-        Where(Const(ConstValue::Bool(true)), t, _f) ~> t,
+        Neg(Neg(x)) => x,
+        Cast { src: Cast { src: inner, dtype: _d }, dtype: outer } => inner.cast(outer.clone()),
+        Where(Const(ConstValue::Bool(true)), t, _f) => t,
     };
     let permissive = matcher.without_early_reject();
     assert!(permissive.early_rejects(&OpKey::Binary(BinaryOp::Add)).iter().all(|reject| reject.is_empty()));

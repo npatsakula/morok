@@ -114,8 +114,7 @@ pub fn op_enum(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 ///
 /// The right-hand side may evaluate to `Arc<UOp>`, `Option<Arc<UOp>>` (`None`
-/// declines) or a `RewriteResult`; `?` works inside it. `~>` is accepted as an alias
-/// of `=>`.
+/// declines) or a `RewriteResult`; `?` works inside it.
 ///
 /// # Pattern Syntax
 ///

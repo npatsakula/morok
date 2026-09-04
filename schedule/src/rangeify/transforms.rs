@@ -407,8 +407,8 @@ pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
 /// Extracts all RANGE operations from nested END/REDUCE/STORE structures.
 pub fn pm_flatten_range() -> &'static crate::TypedPatternMatcher {
     crate::cached_patterns! {
-        r @ End { computation: _, ranges } if !ranges.is_empty() => |r| flatten_range_impl(r),
-        r @ Reduce { src: _, ranges, reduce_op: _ } if !ranges.is_empty() => |r| flatten_range_impl(r),
+        r @ End { computation: _, ranges } if !ranges.is_empty() => flatten_range_impl(r),
+        r @ Reduce { src: _, ranges, reduce_op: _ } if !ranges.is_empty() => flatten_range_impl(r),
     }
 }
 
@@ -452,19 +452,19 @@ pub fn pm_split_ranges() -> crate::TypedPatternMatcher<SplitRangesContext> {
         @context SplitRangesContext;
 
         // Mark RANGE % const: record the modulo constant for this range
-        _modop @ FloorMod(r @ Range { end: _, axis_id: _, axis_type: _ }, c @ Const(_)) => |r, c| {
+        _modop @ FloorMod(r @ Range { end: _, axis_id: _, axis_type: _ }, c @ Const(_)) => {
             mark_range_mod(ctx, r, c);
             None // Don't transform yet, just mark
         },
 
         // An image STORE pins its index ranges against splitting.
-        Store { index, value: _, gate: _ } => |index| {
+        Store { index, value: _, gate: _ } => {
             dont_split_ranges_for_image(ctx, index);
             None
         },
 
         // At SINK: perform the substitution
-        sink @ Sink { sources: _ } if !ctx.marked_ranges.is_empty() => |sink| {
+        sink @ Sink { sources: _ } if !ctx.marked_ranges.is_empty() => {
             do_split_ranges_substitute(ctx, sink)
         },
     }
@@ -1458,17 +1458,17 @@ pub fn pm_simplify_ranges() -> crate::TypedPatternMatcher<SimplifyRangesContext>
         @context SimplifyRangesContext;
 
         // Rule order matches Tinygrad: merge, collect gates, protect REDUCE, substitute at SINK.
-        u @ End { computation: _, ranges: _ } => |u| simplify_merge_adjacent(u),
-        u @ Reduce { src: _, ranges: _, reduce_op: _ } => |u| simplify_merge_adjacent(u),
-        idx @ Index { buffer: _, indices: _ } => |idx| {
+        u @ End { computation: _, ranges: _ } => simplify_merge_adjacent(u),
+        u @ Reduce { src: _, ranges: _, reduce_op: _ } => simplify_merge_adjacent(u),
+        idx @ Index { buffer: _, indices: _ } => {
             mark_gated(ctx, idx);
             None
         },
-        _red @ Reduce { src: _, ranges, reduce_op: _ } => |ranges| {
+        _red @ Reduce { src: _, ranges, reduce_op: _ } => {
             protect_reduce_ranges(ctx, ranges);
             None
         },
-        sink @ Sink { sources: _ } => |sink| substitute_simplified_ranges(ctx, sink),
+        sink @ Sink { sources: _ } => substitute_simplified_ranges(ctx, sink),
     }
 }
 
@@ -1676,16 +1676,16 @@ fn build_add_buffers_patterns() -> crate::TypedPatternMatcher<super::kernel::Ran
             @context super::kernel::RangeifyBufferContext;
             // Flatten multi-range STAGE to 1D.
             buf @ Stage { compute: _ } if matches!(buf.op(), Op::Stage(ops::Stage { ranges, .. }) if ranges.len() > 1)
-                => |buf, _ctx| { flatten_bufferize(buf) },
+                => { flatten_bufferize(buf) },
             // DISK STAGE(BITCAST|CONTIGUOUS) → SLICE.
             buf @ Stage { compute }
                 if matches!(compute.op(), Op::BitCast(..) | Op::Contiguous(..))
-                => |buf, compute, _ctx| late_buffer_slice(compute, buf),
+                => late_buffer_slice(compute, buf),
             // STAGE → STORE conversion (allow_locals=false: treat local as global).
-            buf @ Stage { compute: _ } => |buf, ctx| {
+            buf @ Stage { compute: _ } => {
                 bufferize_to_store(buf, ctx)
             },
             // Strip RESHAPE wrappers on CALL sources.
-            c @ Call { body: _, args: _, info: _ } => |c, _ctx| { strip_reshape_on_callable_sources(c) },
+            c @ Call { body: _, args: _, info: _ } => { strip_reshape_on_callable_sources(c) },
         }
 }

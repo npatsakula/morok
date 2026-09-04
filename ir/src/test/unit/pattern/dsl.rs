@@ -47,11 +47,11 @@ fn assert_no_match(result: RewriteResult) {
 #[test]
 fn op_patterns_with_const_value_patterns() {
     let matcher = patterns! {
-        GetAddr { src, .. } ~> src,
-        Add(x, Const(ConstValue::Int(0))) ~> x,
-        Mul(x, Const(ConstValue::Int(1))) ~> x,
-        Mul(_, zero @ Const(ConstValue::Int(0))) ~> zero,
-        Sub(x, Const(ConstValue::Int(v))) if v == 7 ~> x,
+        GetAddr { src, .. } => src,
+        Add(x, Const(ConstValue::Int(0))) => x,
+        Mul(x, Const(ConstValue::Int(1))) => x,
+        Mul(_, zero @ Const(ConstValue::Int(0))) => zero,
+        Sub(x, Const(ConstValue::Int(v))) if v == 7 => x,
     };
 
     let buffer = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::UInt8);
@@ -76,12 +76,12 @@ fn op_patterns_with_const_value_patterns() {
 #[test]
 fn special_constant_patterns() {
     let matcher = patterns! {
-        Add(x, @zero) ~> x,
-        Add(@zero, x) ~> x,
-        Mul(x, @one) ~> x,
-        Mul(@one, x) ~> x,
-        Mul(_, zero @ @zero) ~> zero,
-        Mul(zero @ @zero, _) ~> zero,
+        Add(x, @zero) => x,
+        Add(@zero, x) => x,
+        Mul(x, @one) => x,
+        Mul(@one, x) => x,
+        Mul(_, zero @ @zero) => zero,
+        Mul(zero @ @zero, _) => zero,
     };
 
     for (x, zero, one, two) in [
@@ -104,7 +104,7 @@ fn special_constant_patterns() {
 #[test]
 fn guards_veto_a_structural_match() {
     let matcher = patterns! {
-        And(x, y) if Arc::ptr_eq(x, y) ~> x,
+        And(x, y) if Arc::ptr_eq(x, y) => x,
         Add(x, c) if {
             match c.op() {
                 Op::Const(cv) => {
@@ -112,7 +112,7 @@ fn guards_veto_a_structural_match() {
                 }
                 _ => false,
             }
-        } ~> x,
+        } => x,
     };
 
     let a = UOp::native_const(42i32);
@@ -135,7 +135,7 @@ fn guards_veto_a_structural_match() {
 #[test]
 fn repeated_binding_requires_pointer_equality() {
     let matcher = patterns! {
-        Where(x, x, x) ~> x
+        Where(x, x, x) => x
     };
 
     let a = UOp::const_(DType::Bool, ConstValue::Bool(true));
@@ -153,8 +153,8 @@ fn repeated_binding_requires_pointer_equality() {
 #[test]
 fn struct_patterns_bind_non_source_fields() {
     let matcher = patterns! {
-        Cast { src: x, dtype } if *dtype == DType::Float32 ~> x,
-        Permute { src: x, axes } if axes.len() == 2 ~> x,
+        Cast { src: x, dtype } if *dtype == DType::Float32 => x,
+        Permute { src: x, axes } if axes.len() == 2 => x,
     };
 
     let x_int = UOp::native_const(42i32);
@@ -171,8 +171,8 @@ fn struct_patterns_bind_non_source_fields() {
 #[test]
 fn nested_struct_patterns() {
     let matcher = patterns! {
-        Cast { src: Cast { src: x, .. }, dtype } if *dtype == DType::Float32 ~> x,
-        Index { buffer: Stage { compute, ranges, .. }, indices } if ranges.len() == indices.len() ~> compute,
+        Cast { src: Cast { src: x, .. }, dtype } if *dtype == DType::Float32 => x,
+        Index { buffer: Stage { compute, ranges, .. }, indices } if ranges.len() == indices.len() => compute,
     };
 
     let x_int = UOp::native_const(42i32);
@@ -194,17 +194,17 @@ fn nested_struct_patterns() {
 fn for_loop_expands_the_listed_ops() {
     #[allow(unused_variables)]
     let matcher = patterns! {
-        Add(x, @zero) ~> x,
+        Add(x, @zero) => x,
         for op in unary [Sqrt, Exp2] {
-            op(c) ~> Arc::clone(c)
+            op(c) => Arc::clone(c)
         },
         for op in binary [Mul, Sub] {
-            op(x, @zero) ~> x
+            op(x, @zero) => x
         },
         for op in ternary [Where, MulAcc] {
-            op(a, _b, _c) ~> Arc::clone(a)
+            op(a, _b, _c) => Arc::clone(a)
         },
-        Mul(x, @one) ~> x,
+        Mul(x, @one) => x,
     };
 
     let x = UOp::native_const(42i32);
@@ -233,13 +233,13 @@ fn for_loop_wildcard_expands_every_op() {
     #[allow(unused_variables)]
     let matcher = patterns! {
         for op in unary [*] {
-            op(c) if matches!(c.op(), Op::Const(_)) ~> Arc::clone(c)
+            op(c) if matches!(c.op(), Op::Const(_)) => Arc::clone(c)
         },
         for op in binary [*] {
-            op(x, @zero) ~> x
+            op(x, @zero) => x
         },
         for op in ternary [*] {
-            op(a, _b, _c) ~> Arc::clone(a)
+            op(a, _b, _c) => Arc::clone(a)
         },
     };
 
@@ -268,7 +268,7 @@ fn for_loop_wildcard_expands_every_op() {
 fn for_loop_body_can_read_the_op_variable() {
     let matcher = patterns! {
         for op in unary [Sqrt, Exp2] {
-            op(x) ~> match op {
+            op(x) => match op {
                 UnaryOp::Sqrt => x.try_exp2().unwrap(),
                 _ => x.try_sqrt().unwrap(),
             }
@@ -286,10 +286,10 @@ fn for_loop_body_supports_guards_and_bindings() {
     #[allow(unused_variables)]
     let matcher = patterns! {
         for op in unary [Sqrt] {
-            op(c) if matches!(c.op(), Op::Const(_)) ~> Arc::clone(c)
+            op(c) if matches!(c.op(), Op::Const(_)) => Arc::clone(c)
         },
         for op in unary [Exp2] {
-            op(inner @ Const(_)) ~> inner
+            op(inner @ Const(_)) => inner
         },
     };
 
@@ -302,12 +302,11 @@ fn for_loop_body_supports_guards_and_bindings() {
     assert_no_match(matcher.rewrite(&non_const.try_exp2().unwrap(), &mut ()));
 }
 
-/// `name @ const(cv)` binds the `ConstValue` itself, for both the infallible (`~>`) and
-/// the fallible (`=>`) rewrite arm.
+/// `name @ const(cv)` binds the `ConstValue` itself for the rewrite body.
 #[test]
 fn const_value_is_extracted_from_the_binding() {
     let matcher = patterns! {
-        Add(x, _c@const(cv)) if cv == ConstValue::Int(0) ~> x,
+        Add(x, _c@const(cv)) if cv == ConstValue::Int(0) => x,
         Sqrt(_c@const(cv)) => cv.cast(&DType::Float32).map(|casted| UOp::const_(DType::Float32, casted)),
     };
 
@@ -324,13 +323,13 @@ fn const_value_is_extracted_from_the_binding() {
 #[test]
 fn field_free_struct_and_unit_patterns() {
     let matcher = patterns! {
-        end_op @ End { .. } ~> {
+        end_op @ End { .. } => {
             let Op::End(ops::End { computation, .. }) = end_op.op() else { unreachable!() };
             Arc::clone(computation)
         },
         reduce_op @ Reduce { .. } if matches!(reduce_op.op(), Op::Reduce(ops::Reduce { reduce_op: ReduceOp::Add, .. }))
-            ~> UOp::const_(reduce_op.dtype(), ConstValue::Int(99)),
-        noop @ Noop ~> UOp::const_(noop.dtype(), ConstValue::Int(1)),
+            => UOp::const_(reduce_op.dtype(), ConstValue::Int(99)),
+        noop @ Noop => UOp::const_(noop.dtype(), ConstValue::Int(1)),
     };
 
     let src = UOp::native_const(42i32);
@@ -357,9 +356,9 @@ fn struct_rest_pattern_ignores_the_remaining_fields() {
     use crate::DeviceSpec;
 
     let matcher = patterns! {
-        Stage { compute: c, .. } ~> c,
-        Index { buffer: c, .. } if matches!(c.op(), Op::Const(_)) ~> c,
-        Copy { src: c, .. } if matches!(c.op(), Op::Const(_)) ~> c,
+        Stage { compute: c, .. } => c,
+        Index { buffer: c, .. } if matches!(c.op(), Op::Const(_)) => c,
+        Copy { src: c, .. } if matches!(c.op(), Op::Const(_)) => c,
     };
 
     let c = UOp::native_const(42.0f32);
@@ -383,9 +382,9 @@ fn struct_rest_pattern_ignores_the_remaining_fields() {
 /// binds the `Option` itself.
 #[test]
 fn option_field_patterns() {
-    let none_only = patterns! { Load { index, alt: None, gate: None } ~> index };
-    let some_only = patterns! { Load { index: _, alt: _, gate: Some(g) } ~> g };
-    let either = patterns! { Load { index, alt: _, gate: _ } ~> index };
+    let none_only = patterns! { Load { index, alt: None, gate: None } => index };
+    let some_only = patterns! { Load { index: _, alt: _, gate: Some(g) } => g };
+    let either = patterns! { Load { index, alt: _, gate: _ } => index };
     let bound = patterns! {
         Store { index, value: _, gate } => {
             match gate {
@@ -416,7 +415,7 @@ fn option_field_patterns() {
 #[test]
 fn nested_option_field_patterns() {
     let matcher = patterns! {
-        Store { index: _, value: Load { index: source, alt: None, gate: None }, gate: None } ~> source
+        Store { index: _, value: Load { index: source, alt: None, gate: None }, gate: None } => source
     };
 
     let target = address(0);
@@ -436,11 +435,11 @@ fn nested_option_field_patterns() {
 fn non_child_fields_are_verbatim_rust_patterns() {
     use crate::types::{AxisId, AxisType};
 
-    let upcast_only = patterns! { Range { end, axis_type: AxisType::Upcast, .. } ~> end };
+    let upcast_only = patterns! { Range { end, axis_type: AxisType::Upcast, .. } => end };
     let loop_axes = patterns! {
-        Range { end, axis_type: kind @ (AxisType::Loop | AxisType::Reduce), .. } if *kind == AxisType::Reduce ~> end
+        Range { end, axis_type: kind @ (AxisType::Loop | AxisType::Reduce), .. } if *kind == AxisType::Reduce => end
     };
-    let by_index = patterns! { GetTuple { src, index: 2 } ~> src };
+    let by_index = patterns! { GetTuple { src, index: 2 } => src };
 
     let end = UOp::index_const(8);
     let range = |axis_type| UOp::range_axis(end.clone(), AxisId::Renumbered(0), axis_type);
@@ -463,7 +462,7 @@ fn non_child_fields_are_verbatim_rust_patterns() {
 #[test]
 fn permutation_pattern_matches_both_orderings() {
     let matcher = patterns! {
-        Add[x, @zero] ~> x
+        Add[x, @zero] => x
     };
 
     let x = UOp::var("a", DType::Int32, 0, i64::MAX);
@@ -476,14 +475,14 @@ fn permutation_pattern_matches_both_orderings() {
     assert!(Arc::ptr_eq(&folded, &x));
 }
 
-/// `=> |captures| expr` names the bindings the fallible rewrite body needs.
+/// Nested struct patterns bind children at every level and the guard sees all of them.
 #[test]
-fn explicit_capture_list_in_a_fallible_rewrite() {
+fn nested_struct_pattern_bindings_reach_the_guard() {
     let matcher = patterns! {
         Index {
             buffer: Index { buffer: real_buffer, indices: inner_indices },
             indices: outer_indices
-        } if outer_indices.len() == 1 && inner_indices.len() == 1 => |real_buffer, inner_indices| {
+        } if outer_indices.len() == 1 && inner_indices.len() == 1 => {
             UOp::index().buffer(real_buffer.clone()).indices(vec![inner_indices[0].clone()]).call().ok()
         }
     };

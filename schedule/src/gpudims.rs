@@ -45,7 +45,7 @@ pub fn pm_add_gpudims() -> TypedPatternMatcher<Renderer> {
     crate::patterns! {
         @context Renderer;
         // add gpudims must be last
-        sink @ Sink { sources: _sources } => |sink| add_gpudims(ctx, sink),
+        sink @ Sink { sources: _sources } => add_gpudims(ctx, sink),
     }
 }
 
@@ -55,10 +55,10 @@ pub fn pm_lower_device_ranges() -> TypedPatternMatcher {
     crate::patterns! {
         // DEVICE is bound at launch, not dispatched as a program axis.
         range @ Range { end: _, axis_id: _, axis_type }
-            if *axis_type == AxisType::Device => |range| lower_device_range(range),
+            if *axis_type == AxisType::Device => lower_device_range(range),
         // A lowered DEVICE PARAM is not a loop and must not be closed by END.
         end @ End { computation: _, ranges }
-            if ranges.iter().any(is_device_num) => |end| cleanup_device_end(end),
+            if ranges.iter().any(is_device_num) => cleanup_device_end(end),
     }
 }
 

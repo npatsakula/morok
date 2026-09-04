@@ -35,8 +35,8 @@
 //!
 //! // Create matcher using the patterns! macro
 //! let matcher = patterns! {
-//!     Add(x, @zero) ~> |x| x.clone(),
-//!     Mul(x, @one) ~> |x| x.clone(),
+//!     Add(x, @zero) => x,
+//!     Mul(x, @one) => x,
 //! };
 //!
 //! // Pass context at rewrite time - patterns see OPTIMIZED children
@@ -47,7 +47,7 @@
 //!
 //! ```ignore
 //! let matcher = patterns! {
-//!     Add(x, @zero) ~> |x| x.clone(),
+//!     Add(x, @zero) => x,
 //! };
 //! let result = graph_rewrite(&matcher, root, &mut ());
 //! ```

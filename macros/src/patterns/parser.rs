@@ -40,7 +40,7 @@ pub struct ForBlock {
     pub body: Vec<PatternRule>,
 }
 
-/// `lhs if guard => rhs`. The `~>` arrow is accepted as an alias of `=>`.
+/// `lhs if guard => rhs`.
 #[derive(Debug)]
 pub struct PatternRule {
     pub lhs: Pattern,
@@ -120,8 +120,6 @@ pub enum FieldPat {
 pub enum RewriteExpr {
     /// Bare binding: `x` — rewrites to a clone of it.
     Var(Ident),
-    /// `|x, y| body` — the parameter list is documentation; bindings are already in scope.
-    Closure(syn::ExprClosure),
     Expr(Expr),
 }
 
@@ -202,12 +200,7 @@ impl Parse for PatternRule {
         } else {
             None
         };
-        if input.peek(Token![~]) {
-            input.parse::<Token![~]>()?;
-            input.parse::<Token![>]>()?;
-        } else {
-            input.parse::<Token![=>]>()?;
-        }
+        input.parse::<Token![=>]>()?;
         let rhs: RewriteExpr = input.parse()?;
         Ok(PatternRule { lhs, guard, rhs })
     }
@@ -216,7 +209,7 @@ impl Parse for PatternRule {
 /// Parse a guard expression, which ends at the arrow.
 fn parse_guard_expr(input: ParseStream) -> Result<Expr> {
     let mut tokens = proc_macro2::TokenStream::new();
-    while !input.is_empty() && !input.peek(Token![~]) && !input.peek(Token![=>]) {
+    while !input.is_empty() && !input.peek(Token![=>]) {
         let tt: proc_macro2::TokenTree = input.parse()?;
         tokens.extend(std::iter::once(tt));
     }
@@ -350,21 +343,6 @@ fn starts_child_pattern(input: ParseStream) -> bool {
 
 impl Parse for RewriteExpr {
     fn parse(input: ParseStream) -> Result<Self> {
-        if input.peek(Token![|]) {
-            // `|params| body`: the body extends to the next top-level comma after the
-            // parameter list, so count pipes to know when the list has closed.
-            let mut tokens = proc_macro2::TokenStream::new();
-            let mut pipes = 0;
-            while !input.is_empty() && !(pipes >= 2 && input.peek(Token![,])) {
-                let tt: proc_macro2::TokenTree = input.parse()?;
-                if matches!(&tt, proc_macro2::TokenTree::Punct(p) if p.as_char() == '|') {
-                    pipes += 1;
-                }
-                tokens.extend(std::iter::once(tt));
-            }
-            return Ok(RewriteExpr::Closure(syn::parse2(tokens)?));
-        }
-
         if input.peek(Ident) {
             let fork = input.fork();
             let _: Ident = fork.parse()?;

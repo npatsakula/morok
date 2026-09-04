@@ -97,26 +97,26 @@ pub fn lower_weak_node(u: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 pub fn pm_lower_weak() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        u @const(value) if u.dtype().is_weak() => |u, value| {
+        u @const(value) if u.dtype().is_weak() => {
             Some(UOp::const_(select_dtype(u), value).cast(u.dtype()))
         },
-        u @ VConst { values } if u.dtype().is_weak() => |u, values| {
+        u @ VConst { values } if u.dtype().is_weak() => {
             Some(UOp::try_vconst(values.clone(), select_dtype(u).scalar_dtype()).ok()?.cast(u.dtype()))
         },
-        u @ Cast { src: inner, dtype } if dtype.is_weak() => |u, inner| {
+        u @ Cast { src: inner, dtype } if dtype.is_weak() => {
             let Op::Cast(ops::Cast { src: x, dtype: inner_dtype }) = inner.op() else { return None };
             if !inner_dtype.is_weak() || x.dtype().is_weak() { return None; }
             Some(x.cast(select_dtype(u)).cast(u.dtype()))
         },
-        u @ Index { buffer, indices } if u.dtype().is_weak() => |u, buffer, indices| {
+        u @ Index { buffer, indices } if u.dtype().is_weak() => {
             let buffer = buffer.cast(select_dtype(u));
             let indices = indices.iter().map(|index| {
                 if index.dtype().is_weak() { commit_weak(index, select_dtype(index)) } else { index.clone() }
             });
             Some(u.with_sources(std::iter::once(buffer).chain(indices).collect()))
         },
-        u if is_lower_weak_node(u.op()) => |u| lower_weak_node(u),
-        u @ Param { shape, arg } if u.dtype() == DType::WeakInt => |u, shape, arg| {
+        u if is_lower_weak_node(u.op()) => lower_weak_node(u),
+        u @ Param { shape, arg } if u.dtype() == DType::WeakInt => {
             if arg.addrspace.is_some() { return None; }
             let mut arg = arg.clone();
             arg.dtype = select_dtype(u);
@@ -182,8 +182,8 @@ pub fn commit_weak_srcs(u: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 pub fn pm_commit_weak() -> TypedPatternMatcher {
     crate::patterns! {
-        u if matches!(u.op(), Op::Binary(..) | Op::Ternary(..)) => |u| commit_weak_srcs(u),
-        u @ Store { index, value, gate } if value.dtype().is_weak() => |u, index, value, gate| {
+        u if matches!(u.op(), Op::Binary(..) | Op::Ternary(..)) => commit_weak_srcs(u),
+        u @ Store { index, value, gate } if value.dtype().is_weak() => {
             let mut src = vec![index.clone(), commit_weak(value, index.dtype())];
             src.extend(gate.iter().cloned());
             Some(u.with_sources(src))
@@ -207,7 +207,7 @@ pub fn cast_weak_srcs(c: &Arc<UOp>, u: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 pub fn pm_cast_weak() -> TypedPatternMatcher {
     crate::patterns! {
-        c @ Cast { src: u, dtype: _ } if matches!(u.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..)) && u.dtype().is_weak() => |c, u| {
+        c @ Cast { src: u, dtype: _ } if matches!(u.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..)) && u.dtype().is_weak() => {
             cast_weak_srcs(c, u)
         },
     }
@@ -227,7 +227,7 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher<WeakMemo> {
         + crate::patterns! {
             @context WeakMemo;
             u @ Shrink { src, offsets, sizes }
-                if offsets.dtype().is_weak() || sizes.dtype().is_weak() => |u, src, offsets, sizes| {
+                if offsets.dtype().is_weak() || sizes.dtype().is_weak() => {
                 let offsets = if offsets.dtype().is_weak() {
                     commit_weak(offsets, select_dtype(offsets))
                 } else {
@@ -240,8 +240,8 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher<WeakMemo> {
                 };
                 Some(u.with_sources(vec![src.clone(), offsets, sizes]))
             },
-            u if !u.dtype().is_weak() && u.op().sources().iter().any(|s| s.dtype().is_weak()) => |u| lower_weak_srcs(ctx, u),
-            u @ Index { buffer, indices } => |u, buffer, indices| {
+            u if !u.dtype().is_weak() && u.op().sources().iter().any(|s| s.dtype().is_weak()) => lower_weak_srcs(ctx, u),
+            u @ Index { buffer, indices } => {
                 let first = indices.first()?;
                 let Op::Ternary(TernaryOp::Where, gate, idx, invalid) = first.op() else { return None };
                 if idx.dtype() != DType::Int64 || !UOp::is_invalid_marker(invalid) || !max_numel_fits_i32(buffer) { return None; }
@@ -249,7 +249,7 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher<WeakMemo> {
                 new_indices[0] = idx.cast(DType::Int32).valid(gate.clone());
                 Some(u.with_sources(std::iter::once(buffer.clone()).chain(new_indices).collect()))
             },
-            u @ Shrink { src, offsets, sizes } => |u, src, offsets, sizes| {
+            u @ Shrink { src, offsets, sizes } => {
                 let Op::Ternary(TernaryOp::Where, gate, idx, invalid) = offsets.op() else { return None };
                 if idx.dtype() != DType::Int64 || !UOp::is_invalid_marker(invalid) || !max_numel_fits_i32(src) { return None; }
                 Some(u.with_sources(vec![src.clone(), idx.cast(DType::Int32).valid(gate.clone()), sizes.clone()]))
