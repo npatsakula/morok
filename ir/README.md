@@ -18,27 +18,26 @@ let sum = a.try_add_op(&b)?;
 let sum = a.try_add_op(&b).unwrap();  // panics if types incompatible
 ```
 
-## Provenance Tracking
+## Origin Tracking
 
-UOp creation locations are automatically tracked via `#[track_caller]`. This enables debugging by tracing where each node originated in Rust source code.
+Every UOp built inside an `OriginScope` records where it came from — a module path
+segment, a public op's call site, an ONNX node, or a free label — as a 4-byte id into a
+process-global arena. The id is part of the node's content hash, so identical subgraphs
+built under different scopes stay distinct nodes; at the kernel cut the body is stripped
+and the origins move onto the kernel `CALL`, so kernel caches still deduplicate. Capture
+is off by default; `SVOD_ORIGIN=1` (or `origin::capture_for_thread(true)`) turns it on.
 
 ```rust
-use svod_ir::provenance::PROVENANCE_TRACKER;
+use svod_ir::origin::{self, OriginScope};
 
+let _capture = origin::capture_for_thread(true);
+let _encoder = OriginScope::module("encoder");
+let _layer = OriginScope::module("layers.3");
 let c = UOp::const_(DType::Float32, ConstValue::Float(1.5));
 
-// Query provenance
-PROVENANCE_TRACKER.with(|t| {
-    let chain = t.borrow().get_chain(c.id());
-    // Returns: file path, line, column where UOp was created
-});
+// Walks the parent chain in the arena.
+assert_eq!(origin::path(c.origin().unwrap()), "encoder.layers.3");
 ```
-
-**Captured info:**
-
-- Workspace-relative file path, line, column
-- Transformation history (substitution, pattern rewrites)
-- ONNX node info (for model import)
 
 ## Features
 
@@ -47,7 +46,7 @@ PROVENANCE_TRACKER.with(|t| {
 - 80+ operations (arithmetic, memory, control flow)
 - UOp graph with topological traversal
 - Symbolic integers (SInt) for shape expressions
-- Provenance tracking with `#[track_caller]`
+- Origin tracking: scopes attribute nodes and kernels to module paths, call sites and ONNX nodes
 - Tensor core ops (WMMA)
 
 **Planned:**

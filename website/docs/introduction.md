@@ -14,7 +14,7 @@ A Rust-based ML compiler inspired by [Tinygrad](https://github.com/tinygrad/tiny
 |---------|-------------|
 | **Declarative Optimization** | `patterns!` DSL for graph rewrites with Z3-verified correctness |
 | **Lazy Evaluation** | Tensors build computation graphs, compiled only at `realize()` |
-| **Provenance Tracking** | `#[track_caller]` traces every UOp to source location |
+| **Origin Tracking** | scopes attribute every kernel to a module path, call site, or ONNX node |
 | **80+ IR Operations** | Arithmetic, memory, control flow, WMMA tensor cores |
 | **20+ Optimizations** | Constant folding, tensor cores, vectorization, loop unrolling |
 
@@ -26,7 +26,7 @@ For architecture details, see the [documentation site](https://npatsakula.github
 |-------|-------------|
 | [dtype](https://github.com/npatsakula/svod/tree/main/dtype/) | Type system: scalars, vectors, pointers, images |
 | [macros](https://github.com/npatsakula/svod/tree/main/macros/) | Procedural macros (`patterns!` DSL) |
-| [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp graph IR: 80+ ops, symbolic integers, provenance |
+| [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp graph IR: 80+ ops, symbolic integers, origins |
 | [device](https://github.com/npatsakula/svod/tree/main/device/) | Buffer management: lazy alloc, zero-copy views, LRU caching |
 | [schedule](https://github.com/npatsakula/svod/tree/main/schedule/) | Optimization engine: 20+ passes, RANGEIFY, Z3 verification |
 | [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | Code generation: Clang (default), LLVM JIT |

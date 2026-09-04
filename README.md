@@ -10,7 +10,7 @@ A Rust-based ML compiler inspired by [Tinygrad](https://github.com/tinygrad/tiny
 |---------|-------------|
 | **Declarative Optimization** | `patterns!` DSL for graph rewrites with Z3-verified correctness |
 | **Lazy Evaluation** | Tensors build computation graphs, compiled only at `realize()` |
-| **Provenance Tracking** | `#[track_caller]` traces every UOp to source location |
+| **Origin Tracking** | scopes attribute every kernel to a module path, call site, or ONNX node |
 | **80+ IR Operations** | Arithmetic, memory, control flow, WMMA tensor cores |
 | **20+ Optimizations** | Constant folding, tensor cores, vectorization, loop unrolling |
 
@@ -22,7 +22,7 @@ For architecture details, see the [documentation site](https://npatsakula.github
 |-------|-------------|
 | [dtype](dtype/) | Type system: scalars, vectors, pointers, images |
 | [macros](macros/) | Procedural macros (`patterns!` DSL) |
-| [ir](ir/) | UOp graph IR: 80+ ops, symbolic integers, provenance |
+| [ir](ir/) | UOp graph IR: 80+ ops, symbolic integers, origins |
 | [device](device/) | Buffer management: lazy alloc, zero-copy views, LRU caching |
 | [schedule](schedule/) | Optimization engine: 20+ passes, RANGEIFY, Z3 verification |
 | [codegen](codegen/) | Code generation: Clang (default), LLVM JIT |

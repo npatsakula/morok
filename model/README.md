@@ -39,7 +39,8 @@ plans.
 ## Examples
 
 ```bash
-cargo run -p svod-model --release --example gigaam_infer -- audio.wav [--rnnt] [--timestamps]
+cargo run -p svod-model --release --example gigaam_infer -- audio.wav [--rnnt] [--timestamps] [--profile]
+SVOD_ORIGIN=1 cargo run -p svod-model --release --example gigaam_infer -- audio.wav --profile --origin-depth 3 --profile-json profile.json  # per-layer profile
 cargo run -p svod-model --release --example vad_bench -- audio.wav            # Silero vs FireRedVAD timing
 cargo run -p svod-model --release --example vad_stream -- audio.wav           # streaming VAD events (simulated mic)
 cargo run -p svod-model --release --example resnet_classify -- --hub --image dog.bin --side 224

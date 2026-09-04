@@ -112,10 +112,11 @@ pub struct ProfileOptions {
     pub iters: u32,             // replays; the per-kernel minimum device time is kept
     pub static_analysis: bool,  // Tier 2/3 (flops/bytes/resources) — cheap, on by default
     pub counters: PmcSelection, // Tier 4 hardware counters
+    pub origin_depth: Option<usize>, // origin rollup की depth; None पूरा path रखता है
 }
 ```
 
-`ProfileOptions::default()` है `{ iters: 1, static_analysis: true, counters: PmcSelection::None }` —
+`ProfileOptions::default()` है `{ iters: 1, static_analysis: true, counters: PmcSelection::None, origin_depth: None }` —
 Tiers 1–3, single pass। explicit control के लिए इसे सीधे construct करें:
 
 ```rust
@@ -137,6 +138,8 @@ let opts = ProfileOptions {
 |---------|--------|
 | `SVOD_PROFILE_ITERS` | min-merge के लिए replay count (कम से कम 1 तक clamp किया गया) |
 | `SVOD_PMC` | Tier-4 selection: empty या `0` → off; `1` → default counter set; वरना एक comma-separated token list (`sqbusy`, `waves`, `valu`) |
+| `SVOD_ORIGIN` | `1` हर op के बनने का scope दर्ज करता है (module path, call site, ONNX node), नीचे देखें |
+| `SVOD_ORIGIN_DEPTH` | origin rollups कितने path segments रखें (`origin_depth`); unset = पूरा path |
 
 ```bash
 # Profile with 20 replays and the default hardware counters.
@@ -153,6 +156,45 @@ SVOD_DEVICE=AMD:0 SVOD_PMC=valu,sqbusy ...
 तेज़ (minimum device-time) वाला sample जीतता है, और *उसी* sample के counters और static analysis को साथ ले
 जाता है। एक कर्नेल की intrinsic cost का robust estimator minimum ही है — यह scheduling jitter, contention,
 और clock-ramp outliers को reject कर देता है जो किसी mean को फुला देते हैं।
+
+## कर्नेल को model code से जोड़ना
+
+`r_128_3_32_4_2_2_2_4_4_192_2` जैसा कर्नेल नाम उसकी shape बताता है, यह नहीं कि वह किस layer
+का काम करता है। `SVOD_ORIGIN=1` के साथ हर tensor op वह scope दर्ज करता है जिसके अंदर वह बना —
+`encoder.layers.3.ffn1` जैसा module path, public op की call site, या ONNX node index — और
+scheduler उनका union हर dispatch पर ले जाता है। सोलह एक जैसी layers अब भी एक ही program
+compile करती हैं; वह सोलह बार, सोलह अलग attributions के साथ dispatch होता है।
+
+Models अपने state-dict paths के साथ scopes खोलते हैं (`OriginScope::module`), ONNX importer हर
+node के लिए एक खोलता है, और stage नाम (`vad`, `encoder`, `ctc_head`) root पर labels हैं।
+हाथ से लिखे `tk` कर्नेल भी बाकी की तरह attribute होते हैं: कर्नेल बनाते समय जो scope सक्रिय है,
+वही उसका origin बन जाता है।
+
+जब किसी run में origins हों, `render_table()` दो rollups जोड़ता है:
+
+- **exclusive** हर dispatch को एक बार, उसके primary origin (जिस scope ने stored value बनाई) पर
+  चार्ज करता है, इसलिए rows कुल का बँटवारा हैं;
+- **inclusive** हर dispatch को उसमें fuse हुए हर origin के हर ancestor पर चार्ज करता है, इसलिए
+  parent row अपने children को समेटती है और rows overlap करती हैं।
+
+दोनों `origin_depth` segments तक काटे जाते हैं; call frames (`@ add tensor/src/arithmetic.rs:31`)
+कर्नेल rows में detail की तरह रहते हैं और कभी rollup key नहीं बनते। किसी भी scope के बाहर बने
+कर्नेल `<unattributed>` row में जाते हैं।
+
+```
+origin rollup (depth 3, exclusive; rows sum to the total):
+  total ms  count    mean µs      %  origin path
+    23.045      2    11522.6    5.3  ctc_head.GigaAmCtcJit.subsampling
+     8.231      3     2743.7    1.9  ctc_head.GigaAmCtcJit.layers.6
+```
+
+`RunProfile::to_json(depth)` कर्नेल rows, दोनों rollups और origin arena export करता है ताकि ids
+offline resolve हो सकें; `gigaam_infer --profile-json out.json --origin-depth 3` ऐसी फ़ाइल लिखता है।
+
+Capture चालू करने से node identity बदलती है: अलग scopes में बने दो एक जैसे subgraphs अब kernel
+cut से पहले merge नहीं होते। कर्नेल programs पर असर नहीं पड़ता, लेकिन जो helper हर call site पर
+वही expression दोबारा बनाता है, उसे `OriginScope::suspend()` के अंदर चलना चाहिए या अपने inputs
+पहले से materialised लेने चाहिए।
 
 ---
 
