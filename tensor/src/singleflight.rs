@@ -65,6 +65,17 @@ impl<K: Hash + Eq + Clone> Singleflight<K> {
         self.claim(key).ok()
     }
 
+    /// [`try_claim`](Self::try_claim) for a cache miss: `lookup` runs again
+    /// under the ticket, so a winner that published between the caller's
+    /// lookup and the claim is not recomputed (under a second kernel name).
+    pub(crate) fn try_claim_miss<V>(&self, key: K, lookup: impl Fn() -> Option<V>) -> Option<Ticket<'_, K>> {
+        if lookup().is_some() {
+            return None;
+        }
+        let ticket = self.try_claim(key)?;
+        lookup().is_none().then_some(ticket)
+    }
+
     fn claim(&self, key: K) -> Result<Ticket<'_, K>, Slot> {
         let mut inflight = self.inflight.lock();
         match inflight.entry(key.clone()) {

@@ -893,3 +893,51 @@ fn test_parallel_prepare_names_kernels_in_schedule_order() {
         assert_eq!(ordinal(parallel_name).1, serial_position + family_sizes[base], "{serial:?} vs {parallel:?}");
     }
 }
+
+/// A hand-lowered `out[0] = value` kernel site, optimized under exactly `opts`.
+fn constant_store_site(value: f32, opts: Vec<svod_ir::Opt>, config: &PrepareConfig) -> KernelSite {
+    let out = UOp::index()
+        .buffer(UOp::param(0, 1, DType::Float32, None))
+        .indices(vec![UOp::index_const(0)])
+        .call()
+        .expect("output index");
+    let body = UOp::sink_with_info(
+        vec![out.store(UOp::native_const(value))],
+        svod_ir::KernelInfo { opts_to_apply: Some(opts), ..Default::default() },
+    );
+    let item = crate::schedule::ScheduleItem {
+        kernel: body.call(SmallVec::new(), svod_ir::CallInfo::default()),
+        ast: body,
+        buffers: vec![],
+        buffer_uop_ids: vec![],
+        fixedvars: HashMap::new(),
+        dependencies: vec![],
+        instance_dependencies: vec![],
+        loop_var_names: HashSet::new(),
+    };
+    KernelSite::resolve(&item, config, optimizer_config_fingerprint(config)).expect("resolve kernel site")
+}
+
+/// One kernel failing to optimize must not cost the rest of the batch their
+/// names: the survivors are published (a retry hits the cache), the failed
+/// key is released unpublished, and its error is what the batch returns.
+#[test_case(0; "failing first")]
+#[test_case(1; "failing middle")]
+#[test_case(2; "failing last")]
+fn compile_missing_kernels_publishes_the_survivors_of_a_failed_optimize(failing: usize) {
+    let config = PrepareConfig { compile_threads: 2, ..PrepareConfig::for_cpu_backend(crate::CpuBackend::Clang) };
+    let sites: Vec<_> = (0..3)
+        .map(|i| {
+            // The kernel has no unrollable axis, so UNROLL is rejected.
+            let opts = if i == failing { vec![svod_ir::Opt::unroll(0, 4)] } else { vec![] };
+            Some(constant_store_site(1000.0 + (failing * 3 + i) as f32, opts, &config))
+        })
+        .collect();
+
+    let Err(err) = compile_missing_kernels(&sites, &config) else { panic!("a failed optimize fails the batch") };
+    assert!(matches!(err, crate::error::Error::Optimize { .. }), "{err}");
+    for (i, site) in sites.iter().flatten().enumerate() {
+        assert_eq!(site.cached().is_some(), i != failing, "kernel {i} published");
+        assert!(opt_flight().try_claim(site.key.clone()).is_some(), "kernel {i} still claimed");
+    }
+}

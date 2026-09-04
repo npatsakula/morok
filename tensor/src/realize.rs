@@ -1270,6 +1270,8 @@ fn map_on_threads<T: Send, R: Send>(threads: usize, items: Vec<T>, f: impl Fn(T)
 /// `nK` suffixes — part of the source text and hence of the object-cache key —
 /// never depend on thread scheduling. Keys another prepare is already
 /// computing are skipped here and awaited by the caller through `opt_flight`.
+/// A kernel that fails to optimize draws no name and fails the batch only
+/// after the others are published, so a retry finds them cached.
 fn compile_missing_kernels(
     sites: &[Option<KernelSite>],
     config: &PrepareConfig,
@@ -1278,8 +1280,8 @@ fn compile_missing_kernels(
     let jobs: Vec<_> = sites
         .iter()
         .flatten()
-        .filter(|site| seen.insert(site.key.clone()) && site.cached().is_none())
-        .filter_map(|site| opt_flight().try_claim(site.key.clone()).map(|ticket| (site, ticket)))
+        .filter(|site| seen.insert(site.key.clone()))
+        .filter_map(|site| opt_flight().try_claim_miss(site.key.clone(), || site.cached()).map(|ticket| (site, ticket)))
         .collect();
     if jobs.is_empty() {
         return Ok(HashMap::new());
@@ -1292,17 +1294,28 @@ fn compile_missing_kernels(
     };
 
     let optimized = map_on_threads(threads, jobs.iter().collect(), |(site, _)| site.optimize(config));
-    let named = optimized
+    let mut failed = None;
+    let named: Vec<_> = jobs
         .into_iter()
-        .map(|optimized| optimized.map(|ast| finalize_kernel_name(&ast)))
-        .collect::<Result<Vec<_>>>()?;
+        .zip(optimized)
+        .filter_map(|(job, optimized)| match optimized {
+            Ok(ast) => Some((job, finalize_kernel_name(&ast))),
+            Err(err) => {
+                failed.get_or_insert(err);
+                None
+            }
+        })
+        .collect();
 
-    let compiled = map_on_threads(threads, jobs.into_iter().zip(named).collect(), |((site, ticket), ast)| {
+    let compiled = map_on_threads(threads, named, |((site, ticket), ast)| {
         let compiled = site.compile(ast);
         drop(ticket);
         compiled.map(|kernel| (site.key.clone(), kernel))
     });
-    compiled.into_iter().collect()
+    match failed {
+        Some(err) => Err(err),
+        None => compiled.into_iter().collect(),
+    }
 }
 
 pub(crate) fn runtime_effect_ast(ast: &Arc<UOp>) -> &Arc<UOp> {
