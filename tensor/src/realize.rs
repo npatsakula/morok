@@ -1253,8 +1253,12 @@ impl KernelSite {
         Ok(result)
     }
 
-    /// The whole miss pipeline for one kernel, inline.
+    /// The whole miss pipeline for one kernel, inline. Detached for the same
+    /// reason `compile_missing_kernels` detaches its workers: optimizing and
+    /// rendering mint UOps, and this path runs under whatever scope the caller
+    /// is realizing inside.
     fn build(&self, config: &PrepareConfig) -> Result<Arc<CachedKernel>> {
+        let _detached = svod_ir::origin::OriginScope::suspend();
         let optimized = self.optimize(config)?;
         self.compile(finalize_kernel_name(&optimized))
     }

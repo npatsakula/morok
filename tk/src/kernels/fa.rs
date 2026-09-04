@@ -661,7 +661,12 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
             // partial-mask path. Such inactive lanes are caller-discarded, so the
             // exact value is immaterial (only finiteness is); partial masks (already
             // >= 1 valid key) are unchanged.
+            //
+            // The clamp is a property of `key_lens`, not of the calling layer: every
+            // layer sharing one `key_lens` must share one clamp kernel, so it is
+            // built outside the caller's origin scope.
             let key_lens_clamped = opts.key_lens.map(|lens| {
+                let _shared = svod_ir::origin::OriginScope::suspend();
                 let ones = Tensor::full(&[b], ConstValue::Int(1), DType::Int32).expect("ones[b]");
                 lens.maximum(&ones).expect("clamp key_lens >= 1")
             });

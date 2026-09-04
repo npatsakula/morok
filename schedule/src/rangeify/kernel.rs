@@ -258,25 +258,6 @@ fn extract_after_callable(deps: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
     })
 }
 
-/// Rebuild `root` with every origin cleared.
-///
-/// The body keys the optimizer, BEAM, the compiled-program and the object cache,
-/// so attribution rides the CALL instead: two dispatches of the same computation
-/// from different modules must still share one compiled program. Nodes whose
-/// sources are unchanged and that carry no origin are returned as-is, so an
-/// already origin-free body hash-conses back to itself.
-fn strip_origins(root: &Arc<UOp>) -> Arc<UOp> {
-    let mut rebuilt: HashMap<u64, Arc<UOp>> = HashMap::new();
-    for node in root.toposort() {
-        let children = node.op().children();
-        let sources: Vec<Arc<UOp>> = children.iter().map(|child| rebuilt[&child.id].clone()).collect();
-        let moved = children.iter().zip(&sources).any(|(old, new)| !Arc::ptr_eq(old, new));
-        let stripped = if moved { node.with_sources(sources) } else { node.clone() };
-        rebuilt.insert(node.id, stripped.rorigin(None));
-    }
-    rebuilt.remove(&root.id).expect("toposort ends at the root")
-}
-
 /// Split STORE and END operations into individual kernels.
 ///
 /// Based on split_store.
@@ -328,14 +309,12 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     };
     // Harvest attribution before the body loses it: `origin` is what this kernel is
     // charged to (the stored value's root), `origins` is everything that fused into it.
-    let body = ret.toposort();
-    let origins: OriginSet = body.iter().filter_map(|node| node.origin()).collect();
-    // The fallback walks root-first (the toposort is children-first), so an unattributed
-    // store target charges the kernel to the nearest attributed node above it rather
-    // than to whichever leaf happens to be deepest.
-    let origin: Option<OriginId> =
-        extract_stored_value(&ret).origin().or_else(|| body.iter().rev().find_map(|node| node.origin()));
-    let ret = if origins.is_empty() { ret } else { strip_origins(&ret) };
+    // The fallback walks root-first, so an unattributed store target charges the
+    // kernel to the nearest attributed node above it rather than to whichever leaf
+    // happens to be deepest.
+    let (fallback, origins): (Option<OriginId>, OriginSet) = ret.kernel_attribution();
+    let origin: Option<OriginId> = extract_stored_value(&ret).origin().or(fallback);
+    let ret = if origins.is_empty() { ret } else { ret.without_origins() };
 
     let closed_ranges = match ret.op() {
         Op::End(ops::End { ranges, .. }) if !ranges.is_empty() => Some(ranges.clone()),

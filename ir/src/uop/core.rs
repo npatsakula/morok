@@ -275,6 +275,33 @@ impl UOp {
         Self::new_with_origin(self.op.clone(), self.dtype.clone(), self.tag.clone(), origin)
     }
 
+    /// What a kernel rooted here is charged to, in one pass: the nearest attributed
+    /// node walking root-first (the toposort is children-first, so it is consumed in
+    /// reverse), and every origin the body carries.
+    pub fn kernel_attribution(self: &Arc<Self>) -> (Option<OriginId>, crate::origin::OriginSet) {
+        let body = self.toposort();
+        (body.iter().rev().find_map(|node| node.origin()), body.iter().filter_map(|node| node.origin()).collect())
+    }
+
+    /// Rebuild this tree with every origin cleared.
+    ///
+    /// A kernel body keys the optimizer, BEAM, the compiled-program and the object
+    /// cache, so attribution rides the callable instead: two dispatches of the same
+    /// computation from different scopes must still share one compiled program.
+    /// Nodes whose sources are unchanged and that carry no origin are returned
+    /// as-is, so an already origin-free tree hash-conses back to itself.
+    pub fn without_origins(self: &Arc<Self>) -> Arc<Self> {
+        let mut rebuilt: HashMap<u64, Arc<Self>> = HashMap::new();
+        for node in self.toposort() {
+            let children = node.op().children();
+            let sources: Vec<Arc<Self>> = children.iter().map(|child| rebuilt[&child.id].clone()).collect();
+            let moved = children.iter().zip(&sources).any(|(old, new)| !Arc::ptr_eq(old, new));
+            let stripped = if moved { node.with_sources(sources) } else { node.clone() };
+            rebuilt.insert(node.id, stripped.rorigin(None));
+        }
+        rebuilt.remove(&self.id).expect("toposort ends at the root")
+    }
+
     /// Check if this UOp has a concrete buffer identity in the graph.
     ///
     /// Returns true for buffer-like identities or RESHAPE/MULTI chains leading to them.

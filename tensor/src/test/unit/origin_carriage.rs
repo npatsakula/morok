@@ -183,3 +183,83 @@ fn profiles_carry_the_dispatch_origins() {
         assert_eq!(profile.origins, origins);
     }
 }
+
+/// A hand-lowered kernel never reaches `split_store` — the cut gates on a
+/// kernel-marked SINK — so `UOp::custom_kernel` owes it the same contract: an
+/// origin-free body, attribution on the callable. Without it every conformer
+/// layer's tile-DSL attention kernel compiles separately.
+#[test]
+fn hand_lowered_kernel_bodies_dedup_across_scopes() {
+    use svod_ir::{Op, UOp, ops};
+
+    let (left_id, right_id) = (module("carriage.hand.left"), module("carriage.hand.right"));
+    let build = || {
+        let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+        input
+            .custom_kernel(&[], |placeholders| UOp::sink(vec![placeholders[0].contiguous()]))
+            .expect("custom kernel")
+            .into_iter()
+            .next()
+            .expect("one output per source")
+    };
+    let left = {
+        let _scope = origin::install(Some(left_id));
+        build()
+    };
+    let right = {
+        let _scope = origin::install(Some(right_id));
+        build()
+    };
+
+    let callable = |tensor: &Tensor| match tensor.uop().op() {
+        Op::After(ops::After { deps, .. }) => deps[0].clone(),
+        op => panic!("custom_kernel returns AFTER(CALL), got {op:?}"),
+    };
+    let parts = |call: &Arc<svod_ir::UOp>| match call.op() {
+        Op::Call(ops::Call { body, info, .. }) => (body.clone(), info.clone()),
+        op => panic!("an opaque body wraps into CALL, got {op:?}"),
+    };
+    let (left_body, left_info) = parts(&callable(&left));
+    let (right_body, right_info) = parts(&callable(&right));
+
+    for body in [&left_body, &right_body] {
+        assert!(
+            body.toposort().iter().all(|node| node.origin().is_none()),
+            "the body keys every downstream cache and must be origin-free:\n{}",
+            body.tree()
+        );
+    }
+    assert!(
+        Arc::ptr_eq(&left_body, &right_body),
+        "stripped bodies must hash-cons to one node:\nLEFT\n{}\nRIGHT\n{}",
+        left_body.tree(),
+        right_body.tree()
+    );
+    assert!(descends_from(left_info.origin, left_id) && descends_from(right_info.origin, right_id));
+    assert_eq!(left_info.origins.iter().copied().collect::<Vec<_>>(), vec![left_id]);
+    assert_eq!(right_info.origins.iter().copied().collect::<Vec<_>>(), vec![right_id]);
+}
+
+/// A caller-supplied attribution wins; the harvested set still describes the body.
+#[test]
+fn hand_lowered_kernel_keeps_an_explicit_origin() {
+    use svod_ir::{Op, UOp, ops};
+
+    let (declared, built_under) = (module("carriage.hand.declared"), module("carriage.hand.built"));
+    let info = svod_ir::CallInfo { origin: Some(declared), ..svod_ir::CallInfo::default() };
+    let output = {
+        let _scope = origin::install(Some(built_under));
+        let input = Tensor::from_slice([1.0f32, 2.0]);
+        input
+            .custom_kernel_with(&[], info, |placeholders| UOp::sink(vec![placeholders[0].contiguous()]))
+            .expect("custom kernel")
+            .into_iter()
+            .next()
+            .expect("one output per source")
+    };
+    let output = output.uop();
+    let Op::After(ops::After { deps, .. }) = output.op() else { panic!("expected AFTER") };
+    let Op::Call(ops::Call { info, .. }) = deps[0].op() else { panic!("expected CALL") };
+    assert_eq!(info.origin, Some(declared));
+    assert_eq!(info.origins.iter().copied().collect::<Vec<_>>(), vec![built_under]);
+}

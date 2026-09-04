@@ -221,6 +221,22 @@ impl UOp {
         if let Op::Sink(ops::Sink { sources, info: None }) = body.op() {
             body = Self::sink_with_info(sources.to_vec(), KernelInfo::default());
         }
+        // Same contract as the scheduler's kernel cut: the body keys every cache
+        // downstream (optimizer, BEAM, compiled program, object cache), so a
+        // hand-lowered kernel built once per module must still hash-cons to one
+        // body. Attribution moves onto the callable instead. This body never
+        // reaches `split_store` — the cut gates on a kernel-marked SINK — so this
+        // is its only chance to be stripped and attributed.
+        let (primary, origins) = body.kernel_attribution();
+        let info = if origins.is_empty() {
+            info
+        } else {
+            let mut info = info;
+            info.origin = info.origin.or(primary);
+            info.origins.union(&origins);
+            body = body.without_origins();
+            info
+        };
         let args = SmallVec::from_vec(contig_srcs.clone());
         let callable = if is_opaque_call_body(body.op()) { body.call(args, info) } else { body.function(args, info) };
 
