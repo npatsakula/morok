@@ -40,22 +40,9 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
         None => return Ok(None),
     };
 
-    let Op::Reduce(svod_ir::ops::Reduce { reduce_op: reduce_type, ranges: _, src, .. }) = reduce_op.op() else {
+    let Some((in0, in1)) = matmul_operands(&reduce_op) else {
         return Ok(None);
     };
-
-    if *reduce_type != ReduceOp::Add {
-        return Ok(None);
-    }
-
-    // Extract MUL operation (possibly under CAST)
-    let mul = src.unwrap_cast();
-
-    let Op::Binary(BinaryOp::Mul, a, b) = mul.op() else {
-        return Ok(None);
-    };
-
-    let (in0, in1) = (tc_operand(a), tc_operand(b));
     let in0_all_ranges = get_ranges(&in0);
     let in1_all_ranges = get_ranges(&in1);
 
@@ -95,6 +82,15 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
     }
 
     Ok(Some(MatmulPattern { reduce_op, in0, in1, in0_ranges, in1_ranges, red_ranges, axis_choices }))
+}
+
+/// The tensor-core operands of a matmul-shaped `REDUCE(ADD, MUL(a, b))`, with
+/// a cast above the MUL and exact integer widenings on `a`/`b` peeled.
+pub(crate) fn matmul_operands(reduce: &Arc<UOp>) -> Option<(Arc<UOp>, Arc<UOp>)> {
+    let Op::Reduce(svod_ir::ops::Reduce { reduce_op: ReduceOp::Add, src, .. }) = reduce.op() else { return None };
+    let mul = src.unwrap_cast();
+    let Op::Binary(BinaryOp::Mul, a, b) = mul.op() else { return None };
+    Some((tc_operand(a), tc_operand(b)))
 }
 
 /// The tensor-core operand behind a MUL input. A value-preserving integer

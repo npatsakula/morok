@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 use svod_ir::uop::{reaching, reaching_each};
-use svod_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, TernaryOp, UOp};
+use svod_ir::{AxisId, AxisType, BinaryOp, Op, TernaryOp, UOp};
 
 use crate::optimizer::config::HeuristicsConfig;
+use crate::optimizer::tc::matmul_operands;
 use crate::optimizer::{Opt, Scheduler, apply_opt};
 use svod_ir::ops;
 
@@ -95,21 +96,8 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
 /// Check if kernel has matmul pattern: REDUCE(ADD) of MUL of INDEX ops.
 pub fn has_matmul_pattern(scheduler: &Scheduler) -> bool {
     let Some(reduceop) = scheduler.reduceop() else { return false };
-
-    if let Op::Reduce(ops::Reduce { src, reduce_op, .. }) = reduceop.op() {
-        if *reduce_op != ReduceOp::Add {
-            return false;
-        }
-        let src = if let Op::Cast(ops::Cast { src, .. }) = src.op() { src } else { src };
-        if let Op::Binary(BinaryOp::Mul, left, right) = src.op() {
-            let left_is_index = matches!(left.op(), Op::Index(..))
-                || matches!(left.op(), Op::Cast(ops::Cast { src, .. }) if matches!(src.op(), Op::Index(..)));
-            let right_is_index = matches!(right.op(), Op::Index(..))
-                || matches!(right.op(), Op::Cast(ops::Cast { src, .. }) if matches!(src.op(), Op::Index(..)));
-            return left_is_index && right_is_index;
-        }
-    }
-    false
+    matmul_operands(&reduceop)
+        .is_some_and(|(a, b)| [a, b].iter().all(|operand| matches!(operand.unwrap_cast().op(), Op::Index(..))))
 }
 
 /// Check if axis is masked (appears in WHERE conditionals).
@@ -583,16 +571,13 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
     let Some(reduceop) = scheduler.reduceop() else {
         return false;
     };
-    let Op::Reduce(ops::Reduce { src, reduce_op, .. }) = reduceop.op() else {
+    let Some((left, right)) = matmul_operands(&reduceop) else {
         return false;
     };
-    if *reduce_op != ReduceOp::Add || scheduler.full_shape().len() < 2 {
+    if scheduler.full_shape().len() < 2 {
         return false;
     }
-
-    let Op::Binary(BinaryOp::Mul, left, right) = src.op() else {
-        return false;
-    };
+    let (left, right) = (left.unwrap_cast(), right.unwrap_cast());
     let (idx0_src, idx1_src) = match (left.op(), right.op()) {
         (Op::Index(ops::Index { indices: i0, .. }), Op::Index(ops::Index { indices: i1, .. })) => {
             let Some(i0) = i0.first() else {

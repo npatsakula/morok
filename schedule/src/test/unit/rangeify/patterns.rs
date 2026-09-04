@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use smallvec::smallvec;
 use svod_dtype::DType;
-use svod_ir::{AxisId, AxisType, BufferizeOpts, DeviceSpec, Op, ReduceOp, SInt, UOp};
+use svod_ir::{AxisId, AxisType, BinaryOp, BufferizeOpts, DeviceSpec, Op, ReduceOp, SInt, UOp};
 use test_case::test_case;
 
 use crate::pattern::RewriteResult;
@@ -48,6 +48,29 @@ fn early_rewrites_leaves_plain_compute_alone() {
     let a = UOp::native_const(1.0f32);
     for untouched in [a.clone(), a.try_add(&a).expect("add")] {
         assert!(matches!(patterns::early_rewrites().rewrite(&untouched, &mut ()), RewriteResult::NoMatch));
+    }
+}
+
+/// A widening integer cast of a product moves onto the operands, so the
+/// product is formed at the accumulator's width instead of wrapping.
+#[test_case(DType::Int8, DType::Int32, true; "int8 product to int32")]
+#[test_case(DType::UInt8, DType::UInt32, true; "uint8 product to uint32")]
+#[test_case(DType::Int8, DType::UInt16, false; "sign change stays")]
+#[test_case(DType::Float16, DType::Float32, false; "float product stays")]
+#[test_case(DType::Int32, DType::Int8, false; "narrowing stays")]
+fn widening_integer_cast_moves_onto_the_product_operands(stored: DType, wide: DType, rewritten_: bool) {
+    let a = UOp::new_buffer(DeviceSpec::Cpu, 4, stored.clone());
+    let b = UOp::new_buffer(DeviceSpec::Cpu, 4, stored);
+    let cast = a.try_mul(&b).expect("mul").cast(wide.clone());
+    match patterns::early_rewrites().rewrite(&cast, &mut ()) {
+        RewriteResult::Rewritten(out) => {
+            assert!(rewritten_, "unexpected rewrite of {}", out.op().as_ref());
+            let Op::Binary(BinaryOp::Mul, x, y) = out.op() else { panic!("expected MUL, got {}", out.op().as_ref()) };
+            assert!(matches!(x.op(), Op::Cast(..)) && matches!(y.op(), Op::Cast(..)));
+            assert_eq!((out.dtype(), x.dtype(), y.dtype()), (wide.clone(), wide.clone(), wide));
+        }
+        RewriteResult::NoMatch => assert!(!rewritten_),
+        other => panic!("unexpected {other:?}"),
     }
 }
 

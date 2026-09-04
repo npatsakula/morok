@@ -107,14 +107,33 @@ pub fn is_elementwise(uop: &Arc<UOp>) -> bool {
 // EARLY CLEANUP PATTERNS
 // ============================================================================
 
+/// Both `Mul` operands are sized integers that `wide` (a sized integer) holds
+/// exactly, so forming the product at `wide` cannot wrap.
+fn widens_int_product(a: &Arc<UOp>, b: &Arc<UOp>, wide: &DType) -> bool {
+    let sized_int = |dtype: &DType| dtype.scalar().is_some_and(|s| s.is_signed() || s.is_unsigned());
+    sized_int(wide)
+        && [a, b].iter().all(|operand| {
+            let dtype = operand.dtype();
+            sized_int(&dtype) && dtype != *wide && DType::can_safe_cast(dtype, wide.clone())
+        })
+}
+
 /// Pattern matcher for early cleanup rewrites during scheduling.
 ///
 /// This handles schedule-specific cleanup:
+/// - Integer products under a widening cast are formed at the wide type
 /// - DETACH removal (gradient computation marker no longer needed)
 /// - CONTIGUOUS_BACKWARD removal (gradient computation marker no longer needed)
 /// - Zero-size tensor folding
 pub fn early_rewrites() -> TypedPatternMatcher {
     crate::patterns! {
+        // A widening integer cast of a product applies to the operands, so the
+        // product is formed at the accumulator's width instead of wrapping in
+        // the narrow type. That is what an integer accumulate dtype means
+        // (ONNX MatMulInteger, tensor cores multiply at full width) and what C
+        // integer promotion already gave the clang backend.
+        Cast { src: Mul(a, b), dtype: wide } if widens_int_product(a, b, wide)
+            => a.cast(wide.clone()).try_mul(&b.cast(wide.clone())).ok(),
         // mop_cleanup: merge adjacent untagged RESHAPEs.
         x @ Reshape { src: x2, new_shape } if x.tag().is_none() && x2.tag().is_none() && matches!(x2.op(), Op::Reshape(..)) => {
             let Op::Reshape(ops::Reshape { src, .. }) = x2.op() else { return None };

@@ -1,5 +1,5 @@
 use crate::*;
-use ndarray::{Array2, array};
+use ndarray::{Array2, Array4, array};
 use svod_dtype::DType;
 use svod_ir::ops;
 use svod_schedule::{
@@ -370,29 +370,28 @@ fn test_matmul_explicit_dtype() {
     assert_eq!(c.uop().dtype(), DType::Float64);
 }
 
-/// A wider integer accumulator must widen the operands before the product.
-/// Before the fix the MUL stayed at int8, so `127 * 2` wrapped to -2: the C
-/// backend hid it behind C integer promotion while LLVM emitted `mul i8` and
-/// produced 62 instead of 318. Assert both the IR dtype (backend independent)
-/// and the realized value.
-#[test]
-fn test_matmul_int8_widens_operands_for_int32_accumulator() {
-    use svod_ir::Op;
-
-    let a = Tensor::from_ndarray(&array![[127i8, -64, 32, 0]]);
-    let b = Tensor::from_ndarray(&array![[2i8], [-1], [0], [1]]);
-
-    let c = a.matmul_with().other(&b).dtype(DType::Int32).call().unwrap();
-    assert_eq!(c.uop().dtype(), DType::Int32);
-    for uop in c.uop().toposort() {
-        if matches!(uop.op(), Op::Binary(svod_ir::BinaryOp::Mul, ..)) {
-            assert_ne!(uop.dtype(), DType::Int8, "int8 MUL survives a wider integer accumulator");
-        }
+crate::codegen_tests! {
+    /// A wider integer accumulator must not wrap the products: `127 * 2` is
+    /// 254, not -2, on every backend (LLVM emits `mul i8` unless the operands
+    /// are widened first; C hid the wrap behind integer promotion).
+    fn test_matmul_int8_products_do_not_wrap(config) {
+        let a = Tensor::from_ndarray(&array![[127i8, -64, 32, 0]]);
+        let b = Tensor::from_ndarray(&array![[2i8], [-1], [0], [1]]);
+        let mut c = a.matmul_with().other(&b).dtype(DType::Int32).call().unwrap();
+        assert_eq!(c.uop().dtype(), DType::Int32);
+        c.realize_with(&config).unwrap();
+        assert_eq!(c.as_vec::<i32>().unwrap(), vec![318]);
     }
 
-    let mut c = c;
-    c.realize().unwrap();
-    assert_eq!(c.as_vec::<i32>().unwrap(), vec![318]);
+    /// The same widening reaches `conv`: an int8 1x1 convolution with an int32
+    /// accumulator forms int32 products.
+    fn test_conv_int8_products_do_not_wrap(config) {
+        let x = Tensor::from_ndarray(&Array4::from_shape_fn((1, 4, 1, 1), |(_, c, _, _)| [127i8, -64, 32, 0][c]));
+        let w = Tensor::from_ndarray(&Array4::from_shape_fn((1, 4, 1, 1), |(_, c, _, _)| [2i8, -1, 0, 1][c]));
+        let mut y = x.conv2d().weight(&w).acc_dtype(DType::Int32).call().unwrap();
+        y.realize_with(&config).unwrap();
+        assert_eq!(y.as_vec::<i32>().unwrap(), vec![318]);
+    }
 }
 
 crate::codegen_tests! {
