@@ -60,7 +60,7 @@ impl IntoRewriteResult for RewriteResult {
 // =============================================================================
 
 pub use helpers::{const_matches, is_any_const, is_neg_one, is_nonzero, is_one, is_zero, try_const};
-pub use simplified::{BlockFn, PatternClosure, RuleMeta, SimplifiedPatternMatcher};
+pub use simplified::{BlockFn, RuleMeta, SimplifiedPatternMatcher};
 
 /// Type alias for backwards compatibility.
 pub type TypedPatternMatcher<C = ()> = SimplifiedPatternMatcher<C>;

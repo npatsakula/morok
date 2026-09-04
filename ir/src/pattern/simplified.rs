@@ -26,9 +26,6 @@ use crate::op::pattern_derived::OpKey;
 
 use super::RewriteResult;
 
-/// Closure type of a hand-written rule: root node and context.
-pub type PatternClosure<C> = Arc<dyn Fn(&Arc<UOp>, &mut C) -> RewriteResult + Send + Sync>;
-
 /// A compiled block: root node, the mask of its direct children's kinds, and context.
 ///
 /// The children mask is handed in rather than read from the node so early rejects can

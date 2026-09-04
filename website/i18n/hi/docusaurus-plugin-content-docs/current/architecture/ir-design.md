@@ -200,17 +200,17 @@ Svod एक मैकेनिज़्म इस्तेमाल करता
 ```rust
 patterns! {
     // Identity folding: x + 0 → x
-    Add[x, @zero] ~> x,
+    Add[x, @zero] => x,
 
     // Constant folding: 3 + 4 → 7
-    Add(a @const(a_val), b @const(b_val))
+    Add(a @const(a_val), _b @const(b_val))
         => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 
     // Self-folding: x / x → 1
-    Idiv(x, x) ~> UOp::one(x.dtype()),
+    Idiv(x, x) => UOp::one(x.dtype()),
 
     // Dead code: if(true) { x } else { y } → x
-    Where(@true, t, _f) ~> t,
+    Where(Const(ConstValue::Bool(true)), t, _f) => t,
 }
 ```
 
@@ -218,10 +218,10 @@ DSL बहुत एक्सप्रेसिव है:
 
 - **`[x, y]` — commutative।** दोनों orderings ट्राई करता है (`ADD`, `MUL`, वगैरह के लिए)
 - **`(x, y)` — ordered।** बिल्कुल इसी ऑर्डर में मैच करता है।
-- **`@zero`, `@one`, `@true` — सिमैंटिक कॉन्स्टेंट।** किसी भी dtype के लिए काम करता है।
-- **`@const(val)` — वैल्यू एक्सट्रैक्ट करें।** कम्पाइल-टाइम कम्प्यूटेशन के लिए।
+- **`@zero`, `@one` — सिमैंटिक कॉन्स्टेंट।** किसी भी dtype के लिए काम करता है।
+- **`c @const(val)` — वैल्यू एक्सट्रैक्ट करें।** कम्पाइल-टाइम कम्प्यूटेशन के लिए।
 - **`x, x` — same operand।** पॉइंटर इक्वैलिटी डिटेक्ट करता है।
-- **`~>` बनाम `=>`** — infallible बनाम fallible रीराइट।
+- **`=>` — रीराइट।** `Arc<UOp>`, `Option<Arc<UOp>>` (`None` का मतलब स्किप) या `RewriteResult` रिटर्न करता है।
 
 रीराइट इंजन बॉटम-अप पैटर्न अप्लाई करता है जब तक कोई और मैच न हो:
 
@@ -369,7 +369,7 @@ println!("{}", tensor.uop().tree());
 ```rust
 patterns! {
     // Your custom optimization
-    MyPattern(x, y) ~> better_version(x, y),
+    MyPattern(x, y) => better_version(x, y),
 }
 ```
 

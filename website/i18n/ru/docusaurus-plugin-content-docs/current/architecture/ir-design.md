@@ -200,17 +200,17 @@ Svod использует один механизм: **перезапись гр
 ```rust
 patterns! {
     // Identity folding: x + 0 → x
-    Add[x, @zero] ~> x,
+    Add[x, @zero] => x,
 
     // Constant folding: 3 + 4 → 7
-    Add(a @const(a_val), b @const(b_val))
+    Add(a @const(a_val), _b @const(b_val))
         => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 
     // Self-folding: x / x → 1
-    Idiv(x, x) ~> UOp::one(x.dtype()),
+    Idiv(x, x) => UOp::one(x.dtype()),
 
     // Dead code: if(true) { x } else { y } → x
-    Where(@true, t, _f) ~> t,
+    Where(Const(ConstValue::Bool(true)), t, _f) => t,
 }
 ```
 
@@ -218,10 +218,10 @@ DSL выразителен:
 
 - **`[x, y]` — коммутативно.** Пробуем оба порядка (для `ADD`, `MUL` и т.д.)
 - **`(x, y)` — упорядочено.** Сопоставляется ровно в этом порядке.
-- **`@zero`, `@one`, `@true` — семантические константы.** Работают для любого DType.
-- **`@const(val)` — извлечение значения.** Для вычислений во время компиляции.
+- **`@zero`, `@one` — семантические константы.** Работают для любого DType.
+- **`c @const(val)` — извлечение значения.** Для вычислений во время компиляции.
 - **`x, x` — один и тот же операнд.** Определяется через равенство указателей.
-- **`~>` vs `=>`** — безусловная vs условная перезапись.
+- **`=>` — перезапись.** Возвращает `Arc<UOp>`, `Option<Arc<UOp>>` (`None` — отказ) или `RewriteResult`.
 
 Движок перезаписи применяет паттерны снизу вверх, пока не останется совпадений:
 
@@ -369,7 +369,7 @@ println!("{}", tensor.uop().tree());
 ```rust
 patterns! {
     // Your custom optimization
-    MyPattern(x, y) ~> better_version(x, y),
+    MyPattern(x, y) => better_version(x, y),
 }
 ```
 

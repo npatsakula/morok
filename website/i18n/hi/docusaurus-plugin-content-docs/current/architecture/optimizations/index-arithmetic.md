@@ -60,15 +60,15 @@ Variant #5 nested floor division flatten करता है। `(a // c1 + c2) 
 // From schedule/src/symbolic/patterns.rs — div_mod_recombine_dsl_patterns()
 
 // #1: x%n + (x//n)*n -> x
-Add[Mod(x, n), Mul[Idiv(x, n), n]] ~> |x| Arc::clone(x),
+Add[Mod(x, n), Mul[Idiv(x, n), n]] => x,
 
 // #2: ((x//a) % c) + (x // b) * c -> x // a  when a*c == b
-Add[Mod(Idiv(x, a), c), Mul[Idiv(x, _b), c]]
-    => |x, a, a_val, c_val, b_val| { /* guard: a_int * c_int == b_int */ },
+Add[Mod(Idiv(x, a @const(a_val)), c @const(c_val)), Mul[Idiv(x, _b @const(b_val)), c]]
+    => { /* guard: a_val * c_val == b_val */ },
 
 // #5: (a//c1 + c2) // c3 -> (a + c1*c2) // (c1*c3)
-Idiv(Add[Idiv(a, c1), _c2], _c3)
-    => |a, c1, c1_val, c2_val, c3_val| { /* guard: c1>0, c3>0, same-sign */ },
+Idiv(Add[Idiv(a, c1 @const(c1_val)), _c2 @const(c2_val)], _c3 @const(c3_val))
+    => { /* guard: c1>0, c3>0, same-sign */ },
 ```
 
 ---

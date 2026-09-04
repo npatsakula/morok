@@ -17,7 +17,7 @@ Svod का symbolic simplifier UOp computation graphs को 140+ अल्ज�
 
 **Range analysis**: हर UOp अपनी runtime minimum (`vmin`) और maximum (`vmax`) वैल्यूज़ ट्रैक करता है, जो नोड construction के दौरान inputs के bounds से eagerly कम्प्यूट होती हैं। कई पैटर्न इन bounds का इस्तेमाल करते हैं compile time पर conditions prove करने के लिए (जैसे, "x हमेशा non-negative है" या "x < n सभी values के लिए")।
 
-**Notation**: `OP[a, b]` commutative पैटर्न है (दोनों operand orderings ट्राई होती हैं)। `OP(a, b)` ordered है। `@zero`/`@one`/`@const` constant values मैच करते हैं। जब एक ही variable name दो बार आए (जैसे, `Idiv(x, x)`), दोनों operands एक ही नोड होने चाहिए (`Arc::ptr_eq` — यानी hash consing से structurally deduplicated)।
+**Notation**: `OP[a, b]` commutative पैटर्न है (दोनों operand orderings ट्राई होती हैं)। `OP(a, b)` ordered है। `@zero`/`@one`/`c @const(v)` constant values मैच करते हैं। जब एक ही variable name दो बार आए (जैसे, `Idiv(x, x)`), दोनों operands एक ही नोड होने चाहिए (`Arc::ptr_eq` — यानी hash consing से structurally deduplicated)।
 
 **Tinygrad reference**: `tinygrad/uop/symbolic.py`, `tinygrad/uop/divandmod.py`
 

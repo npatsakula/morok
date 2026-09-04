@@ -168,7 +168,7 @@ let matcher = patterns! {
 // Context-aware matcher
 let matcher = patterns! {
     @context MyContext;
-    Pattern => |x, ctx| ctx.transform(x)
+    Add(x, y) => ctx.transform(x, y)
 };
 
 // Combining matchers (same context type)
@@ -315,7 +315,7 @@ let result = graph_rewrite(&full_pipeline, graph, &mut ctx);
 | **No backtracking** once committed to branch | Split into separate rules |
 | **No cross-traversal context** "if Y seen earlier" | Use `@context` parameter with manual tracking |
 | **No graph topology queries** (consumers, cycles) | Pre-analysis passes or manual traversal |
-| **Fixed-point limit** MAX_DEPTH = 100 | Deep/circular chains truncated |
+| **No fixed-point limit** `REWRITE_STACK_LIMIT = 500_000` | A runaway rewrite panics; ensure every rule makes progress |
 | **No higher-order patterns** "any commutative op" | Use `for op in binary [Add, Mul, ...]` |
 | **No variable-arity chains** | Explicit enumeration: `Add(Add(x, y), z)` |
 

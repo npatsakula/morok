@@ -200,17 +200,17 @@ Svod uses one mechanism: **pattern-based graph rewriting**.
 ```rust
 patterns! {
     // Identity folding: x + 0 → x
-    Add[x, @zero] ~> x,
+    Add[x, @zero] => x,
 
     // Constant folding: 3 + 4 → 7
-    Add(a @const(a_val), b @const(b_val))
+    Add(a @const(a_val), _b @const(b_val))
         => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 
     // Self-folding: x / x → 1
-    Idiv(x, x) ~> UOp::one(x.dtype()),
+    Idiv(x, x) => UOp::one(x.dtype()),
 
     // Dead code: if(true) { x } else { y } → x
-    Where(@true, t, _f) ~> t,
+    Where(Const(ConstValue::Bool(true)), t, _f) => t,
 }
 ```
 
@@ -218,10 +218,10 @@ The DSL is expressive:
 
 - **`[x, y]` — commutative.** Try both orderings (for `ADD`, `MUL`, etc.)
 - **`(x, y)` — ordered.** Match exactly this order.
-- **`@zero`, `@one`, `@true` — semantic constants.** Works for any dtype.
-- **`@const(val)` — extract value.** For compile-time computation.
+- **`@zero`, `@one` — semantic constants.** Works for any dtype.
+- **`c @const(val)` — extract value.** For compile-time computation.
 - **`x, x` — same operand.** Detects pointer equality.
-- **`~>` vs `=>`** — infallible vs fallible rewrite.
+- **`=>` — rewrite.** Returns `Arc<UOp>`, `Option<Arc<UOp>>` (`None` declines) or `RewriteResult`.
 
 The rewrite engine applies patterns bottom-up until no more matches:
 
@@ -369,7 +369,7 @@ If something should be parallel but isn't, you can see it.
 ```rust
 patterns! {
     // Your custom optimization
-    MyPattern(x, y) ~> better_version(x, y),
+    MyPattern(x, y) => better_version(x, y),
 }
 ```
 

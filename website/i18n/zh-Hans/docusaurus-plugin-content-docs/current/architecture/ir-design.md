@@ -199,17 +199,17 @@ Svod 只用一种机制：**基于模式的图重写**。
 ```rust
 patterns! {
     // Identity folding: x + 0 → x
-    Add[x, @zero] ~> x,
+    Add[x, @zero] => x,
 
     // Constant folding: 3 + 4 → 7
-    Add(a @const(a_val), b @const(b_val))
+    Add(a @const(a_val), _b @const(b_val))
         => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 
     // Self-folding: x / x → 1
-    Idiv(x, x) ~> UOp::one(x.dtype()),
+    Idiv(x, x) => UOp::one(x.dtype()),
 
     // Dead code: if(true) { x } else { y } → x
-    Where(@true, t, _f) ~> t,
+    Where(Const(ConstValue::Bool(true)), t, _f) => t,
 }
 ```
 
@@ -217,10 +217,10 @@ patterns! {
 
 - **`[x, y]` — 交换律。** 尝试两种顺序（用于 `ADD`、`MUL` 等）
 - **`(x, y)` — 有序。** 严格匹配这个顺序。
-- **`@zero`, `@one`, `@true` — 语义常量。** 对任何 DType 有效。
-- **`@const(val)` — 提取值。** 用于编译期计算。
+- **`@zero`, `@one` — 语义常量。** 对任何 DType 有效。
+- **`c @const(val)` — 提取值。** 用于编译期计算。
 - **`x, x` — 同一操作数。** 检测指针相等。
-- **`~>` vs `=>`** — 不会失败 vs 可能失败的重写。
+- **`=>` — 重写。** 返回 `Arc<UOp>`、`Option<Arc<UOp>>`（`None` 表示放弃）或 `RewriteResult`。
 
 重写引擎自底向上应用模式直到没有更多匹配：
 
@@ -368,7 +368,7 @@ println!("{}", tensor.uop().tree());
 ```rust
 patterns! {
     // Your custom optimization
-    MyPattern(x, y) ~> better_version(x, y),
+    MyPattern(x, y) => better_version(x, y),
 }
 ```
 

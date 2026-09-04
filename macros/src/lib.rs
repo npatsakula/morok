@@ -82,7 +82,7 @@ pub fn derive_pattern_enum(input: TokenStream) -> TokenStream {
 ///
 /// Write the enum with named fields as usual; the macro rewrites each such variant
 /// to wrap a struct of the same name in a sibling `ops` module, adds
-/// `From<ops::X> for Op` and `Op::as_x()` accessors, and derives the same
+/// `From<ops::X> for Op`, and derives the same
 /// pattern-matching infrastructure as [`PatternEnum`] from the original field
 /// layout. Must precede `#[derive(...)]` so the derives see the rewritten enum;
 /// `#[pattern(...)]` attributes are consumed.
