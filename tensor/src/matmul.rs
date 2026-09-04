@@ -4,12 +4,10 @@
 //! following Tinygrad's implementation strategy.
 
 use std::iter;
-use std::panic::Location;
 
 use bon::bon;
 use snafu::{ResultExt, ensure};
 use svod_dtype::DType;
-use svod_ir::origin::OriginScope;
 use svod_ir::{SInt, shape::Shape};
 
 use crate::{Result, Tensor, UOpSnafu, error::*};
@@ -41,6 +39,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn dot(&self, other: &Tensor) -> Result<Tensor> {
+        origin_call!("dot");
         self.matmul_with().other(other).call()
     }
 
@@ -85,7 +84,7 @@ impl Tensor {
     #[builder]
     #[track_caller]
     pub fn matmul_with(&self, other: &Tensor, dtype: Option<DType>) -> Result<Tensor> {
-        let _origin = OriginScope::outer_call("matmul", Location::caller());
+        origin_call!("matmul");
 
         // Step 1: Check dimensions
         let (dx, dw) = (self.ndim()?, other.ndim()?);
@@ -130,6 +129,7 @@ impl Tensor {
 
     /// General Matrix Multiplication: alpha * A @ B + beta * C
     #[builder]
+    #[track_caller]
     pub fn gemm(
         &self,
         b: &Tensor,
@@ -139,6 +139,7 @@ impl Tensor {
         #[builder(default = false)] trans_b: bool,
         c: Option<&Tensor>,
     ) -> Result<Tensor> {
+        origin_call!("gemm");
         let a = if trans_a { self.try_transpose(0, 1)? } else { self.clone() };
         let b = if trans_b { b.try_transpose(0, 1)? } else { b.clone() };
         let mut result = a.matmul(&b)?;
@@ -179,7 +180,7 @@ impl Tensor {
     #[builder]
     #[track_caller]
     pub fn linear(&self, weight: &Tensor, bias: Option<&Tensor>, dtype: Option<DType>) -> Result<Tensor> {
-        let _origin = OriginScope::outer_call("linear", Location::caller());
+        origin_call!("linear");
         let weight_shape = weight.shape()?;
 
         // For 1D weight, use element-wise multiply (broadcast)

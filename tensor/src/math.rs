@@ -41,6 +41,7 @@ impl Tensor {
     /// Returns error if dtype is not float.
     #[track_caller]
     pub fn sin(&self) -> Result<Tensor> {
+        origin_call!("sin");
         self.uop().try_sin().map(Self::new).context(UOpSnafu)
     }
 
@@ -59,6 +60,7 @@ impl Tensor {
     /// Returns error if dtype is not float.
     #[track_caller]
     pub fn cos(&self) -> Result<Tensor> {
+        origin_call!("cos");
         self.uop().try_cos().map(Self::new).context(UOpSnafu)
     }
 
@@ -77,6 +79,7 @@ impl Tensor {
     /// Returns error if dtype is not float.
     #[track_caller]
     pub fn tan(&self) -> Result<Tensor> {
+        origin_call!("tan");
         self.uop().try_tan().map(Self::new).context(UOpSnafu)
     }
 
@@ -96,6 +99,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn floor(&self) -> Result<Tensor> {
+        origin_call!("floor");
         Ok(Self::new(UOp::floor(self.uop())))
     }
 
@@ -111,6 +115,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn ceil(&self) -> Result<Tensor> {
+        origin_call!("ceil");
         Ok(Self::new(UOp::ceil(self.uop())))
     }
 
@@ -126,6 +131,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn round(&self) -> Result<Tensor> {
+        origin_call!("round");
         Ok(Self::new(UOp::round(self.uop())))
     }
 
@@ -141,6 +147,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn trunc(&self) -> Result<Tensor> {
+        origin_call!("trunc");
         Ok(Self::new(UOp::trunc(self.uop())))
     }
 
@@ -163,6 +170,7 @@ impl Tensor {
     /// Returns error if dtype is not float.
     #[track_caller]
     pub fn erf(&self) -> Result<Tensor> {
+        origin_call!("erf");
         self.uop().erf().map(Self::new).context(UOpSnafu)
     }
 
@@ -177,6 +185,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn reciprocal(&self) -> Result<Tensor> {
+        origin_call!("reciprocal");
         UOp::try_reciprocal(&self.uop()).map(Self::new).context(UOpSnafu)
     }
 
@@ -191,6 +200,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn square(&self) -> Result<Tensor> {
+        origin_call!("square");
         Ok(Self::new(self.uop().square()))
     }
 
@@ -205,12 +215,14 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn sign(&self) -> Result<Tensor> {
+        origin_call!("sign");
         Ok(Self::new(self.uop().sign()))
     }
 
     /// Linear interpolation: `self + (end - self) * weight`.
     #[track_caller]
     pub fn lerp(&self, end: &Tensor, weight: &Tensor) -> Result<Tensor> {
+        origin_call!("lerp");
         let diff = end.try_sub(self)?;
         self.try_add(&diff.try_mul(weight)?)
     }
@@ -222,6 +234,7 @@ impl Tensor {
     /// Returns `true` where elements are NaN: `self != self`.
     #[track_caller]
     pub fn isnan(&self) -> Result<Tensor> {
+        origin_call!("isnan");
         self.try_ne(self)
     }
 
@@ -234,6 +247,7 @@ impl Tensor {
     /// because its `dtype.min/max` are ±inf.
     #[track_caller]
     pub fn isinf(&self, detect_positive: bool, detect_negative: bool) -> Result<Tensor> {
+        origin_call!("isinf");
         use svod_dtype::{DType, ScalarDType};
         let dtype = self.uop().dtype();
         // (uint_bitcast_dtype, +inf bit pattern, -inf bit pattern, abs-mask)
@@ -272,6 +286,7 @@ impl Tensor {
     /// Hyperbolic sine: `(exp(x) - exp(-x)) / 2`.
     #[track_caller]
     pub fn sinh(&self) -> Result<Tensor> {
+        origin_call!("sinh");
         let exp_pos = self.try_exp()?;
         let exp_neg = self.try_neg()?.try_exp()?;
         let two = self.broadcast_scalar(ConstValue::Int(2))?;
@@ -281,6 +296,7 @@ impl Tensor {
     /// Hyperbolic cosine: `(exp(x) + exp(-x)) / 2`.
     #[track_caller]
     pub fn cosh(&self) -> Result<Tensor> {
+        origin_call!("cosh");
         let exp_pos = self.try_exp()?;
         let exp_neg = self.try_neg()?.try_exp()?;
         let two = self.broadcast_scalar(ConstValue::Int(2))?;
@@ -294,6 +310,7 @@ impl Tensor {
     /// Inverse hyperbolic sine: `log(x + sqrt(x² + 1))`.
     #[track_caller]
     pub fn asinh(&self) -> Result<Tensor> {
+        origin_call!("asinh");
         let one = self.one()?;
         let inner = self.square()?.try_add(&one)?.try_sqrt()?;
         self.try_add(&inner)?.try_log()
@@ -302,6 +319,7 @@ impl Tensor {
     /// Inverse hyperbolic cosine: `log(x + sqrt(x² - 1))`.
     #[track_caller]
     pub fn acosh(&self) -> Result<Tensor> {
+        origin_call!("acosh");
         let one = self.one()?;
         let inner = self.square()?.try_sub(&one)?.try_sqrt()?;
         self.try_add(&inner)?.try_log()
@@ -310,6 +328,7 @@ impl Tensor {
     /// Inverse hyperbolic tangent: `0.5 * log((1+x)/(1-x))`.
     #[track_caller]
     pub fn atanh(&self) -> Result<Tensor> {
+        origin_call!("atanh");
         let one = self.one()?;
         let half = self.broadcast_scalar(ConstValue::Float(0.5))?;
         let num = one.try_add(self)?;
@@ -324,6 +343,7 @@ impl Tensor {
     /// Arcsine using polynomial approximation (Abramowitz & Stegun 4.4.46).
     #[track_caller]
     pub fn asin(&self) -> Result<Tensor> {
+        origin_call!("asin");
         let coefficients = [
             -0.0012624911,
             0.0066700901,
@@ -346,6 +366,7 @@ impl Tensor {
     /// Arccosine: `π/2 - asin(x)`.
     #[track_caller]
     pub fn acos(&self) -> Result<Tensor> {
+        origin_call!("acos");
         let half_pi = self.broadcast_scalar(ConstValue::Float(std::f64::consts::FRAC_PI_2))?;
         half_pi.try_sub(&self.asin()?)
     }
@@ -353,6 +374,7 @@ impl Tensor {
     /// Arctangent: `asin(x / sqrt(1 + x²))`.
     #[track_caller]
     pub fn atan(&self) -> Result<Tensor> {
+        origin_call!("atan");
         let one = self.one()?;
         let denom = one.try_add(&self.square()?)?.try_sqrt()?;
         self.try_div(&denom)?.asin()
@@ -367,6 +389,7 @@ impl Tensor {
     /// `(x < -λ)*(x+bias) + (x > λ)*(x-bias)`
     #[track_caller]
     pub fn shrink(&self, bias: f64, lambd: f64) -> Result<Tensor> {
+        origin_call!("shrink");
         let dtype = self.uop().dtype();
         let neg_lambd = Tensor::const_(-lambd, dtype.clone());
         let pos_lambd = Tensor::const_(lambd, dtype.clone());
@@ -388,6 +411,7 @@ impl Tensor {
     /// graph construction steps (unrolled at compile time).
     #[track_caller]
     pub fn det(&self) -> Result<Tensor> {
+        origin_call!("det");
         let shape = self.shape()?;
         let ndim = shape.len();
         snafu::ensure!(
@@ -514,7 +538,9 @@ impl Tensor {
     /// pivot). Cholesky–Banachiewicz recurrence: columns are built and `cat`-ed
     /// (no full-matrix rewrite per step), so the graph is O(n) and the work
     /// O(n³).
+    #[track_caller]
     pub fn cholesky(&self) -> Result<Tensor> {
+        origin_call!("cholesky");
         let (dims, n, float_dt) = self.square_setup("cholesky")?;
         let batch = &dims[..dims.len() - 2];
         let a = to_float(self, &float_dt)?;
@@ -549,7 +575,9 @@ impl Tensor {
     /// `[m, n]`). Returns `(Q, R)` with `Q` orthonormal `[.., m, m]` and `R`
     /// upper-triangular `[.., m, n]`, `A = Q R`. The reflector loop is O(min(m,n))
     /// graph steps, each a whole-matrix update.
+    #[track_caller]
     pub fn qr(&self) -> Result<(Tensor, Tensor)> {
+        origin_call!("qr");
         let shape = self.shape()?;
         let ndim = shape.len();
         snafu::ensure!(

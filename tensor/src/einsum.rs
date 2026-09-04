@@ -17,7 +17,9 @@ fn argsort<T: Ord>(slice: &[T]) -> Vec<usize> {
 }
 
 impl Tensor {
+    #[track_caller]
     pub fn einsum(formula: &str, operands: &[&Tensor]) -> Result<Tensor> {
+        origin_call!("einsum");
         let mut xs: Vec<Tensor> = operands.iter().map(|t| (*t).clone()).collect();
         let formula = formula.replace(' ', "");
 

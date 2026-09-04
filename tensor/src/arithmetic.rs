@@ -115,9 +115,8 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn logical_not(&self) -> Result<Tensor> {
+        origin_call!("logical_not");
         use svod_dtype::DType;
-
-        let _origin = OriginScope::outer_call("logical_not", Location::caller());
 
         // Cast to bool (non-zero becomes true)
         let as_bool = self.cast(DType::Bool)?;
@@ -154,7 +153,7 @@ impl Tensor {
     /// Returns error if called on non-integer dtype.
     #[track_caller]
     pub fn bitwise_not(&self) -> Result<Tensor> {
-        let _origin = OriginScope::outer_call("bitwise_not", Location::caller());
+        origin_call!("bitwise_not");
 
         // Verify dtype is integer
         let dtype = self.uop().dtype();

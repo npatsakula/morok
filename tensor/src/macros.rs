@@ -76,3 +76,15 @@ macro_rules! custom_kernel_check {
         }
     };
 }
+
+/// Open the call frame of a public op, naming `$op` at the caller's source line.
+///
+/// The enclosing function must be `#[track_caller]` (and so must every wrapper
+/// between it and user code). Nested public ops collapse into the outermost
+/// frame, so one public call yields exactly one frame; with capture off the
+/// guard is a thread-local read and write.
+macro_rules! origin_call {
+    ($op:literal) => {
+        let _origin = ::svod_ir::origin::OriginScope::outer_call($op, ::std::panic::Location::caller());
+    };
+}

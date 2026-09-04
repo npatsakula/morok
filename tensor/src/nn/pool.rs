@@ -21,7 +21,9 @@ impl Tensor {
     /// This is a low-level building block for pooling and convolution. It extracts
     /// all sliding windows of the given kernel size, stride, and dilation from the
     /// spatial dimensions, appending the kernel dimensions at the end.
+    #[track_caller]
     pub fn pool(&self, kernel: &[usize], stride: &[usize], dilation: &[usize]) -> Result<Tensor> {
+        origin_call!("pool");
         let shape = self.shape()?;
         let ndim = shape.len();
         let n_spatial = kernel.len();
@@ -201,6 +203,7 @@ impl Tensor {
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 9]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn avg_pool2d(
         &self,
         kernel_size: &[usize],
@@ -210,6 +213,7 @@ impl Tensor {
         #[builder(default = true)] count_include_pad: bool,
         #[builder(default = false)] ceil_mode: bool,
     ) -> Result<Tensor> {
+        origin_call!("avg_pool2d");
         let n_spatial = kernel_size.len();
         let default_dilation: Vec<usize> = vec![1; n_spatial];
         let stride = stride.unwrap_or(kernel_size);
@@ -323,6 +327,7 @@ impl Tensor {
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 16]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn max_pool2d(
         &self,
         kernel_size: &[usize],
@@ -331,6 +336,7 @@ impl Tensor {
         padding: Option<&[(isize, isize)]>,
         #[builder(default = false)] ceil_mode: bool,
     ) -> Result<Tensor> {
+        origin_call!("max_pool2d");
         let n_spatial = kernel_size.len();
         let default_dilation: Vec<usize> = vec![1; n_spatial];
         let stride = stride.unwrap_or(kernel_size);
@@ -388,6 +394,7 @@ impl Tensor {
     /// assert_eq!(values.as_vec::<f32>().unwrap(), vec![1.0; 4]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn max_pool2d_with_indices(
         &self,
         kernel_size: &[usize],
@@ -396,6 +403,7 @@ impl Tensor {
         padding: Option<&[(isize, isize)]>,
         #[builder(default = false)] ceil_mode: bool,
     ) -> Result<(Tensor, Tensor)> {
+        origin_call!("max_pool2d_with_indices");
         let n_spatial = kernel_size.len();
         let default_dilation: Vec<usize> = vec![1; n_spatial];
         let stride = stride.unwrap_or(kernel_size);
@@ -499,6 +507,7 @@ impl Tensor {
     /// assert_eq!(shape, vec![1, 1, 4, 4]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn max_unpool2d(
         &self,
         indices: &Tensor,
@@ -507,6 +516,7 @@ impl Tensor {
         padding: Option<&[(isize, isize)]>,
         output_size: Option<&[usize]>,
     ) -> Result<Tensor> {
+        origin_call!("max_unpool2d");
         let shape = self.shape()?;
         let ndim = shape.len();
         let n_spatial = kernel_size.len();
@@ -603,6 +613,7 @@ impl Tensor {
     /// assert_eq!(img.as_vec::<f32>().unwrap(), vec![1.0; 16]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn col2im(
         &self,
         image_shape: &[usize],
@@ -611,6 +622,7 @@ impl Tensor {
         pads: Option<&[(isize, isize)]>,
         dilations: Option<&[usize]>,
     ) -> Result<Tensor> {
+        origin_call!("col2im");
         let n_spatial = image_shape.len();
         let no_strides: Vec<usize> = vec![1; n_spatial];
         let no_pads: Vec<(isize, isize)> = vec![(0, 0); n_spatial];

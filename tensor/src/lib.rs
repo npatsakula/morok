@@ -275,7 +275,9 @@ impl Tensor {
     /// No device memory is allocated — only the BUFFER UOp is created.
     /// Use `assign()` to bind real data before `realize()`.
     /// Matches Tinygrad's `Tensor.empty(*shape)`.
+    #[track_caller]
     pub fn empty(shape: &[usize], dtype: DType) -> Self {
+        origin_call!("empty");
         let numel: usize = shape.iter().product();
         let buffer_uop = UOp::new_buffer(svod_dtype::default_device::default_device(), numel, dtype);
         let ir_shape = Shape::from_iter(shape.iter().map(|&d| SInt::Const(d)));
@@ -289,7 +291,9 @@ impl Tensor {
     /// max_val for allocation. This enables rebinding to any value in [min, max]
     /// without reallocation. Matches Tinygrad's
     /// `prod([x.vmax if isinstance(x, UOp) else x for x in shape])`.
+    #[track_caller]
     pub fn empty_dynamic(shape: &[SInt], dtype: DType) -> Self {
+        origin_call!("empty_dynamic");
         let numel: usize = shape.iter().map(sint_vmax).product();
         let buffer_uop = UOp::new_buffer(svod_dtype::default_device::default_device(), numel, dtype);
         let ir_shape = Shape::from_iter(shape.iter().cloned());
@@ -298,12 +302,16 @@ impl Tensor {
     }
 
     /// Create an empty 0-element tensor with the given dtype and shape `[0]`.
+    #[track_caller]
     pub fn empty_zero(dtype: DType) -> Self {
+        origin_call!("empty_zero");
         Self::empty(&[0], dtype)
     }
 
     /// Create a tensor filled with a constant value, broadcast to the given shape.
+    #[track_caller]
     pub fn full(shape: &[usize], value: impl Into<ConstValue>, dtype: DType) -> Result<Self> {
+        origin_call!("full");
         let scalar = Self::const_(value, dtype);
         if shape.is_empty() {
             return Ok(scalar);
@@ -313,12 +321,16 @@ impl Tensor {
     }
 
     /// Create a zero-filled tensor with the given concrete shape.
+    #[track_caller]
     pub fn zeros(shape: &[usize], dtype: DType) -> Result<Self> {
+        origin_call!("zeros");
         Self::full(shape, ConstValue::zero(dtype.base()), dtype)
     }
 
     /// Create a one-filled tensor with the given concrete shape.
+    #[track_caller]
     pub fn ones(shape: &[usize], dtype: DType) -> Result<Self> {
+        origin_call!("ones");
         Self::full(shape, ConstValue::one(dtype.base()), dtype)
     }
 
@@ -336,7 +348,9 @@ impl Tensor {
     /// let batch = Variable::new("batch", 1, 32);
     /// let x = Tensor::full_dynamic(&[batch.bind(16)?.into(), 784.into()], 0.0, DType::Float32)?;
     /// ```
+    #[track_caller]
     pub fn full_dynamic(shape: &[SInt], value: impl Into<ConstValue>, dtype: DType) -> Result<Self> {
+        origin_call!("full_dynamic");
         let const_uop = UOp::const_(dtype.clone(), value.into());
         if shape.is_empty() {
             return Ok(Self::new(const_uop));
@@ -351,12 +365,16 @@ impl Tensor {
     }
 
     /// Create a zero-filled tensor with symbolic (dynamic) dimensions.
+    #[track_caller]
     pub fn zeros_dynamic(shape: &[SInt], dtype: DType) -> Result<Self> {
+        origin_call!("zeros_dynamic");
         Self::full_dynamic(shape, ConstValue::zero(dtype.base()), dtype)
     }
 
     /// Create a one-filled tensor with symbolic (dynamic) dimensions.
+    #[track_caller]
     pub fn ones_dynamic(shape: &[SInt], dtype: DType) -> Result<Self> {
+        origin_call!("ones_dynamic");
         Self::full_dynamic(shape, ConstValue::one(dtype.base()), dtype)
     }
 
@@ -400,12 +418,16 @@ impl Tensor {
     }
 
     /// Cumulative sum along an axis.
+    #[track_caller]
     pub fn cumsum(&self, axis: isize) -> Result<Self> {
+        origin_call!("cumsum");
         self._cumalu(axis, CumReduceOp::Add)
     }
 
     /// Cumulative product along an axis.
+    #[track_caller]
     pub fn cumprod(&self, axis: isize) -> Result<Self> {
+        origin_call!("cumprod");
         self._cumalu(axis, CumReduceOp::Mul)
     }
 
@@ -415,12 +437,14 @@ impl Tensor {
     /// Accepts concrete `i64` or symbolic `Arc<UOp>` for start/stop/step.
     /// If `stop` is None, treats `start` as stop and starts from 0.
     #[builder]
+    #[track_caller]
     pub fn arange_with_dtype(
         start: Arc<UOp>,
         stop: Option<Arc<UOp>>,
         dtype: DType,
         #[builder(default = UOp::const_(dtype.clone(), ConstValue::one(dtype.base())))] step: Arc<UOp>,
     ) -> Result<Self> {
+        origin_call!("arange");
         let (start, stop) = match stop {
             Some(s) => (start, s),
             None => (UOp::const_(dtype.clone(), ConstValue::zero(dtype.base())), start),
@@ -452,7 +476,9 @@ impl Tensor {
     }
 
     /// Create 1D tensor with evenly spaced Int32 values.
+    #[track_caller]
     pub fn arange(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<Self> {
+        origin_call!("arange");
         let dtype = DType::Int32;
         Self::arange_with_dtype()
             .start(UOp::const_(dtype.clone(), ConstValue::Int(start)))
@@ -463,7 +489,9 @@ impl Tensor {
     }
 
     /// Create 1D tensor with evenly spaced values (float parameters).
+    #[track_caller]
     pub fn arange_f64(start: f64, stop: f64, step: f64, dtype: DType) -> Result<Self> {
+        origin_call!("arange");
         if step == 0.0 {
             return Err(Error::SymbolicShapeUnsupported { operation: "arange with step=0".to_string() });
         }
@@ -479,7 +507,9 @@ impl Tensor {
     }
 
     /// Create 1D tensor with `steps` evenly spaced values from `start` to `end` (inclusive).
+    #[track_caller]
     pub fn linspace(start: f64, end: f64, steps: usize, dtype: DType) -> Result<Self> {
+        origin_call!("linspace");
         if steps == 0 {
             return Ok(Self::empty_zero(dtype));
         }
@@ -512,7 +542,9 @@ impl Tensor {
     /// // Integer constant
     /// let forty_two = Tensor::const_(42i64, DType::Int64);
     /// ```
+    #[track_caller]
     pub fn const_<T: Into<ConstValue>>(value: T, dtype: DType) -> Self {
+        origin_call!("const");
         let const_val = value.into();
         let uop = UOp::const_(dtype, const_val);
         Self::new(uop)
@@ -528,7 +560,9 @@ impl Tensor {
     /// let i = Tensor::from_const(42i32);    // DType::Int32
     /// let b = Tensor::from_const(true);     // DType::Bool
     /// ```
+    #[track_caller]
     pub fn from_const<T: Into<ConstValue> + HasDType>(value: T) -> Self {
+        origin_call!("from_const");
         let dtype = T::DTYPE;
         Self::const_(value, dtype)
     }
@@ -559,7 +593,9 @@ impl Tensor {
     /// let mut gpu_tensor = cpu_tensor.to(DeviceSpec::Cuda { device_id: 0 });
     /// gpu_tensor.realize()?;  // Actually transfers data
     /// ```
+    #[track_caller]
     pub fn to(&self, device: DeviceSpec) -> Self {
+        origin_call!("to");
         if self.device() == device {
             return self.clone();
         }
@@ -575,7 +611,9 @@ impl Tensor {
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
     /// let t_int = t.cast(DType::Int32)?;
     /// ```
+    #[track_caller]
     pub fn cast(&self, dtype: svod_dtype::DType) -> Result<Self> {
+        origin_call!("cast");
         let casted = self.uop().cast(dtype);
         Ok(Self::new(casted))
     }
@@ -641,7 +679,9 @@ impl Tensor {
     /// - source and destination are both scalar (vector dtypes unsupported);
     /// - `(shape[-1] * src_size)` divides evenly by `dst_size`;
     /// - the last shape dim is concrete (not symbolic).
+    #[track_caller]
     pub fn bitcast(&self, dtype: svod_dtype::DType) -> Result<Self> {
+        origin_call!("bitcast");
         let src_dt = self.uop().dtype();
         let src_scalar = src_dt.scalar().ok_or_else(|| Error::SymbolicShapeUnsupported {
             operation: "bitcast: non-scalar source dtype".to_string(),
@@ -775,7 +815,9 @@ impl Tensor {
     ///     .try_reshape(&[2, 3]).unwrap();
     /// placeholder.assign(&real_data);
     /// ```
+    #[track_caller]
     pub fn try_assign(&self, value: &Tensor) -> Result<()> {
+        origin_call!("assign");
         let target_uop = self.uop();
         if self.device().is_disk() {
             return Err(Error::IrConstruction {
@@ -823,7 +865,9 @@ impl Tensor {
         Ok(())
     }
 
+    #[track_caller]
     pub fn assign(&self, value: &Tensor) {
+        origin_call!("assign");
         self.try_assign(value).expect("tensor assign failed");
     }
 
@@ -848,7 +892,9 @@ impl Tensor {
     /// c.realize()?;
     /// assert!(c.buffer().is_some());
     /// ```
+    #[track_caller]
     pub fn contiguous(&self) -> Self {
+        origin_call!("contiguous");
         let uop = self.uop();
         if matches!(uop.op(), svod_ir::Op::Contiguous(..)) {
             return self.clone();
@@ -867,19 +913,25 @@ impl Tensor {
     }
 
     /// Broadcast a dtype-aware zero to match this tensor's shape.
+    #[track_caller]
     pub fn zero(&self) -> Result<Self> {
+        origin_call!("zero");
         let sdtype = self.uop().dtype().scalar().expect("scalar dtype");
         self.broadcast_scalar(ConstValue::zero(sdtype))
     }
 
     /// Broadcast a dtype-aware one to match this tensor's shape.
+    #[track_caller]
     pub fn one(&self) -> Result<Self> {
+        origin_call!("one");
         let sdtype = self.uop().dtype().scalar().expect("scalar dtype");
         self.broadcast_scalar(ConstValue::one(sdtype))
     }
 
     /// Identity matrix of shape `[n, m]` with the given dtype.
+    #[track_caller]
     pub fn eye(n: usize, m: usize, dtype: DType) -> Result<Self> {
+        origin_call!("eye");
         let rows = Self::arange(n as i64, None, None)?.try_unsqueeze(-1)?;
         let cols = Self::arange(m as i64, None, None)?;
         rows.try_eq(&cols)?.cast(dtype)
@@ -890,12 +942,14 @@ impl Tensor {
 impl Tensor {
     /// Cumulative sum with exclusive and reverse options.
     #[builder]
+    #[track_caller]
     pub fn cumsum_with(
         &self,
         axis: isize,
         #[builder(default = false)] exclusive: bool,
         #[builder(default = false)] reverse: bool,
     ) -> Result<Self> {
+        origin_call!("cumsum");
         let shape = self.shape()?;
         let ndim = shape.len();
         let axis_idx = Self::normalize_axis(axis, ndim)?;
@@ -926,12 +980,14 @@ impl Tensor {
 
     /// Cumulative product with exclusive and reverse options.
     #[builder]
+    #[track_caller]
     pub fn cumprod_with(
         &self,
         axis: isize,
         #[builder(default = false)] exclusive: bool,
         #[builder(default = false)] reverse: bool,
     ) -> Result<Self> {
+        origin_call!("cumprod");
         let shape = self.shape()?;
         let ndim = shape.len();
         let axis_idx = Self::normalize_axis(axis, ndim)?;

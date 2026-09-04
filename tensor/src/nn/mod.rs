@@ -234,6 +234,7 @@ impl Tensor {
     /// assert!((val[0] - 0.8).abs() < 1e-5);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn nll_loss(
         &self,
         target: &Tensor,
@@ -241,6 +242,7 @@ impl Tensor {
         ignore_index: Option<i64>,
         #[builder(default)] reduction: Reduction,
     ) -> Result<Tensor> {
+        origin_call!("nll_loss");
         let ndim = self.ndim()?;
         snafu::ensure!(ndim >= 2, NdimMinimumSnafu { op: "nll_loss", min: 2_usize, actual: ndim });
         // Gather log-probs at target class, negate
@@ -300,7 +302,9 @@ impl Tensor {
     /// assert_eq!(mask.as_vec::<bool>().unwrap(), vec![true, true, true]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn dropout(&self, p: f64, #[builder(default = false)] training: bool) -> Result<(Tensor, Tensor)> {
+        origin_call!("dropout");
         snafu::ensure!(
             (0.0..=1.0).contains(&p),
             ParamRangeSnafu { op: "dropout", param: "p", value: p.to_string(), constraint: "0.0 <= p <= 1.0" }
@@ -352,6 +356,7 @@ impl Tensor {
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![4.0, 6.0, 4.0, 6.0, 9.0, 6.0, 4.0, 6.0, 4.0]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn conv(
         &self,
         weight: &Tensor,
@@ -363,6 +368,7 @@ impl Tensor {
         strides: Option<&[i64]>,
         dilations: Option<&[i64]>,
     ) -> Result<Tensor> {
+        origin_call!("conv");
         let w_shape = weight.shape()?;
         let kernel: Vec<usize> = match kernel_shape {
             Some(ks) => ks.to_vec(),
@@ -425,6 +431,7 @@ impl Tensor {
     /// assert_eq!(vals.len(), 25); // 5x5 output
     /// ```
     #[builder]
+    #[track_caller]
     pub fn conv_transpose(
         &self,
         weight: &Tensor,
@@ -438,6 +445,7 @@ impl Tensor {
         strides: Option<&[i64]>,
         dilations: Option<&[i64]>,
     ) -> Result<Tensor> {
+        origin_call!("conv_transpose");
         let w_shape = weight.shape()?;
         let kernel: Vec<usize> = match kernel_shape {
             Some(ks) => ks.to_vec(),
@@ -546,6 +554,7 @@ impl Tensor {
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 4]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn avg_pool(
         &self,
         kernel_shape: &[usize],
@@ -556,6 +565,7 @@ impl Tensor {
         strides: Option<&[i64]>,
         dilations: Option<&[i64]>,
     ) -> Result<Tensor> {
+        origin_call!("avg_pool");
         let n = kernel_shape.len();
         let strides_u: Vec<usize> =
             strides.map(|s| s.iter().map(|&v| v as usize).collect()).unwrap_or_else(|| vec![1; n]);
@@ -601,6 +611,7 @@ impl Tensor {
     /// assert!((y.as_vec::<f32>().unwrap()[0] - 2.0).abs() < 1e-5);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn lp_pool(
         &self,
         kernel_shape: &[usize],
@@ -611,6 +622,7 @@ impl Tensor {
         strides: Option<&[i64]>,
         dilations: Option<&[i64]>,
     ) -> Result<Tensor> {
+        origin_call!("lp_pool");
         snafu::ensure!(p >= 1, ParamRangeSnafu { op: "lp_pool", param: "p", value: p.to_string(), constraint: ">= 1" });
         let n_spatial = kernel_shape.len();
         let strides_u: Vec<usize> =
@@ -688,7 +700,9 @@ impl Tensor {
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 4]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn depth_to_space(&self, blocksize: usize, #[builder(default)] mode: DepthToSpaceMode) -> Result<Tensor> {
+        origin_call!("depth_to_space");
         let ndim = self.ndim()?;
         snafu::ensure!(ndim == 4, NdimExactSnafu { op: "depth_to_space", expected: 4_usize, actual: ndim });
         snafu::ensure!(
@@ -761,7 +775,9 @@ impl Tensor {
     /// assert_eq!(shape, [1, 4, 2, 2]);
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 16]);
     /// ```
+    #[track_caller]
     pub fn space_to_depth(&self, blocksize: usize) -> Result<Tensor> {
+        origin_call!("space_to_depth");
         let ndim = self.ndim()?;
         snafu::ensure!(ndim == 4, NdimExactSnafu { op: "space_to_depth", expected: 4_usize, actual: ndim });
         snafu::ensure!(
@@ -845,6 +861,7 @@ impl Tensor {
     /// assert_eq!(shape, [1, 1, 2, 2]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn max_pool(
         &self,
         kernel_shape: &[usize],
@@ -855,6 +872,7 @@ impl Tensor {
         strides: Option<&[i64]>,
         dilations: Option<&[i64]>,
     ) -> Result<(Tensor, Tensor)> {
+        origin_call!("max_pool");
         let n = kernel_shape.len();
         let strides_u: Vec<usize> =
             strides.map(|s| s.iter().map(|&v| v as usize).collect()).unwrap_or_else(|| vec![1; n]);
@@ -917,6 +935,7 @@ impl Tensor {
     /// assert_eq!(shape, [1, 3, 2, 2]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn lrn(
         &self,
         size: usize,
@@ -924,6 +943,7 @@ impl Tensor {
         #[builder(default = 0.75)] beta: f64,
         #[builder(default = 1.0)] bias: f64,
     ) -> Result<Tensor> {
+        origin_call!("lrn");
         let ndim = self.ndim()?;
         snafu::ensure!(ndim == 4, NdimExactSnafu { op: "lrn", expected: 4_usize, actual: ndim });
         snafu::ensure!(
@@ -955,7 +975,9 @@ impl Tensor {
 
 impl Tensor {
     /// Apply a sequence of layers to this tensor.
+    #[track_caller]
     pub fn sequential(&self, layers: &[&dyn Layer]) -> Result<Tensor> {
+        origin_call!("sequential");
         let mut x = self.clone();
         for layer in layers {
             x = layer.forward(&x)?;

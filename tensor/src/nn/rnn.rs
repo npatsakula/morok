@@ -66,6 +66,7 @@ impl Tensor {
     /// assert_eq!(yh_shape, vec![1, 1, 4]); // [num_directions, batch, hidden]
     /// ```
     #[builder]
+    #[track_caller]
     pub fn rnn(
         &self,
         w: &Tensor,
@@ -75,6 +76,7 @@ impl Tensor {
         initial_h: Option<&Tensor>,
         #[builder(default = 0)] layout: usize,
     ) -> Result<RnnOutput> {
+        origin_call!("rnn");
         let ndim = self.ndim()?;
         snafu::ensure!(ndim == 3, NdimExactSnafu { op: "rnn", expected: 3_usize, actual: ndim });
         snafu::ensure!(
@@ -187,6 +189,7 @@ impl Tensor {
     /// assert_eq!(y_shape, vec![2, 1, 1, 4]); // [seq, num_directions, batch, hidden]
     /// ```
     #[builder]
+    #[track_caller]
     pub fn gru(
         &self,
         w: &Tensor,
@@ -197,6 +200,7 @@ impl Tensor {
         #[builder(default = 0)] linear_before_reset: usize,
         #[builder(default = 0)] layout: usize,
     ) -> Result<GruOutput> {
+        origin_call!("gru");
         let ndim = self.ndim()?;
         snafu::ensure!(ndim == 3, NdimExactSnafu { op: "gru", expected: 3_usize, actual: ndim });
         snafu::ensure!(
@@ -348,6 +352,7 @@ impl Tensor {
     /// assert_eq!(yc_shape, vec![1, 1, 4]); // [num_directions, batch, hidden]
     /// ```
     #[builder]
+    #[track_caller]
     pub fn lstm(
         &self,
         w: &Tensor,
@@ -359,6 +364,7 @@ impl Tensor {
         peepholes: Option<&Tensor>,
         #[builder(default = 0)] layout: usize,
     ) -> Result<LstmOutput> {
+        origin_call!("lstm");
         let ndim = self.ndim()?;
         snafu::ensure!(ndim == 3, NdimExactSnafu { op: "lstm", expected: 3_usize, actual: ndim });
         snafu::ensure!(

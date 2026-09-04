@@ -52,11 +52,13 @@ impl Tensor {
     /// assert_eq!(shape, vec![1, 4, 4, 2]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn affine_grid(
         theta: &Tensor,
         size: &[i64],
         #[builder(default = false)] align_corners: bool,
     ) -> Result<Tensor> {
+        origin_call!("affine_grid");
         snafu::ensure!(size.len() >= 3, NdimMinimumSnafu { op: "affine_grid", min: 3_usize, actual: size.len() });
         let n = size[0] as usize;
         let ndim = size.len() - 2; // spatial dims
@@ -143,6 +145,7 @@ impl Tensor {
     /// assert_eq!(shape, vec![1, 1, 4, 4]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn grid_sample(
         &self,
         grid: &Tensor,
@@ -150,6 +153,7 @@ impl Tensor {
         #[builder(default)] padding_mode: GridSamplePaddingMode,
         #[builder(default = false)] align_corners: bool,
     ) -> Result<Tensor> {
+        origin_call!("grid_sample");
         let x_ndim = self.ndim()?;
         snafu::ensure!(x_ndim >= 3, NdimMinimumSnafu { op: "grid_sample", min: 3_usize, actual: x_ndim });
         let x_shape = self.shape()?;

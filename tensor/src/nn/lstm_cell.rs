@@ -30,7 +30,9 @@ impl LSTMCell {
     }
 
     /// Create an LSTM cell with deterministic `sin()` initialization, zero biases.
+    #[track_caller]
     pub fn with_dims(input_size: usize, hidden_size: usize, dtype: DType) -> Self {
+        origin_call!("LSTMCell::with_dims");
         let four_hidden = 4 * hidden_size;
         let w_ih_data: Vec<f32> = (0..four_hidden * input_size).map(|i| ((i as f32) * 0.1).sin() * 0.1).collect();
         let weight_ih = Tensor::from_slice(&w_ih_data)
@@ -52,7 +54,9 @@ impl LSTMCell {
     /// One LSTM step. Returns `(h_next, c_next)`.
     ///
     /// Shapes: `x: [B, input]`, `h, c: [B, hidden]`.
+    #[track_caller]
     pub fn step(&self, x: &Tensor, h: &Tensor, c: &Tensor) -> Result<(Tensor, Tensor)> {
+        origin_call!("LSTMCell::step");
         let gates_x = x.linear().weight(&self.weight_ih).bias(&self.bias_ih).call()?;
         let gates_h = h.linear().weight(&self.weight_hh).bias(&self.bias_hh).call()?;
         let gates = gates_x.try_add(&gates_h)?;

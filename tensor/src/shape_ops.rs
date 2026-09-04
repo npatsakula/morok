@@ -48,6 +48,7 @@ impl Tensor {
     /// - Total elements don't match
     #[track_caller]
     pub fn try_reshape(&self, new_shape: impl IntoIterator<Item = impl Into<SInt>>) -> Result<Tensor> {
+        origin_call!("reshape");
         let dims: Vec<SInt> = new_shape.into_iter().map(Into::into).collect();
 
         // Handle Infer (-1) if present
@@ -79,7 +80,9 @@ impl Tensor {
     }
 
     /// Expand tensor to a new shape with mixed concrete/symbolic dimensions.
+    #[track_caller]
     pub fn try_expand(&self, new_shape: impl IntoIterator<Item = impl Into<SInt>>) -> Result<Tensor> {
+        origin_call!("expand");
         let requested: Vec<SInt> = new_shape.into_iter().map(Into::into).collect();
         // Resolve Infer (-1) to current dimension (expand's "keep" semantics)
         let current_shape = self.shape()?;
@@ -112,6 +115,7 @@ impl Tensor {
     /// - Axis indices out of range
     #[track_caller]
     pub fn try_permute(&self, axes: &[isize]) -> Result<Tensor> {
+        origin_call!("permute");
         let shape = self.shape()?;
         let ndim = shape.len();
 
@@ -140,6 +144,7 @@ impl Tensor {
     /// Returns error if axis indices are out of range.
     #[track_caller]
     pub fn try_transpose(&self, dim0: isize, dim1: isize) -> Result<Tensor> {
+        origin_call!("transpose");
         let shape = self.shape()?;
         let ndim = shape.len();
 
@@ -189,6 +194,7 @@ impl Tensor {
     /// - Axis index out of range
     #[track_caller]
     pub fn try_squeeze(&self, dim: Option<isize>) -> Result<Tensor> {
+        origin_call!("squeeze");
         let shape = self.shape()?;
 
         let new_shape = match dim {
@@ -242,6 +248,7 @@ impl Tensor {
     /// Returns error if axis index is out of range.
     #[track_caller]
     pub fn try_unsqueeze(&self, dim: isize) -> Result<Tensor> {
+        origin_call!("unsqueeze");
         let shape = self.shape()?;
         let ndim = shape.len();
 
@@ -275,6 +282,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn flip(&self, axes: &[isize]) -> Result<Tensor> {
+        origin_call!("flip");
         let shape = self.shape()?;
         let ndim = shape.len();
         let flip_spec: Vec<bool> =
@@ -293,6 +301,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn split(&self, sizes: &[usize], dim: isize) -> Result<Vec<Tensor>> {
+        origin_call!("split");
         let shape = self.shape()?;
         let ndim = shape.len();
         let dim = Self::normalize_axis(dim, ndim)?;
@@ -327,6 +336,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn repeat(&self, repeats: &[SInt]) -> Result<Tensor> {
+        origin_call!("repeat");
         let shape = self.shape()?;
         let ndim = shape.len();
         snafu::ensure!(
@@ -369,6 +379,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn chunk(&self, chunks: usize, dim: isize) -> Result<Vec<Tensor>> {
+        origin_call!("chunk");
         snafu::ensure!(
             chunks > 0,
             ParamRangeSnafu { op: "chunk", param: "chunks", value: chunks.to_string(), constraint: "> 0" }
@@ -397,6 +408,7 @@ impl Tensor {
     /// contiguity, since the lazy IR backend picks copy-vs-view per kernel.
     #[track_caller]
     pub fn view(&self, new_shape: impl IntoIterator<Item = impl Into<SInt>>) -> Result<Tensor> {
+        origin_call!("view");
         self.try_reshape(new_shape)
     }
 
@@ -412,6 +424,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn flatten(&self) -> Result<Tensor> {
+        origin_call!("flatten");
         self.try_reshape([-1])
     }
 
@@ -435,6 +448,7 @@ impl Tensor {
     /// - Number of padding pairs doesn't match dimensions
     #[track_caller]
     pub fn try_pad(&self, padding: &[(isize, isize)]) -> Result<Tensor> {
+        origin_call!("pad");
         let shape = self.shape()?;
 
         // Empty padding (scalar) → identity
@@ -502,6 +516,7 @@ impl Tensor {
     /// - Non-concat dimensions don't match
     #[track_caller]
     pub fn cat(tensors: &[&Tensor], dim: isize) -> Result<Tensor> {
+        origin_call!("cat");
         if tensors.is_empty() {
             return Err(IrConstructionSnafu { details: "cat requires at least one tensor".to_string() }.build());
         }
@@ -592,6 +607,7 @@ impl Tensor {
     /// Returns error if `tensors` is empty or the shapes are not all identical.
     #[track_caller]
     pub fn stack(tensors: &[&Tensor], dim: isize) -> Result<Tensor> {
+        origin_call!("stack");
         let first = tensors
             .first()
             .ok_or_else(|| IrConstructionSnafu { details: "stack requires at least one tensor".to_string() }.build())?;
@@ -624,6 +640,7 @@ impl Tensor {
     /// Inverse of flatten: splits dimension `dim` into the shape given by `sizes`.
     #[track_caller]
     pub fn unflatten(&self, dim: isize, sizes: &[isize]) -> Result<Tensor> {
+        origin_call!("unflatten");
         let shape = self.shape()?;
         let dim = Self::normalize_axis(dim, shape.len())?;
         let mut new_shape = svod_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
@@ -636,6 +653,7 @@ impl Tensor {
     /// `indexing`: `Ij` (matrix/default) or `Xy` (Cartesian, swaps first two inputs).
     #[track_caller]
     pub fn meshgrid(tensors: &[&Tensor], indexing: MeshgridIndexing) -> Result<Vec<Tensor>> {
+        origin_call!("meshgrid");
         let n = tensors.len();
         let sizes: Vec<usize> = tensors.iter().map(|t| t.numel().unwrap()).collect();
         // For "xy" indexing, swap the first two inputs
@@ -679,6 +697,7 @@ impl Tensor {
     /// Supports symbolic dimensions — symbolic dims produce scalar UOp tensors.
     #[track_caller]
     pub fn shape_tensor(&self) -> Result<Tensor> {
+        origin_call!("shape_tensor");
         let shape = self.shape()?;
 
         // If all concrete, fast path
@@ -719,6 +738,7 @@ impl Tensor {
     /// Returns error if negative indices are used with symbolic shape dimensions.
     #[track_caller]
     pub fn try_shrink<R: IntoShrinkRange>(&self, ranges: impl IntoIterator<Item = R>) -> Result<Tensor> {
+        origin_call!("shrink");
         use svod_ir::ShrinkRange;
 
         let shape = self.shape()?;
@@ -766,7 +786,9 @@ impl Tensor {
     /// Axes where `target == current` are unchanged.
     ///
     /// `axes` specifies which dimensions to apply (default: all).
+    #[track_caller]
     pub fn center_crop_pad(&self, target_shape: &[usize], axes: Option<&[usize]>) -> Result<Tensor> {
+        origin_call!("center_crop_pad");
         let shape = self.shape()?;
         let ndim = shape.len();
         let default_axes: Vec<usize> = (0..ndim).collect();
@@ -875,7 +897,9 @@ impl Tensor {
     }
 
     /// Keep upper triangle, zero below.
+    #[track_caller]
     pub fn triu(&self, diagonal: i64) -> Result<Tensor> {
+        origin_call!("triu");
         let shape = self.shape()?;
         let ndim = shape.len();
         snafu::ensure!(ndim >= 2, NdimMinimumSnafu { op: "triu", min: 2usize, actual: ndim });
@@ -887,7 +911,9 @@ impl Tensor {
     }
 
     /// Keep lower triangle, zero above.
+    #[track_caller]
     pub fn tril(&self, diagonal: i64) -> Result<Tensor> {
+        origin_call!("tril");
         let shape = self.shape()?;
         let ndim = shape.len();
         snafu::ensure!(ndim >= 2, NdimMinimumSnafu { op: "tril", min: 2usize, actual: ndim });
@@ -903,6 +929,7 @@ impl Tensor {
 impl Tensor {
     /// Slice tensor with Python-style indexing: negative indices, steps, and axis selection.
     #[builder]
+    #[track_caller]
     pub fn slice_with(
         &self,
         starts: &[i64],
@@ -910,6 +937,7 @@ impl Tensor {
         axes: Option<&[i64]>,
         steps: Option<&[i64]>,
     ) -> Result<Tensor> {
+        origin_call!("slice");
         let shape = self.shape()?;
         let ndim = shape.len();
 

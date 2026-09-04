@@ -23,7 +23,9 @@ impl Conv1d {
     }
 
     /// Create a Conv1d with deterministic `sin()` initialization, zero bias.
+    #[track_caller]
     pub fn with_dims(in_channels: usize, out_channels: usize, kernel: usize, dtype: DType) -> Self {
+        origin_call!("Conv1d::with_dims");
         let weight_data: Vec<f32> =
             (0..in_channels * out_channels * kernel).map(|i| ((i as f32) * 0.1).sin() * 0.1).collect();
         let weight = Tensor::from_slice(&weight_data)

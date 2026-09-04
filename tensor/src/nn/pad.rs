@@ -149,7 +149,9 @@ impl Tensor {
     /// y.realize().unwrap();
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![f32::NEG_INFINITY, 1.0, 2.0, 3.0]);
     /// ```
+    #[track_caller]
     pub fn try_pad_value(&self, padding: &[(isize, isize)], value: f64) -> Result<Tensor> {
+        origin_call!("pad_value");
         if value == 0.0 {
             return self.try_pad(padding);
         }
@@ -253,12 +255,14 @@ impl Tensor {
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn pad_with(
         &self,
         padding: &[(isize, isize)],
         #[builder(default)] mode: PadMode,
         #[builder(default)] value: f64,
     ) -> Result<Tensor> {
+        origin_call!("pad");
         match mode {
             PadMode::Constant => self.try_pad_value(padding, value),
             PadMode::Replicate => pad_replicate(self, padding),

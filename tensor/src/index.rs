@@ -8,10 +8,8 @@
 //! (the lib is immutable; `assign` covers realized-buffer in-place writes).
 
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
-use std::panic::Location;
 
 use svod_ir::SInt;
-use svod_ir::origin::OriginScope;
 
 use super::*;
 
@@ -253,7 +251,7 @@ impl Tensor {
     /// numpy-style read indexing. Build `spec` with [`s!`].
     #[track_caller]
     pub fn getitem(&self, spec: impl Into<IndexSpec>) -> Result<Tensor> {
-        let _origin = OriginScope::outer_call("getitem", Location::caller());
+        origin_call!("getitem");
         self.index_impl(spec.into().0, None)
     }
 
@@ -261,7 +259,7 @@ impl Tensor {
     /// with the `spec` region overwritten by `value` (broadcast). Nothing mutates.
     #[track_caller]
     pub fn set(&self, spec: impl Into<IndexSpec>, value: &Tensor) -> Result<Tensor> {
-        let _origin = OriginScope::outer_call("set", Location::caller());
+        origin_call!("set");
         self.index_impl(spec.into().0, Some(value))
     }
 

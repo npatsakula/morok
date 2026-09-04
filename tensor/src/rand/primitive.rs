@@ -31,7 +31,9 @@ impl Tensor {
     ///
     /// THREEFRY-backed; deterministic for a fixed seed (set via
     /// [`crate::rand::manual_seed`]).
+    #[track_caller]
     pub fn rand(shape: &[usize]) -> Result<Tensor> {
+        origin_call!("rand");
         Self::rand_with(shape, DType::Float32, svod_dtype::default_device::default_device())
     }
 
@@ -39,7 +41,9 @@ impl Tensor {
     ///
     /// Supported dtypes: `Float16`, `BFloat16`, `Float32`, `Float64`. Integer
     /// dtypes are not supported here — use `Tensor::randint` instead.
+    #[track_caller]
     pub fn rand_with(shape: &[usize], dtype: DType, device: DeviceSpec) -> Result<Tensor> {
+        origin_call!("rand");
         let scalar = dtype.scalar().ok_or_else(|| Error::SymbolicShapeUnsupported {
             operation: format!("Tensor::rand: non-scalar dtype {dtype:?}"),
         })?;
