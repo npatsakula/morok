@@ -11,7 +11,7 @@ description = "Architecture-level algorithms for the Svod ML compiler"
 [dependencies]
 serde = { version = "1.0", features = ["derive"], optional = true }
 snafu = "0.9"
-svod-runtime = { version = "=0.1.0-alpha.5", path = "../runtime" }
+svod-runtime = { version = "=0.1.0-alpha.6", path = "../runtime" }
 
 [dev-dependencies]
 proptest = "1.9"

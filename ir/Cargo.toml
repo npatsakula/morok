@@ -10,10 +10,10 @@ description = "Intermediate representation for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]
-svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.5", features = [
+svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.6", features = [
   "serde",
 ] }
-svod-macros = { path = "../macros", version = "=0.1.0-alpha.5" }
+svod-macros = { path = "../macros", version = "=0.1.0-alpha.6" }
 smallvec = { workspace = true, features = ["serde"] }
 snafu = "0.8.9"
 itertools = "0.14.0"
