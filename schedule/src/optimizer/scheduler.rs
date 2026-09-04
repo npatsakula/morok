@@ -814,13 +814,7 @@ impl Scheduler {
         let mut subst_map = HashMap::new();
         subst_map.insert(UOpKey(rng), sub_axis);
 
-        let old_ast_id = self.ast.id;
         self.ast = self.ast.substitute(&subst_map);
-
-        // Record high-level transformation
-        if old_ast_id != self.ast.id {
-            svod_ir::provenance::record_transformed(self.ast.id, old_ast_id, svod_ir::provenance::PassName::ShiftTo);
-        }
 
         // Clear caches (maxarg will be recomputed on next access)
         self.clear_caches();
@@ -926,17 +920,7 @@ impl Scheduler {
         }
 
         // Apply substitution
-        let old_ast_id = self.ast.id;
         self.ast = self.ast.substitute(&subst_map);
-
-        // Record high-level transformation
-        if old_ast_id != self.ast.id {
-            svod_ir::provenance::record_transformed(
-                self.ast.id,
-                old_ast_id,
-                svod_ir::provenance::PassName::ConvertLoopToGlobal,
-            );
-        }
 
         self.clear_caches();
 

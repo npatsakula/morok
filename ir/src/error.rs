@@ -249,24 +249,3 @@ pub enum Error {
     #[snafu(display("unsupported multi-device form {operation}: {reason}"))]
     MultiUnsupported { operation: &'static str, reason: &'static str },
 }
-
-/// Enhance an error with provenance information for a UOp.
-///
-/// This function retrieves the provenance chain for a UOp and logs it,
-/// providing detailed debugging information about the operation's origin and
-/// transformation history.
-pub fn log_provenance(uop_id: u64, error: &Error) {
-    use crate::provenance::{PROVENANCE_TRACKER, format_chain};
-
-    PROVENANCE_TRACKER.with(|tracker| {
-        let chain = tracker.borrow().get_chain(uop_id);
-        if !chain.is_empty() {
-            tracing::error!(
-                uop.id = uop_id,
-                error = %error,
-                provenance_chain = %format_chain(&chain),
-                "uop error with provenance"
-            );
-        }
-    });
-}

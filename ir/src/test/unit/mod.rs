@@ -8,6 +8,7 @@ pub mod control;
 pub mod dtype_rule;
 pub mod memory;
 pub mod movement;
+pub mod origin;
 pub mod pattern;
 pub mod reduction;
 pub mod shape;
@@ -20,5 +21,3 @@ pub mod validation;
 pub mod vector;
 pub mod vmin_vmax;
 pub mod wire;
-
-pub mod provenance;

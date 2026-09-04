@@ -342,8 +342,8 @@ def validate_graph(graph: Any, name: str) -> dict[int, dict[str, Any]]:
   base_fields = {"schema_version", "stage", "roots", "nodes"}
   require(frozenset(graph) in {frozenset(base_fields), frozenset(base_fields | {"verbose"})}, path,
           f"fields must be {sorted(base_fields)} with optional verbose, got {sorted(graph)}")
-  require(u64_value(graph["schema_version"], path + ".schema_version") == 6,
-          path + ".schema_version", "expected schema version 6")
+  require(u64_value(graph["schema_version"], path + ".schema_version") == 7,
+          path + ".schema_version", "expected schema version 7")
   string_value(graph["stage"], path + ".stage", nonempty=True)
   integer_list(graph["roots"], path + ".roots")
   list_value(graph["nodes"], path + ".nodes")
@@ -427,8 +427,8 @@ def binding_variables(nodes: dict[int, dict[str, Any]]) -> list[tuple[str, int |
 def validate_schedule(schedule: Any, name: str) -> None:
   path = f"{name}:$"
   exact_keys(schedule, {"schema_version", "stage", "items", "output_slots"}, path)
-  require(u64_value(schedule["schema_version"], path + ".schema_version") == 6,
-          path + ".schema_version", "expected schema version 6")
+  require(u64_value(schedule["schema_version"], path + ".schema_version") == 7,
+          path + ".schema_version", "expected schema version 7")
   require(schedule["stage"] == "scheduled", path + ".stage", "schedule document stage must be 'scheduled'")
   list_value(schedule["items"], path + ".items")
   callable_indices: list[int] = []
@@ -639,7 +639,7 @@ def report(left: dict[str, Any], right: dict[str, Any], left_name: str, right_na
 def test_graph() -> dict[str, Any]:
   scalar = {"kind": "scalar", "name": "float32"}
   none = {"kind": "none"}
-  return {"schema_version": 6, "stage": "gated", "roots": [5], "nodes": [
+  return {"schema_version": 7, "stage": "gated", "roots": [5], "nodes": [
     {"id": 0, "op": "PARAM", "dtype": scalar, "shape": [], "arg": {"kind": "param", "slot": 0, "dtype": scalar,
      "vmin_vmax": None, "multiple_of": None, "name": None, "address_space": "global", "axis": None, "device": None, "volatile": False}, "src": []},
     {"id": 1, "op": "CONST", "dtype": scalar, "shape": [], "arg": {"kind": "const", "value": {"kind": "float", "bits": "0x0000000000000000"}}, "src": []},
@@ -656,7 +656,7 @@ def test_schedule() -> dict[str, Any]:
   graph = json.loads(json.dumps(test_graph()))
   graph["stage"] = "kernel_ast"
   graph["nodes"][0]["arg"].update(name="schedule_n", address_space=None)
-  return {"schema_version": 6, "stage": "scheduled", "items": [{
+  return {"schema_version": 7, "stage": "scheduled", "items": [{
     "order": 0, "callable_index": 0, "ast": graph, "buffers": [], "output_slots": [], "dependencies": [],
     "bindings": [{
       "kind": "param", "slot": 0, "name": "schedule_n", "dtype": {"kind": "scalar", "name": "float32"},

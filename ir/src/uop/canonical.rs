@@ -14,7 +14,7 @@ use crate::ops;
 use crate::{AxisId, BinaryOp, ConstValue, Op, SInt, TernaryOp, UOp};
 
 /// Version of the canonical graph schema.
-pub const CANONICAL_SCHEMA_VERSION: u32 = 6;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 7;
 
 /// Canonical graph representation used by cross-implementation parity tests.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -35,6 +35,9 @@ pub struct CanonicalVerboseNode {
     pub runtime_id: u64,
     pub tag: String,
     pub backend_dtype: String,
+    /// Rendered origin path, absent when the node carries no origin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_xxh64: Option<String>,
 }
@@ -277,6 +280,7 @@ impl CanonicalGraph {
                     runtime_id: node.id,
                     tag: format!("{:?}", node.tag()),
                     backend_dtype: format!("{:?}", node.dtype()),
+                    origin: node.origin().map(crate::origin::path),
                     content_xxh64: match node.op() {
                         Op::ProgramBinary(ops::ProgramBinary { bytes, .. }) => {
                             Some(format!("0x{:016x}", xxhash_rust::xxh64::xxh64(bytes, 0)))

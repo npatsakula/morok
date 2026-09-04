@@ -300,7 +300,7 @@ def canonical_graph(stage: str, roots: Iterable[UOp], verbose: bool = False) -> 
       "src": [ids[source] for source in canonical_sources(node)],
     })
 
-  graph = {"schema_version": 6, "stage": stage, "roots": [ids[root] for root in roots], "nodes": nodes}
+  graph = {"schema_version": 7, "stage": stage, "roots": [ids[root] for root in roots], "nodes": nodes}
   if verbose:
     graph["verbose"] = [
       {
@@ -406,7 +406,7 @@ def canonical_schedule(kernel_graph: UOp, linear: UOp, var_vals: dict[str, int])
         schedule_outputs.append({"item": item, "buffer": scheduled_original_buffers[item].index(output_buffer)})
         break
     else: raise CanonicalSerializationError("scheduler output is absent from LINEAR buffer arguments")
-  return {"schema_version": 6, "stage": "scheduled", "items": items, "output_slots": schedule_outputs}
+  return {"schema_version": 7, "stage": "scheduled", "items": items, "output_slots": schedule_outputs}
 
 
 def fixture(name: str) -> UOp:

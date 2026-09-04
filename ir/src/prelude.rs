@@ -9,6 +9,7 @@
 
 // Core types
 pub use crate::Op;
+pub use crate::origin::{OriginId, OriginScope, OriginSet};
 pub use crate::uop::{IntoUOp, UOp, UOpKey};
 
 // Operation types
