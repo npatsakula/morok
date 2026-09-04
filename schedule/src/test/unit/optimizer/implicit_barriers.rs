@@ -2,7 +2,7 @@
 //! inference and its interaction with renderer-supplied rewrite capabilities.
 
 use crate::optimizer::early_decomposition_patterns;
-use crate::optimizer::implicit_barriers::pm_implicit_barriers;
+use crate::optimizer::implicit_barriers::add_implicit_barriers;
 use smallvec::{SmallVec, smallvec};
 use std::sync::Arc;
 use svod_dtype::{AddrSpace, DType};
@@ -25,7 +25,7 @@ fn index(buffer: Arc<UOp>, offset: Arc<UOp>) -> Arc<UOp> {
 }
 
 fn rewrite(root: Arc<UOp>) -> Arc<UOp> {
-    graph_rewrite(pm_implicit_barriers(), root, &mut ())
+    add_implicit_barriers(root)
 }
 
 #[test]

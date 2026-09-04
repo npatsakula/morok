@@ -119,28 +119,37 @@ fn integer_binary_does_not_wrap(op: BinaryOp, lhs: &Arc<UOp>, rhs: &Arc<UOp>, re
     }
 }
 
-fn integer_arithmetic_does_not_wrap(value: &Arc<UOp>) -> bool {
-    match value.op() {
+/// Per-call memo of `integer_arithmetic_does_not_wrap`: index expressions are
+/// DAGs with heavy sharing, and the proof recurses into both operands.
+type WrapMemo = rustc_hash::FxHashMap<u64, bool>;
+
+fn integer_arithmetic_does_not_wrap(memo: &mut WrapMemo, value: &Arc<UOp>) -> bool {
+    if let Some(&known) = memo.get(&value.id) {
+        return known;
+    }
+    let result = match value.op() {
         Op::Binary(
             op @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::FloorDiv | BinaryOp::FloorMod),
             lhs,
             rhs,
         ) => {
-            integer_arithmetic_does_not_wrap(lhs)
-                && integer_arithmetic_does_not_wrap(rhs)
+            integer_arithmetic_does_not_wrap(memo, lhs)
+                && integer_arithmetic_does_not_wrap(memo, rhs)
                 && integer_binary_does_not_wrap(*op, lhs, rhs, &value.dtype())
         }
-        Op::Unary(svod_ir::UnaryOp::Neg, src) => {
-            let Some((dtype_min, dtype_max)) = integer_dtype_bounds(&value.dtype()) else { return false };
-            let Some((src_min, src_max)) = sound_integer_range(src) else { return false };
-            integer_arithmetic_does_not_wrap(src)
-                && src_max
-                    .checked_neg()
-                    .zip(src_min.checked_neg())
-                    .is_some_and(|(min, max)| dtype_min <= min && min <= max && max <= dtype_max)
-        }
+        Op::Unary(svod_ir::UnaryOp::Neg, src) => integer_dtype_bounds(&value.dtype())
+            .zip(sound_integer_range(src))
+            .is_some_and(|((dtype_min, dtype_max), (src_min, src_max))| {
+                integer_arithmetic_does_not_wrap(memo, src)
+                    && src_max
+                        .checked_neg()
+                        .zip(src_min.checked_neg())
+                        .is_some_and(|(min, max)| dtype_min <= min && min <= max && max <= dtype_max)
+            }),
         _ => true,
-    }
+    };
+    memo.insert(value.id, result);
+    result
 }
 
 fn typed_integer_rewrite_is_exact(original: &Arc<UOp>, replacement: &Arc<UOp>) -> bool {
@@ -148,11 +157,12 @@ fn typed_integer_rewrite_is_exact(original: &Arc<UOp>, replacement: &Arc<UOp>) -
         (Ok(original), Ok(replacement)) => original == replacement,
         _ => false,
     };
+    let mut memo = WrapMemo::default();
     original.dtype() == replacement.dtype()
         && same_shape
         && integer_dtype_bounds(&original.dtype()).is_some()
-        && integer_arithmetic_does_not_wrap(original)
-        && integer_arithmetic_does_not_wrap(replacement)
+        && integer_arithmetic_does_not_wrap(&mut memo, original)
+        && integer_arithmetic_does_not_wrap(&mut memo, replacement)
 }
 
 /// Python's `divmod`: the `(q, r)` pair with `c == q*d + r` and `r` carrying the
@@ -1879,7 +1889,7 @@ fn comparison_dsl_patterns_unchecked() -> &'static TypedPatternMatcher {
         Lt(quotient @ FloorDiv(x, _d @const(d_val)), _c @const(c_val)) => {
             let d_int = d_val.try_int()?;
             let c_int = c_val.try_int()?;
-            if d_int <= 0 || !integer_arithmetic_does_not_wrap(quotient) { return None; }
+            if d_int <= 0 || !integer_arithmetic_does_not_wrap(&mut WrapMemo::default(), quotient) { return None; }
 
             // For positive d, floor(x / d) < c is exactly x < c * d.
             let product = (c_int as i128).checked_mul(d_int as i128)?;

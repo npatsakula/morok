@@ -268,12 +268,15 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     trace!(uop_id = x.id, op = ?std::mem::discriminant(x.op()), "split_store: entering");
 
     // DEVICE ranges are launch lanes and remain open across a callable boundary.
-    // Any computational range still makes this an interior STORE.
+    // Any computational range still makes this an interior STORE. `ranges()`
+    // clones every RANGE reachable through the AFTER chain, so consult it only
+    // when something is actually in scope.
     let scope = x.in_scope_ranges();
-    if x.ranges()
-        .into_iter()
-        .filter(|range| scope.contains(&range.id))
-        .any(|range| !matches!(range.op(), Op::Range(ops::Range { axis_type: svod_ir::AxisType::Device, .. })))
+    if !scope.is_empty()
+        && x.ranges()
+            .into_iter()
+            .filter(|range| scope.contains(&range.id))
+            .any(|range| !matches!(range.op(), Op::Range(ops::Range { axis_type: svod_ir::AxisType::Device, .. })))
     {
         return None;
     }

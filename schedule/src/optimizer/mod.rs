@@ -73,7 +73,7 @@ pub use types::{AxisType, Opt, OptArg, OptArgExt, OptOps};
 use crate::devectorize::{
     Fp8DecompCtx, pm_add_loads, pm_expand_broadcast, pm_float_decomp, pm_long_decomp, pm_reduce_local,
 };
-use crate::gpudims::pm_add_gpudims;
+use crate::gpudims::{GpuDimsContext, pm_add_gpudims};
 use crate::rangeify::patterns::{
     pm_comparison_negations, pm_demorgan, pm_div_to_shr, pm_fdiv_to_mul, pm_fma_decomposition, pm_half_bf16_cast,
     pm_load_collapse, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_shl_add_to_mulacc, pm_threefry_decomp,
@@ -82,7 +82,7 @@ use crate::rangeify::transforms::{SimplifyRangesContext, pm_flatten_range, pm_si
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::index_lowering::WeakMemo;
 use crate::symbolic::patterns::{pm_fold_cast_const, sym, symbolic, symbolic_simple};
-use implicit_barriers::pm_implicit_barriers;
+use implicit_barriers::add_implicit_barriers;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 use svod_ir::{AxisId, Op, UOp};
@@ -357,7 +357,7 @@ fn apply_post_optimization_configured_with_capture(
     let t_stage = std::time::Instant::now();
     let with_device_ranges = graph_rewrite(&crate::gpudims::pm_lower_device_ranges(), with_local_buffers, &mut ());
     let with_gpudims = if renderer.has_local || renderer.has_threads {
-        graph_rewrite(&pm_add_gpudims(), with_device_ranges, &mut renderer.clone())
+        graph_rewrite(&pm_add_gpudims(), with_device_ranges, &mut GpuDimsContext::from(renderer.clone()))
     } else {
         with_device_ranges
     };
@@ -570,7 +570,7 @@ fn apply_post_optimization_configured_with_capture(
     }
     // Renderer rewrites can create local-memory dependencies, so barriers are
     // inferred after the captured late-final-rewrite boundary.
-    let rendered = graph_rewrite(pm_implicit_barriers(), final_rewrite, &mut ());
+    let rendered = add_implicit_barriers(final_rewrite);
     tracing::debug!(
         ast.optimized = rendered.tree(),
         node_count = rendered.node_count(),
@@ -762,7 +762,7 @@ pub(crate) fn apply_dtype_decomps(root: Arc<UOp>, renderer: Renderer) -> Arc<UOp
 #[cfg(test)]
 pub(crate) fn finish_final_rewrite(root: Arc<UOp>) -> Arc<UOp> {
     let root = graph_rewrite(crate::symbolic::patterns::pm_remove_invalid(), root, &mut ());
-    graph_rewrite(pm_implicit_barriers(), root, &mut ())
+    add_implicit_barriers(root)
 }
 
 #[cfg(test)]

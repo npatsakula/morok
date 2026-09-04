@@ -19,7 +19,8 @@ fn thread_extent_maps_to_exact_core_id_cardinality() {
     let thread = UOp::range_axis(UOp::index_const(2), svod_ir::AxisId::Renumbered(0), AxisType::Thread);
     let sink = UOp::sink(vec![thread.clone()]);
 
-    let lowered = add_gpudims(&Renderer::cpu(), &sink).expect("thread range should lower to core_id");
+    let lowered =
+        add_gpudims(&mut GpuDimsContext::from(Renderer::cpu()), &sink).expect("thread range should lower to core_id");
     let core_id = lowered
         .toposort()
         .into_iter()
@@ -35,7 +36,7 @@ fn thread_extent_maps_to_exact_core_id_cardinality() {
 
     // One core_id cannot stand in for two THREAD axes: decline, don't panic.
     let second = UOp::range_axis(UOp::index_const(3), svod_ir::AxisId::Renumbered(1), AxisType::Thread);
-    assert!(add_gpudims(&Renderer::cpu(), &UOp::sink(vec![thread, second])).is_none());
+    assert!(add_gpudims(&mut GpuDimsContext::from(Renderer::cpu()), &UOp::sink(vec![thread, second])).is_none());
 }
 
 #[test]
@@ -44,7 +45,7 @@ fn existing_special_skips_all_gpudims_lowering() {
     let special = UOp::special(UOp::index_const(8), "gidx0".to_string());
     let sink = UOp::sink(vec![global, special]);
 
-    assert!(add_gpudims(&Renderer::amd_cdna3(), &sink).is_none());
+    assert!(add_gpudims(&mut GpuDimsContext::from(Renderer::amd_cdna3()), &sink).is_none());
 }
 
 /// Extents of the `gidx*` SPECIALs `add_gpudims` emits for the given axes,
@@ -57,7 +58,8 @@ fn global_special_extents(renderer: &Renderer, global_extents: &[i64], local_ext
             ranges.push(UOp::range_axis(UOp::index_const(extent), axis, axis_type));
         }
     }
-    let lowered = add_gpudims(renderer, &UOp::sink(ranges)).expect("GPU ranges should lower");
+    let lowered =
+        add_gpudims(&mut GpuDimsContext::from(renderer.clone()), &UOp::sink(ranges)).expect("GPU ranges should lower");
     let mut ends: Vec<usize> = lowered
         .toposort()
         .into_iter()
@@ -101,7 +103,11 @@ fn device_range_becomes_device_num_and_its_end_drops_all_params(dtype: DType, ex
 fn a_non_device_end_keeps_its_params() {
     let other = UOp::variable("other".to_string(), 0, 7, DType::Index);
     let ended = UOp::index_const(1).end(smallvec::smallvec![other.clone()]);
-    let lowered = crate::rewrite::graph_rewrite(&pm_add_gpudims(), ended.clone(), &mut Renderer::amd_cdna3());
+    let lowered = crate::rewrite::graph_rewrite(
+        &pm_add_gpudims(),
+        ended.clone(),
+        &mut GpuDimsContext::from(Renderer::amd_cdna3()),
+    );
 
     assert!(Arc::ptr_eq(&lowered, &ended));
 }
@@ -120,7 +126,8 @@ fn missing_group_reduce_masks_a_structured_global_param_store(buffer: Arc<UOp>) 
     let store = index.store(group.cast(DType::Float32));
     let sink = UOp::sink(vec![store]);
 
-    let lowered = add_gpudims(&Renderer::amd_cdna3(), &sink).expect("group range should lower");
+    let lowered =
+        add_gpudims(&mut GpuDimsContext::from(Renderer::amd_cdna3()), &sink).expect("group range should lower");
     let masked_index = lowered
         .toposort()
         .into_iter()

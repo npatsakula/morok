@@ -17,6 +17,8 @@ use std::sync::{Arc, LazyLock};
 use super::context::RangeifyContext;
 use super::indexing::IndexingContext;
 use super::kernel::RangeifyBufferContext;
+use crate::passes::slice_memo::SliceMemo;
+use rustc_hash::FxHashMap;
 use smallvec::{SmallVec, smallvec};
 use svod_ir::ops;
 use svod_ir::shape::Shape;
@@ -1105,8 +1107,10 @@ fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPa
 
     for range in ranges {
         // 1. Gated toposort: find nodes "in scope" of this range
-        let in_scope: HashSet<UOpKey> =
-            u.toposort_filtered(|node| node.in_scope_ranges().contains(&range.id)).into_iter().map(UOpKey).collect();
+        // Visited in toposort order, as tinygrad's dict is: iterating the set would
+        // name the synthetic vars in hash order and make the pass nondeterministic.
+        let in_scope_nodes = u.toposort_filtered(|node| node.in_scope_ranges().contains(&range.id));
+        let in_scope: HashSet<UOpKey> = in_scope_nodes.iter().cloned().map(UOpKey).collect();
 
         // Bail if nested REDUCE or STORE in scope (can't collapse through these)
         if in_scope.iter().any(|k| matches!(k.0.op(), Op::Reduce(..) | Op::Store(..))) {
@@ -1115,8 +1119,8 @@ fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPa
 
         // 2. Identify external inputs and substitute with scalar PARAMs.
         let mut replaces: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
-        for node in &in_scope {
-            node.0.op().map_child(|child| {
+        for node in &in_scope_nodes {
+            node.op().map_child(|child| {
                 let key = UOpKey(child.clone());
                 if in_scope.contains(&key) || replaces.contains_key(&key) {
                     return;
@@ -1150,10 +1154,9 @@ fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPa
         // 4. Apply algebraic patterns to try eliminating the range
         let result = crate::rewrite::graph_rewrite(pm, synthetic_reduce, &mut ());
 
-        // 5. Check range eliminated (use plain toposort, NOT in_scope_ranges,
+        // 5. Check range eliminated (a plain walk, NOT in_scope_ranges,
         //    since REDUCE "ends" ranges and would give a false positive)
-        let has_range = result.toposort().iter().any(|x| matches!(x.op(), Op::Range(..)));
-        if has_range {
+        if result.any_in_subtree(|x| matches!(x.op(), Op::Range(..))) {
             return None;
         }
 
@@ -1202,10 +1205,23 @@ pub(crate) fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &svod_dtype::DType) 
 // RANGE SIMPLIFICATION
 // ============================================================================
 
-/// Bounds collected from INDEX validity gates for `pm_simplify_ranges`.
-#[derive(Default)]
+/// Per-pass state of `pm_simplify_ranges`: the bounds collected from INDEX
+/// validity gates, plus the slice analyses `simplify_merge_adjacent` needs for
+/// every END/REDUCE it visits, memoized so no match toposorts its own slice.
 pub struct SimplifyRangesContext {
     bounds: HashMap<UOpKey, Arc<UOp>>,
+    reduces: SliceMemo,
+    divmod_counts: FxHashMap<u64, usize>,
+}
+
+impl Default for SimplifyRangesContext {
+    fn default() -> Self {
+        Self {
+            bounds: HashMap::new(),
+            reduces: SliceMemo::ungated(|uop| matches!(uop.op(), Op::Reduce(..))),
+            divmod_counts: FxHashMap::default(),
+        }
+    }
 }
 
 /// Simplify ranges by merging adjacent ranges to reduce divmod operations.
@@ -1222,7 +1238,7 @@ pub struct SimplifyRangesContext {
 /// - Original: Two ranges R1(16) and R2(8)
 /// - Merge: Create R_merged(128), decompose as R1 = merged // 8 and R2 = merged % 8
 /// - Accept: Only if this reduces or maintains the divmod count
-pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
+pub fn simplify_merge_adjacent(ctx: &mut SimplifyRangesContext, u: &Arc<UOp>) -> Option<Arc<UOp>> {
     use crate::passes::linearize_index::count_divmod;
 
     // Get ended ranges for this operation
@@ -1236,15 +1252,8 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Collect all REDUCE operations in the backward slice.
-    let reduce_ranges: Vec<SmallVec<[Arc<UOp>; 4]>> = u
-        .toposort()
-        .iter()
-        .filter_map(|dep| match dep.op() {
-            Op::Reduce(ops::Reduce { ranges, .. }) => Some(ranges.clone()),
-            _ => None,
-        })
-        .collect();
+    let reduces = ctx.reduces.get(u);
+    let mut divmod_count = |uop: &Arc<UOp>| *ctx.divmod_counts.entry(uop.id).or_insert_with(|| count_divmod(uop));
 
     // Cumulative merging: try all pairs and accumulate successful merges into `current`.
     let mut current = Arc::clone(u);
@@ -1283,7 +1292,8 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
         }
 
         // Check same REDUCE scope.
-        let valid_reduce_scope = reduce_ranges.iter().all(|rngs| {
+        let valid_reduce_scope = reduces.iter().all(|reduce| {
+            let Op::Reduce(ops::Reduce { ranges: rngs, .. }) = reduce.op() else { return true };
             let r0_in = rngs.iter().any(|rng| Arc::ptr_eq(rng, r0));
             let r1_in = rngs.iter().any(|rng| Arc::ptr_eq(rng, r1));
             r0_in == r1_in
@@ -1326,10 +1336,7 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
         let simplified = crate::rewrite::graph_rewrite(&*MERGE_SYM, rewritten, &mut ());
 
         // Accept if divmod count is reduced or equal.
-        let original_divmod = count_divmod(&current);
-        let new_divmod = count_divmod(&simplified);
-
-        if new_divmod <= original_divmod {
+        if divmod_count(&simplified) <= divmod_count(&current) {
             current = simplified;
             changed = true;
         }
@@ -1458,8 +1465,8 @@ pub fn pm_simplify_ranges() -> crate::TypedPatternMatcher<SimplifyRangesContext>
         @context SimplifyRangesContext;
 
         // Rule order matches Tinygrad: merge, collect gates, protect REDUCE, substitute at SINK.
-        u @ End { computation: _, ranges: _ } => simplify_merge_adjacent(u),
-        u @ Reduce { src: _, ranges: _, reduce_op: _ } => simplify_merge_adjacent(u),
+        u @ End { computation: _, ranges: _ } => simplify_merge_adjacent(ctx, u),
+        u @ Reduce { src: _, ranges: _, reduce_op: _ } => simplify_merge_adjacent(ctx, u),
         idx @ Index { buffer: _, indices: _ } => {
             mark_gated(ctx, idx);
             None

@@ -56,7 +56,7 @@ pub use expand::{build_range_map, expander2, pm_group_for_reduce, pre_expand};
 pub use devectorize::devectorize;
 
 // Re-export gpudims pass
-pub use gpudims::{pm_add_gpudims, pm_lower_device_ranges};
+pub use gpudims::{GpuDimsContext, pm_add_gpudims, pm_lower_device_ranges};
 
 // Re-export optimizer entry points
 pub use optimizer::{

@@ -50,7 +50,11 @@ fn through_devectorize(ast: Arc<UOp>, renderer: &Renderer) -> Arc<UOp> {
         + crate::devectorize::pm_reduce_local();
     let ast = graph_rewrite(&reduce, ast, &mut crate::devectorize::ReduceContext::default());
     let ast = graph_rewrite(&crate::gpudims::pm_lower_device_ranges(), ast, &mut ());
-    let ast = graph_rewrite(&crate::gpudims::pm_add_gpudims(), ast, &mut renderer.clone());
+    let ast = graph_rewrite(
+        &crate::gpudims::pm_add_gpudims(),
+        ast,
+        &mut crate::gpudims::GpuDimsContext::from(renderer.clone()),
+    );
     let loads = crate::symbolic::patterns::symbolic_simple().clone()
         + crate::devectorize::pm_expand_broadcast().clone()
         + crate::devectorize::pm_add_loads().clone();

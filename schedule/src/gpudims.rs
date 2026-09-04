@@ -33,17 +33,27 @@ use crate::optimizer::Renderer;
 use crate::pattern::TypedPatternMatcher;
 use svod_ir::ops;
 
+/// Device limits plus the SINK this pass already lowered. The engine re-matches
+/// a rewritten SINK; when every GPU range was substituted, that second visit can
+/// only return `None`, so it skips the second full-graph analysis.
+pub struct GpuDimsContext {
+    renderer: Renderer,
+    lowered: Option<u64>,
+}
+
+impl From<Renderer> for GpuDimsContext {
+    fn from(renderer: Renderer) -> Self {
+        Self { renderer, lowered: None }
+    }
+}
+
 /// Pattern matcher for GPU dimension injection.
 ///
 /// Matches SINK operations and transforms GLOBAL/LOCAL ranges to SPECIAL ops.
 /// Must run after pm_reduce and before pm_add_loads.
-///
-/// # Context
-///
-/// Requires `&Renderer` context to access device limits (global_max, local_max).
-pub fn pm_add_gpudims() -> TypedPatternMatcher<Renderer> {
+pub fn pm_add_gpudims() -> TypedPatternMatcher<GpuDimsContext> {
     crate::patterns! {
-        @context Renderer;
+        @context GpuDimsContext;
         // add gpudims must be last
         sink @ Sink { sources: _sources } => add_gpudims(ctx, sink),
     }
@@ -89,10 +99,14 @@ fn cleanup_device_end(end: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// 3. Categorize ranges by axis type (GLOBAL/THREAD vs LOCAL/WARP/GROUP_REDUCE)
 /// 4. Create SPECIAL indices with dimension limiting
 /// 5. Substitute RANGE ops with computed indices
-fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
+fn add_gpudims(ctx: &mut GpuDimsContext, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Sink(..) = sink.op() else {
         return None;
     };
+    if ctx.lowered == Some(sink.id) {
+        return None;
+    }
+    let renderer = &ctx.renderer;
 
     // Collect topology (all UOps reachable from sink)
     let topo = sink.toposort();
@@ -167,28 +181,28 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     let local_shape = extract_shape(&local_ranges);
 
     let dont_use_locals = sink.metadata::<crate::optimizer::KernelInfo>().is_some_and(|info| info.dont_use_locals);
-    let all_idxs: Vec<Arc<UOp>> = if ctx.has_threads {
+    let all_idxs: Vec<Arc<UOp>> = if renderer.has_threads {
         // global_shape contains RANGE extents, not range indices. Match
         // Tinygrad's `int(global_shape[0])-1`: Thread(N) has N core IDs.
         let end = thread_core_bound(&global_dims, &local_dims, &global_shape)?;
         vec![UOp::variable("core_id".to_string(), 0, end - 1, DType::Int32).cast(DType::WeakInt)]
     } else if dont_use_locals {
         assert!(local_dims.is_empty(), "can't use locals if there's no local dims");
-        get_grouped_dims("idx", &global_shape, ctx.global_max.as_deref(), true)
+        get_grouped_dims("idx", &global_shape, renderer.global_max.as_deref(), true)
     } else {
         // Generate GPU indices
         // Renderer keeps the workgroup product cap separate from per-axis caps.
         let local_max: Option<Vec<usize>> =
-            ctx.local_max_axes().map(|axes| axes.to_vec()).or_else(|| ctx.local_max.map(|max| vec![max; 3]));
+            renderer.local_max_axes().map(|axes| axes.to_vec()).or_else(|| renderer.local_max.map(|max| vec![max; 3]));
         let local_max_slice = local_max.as_deref();
 
         // Create local indices (lidx0, lidx1, ...)
         let local_idxs = get_grouped_dims("lidx", &local_shape, local_max_slice, false);
         let hw_local = hardware_local_extents(&local_idxs);
-        let global_max = ctx.global_prod_max.as_ref().map_or_else(
-            || ctx.global_max.clone(),
+        let global_max = renderer.global_prod_max.as_ref().map_or_else(
+            || renderer.global_max.clone(),
             |prod_max| {
-                let base = ctx.global_max.as_ref().unwrap_or(prod_max);
+                let base = renderer.global_max.as_ref().unwrap_or(prod_max);
                 base.iter()
                     .zip(prod_max)
                     .zip(hw_local.iter().copied().chain(std::iter::repeat(1)).take(3))
@@ -236,7 +250,18 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    Some(sink.substitute(&subs))
+    let lowered = sink.substitute(&subs);
+    // `global_dims`/`local_dims` keep one range per axis id; a second range on
+    // the same id would survive and still needs the re-visit.
+    let gpu_ranges = all_ranges.keys().filter(|(_, axis_type)| is_gpu_axis(*axis_type)).count();
+    if gpu_ranges == all_dims.len() {
+        ctx.lowered = Some(lowered.id);
+    }
+    Some(lowered)
+}
+
+fn is_gpu_axis(axis_type: AxisType) -> bool {
+    matches!(axis_type, AxisType::Global | AxisType::Thread | AxisType::Local | AxisType::Warp | AxisType::GroupReduce)
 }
 
 /// Hardware extent of each `lidx*` axis behind the local indices.
