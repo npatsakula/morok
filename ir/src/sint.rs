@@ -43,7 +43,7 @@ fn symbolic_contains_max_term(expr: &Arc<UOp>, needle: &Arc<UOp>) -> bool {
 /// # Examples
 ///
 /// ```rust
-/// # use svod_ir::{SInt, UOp, ConstValue, Op};
+/// # use svod_ir::{SInt, UOp, ConstValue, Op, ops};
 /// # use svod_dtype::DType;
 /// // Concrete dimension
 /// let static_dim = SInt::from(32);
