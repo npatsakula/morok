@@ -240,6 +240,38 @@ fn hand_lowered_kernel_bodies_dedup_across_scopes() {
     assert_eq!(right_info.origins.iter().copied().collect::<Vec<_>>(), vec![right_id]);
 }
 
+/// Materialising an input belongs to its producer: two scopes handing the same
+/// unscoped tensor to a hand-lowered kernel share one copy instead of one each.
+#[test]
+fn hand_lowered_kernel_inputs_are_materialised_once_per_producer() {
+    use svod_ir::{Op, UOp, ops};
+
+    let shared = &Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]) * &Tensor::from_slice([2.0f32; 4]);
+    let launch = |scope: OriginId| {
+        let _scope = origin::install(Some(scope));
+        let out = Tensor::from_slice([0.0f32; 4]);
+        out.custom_kernel(&[&shared], |placeholders| UOp::sink(vec![placeholders[0].contiguous()]))
+            .expect("custom kernel")
+            .into_iter()
+            .next()
+            .expect("one output per source")
+    };
+    let left = launch(module("carriage.input.left"));
+    let right = launch(module("carriage.input.right"));
+
+    let input_arg = |tensor: &Tensor| match tensor.uop().op() {
+        Op::After(ops::After { deps, .. }) => match deps[0].op() {
+            Op::Call(ops::Call { args, .. }) => args[1].clone(),
+            op => panic!("expected CALL, got {op:?}"),
+        },
+        op => panic!("expected AFTER(CALL), got {op:?}"),
+    };
+    let (left_input, right_input) = (input_arg(&left), input_arg(&right));
+    assert!(matches!(left_input.op(), Op::Contiguous(..)));
+    assert_eq!(left_input.origin(), shared.uop().origin(), "the copy takes the producer's origin, not the caller's");
+    assert!(Arc::ptr_eq(&left_input, &right_input), "both scopes must share one materialisation");
+}
+
 /// A caller-supplied attribution wins; the harvested set still describes the body.
 #[test]
 fn hand_lowered_kernel_keeps_an_explicit_origin() {
