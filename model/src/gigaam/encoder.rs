@@ -2,6 +2,7 @@ use ndarray::Array4;
 use snafu::ResultExt;
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::SInt;
+use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 
 use crate::init::{fan_in_uniform, ones, zeros};
@@ -247,9 +248,13 @@ impl MultiHeadSelfAttention {
             .context(TensorSnafu)?
             .try_reshape([t.clone(), b.clone(), SInt::Const(h), SInt::Const(d_k)])
             .context(TensorSnafu)?;
+        // The table is shared by every layer, so its cast is built outside the
+        // layer's origin scope and hash-conses across layers.
         let rope_dtype = y_heads.uop().dtype();
-        let cos = cos.cast(rope_dtype.clone()).context(TensorSnafu)?;
-        let sin = sin.cast(rope_dtype).context(TensorSnafu)?;
+        let (cos, sin) = {
+            let _shared = OriginScope::suspend();
+            (cos.cast(rope_dtype.clone()).context(TensorSnafu)?, sin.cast(rope_dtype).context(TensorSnafu)?)
+        };
         let qk_input = y_heads
             .apply_rotary_emb(&cos, &sin, false)
             .context(TensorSnafu)?
@@ -302,6 +307,9 @@ fn sdpa_attention(q: &Tensor, k: &Tensor, v: &Tensor, key_lens: Option<&Tensor>)
             let dim = |i: usize| qs[i].as_const().expect("concrete dim");
             let (b, n) = (dim(0), dim(1));
             // [B, 1, 1, N] bool key mask: true (masked) where arange(N) ≥ key_lens[b].
+            // A property of `key_lens`, shared by every layer: built outside the
+            // layer's origin scope so the layers share one mask.
+            let _shared = OriginScope::suspend();
             let range = Tensor::arange(n as i64, None, None)
                 .context(TensorSnafu)?
                 .try_reshape([1usize, 1, 1, n])

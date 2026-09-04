@@ -1,5 +1,7 @@
 //! Origin capture in the importer: every node of an imported graph, including the
-//! nodes of an `If` subgraph, must own the UOps it builds.
+//! nodes of an `If` subgraph, must own the UOps it builds. The exception is a node
+//! that builds only literals, which are origin-opaque so that no two scopes can
+//! split one constant.
 
 use std::collections::BTreeSet;
 
@@ -123,13 +125,16 @@ fn subgraph_nodes_chain_to_the_enclosing_node() {
     // The If node is index 0 of the outer graph; the branch attribute is a
     // segment under it, and the branch's own node indices restart at zero.
     // Both branches are live in the merged graph and must stay distinguishable.
-    for expected in [
-        "#0:If",
-        "#0:If.then_branch.#0:Constant",
-        "#0:If.then_branch.#1:Add",
-        "#0:If.else_branch.#1:Add",
-        "initializer",
-    ] {
+    for expected in ["#0:If", "#0:If.then_branch", "#0:If.then_branch.#1:Add", "#0:If.else_branch.#1:Add"] {
         assert!(paths.contains(expected), "missing {expected} in {paths:?}");
+    }
+
+    // This model's `Constant` node and its scalar `condition` initializer build
+    // nothing but literals, and literals are origin-opaque (`origin_opaque` in
+    // svod-ir) so that no two scopes can split one constant. Neither owns an
+    // attributed node; the scopes still reach the graph through their consumers.
+    // `nodes_own_the_uops_they_build` covers initializers that do build one.
+    for absent in ["#0:If.then_branch.#0:Constant", "initializer"] {
+        assert!(!paths.contains(absent), "a literal carries no origin, so {absent} cannot appear in {paths:?}");
     }
 }

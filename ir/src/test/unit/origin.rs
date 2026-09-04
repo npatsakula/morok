@@ -357,8 +357,10 @@ fn identity_ops_never_carry_an_origin() {
     assert_eq!(param.origin(), None);
     assert_eq!(unique.origin(), None);
     assert_eq!(lunique.origin(), None);
-    // Consts do carry one: they are values, not identities.
-    assert_eq!(UOp::const_(DType::Int32, ConstValue::Int(17)).origin(), origin::current());
+    // A literal is the one value here: two scopes build it independently and
+    // identically, so an origin on it would only split a node the kernel cut
+    // re-merges (see `origin_opaque`).
+    assert_eq!(UOp::const_(DType::Int32, ConstValue::Int(17)).origin(), None);
 }
 
 #[test]

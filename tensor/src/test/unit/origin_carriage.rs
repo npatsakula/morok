@@ -272,6 +272,36 @@ fn hand_lowered_kernel_inputs_are_materialised_once_per_producer() {
     assert!(Arc::ptr_eq(&left_input, &right_input), "both scopes must share one materialisation");
 }
 
+/// A value-producing body is inlined by rangeify and cut like any other graph, so
+/// its nodes keep their origins for the cut to harvest instead of being stripped.
+#[test]
+fn inlined_function_bodies_keep_their_origins() {
+    use svod_ir::{Op, ops};
+
+    let scope = module("carriage.function");
+    let output = {
+        let _scope = origin::install(Some(scope));
+        let input = Tensor::from_slice([1.0f32, 2.0]);
+        input
+            .custom_kernel(&[], |placeholders| placeholders[0].try_mul(&placeholders[0]).expect("mul"))
+            .expect("custom kernel")
+            .into_iter()
+            .next()
+            .expect("one output per source")
+    };
+    let output = output.uop();
+    let Op::After(ops::After { deps, .. }) = output.op() else { panic!("expected AFTER") };
+    let Op::Function(ops::Function { body, info, .. }) = deps[0].op() else {
+        panic!("a value body wraps into FUNCTION, got {}", deps[0].op().as_ref())
+    };
+    assert!(info.origins.is_empty(), "attribution stays on the nodes, not on the callable");
+    assert!(
+        body.toposort().iter().any(|node| node.origin() == Some(scope)),
+        "the body keeps its origins for the cut:\n{}",
+        body.tree()
+    );
+}
+
 /// A caller-supplied attribution wins; the harvested set still describes the body.
 #[test]
 fn hand_lowered_kernel_keeps_an_explicit_origin() {
@@ -294,4 +324,37 @@ fn hand_lowered_kernel_keeps_an_explicit_origin() {
     let Op::Call(ops::Call { info, .. }) = deps[0].op() else { panic!("expected CALL") };
     assert_eq!(info.origin, Some(declared));
     assert_eq!(info.origins.iter().copied().collect::<Vec<_>>(), vec![built_under]);
+}
+
+/// A literal is the one node two scopes build independently yet identically, so an
+/// origin on it splits what should be a single constant. The kernel cut re-merges
+/// the halves with `without_origins`, which lets a structural rewrite the pre-cut
+/// passes could not see — `WHERE(_, t, t) -> t` here — fire *after* the CALL ABI was
+/// fixed, leaving the kernel bound to a buffer its compiled program never reads.
+///
+/// `scatter_reduce(include_self = false)` is the smallest graph with that shape: the
+/// `full` target's fill value and the reduction's own identity are the same literal
+/// reached through two call frames. Unlike the tests above this needs real call
+/// frames, so it enables capture rather than installing an id.
+#[test]
+fn a_literal_split_by_call_frames_does_not_change_the_kernel_abi() {
+    use crate::indexing::ScatterReduction;
+    use svod_ir::{ConstValue, DType};
+
+    crate::test::helpers::test_setup();
+
+    let scattered = |capture: bool| -> Vec<f32> {
+        let _capture = origin::capture_for_thread(capture);
+        let target = Tensor::full(&[4], ConstValue::Float(0.0), DType::Float32).expect("full target");
+        let index = Tensor::from_slice([0i32, 0, 2, 2]);
+        let source = Tensor::full(&[4], ConstValue::Float(1.0), DType::Float32).expect("full source");
+        let mut out = target
+            .scatter_reduce(0, &index, &source, ScatterReduction::Sum, false)
+            .expect("scatter_reduce")
+            .contiguous();
+        out.realize().expect("the CALL must bind exactly the buffers its program reads");
+        out.array_view::<f32>().expect("read back").iter().copied().collect()
+    };
+
+    assert_eq!(scattered(true), scattered(false), "capture must not change the compiled result");
 }

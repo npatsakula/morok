@@ -672,10 +672,15 @@ fn arg_key(op: &Op) -> ArgKey {
         }
         Op::Call(ops::Call { info, .. }) | Op::Function(ops::Function { info, .. }) => ArgKey::Call(
             info.grad_tag.clone(),
-            // Rendered paths, not raw ids: an id is the arena's allocation order, so
-            // ordering by it would make the emitted instruction order depend on which
-            // scope happened to be interned first.
-            info.origins.iter().map(|&origin| svod_ir::origin::path(origin)).collect(),
+            // Sorted rendered paths, not raw ids: an id is the arena's allocation
+            // order, so ordering by it would make the emitted instruction order
+            // depend on which scope happened to be interned first.
+            info.origins
+                .iter()
+                .map(|&origin| svod_ir::origin::path(origin))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
             info.name.clone(),
             info.precompile,
             info.precompile_backward,

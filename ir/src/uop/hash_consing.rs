@@ -65,11 +65,21 @@ fn content_hash(op: &Op, dtype: &DType, origin: Option<OriginId>) -> u64 {
     h.finish()
 }
 
-/// Ops whose identity is their allocation, not their structure: buffer ids key the
-/// realize/tensor tables and PARAM positions key kernel dedup, so an origin must
-/// never split them.
+/// Ops an origin must never split.
+///
+/// BUFFER/PARAM/UNIQUE/LUNIQUE are identities rather than structures: buffer ids key
+/// the realize/tensor tables and PARAM positions key kernel dedup.
+///
+/// CONST is the one *value* here. A literal is the only node two scopes build
+/// independently yet identically — every other node is distinguished by its
+/// operands, which already carry the scope that produced them. Splitting a literal
+/// buys no attribution (a constant costs nothing to execute) and defeats every
+/// structural-equality rewrite, `WHERE(_, t, t) -> t` among them. That matters
+/// beyond code quality: the kernel cut re-merges the split literals with
+/// `without_origins`, so a rewrite the pre-cut passes could not see fires after the
+/// CALL ABI is fixed and drops a PARAM the CALL still binds.
 fn origin_opaque(op: &Op) -> bool {
-    matches!(op, Op::Buffer(..) | Op::Param(..) | Op::Unique(..) | Op::LUnique(..))
+    matches!(op, Op::Buffer(..) | Op::Param(..) | Op::Unique(..) | Op::LUnique(..) | Op::Const(..))
 }
 
 /// Table hash: the content hash mixed with the tag, which participates in

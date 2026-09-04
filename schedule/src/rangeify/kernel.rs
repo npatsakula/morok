@@ -312,7 +312,8 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     // The fallback walks root-first, so an unattributed store target charges the
     // kernel to the nearest attributed node above it rather than to whichever leaf
     // happens to be deepest.
-    let (fallback, origins): (Option<OriginId>, OriginSet) = ret.kernel_attribution();
+    let (fallback, origins): (Option<OriginId>, OriginSet) =
+        if svod_ir::origin::any_interned() { ret.kernel_attribution() } else { (None, OriginSet::new()) };
     let origin: Option<OriginId> = extract_stored_value(&ret).origin().or(fallback);
     let ret = if origins.is_empty() { ret } else { ret.without_origins() };
 

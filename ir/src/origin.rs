@@ -15,6 +15,7 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -155,6 +156,15 @@ struct Arena {
     table: Vec<Origin>,
 }
 
+static ANY_INTERNED: AtomicBool = AtomicBool::new(false);
+
+/// Whether any origin was ever interned in this process. While false no node can
+/// carry one, so harvest passes skip their graph walks.
+#[inline]
+pub fn any_interned() -> bool {
+    ANY_INTERNED.load(Ordering::Relaxed)
+}
+
 fn arena() -> std::sync::MutexGuard<'static, Arena> {
     static ARENA: OnceLock<Mutex<Arena>> = OnceLock::new();
     ARENA.get_or_init(Mutex::default).lock().unwrap_or_else(|poison| poison.into_inner())
@@ -163,6 +173,7 @@ fn arena() -> std::sync::MutexGuard<'static, Arena> {
 /// Intern one origin, returning its stable id. Idempotent: equal origins (same
 /// parent and frame) always map to the same id for the life of the process.
 pub fn intern(origin: Origin) -> OriginId {
+    ANY_INTERNED.store(true, Ordering::Relaxed);
     let mut arena = arena();
     if let Some(&id) = arena.ids.get(&origin) {
         return id;
