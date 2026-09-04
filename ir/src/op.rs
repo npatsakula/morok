@@ -24,9 +24,10 @@ use svod_dtype::DeviceSpec;
 /// - SmallVec avoids heap allocation for common cases (≤4 children)
 /// - Late gating is carried by LOAD/STORE following Tinygrad's model
 ///
-/// Hash is derived and uses UOp's Hash impl for `Arc<UOp>` children.
-/// UOp hashes by content (dtype + op), enabling content-based hashing for caching.
-#[derive(Debug, Clone, Hash)]
+/// `Hash`/`PartialEq` are derived: children hash by their content hash and compare
+/// by interned identity, so the derives give both the structural content hash and
+/// the exact equality the intern table needs.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 #[derive(strum::AsRefStr)]
 #[derive(svod_macros::PatternEnum)]
 #[pattern(grouped = [Unary, Binary, Ternary])]

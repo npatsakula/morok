@@ -202,18 +202,23 @@ pub struct UOp {
     pub(crate) metadata: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
-/// Hash implementation for UOp based on content (dtype + op).
-///
-/// This enables content-based hashing for cross-run caching. The hash traverses
-/// the DAG structure since Op contains `Arc<UOp>` children that also get hashed.
-/// Cache fields are intentionally skipped - they don't affect semantic identity.
+/// Hashes by the precomputed structural content hash, so a derived `Hash` on a
+/// parent `Op` is O(children) and deterministic across runs.
 impl Hash for UOp {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.dtype.hash(state);
-        self.op.hash(state);
-        // Intentionally skip: id, caches, metadata
+        state.write_u64(self.content_hash);
     }
 }
+
+/// Interned identity: structurally equal nodes are the same allocation, so
+/// comparing ids is exact and O(1).
+impl PartialEq for UOp {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for UOp {}
 
 impl UOp {
     /// Get the operation.
@@ -1445,15 +1450,24 @@ fn visited_set(capacity: usize) -> rustc_hash::FxHashSet<*const UOp> {
     rustc_hash::FxHashSet::with_capacity_and_hasher(capacity, Default::default())
 }
 
-impl Clone for UOp {
-    fn clone(&self) -> Self {
+impl UOp {
+    /// Allocate a node with a fresh id; interning and provenance are the caller's job.
+    pub(crate) fn fresh(
+        op: Op,
+        dtype: DType,
+        tag: Option<SmallVec<[usize; 2]>>,
+        content_hash: u64,
+        src_ops: crate::op::OpMask,
+        metadata: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Self {
         Self {
-            id: self.id,
-            op: self.op.clone(),
-            dtype: self.dtype.clone(),
-            content_hash: self.content_hash,
-            src_ops: self.src_ops,
-            tag: self.tag.clone(),
+            id: crate::uop::hash_consing::next_uop_id(),
+            op,
+            dtype,
+            content_hash,
+            src_ops,
+            tag,
+            metadata,
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),
@@ -1464,7 +1478,6 @@ impl Clone for UOp {
             has_weak_float_cache: std::sync::OnceLock::new(),
             device_spec_cache: std::sync::OnceLock::new(),
             addrspace_cache: std::sync::OnceLock::new(),
-            metadata: self.metadata.clone(),
         }
     }
 }

@@ -36,5 +36,5 @@ pub use canonical::{
 };
 pub use core::{IntoUOp, UOp, UOpKey};
 pub use cost::compute_ops_estimate;
-pub use hash_consing::{gc_dead_refs, live_uop_ids, set_uop_drop_hook};
+pub use hash_consing::{live_uop_ids, set_uop_drop_hook};
 pub use wire::OptimizerWireGraph;

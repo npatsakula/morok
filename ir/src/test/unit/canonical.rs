@@ -1,7 +1,6 @@
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ImageKind};
 
 use crate::uop::canonical::CanonicalAxis;
-use crate::uop::gc_dead_refs;
 use crate::{
     AxisId, AxisType, BinaryOp, BufferizeOpts, CallInfo, CanonicalArg, CanonicalConst, CanonicalDType, CanonicalGraph,
     CanonicalProgramValue, CanonicalShapeDim, ConstValue, InsArg, KernelInfo, Op, ProgramInfo, ReduceOp,
@@ -29,7 +28,6 @@ fn range_arg(axis: AxisId, axis_type: AxisType) -> CanonicalArg {
 #[test]
 fn canonical_json_is_stable_generic_json_free_of_runtime_ids() {
     let first = graph_json();
-    gc_dead_refs();
     let second = graph_json();
     assert_eq!(first, second);
     assert!(!first.contains("runtime_id"));
