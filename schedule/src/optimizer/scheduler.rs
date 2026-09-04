@@ -35,6 +35,46 @@ pub fn clear_kernel_name_counts() {
     }
 }
 
+/// Make a shape name unique for this process: the n-th kernel sharing a
+/// function name gets the `n{n-1}` suffix. The suffix is the only part of a
+/// kernel's identity that depends on the order kernels are finished in.
+pub fn unique_kernel_name(shape_name: &str) -> String {
+    let mut counts = kernel_name_counts().lock().unwrap();
+    let count = counts.entry(svod_ir::to_function_name(shape_name)).or_insert(0);
+    *count += 1;
+    if *count > 1 { format!("{shape_name}n{}", *count - 1) } else { shape_name.to_string() }
+}
+
+/// When a finished kernel receives its unique name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelNaming {
+    /// Suffix the shape name through the process-wide counter immediately.
+    Unique,
+    /// Leave the bare shape name; the caller applies [`finalize_kernel_name`]
+    /// once it knows the order — kernels optimized concurrently would
+    /// otherwise draw suffixes in scheduling-dependent order.
+    Deferred,
+}
+
+/// Give a kernel finished under [`KernelNaming::Deferred`] its unique name, on
+/// both channels the optimizer writes it to: the SINK's structural
+/// `KernelInfo.name` and the attached optimizer metadata. Kernels without
+/// optimizer metadata were never named and stay as they are.
+pub fn finalize_kernel_name(ast: &Arc<UOp>) -> Arc<UOp> {
+    use crate::optimizer::KernelInfo;
+    let Some(info) = ast.metadata::<KernelInfo>() else { return ast.clone() };
+    let name = unique_kernel_name(&info.name);
+    let renamed = match ast.op() {
+        Op::Sink(ops::Sink { sources, info }) => {
+            let mut structural = info.clone().unwrap_or_default();
+            structural.name = Some(name.clone());
+            UOp::sink_with_info(sources.iter().cloned().collect(), structural).rtag(ast.tag().clone())
+        }
+        _ => ast.clone(),
+    };
+    renamed.with_metadata(KernelInfo { name, ..(*info).clone() })
+}
+
 /// Scheduler for kernel optimization.
 ///
 /// Manages the optimization state of a kernel, including:
@@ -926,11 +966,21 @@ impl Scheduler {
     /// println!("Kernel: {}", info.name); // "r_16_16_32_4"
     /// ```
     pub fn get_optimized_ast(&self, name_override: Option<String>) -> Arc<UOp> {
-        use crate::optimizer::KernelInfo;
+        let name = name_override.unwrap_or_else(|| unique_kernel_name(&self.shape_name()));
+        self.finish(name)
+    }
 
-        // 1. Generate kernel name
-        let custom_name = name_override.is_some();
-        let name = name_override.unwrap_or_else(|| {
+    /// `get_optimized_ast(None)` with the naming step chosen by the caller.
+    pub fn get_optimized_ast_with_naming(&self, naming: KernelNaming) -> Arc<UOp> {
+        match naming {
+            KernelNaming::Unique => self.get_optimized_ast(None),
+            KernelNaming::Deferred => self.finish(self.shape_name()),
+        }
+    }
+
+    /// Auto-generated kernel name from the optimized loop structure.
+    fn shape_name(&self) -> String {
+        {
             // Prefix: "r" for reduce, "E" for elementwise
             let prefix = if self.reduceop().is_some() { "r" } else { "E" };
 
@@ -963,18 +1013,11 @@ impl Scheduler {
             );
 
             if shape_parts.is_empty() { prefix.to_string() } else { format!("{}_{}", prefix, shape_parts.join("_")) }
-        });
+        }
+    }
 
-        // Deduplicate kernel names
-        let name = if custom_name {
-            name
-        } else {
-            let mut counts = kernel_name_counts().lock().unwrap();
-            let count = counts.entry(svod_ir::to_function_name(&name)).or_insert(0);
-            *count += 1;
-
-            if *count > 1 { format!("{}n{}", name, *count - 1) } else { name }
-        };
+    fn finish(&self, name: String) -> Arc<UOp> {
+        use crate::optimizer::KernelInfo;
 
         // 2. Flatten ranges (top-down graph_rewrite default).
         let flattened_ast =

@@ -64,9 +64,9 @@ pub use heuristics::hand_coded_optimizations;
 pub use kernel_info::KernelInfo;
 pub use opts::apply_opt;
 pub use renderer::{Renderer, TcOpt, TensorCore};
-pub use scheduler::Scheduler;
 #[cfg(test)]
 pub use scheduler::clear_kernel_name_counts;
+pub use scheduler::{KernelNaming, Scheduler, finalize_kernel_name, unique_kernel_name};
 use svod_ir::ops;
 pub use types::{AxisType, Opt, OptArg, OptArgExt, OptOps};
 
@@ -966,7 +966,17 @@ pub fn optimize_kernel_with_config(
     renderer: &Renderer,
     config: &OptimizerConfig,
 ) -> Result<Arc<svod_ir::UOp>, OptError> {
-    optimize_kernel_with_config_impl(ast, renderer, config, None)
+    optimize_kernel_with_config_impl(ast, renderer, config, None, KernelNaming::Unique)
+}
+
+/// `optimize_kernel_with_config` with the kernel-name step chosen by the caller.
+pub fn optimize_kernel_with_naming(
+    ast: Arc<svod_ir::UOp>,
+    renderer: &Renderer,
+    config: &OptimizerConfig,
+    naming: KernelNaming,
+) -> Result<Arc<svod_ir::UOp>, OptError> {
+    optimize_kernel_with_config_impl(ast, renderer, config, None, naming)
 }
 
 /// Run the production optimizer and also return its graph immediately after
@@ -978,7 +988,8 @@ pub fn optimize_kernel_with_config_and_final_rewrite(
     config: &OptimizerConfig,
 ) -> Result<(Arc<svod_ir::UOp>, Arc<svod_ir::UOp>), OptError> {
     let mut final_rewrite = None;
-    let optimized = optimize_kernel_with_config_impl(ast, renderer, config, Some(&mut final_rewrite))?;
+    let optimized =
+        optimize_kernel_with_config_impl(ast, renderer, config, Some(&mut final_rewrite), KernelNaming::Unique)?;
     Ok((final_rewrite.expect("post-optimization must capture final rewrite"), optimized))
 }
 
@@ -987,6 +998,7 @@ fn optimize_kernel_with_config_impl(
     renderer: &Renderer,
     config: &OptimizerConfig,
     final_rewrite_capture: Option<&mut Option<Arc<svod_ir::UOp>>>,
+    naming: KernelNaming,
 ) -> Result<Arc<svod_ir::UOp>, OptError> {
     if renderer.supported_ops().is_none() {
         return Err(OptError::MissingRendererCapabilities);
@@ -1001,16 +1013,16 @@ fn optimize_kernel_with_config_impl(
     let pre_optimized = apply_pre_optimization(ast)?;
 
     let optimized = if let Some(opts) = explicit_opts {
-        apply_explicit_opts(pre_optimized, renderer, &opts)?
+        apply_explicit_opts(pre_optimized, renderer, &opts, naming)?
     } else {
         match config.strategy {
             OptStrategy::None => pre_optimized, // No heuristic optimization, but post-optimization still needed
-            OptStrategy::Heuristic => optimize_heuristic(pre_optimized, renderer, &config.heuristics),
+            OptStrategy::Heuristic => optimize_heuristic(pre_optimized, renderer, &config.heuristics, naming),
             OptStrategy::Beam { .. } => {
                 // Beam search requires a compile_and_time function.
                 // Use optimize_kernel_beam() for actual beam search.
                 // Fall back to heuristics for the simple API.
-                optimize_heuristic(pre_optimized, renderer, &config.heuristics)
+                optimize_heuristic(pre_optimized, renderer, &config.heuristics, naming)
             }
         }
     };
@@ -1066,13 +1078,14 @@ fn apply_explicit_opts(
     ast: Arc<svod_ir::UOp>,
     renderer: &Renderer,
     opts: &[Opt],
+    naming: KernelNaming,
 ) -> Result<Arc<svod_ir::UOp>, OptError> {
     let mut scheduler = Scheduler::new(ast, renderer.clone());
     scheduler.convert_loop_to_global()?;
     for opt in opts {
         apply_opt(&mut scheduler, opt, true)?;
     }
-    Ok(scheduler.get_optimized_ast(None))
+    Ok(scheduler.get_optimized_ast_with_naming(naming))
 }
 
 /// Apply optimizations with explicit strategy selection (legacy API).
@@ -1170,7 +1183,12 @@ pub fn prepare_scheduler(ast: Arc<svod_ir::UOp>, renderer: &Renderer) -> Result<
 }
 
 /// Apply heuristic-based optimizations.
-fn optimize_heuristic(ast: Arc<svod_ir::UOp>, renderer: &Renderer, config: &HeuristicsConfig) -> Arc<svod_ir::UOp> {
+fn optimize_heuristic(
+    ast: Arc<svod_ir::UOp>,
+    renderer: &Renderer,
+    config: &HeuristicsConfig,
+    naming: KernelNaming,
+) -> Arc<svod_ir::UOp> {
     // Step 1: Create scheduler (AST already simplified by apply_pre_optimization Stage 3)
     let mut scheduler = Scheduler::new(ast, renderer.clone());
 
@@ -1181,5 +1199,5 @@ fn optimize_heuristic(ast: Arc<svod_ir::UOp>, renderer: &Renderer, config: &Heur
     heuristics::hand_coded_optimizations(&mut scheduler, config);
 
     // Step 5: Extract optimized AST
-    scheduler.get_optimized_ast(None)
+    scheduler.get_optimized_ast_with_naming(naming)
 }

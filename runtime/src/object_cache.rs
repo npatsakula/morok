@@ -3,6 +3,10 @@
 //! Entries are intentionally schema-specific: old formats are cache misses, not
 //! migration inputs. The store owns no process-global state, so callers can
 //! disable it or drop it without affecting compiler/runtime lifetime.
+//!
+//! Publication is atomic (temp file + rename) but never fsynced: this is a
+//! build cache, so an entry torn by a power loss is just a miss — the payload
+//! digest check in `decode_entry` rejects it and the file is removed.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
@@ -386,9 +390,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             .open(&temp)
             .map_err(|e| cache_io("create cache temp", e))?;
         file.write_all(bytes).map_err(|e| cache_io("write cache temp", e))?;
-        file.sync_all().map_err(|e| cache_io("sync cache temp", e))?;
-        fs::rename(&temp, path).map_err(|e| cache_io("publish cache entry", e))?;
-        File::open(parent).and_then(|directory| directory.sync_all()).map_err(|e| cache_io("sync cache directory", e))
+        drop(file);
+        fs::rename(&temp, path).map_err(|e| cache_io("publish cache entry", e))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);

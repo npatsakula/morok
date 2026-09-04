@@ -34,8 +34,9 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
+use rayon::prelude::*;
 use svod_schedule::optimizer::beam::{CompiledCandidate, beam_search_cached_remote};
-use svod_schedule::{apply_post_optimization_with_config, prepare_scheduler};
+use svod_schedule::{KernelNaming, apply_post_optimization_with_config, finalize_kernel_name, prepare_scheduler};
 use tracing::{debug, trace};
 
 use crate::{
@@ -54,6 +55,7 @@ use svod_device::{Buffer, device::Device};
 use svod_ir::ops;
 use svod_ir::pattern::is_any_const;
 use svod_ir::{DeviceSpec, Op, UOp, UOpKey};
+use svod_runtime::kernel_cache::CachedKernel;
 use svod_runtime::{
     ExecutionPlan, ExecutionPlanBuilder, PreparedCopy, PreparedCustomFunction, PreparedKernel, PreparedOp,
     ProfileOptions, RunProfile,
@@ -430,12 +432,7 @@ impl Tensor {
             return Ok(());
         }
 
-        // Collect input buffers and old UOps from ALL pending tensors
         let old_uops: Vec<Arc<UOp>> = pending_indices.iter().map(|&i| tensors[i].uop()).collect();
-        let mut all_input_buffers = crate::schedule::InputBuffers::new();
-        for uop in &old_uops {
-            all_input_buffers.extend(collect_input_buffers(uop));
-        }
 
         // Create merged SINK(CONTIGUOUS(t1), ..., CONTIGUOUS(tN))
         let contiguouses: Vec<Arc<UOp>> = old_uops.iter().map(|u| u.contiguous()).collect();
@@ -953,36 +950,23 @@ pub(crate) fn restore_post_schedule_pre_schedule(
     }
 }
 
+/// Collect every BUFFER reachable from the callable sources that has a
+/// buffer registered in the tensor registry (`from_slice_on()` and
+/// `realize()` register theirs), in one walk over all items, so schedule
+/// creation never needs global registry lookups of its own.
 fn build_schedule_input_buffers(pre_schedule: &crate::schedule::PreSchedule) -> crate::schedule::InputBuffers {
     let mut inputs = crate::schedule::InputBuffers::new();
-
-    for item in &pre_schedule.items {
-        for src in &item.sources {
-            inputs.extend(collect_input_buffers(src));
-        }
-    }
-
-    inputs
-}
-
-/// Collect input buffers from a computation graph.
-///
-/// Walks the UOp graph and collects all BUFFER UOps that have
-/// associated buffers in the tensor registry's buffer index.
-/// Input tensors (from `from_slice()`) and realized tensors
-/// register their buffers for this lookup to work.
-///
-/// This allows schedule creation to receive buffers explicitly without
-/// needing global registry lookups during kernel buffer collection.
-fn collect_input_buffers(root: &Arc<UOp>) -> crate::schedule::InputBuffers {
-    let mut inputs = HashMap::new();
-    for node in root.toposort() {
-        if let Op::Buffer(..) = node.op() {
-            // Buffers are registered in from_slice_on() and realize()
-            if let Some(buf) = crate::tensor_registry::get_buffer(node.id) {
-                inputs.insert(node.id, buf);
+    let mut reach = crate::schedule::ReachOnce::new();
+    for source in pre_schedule.items.iter().flat_map(|item| &item.sources) {
+        let collected = reach.walk(source, |node| {
+            if matches!(node.op(), Op::Buffer(..))
+                && let Some(buffer) = crate::tensor_registry::get_buffer(node.id)
+            {
+                inputs.insert(node.id, buffer);
             }
-        }
+            Ok(())
+        });
+        collected.expect("buffer collection never fails");
     }
     inputs
 }
@@ -1153,6 +1137,174 @@ impl OptCacheState {
     }
 }
 
+/// Global cache for optimized + compiled kernels; identical kernels across
+/// prepare calls (e.g. sort substages with the same axis) skip optimization
+/// and compilation. Bounded so long-running processes do not accumulate dead
+/// kernel entries.
+fn opt_cache() -> &'static OptCacheState {
+    static OPT_CACHE: std::sync::OnceLock<OptCacheState> = std::sync::OnceLock::new();
+    OPT_CACHE.get_or_init(OptCacheState::new)
+}
+
+/// A schedule item's compiled-kernel work, resolved up front so the cache-miss
+/// pipeline can run off the schedule loop.
+struct KernelSite {
+    key: OptKey,
+    ast: Arc<UOp>,
+    device: Arc<Device>,
+    renderer: svod_schedule::OptimizerRenderer,
+    /// Beam timing only.
+    buffers: Vec<Buffer>,
+}
+
+impl KernelSite {
+    fn resolve(item: &ScheduleItem, config: &PrepareConfig, optimizer_fingerprint: u64) -> Result<Self> {
+        let device_spec = item
+            .buffers
+            .iter()
+            .map(|b| b.allocator().device_spec())
+            .find(|spec| !spec.is_disk())
+            .unwrap_or_else(svod_dtype::default_device::default_device);
+        let device = config.resolve_device(&device_spec, svod_device::registry::registry())?;
+        let renderer = get_optimizer_renderer(&device);
+        let key = optimized_kernel_key(
+            &item.ast,
+            &device.device,
+            device.compiler.cache_key(),
+            renderer.cache_fingerprint(),
+            optimizer_fingerprint,
+        );
+        let buffers = if matches!(config.optimizer.strategy, svod_schedule::OptStrategy::Beam { .. }) {
+            item.buffers.clone()
+        } else {
+            Vec::new()
+        };
+        Ok(Self { key, ast: item.ast.clone(), device, renderer, buffers })
+    }
+
+    fn codegen(&self) -> &str {
+        self.device.compiler.cache_key()
+    }
+
+    /// Optimize with the kernel name left un-suffixed (`finalize_kernel_name`
+    /// assigns it in schedule order).
+    fn optimize(&self, config: &PrepareConfig) -> Result<Arc<UOp>> {
+        // Author-supplied `opts_to_apply` short-circuits before beam: such
+        // kernels must go through the heuristic entry so `apply_explicit_opts`
+        // honors the exact opt list (empty = none).
+        let has_explicit_opts =
+            matches!(self.ast.op(), Op::Sink(ops::Sink { info: Some(ki), .. }) if ki.opts_to_apply.is_some());
+        if !has_explicit_opts && matches!(config.optimizer.strategy, svod_schedule::OptStrategy::Beam { .. }) {
+            beam_search_optimize(self.ast.clone(), &self.renderer, &self.device, &self.buffers, &config.optimizer)
+        } else {
+            svod_schedule::optimize_kernel_with_naming(
+                self.ast.clone(),
+                &self.renderer,
+                &config.optimizer,
+                KernelNaming::Deferred,
+            )
+            .context(OptimizeSnafu)
+        }
+    }
+
+    /// Render and compile a named optimized kernel, then publish it under `key`.
+    fn compile(&self, optimized: Arc<UOp>) -> Result<Arc<CachedKernel>> {
+        let program =
+            svod_codegen::program_pipeline::program_from_sink_with_renderer(optimized, self.device.renderer.as_ref())
+                .context(RenderKernelSnafu)?;
+        let codegen = self.codegen();
+        let result = svod_runtime::kernel_cache::get_or_compile_kernel(
+            crate::schedule_cache::content_hash(&program),
+            codegen,
+            || {
+                let (spec, compiled) = compile_with_program_pipeline_components(
+                    program.clone(),
+                    self.device.renderer.as_ref(),
+                    self.device.compiler.as_ref(),
+                )?;
+                let program = (self.device.runtime)(&compiled).context(CreateProgramSnafu)?;
+                Ok(CachedKernel {
+                    program,
+                    device: codegen.to_string(),
+                    code: spec.src,
+                    entry_point: spec.name,
+                    var_names: spec.var_names,
+                    globals: spec.globals,
+                    outs: spec.outs,
+                    ins: spec.ins,
+                    global_size: spec.global_size,
+                    local_size: spec.local_size,
+                })
+            },
+        )?;
+        opt_cache().insert(self.key.clone(), Arc::clone(&result));
+        Ok(result)
+    }
+
+    /// The whole miss pipeline for one kernel, inline.
+    fn build(&self, config: &PrepareConfig) -> Result<Arc<CachedKernel>> {
+        let optimized = self.optimize(config)?;
+        self.compile(finalize_kernel_name(&optimized))
+    }
+
+    fn cached(&self) -> Option<Arc<CachedKernel>> {
+        opt_cache().map.pin().get(&self.key).cloned()
+    }
+}
+
+fn map_on_threads<T: Send, R: Send>(threads: usize, items: Vec<T>, f: impl Fn(T) -> R + Sync + Send) -> Vec<R> {
+    match threads {
+        1 => items.into_iter().map(f).collect(),
+        0 => items.into_par_iter().map(f).collect(),
+        n => rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .expect("compile thread pool")
+            .install(|| items.into_par_iter().map(f).collect()),
+    }
+}
+
+/// Optimize, name, render and compile every distinct kernel this plan misses
+/// in the optimized-kernel cache. Optimizing and compiling fan out over
+/// `config.compile_threads`; naming runs in schedule order in between, so the
+/// `nK` suffixes — part of the source text and hence of the object-cache key —
+/// never depend on thread scheduling. Keys another prepare is already
+/// computing are skipped here and awaited by the caller through `opt_flight`.
+fn compile_missing_kernels(
+    sites: &[Option<KernelSite>],
+    config: &PrepareConfig,
+) -> Result<HashMap<OptKey, Arc<CachedKernel>>> {
+    let mut seen = HashSet::new();
+    let jobs: Vec<_> = sites
+        .iter()
+        .flatten()
+        .filter(|site| seen.insert(site.key.clone()) && site.cached().is_none())
+        .filter_map(|site| opt_flight().try_claim(site.key.clone()).map(|ticket| (site, ticket)))
+        .collect();
+    if jobs.is_empty() {
+        return Ok(HashMap::new());
+    }
+    // Beam already fans out over its own worker processes.
+    let threads = if matches!(config.optimizer.strategy, svod_schedule::OptStrategy::Beam { .. }) {
+        1
+    } else {
+        config.compile_threads
+    };
+
+    let optimized = map_on_threads(threads, jobs.iter().collect(), |(site, _)| site.optimize(config));
+    let named = optimized
+        .into_iter()
+        .map(|optimized| optimized.map(|ast| finalize_kernel_name(&ast)))
+        .collect::<Result<Vec<_>>>()?;
+
+    let compiled = map_on_threads(threads, jobs.into_iter().zip(named).collect(), |((site, ticket), ast)| {
+        let compiled = site.compile(ast);
+        drop(ticket);
+        compiled.map(|kernel| (site.key.clone(), kernel))
+    });
+    compiled.into_iter().collect()
+}
+
 pub(crate) fn runtime_effect_ast(ast: &Arc<UOp>) -> &Arc<UOp> {
     match ast.op() {
         Op::End(ops::End { computation, .. }) if matches!(computation.op(), Op::Copy(..) | Op::CustomFunction(..)) => {
@@ -1318,22 +1470,23 @@ fn prepare_execution_plan(
         uop_id_to_idx.insert(uop_id, idx);
     }
 
-    // Step 2: Compile callable kernels and create prepared runtime ops
+    // Step 2: Compile callable kernels and create prepared runtime ops.
+    // COPY and CUSTOM_FUNCTION items need no compilation; everything else
+    // resolves to a kernel site whose cache misses are compiled off the loop.
+    let sites = schedule_items
+        .iter()
+        .map(|item| match runtime_effect_ast(&item.ast).op() {
+            Op::Copy(..) | Op::CustomFunction(..) => Ok(None),
+            _ => KernelSite::resolve(item, config, optimizer_fingerprint).map(Some),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let compiled = compile_missing_kernels(&sites, config)?;
 
-    // Pre-compile: optimize + compile each UNIQUE ast once, cache by pre-optimization ast id.
-    // Uses global cache so identical kernels across prepare calls (e.g., sort substages
-    // with same axis) skip both optimization and compilation. Bounded via FIFO eviction
-    // to keep long-running processes from accumulating dead kernel entries indefinitely.
-    static OPT_CACHE: std::sync::OnceLock<OptCacheState> = std::sync::OnceLock::new();
-    let opt_state = OPT_CACHE.get_or_init(OptCacheState::new);
-    let opt_cache = &opt_state.map;
-    let opt_guard = opt_cache.guard();
-
-    for item in &schedule_items {
-        // COPY operations: buffer-to-buffer transfer (DISK→CPU, CPU→CUDA, etc.)
-        // No compilation needed — register as PreparedOp for runtime execution.
+    for (item, site) in schedule_items.iter().zip(&sites) {
         let runtime_ast = runtime_effect_ast(&item.ast);
 
+        // COPY operations: buffer-to-buffer transfer (DISK→CPU, CPU→CUDA, etc.)
+        // No compilation needed — register as PreparedOp for runtime execution.
         if matches!(runtime_ast.op(), Op::Copy(..)) {
             let buffer_indices = resolve_item_buffer_indices(item, &uop_id_to_idx)?;
             builder.add_op_with_instance_dependencies(
@@ -1369,81 +1522,13 @@ fn prepare_execution_plan(
             continue;
         }
 
-        let item_device_spec = item
-            .buffers
-            .iter()
-            .map(|b| b.allocator().device_spec())
-            .find(|spec| !spec.is_disk())
-            .unwrap_or_else(svod_dtype::default_device::default_device);
-        let item_device = config.resolve_device(&item_device_spec, alloc_registry)?;
-        let item_codegen = item_device.compiler.cache_key();
-        let optimizer_renderer = get_optimizer_renderer(&item_device);
-        let opt_key = optimized_kernel_key(
-            &item.ast,
-            &item_device.device,
-            item_codegen,
-            optimizer_renderer.cache_fingerprint(),
-            optimizer_fingerprint,
-        );
-
-        let cached = opt_flight().run(
-            opt_key.clone(),
-            || opt_cache.get(&opt_key, &opt_guard).map(Arc::clone),
-            || {
-                // Author-supplied `opts_to_apply` short-circuits before beam: such
-                // kernels must go through the heuristic entry so `apply_explicit_opts`
-                // honors the exact opt list (empty = none).
-                let has_explicit_opts =
-                    matches!(item.ast.op(), Op::Sink(ops::Sink { info: Some(ki), .. }) if ki.opts_to_apply.is_some());
-                let optimized_ast = if !has_explicit_opts
-                    && matches!(config.optimizer.strategy, svod_schedule::OptStrategy::Beam { .. })
-                {
-                    beam_search_optimize(
-                        item.ast.clone(),
-                        &optimizer_renderer,
-                        &item_device,
-                        &item.buffers,
-                        &config.optimizer,
-                    )?
-                } else {
-                    svod_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
-                        .context(OptimizeSnafu)?
-                };
-
-                let program = svod_codegen::program_pipeline::program_from_sink_with_renderer(
-                    optimized_ast,
-                    item_device.renderer.as_ref(),
-                )
-                .context(RenderKernelSnafu)?;
-
-                let result = svod_runtime::kernel_cache::get_or_compile_kernel(
-                    crate::schedule_cache::content_hash(&program),
-                    item_codegen,
-                    || {
-                        let (spec, compiled) = compile_with_program_pipeline_components(
-                            program.clone(),
-                            item_device.renderer.as_ref(),
-                            item_device.compiler.as_ref(),
-                        )?;
-                        let program = (item_device.runtime)(&compiled).context(CreateProgramSnafu)?;
-                        Ok(svod_runtime::kernel_cache::CachedKernel {
-                            program,
-                            device: item_codegen.to_string(),
-                            code: spec.src.clone(),
-                            entry_point: spec.name.clone(),
-                            var_names: spec.var_names.clone(),
-                            globals: spec.globals.clone(),
-                            outs: spec.outs.clone(),
-                            ins: spec.ins.clone(),
-                            global_size: spec.global_size.clone(),
-                            local_size: spec.local_size.clone(),
-                        })
-                    },
-                )?;
-                opt_state.insert(opt_key.clone(), Arc::clone(&result));
-                Ok(result)
-            },
-        )?;
+        let site = site.as_ref().expect("non-copy, non-custom items resolve to kernel sites");
+        // Kernels another prepare was compiling are awaited here (holding no
+        // tickets of our own); a failed foreign winner makes us build inline.
+        let cached = match compiled.get(&site.key) {
+            Some(kernel) => Arc::clone(kernel),
+            None => opt_flight().run(site.key.clone(), || site.cached(), || site.build(config))?,
+        };
 
         // Build buffer indices in compiled ABI order (`ProgramSpec.globals`), not necessarily CALL arg order.
         let buffer_indices = resolve_compiled_kernel_buffer_indices(item, &uop_id_to_idx, &cached.globals)?;
@@ -1473,7 +1558,7 @@ fn prepare_execution_plan(
             id: item.kernel.id,
             ast: item.ast.clone(),
             kernel: cached,
-            device: item_device.device.clone(),
+            device: site.device.device.clone(),
             buffer_indices,
             output_indices,
             input_indices,
@@ -1603,33 +1688,20 @@ fn compile_with_program_pipeline_components(
     renderer: &dyn svod_device::device::Renderer,
     compiler: &dyn svod_device::device::Compiler,
 ) -> Result<(svod_device::device::ProgramSpec, svod_device::device::CompiledSpec)> {
-    let mut program = match kernel_ast.op() {
-        Op::Program(..) => kernel_ast,
-        other => {
-            return IrConstructionSnafu {
-                details: format!("compile_with_program_pipeline_components expects PROGRAM input, got {other:?}"),
-            }
-            .fail();
+    if !matches!(kernel_ast.op(), Op::Program(..)) {
+        return IrConstructionSnafu {
+            details: format!(
+                "compile_with_program_pipeline_components expects PROGRAM input, got {:?}",
+                kernel_ast.op()
+            ),
         }
-    };
-
-    program = svod_codegen::program_pipeline::get_program(
-        &program,
-        renderer,
-        compiler,
-        svod_codegen::program_pipeline::ProgramTarget::Source,
-    )
-    .context(RenderKernelSnafu)?;
-
-    let rendered_entry = svod_device::device::ProgramSpec::from_uop(&program)
-        .map(|spec| spec.name)
-        .context(crate::error::ProgramSpecSnafu { stage: "SOURCE stage" })?;
-
-    let (program, compiled) =
-        svod_codegen::program_pipeline::do_compile(&program, compiler).context(CompileKernelSnafu)?;
-
-    let spec = svod_device::device::ProgramSpec::from_uop(&program)
-        .context(crate::error::ProgramSpecSnafu { stage: format!("after compile (entry='{rendered_entry}')") })?;
+        .fail();
+    }
+    // `do_render` validates the SOURCE specification it returns and `do_compile`
+    // the BINARY it attaches, so neither stage is re-read through `from_uop`.
+    let (rendered, spec) =
+        svod_codegen::program_pipeline::do_render(&kernel_ast, renderer).context(RenderKernelSnafu)?;
+    let (_, compiled) = svod_codegen::program_pipeline::do_compile(&rendered, compiler).context(CompileKernelSnafu)?;
     Ok((spec, compiled))
 }
 
@@ -1937,7 +2009,7 @@ fn beam_search_optimize(
 
     // Apply post-optimization to final result with renderer so pm_add_gpudims runs
     // (Thread → core_id, Global → SPECIAL).
-    let raw_ast = result.scheduler.get_optimized_ast(None);
+    let raw_ast = result.scheduler.get_optimized_ast_with_naming(KernelNaming::Deferred);
     apply_post_optimization_with_config(raw_ast, renderer, &post_optimizer_config).context(OptimizeSnafu)
 }
 

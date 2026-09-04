@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use svod_device::device::{
-    AbiParamDescriptor, CompiledSpec, Compiler, ProgramSpec, Renderer, binary_stage_identity, source_stage_identity,
-    validate_binary_stage, validate_source_stage,
+    AbiParamDescriptor, CompiledSpec, Compiler, ProgramSpec, Renderer, binary_stage_identity,
+    minted_source_stage_identity, source_stage_identity, validate_binary_stage, validate_source_stage,
 };
 use svod_device::{Error, Result};
 use svod_dtype::DeviceSpec;
@@ -408,14 +408,12 @@ pub fn do_compile(program: &Arc<UOp>, compiler: &dyn Compiler) -> Result<(Arc<UO
     validate_program_shape(program)?;
     let (sink, info, linear, source, binary) = unpack_program(program)?;
     let source = source.ok_or_else(|| invalid_program_state("PROGRAM has no SOURCE stage"))?;
-    let linear_uop = linear.clone().ok_or_else(|| invalid_program_state("PROGRAM has no LINEAR stage"))?;
     if matches!(source.op(), Op::Source(ops::Source { code, .. }) if code.is_empty()) {
         return Err(invalid_program_state("PROGRAM has empty SOURCE stage"));
     }
 
     let spec = ProgramSpec::from_uop(program)?;
-    let expected_source = source_stage_identity(&info, &spec.abi, &linear_uop, &spec.src)?;
-    validate_source_stage(&source, &expected_source)?;
+    let expected_source = minted_source_stage_identity(&info, &spec.abi, &source)?;
 
     if let Some(binary_uop) = binary {
         let bytes = match binary_uop.op() {
@@ -428,7 +426,7 @@ pub fn do_compile(program: &Arc<UOp>, compiler: &dyn Compiler) -> Result<(Arc<UO
         compiled.src = Some(spec.src.clone());
         compiled.global_size = spec.global_size.clone();
         compiled.local_size = spec.local_size.clone();
-        compiled.bind_program_stage(linear_uop, &info.target, compiler.cache_key(), expected_binary)?;
+        compiled.bind_program_stage(&info.target, compiler.cache_key(), expected_binary)?;
         return Ok((program.clone(), compiled));
     }
 
@@ -450,7 +448,7 @@ pub fn do_compile(program: &Arc<UOp>, compiler: &dyn Compiler) -> Result<(Arc<UO
 
     compiled.src = Some(spec.src.clone());
     let binary_identity = binary_stage_identity(expected_source, compiler.cache_key(), &compiled.bytes);
-    compiled.bind_program_stage(linear_uop, &info.target, compiler.cache_key(), binary_identity.clone())?;
+    compiled.bind_program_stage(&info.target, compiler.cache_key(), binary_identity.clone())?;
     let binary_uop = UOp::binary_with_identity(compiled.bytes.clone(), binary_identity.clone());
     validate_binary_stage(&binary_uop, &binary_identity)?;
     let compiled_program = rebuild_program(program, linear, Some(source), Some(binary_uop))?;
@@ -472,21 +470,19 @@ pub fn do_compile(program: &Arc<UOp>, compiler: &dyn Compiler) -> Result<(Arc<UO
 /// worker for this exact SOURCE-stage PROGRAM.
 pub fn adopt_compiled_bytes(program: &Arc<UOp>, compiler_key: &str, bytes: Vec<u8>) -> Result<CompiledSpec> {
     validate_program_shape(program)?;
-    let (sink, info, linear, source, binary) = unpack_program(program)?;
+    let (sink, info, _, source, binary) = unpack_program(program)?;
     if binary.is_some() {
         return Err(invalid_program_state("cannot adopt bytes into an already compiled PROGRAM"));
     }
-    let linear = linear.ok_or_else(|| invalid_program_state("PROGRAM has no LINEAR stage"))?;
     let source = source.ok_or_else(|| invalid_program_state("PROGRAM has no SOURCE stage"))?;
     let spec = ProgramSpec::from_uop(program)?;
-    let expected_source = source_stage_identity(&info, &spec.abi, &linear, &spec.src)?;
-    validate_source_stage(&source, &expected_source)?;
+    let expected_source = minted_source_stage_identity(&info, &spec.abi, &source)?;
     let identity = binary_stage_identity(expected_source, compiler_key, &bytes);
     let mut compiled = CompiledSpec::from_bytes(spec.name, bytes, sink, spec.abi)?;
     compiled.src = Some(spec.src);
     compiled.global_size = spec.global_size;
     compiled.local_size = spec.local_size;
-    compiled.bind_program_stage(linear, &info.target, compiler_key, identity)?;
+    compiled.bind_program_stage(&info.target, compiler_key, identity)?;
     Ok(compiled)
 }
 

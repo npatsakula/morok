@@ -429,3 +429,33 @@ fn beam_worker_artifact_validates_source_binary_abi_and_compiler_identity() {
         .is_err()
     );
 }
+
+/// Downstream stages trust the LINEAR digest minted at render time but
+/// re-derive every other identity field from the PROGRAM they are given.
+#[test]
+fn program_spec_from_uop_rechecks_every_minted_identity_field_but_the_linear_digest() {
+    let sink = UOp::sink(vec![UOp::native_const(3.0f32)]);
+    let linear = UOp::linear(sink.toposort().into());
+    let info = svod_ir::ProgramInfo::from_sink(&sink, DeviceSpec::Cpu);
+    let abi = crate::device::ProgramSpec::validate_program_param_abi(&sink, &info).unwrap();
+    let code = "void test(void) {}".to_string();
+    let minted = crate::device::source_stage_identity(&info, &abi, &linear, &code).unwrap();
+    let staged = |source| UOp::program(sink.clone(), info.clone(), Some(linear.clone()), Some(source), None);
+
+    let honest = UOp::source_with_identity(code.clone(), minted.clone());
+    assert_eq!(crate::device::minted_source_stage_identity(&info, &abi, &honest).unwrap(), minted);
+    crate::device::ProgramSpec::from_uop(&staged(honest)).expect("minted identity is accepted");
+
+    let tampered = [
+        UOp::source_with_identity(format!("{code} // edited"), minted.clone()),
+        UOp::source_with_identity(
+            code.clone(),
+            svod_ir::SourceStageIdentity { entry_name: "other".into(), ..minted.clone() },
+        ),
+        UOp::source_with_identity(code.clone(), svod_ir::SourceStageIdentity { version: minted.version + 1, ..minted }),
+    ];
+    for source in tampered {
+        let err = crate::device::ProgramSpec::from_uop(&staged(source)).expect_err("tampered SOURCE must be rejected");
+        assert!(matches!(err, crate::Error::ProgramStageMismatch { stage: "SOURCE", .. }), "{err:?}");
+    }
+}

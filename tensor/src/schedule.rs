@@ -65,30 +65,65 @@ fn source_primary_buffer_id(src: &Arc<UOp>) -> Option<u64> {
     }
 }
 
-fn validate_mselect_bounds(call_id: u64, root: &Arc<UOp>) -> Result<()> {
-    for node in root.toposort() {
-        let Op::MSelect(ops::MSelect { buffer, device_index }) = node.op() else { continue };
-        let Op::MStack(ops::MStack { buffers }) = buffer.op() else {
-            return Err(Error::MultiUnsupportedForm {
-                call_id,
-                details: format!("MSELECT {} must select from an explicit MSTACK", node.id),
+/// Depth-first walk over several roots that visits each node once in total:
+/// callable sources share their producer chains, so walking them one root at
+/// a time would re-traverse the whole upstream graph per schedule item.
+pub(crate) struct ReachOnce {
+    visited: HashSet<u64>,
+    stack: Vec<Arc<UOp>>,
+}
+
+impl ReachOnce {
+    pub(crate) fn new() -> Self {
+        Self { visited: HashSet::new(), stack: Vec::new() }
+    }
+
+    pub(crate) fn walk(&mut self, root: &Arc<UOp>, mut visit: impl FnMut(&Arc<UOp>) -> Result<()>) -> Result<()> {
+        if self.visited.insert(root.id) {
+            self.stack.push(root.clone());
+        }
+        while let Some(node) = self.stack.pop() {
+            visit(&node)?;
+            node.op().map_child(|child| {
+                if self.visited.insert(child.id) {
+                    self.stack.push(child.clone());
+                }
             });
-        };
-        if *device_index >= buffers.len() {
-            return Err(Error::MultiSelectOutOfBounds {
-                source_id: node.id,
-                device_index: *device_index,
-                lane_count: buffers.len(),
-            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_mselect_bounds(items: &[PreScheduleItem]) -> Result<()> {
+    let mut reach = ReachOnce::new();
+    for item in items {
+        for source in &item.sources {
+            reach.walk(source, |node| {
+                let Op::MSelect(ops::MSelect { buffer, device_index }) = node.op() else { return Ok(()) };
+                let Op::MStack(ops::MStack { buffers }) = buffer.op() else {
+                    return Err(Error::MultiUnsupportedForm {
+                        call_id: item.kernel.id,
+                        details: format!("MSELECT {} must select from an explicit MSTACK", node.id),
+                    });
+                };
+                if *device_index >= buffers.len() {
+                    return Err(Error::MultiSelectOutOfBounds {
+                        source_id: node.id,
+                        device_index: *device_index,
+                        lane_count: buffers.len(),
+                    });
+                }
+                Ok(())
+            })?;
         }
     }
     Ok(())
 }
 
-fn device_lane_binding(call_id: u64, ast: &Arc<UOp>, lane_count: Option<usize>) -> Result<bool> {
+fn device_lane_binding(call_id: u64, ast_nodes: &[Arc<UOp>], lane_count: Option<usize>) -> Result<bool> {
     let mut device_ranges = Vec::new();
     let mut device_params = Vec::new();
-    for node in ast.toposort() {
+    for node in ast_nodes {
         match node.op() {
             Op::Range(ops::Range { axis_type: svod_ir::AxisType::Device, .. }) => device_ranges.push(node),
             Op::Param(ops::Param { arg, .. })
@@ -155,11 +190,14 @@ struct MultiSourceExpansion {
     is_multi: bool,
 }
 
-fn expand_multi_sources(call_id: u64, ast: &Arc<UOp>, sources: &[Arc<UOp>]) -> Result<MultiSourceExpansion> {
-    for source in sources {
-        validate_mselect_bounds(call_id, source)?;
-    }
-
+/// `ast_nodes` is `ast.toposort()`, shared with the caller's own body scan.
+/// MSELECT bounds were already checked once per pre-schedule.
+fn expand_multi_sources(
+    call_id: u64,
+    ast: &Arc<UOp>,
+    ast_nodes: &[Arc<UOp>],
+    sources: &[Arc<UOp>],
+) -> Result<MultiSourceExpansion> {
     let mut lane_count = None;
     for (source_index, source) in sources.iter().enumerate() {
         let Op::MStack(ops::MStack { buffers }) = source.op() else { continue };
@@ -175,7 +213,7 @@ fn expand_multi_sources(call_id: u64, ast: &Arc<UOp>, sources: &[Arc<UOp>]) -> R
         }
     }
 
-    let bind_device_num = device_lane_binding(call_id, ast, lane_count)?;
+    let bind_device_num = device_lane_binding(call_id, ast_nodes, lane_count)?;
     let Some(lane_count) = lane_count else {
         return Ok(MultiSourceExpansion { lanes: vec![sources.to_vec()], bind_device_num: false, is_multi: false });
     };
@@ -903,6 +941,8 @@ pub fn create_pre_schedule(transformed: Arc<UOp>) -> Result<PreSchedule> {
         });
     }
 
+    validate_mselect_bounds(&items)?;
+
     // Step 3: Eagerly unroll outer loops into a flat list of kernel
     // invocations — each invocation carries the concrete `fixedvars` produced
     // by its enclosing loop counters.
@@ -949,7 +989,7 @@ pub fn instantiate_schedule(
     for item in &pre_schedule.items {
         let nodes = item.ast.toposort();
 
-        let expansion = expand_multi_sources(item.kernel.id, &item.ast, &item.sources)?;
+        let expansion = expand_multi_sources(item.kernel.id, &item.ast, &nodes, &item.sources)?;
         let mut lane_buffers = Vec::with_capacity(expansion.lanes.len());
         for sources in &expansion.lanes {
             lane_buffers.push(collect_callable_buffers(sources, input_buffers, &mut allocated_buffers, &output_ids)?);

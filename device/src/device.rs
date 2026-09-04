@@ -299,7 +299,6 @@ pub struct CompiledSpec {
     /// Complete kernel argument ABI in source-signature order.
     pub abi: Vec<AbiParamDescriptor>,
 
-    linear_stage: Option<Arc<UOp>>,
     stage_identity: Option<BinaryStageIdentity>,
 }
 
@@ -410,7 +409,9 @@ fn source_stage_identity_from_parts(
     })
 }
 
-/// Construct the semantic identity for one rendered SOURCE stage.
+/// Construct the semantic identity for one rendered SOURCE stage. This is the
+/// only place the LINEAR digest is computed; later stages read it back through
+/// [`minted_source_stage_identity`].
 pub fn source_stage_identity(
     info: &svod_ir::ProgramInfo,
     abi: &[AbiParamDescriptor],
@@ -418,6 +419,42 @@ pub fn source_stage_identity(
     source: &str,
 ) -> Result<SourceStageIdentity> {
     source_stage_identity_from_parts(abi, &info.target, info.function_name(), linear, source)
+}
+
+/// The identity a SOURCE stage was minted with, re-checked against the PROGRAM
+/// that now carries it. Every field except the LINEAR digest is re-derived
+/// here; the digest is the one computed when the stage was rendered, so a
+/// PROGRAM flowing render → compile → load hashes its LINEAR exactly once.
+pub fn minted_source_stage_identity(
+    info: &svod_ir::ProgramInfo,
+    abi: &[AbiParamDescriptor],
+    source: &Arc<UOp>,
+) -> Result<SourceStageIdentity> {
+    let Op::Source(ops::Source { code, identity }) = source.op() else {
+        return Err(Error::ProgramStageMismatch {
+            stage: "SOURCE",
+            reason: format!("expected SOURCE, got {:?}", source.op()),
+        });
+    };
+    let minted = identity.as_ref().ok_or_else(|| Error::ProgramStageMismatch {
+        stage: "SOURCE",
+        reason: "stage has no semantic identity".into(),
+    })?;
+    let expected = SourceStageIdentity {
+        version: SOURCE_STAGE_IDENTITY_VERSION,
+        abi: stage_abi(abi),
+        target: info.target.clone(),
+        entry_name: info.function_name(),
+        linear_sha256: minted.linear_sha256,
+        source_sha256: sha256(code.as_bytes()),
+    };
+    if **minted != expected {
+        return Err(Error::ProgramStageMismatch {
+            stage: "SOURCE",
+            reason: format!("expected {expected:?}, got {minted:?}"),
+        });
+    }
+    Ok(expected)
 }
 
 /// Construct the semantic identity for one compiled BINARY stage.
@@ -601,7 +638,6 @@ impl CompiledSpec {
             local_size: None,
             buf_count,
             abi,
-            linear_stage: None,
             stage_identity: Some(identity),
         };
         spec.validate_stage_identity(target, compiler_key)?;
@@ -627,7 +663,6 @@ impl CompiledSpec {
             local_size: Some(default_launch_size()),
             buf_count,
             abi,
-            linear_stage: None,
             stage_identity: None,
         })
     }
@@ -651,7 +686,6 @@ impl CompiledSpec {
             local_size: Some(default_launch_size()),
             buf_count,
             abi,
-            linear_stage: None,
             stage_identity: None,
         })
     }
@@ -682,25 +716,24 @@ impl CompiledSpec {
             local_size: local_size.map(concrete_launch_size),
             buf_count,
             abi,
-            linear_stage: None,
             stage_identity: None,
         })
     }
 
-    /// Bind compiler output to the exact staged PROGRAM that produced it.
+    /// Bind compiler output to the staged PROGRAM identity that produced it.
     pub fn bind_program_stage(
         &mut self,
-        linear: Arc<UOp>,
         target: &DeviceSpec,
         compiler_key: &str,
         identity: BinaryStageIdentity,
     ) -> Result<()> {
-        self.linear_stage = Some(linear);
         self.stage_identity = Some(identity);
         self.validate_stage_identity(target, compiler_key)
     }
 
     /// Validate all semantic stage fields required before executable loading.
+    /// The LINEAR digest is the minted one (see `minted_source_stage_identity`);
+    /// every other field is re-derived from this specification.
     pub fn validate_stage_identity(&self, target: &DeviceSpec, compiler_key: &str) -> Result<()> {
         let identity = self.stage_identity.as_ref().ok_or_else(|| Error::ProgramStageMismatch {
             stage: "BINARY",
@@ -710,17 +743,13 @@ impl CompiledSpec {
             stage: "SOURCE",
             reason: "compiled specification does not retain its source payload".into(),
         })?;
-        let expected_source = if let Some(linear) = self.linear_stage.as_ref() {
-            source_stage_identity_from_parts(&self.abi, target, self.name.clone(), linear, source)?
-        } else {
-            SourceStageIdentity {
-                version: SOURCE_STAGE_IDENTITY_VERSION,
-                abi: stage_abi(&self.abi),
-                target: target.clone(),
-                entry_name: self.name.clone(),
-                linear_sha256: identity.source.linear_sha256,
-                source_sha256: sha256(source.as_bytes()),
-            }
+        let expected_source = SourceStageIdentity {
+            version: SOURCE_STAGE_IDENTITY_VERSION,
+            abi: stage_abi(&self.abi),
+            target: target.clone(),
+            entry_name: self.name.clone(),
+            linear_sha256: identity.source.linear_sha256,
+            source_sha256: sha256(source.as_bytes()),
         };
         if identity.source != expected_source {
             return Err(Error::ProgramStageMismatch {
@@ -1467,8 +1496,7 @@ impl ProgramSpec {
         };
 
         let abi = Self::validate_program_param_abi(sink, info)?;
-        let expected_source = source_stage_identity(info, &abi, linear, &source_code)?;
-        validate_source_stage(source, &expected_source)?;
+        let expected_source = minted_source_stage_identity(info, &abi, source)?;
 
         if let Some(binary) = binary {
             let Op::ProgramBinary(ops::ProgramBinary { bytes, identity }) = binary.op() else {

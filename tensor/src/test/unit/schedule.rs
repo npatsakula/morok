@@ -828,3 +828,28 @@ fn test_instantiate_schedule_rejects_invocation_with_unknown_kernel_id() {
     };
     assert_ir_construction_error_contains(err, "invocation references unknown kernel id");
 }
+
+#[test]
+fn reach_once_visits_shared_producers_a_single_time() {
+    let shared = UOp::native_const(1.0f32);
+    let roots = [
+        UOp::sink(vec![shared.clone(), UOp::native_const(2.0f32)]),
+        UOp::sink(vec![shared.clone(), UOp::native_const(3.0f32)]),
+    ];
+
+    let mut reach = crate::schedule::ReachOnce::new();
+    let mut visited = Vec::new();
+    for root in &roots {
+        reach
+            .walk(root, |node| {
+                visited.push(node.id);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    assert_eq!(visited.len(), 5, "{visited:?}");
+    assert_eq!(visited.iter().filter(|&&id| id == shared.id).count(), 1);
+    let expected: HashSet<u64> = roots.iter().flat_map(|root| root.toposort()).map(|node| node.id).collect();
+    assert_eq!(visited.into_iter().collect::<HashSet<_>>(), expected);
+}

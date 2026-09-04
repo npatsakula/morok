@@ -1662,3 +1662,37 @@ fn test_apply_threading_heuristic_symbolic_work_and_divisibility() {
     let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
     assert!(!thread_axes.is_empty(), "Should have Thread axis after apply_threading");
 }
+
+/// Deferred naming leaves the bare shape name; `finalize_kernel_name` then
+/// draws the same suffix `get_optimized_ast(None)` would have drawn, on both
+/// the SINK's structural info and the optimizer metadata.
+#[test]
+fn test_deferred_naming_finalizes_to_the_unique_name() {
+    use crate::optimizer::{KernelInfo, KernelNaming, finalize_kernel_name};
+
+    let r_global = UOp::range_axis(UOp::index_const(4099), AxisId::Renumbered(0), AxisType::Global);
+    let sink = UOp::sink(vec![UOp::native_const(1.0f32), r_global]);
+    let scheduler = Scheduler::new(sink, Renderer::cuda());
+    let name_of = |ast: &Arc<UOp>| ast.metadata::<KernelInfo>().unwrap().name.clone();
+    let ordinal = |name: &str| match name.strip_prefix("E_4099").unwrap_or_else(|| panic!("{name}")) {
+        "" => 0,
+        suffix => suffix.strip_prefix('n').unwrap().parse::<usize>().unwrap(),
+    };
+
+    let unique = scheduler.get_optimized_ast(None);
+    let deferred = scheduler.get_optimized_ast_with_naming(KernelNaming::Deferred);
+    assert_eq!(name_of(&deferred), "E_4099");
+
+    let finalized = finalize_kernel_name(&deferred);
+    let name = name_of(&finalized);
+    assert_eq!(ordinal(&name), ordinal(&name_of(&unique)) + 1, "{name}");
+    let Op::Sink(ops::Sink { info: Some(info), .. }) = finalized.op() else { panic!("{:?}", finalized.op()) };
+    assert_eq!(info.name.as_deref(), Some(name.as_str()));
+    assert_eq!(
+        finalized.metadata::<KernelInfo>().unwrap().applied_opts,
+        unique.metadata::<KernelInfo>().unwrap().applied_opts
+    );
+
+    let unnamed = UOp::sink(vec![UOp::native_const(2.0f32)]);
+    assert!(Arc::ptr_eq(&finalize_kernel_name(&unnamed), &unnamed));
+}

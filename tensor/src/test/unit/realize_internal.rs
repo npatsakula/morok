@@ -828,3 +828,68 @@ fn buffers_expire_automatically_with_their_graphs() {
     drop(c);
     assert!(crate::tensor_registry::get_buffer(out_id).is_none(), "entry must expire with the tensor graph");
 }
+
+/// The `nK` name suffix is drawn from a process-wide counter as kernels are
+/// finished. A parallel prepare must draw it in schedule order, exactly like
+/// a single-threaded one, or the object cache (keyed on source text) would
+/// miss on every run.
+#[test]
+fn test_parallel_prepare_names_kernels_in_schedule_order() {
+    const KERNELS: usize = 6;
+    // A length no other test reduces over keeps this shape name's counter ours.
+    const LEN: usize = 4099;
+
+    fn plan_kernels(offset: f32, threads: usize) -> Vec<(String, Vec<usize>)> {
+        let mut outputs: Vec<Tensor> = (0..KERNELS)
+            .map(|i| {
+                let x = Tensor::from_slice((0..LEN).map(|v| v as f32).collect::<Vec<_>>());
+                let scale = Tensor::full(&[LEN], offset + i as f32, DType::Float32).unwrap();
+                (&x * &scale).sum(0).unwrap()
+            })
+            .collect();
+        let config = PrepareConfig { compile_threads: threads, ..Default::default() };
+        let plan = Tensor::prepare_batch_with(outputs.iter_mut(), &config).unwrap();
+        plan.prepared_kernels().iter().map(|k| (k.kernel.entry_point.clone(), k.kernel.globals.clone())).collect()
+    }
+    // Position of a name in its shape family: `E_x` -> 0, `E_xn3` -> 3.
+    fn ordinal(name: &str) -> (&str, usize) {
+        match name.rsplit_once('n') {
+            Some((base, digits)) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
+                (base, digits.parse().unwrap())
+            }
+            _ => (name, 0),
+        }
+    }
+    fn assert_schedule_ordered(kernels: &[(String, Vec<usize>)]) -> HashMap<&str, usize> {
+        let mut last: HashMap<&str, usize> = HashMap::new();
+        for (name, _) in kernels {
+            let (base, position) = ordinal(name);
+            if let Some(previous) = last.insert(base, position) {
+                assert_eq!(position, previous + 1, "{name} drawn out of schedule order in {kernels:?}");
+            }
+        }
+        last
+    }
+
+    // Disjoint constants: a kernel shared with the serial run would be an
+    // optimizer-cache hit that keeps its earlier name.
+    let serial = plan_kernels(1.5, 1);
+    let parallel = plan_kernels(101.5, 4);
+    assert!(serial.len() >= KERNELS, "{serial:?}");
+    assert_eq!(serial.len(), parallel.len());
+    assert_schedule_ordered(&serial);
+    assert_schedule_ordered(&parallel);
+    for ((serial_name, serial_globals), (parallel_name, parallel_globals)) in serial.iter().zip(&parallel) {
+        assert_eq!(ordinal(serial_name).0, ordinal(parallel_name).0, "{serial:?} vs {parallel:?}");
+        assert_eq!(serial_globals, parallel_globals, "{serial_name}: ABI must not depend on threading");
+    }
+    // Every family continues exactly where the serial run left it.
+    let mut family_sizes: HashMap<&str, usize> = HashMap::new();
+    for (name, _) in &serial {
+        *family_sizes.entry(ordinal(name).0).or_default() += 1;
+    }
+    for ((serial_name, _), (parallel_name, _)) in serial.iter().zip(&parallel) {
+        let (base, serial_position) = ordinal(serial_name);
+        assert_eq!(ordinal(parallel_name).1, serial_position + family_sizes[base], "{serial:?} vs {parallel:?}");
+    }
+}
