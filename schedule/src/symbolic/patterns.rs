@@ -1164,10 +1164,16 @@ fn fits_in_u32(value: &Arc<UOp>) -> bool {
 ///
 /// x:ints.cast(ints, a).cast(b) → x.cast(b) when a.min <= x.vmin and x.vmax <= a.max.
 /// Uses vmin/vmax analysis — belongs in symbolic tier, not symbolic_simple.
+///
+/// `x` must be strong: for a weak `x` the inner cast is the width the value
+/// commits at (`pm_lower_index_dtype`), and collapsing it leaves `x` under the
+/// outer cast alone, where `cast_weak_srcs` joins `b` with `x`'s own int width
+/// — for `b = u64` that join is float, turning integer index math into `fmod`.
 fn range_based_cast_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         Cast { src: Cast { src: x, dtype: intermediate }, dtype: outer }
             if x.dtype().is_int()
+            && !x.dtype().is_weak()
             && intermediate.is_int()
             => {
                 // Check if x's value range fits within the intermediate type

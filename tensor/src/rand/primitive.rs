@@ -2,10 +2,10 @@
 //!
 //! Pipeline:
 //!
-//! 1. `state::next_counter(device, num)` returns `(seed_buf, counter_val)` —
-//!    counter advances atomically per call. `counter_val` is stamped into the
-//!    graph as a CONST u64; the seed remains a BUFFER, which is what prevents
-//!    the rand output from const-folding.
+//! 1. `state::next_counter(device, num)` returns `(seed, counter)`, two `[2]`
+//!    u32 BUFFER Tensors — the counter advances atomically per call. Both are
+//!    kernel inputs rather than graph constants, so same-shape draws share one
+//!    program and the output never const-folds.
 //! 2. Derive a per-call `new_key` via one THREEFRY pass over `(c_low, c_high)`
 //!    against the seed.
 //! 3. Build `counts0 = arange(num/2)`, `counts1 = counts0 + num/2`, then run
@@ -56,22 +56,20 @@ impl Tensor {
         }
         // Number of uint32 words needed to cover `numel * itemsize` bytes.
         let num_words = (numel * scalar.bytes()).div_ceil(4) as u64;
-        let (seed, counter_val) = state::next_counter(&device, num_words);
-        let bits = random_bits(&seed, counter_val, num_words as usize)?;
+        let (seed, counter) = state::next_counter(&device, num_words);
+        let bits = random_bits(&seed, &counter, num_words as usize)?;
         bits_to_rand(&bits, shape, dtype)
     }
 }
 
-/// Produce `num` uint32 random words by stamping `counter_val` as a CONST u64
-/// into the THREEFRY graph. Single-chunk (no outer loop): `num` is bounded by
-/// `usize`, which is more than enough for any realistic tensor shape.
-fn random_bits(seed: &Tensor, counter_val: u64, num: usize) -> Result<Tensor> {
+/// Produce `num` uint32 random words from the `[lo, hi]` u32 `counter`
+/// BUFFER. Single-chunk (no outer loop): `num` is bounded by `usize`, which is
+/// more than enough for any realistic tensor shape.
+fn random_bits(seed: &Tensor, counter: &Tensor, num: usize) -> Result<Tensor> {
     let u32_dt = DType::Scalar(ScalarDType::UInt32);
 
-    // c_low, c_high as `[1]` u32 Tensors. CONST is fine — the per-call key
-    // derivation only depends on `seed` (BUFFER) for non-foldability.
-    let c_low = Tensor::full(&[1], (counter_val & 0xFFFF_FFFF) as u32, u32_dt.clone())?;
-    let c_high = Tensor::full(&[1], (counter_val >> 32) as u32, u32_dt.clone())?;
+    let c_low = counter.try_shrink([(0usize, 1usize)])?;
+    let c_high = counter.try_shrink([(1usize, 2usize)])?;
 
     // Step 1: per-call key derivation. THREEFRY(seed, [c_low, c_high]) → `[2]` u32.
     let new_key = threefry_random_bits(seed, &c_low, &c_high)?;

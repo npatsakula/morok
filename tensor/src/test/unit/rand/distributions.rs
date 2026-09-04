@@ -220,3 +220,24 @@ fn shape_validators_reject_empty_shape() {
     assert!(Tensor::kaiming_uniform(&[], 0.0).is_err());
     assert!(Tensor::kaiming_normal(&[], 0.0).is_err());
 }
+
+/// Regression: a draw whose word count is not a multiple of the THREEFRY pair
+/// width (`numel = 15` → 8 pairs, 16 words shrunk to 15) collapsed the
+/// `arange.cast(u32).cast(u64)` chain of the counts before the weak index
+/// math committed to an int width, and index lowering then promoted the
+/// `range % 8` to a float `fmod` that failed kernel verification.
+#[test_case::test_case(&[15]; "n15")]
+#[test_case::test_case(&[3, 5]; "s3x5")]
+#[test_case::test_case(&[5, 3]; "s5x3")]
+#[test_case::test_case(&[7]; "n7")]
+#[test_case::test_case(&[2, 4]; "s2x4")]
+#[test_case::test_case(&[64, 64]; "s64x64")]
+fn uniform_realizes_for_any_numel(shape: &[usize]) {
+    let _g = RAND_TEST_LOCK.lock();
+    manual_seed(7);
+    let mut t = Tensor::uniform(shape, -1.0, 1.0).unwrap();
+    t.realize().expect("realize");
+    let v = t.as_vec::<f32>().expect("read");
+    assert_eq!(v.len(), shape.iter().product::<usize>());
+    assert!(v.iter().all(|x| (-1.0..1.0).contains(x)), "{v:?}");
+}
