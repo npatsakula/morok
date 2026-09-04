@@ -120,8 +120,8 @@ pub fn early_rewrites() -> TypedPatternMatcher {
             let Op::Reshape(ops::Reshape { src, .. }) = x2.op() else { return None };
             Some(UOp::new(Op::Reshape(ops::Reshape { src: src.clone(), new_shape: new_shape.clone() }), x.dtype()))
         },
-        Detach(x) ~> |x| x.clone(),
-        ContiguousBackward(x) ~> |x| x.clone(),
+        Detach { src: x } ~> |x| x.clone(),
+        ContiguousBackward { src: x } ~> |x| x.clone(),
         // A COPY transfers one contiguous range, so a source that is resized or
         // reordered by a movement op must be materialised first (tinygrad
         // `schedule/rangeify.py:149`). Without this the transfer is sized by the
@@ -572,7 +572,7 @@ pub fn split_reduceop_patterns() -> TypedPatternMatcher<SplitReduceOpConfig> {
 /// `reduce_collapse` pattern matchers without duplication.
 pub(crate) fn pm_reduce_unparented() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        reduce @ Reduce { src, ranges, reduce_op: Add | Max | Mul, num_axes } => |reduce, src, ranges, reduce_op, num_axes| {
+        reduce @ Reduce { src, ranges, reduce_op: reduce_op @ (ReduceOp::Add | ReduceOp::Max | ReduceOp::Mul), num_axes } => |reduce, src, ranges, reduce_op, num_axes| {
             assert!(
                 ranges.iter().all(|r| matches!(r.op(), Op::Range(..))),
                 "reduce_unparented: all reduce ranges must be RANGE ops, got: {:?}",
@@ -810,7 +810,7 @@ pub fn rangeify_codegen_patterns() -> TypedPatternMatcher<LocalAddBufferContext>
     crate::patterns! {
         @context LocalAddBufferContext;
         // NOOP → zero constant (scalar or vector)
-        noop @ Noop() if noop.dtype().base() != svod_dtype::ScalarDType::Void => |noop, _ctx| {
+        noop @ Noop if noop.dtype().base() != svod_dtype::ScalarDType::Void => |noop, _ctx| {
             Some(dtype_zero(noop.dtype()))
         },
         // CONTIGUOUS: extract hints and return source.
@@ -831,7 +831,7 @@ pub fn rangeify_codegen_patterns() -> TypedPatternMatcher<LocalAddBufferContext>
 pub fn rangeify_codegen_simple() -> TypedPatternMatcher {
     crate::patterns! {
         // NOOP → zero constant (scalar or vector)
-        noop @ Noop() if noop.dtype().base() != svod_dtype::ScalarDType::Void => |noop| {
+        noop @ Noop if noop.dtype().base() != svod_dtype::ScalarDType::Void => |noop| {
             Some(dtype_zero(noop.dtype()))
         },
         // CONTIGUOUS → source (strip wrapper, no opts to extract at this stage)

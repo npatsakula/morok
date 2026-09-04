@@ -1819,10 +1819,10 @@ pub fn pm_reduce_local() -> TypedPatternMatcher<ReduceContext> {
             @context ReduceContext;
 
             // Ranged reduction conversion precedes horizontal-only reduction.
-            red @ Reduce(_, ..) if matches!(red.op(), Op::Reduce(ops::Reduce { ranges, .. }) if !ranges.is_empty())
+            red @ Reduce { .. } if matches!(red.op(), Op::Reduce(ops::Reduce { ranges, .. }) if !ranges.is_empty())
                 => reduce_to_acc(red, ctx),
 
-            red @ Reduce(_, ..) if matches!(red.op(), Op::Reduce(ops::Reduce { ranges, .. }) if ranges.is_empty())
+            red @ Reduce { .. } if matches!(red.op(), Op::Reduce(ops::Reduce { ranges, .. }) if ranges.is_empty())
                 => expand_horizontal_reduce(red),
 
             // Merge END nodes sharing the same reduce ranges.

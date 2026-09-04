@@ -147,12 +147,10 @@ fn derived_requirement_is_the_union_of_single_kind_sources() {
     assert!(
         derived(&patterns! { Add(x, c @anyconst(_vals)) => Some(x.add(c)) }, OpKey::Binary(BinaryOp::Add)).is_empty()
     );
-
-    // A top-level alternative only demands what every branch demands.
-    let alternative =
-        patterns! { (Cast { src: Mul(a, b), dtype: _d } | BitCast { src: Mul(a, b), dtype: _e }) => Some(a.mul(b)) };
-    assert_eq!(derived(&alternative, OpKey::Cast), mul);
-    assert_eq!(derived(&alternative, OpKey::BitCast), mul);
+    // Verbatim (non-child) fields are not sources.
+    assert!(
+        derived(&patterns! { Cast { src: x, dtype: DType::Scalar(_) } => Some(x.clone()) }, OpKey::Cast).is_empty()
+    );
 }
 
 /// Bare-variable sources constrain nothing, so the rule stays dispatchable everywhere.
@@ -193,7 +191,7 @@ fn early_reject_preserves_rewrite_results() {
         Sub(Add(a, b), c) if Arc::ptr_eq(b, c) => Some(a.clone()),
         Neg(Neg(x)) ~> x,
         Cast { src: Cast { src: inner, dtype: _d }, dtype: outer } ~> inner.cast(outer.clone()),
-        Where(Const(1), t, _f) ~> t,
+        Where(Const(ConstValue::Bool(true)), t, _f) ~> t,
     };
     let permissive = matcher.without_early_reject();
     assert!(permissive.early_rejects(&OpKey::Binary(BinaryOp::Add)).iter().all(|reject| reject.is_empty()));

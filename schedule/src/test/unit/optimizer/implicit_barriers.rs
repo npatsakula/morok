@@ -31,7 +31,7 @@ fn rewrite(root: Arc<UOp>) -> Arc<UOp> {
 #[test]
 fn renderer_extra_matcher_local_dependency_precedes_barrier_inference() {
     let extra = crate::patterns! {
-        Noop() => || {
+        Noop => || {
             let local = buffer(0, AddrSpace::Local);
             let store = index(local.clone(), UOp::index_const(0)).store_value(UOp::native_const(1.0f32));
             Some(local.after(smallvec![store]))

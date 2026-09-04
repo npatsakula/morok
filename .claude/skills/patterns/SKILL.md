@@ -7,109 +7,90 @@ description: Reference for Svod's patterns! DSL and rewrite engine API. Use when
 
 ## Pattern Syntax Quick Reference
 
+The left-hand side follows Rust pattern syntax, extended only with what a Rust
+pattern cannot say across an `Arc<UOp>` edge: nested op patterns, commutative
+`Op[a, b]`, `@zero`/`@one`, and `x @const(v)` value extraction. Everything else in
+a struct field is a plain Rust pattern with rustc's own diagnostics.
+
 ### Basic Pattern Structure
 
 ```rust
 use svod_schedule::patterns;
 
 let matcher = patterns! {
-    // Infallible rewrite (always returns Arc<UOp>)
-    Pattern ~> rewrite_expr,
-
-    // Fallible rewrite (returns Option<Arc<UOp>>)
-    Pattern => rewrite_expr,
+    Pattern => rewrite_expr,              // rewrite: Arc<UOp>, Option<Arc<UOp>> or RewriteResult
+    Pattern if guard => rewrite_expr,     // guard before the arrow
 };
 ```
+
+The right-hand side may evaluate to `Arc<UOp>`, `Option<Arc<UOp>>` (`None` declines),
+or a `RewriteResult` (so `Gate` is expressible); `?` works inside a block body.
+`~>` is accepted as an alias of `=>` and means the same thing.
 
 ### Variable Binding
 
 | Syntax | Description | Example |
 |--------|-------------|---------|
-| `x` | Bind any UOp to variable `x` | `Add(x, y)` |
+| `x` | Bind any UOp to variable `x` (snake_case = binding) | `Add(x, y)` |
 | `_` | Wildcard (ignore) | `Add(_, y)` |
-| `name @ pattern` | Bind entire match to `name` | `result @ Add(x, y)` |
-| `c @const(cv)` | Bind UOp to `c`, ConstValue to `cv` | `Add(x, c@const(cv))` |
+| `name @ pattern` | Bind the whole sub-match to `name` | `result @ Add(x, y)` |
+| `c @const(cv)` | Bind UOp to `c`, its `ConstValue` to `cv` | `Add(x, c @const(cv))` |
+| `c @vconst(vs)` / `c @anyconst(vs)` | VCONST lanes / CONST-or-VCONST as `Vec<ConstValue>` | `Mul(x, c @anyconst(vs))` |
+
+A name used twice must be the same node: `Add(x, x)` generates `Arc::ptr_eq`.
 
 ### Constant Patterns
 
 ```rust
-// Specific constants
-Const(0)          // Integer 0
-Const(1.0)        // Float 1.0
-
-// Special constants
-@zero             // Matches 0 or 0.0
-@one              // Matches 1 or 1.0
-@const            // Any constant
+Const(_)                    // any CONST
+Const(v)                    // bind the ConstValue
+Const(ConstValue::Int(0))   // a Rust pattern over the ConstValue
+@zero / @one                // zero / one of any numeric dtype
 ```
 
 ### Operation Patterns
 
-**Tuple style (positional):**
+**ALU ops (Unary/Binary/Ternary) by kind, positional:**
 ```rust
 Neg(x)                    // Unary
 Add(x, y)                 // Binary
 Where(cond, t, f)         // Ternary
+Add[x, @zero]             // commutative: also tries the swapped order
 ```
+Names resolve against `svod_ir::op::alu`, so a typo or wrong arity is a normal
+rustc error at the op's span.
 
-**Struct style (named fields):**
+**Struct ops by field:**
 ```rust
-Cast { src: x, dtype }
-Load { buffer: b, index: i }
-Bufferize { compute: x, ranges, .. }  // .. ignores rest
+Cast { src: x, dtype }                       // child fields nest; `dtype` binds the field
+Range { axis_type: AxisType::Upcast, .. }    // non-child fields are verbatim Rust patterns
+Reduce { reduce_op: op @ (ReduceOp::Add | ReduceOp::Max), src, .. }
+GetTuple { index: 2, .. }
+Load { index, gate: Some(g), .. }            // Option<Arc<UOp>> children: Some(pat) / None
+Reduce { .. }                                // any REDUCE
+Noop                                         // unit variant
 ```
-
-### Guards and Conditions
-
-```rust
-// Guard before arrow
-Pattern if condition ~> rewrite_expr
-
-// Examples
-Add(x, y) if !x.dtype().is_float() => transform(x, y)
-Cast { src: x, dtype } if x.dtype() == *dtype ~> x
-Lt(x, x) if !x.dtype().is_float() ~> false.into_uop(DType::Bool)
-```
+A field is a child pattern when it is `_`, `@..`, a snake_case binding, or an
+identifier applied to `(..)`/`[..]`/`{..}`/`@`; anything else is passed through
+as a Rust pattern. There is no positional form for struct ops.
 
 ### Rewrite Expressions
 
 ```rust
-// Simple variable return
-Add(x, @zero) ~> x
-
-// Closure (infallible)
-Mul(x, y) ~> |x| x.clone()
-
-// Closure (fallible)
-Add(x, @zero) => |x| Some(x.clone())
-
-// Multi-parameter
-Mul(x, y) => |x, y| x.try_mul(y).ok()
-
-// Block expression
-Mul(x, y) => {
-    let result = x.try_mul(y).ok()?;
-    Some(result)
-}
-
-// General expression
-Neg(x) => UOp::neg(x)
+Add(x, @zero) => x                       // bare binding: clone of it
+Neg(x) => UOp::neg(x)                    // expression
+Mul(x, y) => x.try_mul(y).ok()           // Option declines with None
+Mul(x, y) => { let r = x.try_mul(y).ok()?; Some(r) }
+Mul(x, y) => |x, y| x.try_mul(y).ok()    // closure form: the parameter list is documentation only
 ```
 
 ### Context-Aware Patterns
 
 ```rust
-// Declare context type
 let matcher = patterns! {
     @context MyContext;
-
-    Add(x, @zero) => {
-        ctx.track_rewrite();
-        Some(Arc::clone(x))
-    }
+    Add(x, @zero) => { ctx.track_rewrite(); Some(Arc::clone(x)) }
 };
-
-// Use with context
 let mut ctx = MyContext::new();
 let result = graph_rewrite(&matcher, root, &mut ctx);
 ```
@@ -118,127 +99,41 @@ let result = graph_rewrite(&matcher, root, &mut ctx);
 
 ### Commutative Patterns
 
-Use `[]` instead of `()` to try all orderings:
+`[]` instead of `()` tries all orderings of that level; the shared prefix and the
+rewrite body are generated once and retried per ordering (Tinygrad semantics).
 
 ```rust
-// Matches Add(x, zero) OR Add(zero, x)
-Add[x, @zero] ~> |x| x.clone()
-
-// Matches Mul(x, one) OR Mul(one, x)
-Mul[x, @one] ~> |x| x.clone()
-
-// Non-commutative - only one ordering
-Sub(x, @zero) ~> |x| x.clone()
-```
-
-### Alternative Patterns
-
-Match if ANY pattern matches:
-
-```rust
-(Add | Mul)(x, y)       // Matches Add(x, y) OR Mul(x, y)
-(Neg | Not)(x)          // Matches Neg(x) OR Not(x)
+Add[x, @zero] => x                       // Add(x, 0) or Add(0, x)
+Add[Mul[x, c1 @const(a)], Mul[x, c2 @const(b)]] => ...   // 2 × 2 × 2 orderings
+Sub(x, @zero) => x                       // non-commutative: one ordering
 ```
 
 ### Nested Patterns
 
 ```rust
-Add(Neg(x), y)          // Nested operations
-Mul(Add(a, b), c)       // Complex nesting
-Index { buffer: Bufferize { compute: Cast { src: x }, .. }, .. }
+Add(Neg(x), y)
+Index { buffer: Stage { compute: Cast { src: x, .. }, .. }, .. }
 ```
 
 ### For-Blocks (Iteration)
 
-Generate multiple patterns at once:
-
 ```rust
-// Iterate over specific operations
 for op in unary [Neg, Sqrt, Exp] {
     op(c @const(cv)) => eval_unary(op, cv),
 }
-
-for op in binary [Add, Mul, Sub] {
-    op(x, @zero) ~> |x| x.clone()
-}
-
-for op in ternary [Where, MulAcc] {
-    op(a, b, c) => fold_ternary(op, a, b, c)
-}
-
-// Wildcard - ALL operations
-for op in unary [*] {
-    op(c @const(cv)) => eval_unary(op, cv),
-}
-
-for op in binary [*] {
-    op(x, @zero) ~> x
+for op in binary [*] {                   // every op of the kind
+    op(x, @zero) => x,
 }
 ```
+Inside the block `op` is the ALU op value (`BinaryOp` etc.) and is usable in the
+guard and body. Op sets over different kinds are written as separate rules or
+for-blocks; there is no `(Add | Mul)(x, y)` form.
 
-### Duplicate Detection
+### Removed forms (do not use)
 
-Same variable name generates `Arc::ptr_eq` check:
-
-```rust
-// x + x → 2*x (only when operands are identical)
-Add(x, x) => |x| x.try_mul(&UOp::const_(x.dtype(), 2)).ok()
-
-// x // x → 1
-Idiv(x, x) => |x| Some(UOp::const_(x.dtype(), 1))
-
-// x & x → x
-And(x, x) ~> |x| x.clone()
-```
-
-### Option Patterns
-
-```rust
-Some(pattern)           // Matches Option::Some
-None                    // Matches Option::None
-
-// Example
-Index { buffer: b, gate: None } ~> b
-Index { buffer: b, gate: Some(g) } => Some(g.clone())
-```
-
-## Supported Operations
-
-### Unary Operations (20)
-
-```
-Neg, Not, Abs, Sqrt, Rsqrt, Exp, Exp2, Log, Log2, Sin, Cos, Tan,
-Reciprocal, Trunc, Floor, Ceil, Round, Sign, Erf, Square
-```
-
-### Binary Operations (20)
-
-```
-Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv,
-Lt, Le, Eq, Ne, Gt, Ge,
-And, Or, Xor, Shl, Shr, Threefry
-```
-
-### Ternary Operations (2)
-
-```
-Where, MulAcc
-```
-
-### Single-Source Operations
-
-```
-Cast, Reshape, Permute, Expand, Pad, Shrink, Flip, Contract,
-Unroll, Contiguous, Detach, BitCast, ReduceAxis, Multi, Bufferize,
-```
-
-### Special Operations
-
-```
-Range, End, If, Buffer, BufferView, MSelect, Index, PointerIndex,
-Copy, Load, LoadGated, Store, StoreGated, Bind, Assign,
-Reduce, AllReduce, Wmma, Kernel, Sink, Vectorize, GEP
-```
+`Const(0)` literal shorthand, bare `@const`, `(A | B)(..)` alternatives, tuple
+positional form for struct ops (`Store(idx, val)`, `Range(_)`, `Noop()`), and
+`reduce_op: Add | Max` bare-name alternatives. Use the Rust-pattern forms above.
 
 ## Rewrite Engine API
 
@@ -264,8 +159,8 @@ use svod_schedule::patterns;
 
 // Simple matcher
 let matcher = patterns! {
-    Add(x, @zero) ~> |x| x.clone(),
-    Mul(x, @one) ~> |x| x.clone(),
+    Add(x, @zero) => x,
+    Mul(x, @one) => x,
 };
 
 // Context-aware matcher
@@ -415,7 +310,7 @@ let result = graph_rewrite(&full_pipeline, graph, &mut ctx);
 | Limitation | Workaround |
 |------------|------------|
 | **No negative matching** `Add(!Const(_), y)` | Use guards: `Add(x, y) if !matches!(x.op(), Op::Const(_))` |
-| **No backtracking** once committed to branch | Use explicit alternatives: `(Op1 \| Op2)(x, y)` |
+| **No backtracking** once committed to branch | Split into separate rules |
 | **No cross-traversal context** "if Y seen earlier" | Use `@context` parameter with manual tracking |
 | **No graph topology queries** (consumers, cycles) | Pre-analysis passes or manual traversal |
 | **Fixed-point limit** MAX_DEPTH = 100 | Deep/circular chains truncated |
@@ -426,7 +321,7 @@ let result = graph_rewrite(&full_pipeline, graph, &mut ctx);
 
 1. **Wildcard patterns expensive** - `x if cond` checked for EVERY op. Use specific OpKey instead.
 2. **Deep nesting slow** - Triple nested patterns like `Index { buffer: Bufferize { compute: Cast { src: x } } }` should use guards or intermediate patterns.
-3. **Large alternative lists** - Keep under ~10 ops. Prefer `for op in binary [...]` over `(Add | Mul | Sub)(x, y)`.
+3. **Op sets** - Use `for op in binary [...]` for the same rule over several ops.
 4. **Permutation overhead** - `Add[x, y]` tries both orderings. Use `Add(x, @zero)` when order doesn't matter.
 5. **Ensure progress** - `Neg(x) => x.try_neg()` may loop. `Neg(Neg(x)) => x` makes structural progress.
 
@@ -452,11 +347,11 @@ The rewrite engine semantics match Tinygrad's `unified_rewrite` (ops.py:1177-123
 
 ### Common Pitfalls
 
-1. **`~>` vs `=>`**: `~>` is infallible (returns `Arc<UOp>`), `=>` is fallible (returns `Option`)
+1. **Arrows**: `=>` accepts `Arc<UOp>`, `Option<Arc<UOp>>` or `RewriteResult`; `~>` is only an alias
 2. **Wildcard performance**: `x if condition` checked for EVERY op - use specific OpKey patterns
 3. **Commutative**: `Add[x, y]` tries both orderings - use `Add(x, y)` when ordering matters
 4. **Duplicate detection**: `Add(x, x)` auto-generates `Arc::ptr_eq` - only identical variable names
-5. **Guard placement**: Guard goes AFTER pattern, BEFORE arrow: `Pattern if cond ~> rewrite`
+5. **Guard placement**: Guard goes AFTER pattern, BEFORE arrow: `Pattern if cond => rewrite`
 6. **Rewrite function semantics**: `graph_rewrite()` patterns see OPTIMIZED children; use `graph_rewrite_bottom_up()` for patterns that need ORIGINAL structure (e.g., nested `Index { buffer: Bufferize { ... } }`)
 
 ### Debugging

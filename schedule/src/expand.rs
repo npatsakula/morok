@@ -172,7 +172,7 @@ fn expand_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
 pub fn expander2() -> &'static TypedPatternMatcher<RangeMap> {
     crate::cached_patterns! {
         @context RangeMap;
-        reduce @ Reduce(_, ..) => expand_reduce(reduce),
+        reduce @ Reduce { .. } => expand_reduce(reduce),
         range @ Range { end: _, axis_id, axis_type }
             if matches!(axis_type, AxisType::Upcast | AxisType::Unroll) && ctx.contains_key(axis_id)
             => expand_range(ctx, range),
@@ -241,6 +241,6 @@ fn fix_group_for_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Grouped reduction lowering runs with reduction removal, after expansion.
 pub fn pm_group_for_reduce() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        reduce @ Reduce(_, ..) => fix_group_for_reduce(reduce),
+        reduce @ Reduce { .. } => fix_group_for_reduce(reduce),
     }
 }

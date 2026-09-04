@@ -43,13 +43,15 @@ fn assert_no_match(result: RewriteResult) {
     assert!(matches!(result, RewriteResult::NoMatch), "expected NoMatch");
 }
 
+/// `Const(pat)` takes a Rust pattern over the `ConstValue`; a name binds the value.
 #[test]
-fn op_patterns_with_literal_constants() {
+fn op_patterns_with_const_value_patterns() {
     let matcher = patterns! {
-        GetAddr(src) ~> src,
-        Add(x, Const(0)) ~> x,
-        Mul(x, Const(1)) ~> x,
-        Mul(_, zero @ Const(0)) ~> zero,
+        GetAddr { src, .. } ~> src,
+        Add(x, Const(ConstValue::Int(0))) ~> x,
+        Mul(x, Const(ConstValue::Int(1))) ~> x,
+        Mul(_, zero @ Const(ConstValue::Int(0))) ~> zero,
+        Sub(x, Const(ConstValue::Int(v))) if v == 7 ~> x,
     };
 
     let buffer = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::UInt8);
@@ -64,7 +66,9 @@ fn op_patterns_with_literal_constants() {
     assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Mul, x.clone(), one.clone()), &mut ()), &x);
     assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Mul, x.clone(), zero.clone()), &mut ()), &zero);
     assert_no_match(matcher.rewrite(&binary(BinaryOp::Add, x.clone(), one), &mut ()));
-    assert_no_match(matcher.rewrite(&binary(BinaryOp::Mul, x, two), &mut ()));
+    assert_no_match(matcher.rewrite(&binary(BinaryOp::Mul, x.clone(), two.clone()), &mut ()));
+    assert_rewrites_to(matcher.rewrite(&binary(BinaryOp::Sub, x.clone(), UOp::native_const(7i32)), &mut ()), &x);
+    assert_no_match(matcher.rewrite(&binary(BinaryOp::Sub, x, two), &mut ()));
 }
 
 /// `@zero`/`@one` match the int and the float spelling of the constant, in either operand
@@ -285,7 +289,7 @@ fn for_loop_body_supports_guards_and_bindings() {
             op(c) if matches!(c.op(), Op::Const(_)) ~> Arc::clone(c)
         },
         for op in unary [Exp2] {
-            op(inner @ @const) ~> inner
+            op(inner @ Const(_)) ~> inner
         },
     };
 
@@ -315,16 +319,18 @@ fn const_value_is_extracted_from_the_binding() {
     assert_rewrites_to(matcher.rewrite(&c.try_sqrt().unwrap(), &mut ()), &c);
 }
 
-/// `..` in a tuple pattern makes the rule arity-independent for variable-arity ops.
+/// A struct pattern with only `..` matches the op whatever its fields hold; `Noop` is
+/// the bare unit variant.
 #[test]
-fn rest_pattern_matches_any_arity() {
+fn field_free_struct_and_unit_patterns() {
     let matcher = patterns! {
-        end_op @ End(_, ..) ~> {
+        end_op @ End { .. } ~> {
             let Op::End(ops::End { computation, .. }) = end_op.op() else { unreachable!() };
             Arc::clone(computation)
         },
-        reduce_op @ Reduce(_, ..) if matches!(reduce_op.op(), Op::Reduce(ops::Reduce { reduce_op: ReduceOp::Add, .. }))
+        reduce_op @ Reduce { .. } if matches!(reduce_op.op(), Op::Reduce(ops::Reduce { reduce_op: ReduceOp::Add, .. }))
             ~> UOp::const_(reduce_op.dtype(), ConstValue::Int(99)),
+        noop @ Noop ~> UOp::const_(noop.dtype(), ConstValue::Int(1)),
     };
 
     let src = UOp::native_const(42i32);
@@ -338,6 +344,10 @@ fn rest_pattern_matches_any_arity() {
     assert_rewrites_to(matcher.rewrite(&src.reduce(smallvec![r0.clone()], ReduceOp::Add), &mut ()), &ninety_nine);
     assert_rewrites_to(matcher.rewrite(&src.reduce(smallvec![r0.clone(), r1], ReduceOp::Add), &mut ()), &ninety_nine);
     assert_no_match(matcher.rewrite(&src.reduce(smallvec![r0], ReduceOp::Mul), &mut ()));
+
+    let noop = UOp::new(Op::Noop, DType::Void);
+    assert_rewrites_to(matcher.rewrite(&noop, &mut ()), &UOp::const_(DType::Void, ConstValue::Int(1)));
+    assert_no_match(matcher.rewrite(&src, &mut ()));
 }
 
 /// `..` in a struct pattern matches a prefix of the sources (Tinygrad's `zip()` semantics)
@@ -419,28 +429,33 @@ fn nested_option_field_patterns() {
     assert_no_match(matcher.rewrite(&target.store(gated_load), &mut ()));
 }
 
-/// `|` alternatives: over whole patterns, over op names alone, and combined with `@zero`/`@one`.
+/// Non-child fields are plain Rust patterns: enum paths, `|` alternatives, bindings on
+/// them, and literals all match by value. A `Range { axis_type: AxisType::Upcast, .. }`
+/// rule must therefore reject every other axis type.
 #[test]
-fn alternative_patterns() {
-    let whole = patterns! { (Add(x, _y) | Mul(x, _y)) ~> x };
-    let op_names = patterns! { (Add | Mul)(x, @zero) ~> x };
-    let special = patterns! { (Add(x, @zero) | Add(x, @one)) ~> x };
+fn non_child_fields_are_verbatim_rust_patterns() {
+    use crate::types::{AxisId, AxisType};
 
-    let x = UOp::native_const(42i32);
-    let zero = UOp::native_const(0i32);
-    let one = UOp::native_const(1i32);
-    let two = UOp::native_const(2i32);
+    let upcast_only = patterns! { Range { end, axis_type: AxisType::Upcast, .. } ~> end };
+    let loop_axes = patterns! {
+        Range { end, axis_type: kind @ (AxisType::Loop | AxisType::Reduce), .. } if *kind == AxisType::Reduce ~> end
+    };
+    let by_index = patterns! { GetTuple { src, index: 2 } ~> src };
 
-    for op in [BinaryOp::Add, BinaryOp::Mul] {
-        assert_rewrites_to(whole.rewrite(&binary(op, x.clone(), one.clone()), &mut ()), &x);
-        assert_rewrites_to(op_names.rewrite(&binary(op, x.clone(), zero.clone()), &mut ()), &x);
+    let end = UOp::index_const(8);
+    let range = |axis_type| UOp::range_axis(end.clone(), AxisId::Renumbered(0), axis_type);
+    assert_rewrites_to(upcast_only.rewrite(&range(AxisType::Upcast), &mut ()), &end);
+    for other in [AxisType::Loop, AxisType::Reduce, AxisType::Global, AxisType::Unroll] {
+        assert_no_match(upcast_only.rewrite(&range(other), &mut ()));
     }
-    assert_no_match(whole.rewrite(&binary(BinaryOp::Sub, x.clone(), one.clone()), &mut ()));
-    assert_no_match(op_names.rewrite(&binary(BinaryOp::Sub, x.clone(), zero.clone()), &mut ()));
+    assert_rewrites_to(loop_axes.rewrite(&range(AxisType::Reduce), &mut ()), &end);
+    assert_no_match(loop_axes.rewrite(&range(AxisType::Loop), &mut ()));
+    assert_no_match(loop_axes.rewrite(&range(AxisType::Upcast), &mut ()));
 
-    assert_rewrites_to(special.rewrite(&binary(BinaryOp::Add, x.clone(), zero), &mut ()), &x);
-    assert_rewrites_to(special.rewrite(&binary(BinaryOp::Add, x.clone(), one), &mut ()), &x);
-    assert_no_match(special.rewrite(&binary(BinaryOp::Add, x, two), &mut ()));
+    let tuple = UOp::new(Op::Tuple(ops::Tuple { src: smallvec![end.clone(), end.clone(), end.clone()] }), DType::Void);
+    let get = |index| UOp::new(Op::GetTuple(ops::GetTuple { src: tuple.clone(), index }), end.dtype());
+    assert_rewrites_to(by_index.rewrite(&get(2), &mut ()), &tuple);
+    assert_no_match(by_index.rewrite(&get(1), &mut ()));
 }
 
 /// `Op[a, b]` tries both source orderings — including under `graph_rewrite`, which is where

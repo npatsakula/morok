@@ -356,7 +356,7 @@ fn identity_and_zero_patterns_unchecked() -> &'static TypedPatternMatcher {
         // ========== Rounding identity for integer types ==========
         // Floor/Ceil/Trunc/Round on integers is identity — rounding is a no-op.
         for op in unary [Floor, Ceil, Trunc, Round] {
-            op(x) if !x.dtype().is_float() ~> { let _ = op; x.clone() }
+            op(x) if !x.dtype().is_float() ~> x.clone()
         },
 
         // ========== Zero propagation ==========
@@ -451,7 +451,7 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
         // Unary/cast operations preserve Invalid and move inside its gate.
         for op in unary [*] {
             op(invalid) if UOp::is_invalid_marker(invalid)
-                ~> { let _ = op; UOp::invalid_marker() },
+                ~> UOp::invalid_marker(),
             r @ op(Where(cond, x, invalid)) if UOp::is_invalid_marker(invalid) => {
                 let inner = UOp::new(Op::Unary(op, x.clone()), r.dtype());
                 let marker = UOp::invalid_marker();
@@ -510,9 +510,9 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
         // a typed marker, so create one with the operation's result dtype.
         for op in binary [Add, Mul, Sub, FloorMod, Max, FloorDiv, Fdiv, Pow, And, Or, Xor, Shl, Shr] {
             op(invalid, _y) if UOp::is_invalid_marker(invalid)
-                ~> { let _ = op; UOp::invalid_marker() },
+                ~> UOp::invalid_marker(),
             op(_y, invalid) if UOp::is_invalid_marker(invalid)
-                ~> { let _ = op; UOp::invalid_marker() },
+                ~> UOp::invalid_marker(),
         },
     }
 }
@@ -704,10 +704,7 @@ pub(crate) fn commutative_canonicalization() -> &'static TypedPatternMatcher {
             r @ op(a, b)
                 if crate::linearize::tinygrad_weakint_expr(r)
                     && crate::linearize::tinygrad_tuplize_cmp(b, a) == Some(Ordering::Less)
-                ~> {
-                    let _ = op;
-                    r.replace().src(vec![b.clone(), a.clone()]).call()
-                },
+                ~> r.replace().src(vec![b.clone(), a.clone()]).call(),
         },
     }
 }
@@ -1420,7 +1417,7 @@ pub fn dead_loop_patterns() -> &'static TypedPatternMatcher {
 
     crate::cached_patterns! {
         // RANGE with vmax < 0 (empty/dead) → Const(0)
-        r @ Range(_) if is_empty_range(r) ~> UOp::index_const(0),
+        r @ Range { .. } if is_empty_range(r) ~> UOp::index_const(0),
 
         // RANGE(Const) with vmin == vmax (trivial) → Const(vmin)
         r @ Range { end: Const(_) } if is_trivial_range(r) ~> trivial_range_value(r),
@@ -1464,7 +1461,7 @@ fn vmin_vmax_collapse_patterns_unchecked() -> &'static TypedPatternMatcher {
         // SoundVminVmaxProperty returns None for unsound ops (LOAD/Pow/Fdiv); `is_collapsible`
         // excludes float results; Add/Sub/Max are omitted (see fn doc).
         for op in binary [Mul, FloorDiv, FloorMod, Lt, Le, Eq, Ne, Gt, Ge] {
-            r @ op(_, _) if is_collapsible(r) => { let _ = op; try_collapse(r) },
+            r @ op(_, _) if is_collapsible(r) => try_collapse(r),
         },
         // Param/Special with vmin == vmax → const (e.g., Variable with min==max after binding)
         r @ Param { shape: _, arg: _ } if is_collapsible(r) => try_collapse(r),
