@@ -89,11 +89,17 @@ impl JitKernel {
 /// Returns the `--target=<arch>-none-unknown-elf` flag for the host architecture.
 /// Shared between the C and LLVM IR compilation paths.
 pub(crate) fn elf_target_triple() -> String {
+    format!("--target={}", elf_triple())
+}
+
+/// Bare `<arch>-none-unknown-elf` triple shared by the clang and in-process
+/// LLVM object producers.
+pub(crate) fn elf_triple() -> String {
     let arch = std::env::consts::ARCH;
     if arch == "powerpc64" && cfg!(target_endian = "little") {
-        "--target=powerpc64le-none-unknown-elf".to_string()
+        "powerpc64le-none-unknown-elf".to_string()
     } else {
-        format!("--target={arch}-none-unknown-elf")
+        format!("{arch}-none-unknown-elf")
     }
 }
 

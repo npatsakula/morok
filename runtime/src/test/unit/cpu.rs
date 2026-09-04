@@ -35,7 +35,8 @@ fn llvm_jit_emits_reusable_object_bytes() {
     assert!(!compiled.bytes.is_empty());
     crate::clang::validate_relocatable_object(&compiled.bytes, "source_only").unwrap();
     assert_eq!(device.base_device_key(), "CPU");
-    assert!(device.compiler.cache_key().starts_with("cpu-llvm-clang:"));
+    let producer = if crate::llvm_inprocess::library().is_ok() { "cpu-llvm-inprocess:" } else { "cpu-llvm-clang:" };
+    assert!(device.compiler.cache_key().starts_with(producer), "{}", device.compiler.cache_key());
 
     let invalid =
         ProgramSpec::new("test".into(), "this is not valid LLVM IR".into(), DeviceSpec::Cpu, UOp::sink(vec![]));

@@ -279,11 +279,10 @@ impl Program for LlvmProgram {
     }
 }
 
-/// LLVM-text compiler backed by external Clang object emission.
+/// LLVM-text compiler; objects come from libLLVM in process or from clang.
 struct LlvmCompiler {
     cache: Option<Arc<ObjectCache>>,
-    toolchain: ClangToolchain,
-    flags: Vec<String>,
+    producer: crate::llvm::LlvmObjectProducer,
     identity: CompilerIdentity,
     cache_key: String,
 }
@@ -295,10 +294,11 @@ impl Compiler for LlvmCompiler {
             cache.get_or_compile(
                 &key,
                 |bytes| crate::clang::validate_relocatable_object(bytes, &spec.name),
-                || crate::llvm::compile_ir_to_object_with(&self.toolchain, &spec.src, &self.flags),
+                || self.producer.compile(&spec.src),
             )
         } else {
-            crate::llvm::compile_ir_to_object_with(&self.toolchain, &spec.src, &self.flags)
+            self.producer
+                .compile(&spec.src)
                 .and_then(|bytes| crate::clang::validate_relocatable_object(&bytes, &spec.name).map(|()| bytes))
         }
         .map_err(runtime_as_device)?;
@@ -453,26 +453,12 @@ pub fn create_cpu_codegen(backend: CpuBackend) -> Result<(Arc<dyn Renderer>, Arc
         }
         CpuBackend::Llvm => {
             let cache = ObjectCache::from_env().map_err(runtime_as_device)?.map(Arc::new);
-            let toolchain = ClangToolchain::discover(cache.as_deref()).map_err(runtime_as_device)?;
-            let flags = crate::llvm::llvm_object_flags();
-            let target_architecture = toolchain.target_identity(cache.as_deref(), &flags).map_err(runtime_as_device)?;
-            let identity = CompilerIdentity {
-                schema: OBJECT_CACHE_SCHEMA,
-                backend: "cpu-llvm-clang".into(),
-                target_architecture,
-                toolchain: toolchain.identity().into(),
-                flags: flags.clone(),
-                abi: format!(
-                    "svod-llvm-kernel-abi-v1;pointer-width={};endian={}",
-                    usize::BITS,
-                    if cfg!(target_endian = "little") { "little" } else { "big" }
-                ),
-                object_format: "elf-relocatable-svod-jit-loader-v1".into(),
-            };
+            let (producer, identity) =
+                crate::llvm::llvm_object_producer(cache.as_deref()).map_err(runtime_as_device)?;
             let cache_key = identity.cache_key();
             Ok((
                 Arc::new(LlvmRendererWrapper { device: device_spec }),
-                Arc::new(LlvmCompiler { cache, toolchain, flags, identity, cache_key }),
+                Arc::new(LlvmCompiler { cache, producer, identity, cache_key }),
             ))
         }
     }
