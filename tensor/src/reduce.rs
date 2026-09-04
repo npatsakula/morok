@@ -155,13 +155,17 @@ impl Tensor {
 
     /// Sum with additional options (keepdim, dtype, promote).
     ///
+    /// Accumulation dtype, in precedence order: an explicit `dtype`, else
+    /// `promote` (default: on, matching [`sum`](Self::sum) and Tinygrad), else
+    /// the input dtype. Passing both `dtype` and `promote(true)` is an error.
+    ///
     /// # Examples
     /// ```ignore
     /// // Explicit dtype
     /// tensor.sum_with(0).dtype(DType::Float32).call()?;
     ///
-    /// // Auto-promote (int8→int32, etc.)
-    /// tensor.sum_with(0).promote(true).call()?;
+    /// // Opt out of promotion (int8 accumulates in int8)
+    /// tensor.sum_with(0).promote(false).call()?;
     ///
     /// // With keepdim
     /// tensor.sum_with(0).keepdim(true).call()?;
@@ -173,8 +177,12 @@ impl Tensor {
         axes: impl Into<AxisSpec>,
         #[builder(default = false)] keepdim: bool,
         dtype: Option<DType>,
-        #[builder(default = false)] promote: bool,
+        promote: Option<bool>,
     ) -> Result<Self> {
+        if dtype.is_some() && promote == Some(true) {
+            return Err(Error::ConflictingReductionOptions);
+        }
+        let promote = promote.unwrap_or(dtype.is_none());
         reduce_internal(self, ReduceOp::Add, axes.into(), keepdim, dtype, promote)
     }
 
@@ -187,6 +195,10 @@ impl Tensor {
     }
 
     /// Product with additional options (keepdim, dtype, promote).
+    ///
+    /// Unlike [`sum_with`](Self::sum_with), `promote` defaults to `false`: a
+    /// product preserves the input dtype unless asked otherwise, matching
+    /// [`prod`](Self::prod) and Tinygrad.
     #[builder]
     #[track_caller]
     pub fn prod_with(
@@ -747,10 +759,11 @@ fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool, correction: i64
     // Square the deviations: (X - E[X])²
     let squared_dev = deviation.square()?;
 
-    // `None` lets the reduce accumulate fp16/bf16/fp8 in float32 and cast the result
-    // back; an explicit narrow dtype would accumulate the long sum in fp16 and
-    // diverge under a reassociating opt.
-    let sum_sq_dev = reduce_internal(&squared_dev, ReduceOp::Add, axes, keepdim, None, false)?;
+    // Accumulate *and* divide in `sum_acc_dtype` like `mean_impl`, casting to the
+    // output dtype only at the end: a float16 sum of squares cast back before the
+    // divide overflows to inf well before the ratio would.
+    let acc_dtype = Tensor::sum_acc_dtype(&squared_dev.uop().dtype());
+    let sum_sq_dev = reduce_internal(&squared_dev, ReduceOp::Add, axes, keepdim, Some(acc_dtype.clone()), false)?;
 
     // Divide by max(0, N - correction): correction=1 is the unbiased sample
     // variance, correction=0 the population variance.
@@ -759,12 +772,13 @@ fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool, correction: i64
         // n <= correction (e.g. a single element with correction=1) ⇒ divisor 0.
         // svod's `/` rejects a constant-zero divisor, so express the IEEE result as
         // `reduced * inf` (0*inf = NaN, k*inf = +inf).
-        let inf = Tensor::new(UOp::const_(output_dtype, svod_ir::ConstValue::Float(f64::INFINITY)));
+        let inf = Tensor::new(UOp::const_(acc_dtype.clone(), svod_ir::ConstValue::Float(f64::INFINITY)));
         &sum_sq_dev * &inf
     } else {
-        let denom_tensor = Tensor::new(UOp::const_(output_dtype, svod_ir::ConstValue::Float(denom as f64)));
+        let denom_tensor = Tensor::new(UOp::const_(acc_dtype.clone(), svod_ir::ConstValue::Float(denom as f64)));
         &sum_sq_dev / &denom_tensor
     };
+    let variance = if acc_dtype != output_dtype { variance.cast(output_dtype)? } else { variance };
 
     Ok((variance, mean))
 }

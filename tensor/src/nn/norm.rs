@@ -181,11 +181,20 @@ impl Tensor {
     /// ```
     pub fn mean_variance_normalize(&self, axes: &[isize], eps: f64) -> Result<Tensor> {
         let axes_spec = AxisSpec::Multiple(axes.to_vec());
-        let mean = self.mean_with().axes(axes_spec.clone()).keepdim(true).call()?;
-        let centered = self.try_sub(&mean)?;
+        // Normalize in f32 like `layernorm_with_stats`: a float16 `eps` is
+        // subnormal, so a constant slice divides 0 by a flushed 0 and gives NaN.
+        let original_dtype = self.uop().dtype();
+        // Integer inputs keep the float32 result they always produced.
+        let output_dtype = if original_dtype.is_float() { original_dtype.clone() } else { DType::Float32 };
+        let x32 = if original_dtype != DType::Float32 { self.cast(DType::Float32)? } else { self.clone() };
+
+        let mean = x32.mean_with().axes(axes_spec.clone()).keepdim(true).call()?;
+        let centered = x32.try_sub(&mean)?;
         let pop_std = centered.square()?.mean_with().axes(axes_spec).keepdim(true).call()?.try_sqrt()?;
-        let eps = Tensor::const_(eps, self.uop().dtype());
-        centered.try_div(&pop_std.try_add(&eps)?)
+        let eps = Tensor::const_(eps, DType::Float32);
+        let normalized = centered.try_div(&pop_std.try_add(&eps)?)?;
+
+        if output_dtype != DType::Float32 { normalized.cast(output_dtype) } else { Ok(normalized) }
     }
 
     /// Group normalization: reshape into groups, layernorm each group, then

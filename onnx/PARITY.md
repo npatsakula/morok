@@ -2,14 +2,14 @@
 
 **162 / 200** standard operators implemented (81%).
 
-Test results from the ONNX backend node test suite (backends: clang, llvm): **1361** pass, **0** fail, **317** skip (out of 1678 tests). A test passes only if all backends pass.
+Test results from the ONNX backend node test suite (backends: clang, llvm): **1357** pass, **0** fail, **321** skip (out of 1678 tests). A test passes only if all backends pass.
 
 ### Backend results
 
 | Backend | Pass | Fail | Skip |
 |---------|------|------|------|
-| clang | 1361 | 0 | 317 |
-| llvm | 1361 | 0 | 317 |
+| clang | 1357 | 0 | 321 |
+| llvm | 1357 | 0 | 321 |
 
 The *expanded uses* column counts how many `_expanded` tests exercise each
 operator as a building block (indirect coverage beyond direct tests).
@@ -125,7 +125,7 @@ operator as a building block (indirect coverage beyond direct tests).
 | DequantizeLinear | - | 14 skip | - | - |
 | DynamicQuantizeLinear | - | 3 skip | 3 skip | - |
 | QLinearConv | Y | 1 pass | - | - |
-| QLinearMatMul | Y | 8 pass | - | - |
+| QLinearMatMul | Y | 4 pass, 4 skip | - | - |
 | QuantizeLinear | - | 13 skip | - | 3 |
 
 ## Shape & Transform

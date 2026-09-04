@@ -170,6 +170,26 @@ impl Tensor {
         padded.try_add(&fill_term)
     }
 
+    /// Pad with a typed constant fill.
+    ///
+    /// [`try_pad_value`](Self::try_pad_value) routes its fill through `f64`,
+    /// which cannot represent the extremes of `u64`/`i64` and has no meaning for
+    /// `bool`. Float callers should keep using `try_pad_value`: its additive form
+    /// avoids nesting a WHERE over `try_pad`'s own mask, which is fragile with
+    /// infinite fills.
+    pub(crate) fn pad_const(&self, padding: &[(isize, isize)], value: ConstValue) -> Result<Tensor> {
+        let dtype = self.uop().dtype();
+        let sdtype = dtype.scalar().expect("pad_const requires scalar dtype");
+        if value == ConstValue::zero(sdtype) {
+            return self.try_pad(padding);
+        }
+        let zero = Tensor::new(UOp::const_(dtype.clone(), ConstValue::zero(sdtype)));
+        let ones = Tensor::new(UOp::const_(dtype.clone(), ConstValue::one(sdtype))).broadcast_to(&self.shape()?)?;
+        let in_bounds = ones.try_pad(padding)?.try_ne(&zero)?;
+        let fill = Tensor::new(UOp::const_(dtype, value));
+        self.try_pad(padding)?.where_(&in_bounds, &fill)
+    }
+
     /// Pad with configurable mode and fill value.
     ///
     /// Supports four padding modes via [`PadMode`]:

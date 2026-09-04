@@ -2,6 +2,7 @@
 
 use crate::Tensor;
 use ndarray::{Array2, array};
+use svod_dtype::DType;
 
 crate::codegen_tests! {
     // =========================================================================
@@ -127,6 +128,50 @@ crate::codegen_tests! {
         // Should still produce valid output (no NaN/Inf)
         for val in result.as_vec::<f32>().unwrap() {
             assert!(val.is_finite(), "softcap produced non-finite value: {val}");
+        }
+    }
+
+    fn test_sdpa_softcap_applies_before_mask(config) {
+        // Softcap must cap the raw scaled scores. Applied after the causal mask
+        // it squashes `dtype::min` to `-cap`, leaving the masked key ~27% of the
+        // softmax weight (query 0 then reads 0.731 instead of V[0] = 1.0).
+        let q = Tensor::from_ndarray(&array![[[[0.0f32], [0.0]]]]);
+        let k = q.clone();
+        let v = Tensor::from_ndarray(&array![[[[1.0f32], [100.0]]]]);
+
+        let mut result = q
+            .scaled_dot_product_attention()
+            .key(&k)
+            .value(&v)
+            .is_causal(true)
+            .softcap(1.0)
+            .call()
+            .unwrap();
+        result.realize_with(&config).unwrap();
+        let view = result.array_view::<f32>().unwrap();
+        assert_eq!(view[[0, 0, 0, 0]], 1.0, "query 0 must see only V[0]");
+        // Query 1 attends to both keys equally: (1 + 100) / 2.
+        assert!((view[[0, 0, 1, 0]] - 50.5).abs() < 1e-3);
+    }
+
+    fn test_sdpa_float16_scores_stay_in_float32(config) {
+        // 64 products of 100·100 sum to 640000, past float16's 65504: scores
+        // formed in the input dtype overflow to inf and softmax gives NaN.
+        let q_data: Vec<f32> = vec![100.0; 2 * 64];
+        let mut k_data: Vec<f32> = vec![100.0; 64];
+        k_data.extend(std::iter::repeat_n(99.0f32, 64));
+        let q = Tensor::from_slice(q_data).try_reshape([1, 1, 2, 64]).unwrap().cast(DType::Float16).unwrap();
+        let k = Tensor::from_slice(k_data).try_reshape([1, 1, 2, 64]).unwrap().cast(DType::Float16).unwrap();
+        let v = Tensor::from_slice([1.0f32, 100.0]).try_reshape([1, 1, 2, 1]).unwrap().cast(DType::Float16).unwrap();
+
+        let result = q.scaled_dot_product_attention().key(&k).value(&v).call().unwrap();
+        assert_eq!(result.uop().dtype(), DType::Float16, "output must keep the query dtype");
+        let mut result = result.cast(DType::Float32).unwrap();
+        result.realize_with(&config).unwrap();
+        // Key 0 wins by 800 in score, so every query reads V[0] = 1.0.
+        for value in result.as_vec::<f32>().unwrap() {
+            assert!(value.is_finite(), "float16 scores overflowed: {value}");
+            assert!((value - 1.0).abs() < 1e-3, "expected 1.0, got {value}");
         }
     }
 

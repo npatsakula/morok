@@ -1,6 +1,6 @@
 //! Tests for neural network operations: pool, conv, normalization, resize.
 
-use ndarray::{Array4, array};
+use ndarray::{Array2, Array4, array};
 use svod_dtype::DType;
 
 use crate::Tensor;
@@ -621,6 +621,155 @@ crate::codegen_tests! {
 
         assert_eq!(new_h.as_vec::<f32>().unwrap(), exp_h.as_vec::<f32>().unwrap());
         assert_eq!(new_c.as_vec::<f32>().unwrap(), exp_c.as_vec::<f32>().unwrap());
+    }
+
+    fn test_mean_variance_normalize_float16_constant_row(config) {
+        // A float16 `eps` is subnormal and flushes to zero, so a constant row
+        // divided 0 by 0 and produced NaN; the f32 path returns zeros.
+        let x = Tensor::from_slice(vec![1000.0f32; 512]).try_reshape([1, 512]).unwrap().cast(DType::Float16).unwrap();
+        let y = x.mean_variance_normalize(&[1], 1e-5).unwrap();
+        assert_eq!(y.uop().dtype(), DType::Float16);
+        let mut y = y.cast(DType::Float32).unwrap();
+        let values = y.realize_with_and(&config).as_vec::<f32>().unwrap();
+        assert!(values.iter().all(|v| *v == 0.0), "expected zeros, got {:?}", &values[..4]);
+    }
+
+    fn test_mean_variance_normalize_float16_matches_float32(config) {
+        // Near-constant row: 1000 ± 4 in float16 must track the float32 result.
+        let data: Vec<f32> = (0..512).map(|i| if i % 2 == 0 { 1004.0 } else { 996.0 }).collect();
+        let x32 = Tensor::from_slice(data).try_reshape([1, 512]).unwrap();
+        let x16 = x32.cast(DType::Float16).unwrap();
+
+        let mut reference = x32.mean_variance_normalize(&[1], 1e-5).unwrap();
+        let reference = reference.realize_with_and(&config).as_vec::<f32>().unwrap();
+        let mut actual = x16.mean_variance_normalize(&[1], 1e-5).unwrap().cast(DType::Float32).unwrap();
+        let actual = actual.realize_with_and(&config).as_vec::<f32>().unwrap();
+
+        for (got, expected) in actual.iter().zip(reference.iter()) {
+            assert!((got - expected).abs() < 1e-3, "got {got}, expected {expected}");
+        }
+    }
+
+    fn test_qlinear_matmul_saturates_output(config) {
+        // 3 x 200 = 600 accumulator: ONNX QuantizeLinear saturates to 255,
+        // an int32 truncation would wrap it to 88.
+        let a = Tensor::from_ndarray(&Array2::from_elem((2, 3), 200u8));
+        let b = Tensor::from_ndarray(&Array2::from_elem((3, 1), 1u8));
+        let one = Tensor::from_slice([1.0f32]);
+        let zero_u8 = Tensor::from_slice([0u8]);
+
+        let saturated = |b_zero_point: &Tensor| {
+            let mut y = a
+                .qlinear_matmul()
+                .a_scale(&one)
+                .a_zero_point(&zero_u8)
+                .b(&b)
+                .b_scale(&one)
+                .b_zero_point(b_zero_point)
+                .y_scale(&one)
+                .y_zero_point(&zero_u8)
+                .call()
+                .unwrap();
+            y.realize_with_and(&config).as_vec::<u8>().unwrap()
+        };
+
+        assert_eq!(saturated(&zero_u8), vec![255, 255]);
+        // b_zero_point = 2 makes every product -200, so -600 clamps to 0.
+        assert_eq!(saturated(&Tensor::from_slice([2u8])), vec![0, 0]);
+    }
+
+    fn test_qlinear_matmul_saturates_to_int8_range(config) {
+        // Same 600 accumulator against a signed output dtype: clamps to 127.
+        let a = Tensor::from_ndarray(&Array2::from_elem((1, 3), 200u8));
+        let b = Tensor::from_ndarray(&Array2::from_elem((3, 1), 1u8));
+        let one = Tensor::from_slice([1.0f32]);
+        let mut y = a
+            .qlinear_matmul()
+            .a_scale(&one)
+            .a_zero_point(&Tensor::from_slice([0u8]))
+            .b(&b)
+            .b_scale(&one)
+            .b_zero_point(&Tensor::from_slice([0u8]))
+            .y_scale(&one)
+            .y_zero_point(&Tensor::from_slice([0i8]))
+            .call()
+            .unwrap();
+        assert_eq!(y.realize_with_and(&config).as_vec::<i8>().unwrap(), vec![127]);
+    }
+
+    fn test_dynamic_quantized_linear_float16_small_activations(config) {
+        // In float16 the 1e-6 epsilon and a ~3e-6 scale are subnormal, so
+        // deriving the scale in the input dtype sent `x / scale` to infinity.
+        let x = Tensor::from_slice([1e-4f32, 2e-4, 3e-4, 4e-4])
+            .try_reshape([1, 4])
+            .unwrap()
+            .cast(DType::Float16)
+            .unwrap();
+
+        // Reference from the float16-rounded activations, quantized in f32.
+        let mut widened = x.cast(DType::Float32).unwrap();
+        let values = widened.realize_with_and(&config).as_vec::<f32>().unwrap();
+        let scale = (values.iter().fold(0.0f32, |acc, v| acc.max(v.abs())) / 127.0).max(1e-6);
+        let expected: f32 = values.iter().map(|v| (v / scale).round().clamp(-127.0, 127.0)).sum::<f32>() * scale;
+
+        let weight = Tensor::from_slice([1i8, 1, 1, 1]).try_reshape([1, 4]).unwrap();
+        let weight_scale = Tensor::from_slice([1.0f32]);
+        let output = x.dynamic_quantized_linear().weight(&weight).weight_scale(&weight_scale).call().unwrap();
+        assert_eq!(output.uop().dtype(), DType::Float16);
+        let mut output = output.cast(DType::Float32).unwrap();
+        let got = output.realize_with_and(&config).as_vec::<f32>().unwrap()[0];
+        assert!(got.is_finite(), "float16 activation scale overflowed: {got}");
+        assert!((got - expected).abs() <= expected * 2e-2, "got {got}, expected {expected}");
+    }
+
+    fn test_conv2d_int8_promotes_accumulator(config) {
+        // 3x3 of 10 convolved with 3x3 of 5 sums to 450 — only representable
+        // once the reduction promotes int8 to int32.
+        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 10.0f32)).cast(DType::Int8).unwrap();
+        let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 5.0f32)).cast(DType::Int8).unwrap();
+        let mut result = x.conv2d().weight(&w).call().unwrap().contiguous();
+        result.realize_with(&config).unwrap();
+        assert_eq!(result.uop().dtype(), DType::Int32);
+        assert_eq!(result.as_vec::<i32>().unwrap(), vec![450]);
+    }
+
+    fn test_conv2d_int8_explicit_acc_dtype_wins(config) {
+        // An explicit `acc_dtype` still selects the accumulator (and suppresses
+        // promotion) rather than conflicting with it.
+        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 10.0f32)).cast(DType::Int8).unwrap();
+        let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 5.0f32)).cast(DType::Int8).unwrap();
+        let mut result =
+            x.conv2d().weight(&w).acc_dtype(DType::Int64).call().unwrap().contiguous();
+        result.realize_with(&config).unwrap();
+        assert_eq!(result.uop().dtype(), DType::Int64);
+        assert_eq!(result.as_vec::<i64>().unwrap(), vec![450]);
+    }
+
+    fn test_avg_pool2d_int8_promotes_accumulator(config) {
+        // 2x2 window of 100 sums to 400: wraps to -112 (mean -28) in int8.
+        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 100.0f32)).cast(DType::Int8).unwrap();
+
+        // count_include_pad=false divides two promoted int32 sums.
+        let mut counted = x.avg_pool2d().kernel_size(&[2, 2]).count_include_pad(false).call().unwrap().contiguous();
+        counted.realize_with(&config).unwrap();
+        assert_eq!(counted.as_vec::<i32>().unwrap(), vec![100]);
+
+        // ceil_mode=true takes the third path (sum / pooled-ones sum).
+        let mut ceil = x
+            .avg_pool2d()
+            .kernel_size(&[2, 2])
+            .count_include_pad(true)
+            .ceil_mode(true)
+            .call()
+            .unwrap()
+            .contiguous();
+        ceil.realize_with(&config).unwrap();
+        assert_eq!(ceil.as_vec::<i32>().unwrap(), vec![100]);
+
+        // count_include_pad=true without ceil_mode goes through `mean` (float32).
+        let mut plain = x.avg_pool2d().kernel_size(&[2, 2]).call().unwrap().contiguous();
+        plain.realize_with(&config).unwrap();
+        assert_eq!(plain.as_vec::<f32>().unwrap(), vec![100.0]);
     }
 }
 

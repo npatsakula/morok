@@ -33,10 +33,10 @@ impl Tensor {
 
     /// Dynamically quantized per-token linear operation.
     ///
-    /// Activations are symmetrically quantized along the contraction axis,
-    /// multiplied by a per-output-channel integer weight, accumulated in the
-    /// dtype's normal sum type,
-    /// and rescaled in FP32 before the optional bias and output cast.
+    /// Activations are symmetrically quantized along the contraction axis in
+    /// FP32 (so a float16 input keeps a representable scale), multiplied by a
+    /// per-output-channel integer weight, accumulated in the dtype's normal sum
+    /// type, and rescaled in FP32 before the optional bias and output cast.
     #[builder]
     pub fn dynamic_quantized_linear(
         &self,
@@ -86,13 +86,18 @@ impl Tensor {
         }
 
         let accumulation_dtype = Self::sum_acc_dtype(&quantized_dtype);
-        let limit = Tensor::from_const(quantized_dtype.max_value()).cast(output_dtype.clone())?;
+        // The per-token abs-max is exact in the input dtype; the scale and its
+        // reciprocal are derived in float32, where the epsilon is representable
+        // and `1 / scale` cannot overflow, then applied as one float32 multiply.
+        let limit = Tensor::from_const(quantized_dtype.max_value()).cast(DType::Float32)?;
         let neg_limit = limit.try_neg()?;
-        let epsilon = Tensor::from_const(1e-6f32).cast(output_dtype.clone())?;
-        let activation_scale =
-            self.try_abs()?.max_with().axes(-1isize).keepdim(true).call()?.try_div(&limit)?.maximum(&epsilon)?;
+        let epsilon = Tensor::from_const(1e-6f32).cast(DType::Float32)?;
+        let absmax = self.try_abs()?.max_with().axes(-1isize).keepdim(true).call()?.cast(DType::Float32)?;
+        let activation_scale = absmax.try_div(&limit)?.maximum(&epsilon)?;
+        let inv_scale = Tensor::from_const(1.0f32).try_div(&activation_scale)?;
         let quantized = self
-            .try_div(&activation_scale)?
+            .cast(DType::Float32)?
+            .try_mul(&inv_scale)?
             .round()?
             .clamp()
             .min(&neg_limit)
@@ -103,7 +108,7 @@ impl Tensor {
 
         let mut output = accumulated
             .cast(DType::Float32)?
-            .try_mul(&activation_scale.cast(DType::Float32)?)?
+            .try_mul(&activation_scale)?
             .try_mul(&weight_scale.cast(DType::Float32)?)?;
         if let Some(bias) = bias {
             output = output.try_add(&bias.cast(DType::Float32)?)?;
@@ -302,9 +307,8 @@ fn reshape_per_channel(zp: &Tensor, target_ndim: usize) -> Result<Tensor> {
 
 /// Rescale an integer result and requantize to the output zero-point's dtype.
 ///
-/// No clamping: overflow means broken calibration — let it surface as garbage
-/// rather than silently saturating to boundary values.
-/// Round → Int32 → target dtype (int-to-int trunc wraps naturally).
+/// Round → clamp to the output dtype's range → cast, matching ONNX
+/// `QuantizeLinear`, which saturates rather than wrapping.
 fn requantize(int_result: &Tensor, scales: &[&Tensor], out_scale: &Tensor, out_zero_point: &Tensor) -> Result<Tensor> {
     let out_dtype = out_zero_point.uop().dtype();
     let scale_dtype = out_scale.uop().dtype();
@@ -324,6 +328,5 @@ fn requantize(int_result: &Tensor, scales: &[&Tensor], out_scale: &Tensor, out_z
         .try_mul(&combined.cast(DType::Float64)?)?
         .try_add(&out_zero_point.cast(DType::Float64)?)?
         .round()?;
-    // Float → Int32 (safe range) → target dtype (int trunc wraps)
-    rescaled.cast(DType::Int32)?.cast(out_dtype)
+    rescaled.clamp_cast(out_dtype)
 }

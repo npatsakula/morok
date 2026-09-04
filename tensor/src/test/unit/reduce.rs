@@ -640,6 +640,38 @@ crate::codegen_tests! {
         assert_close_f32(&r, &[2.5], 1e-2);
     }
 
+    // 16384 squared deviations of 9.0 sum to 147456, past float16's 65504: the
+    // sum of squares must stay in float32 through the divide, not be cast back
+    // before it.
+    fn test_var_float16_large_n_stays_finite(config) {
+        test_setup();
+        let data: Vec<f32> = (0..16384).map(|i| if i % 2 == 0 { 3.0 } else { -3.0 }).collect();
+        let t = Tensor::from_slice(data).cast(DType::Float16).unwrap();
+
+        let v = t.var_with().axes(()).correction(0).call().unwrap();
+        assert_eq!(v.uop().dtype(), DType::Float16, "var must cast back to input dtype");
+        let v = v.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        assert!(v[0].is_finite(), "float16 var overflowed to {}", v[0]);
+        assert_close_f32(&v, &[9.0], 1e-3);
+
+        let s = t.std_with().axes(()).correction(0).call().unwrap();
+        let s = s.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        assert_close_f32(&s, &[3.0], 1e-3);
+    }
+
+    // Near-constant row: 1000 ± 4 over 8192 elements. The deviations are tiny
+    // relative to the values, but their squares still sum past float16 range.
+    fn test_var_float16_near_constant_row(config) {
+        test_setup();
+        let data: Vec<f32> = (0..8192).map(|i| if i % 2 == 0 { 1004.0 } else { 996.0 }).collect();
+        let t = Tensor::from_slice(data).try_reshape([1, 8192]).unwrap().cast(DType::Float16).unwrap();
+
+        let v = t.var_with().axes(1isize).correction(0).call().unwrap();
+        let v = v.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        assert!(v[0].is_finite(), "float16 var overflowed to {}", v[0]);
+        assert_close_f32(&v, &[16.0], 1e-3);
+    }
+
     // correction parameter (population variance) + single-element 0/0 → NaN.
     fn test_var_correction_and_single_element(config) {
         test_setup();
@@ -814,4 +846,39 @@ crate::codegen_tests! {
         let mut result = x.hardmax(-1).unwrap();
         assert_eq!(result.realize_with_and(&config).as_vec::<f32>().unwrap(), [0.0, 1.0, 0.0, 1.0, 0.0, 0.0]);
     }
+
+    fn test_sum_with_promotes_by_default(config) {
+        // 9 x 50 overflows int8; the promoted int32 accumulator keeps it exact.
+        let x = Tensor::from_slice([50i8; 9]);
+
+        let mut promoted = x.sum_with().axes(()).call().unwrap();
+        assert_eq!(promoted.uop().dtype(), DType::Int32);
+        assert_eq!(promoted.realize_with_and(&config).as_vec::<i32>().unwrap(), [450]);
+
+        // Explicit opt-out keeps the narrow accumulator (450 wraps to -62).
+        let mut narrow = x.sum_with().axes(()).promote(false).call().unwrap();
+        assert_eq!(narrow.uop().dtype(), DType::Int8);
+        assert_eq!(narrow.realize_with_and(&config).as_vec::<i8>().unwrap(), [-62]);
+
+        // An explicit dtype still wins over the default promotion.
+        let mut explicit = x.sum_with().axes(()).dtype(DType::Int64).call().unwrap();
+        assert_eq!(explicit.uop().dtype(), DType::Int64);
+        assert_eq!(explicit.realize_with_and(&config).as_vec::<i64>().unwrap(), [450]);
+    }
+}
+
+#[test]
+fn test_sum_with_rejects_dtype_and_promote() {
+    let x = Tensor::from_slice([1i8, 2, 3]);
+    assert!(matches!(
+        x.sum_with().axes(()).dtype(DType::Int64).promote(true).call(),
+        Err(crate::Error::ConflictingReductionOptions)
+    ));
+}
+
+#[test]
+fn test_prod_with_preserves_dtype_by_default() {
+    let x = Tensor::from_slice([2i8, 3, 4]);
+    assert_eq!(x.prod_with().axes(()).call().unwrap().uop().dtype(), DType::Int8);
+    assert_eq!(x.prod_with().axes(()).promote(true).call().unwrap().uop().dtype(), DType::Int32);
 }

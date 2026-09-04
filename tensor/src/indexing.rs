@@ -231,7 +231,8 @@ impl Tensor {
         match reduce {
             ScatterReduction::Sum => {
                 let zero = Tensor::const_(ConstValue::Int(0), dtype.clone());
-                let reduced = src_p.where_(&mask_p, &zero)?.sum_with().axes(-1isize).call()?;
+                // Scatter keeps `self`'s dtype: no accumulator promotion here.
+                let reduced = src_p.where_(&mask_p, &zero)?.sum_with().axes(-1isize).promote(false).call()?;
                 reduced.try_add(&self_or(ConstValue::Int(0))?)
             }
             ScatterReduction::Prod => {
@@ -330,17 +331,20 @@ impl Tensor {
         let n_stages = (orig_len as u64 - 1).ilog2() as usize + 1;
         let padded_len = 1usize << n_stages;
 
-        // Pad to power of 2
-        let sentinel = if descending {
-            if self.uop().dtype().is_float() { f64::NEG_INFINITY } else { i64::MIN as f64 }
-        } else if self.uop().dtype().is_float() {
-            f64::INFINITY
-        } else {
-            i64::MAX as f64
-        };
+        // Pad to a power of 2 with a sentinel that loses to every real element:
+        // ±inf for floats, the dtype's own extreme otherwise (an `i64`-derived
+        // sentinel is wrong for `u64` above 2^63 and for `bool`).
+        let dtype = self.uop().dtype();
         let mut padding = vec![(0isize, 0isize); ndim];
         padding[dim] = (0, (padded_len - orig_len) as isize);
-        let mut x = self.try_pad_value(&padding, sentinel)?;
+        let mut x = if dtype.is_float() {
+            let sentinel = if descending { f64::NEG_INFINITY } else { f64::INFINITY };
+            self.try_pad_value(&padding, sentinel)?
+        } else {
+            let scalar = dtype.scalar().expect("sort requires a scalar dtype");
+            let sentinel = if descending { ConstValue::min(scalar) } else { ConstValue::max(scalar) };
+            self.pad_const(&padding, sentinel)?
+        };
 
         // Unflatten dim into n_stages binary dimensions
         let unflatten_sizes: Vec<isize> = vec![2; n_stages];
