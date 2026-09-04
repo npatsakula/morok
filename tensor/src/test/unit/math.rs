@@ -139,6 +139,20 @@ fn test_isinf() {
 }
 
 crate::codegen_tests! {
+    /// Half builtins must round to half on every backend: the C backend computes
+    /// them at f32 and used to hand the f32 result straight to the consumer.
+    fn test_float16_builtins_round_to_float16(config) {
+        let x = Tensor::from_slice([0.5f32, 100.0]).cast(DType::Float16).unwrap();
+        let mut sqrt = x.try_sqrt().unwrap().cast(DType::Float32).unwrap();
+        sqrt.realize_with(&config).unwrap();
+        assert_eq!(sqrt.as_vec::<f32>().unwrap()[0], 0.70703125);
+        let mut exp2 = x.try_exp2().unwrap().cast(DType::Float32).unwrap();
+        exp2.realize_with(&config).unwrap();
+        assert!(exp2.as_vec::<f32>().unwrap()[1].is_infinite(), "exp2(100) must overflow float16");
+    }
+}
+
+crate::codegen_tests! {
     /// The lowered transcendentals must match libm. `sin(+-1e6)` exercises
     /// Payne-Hanek reduction rather than the small-angle Cody-Waite path.
     fn test_transcendental_values(config) {

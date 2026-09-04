@@ -9,7 +9,7 @@ use crate::optimizer::heuristics::{
     apply_default_upcast, apply_heuristic_upcasts, apply_image_upcasts, apply_matvec_fast_path, try_tensor_cores,
 };
 use crate::optimizer::{Opt, OptOps, Renderer, Scheduler};
-use crate::test::helpers::create_typed_matmul_pattern;
+use crate::test::helpers::{create_matmul_pattern_with, create_typed_matmul_pattern};
 use svod_ir::ops;
 
 /// Matvec-shaped `sum_k A[k] * B[k]` over `stored` buffers; with `wide`, both
@@ -69,6 +69,19 @@ fn try_tensor_cores_sees_through_widening_integer_casts(stored: DType, wide: DTy
         _ => None,
     });
     assert_eq!(wmma, uses_tc.then_some(stored));
+}
+
+/// A fused elementwise producer on a MUL operand (`relu(A) @ B`, a padded
+/// conv's `WHERE`) leaves the WMMA legal; tinygrad only checks the dtypes, so
+/// the hand-coded path must not demand bare loads.
+#[test]
+fn try_tensor_cores_accepts_fused_operands() {
+    let relu = |value: Arc<UOp>| UOp::alu(svod_ir::BinaryOp::Max, value.clone(), value.const_like(0.0f64));
+    let sink = create_matmul_pattern_with(16, 16, 16, DType::Float16, relu);
+    let mut scheduler = Scheduler::new(sink, Renderer::amd_rdna3());
+
+    assert!(try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().build()));
+    assert!(scheduler.ast().toposort().iter().any(|u| matches!(u.op(), Op::Wmma(..))));
 }
 
 /// The matvec fast path applies GROUP + LOCAL + UPCAST in one shot, unless

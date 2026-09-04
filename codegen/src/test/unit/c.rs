@@ -220,6 +220,24 @@ fn clang_vector_alignment_rounds_down_like_tinygrad() {
     );
 }
 
+/// C evaluates sub-`int` scalar arithmetic at `int` width and the `f`-suffixed
+/// builtins at f32; both results must be cast back to the IR dtype so an
+/// inlined consumer sees the wrapped or rounded value.
+#[test_case::test_case(DType::Int8, "signed char"; "int8 add")]
+#[test_case::test_case(DType::UInt16, "unsigned short"; "uint16 add")]
+#[test_case::test_case(DType::Float16, "_Float16"; "half sqrt")]
+#[test_case::test_case(DType::BFloat16, "__bf16"; "bfloat16 sqrt")]
+fn clang_narrows_promoted_arithmetic(dtype: DType, c_type: &str) {
+    let a = UOp::load().index(element(UOp::param(1, 4, dtype.clone(), None), 0)).call();
+    let value = if dtype.is_float() { a.try_sqrt().expect("sqrt") } else { a.try_add(&a).expect("add") };
+    let wide = value.cast(DType::Int32);
+    let sink = UOp::sink(vec![element(UOp::param(0, 4, DType::Int32, None), 0).store(wide)]);
+
+    let rendered = render_linearized(&sink, Some("narrow")).expect("render narrowed C arithmetic");
+    assert!(rendered.code.contains(&format!("({c_type})")), "{}", rendered.code);
+    assert_c_compiles(&rendered.code);
+}
+
 #[test]
 fn test_render_rejects_non_linear_inputs() {
     let sink = UOp::sink(vec![UOp::const_(DType::Float32, ConstValue::Float(1.0))]);

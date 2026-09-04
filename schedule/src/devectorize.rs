@@ -1943,6 +1943,9 @@ fn apply_reduce_binary(reduce_op: ReduceOp, a: Arc<UOp>, b: Arc<UOp>) -> Arc<UOp
         ReduceOp::Add => UOp::alu(BinaryOp::Add, a, b),
         ReduceOp::Mul => UOp::alu(BinaryOp::Mul, a, b),
         ReduceOp::Max => UOp::alu(BinaryOp::Max, a, b),
+        // Floats go through MAX so NaN is ignored exactly as in a max reduce;
+        // `a < b ? a : b` would keep the last element after a NaN instead.
+        ReduceOp::Min if a.dtype().is_float() => UOp::alu(BinaryOp::Max, a.neg(), b.neg()).neg(),
         ReduceOp::Min => {
             let dtype = a.dtype();
             let cond = UOp::new(

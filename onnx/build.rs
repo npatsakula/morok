@@ -196,6 +196,13 @@ fn should_skip(name: &str) -> bool {
     ];
 
     const SKIP_EXACT: &[&str] = &[
+        // The int8 expectations come from onnx's `op_qlinear_matmul.py`, which
+        // casts without clipping; the spec, QLinearConv's reference, and ONNX
+        // Runtime saturate, and so does svod.
+        "test_qlinearmatmul_2D_int8_float16",
+        "test_qlinearmatmul_2D_int8_float32",
+        "test_qlinearmatmul_3D_int8_float16",
+        "test_qlinearmatmul_3D_int8_float32",
         "test_batchnorm_example_training_mode",
         "test_batchnorm_epsilon_training_mode",
         "test_dropout_random_old",

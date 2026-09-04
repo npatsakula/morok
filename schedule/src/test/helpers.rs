@@ -140,6 +140,21 @@ pub fn create_matmul_pattern(m: i64, n: i64, k: i64) -> Arc<UOp> {
 /// Buffer-backed row-major `C[m,n] = sum_k A[m,k] * B[k,n]` with `A`/`B` stored
 /// as `stored`; with `wide`, both loads are cast to it before the product.
 pub fn create_typed_matmul_pattern(m: i64, n: i64, k: i64, stored: DType, wide: Option<DType>) -> Arc<UOp> {
+    create_matmul_pattern_with(m, n, k, stored, |value| match &wide {
+        Some(wide) => value.cast(wide.clone()),
+        None => value,
+    })
+}
+
+/// Buffer-backed row-major `C[m,n] = sum_k A[m,k] * B[k,n]` over `stored`
+/// buffers, with `operand` applied to each load before the product.
+pub fn create_matmul_pattern_with(
+    m: i64,
+    n: i64,
+    k: i64,
+    stored: DType,
+    operand: impl Fn(Arc<UOp>) -> Arc<UOp>,
+) -> Arc<UOp> {
     use smallvec::smallvec;
 
     let m_range = UOp::range_axis(UOp::index_const(m), AxisId::Renumbered(0), AxisType::Global);
@@ -148,11 +163,7 @@ pub fn create_typed_matmul_pattern(m: i64, n: i64, k: i64, stored: DType, wide: 
     let load = |numel: i64, row: &Arc<UOp>, stride: i64, col: &Arc<UOp>| {
         let buffer = UOp::new_buffer(DeviceSpec::Cpu, numel as usize, stored.clone());
         let index = row.try_mul(&UOp::index_const(stride)).and_then(|x| x.try_add(col)).expect("index should build");
-        let value = UOp::index().buffer(buffer).indices(vec![index]).call().expect("load should build");
-        match &wide {
-            Some(wide) => value.cast(wide.clone()),
-            None => value,
-        }
+        operand(UOp::index().buffer(buffer).indices(vec![index]).call().expect("load should build"))
     };
     let a = load(m * k, &m_range, k, &k_range);
     let b = load(k * n, &k_range, n, &n_range);

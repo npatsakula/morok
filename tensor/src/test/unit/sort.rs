@@ -28,6 +28,51 @@ crate::codegen_tests! {
         assert_eq!(sorted.as_vec::<f32>().unwrap(), [5.0, 4.0, 3.0, 1.0, 1.0]);
     }
 
+    fn test_sort_uint64_above_i64_max(config) {
+        // The old sentinel was `i64::MAX as f64`, below 1e19, so the pad value
+        // outranked the real data and leaked into the result.
+        let data = [3u64, 10_000_000_000_000_000_000, 2];
+        let t = Tensor::from_slice(data);
+
+        let (sorted, indices) = t.sort(-1, false).unwrap();
+        let mut sorted = sorted;
+        sorted.realize_with(&config).unwrap();
+        assert_eq!(sorted.as_vec::<u64>().unwrap(), [2, 3, 10_000_000_000_000_000_000]);
+        let mut indices = indices;
+        indices.realize_with(&config).unwrap();
+        assert_eq!(indices.as_vec::<i32>().unwrap(), [2, 0, 1]);
+
+        let (desc, _) = t.sort(-1, true).unwrap();
+        let mut desc = desc;
+        desc.realize_with(&config).unwrap();
+        assert_eq!(desc.as_vec::<u64>().unwrap(), [10_000_000_000_000_000_000, 3, 2]);
+    }
+
+    fn test_sort_bool(config) {
+        let t = Tensor::from_slice([true, false, true]);
+
+        let (asc, _) = t.sort(-1, false).unwrap();
+        let mut asc = asc;
+        asc.realize_with(&config).unwrap();
+        assert_eq!(asc.as_vec::<bool>().unwrap(), [false, true, true]);
+
+        let (desc, _) = t.sort(-1, true).unwrap();
+        let mut desc = desc;
+        desc.realize_with(&config).unwrap();
+        assert_eq!(desc.as_vec::<bool>().unwrap(), [true, true, false]);
+    }
+
+    fn test_topk_uint64_above_i64_max(config) {
+        let t = Tensor::from_slice([3u64, 10_000_000_000_000_000_000, 2]);
+        let (values, indices) = t.topk(2, -1, true).unwrap();
+        let mut values = values;
+        values.realize_with(&config).unwrap();
+        assert_eq!(values.as_vec::<u64>().unwrap(), [10_000_000_000_000_000_000, 3]);
+        let mut indices = indices;
+        indices.realize_with(&config).unwrap();
+        assert_eq!(indices.as_vec::<i32>().unwrap(), [1, 0]);
+    }
+
     fn test_sort_power_of_2_size(config) {
         let t = Tensor::from_slice([4.0f32, 2.0, 1.0, 3.0]);
         let (sorted, _) = t.sort(-1, false).unwrap();

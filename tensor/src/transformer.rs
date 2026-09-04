@@ -149,15 +149,27 @@ impl Tensor {
             .context(SymbolicShapeUnsupportedSnafu { operation: "scaled_dot_product_attention" })?;
         let scale_val = scale.unwrap_or(1.0 / (head_dim as f64).sqrt());
 
-        let scores_dtype = self.uop().dtype();
+        // Scores are formed, masked and softmaxed in the sum accumulator dtype
+        // (float32 for fp16/bf16/fp8): the fallback softmax otherwise runs in
+        // float16, where the additive mask constant is only -65504.
+        let scores_dtype = Tensor::sum_acc_dtype(&q_dtype);
 
         // Q @ K^T
         let kt = key.try_transpose(-1, -2)?;
-        let mut scores = self.matmul(&kt)?;
+        let mut scores = self.matmul_with().other(&kt).dtype(scores_dtype.clone()).call()?;
 
         // Scale
         let scale_t = Tensor::const_(scale_val, scores_dtype.clone());
         scores = scores.try_mul(&scale_t)?;
+
+        // Softcap the raw scaled scores, before any mask: capping afterwards
+        // squashes a masked `dtype::min` to `-cap`, leaving it softmax weight.
+        if let Some(cap) = softcap
+            && cap > 0.0
+        {
+            let cap_t = Tensor::const_(cap, scores_dtype.clone());
+            scores = scores.try_div(&cap_t)?.tanh()?.try_mul(&cap_t)?;
+        }
 
         // Build a boolean "keep" mask that ANDs together the causal constraint,
         // the optional sliding-window band, and the user-supplied `attn_mask`.
@@ -223,22 +235,18 @@ impl Tensor {
             scores = scores.try_add(additive)?;
         }
 
-        // Softcap
-        if let Some(cap) = softcap
-            && cap > 0.0
-        {
-            let cap_t = Tensor::const_(cap, scores_dtype.clone());
-            scores = scores.try_div(&cap_t)?.tanh()?.try_mul(&cap_t)?;
-        }
-
         // Softmax + output. Re-zero out-of-band weights so a fully-masked row
         // (whose softmax would otherwise be uniform over the masked keys)
         // produces exact zeros rather than `1/k_len` leakage.
         let mut attn_weights = scores.softmax(-1isize)?;
         if let Some(keep) = keep_mask.as_ref() {
-            let zero = Tensor::const_(ConstValue::zero(scores_dtype.base()), scores_dtype);
+            let zero = Tensor::const_(ConstValue::zero(scores_dtype.base()), scores_dtype.clone());
             let masked_out = keep.logical_not()?;
             attn_weights = zero.where_(&masked_out, &attn_weights)?;
+        }
+        // Back to the query dtype for `@ V`, as tinygrad does.
+        if scores_dtype != q_dtype {
+            attn_weights = attn_weights.cast(q_dtype)?;
         }
         attn_weights.matmul(value)
     }

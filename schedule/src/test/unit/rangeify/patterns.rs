@@ -74,6 +74,17 @@ fn widening_integer_cast_moves_onto_the_product_operands(stored: DType, wide: DT
     }
 }
 
+/// `neg(x)` lowers to `x * -1` with the constant already wrapped into the
+/// narrow type, so a widening cast above it must not touch the product.
+#[test]
+fn widening_cast_leaves_constant_products_alone() {
+    let x = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::UInt8);
+    for product in [x.neg(), x.try_mul(&x.const_like(3)).expect("mul")] {
+        let cast = product.cast(DType::Int32);
+        assert!(matches!(patterns::early_rewrites().rewrite(&cast, &mut ()), RewriteResult::NoMatch));
+    }
+}
+
 /// A reduction over an empty axis folds to its identity broadcast over the
 /// surviving shape — not to a bare scalar.
 #[test]

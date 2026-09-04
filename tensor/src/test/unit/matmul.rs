@@ -383,6 +383,23 @@ crate::codegen_tests! {
         assert_eq!(c.as_vec::<i32>().unwrap(), vec![318]);
     }
 
+    /// Narrow integer arithmetic wraps at its own width on every backend before
+    /// a widening cast sees it: `neg` is a product with a wrapped `-1`, and C
+    /// evaluates `signed char` arithmetic at `int` width unless told otherwise.
+    fn test_narrow_int_arithmetic_wraps_before_widening(config) {
+        let realized = |t: Tensor| {
+            let mut t = t.cast(DType::Int32).unwrap();
+            t.realize_with(&config).unwrap();
+            t.as_vec::<i32>().unwrap()
+        };
+        let u8s = Tensor::from_slice([1u8, 2, 200]);
+        assert_eq!(realized(u8s.try_neg().unwrap()), vec![255, 254, 56]);
+        assert_eq!(realized(u8s.try_sub(&Tensor::from_slice([2u8, 1, 100])).unwrap()), vec![255, 1, 100]);
+        assert_eq!(realized(u8s.lshift(&Tensor::from_slice([4u8, 4, 4])).unwrap()), vec![16, 32, 128]);
+        let i8s = Tensor::from_slice([100i8, -128, 127]);
+        assert_eq!(realized(i8s.try_add(&i8s).unwrap()), vec![-56, 0, -2]);
+    }
+
     /// The same widening reaches `conv`: an int8 1x1 convolution with an int32
     /// accumulator forms int32 products.
     fn test_conv_int8_products_do_not_wrap(config) {
@@ -437,7 +454,18 @@ use svod_schedule::{OptimizerRenderer, optimize_kernel_with_config};
 
 /// The single kernel AST the scheduler produces for `a·b` accumulating in `out`.
 fn matmul_kernel_ast(a_shape: &[usize], b_shape: &[usize], in_dtype: DType, out: DType) -> Arc<UOp> {
-    let a = Tensor::empty(a_shape, in_dtype.clone());
+    fused_matmul_kernel_ast(a_shape, b_shape, in_dtype, out, |a| a)
+}
+
+/// Like [`matmul_kernel_ast`], with `producer` applied to `a` before the matmul.
+fn fused_matmul_kernel_ast(
+    a_shape: &[usize],
+    b_shape: &[usize],
+    in_dtype: DType,
+    out: DType,
+    producer: impl Fn(Tensor) -> Tensor,
+) -> Arc<UOp> {
+    let a = producer(Tensor::empty(a_shape, in_dtype.clone()));
     let b = Tensor::empty(b_shape, in_dtype);
     let c = a.matmul_with().other(&b).dtype(out).call().expect("tensor matmul");
     let rangeified = svod_schedule::rangeify_with_map(UOp::sink(vec![c.uop().contiguous()])).expect("rangeify matmul");
@@ -561,6 +589,20 @@ fn native_amd_tensor_core_compile_only(
     if let Some(format_selectors) = format_selectors {
         assert!(rendered.code.contains(format_selectors), "wrong scaled format selectors");
     }
+}
+
+/// A fused elementwise producer (`relu(a) @ b`) keeps the WMMA legal; the
+/// hand-coded path must select it as tinygrad does.
+#[test]
+fn test_matmul_fused_producer_gfx1151_uses_wmma_compile_only() {
+    let ast = fused_matmul_kernel_ast(&[16, 16], &[16, 16], DType::Float16, DType::Float32, |a| a.relu().unwrap());
+    let optimizer = amd_optimizer(AmdArch::Gfx1151, None);
+    let heuristics = HeuristicsConfig::builder().matvec_enabled(false).build();
+    let config = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).heuristics(heuristics).build();
+    let optimized = optimize_kernel_with_config(ast, &optimizer, &config).expect("heuristic optimization");
+    let nodes = optimized.toposort();
+    let Op::Wmma(ops::Wmma { metadata, .. }) = find_wmma(&nodes).op() else { unreachable!() };
+    assert_eq!((metadata.dtype_in.clone(), metadata.dtype_out.clone()), (DType::Float16, DType::Float32));
 }
 
 fn eval_lane(u: &Arc<UOp>, lane: i64) -> i64 {
