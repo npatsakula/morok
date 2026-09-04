@@ -1,8 +1,9 @@
 //! CPU device implementation with selectable JIT backends.
 //!
 //! This module provides a Device instance for CPU execution using either:
-//! - Clang C codegen (default, human-readable, fast debug cycles)
-//! - LLVM JIT (maximum optimization, slower compilation)
+//! - LLVM IR codegen (default): compiled in-process through libLLVM, falling
+//!   back to `clang -x ir` when the library is not found
+//! - Clang C codegen: human-readable source, useful for debugging kernels
 //!
 //! The backend can be selected via:
 //! - `SVOD_CPU_BACKEND` environment variable ("clang" or "llvm")
@@ -27,12 +28,10 @@ use crate::object_cache::{CompilerIdentity, OBJECT_CACHE_SCHEMA, ObjectCache, Ob
 /// CPU backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CpuBackend {
-    /// Clang C codegen backend (default).
-    /// Generates C source, compiles with clang, loads via dlopen.
-    #[default]
+    /// Clang C codegen backend: C source compiled by `clang -c`.
     Clang,
-    /// LLVM JIT backend.
-    /// Maximum optimization, slower compilation.
+    /// LLVM IR backend (default): in-process libLLVM, or `clang -x ir` as fallback.
+    #[default]
     Llvm,
 }
 

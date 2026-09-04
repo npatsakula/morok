@@ -15,8 +15,8 @@ kernel.execute(&[buf_a.ptr(), buf_b.ptr(), buf_out.ptr()])?;
 
 | Backend | How it works | Feature |
 |---------|-------------|---------|
-| **Clang** (default) | Compiles C via `clang -c`, loads via JIT ELF loader | always |
-| **LLVM JIT** | Compiles LLVM IR via `clang -x ir`, loads via JIT ELF loader | always |
+| **LLVM** (default) | Compiles LLVM IR in-process through `libLLVM` (falls back to `clang -x ir`), loads via JIT ELF loader | always |
+| **Clang** | Compiles C via `clang -c`, loads via JIT ELF loader | always |
 
 Select at runtime: `SVOD_CPU_BACKEND=clang|llvm`
 
