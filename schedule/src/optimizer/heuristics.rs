@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use svod_ir::uop::reaching;
 use svod_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, TernaryOp};
 
 use crate::optimizer::config::HeuristicsConfig;
@@ -119,9 +120,10 @@ pub fn is_masked(scheduler: &Scheduler, axis: usize) -> bool {
     }
     let target_rng = &rngs[axis];
 
+    let mut reaches_target = reaching(target_rng);
     for node in scheduler.ast().toposort() {
         if let Op::Ternary(TernaryOp::Where, cond, _, _) = node.op()
-            && cond.backward_slice_ids().contains(&target_rng.id)
+            && reaches_target.contains(cond)
         {
             return true;
         }
@@ -137,13 +139,15 @@ pub fn has_broadcast_pattern(scheduler: &Scheduler, axis: usize) -> bool {
     }
     let target_rng = &rngs[axis];
 
+    // One memo shared by every buffer and index: the target range is fixed, so
+    // each node's answer is computed at most once for the whole scan.
+    let mut reaches_target = reaching(target_rng);
     for buf in scheduler.bufs() {
-        let in_backward = buf.backward_slice_ids().contains(&target_rng.id);
-        if !in_backward {
+        if !reaches_target.contains(buf) {
             continue;
         }
         if let Op::Index { indices, .. } = buf.op() {
-            let in_index = indices.iter().any(|idx| idx.backward_slice_ids().contains(&target_rng.id));
+            let in_index = indices.iter().any(|idx| reaches_target.contains(idx));
             if !in_index {
                 return true;
             }
@@ -165,13 +169,14 @@ pub fn count_strides(scheduler: &Scheduler, axis: usize) -> (usize, usize) {
     let target_rng = &rngs[axis];
     let mut num_strides = 0;
     let mut sum_strides: usize = 0;
+    let mut reaches_target = reaching(target_rng);
 
     for buf in scheduler.bufs() {
         if let Op::Index { indices, .. } = buf.op() {
             // Get the combined linearized index and unwrap WHERE if present.
             let idx = indices.first().map(|i| i.get_idx()).unwrap_or_else(|| buf.clone());
 
-            if idx.backward_slice_ids().contains(&target_rng.id) {
+            if reaches_target.contains(&idx) {
                 num_strides += 1;
             }
 
@@ -794,6 +799,20 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
 
         let upcast_and_unroll_ranges = scheduler.ranges_of(&[AxisType::Upcast, AxisType::Unroll]);
 
+        // "every existing UPCAST/UNROLL range appears in this buffer's indices"
+        // does not depend on the candidate axis, so it is computed once per
+        // buffer instead of once per (axis, buffer).
+        let bufs = scheduler.bufs();
+        let all_upcast_in_idx: Vec<bool> = {
+            let mut reach: Vec<_> = upcast_and_unroll_ranges.iter().map(reaching).collect();
+            bufs.iter()
+                .map(|buf| match buf.op() {
+                    Op::Index { indices, .. } => reach.iter_mut().all(|r2| indices.iter().any(|idx| r2.contains(idx))),
+                    _ => false,
+                })
+                .collect()
+        };
+
         for &axis_idx in &upcastable {
             if upcasted_axes.contains(&axis_idx) {
                 continue;
@@ -808,17 +827,11 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
             // Stride-0 check: axis must be NOT in some buffer's index
             // backward_slice AND all existing UPCAST/UNROLL ranges ARE.
             let has_stride0 = {
-                let bufs = scheduler.bufs();
-                bufs.iter().any(|buf| {
-                    if let Op::Index { indices, .. } = buf.op() {
-                        let rng_not_in_idx = !indices.iter().any(|idx| idx.backward_slice_ids().contains(&rng.id));
-                        let all_upcast_in_idx = upcast_and_unroll_ranges
-                            .iter()
-                            .all(|r2| indices.iter().any(|idx| idx.backward_slice_ids().contains(&r2.id)));
-                        rng_not_in_idx && all_upcast_in_idx
-                    } else {
-                        false
-                    }
+                let mut reaches_rng = reaching(rng);
+                bufs.iter().zip(&all_upcast_in_idx).any(|(buf, &all_upcast)| {
+                    all_upcast
+                        && matches!(buf.op(), Op::Index { indices, .. }
+                            if !indices.iter().any(|idx| reaches_rng.contains(idx)))
                 })
             };
 

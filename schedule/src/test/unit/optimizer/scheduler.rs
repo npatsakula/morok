@@ -535,7 +535,7 @@ fn test_shift_to_symbolic_exact_division() {
 
     let (replaced_rng, _new_rng) = result.unwrap();
     if let Op::Range { end, .. } = replaced_rng.op() {
-        assert!(end.backward_slice_ids().contains(&v.id), "reduced symbolic end should still depend on V");
+        assert!(end.any_in_subtree(|n| n.id == v.id), "reduced symbolic end should still depend on V");
     } else {
         panic!("Expected range after symbolic split");
     }

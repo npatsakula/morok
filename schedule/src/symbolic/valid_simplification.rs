@@ -113,19 +113,23 @@ pub fn simplify_valid(valid: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     let mut clauses = split_and(valid);
 
-    // Sort by priority
-    let clauses_snapshot = clauses.clone();
-    let backward_slices: Vec<&HashSet<u64>> = clauses_snapshot.iter().map(|c| c.backward_slice_ids()).collect();
+    // Sort by priority: a clause whose parsed expression more clauses depend on
+    // is applied first. One DFS per clause tallies every expression it reaches,
+    // instead of materializing each clause's whole dependency set.
+    let mut expr_ids: HashMap<u64, usize> = HashMap::new();
+    for expr_id in clauses.iter().filter_map(|c| parse_valid(c).map(|(expr, _, _)| expr.id)) {
+        let next = expr_ids.len();
+        expr_ids.entry(expr_id).or_insert(next);
+    }
+    let mut dependents = vec![0i32; expr_ids.len()];
+    for clause in &clauses {
+        for node in clause.collect_in_subtree(|n| expr_ids.contains_key(&n.id)) {
+            dependents[expr_ids[&node.id]] += 1;
+        }
+    }
     clauses.sort_by_key(|v| {
         let Some((expr, _, _)) = parse_valid(v) else { return 0i32 };
-        let expr_id = expr.id;
-        let mut priority = 0i32;
-        for (i, _other) in clauses_snapshot.iter().enumerate() {
-            if backward_slices[i].contains(&expr_id) {
-                priority -= 1;
-            }
-        }
-        priority
+        -dependents[expr_ids[&expr.id]]
     });
 
     // Save sorted list BEFORE dedup for final comparison (if ret != valids else None`)
@@ -221,7 +225,7 @@ pub(crate) fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: boo
             for candidates in &candidate_sets {
                 // `if any(X not in uop.backward_slice_with_self for X,_ in candidate): continue`
                 // — upstream skips the branch before substituting, not after.
-                if candidates.iter().any(|(x, _)| !uop.backward_slice_ids().contains(&x.id)) {
+                if candidates.iter().any(|(x, _)| !uop.any_in_subtree(|n| n.id == x.id)) {
                     continue;
                 }
                 // Substitute each candidate, simplify, substitute back, simplify again

@@ -378,7 +378,8 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
             {
                 ctx.clear_realize(value);
             }
-            if value.backward_slice_ids().contains(&index.base().id) {
+            let index_base = index.base().id;
+            if value.any_in_subtree(|n| n.id == index_base) {
                 ctx.mark_realize_non_removable(value);
             }
             None

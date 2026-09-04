@@ -2271,8 +2271,7 @@ fn reduce_mul_chain_sym(
     let mut inside = Vec::new();
     let mut outside = Vec::new();
     for factor in &factors {
-        let factor_ids = factor.backward_slice_ids();
-        let depends_on_range = range_ids.iter().any(|rid| factor_ids.contains(rid));
+        let depends_on_range = factor.any_in_subtree(|n| range_ids.contains(&n.id));
         if !depends_on_range
             && (reduce_op != ReduceOp::Max
                 || matches!(SoundVminVmaxProperty::get(factor), Some((ConstValue::Int(v), _)) if *v >= 0))

@@ -201,7 +201,7 @@ impl CFGContext {
                     // Tinygrad: assert y.src[1] not in x.backward_slice_with_self
                     // A cycle here indicates a malformed kernel structure.
                     assert!(
-                        !x.backward_slice_ids().contains(&range.id),
+                        !x.any_in_subtree(|n| n.id == range.id),
                         "CFGContext: edge would create cycle (range {} → predecessor {}). \
                          This indicates a malformed kernel — see Tinygrad linearizer.py:81",
                         range.id,

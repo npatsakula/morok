@@ -153,10 +153,6 @@ pub struct UOp {
     /// Cached O(1) lookup used by `simplify_valid` to skip And chains inside INDEX trees.
     #[debug(skip)]
     pub(crate) has_index_in_sources_cache: std::sync::OnceLock<bool>,
-    /// Cached backward slice: IDs of all nodes reachable from this UOp (including self).
-    /// O(1) membership test via `backward_slice_ids().contains(&target.id)`.
-    #[debug(skip)]
-    pub(crate) backward_slice_cache: std::sync::OnceLock<HashSet<u64>>,
     /// Whether this node or any node in its backward slice has a weak-float dtype.
     /// Cached O(1) lookup used by the value-sensitive symbolic guard.
     #[debug(skip)]
@@ -1477,7 +1473,6 @@ impl UOp {
             vmin_vmax_cache: std::sync::OnceLock::new(),
             sound_vmin_vmax_cache: std::sync::OnceLock::new(),
             has_index_in_sources_cache: std::sync::OnceLock::new(),
-            backward_slice_cache: std::sync::OnceLock::new(),
             has_weak_float_cache: std::sync::OnceLock::new(),
             device_spec_cache: std::sync::OnceLock::new(),
             addrspace_cache: std::sync::OnceLock::new(),

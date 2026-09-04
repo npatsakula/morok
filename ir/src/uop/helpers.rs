@@ -280,21 +280,11 @@ impl UOp {
         result
     }
 
-    /// Cached backward slice: set of all node IDs reachable from this UOp.
-    ///
-    /// O(1) membership test via `contains()`. Computed once and cached per-node.
-    /// Prefer this over `backward_slice()` when you only need to check if a
-    /// node is in the dependency set.
-    pub fn backward_slice_ids(self: &Arc<Self>) -> &HashSet<u64> {
-        use crate::uop::cached_property::CachedProperty;
-        use crate::uop::properties::BackwardSliceProperty;
-        BackwardSliceProperty::get(self)
-    }
-
     /// Returns all nodes that this UOp depends on (backward slice / dependency set).
     ///
-    /// For membership tests, prefer [`Self::backward_slice_ids`] which returns
-    /// a cached `HashSet<u64>` with O(1) lookup.
+    /// For membership tests prefer [`UOp::any_in_subtree`], or
+    /// [`crate::uop::reachability::SubtreeMemo`] when the same question is
+    /// asked of many roots.
     pub fn backward_slice(self: &Arc<Self>) -> Vec<Arc<Self>> {
         let mut visited = HashSet::new();
         let mut result = Vec::new();
@@ -317,11 +307,6 @@ impl UOp {
         }
 
         result
-    }
-
-    /// Returns this UOp and every node it depends on.
-    pub fn backward_slice_with_self(self: &Arc<Self>) -> Vec<Arc<Self>> {
-        self.backward_slice()
     }
 
     /// Create a new RANGE UOp with a different axis type.

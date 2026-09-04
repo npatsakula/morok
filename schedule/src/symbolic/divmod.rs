@@ -340,7 +340,7 @@ fn nest_by_factor(
             let Ok(high) = nested.try_mod(&outer).and_then(|rest| rest.try_mul(&divisor_uop)) else { continue };
             if low.is_empty() { high } else { high.try_add(&digit).ok()? }
         };
-        let cost = candidate.backward_slice_ids().len();
+        let cost = candidate.node_count();
         if best.as_ref().is_none_or(|(best_cost, _)| cost < *best_cost) {
             best = Some((cost, candidate));
         }
