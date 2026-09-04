@@ -6,6 +6,7 @@ mod importer;
 mod indexing;
 mod kernel_count;
 mod nn;
+mod origin;
 #[allow(clippy::field_reassign_with_default)]
 mod proto;
 mod reduce;

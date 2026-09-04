@@ -57,7 +57,7 @@ fn rewrite_per_shard_alu(root: &Arc<UOp>) -> Option<Arc<UOp>> {
             return None;
         }
     }
-    Some(UOp::multi(root.with_sources(local_sources), axis).rtag(root.tag().clone()))
+    Some(UOp::multi(root.with_sources(local_sources), axis).rtag(root.tag().clone()).rorigin(root.origin()))
 }
 
 fn passthrough_unary_wrapper(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -68,7 +68,7 @@ fn passthrough_unary_wrapper(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UO
     ) {
         return None;
     }
-    Some(UOp::multi(root.with_sources(vec![local]), axis).rtag(root.tag().clone()))
+    Some(UOp::multi(root.with_sources(vec![local]), axis).rtag(root.tag().clone()).rorigin(root.origin()))
 }
 
 fn reduce_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -80,7 +80,8 @@ fn reduce_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
     if axis >= *num_axes {
         return Some(
             UOp::multi(local.reduce_with_num_axes(ranges.clone(), *reduce_op, *num_axes), axis - num_axes)
-                .rtag(root.tag().clone()),
+                .rtag(root.tag().clone())
+                .rorigin(root.origin()),
         );
     }
 
@@ -126,7 +127,7 @@ fn reduce_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
     let collective = UOp::allreduce(UOp::mstack(local_reductions), device, *reduce_op);
     let result = if widen_dtype.is_some() { collective.cast(root.dtype()) } else { collective };
-    Some(result.rtag(root.tag().clone()))
+    Some(result.rtag(root.tag().clone()).rorigin(root.origin()))
 }
 
 fn lower_host_allreduce(root: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -158,9 +159,19 @@ fn lower_host_allreduce(root: &Arc<UOp>) -> Option<Arc<UOp>> {
         formals.push(UOp::placeholder_like(buffer, slot + 1, svod_ir::AddrSpace::Global).ok()?);
     }
     let body = UOp::custom_function(CustomFunctionKind::AllReduce { reduce_op: *reduce_op }, formals);
-    let call =
-        body.call(args, CallInfo { name: Some("host_allreduce".into()), precompile: true, ..CallInfo::default() });
-    Some(output.after(smallvec![call]).rtag(root.tag().clone()))
+    // Host collectives never reach `split_store`, so this is their only chance to be
+    // attributed; the whole staged reduction belongs to the ALLREDUCE's scope.
+    let call = body.call(
+        args,
+        CallInfo {
+            name: Some("host_allreduce".into()),
+            precompile: true,
+            origin: root.origin(),
+            origins: root.origin().into_iter().collect(),
+            ..CallInfo::default()
+        },
+    );
+    Some(output.after(smallvec![call]).rtag(root.tag().clone()).rorigin(root.origin()))
 }
 
 fn host_allreduce_dtype_supported(dtype: &DType) -> bool {
@@ -187,7 +198,7 @@ fn permute_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Permute(ops::Permute { axes, .. }) = root.op() else { return None };
     let (local, axis) = multi_axis(multi)?;
     let new_axis = axes.iter().position(|&candidate| candidate == axis)?;
-    Some(UOp::multi(root.with_sources(vec![local]), new_axis).rtag(root.tag().clone()))
+    Some(UOp::multi(root.with_sources(vec![local]), new_axis).rtag(root.tag().clone()).rorigin(root.origin()))
 }
 
 fn flip_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -196,7 +207,7 @@ fn flip_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
     if axes.get(axis).copied().unwrap_or(true) {
         return None;
     }
-    Some(UOp::multi(root.with_sources(vec![local]), axis).rtag(root.tag().clone()))
+    Some(UOp::multi(root.with_sources(vec![local]), axis).rtag(root.tag().clone()).rorigin(root.origin()))
 }
 
 fn const_at(uop: &Arc<UOp>, axis: usize) -> Option<ConstValue> {
@@ -223,7 +234,9 @@ fn pad_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
     Some(
-        UOp::multi(root.with_sources(vec![local, begin_pads.clone(), end_pads.clone()]), axis).rtag(root.tag().clone()),
+        UOp::multi(root.with_sources(vec![local, begin_pads.clone(), end_pads.clone()]), axis)
+            .rtag(root.tag().clone())
+            .rorigin(root.origin()),
     )
 }
 
@@ -233,7 +246,7 @@ fn move_mselect_before_movement(root: &Arc<UOp>, buffer: &Arc<UOp>, device_index
     }
     let mut sources: Vec<_> = buffer.op().sources().iter().map(|src| (*src).clone()).collect();
     sources[0] = sources[0].mselect(device_index);
-    Some(buffer.with_sources(sources).rtag(root.tag().clone()))
+    Some(buffer.with_sources(sources).rtag(root.tag().clone()).rorigin(root.origin()))
 }
 
 /// Tinygrad `multi_pm` clauses that have an exact representation in Svod.

@@ -671,7 +671,10 @@ fn canonical_arg(node: &Arc<UOp>, ids: &FxHashMap<u64, usize>, verbose: bool) ->
             }
             CanonicalArg::Call {
                 grad_tag: None,
-                metadata: info.metadata.clone(),
+                // Svod has no equivalent of Tinygrad's call `aux` strings, and origins
+                // are deliberately absent from the parity form (per-node origins are
+                // rendered in the verbose form instead).
+                metadata: Vec::new(),
                 name: info.name.clone(),
                 precompile: info.precompile,
                 precompile_backward: info.precompile_backward,

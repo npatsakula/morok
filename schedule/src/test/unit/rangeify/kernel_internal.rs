@@ -15,7 +15,7 @@ fn test_fix_assign_cycle_returns_typed_error() {
 
     let call_for_b1 = UOp::sink_with_info(vec![], KernelInfo::default()).call(
         smallvec![b2.clone()],
-        CallInfo { grad_tag: None, metadata: vec!["writer".to_string()], ..CallInfo::default() },
+        CallInfo { grad_tag: None, name: Some("writer".to_string()), ..CallInfo::default() },
     );
     let after_b1 = b1.after(smallvec![after_b2, call_for_b1]);
 

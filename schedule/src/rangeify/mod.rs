@@ -24,7 +24,7 @@ pub use indexing::{IndexingContext, run_rangeify};
 pub use kernel::{KernelGraphError, LocalAddBufferContext, RangeifyBufferContext};
 
 // Entry points
-pub use kernel::try_get_kernel_graph;
+pub use kernel::{kernel_graph_pre_cut, try_get_kernel_graph};
 pub use transforms::{RangeifyResult, rangeify, rangeify_with_map};
 
 // Configuration

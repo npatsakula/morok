@@ -6,7 +6,7 @@ use svod_ir::ConstValue;
 use svod_tensor::Tensor;
 
 use crate::init::fan_in_uniform;
-use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
+use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed, scope_index, scoped, scoped_index};
 
 use super::attention::{MultiHeadAttention, causal_mask};
 use super::blocks::{LayerNormWeights, linear_with_bias};
@@ -102,17 +102,17 @@ impl DecoderBlock {
     /// Forward with SDPA (standard path). `xa` is the encoder output.
     pub fn forward(&self, x: &Tensor, xa: &Tensor, mask: &Tensor) -> Result<Tensor> {
         // Self-attention (causal)
-        let h = self.attn_ln.apply(x)?;
-        let attn_out = self.attn.forward(&h, None, Some(mask))?;
+        let h = scoped("attn_ln", || self.attn_ln.apply(x))?;
+        let attn_out = scoped("attn", || self.attn.forward(&h, None, Some(mask)))?;
         let x = x.try_add(&attn_out).context(TensorSnafu)?;
 
         // Cross-attention
-        let h = self.cross_attn_ln.apply(&x)?;
-        let cross_out = self.cross_attn.forward(&h, Some(xa), None)?;
+        let h = scoped("cross_attn_ln", || self.cross_attn_ln.apply(&x))?;
+        let cross_out = scoped("cross_attn", || self.cross_attn.forward(&h, Some(xa), None))?;
         let x = x.try_add(&cross_out).context(TensorSnafu)?;
 
         // MLP
-        let h = self.mlp_ln.apply(&x)?;
+        let h = scoped("mlp_ln", || self.mlp_ln.apply(&x))?;
         let h = linear_with_bias(&h, &self.mlp0_w, &self.mlp0_b)?;
         let h = h.gelu_exact().context(TensorSnafu)?;
         let h = linear_with_bias(&h, &self.mlp1_w, &self.mlp1_b)?;
@@ -197,10 +197,11 @@ impl TextDecoder {
         let xa = xa.cast(self.activation_dtype.clone()).context(TensorSnafu)?;
         let mut cross_ks = Vec::with_capacity(self.blocks.len());
         let mut cross_vs = Vec::with_capacity(self.blocks.len());
-        for block in &self.blocks {
+        for (index, block) in self.blocks.iter().enumerate() {
+            let _origin = scope_index("blocks", index);
             // Keep each GEMM independent from the final layer/head packing.
-            let k = block.cross_attn.key.forward(&xa)?.contiguous();
-            let v = block.cross_attn.value.forward(&xa)?.contiguous();
+            let k = scoped("cross_attn", || scoped("key", || block.cross_attn.key.forward(&xa)))?.contiguous();
+            let v = scoped("cross_attn", || scoped("value", || block.cross_attn.value.forward(&xa)))?.contiguous();
             cross_ks.push(block.cross_attn.split_heads(&k)?);
             cross_vs.push(block.cross_attn.split_heads(&v)?);
         }
@@ -237,12 +238,12 @@ impl TextDecoder {
         let mask = causal_mask(seq_len, x.uop().dtype().clone())?;
 
         let mut x = x;
-        for block in &self.blocks {
-            x = block.forward(&x, &xa, &mask)?;
+        for (index, block) in self.blocks.iter().enumerate() {
+            x = scoped_index("blocks", index, || block.forward(&x, &xa, &mask))?;
         }
 
         // Final LayerNorm
-        let x = self.ln.apply(&x)?;
+        let x = scoped("ln", || self.ln.apply(&x))?;
 
         // Tied output: logits = x @ token_embedding.T  → [B, L, n_vocab]
         let output_weight = self.token_embedding.cast(x.uop().dtype()).context(TensorSnafu)?;
@@ -281,8 +282,9 @@ impl TextDecoder {
         let mut x = x;
         let mut selected_qk: Vec<Option<Tensor>> = (0..alignment_heads.len()).map(|_| None).collect();
         for (layer, block) in self.blocks.iter().enumerate() {
-            let h = block.attn_ln.apply(&x)?;
-            let attn_out = block.attn.forward(&h, None, Some(&mask))?;
+            let _origin = scope_index("blocks", layer);
+            let h = scoped("attn_ln", || block.attn_ln.apply(&x))?;
+            let attn_out = scoped("attn", || block.attn.forward(&h, None, Some(&mask)))?;
             x = x.try_add(&attn_out).context(TensorSnafu)?;
 
             let h = block.cross_attn_ln.apply(&x)?;
@@ -389,8 +391,9 @@ impl TextDecoder {
         let mut self_vs: Vec<Tensor> = Vec::with_capacity(self.blocks.len());
 
         for (layer, block) in self.blocks.iter().enumerate() {
-            let h = block.attn_ln.apply(&x)?;
-            let (attn_out, sk, sv) = block.attn.forward_return_kv(&h, None, Some(&mask))?;
+            let _origin = scope_index("blocks", layer);
+            let h = scoped("attn_ln", || block.attn_ln.apply(&x))?;
+            let (attn_out, sk, sv) = scoped("attn", || block.attn.forward_return_kv(&h, None, Some(&mask)))?;
             x = x.try_add(&attn_out).context(TensorSnafu)?;
 
             self_ks.push(block.attn.split_heads(&sk)?);
@@ -428,7 +431,7 @@ impl TextDecoder {
             x = x.try_add(&h).context(TensorSnafu)?;
         }
 
-        let x = self.ln.apply(&x)?;
+        let x = scoped("ln", || self.ln.apply(&x))?;
         let logits = x
             .linear()
             .weight(&self.token_embedding.cast(x.uop().dtype()).context(TensorSnafu)?)
@@ -567,11 +570,12 @@ impl TextDecoder {
         let mut new_vs: Vec<Tensor> = Vec::with_capacity(n_layer);
 
         for (l, block) in self.blocks.iter().enumerate() {
+            let _origin = scope_index("blocks", l);
             let lh_start = l * n_head;
             let lh_end = (l + 1) * n_head;
 
             // ── Self-attn with cache ─────────────────────────────────────
-            let h = block.attn_ln.apply(&x)?;
+            let h = scoped("attn_ln", || block.attn_ln.apply(&x))?;
             let q = block.attn.query.forward(&h)?;
             let new_k_raw = block.attn.key.forward(&h)?;
             let new_v_raw = block.attn.value.forward(&h)?;
@@ -732,7 +736,7 @@ impl TextDecoder {
                 svod_ir::SInt::Const(d_head),
             ])
             .context(TensorSnafu)?;
-        let x = self.ln.apply(&x)?;
+        let x = scoped("ln", || self.ln.apply(&x))?;
         let logits = x
             .linear()
             .weight(&self.token_embedding.cast(x.uop().dtype()).context(TensorSnafu)?)

@@ -67,11 +67,13 @@ fn prepared(id: u64, kernel: CachedKernel, buffer_indices: Vec<usize>) -> Prepar
         buffer_ptrs: Vec::new(),
         buffer_ids: Vec::new(),
         runtime_vars: Vec::new(),
+        origin: None,
+        origins: Default::default(),
     }
 }
 
 fn copy_op(id: u64, buffer_indices: Vec<usize>, dependencies: Vec<u64>) -> PreparedOp {
-    PreparedOp::BufferCopy(PreparedCopy { id, buffer_indices, dependencies })
+    PreparedOp::BufferCopy(PreparedCopy { id, buffer_indices, dependencies, origin: None, origins: Default::default() })
 }
 
 /// Copies `buffers[1]` over `buffers[0]`, four f32 wide, counting its calls.
@@ -231,6 +233,8 @@ fn custom_function_over_an_absent_buffer(builder: &mut ExecutionPlanBuilder) -> 
         fixedvars: HashMap::new(),
         dependencies: Vec::new(),
         runtime_vars: Vec::new(),
+        origin: None,
+        origins: Default::default(),
     }));
     dst
 }
@@ -308,6 +312,8 @@ fn test_execute_custom_function_op_returns_unsupported() {
         fixedvars: HashMap::new(),
         dependencies: Vec::new(),
         runtime_vars: Vec::new(),
+        origin: None,
+        origins: Default::default(),
     }));
     builder.set_output_buffer(dst_idx);
 
@@ -339,6 +345,8 @@ fn test_execution_plan_runs_host_allreduce_numerically() {
         fixedvars: HashMap::new(),
         dependencies: Vec::new(),
         runtime_vars: Vec::new(),
+        origin: None,
+        origins: Default::default(),
     }));
     builder.set_output_buffer(output);
     let plan = builder.build().unwrap();
@@ -831,6 +839,30 @@ impl svod_device::Graph for ProfileReplayGraph {
         self.replays.fetch_add(1, Ordering::SeqCst);
         Ok(Some(vec![Arc::new(FixedGraphTimestamps { drops: Arc::clone(&self.timestamp_drops) })]))
     }
+}
+
+/// Attribution rides the dispatch, not the shared program: both profile push
+/// sites copy it off the `PreparedKernel`.
+#[test]
+fn profiles_carry_the_dispatch_origins() {
+    use svod_ir::origin::{self, Origin, OriginFrame};
+
+    let origin = origin::intern(Origin { parent: None, frame: OriginFrame::Label { text: "profiled".into() } });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let dst_idx = builder.add_buffer(7, cpu_buffer(DType::Float32, 4));
+    let src_idx = builder.add_buffer(8, f32_buffer(&[1.0, 2.0, 3.0, 4.0]));
+    let mut kernel = prepared(7, cached(copy4f32(&calls), 2), vec![dst_idx, src_idx]);
+    kernel.origin = Some(origin);
+    kernel.origins = [origin].into_iter().collect();
+    builder.add_kernel(kernel);
+    builder.set_output_buffer(dst_idx);
+    let plan = builder.build().unwrap();
+
+    let profiles = plan.execute_profiled().unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].origin, Some(origin));
+    assert_eq!(profiles[0].origins.as_ref(), [origin]);
 }
 
 /// With a graph backend attached, profiling reads the replay's own timestamps

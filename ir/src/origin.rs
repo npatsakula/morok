@@ -375,6 +375,12 @@ pub fn get(id: OriginId) -> Option<Origin> {
     arena().table.read().expect("origin arena is poisoned").get(id.get() as usize - 1).cloned()
 }
 
+/// Whether `id` names a call frame, without cloning the frame out of the arena.
+fn is_call(id: OriginId) -> bool {
+    let table = arena().table.read().expect("origin arena is poisoned");
+    table.get(id.get() as usize - 1).is_some_and(|origin| matches!(origin.frame, OriginFrame::Call { .. }))
+}
+
 /// Every origin interned so far, in id order (`snapshot()[i]` is id `i + 1`).
 /// The arena is append-only, so the length only grows.
 pub fn snapshot() -> Vec<Origin> {
@@ -441,16 +447,51 @@ fn flag() -> &'static AtomicBool {
     })
 }
 
-/// Whether scope constructors capture. Process-wide, seeded once from `SVOD_ORIGIN`
-/// (unset, empty or `0` means off).
-#[inline]
-pub fn enabled() -> bool {
-    flag().load(Ordering::Relaxed)
+thread_local! {
+    /// Per-thread capture override; `None` defers to the process-wide flag.
+    static LOCAL_FLAG: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// Turn capture on or off, returning the previous setting.
+/// Whether scope constructors capture: this thread's override when it has one,
+/// else the process-wide flag, seeded once from `SVOD_ORIGIN` (unset, empty or
+/// `0` means off).
+#[inline]
+pub fn enabled() -> bool {
+    match LOCAL_FLAG.with(Cell::get) {
+        Some(value) => value,
+        None => flag().load(Ordering::Relaxed),
+    }
+}
+
+/// Turn capture on or off process-wide, returning the previous setting.
 pub fn set_enabled(value: bool) -> bool {
     flag().swap(value, Ordering::Relaxed)
+}
+
+/// Override capture for the current thread only, returning the previous
+/// override. Tests use this: capture changes node identity, so flipping the
+/// process-wide flag would reshape graphs that other threads build in parallel.
+/// Worker threads inherit nothing — carry a captured scope across a thread
+/// boundary with [`install`] instead.
+pub fn set_enabled_for_thread(value: Option<bool>) -> Option<bool> {
+    LOCAL_FLAG.with(|cell| cell.replace(value))
+}
+
+/// Thread-local capture override that restores the previous override on drop.
+#[must_use]
+pub struct ThreadCapture {
+    previous: Option<bool>,
+}
+
+impl Drop for ThreadCapture {
+    fn drop(&mut self) {
+        set_enabled_for_thread(self.previous);
+    }
+}
+
+/// Force capture on or off for the current thread until the guard drops.
+pub fn capture_for_thread(value: bool) -> ThreadCapture {
+    ThreadCapture { previous: set_enabled_for_thread(Some(value)) }
 }
 
 thread_local! {
@@ -506,6 +547,23 @@ impl OriginScope {
     /// A public entry point plus the caller location the `#[track_caller]` chain resolved.
     pub fn call(op: OpName, at: &'static Location<'static>) -> Self {
         Self::push(|| OriginFrame::Call { op, at: SourceLocation::from_caller(at) })
+    }
+
+    /// A public entry point that yields to an outer one: the frame is pushed only
+    /// when the current leaf is not already a call, so an op implemented on top of
+    /// other public ops keeps exactly one call frame — the outermost, which is the
+    /// one that names user code.
+    pub fn outer_call(op: OpName, at: &'static Location<'static>) -> Self {
+        let previous = current();
+        if enabled() && !previous.is_some_and(is_call) {
+            CURRENT.with(|cell| {
+                cell.set(Some(intern(Origin {
+                    parent: previous,
+                    frame: OriginFrame::Call { op, at: SourceLocation::from_caller(at) },
+                })))
+            });
+        }
+        Self { previous }
     }
 
     /// Detach from the enclosing scope: nodes built inside carry no origin.

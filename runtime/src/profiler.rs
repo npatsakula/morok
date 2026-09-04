@@ -254,6 +254,10 @@ pub struct KernelProfile {
     pub kernel: Arc<CachedKernel>,
     /// Device this kernel executed on.
     pub device: DeviceSpec,
+    /// Scope this dispatch is charged to, from the plan op that produced it.
+    pub origin: Option<svod_ir::OriginId>,
+    /// Every scope folded into this kernel.
+    pub origins: svod_ir::OriginSet,
     /// Number of buffer arguments.
     pub num_buffers: usize,
     /// Host wall-clock around the dispatch submit. On async backends (GPU) this

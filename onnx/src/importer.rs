@@ -9,6 +9,7 @@ use prost::Message;
 use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_ir::SInt;
+use svod_ir::origin::OriginScope;
 use svod_tensor::{Tensor, Variable};
 
 use crate::error::{EmptyModelSnafu, IoSnafu, MissingInputSnafu, ProtobufDecodeSnafu, Result};
@@ -263,6 +264,9 @@ impl OnnxImporter {
         let initializer_names: std::collections::HashSet<String> =
             proto_graph.initializer.iter().map(|i| i.name.clone()).collect();
 
+        // Weights are built outside any node, so they get their own root scope.
+        let initializer_scope = OriginScope::label("initializer");
+
         // Create DISK tensor if we have a file path
         let disk_tensor = model_path.map(|p| Tensor::from_path(p).expect("DISK tensor creation"));
 
@@ -322,6 +326,7 @@ impl OnnxImporter {
                 initializers.insert(init.name.clone(), const_fold_scalar(tensor));
             }
         }
+        drop(initializer_scope);
 
         // Extract input specs (excluding initializers)
         let mut inputs: HashMap<String, InputSpec> = HashMap::new();
@@ -453,13 +458,14 @@ impl OnnxImporter {
 
         // Process nodes in order (ONNX guarantees topological order)
         for (node_index, node) in graph.nodes.iter().enumerate() {
-            let _span = tracing::debug_span!("onnx_node", idx = node_index, op = %node.op_type).entered();
-
             let node_opset = if node.domain.is_empty() || node.domain == "ai.onnx" {
                 opset_version
             } else {
                 onnx_opset_version(&graph.opsets, &node.domain)
             };
+
+            let _span = tracing::debug_span!("onnx_node", idx = node_index, op = %node.op_type).entered();
+            let _origin = node_origin(node_index, node, node_opset);
 
             // Gather fast path: when indices are from initializers/Constant nodes,
             // use shrink+cat instead of index_select. Creates zero kernels vs 2-5
@@ -522,6 +528,7 @@ impl OnnxImporter {
     /// Prepare a subgraph from a GraphProto embedded in a node attribute.
     /// Recursively extracts nested subgraph attributes (e.g., If inside If).
     fn prepare_subgraph(&self, graph: &GraphProto) -> Result<SubGraph> {
+        let initializer_scope = OriginScope::label("initializer");
         let mut initializers: HashMap<String, Tensor> = HashMap::new();
         for init in &graph.initializer {
             if !init.name.is_empty() {
@@ -529,6 +536,7 @@ impl OnnxImporter {
                 initializers.insert(init.name.clone(), tensor);
             }
         }
+        drop(initializer_scope);
 
         let input_names: Vec<String> = graph
             .input
@@ -560,9 +568,14 @@ impl OnnxImporter {
     fn execute_subgraph(
         &self,
         subgraph: &SubGraph,
+        branch: &str,
         parent_values: &HashMap<String, Tensor>,
         opset_version: i64,
     ) -> Result<Vec<Tensor>> {
+        // Both branches of an `If` end up in the merged graph, so the attribute name
+        // is what separates them under the enclosing node's origin.
+        let _origin = OriginScope::label(branch);
+
         // Start with subgraph's own initializers
         let mut values: HashMap<String, Tensor> = subgraph.initializers.clone();
 
@@ -574,6 +587,7 @@ impl OnnxImporter {
         // Execute subgraph nodes (subgraphs inherit the parent's opset).
         // Control-flow ops (If) are intercepted here, matching trace_graph.
         for (node_index, node) in subgraph.nodes.iter().enumerate() {
+            let _origin = node_origin(node_index, node, opset_version);
             if node.op_type == "If" {
                 self.process_if_node(node_index, node, &mut values, opset_version, &subgraph.subgraphs)?;
             } else {
@@ -622,8 +636,8 @@ impl OnnxImporter {
             .get(&(node_index, "else_branch".to_string()))
             .ok_or_else(|| crate::Error::IrConstruction { details: "If node missing else_branch attribute".into() })?;
 
-        let then_outputs = self.execute_subgraph(then_branch, values, opset_version)?;
-        let else_outputs = self.execute_subgraph(else_branch, values, opset_version)?;
+        let then_outputs = self.execute_subgraph(then_branch, "then_branch", values, opset_version)?;
+        let else_outputs = self.execute_subgraph(else_branch, "else_branch", values, opset_version)?;
 
         for (i, output_name) in node.output.iter().enumerate() {
             if output_name.is_empty() {
@@ -733,6 +747,18 @@ impl Default for OnnxImporter {
     }
 }
 
+/// Origin scope for one ONNX node: the index into its own `graph.node` plus the
+/// identity a profile row needs. Costs one atomic load while capture is off.
+fn node_origin(index: usize, node: &NodeProto, opset: i64) -> OriginScope {
+    OriginScope::onnx(
+        index as u32,
+        (!node.name.is_empty()).then_some(node.name.as_str()),
+        &node.op_type,
+        &node.domain,
+        opset,
+    )
+}
+
 /// Const-fold a scalar tensor (shape `()`) into a CONST UOp.
 ///
 /// When a tensor has exactly 1 element and a buffer, extract the scalar value
@@ -774,6 +800,7 @@ fn resolve_symbolic_shapes(
     variables: &HashMap<String, Variable>,
     bindings: &HashMap<String, i64>,
 ) -> Result<HashMap<String, Tensor>> {
+    let _origin = OriginScope::label("input");
     specs
         .iter()
         .filter(|(_, spec)| !spec.optional)

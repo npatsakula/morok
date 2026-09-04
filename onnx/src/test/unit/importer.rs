@@ -839,7 +839,7 @@ fn test_batch_norm_training() {
 ///
 /// Graph: condition (bool scalar initializer) -> If -> output
 /// The then_branch adds `x + 10.0`, the else_branch adds `x + 20.0`.
-fn make_if_model(cond_value: bool, x_values: &[f32]) -> ModelProto {
+pub(super) fn make_if_model(cond_value: bool, x_values: &[f32]) -> ModelProto {
     let mut model = ModelProto::default();
     let mut graph = GraphProto::default();
     graph.name = "if_test".to_string();

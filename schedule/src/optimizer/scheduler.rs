@@ -68,7 +68,9 @@ pub fn finalize_kernel_name(ast: &Arc<UOp>) -> Arc<UOp> {
         Op::Sink(ops::Sink { sources, info }) => {
             let mut structural = info.clone().unwrap_or_default();
             structural.name = Some(name.clone());
-            UOp::sink_with_info(sources.iter().cloned().collect(), structural).rtag(ast.tag().clone())
+            UOp::sink_with_info(sources.iter().cloned().collect(), structural)
+                .rtag(ast.tag().clone())
+                .rorigin(ast.origin())
         }
         _ => ast.clone(),
     };

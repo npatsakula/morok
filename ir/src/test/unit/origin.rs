@@ -1,33 +1,12 @@
 //! Unit tests for the origin arena, scopes, rendering and UOp carriage.
 
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::Arc;
 
 use proptest::prelude::*;
 use test_case::test_case;
 
 use crate::origin::{self, Origin, OriginFrame, OriginId, OriginScope, OriginSet, SourceLocation};
 use crate::{ConstValue, DType, Op, ParamArg, UOp, ops};
-
-/// `set_enabled` is process-wide, so every test that flips it runs alone and
-/// restores the previous value even if the body panics.
-struct Capture {
-    _guard: MutexGuard<'static, ()>,
-    previous: bool,
-}
-
-impl Capture {
-    fn on() -> Self {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|poison| poison.into_inner());
-        Self { _guard: guard, previous: origin::set_enabled(true) }
-    }
-}
-
-impl Drop for Capture {
-    fn drop(&mut self) {
-        origin::set_enabled(self.previous);
-    }
-}
 
 fn module(name: &str) -> Origin {
     Origin { parent: None, frame: OriginFrame::Module { name: Arc::from(name) } }
@@ -100,7 +79,7 @@ proptest! {
 
 #[test]
 fn scopes_nest_and_restore_on_drop() {
-    let _capture = Capture::on();
+    let _capture = crate::origin::capture_for_thread(true);
     assert_eq!(origin::current(), None);
 
     let outer = OriginScope::module("encoder");
@@ -118,7 +97,7 @@ fn scopes_nest_and_restore_on_drop() {
 
 #[test]
 fn a_panic_unwinding_through_a_scope_restores_the_previous_one() {
-    let _capture = Capture::on();
+    let _capture = crate::origin::capture_for_thread(true);
     let _outer = OriginScope::module("unwind-outer");
     let outer_id = origin::current();
 
@@ -133,7 +112,7 @@ fn a_panic_unwinding_through_a_scope_restores_the_previous_one() {
 
 #[test]
 fn suspend_detaches_and_install_reattaches() {
-    let _capture = Capture::on();
+    let _capture = crate::origin::capture_for_thread(true);
     let _outer = OriginScope::module("suspend-outer");
     let outer_id = origin::current().expect("scope installed");
 
@@ -147,6 +126,7 @@ fn suspend_detaches_and_install_reattaches() {
 
     let worker = std::thread::spawn(move || {
         assert_eq!(origin::current(), None, "a fresh thread starts unscoped");
+        let _capture = crate::origin::capture_for_thread(true);
         let _installed = origin::install(Some(outer_id));
         let seen = origin::current();
         let _nested = OriginScope::label("worker");
@@ -162,9 +142,7 @@ fn suspend_detaches_and_install_reattaches() {
 #[test_case("onnx"; "onnx frame")]
 #[test_case("call"; "call frame")]
 fn constructors_are_no_ops_while_capture_is_off(kind: &str) {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|poison| poison.into_inner());
-    let previous = origin::set_enabled(false);
+    let _capture = crate::origin::capture_for_thread(false);
 
     let scope = match kind {
         "module" => OriginScope::module("off"),
@@ -175,7 +153,6 @@ fn constructors_are_no_ops_while_capture_is_off(kind: &str) {
     let captured = origin::current();
     drop(scope);
 
-    origin::set_enabled(previous);
     assert_eq!(captured, None, "{kind} scope must not capture while disabled");
 }
 
@@ -318,7 +295,7 @@ fn expression() -> Arc<UOp> {
 
 #[test]
 fn distinct_scopes_split_a_shared_expression() {
-    let _capture = Capture::on();
+    let _capture = crate::origin::capture_for_thread(true);
 
     let (first, first_origin) = {
         let _scope = OriginScope::module("split.a");
@@ -343,7 +320,7 @@ fn distinct_scopes_split_a_shared_expression() {
 
 #[test]
 fn rewrites_and_rebuilds_keep_the_origin() {
-    let _capture = Capture::on();
+    let _capture = crate::origin::capture_for_thread(true);
     let _scope = OriginScope::module("carriage");
     let scope_id = origin::current();
 
@@ -358,7 +335,7 @@ fn rewrites_and_rebuilds_keep_the_origin() {
 
 #[test]
 fn rorigin_reinterns_and_is_identity_when_equal() {
-    let _capture = Capture::on();
+    let _capture = crate::origin::capture_for_thread(true);
     let outer = OriginScope::module("rorigin.outer");
     let outer_id = origin::current();
     let node = expression();
@@ -375,7 +352,7 @@ fn rorigin_reinterns_and_is_identity_when_equal() {
 
 #[test]
 fn identity_ops_never_carry_an_origin() {
-    let _capture = Capture::on();
+    let _capture = crate::origin::capture_for_thread(true);
     let _scope = OriginScope::module("identity");
 
     let shape = UOp::new(Op::Stack(ops::Stack { sources: smallvec::smallvec![UOp::index_const(4)] }), DType::Index);
@@ -395,7 +372,7 @@ fn identity_ops_never_carry_an_origin() {
 
 #[test]
 fn the_optimizer_wire_format_round_trips_the_origin() {
-    let _capture = Capture::on();
+    let _capture = crate::origin::capture_for_thread(true);
     let _scope = OriginScope::module("wire");
 
     let node = expression();
@@ -408,7 +385,7 @@ fn the_optimizer_wire_format_round_trips_the_origin() {
 
 #[test]
 fn canonical_default_form_ignores_origins_while_verbose_reports_them() {
-    let _capture = Capture::on();
+    let _capture = crate::origin::capture_for_thread(true);
     let _scope = OriginScope::module("canonical");
 
     let scoped = expression();

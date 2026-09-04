@@ -4,10 +4,12 @@
 //! following Tinygrad's implementation strategy.
 
 use std::iter;
+use std::panic::Location;
 
 use bon::bon;
 use snafu::{ResultExt, ensure};
 use svod_dtype::DType;
+use svod_ir::origin::OriginScope;
 use svod_ir::{SInt, shape::Shape};
 
 use crate::{Result, Tensor, UOpSnafu, error::*};
@@ -37,6 +39,7 @@ impl Tensor {
     /// let b = Tensor::from_slice(&[5.0f32, 6.0, 7.0, 8.0]).try_reshape(&[2, 2])?;
     /// let result = a.dot(&b)?; // [2, 2]
     /// ```
+    #[track_caller]
     pub fn dot(&self, other: &Tensor) -> Result<Tensor> {
         self.matmul_with().other(other).call()
     }
@@ -51,6 +54,7 @@ impl Tensor {
     /// let b = Tensor::from_slice(&[5.0f32, 6.0, 7.0, 8.0]).try_reshape(&[2, 2])?;
     /// let result = a.matmul(&b)?;
     /// ```
+    #[track_caller]
     pub fn matmul(&self, other: &Tensor) -> Result<Tensor> {
         self.matmul_with().other(other).call()
     }
@@ -79,7 +83,10 @@ impl Tensor {
     /// let result = a.matmul_with(&b).dtype(DType::Float64).call()?;
     /// ```
     #[builder]
+    #[track_caller]
     pub fn matmul_with(&self, other: &Tensor, dtype: Option<DType>) -> Result<Tensor> {
+        let _origin = OriginScope::outer_call("matmul", Location::caller());
+
         // Step 1: Check dimensions
         let (dx, dw) = (self.ndim()?, other.ndim()?);
         ensure!(dx != 0 && dw != 0, DotDimensionSnafu { lhs_dims: dx, rhs_dims: dw });
@@ -170,7 +177,9 @@ impl Tensor {
     /// // result shape: [1, 2]
     /// ```
     #[builder]
+    #[track_caller]
     pub fn linear(&self, weight: &Tensor, bias: Option<&Tensor>, dtype: Option<DType>) -> Result<Tensor> {
+        let _origin = OriginScope::outer_call("linear", Location::caller());
         let weight_shape = weight.shape()?;
 
         // For 1D weight, use element-wise multiply (broadcast)

@@ -3,9 +3,12 @@
 //! This module provides reduction operations like sum, max, min, prod, and mean
 //! with ergonomic APIs that match PyTorch/NumPy conventions.
 
+use std::panic::Location;
+
 use bon::bon;
 use snafu::ResultExt;
 use svod_dtype::{DType, ScalarDType};
+use svod_ir::origin::OriginScope;
 use svod_ir::{ReduceOp, SInt, UOp};
 
 use crate::{
@@ -150,6 +153,7 @@ impl Tensor {
     /// Use `sum_with().promote(false)` to preserve input dtype.
     #[track_caller]
     pub fn sum(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
+        let _origin = OriginScope::outer_call("sum", Location::caller());
         reduce_internal(self, ReduceOp::Add, axes.into(), false, None, true)
     }
 
@@ -179,6 +183,7 @@ impl Tensor {
         dtype: Option<DType>,
         promote: Option<bool>,
     ) -> Result<Self> {
+        let _origin = OriginScope::outer_call("sum", Location::caller());
         if dtype.is_some() && promote == Some(true) {
             return Err(Error::ConflictingReductionOptions);
         }
@@ -214,6 +219,7 @@ impl Tensor {
     /// Maximum of tensor elements over given axes.
     ///
     /// Always preserves input dtype.
+    #[track_caller]
     pub fn max(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
         reduce_internal(self, ReduceOp::Max, axes.into(), false, None, false)
     }

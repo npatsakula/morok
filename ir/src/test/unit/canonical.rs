@@ -352,10 +352,10 @@ fn canonical_call_sink_and_allreduce_metadata_are_typed() {
         smallvec::smallvec![],
         CallInfo {
             grad_tag: None,
-            metadata: vec!["first".into(), "second".into()],
             name: Some("call_name".into()),
             precompile: true,
             precompile_backward: true,
+            ..Default::default()
         },
     );
     let allreduce = UOp::new(
@@ -379,9 +379,7 @@ fn canonical_call_sink_and_allreduce_metadata_are_typed() {
     assert!(graph.nodes.iter().any(|node| matches!(
         &node.arg,
         CanonicalArg::Call { grad_tag, metadata, name, precompile: true, precompile_backward: true }
-            if grad_tag.is_none()
-                && metadata == &vec!["first".to_string(), "second".to_string()]
-                && name.as_deref() == Some("call_name")
+            if grad_tag.is_none() && metadata.is_empty() && name.as_deref() == Some("call_name")
     )));
     assert!(graph.nodes.iter().any(|node| matches!(
         &node.arg,

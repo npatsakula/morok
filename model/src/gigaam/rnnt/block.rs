@@ -37,6 +37,7 @@ use svod_tensor::Tensor;
 use crate::gigaam::Result;
 use crate::gigaam::error::TensorSnafu;
 use crate::gigaam::model::GigaAm;
+use crate::state::scoped;
 
 /// Decode steps per block execute. Amortizes the per-block readback; bounds
 /// the unrolled plan (~40 kernels/step).
@@ -105,10 +106,10 @@ pub(crate) fn forward_block<const W: usize>(
         let idx = t(t(win_clamp.try_reshape([b, w, 1]))?.try_expand([b, w, j]))?;
         let enc_window = t(enc_proj.gather(1, &idx))?; // [B,W,J]
 
-        let (g, new_h, new_c) = head.predictor.forward_parts(&prev, &h, &c)?;
+        let (g, new_h, new_c) = scoped("head", || scoped("predictor", || head.predictor.forward_parts(&prev, &h, &c)))?;
         // `argmax_preproj` broadcasts the `[B,1,J]` predictor projection over the
         // window axis, so the same call serves W=1 and W>1.
-        let toks = head.joint.argmax_preproj(&enc_window, &g)?; // [B,W] i32
+        let toks = scoped("head", || scoped("joint", || head.joint.argmax_preproj(&enc_window, &g)))?; // [B,W] i32
         let tok64 = t(toks.cast(DType::Int64))?;
 
         let is_blank = t(tok64.try_eq(&Tensor::from_slice([blank])))?; // [B,W]

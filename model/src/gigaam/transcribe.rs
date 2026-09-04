@@ -32,6 +32,7 @@ use crate::gigaam::jit::GigaAmEncoderJit;
 use crate::gigaam::model::{GigaAm, Head};
 use crate::gigaam::rnnt::RnntBlockBackend;
 use crate::jit::InputSpec;
+use crate::state::scoped;
 
 /// User-facing knobs for [`GigaAmTranscriber`].
 ///
@@ -276,7 +277,10 @@ impl GigaAmTranscriber {
                     model.config.decoder.clone()
                 };
                 let mut jit = GigaAmCtcJit::new(model.clone());
-                jit.prepare_with_config(mel_spec, lengths_spec, &prepare_config).context(JitSnafu)?;
+                // The stage name the profiler groups by is the root of every
+                // origin path the capture below mints.
+                scoped("ctc_head", || jit.prepare_with_config(mel_spec, lengths_spec, &prepare_config))
+                    .context(JitSnafu)?;
                 HeadDecoder::Ctc { jit, decoder }
             }
             Head::Rnnt { runtime, .. } => {
@@ -288,7 +292,7 @@ impl GigaAmTranscriber {
                 // all-static now).
                 let mut enc_config = prepare_config.clone();
                 enc_config.device_local_outputs = true;
-                enc.prepare_with_config(mel_spec, lengths_spec, &enc_config).context(JitSnafu)?;
+                scoped("encoder", || enc.prepare_with_config(mel_spec, lengths_spec, &enc_config)).context(JitSnafu)?;
                 encoder_jit = Some(enc);
                 // Decode lanes are independent of the encoder batch: wider
                 // waves amortize the per-step launch floor over more chunks
@@ -300,7 +304,8 @@ impl GigaAmTranscriber {
                     SubsamplingMode::Conv2d => 3,
                 };
                 let max_t_sub = subs_output_length(subs_kernel, max_t_mel);
-                let backend = RnntBlockBackend::from_model(model.clone(), DECODE_LANES, max_t_sub).context(JitSnafu)?;
+                let backend = scoped("decode", || RnntBlockBackend::from_model(model.clone(), DECODE_LANES, max_t_sub))
+                    .context(JitSnafu)?;
                 let decoder = RnntDecoder::new(
                     runtime.vocabulary.clone(),
                     RnntOpts { max_symbols_per_step: runtime.max_symbols_per_step },

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use smallvec::SmallVec;
 use snafu::{ResultExt, Snafu};
+use svod_ir::origin::{OriginId, OriginSet};
 use svod_ir::{CallInfo, Op, SInt, UOp, UOpKey};
 use tracing::{debug, trace};
 
@@ -257,6 +258,25 @@ fn extract_after_callable(deps: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
     })
 }
 
+/// Rebuild `root` with every origin cleared.
+///
+/// The body keys the optimizer, BEAM, the compiled-program and the object cache,
+/// so attribution rides the CALL instead: two dispatches of the same computation
+/// from different modules must still share one compiled program. Nodes whose
+/// sources are unchanged and that carry no origin are returned as-is, so an
+/// already origin-free body hash-conses back to itself.
+fn strip_origins(root: &Arc<UOp>) -> Arc<UOp> {
+    let mut rebuilt: HashMap<u64, Arc<UOp>> = HashMap::new();
+    for node in root.toposort() {
+        let children = node.op().children();
+        let sources: Vec<Arc<UOp>> = children.iter().map(|child| rebuilt[&child.id].clone()).collect();
+        let moved = children.iter().zip(&sources).any(|(old, new)| !Arc::ptr_eq(old, new));
+        let stripped = if moved { node.with_sources(sources) } else { node.clone() };
+        rebuilt.insert(node.id, stripped.rorigin(None));
+    }
+    rebuilt.remove(&root.id).expect("toposort ends at the root")
+}
+
 /// Split STORE and END operations into individual kernels.
 ///
 /// Based on split_store.
@@ -306,6 +326,17 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
             LazyLock::new(|| local_to_param_patterns() + rangeify_codegen_patterns());
         graph_rewrite_bottom_up(&*PM_CTX_DEP, x.clone(), &mut lctx)
     };
+    // Harvest attribution before the body loses it: `origin` is what this kernel is
+    // charged to (the stored value's root), `origins` is everything that fused into it.
+    let body = ret.toposort();
+    let origins: OriginSet = body.iter().filter_map(|node| node.origin()).collect();
+    // The fallback walks root-first (the toposort is children-first), so an unattributed
+    // store target charges the kernel to the nearest attributed node above it rather
+    // than to whichever leaf happens to be deepest.
+    let origin: Option<OriginId> =
+        extract_stored_value(&ret).origin().or_else(|| body.iter().rev().find_map(|node| node.origin()));
+    let ret = if origins.is_empty() { ret } else { strip_origins(&ret) };
+
     let closed_ranges = match ret.op() {
         Op::End(ops::End { ranges, .. }) if !ranges.is_empty() => Some(ranges.clone()),
         _ => None,
@@ -328,7 +359,7 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     let sources: SmallVec<[Arc<UOp>; 4]> =
         lctx.map.values().cloned().chain(lctx.vars.keys().map(|k| k.0.clone())).collect();
 
-    let call = ast.call(sources.clone(), CallInfo::default());
+    let call = ast.call(sources.clone(), CallInfo { origin, origins, ..CallInfo::default() });
     debug!(
         call_id = call.id,
         num_sources = sources.len(),
@@ -464,6 +495,35 @@ fn fix_assign(root: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
 /// # Returns
 /// Returns `(result, RangeifyBufferContext)`.
 pub fn try_get_kernel_graph(root: Arc<UOp>) -> Result<(Arc<UOp>, RangeifyBufferContext), KernelGraphError> {
+    // The cut promises origin-free kernel bodies. Nodes minted here — the AST SINK,
+    // the END wrapper, the CALL — would otherwise adopt the scope a caller happens
+    // to be realizing inside and fork every cache keyed on the body.
+    let _detached = svod_ir::origin::OriginScope::suspend();
+
+    let (pre_cut, ctx) = kernel_graph_pre_cut(root);
+
+    let t_stage = std::time::Instant::now();
+    let after_split = split_all_stores(&pre_cut);
+    tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: split_all_stores complete");
+
+    validate_normal_kernel_devices(&after_split).context(IrSnafu)?;
+
+    let t_stage = std::time::Instant::now();
+    let result = fix_assign(&after_split).context(IrSnafu)?;
+    tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: fix_assign complete");
+
+    if crate::spec::spec_enabled() {
+        crate::spec::verify_kernel_graph(&result).context(SpecSnafu)?;
+    }
+
+    svod_ir::dump_canonical_stage("kernel_ast", &result);
+    Ok((result, ctx))
+}
+
+/// Everything before the kernel cut: STAGE → STORE buffering and the one-shot
+/// flatten pass. Split out because this is the last point where origins are still
+/// on the nodes — `split_store` harvests them onto the CALL and strips the body.
+pub fn kernel_graph_pre_cut(root: Arc<UOp>) -> (Arc<UOp>, RangeifyBufferContext) {
     use super::transforms::pm_add_buffers_patterns;
     use crate::rewrite::graph_rewrite_bottom_up;
 
@@ -512,22 +572,7 @@ pub fn try_get_kernel_graph(root: Arc<UOp>) -> Result<(Arc<UOp>, RangeifyBufferC
         "kernel split: pm_flatten_range pre-pass complete"
     );
 
-    let t_stage = std::time::Instant::now();
-    let after_split = split_all_stores(&after_ctx_free);
-    tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: split_all_stores complete");
-
-    validate_normal_kernel_devices(&after_split).context(IrSnafu)?;
-
-    let t_stage = std::time::Instant::now();
-    let result = fix_assign(&after_split).context(IrSnafu)?;
-    tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: fix_assign complete");
-
-    if crate::spec::spec_enabled() {
-        crate::spec::verify_kernel_graph(&result).context(SpecSnafu)?;
-    }
-
-    svod_ir::dump_canonical_stage("kernel_ast", &result);
-    Ok((result, ctx))
+    (after_ctx_free, ctx)
 }
 
 /// Split all STORE/END operations into CALL wrappers.

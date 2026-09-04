@@ -12,7 +12,7 @@ use svod_dtype::DType;
 use svod_ir::ConstValue;
 use svod_tensor::Tensor;
 
-use crate::state::{self, HasStateDict, StateDict, prefixed};
+use crate::state::{self, HasStateDict, StateDict, prefixed, scoped};
 
 use super::blocks::LinearWeights;
 use super::error::{Result, TensorSnafu, tk_launch_error};
@@ -68,13 +68,13 @@ impl MultiHeadAttention {
         mask: Option<&Tensor>,
         key_lens: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let q = self.query.forward(x)?;
+        let q = scoped("query", || self.query.forward(x))?;
         let kv_input = xa.unwrap_or(x);
-        let k = self.key.forward(kv_input)?;
-        let v = self.value.forward(kv_input)?;
+        let k = scoped("key", || self.key.forward(kv_input))?;
+        let v = scoped("value", || self.value.forward(kv_input))?;
 
         let out = self.fa_attention(&q, &k, &v, mask.is_some(), key_lens)?;
-        self.out.forward(&out)
+        scoped("out", || self.out.forward(&out))
     }
 
     pub fn forward_return_kv(
@@ -83,13 +83,13 @@ impl MultiHeadAttention {
         xa: Option<&Tensor>,
         mask: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        let q = self.query.forward(x)?;
+        let q = scoped("query", || self.query.forward(x))?;
         let kv_input = xa.unwrap_or(x);
-        let k = self.key.forward(kv_input)?;
-        let v = self.value.forward(kv_input)?;
+        let k = scoped("key", || self.key.forward(kv_input))?;
+        let v = scoped("value", || self.value.forward(kv_input))?;
 
         let out = self.fa_attention(&q, &k, &v, mask.is_some(), None)?;
-        let out = self.out.forward(&out)?;
+        let out = scoped("out", || self.out.forward(&out))?;
         Ok((out, k, v))
     }
 

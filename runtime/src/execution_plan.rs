@@ -35,6 +35,7 @@ use snafu::ResultExt;
 use svod_device::device::ProgramSpec;
 use svod_device::{Buffer, BufferId};
 use svod_dtype::DeviceSpec;
+use svod_ir::origin::{OriginId, OriginSet};
 use svod_ir::{CustomFunctionKind, Op, UOp};
 
 use crate::error::{ExecSnafu, Result};
@@ -174,6 +175,13 @@ pub struct PreparedKernel {
     /// from `ast`. Populated at construction so `validate_runtime_var_bounds`
     /// doesn't re-toposort on every execute call.
     pub runtime_vars: Vec<RuntimeVar>,
+
+    /// Scope this dispatch is charged to. Per dispatch, not per program: the
+    /// `kernel` above is shared by every structurally identical kernel.
+    pub origin: Option<OriginId>,
+
+    /// Every scope folded into this kernel by fusion.
+    pub origins: OriginSet,
 }
 
 impl PreparedKernel {
@@ -243,6 +251,12 @@ pub struct PreparedCopy {
 
     /// Operation IDs that must complete before this copy.
     pub dependencies: Vec<u64>,
+
+    /// Scope this copy is charged to.
+    pub origin: Option<OriginId>,
+
+    /// Every scope folded into this copy.
+    pub origins: OriginSet,
 }
 
 /// Prepared custom runtime function operation.
@@ -270,6 +284,12 @@ pub struct PreparedCustomFunction {
     /// reachable from `attrs`. Populated at construction so
     /// `validate_runtime_var_bounds` doesn't re-toposort on every execute call.
     pub runtime_vars: Vec<RuntimeVar>,
+
+    /// Scope this operation is charged to.
+    pub origin: Option<OriginId>,
+
+    /// Every scope folded into this operation.
+    pub origins: OriginSet,
 }
 
 /// Prepared execution item.
@@ -1393,6 +1413,8 @@ impl ExecutionPlan {
                             KernelProfile {
                                 kernel: Arc::clone(&kernel.kernel),
                                 device: kernel.device.clone(),
+                                origin: kernel.origin,
+                                origins: kernel.origins.clone(),
                                 num_buffers: kernel.buffer_ptrs.len(),
                                 wall,
                                 gpu_start_ns: None,
@@ -1428,6 +1450,8 @@ impl ExecutionPlan {
                                     KernelProfile {
                                         kernel: Arc::clone(&kernel.kernel),
                                         device: kernel.device.clone(),
+                                        origin: kernel.origin,
+                                        origins: kernel.origins.clone(),
                                         num_buffers: kernel.buffer_ptrs.len(),
                                         wall: start.elapsed(),
                                         gpu_start_ns: None,
@@ -1730,6 +1754,7 @@ impl std::fmt::Debug for PreparedKernel {
             .field("vals", &self.vals)
             .field("fixedvars", &self.fixedvars)
             .field("dependencies", &self.dependencies)
+            .field("origins", &self.origins)
             .finish()
     }
 }

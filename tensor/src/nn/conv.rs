@@ -1,9 +1,12 @@
 //! Convolution operations: conv2d, conv_transpose2d.
 
+use std::panic::Location;
+
 use bon::bon;
 use snafu::OptionExt;
 
 use svod_ir::SInt;
+use svod_ir::origin::OriginScope;
 
 use crate::Tensor;
 use crate::error::SymbolicShapeUnsupportedSnafu;
@@ -80,6 +83,7 @@ impl Tensor {
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![19.0]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn conv2d(
         &self,
         weight: &Tensor,
@@ -90,6 +94,7 @@ impl Tensor {
         padding: Option<&[(isize, isize)]>,
         acc_dtype: Option<svod_dtype::DType>,
     ) -> Result<Tensor> {
+        let _origin = OriginScope::outer_call("conv2d", Location::caller());
         let x_shape = self.shape()?;
         let w_shape = weight.shape()?;
 

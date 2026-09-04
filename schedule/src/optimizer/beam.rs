@@ -881,6 +881,10 @@ impl CacheKey {
         // traverses (dtype, op) of the entire DAG — same AST structure produces
         // the same hash regardless of process-local ids.
         use std::hash::{Hash, Hasher};
+        debug_assert!(
+            scheduler.ast().toposort().iter().all(|node| node.origin().is_none()),
+            "kernel ASTs are stripped at the cut; an origin here would fork the on-disk beam cache"
+        );
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         scheduler.ast().hash(&mut hasher);
         let ast_hash = hasher.finish();

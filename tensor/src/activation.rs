@@ -3,8 +3,11 @@
 //! This module provides common activation functions used in deep learning,
 //! including relu, sigmoid, tanh, softmax, and their variants.
 
+use std::panic::Location;
+
 use bon::bon;
 use snafu::{OptionExt, ResultExt, ensure};
+use svod_ir::origin::OriginScope;
 use svod_ir::{ConstValue, UOp};
 
 use crate::error::{DivisibilitySnafu, SymbolicShapeUnsupportedSnafu};
@@ -88,7 +91,9 @@ impl Tensor {
     /// let probs = logits.softmax(-1)?;
     /// // sum(probs) = 1.0, probs[i] > 0 for all i
     /// ```
+    #[track_caller]
     pub fn softmax(&self, axis: impl Into<AxisSpec>) -> Result<Self> {
+        let _origin = OriginScope::outer_call("softmax", Location::caller());
         let axis = axis.into();
 
         // softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))
@@ -116,7 +121,9 @@ impl Tensor {
     /// let log_probs = logits.log_softmax(-1)?;
     /// // More numerically stable than logits.softmax(-1)?.try_log()
     /// ```
+    #[track_caller]
     pub fn log_softmax(&self, axis: impl Into<AxisSpec>) -> Result<Self> {
+        let _origin = OriginScope::outer_call("log_softmax", Location::caller());
         let axis = axis.into();
 
         // log_softmax(x) = x - max(x) - log(sum(exp(x - max(x))))

@@ -286,8 +286,13 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
         }
     });
 
+    // The build closure runs once, at capture, on the caller's thread, so it
+    // inherits the caller's origin scope; the wrapper's name roots every kernel
+    // the plan ends up owning.
+    let name_str = name.to_string();
     let build_closure = quote! {
         (|| {
+            let __jit_origin = svod_ir::origin::OriginScope::label(#name_str);
             let model: &#model_ty = &self.model;
             let (#(#build_args),*) = (#(#build_arg_sources),*);
             #build_body

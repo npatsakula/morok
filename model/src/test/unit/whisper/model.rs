@@ -114,6 +114,7 @@ fn materialized_cross_kv_matches_reference_projection() {
 
 #[test]
 fn low_precision_cross_projection_keeps_fp32_cache_storage() {
+    let _structural = svod_ir::origin::capture_for_thread(false);
     let mut dims = small_decoder_dims();
     dims.dtype = DType::Float16;
     let model = Whisper::empty(dims.clone());

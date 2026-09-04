@@ -168,7 +168,7 @@ pub fn early_rewrites() -> TypedPatternMatcher {
 
         // Any non-SINK op with zero size → const 0.
         x if !matches!(x.op(), Op::Sink(..)) && has_zero_size(x) => {
-            let replacement = x.const_like(0).rtag(x.tag().clone());
+            let replacement = x.const_like(0).rtag(x.tag().clone()).rorigin(x.origin());
             (!Arc::ptr_eq(&replacement, x)).then_some(replacement)
         }
     }
@@ -291,7 +291,7 @@ fn convert_reduce_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Optio
     let bx_sources = transform_sources_with_bufferize(x, ctx).unwrap_or_else(|| x.op().sources().into_iter().collect());
     let indexed_src = bx_sources.first().cloned().unwrap_or_else(|| src.clone());
     let reduce_ranges: SmallVec<[Arc<UOp>; 4]> = input_ranges.iter().take(*num_axes).cloned().collect();
-    let target = indexed_src.reduce(reduce_ranges, *reduce_op);
+    let target = indexed_src.reduce(reduce_ranges, *reduce_op).rorigin(x.origin());
     let target = if let Some(t) = x.tag() { target.with_tag(t.clone()) } else { target };
 
     // Transfer context to new identity (range_map + realize_map only)
@@ -333,7 +333,9 @@ pub fn buffer_folding() -> TypedPatternMatcher {
                 if let Some(t) = compute.tag() { merged.extend(t.iter().copied()); }
                 if let Some(t) = buf.tag() { merged.extend(t.iter().copied()); }
                 let tag = if merged.is_empty() { None } else { Some(merged) };
-                let result = compute.rtag(tag);
+                // Tags merge because both identities must reach the output map; origin
+                // keeps the primary one and the harvest union recovers the rest.
+                let result = compute.rtag(tag).rorigin(compute.origin().or_else(|| buf.origin()));
                 // .shrink((0, s) for s in b2.shape) if b2.shape.
                 // try_shrink has noop detection (returns self when result shape == shrink shape).
                 if !ranges.is_empty()
