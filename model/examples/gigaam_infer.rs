@@ -70,8 +70,9 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     profile_json: Option<PathBuf>,
 
-    /// Roll origin paths up to this many outermost frames (default: the full
-    /// module path). Call frames are never a rollup level.
+    /// Roll origin paths up to this many outermost frames (default:
+    /// `SVOD_ORIGIN_DEPTH`, else the full module path). Call frames are never a
+    /// rollup level.
     #[arg(long, value_name = "N")]
     origin_depth: Option<usize>,
 
@@ -188,11 +189,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if let Some(profile) = &result.profile {
+        // `--origin-depth` wins; otherwise the depth the profile was produced at,
+        // falling back to `SVOD_ORIGIN_DEPTH` for profiles assembled stage by
+        // stage rather than through `ExecutionPlan::profile`.
+        let depth = args
+            .origin_depth
+            .or(profile.origin_depth)
+            .or_else(|| svod_runtime::ProfileOptions::from_env().origin_depth);
         if args.profile {
-            println!("\n--- Profile ---\n{}", profile.render_report(args.origin_depth));
+            println!("\n--- Profile ---\n{}", profile.render_report_at(depth));
         }
         if let Some(path) = &args.profile_json {
-            std::fs::write(path, profile.to_json(args.origin_depth))?;
+            std::fs::write(path, profile.to_json_at(depth))?;
             println!("Profile JSON: {}", path.display());
         }
     }

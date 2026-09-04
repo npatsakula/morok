@@ -289,7 +289,7 @@ Schedule-स्तर का काम एक कॉलेबल IR के ज�
 Call {
     body: Arc<UOp>,                     // FUNCTION (या उसकी बॉडी)
     args: SmallVec<[Arc<UOp>; 4]>,      // कंक्रीट आर्ग्युमेंट वैल्यूज़
-    info: CallInfo,                     // मेटाडेटा (name, grad_tag, …)
+    info: CallInfo,                     // ऐनोटेशन (name, origin, …)
 }
 ```
 
@@ -303,8 +303,12 @@ Call {
 |--------|------|----------|
 | `name` | `Option<String>` | इंसान के पढ़ने योग्य कॉलेबल नाम |
 | `grad_tag` | `Option<String>` | फ़्यूचर ग्रेडिएंट-कॉलबैक आइडेंटिटी के लिए रिज़र्व |
-| `metadata` | `Vec<String>` | स्थिर हैशेबल ऐनोटेशन |
+| `origin` | `Option<OriginId>` | स्टोर की गई वैल्यू के रूट का origin — कर्नेल किसके खाते में जाता है |
+| `origins` | `OriginSet` | स्ट्रिप होने से पहले बॉडी में पहुँच योग्य हर origin |
 | `precompile` / `precompile_backward` | `bool` | प्री-कंपाइल हिंट |
+
+कर्नेल का CALL ही वह ऐट्रिब्यूशन कैरी करता है जिसे प्रोफ़ाइलर की रोलअप पढ़ती हैं; देखें
+[कर्नेल की प्रोफ़ाइलिंग और बेंचमार्किंग](../tile-kernels/profiling.md)।
 
 ### FUNCTION — री-यूज़ेबल बॉडी
 

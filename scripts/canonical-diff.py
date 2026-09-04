@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and compare canonical schema-v6 graphs by explicit node ID."""
+"""Validate and compare canonical schema-v7 graphs by explicit node ID."""
 
 from __future__ import annotations
 
@@ -287,8 +287,9 @@ def validate_arg(value: Any, op: str, path: str) -> list[int]:
     enum_value(value["op"], REDUCE_OPS, path + ".op", "reduction")
     string_value(value["device"], path + ".device", nonempty=True)
   if kind == "call":
-    require(value["grad_tag"] is None, path + ".grad_tag", "schema v6 requires null")
-    string_list(value["metadata"], path + ".metadata")
+    require(value["grad_tag"] is None, path + ".grad_tag", "schema v7 requires null")
+    require(string_list(value["metadata"], path + ".metadata") == [],
+            path + ".metadata", "schema v7 requires an empty CALL metadata list")
     optional_string(value["name"], path + ".name")
     bool_value(value["precompile"], path + ".precompile")
     bool_value(value["precompile_backward"], path + ".precompile_backward")
@@ -395,6 +396,7 @@ def validate_verbose(value: Any, node_map: dict[int, dict[str, Any]], path: str)
     common = {"id", "tag", "backend_dtype"}
     rust_fields = common | {"runtime_id"}
     python_fields = common | {"object_id"}
+    if "origin" in entry: rust_fields.add("origin")
     if "content_xxh64" in entry: rust_fields.add("content_xxh64")
     if "content_sha256" in entry: python_fields.add("content_sha256")
     require(frozenset(entry) in {frozenset(rust_fields), frozenset(python_fields)}, entry_path,
@@ -405,6 +407,7 @@ def validate_verbose(value: Any, node_map: dict[int, dict[str, Any]], path: str)
     string_value(entry["tag"], entry_path + ".tag"); string_value(entry["backend_dtype"], entry_path + ".backend_dtype")
     identity = "runtime_id" if "runtime_id" in entry else "object_id"
     u64_value(entry[identity], entry_path + f".{identity}")
+    if "origin" in entry: string_value(entry["origin"], entry_path + ".origin", nonempty=True)
     if "content_xxh64" in entry:
       require(XXH64.fullmatch(string_value(entry["content_xxh64"], entry_path + ".content_xxh64")) is not None,
               entry_path + ".content_xxh64", "expected lowercase xxh64 payload")

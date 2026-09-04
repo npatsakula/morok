@@ -288,7 +288,7 @@ flowchart TD
 Call {
     body: Arc<UOp>,                     // FUNCTION (или его тело)
     args: SmallVec<[Arc<UOp>; 4]>,      // конкретные значения аргументов
-    info: CallInfo,                     // метаданные (name, grad_tag, ...)
+    info: CallInfo,                     // аннотации (name, origin, ...)
 }
 ```
 
@@ -301,8 +301,12 @@ Call {
 |------|-----|------------|
 | `name` | `Option<String>` | Человекочитаемое имя callable |
 | `grad_tag` | `Option<String>` | Зарезервировано для идентичности градиентного коллбека |
-| `metadata` | `Vec<String>` | Стабильные хешируемые аннотации |
+| `origin` | `Option<OriginId>` | Origin корня сохраняемого значения — то, на что списывается ядро |
+| `origins` | `OriginSet` | Все origin, достижимые в теле до их удаления |
 | `precompile` / `precompile_backward` | `bool` | Подсказки для предкомпиляции |
+
+Именно CALL ядра несёт атрибуцию, которую читают сводки профилировщика; см.
+[Профилирование и бенчмаркинг ядер](../tile-kernels/profiling.md).
 
 ### FUNCTION — переиспользуемое тело
 

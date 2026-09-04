@@ -127,6 +127,7 @@ let opts = ProfileOptions {
     iters: 50,
     static_analysis: true,
     counters: PmcSelection::Default, // add Tier 4
+    origin_depth: Some(3), // roll the origin rows up to three frames
 };
 ```
 
@@ -140,7 +141,7 @@ let opts = ProfileOptions {
 | `SVOD_PROFILE_ITERS` | replay count for the min-merge (clamped to at least 1) |
 | `SVOD_PMC` | Tier-4 selection: empty or `0` → off; `1` → the default counter set; otherwise a comma-separated token list (`sqbusy`, `waves`, `valu`) |
 | `SVOD_ORIGIN` | `1` records the scope every op is built under (module path, call site, ONNX node), see below |
-| `SVOD_ORIGIN_DEPTH` | path segments the origin rollups keep (`origin_depth`); unset keeps the full path |
+| `SVOD_ORIGIN_DEPTH` | path segments the origin rollups keep (`origin_depth`); unset — or `0` — keeps the full path |
 
 ```bash
 # Profile with 20 replays and the default hardware counters.
@@ -180,7 +181,9 @@ When a run carries origins, `render_table()` appends two rollups:
 
 Both are cut to `origin_depth` segments; call frames (`@ add tensor/src/arithmetic.rs:31`)
 stay as detail on the kernel rows and never form rollup keys. Kernels built outside any
-scope land on a `<unattributed>` row.
+scope land on a `<unattributed>` row. The depth travels on the `RunProfile`, so
+`render_table()`, `Display` and `to_json()` cut at the depth the profile was produced with
+(`SVOD_ORIGIN_DEPTH` included); `render_table_at(d)` / `to_json_at(d)` override it.
 
 ```
 origin rollup (depth 3, exclusive; rows sum to the total):
@@ -189,8 +192,10 @@ origin rollup (depth 3, exclusive; rows sum to the total):
      8.231      3     2743.7    1.9  ctc_head.GigaAmCtcJit.layers.6
 ```
 
-`RunProfile::to_json(depth)` exports the kernel rows, both rollups and the origin arena so
-ids resolve offline; `gigaam_infer --profile-json out.json --origin-depth 3` writes one.
+`RunProfile::to_json()` exports the kernel rows — each carrying the raw `origin_id` /
+`origin_ids` beside its rendered path — both rollups, and only the arena entries those ids
+reach, as `{ id, parent, frame }`, so paths resolve offline without embedding the whole
+process arena; `gigaam_infer --profile-json out.json --origin-depth 3` writes one.
 
 Turning capture on changes node identity: two identical subgraphs built under different
 scopes no longer merge before the kernel cut. Kernel programs are unaffected, but a helper

@@ -287,7 +287,7 @@ SOURCE → BINARY` 的严格阶段把体送进编译流水线。
 Call {
     body: Arc<UOp>,                     // FUNCTION（或其体）
     args: SmallVec<[Arc<UOp>; 4]>,      // 具体的参数值
-    info: CallInfo,                     // 元数据（name、grad_tag……）
+    info: CallInfo,                     // 注解（name、origin……）
 }
 ```
 
@@ -300,8 +300,12 @@ Call {
 |------|------|------|
 | `name` | `Option<String>` | 可读的 callable 名称 |
 | `grad_tag` | `Option<String>` | 为梯度回调的身份保留 |
-| `metadata` | `Vec<String>` | 稳定的可哈希注解 |
+| `origin` | `Option<OriginId>` | 被存储值根节点的 origin —— 该内核记在谁的账上 |
+| `origins` | `OriginSet` | 剥离之前体内可达的每一个 origin |
 | `precompile` / `precompile_backward` | `bool` | 预编译提示 |
+
+内核的 CALL 正是携带性能分析汇总所读取的归属信息之处；参见
+[内核的性能分析与基准测试](../tile-kernels/profiling.md)。
 
 ### FUNCTION — 可重用的体
 

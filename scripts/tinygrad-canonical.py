@@ -36,7 +36,7 @@ def verify_target() -> None:
 
 
 class CanonicalSerializationError(TypeError):
-  """The graph cannot be represented by canonical schema v6 without loss."""
+  """The graph cannot be represented by canonical schema v7 without loss."""
 
 
 class UnsupportedDivergenceError(CanonicalSerializationError):
@@ -187,11 +187,9 @@ def canonical_arg(node: UOp, ids: dict[UOp, int], stage: str, verbose: bool) -> 
     }
   if node.op in {Ops.CALL, Ops.FUNCTION} and isinstance(node.arg, CallInfo):
     if node.arg.grad_fxn is not None: raise CanonicalSerializationError("callable grad_fxn has no stable cross-language identity")
-    metadata = [] if node.arg.aux is None else node.arg.aux
-    if not isinstance(metadata, (tuple, list)) or not all(isinstance(item, str) for item in metadata):
-      raise CanonicalSerializationError(f"CallInfo aux must be a sequence of strings, got {type(metadata).__name__}")
+    if node.arg.aux: raise UnsupportedDivergenceError("CallInfo aux has no Svod CallInfo representation")
     return {
-      "kind": "call", "grad_tag": None, "metadata": list(metadata), "name": node.arg.name,
+      "kind": "call", "grad_tag": None, "metadata": [], "name": node.arg.name,
       "precompile": node.arg.precompile, "precompile_backward": node.arg.precompile_backward,
     }
   if node.op is Ops.SINK and isinstance(node.arg, KernelInfo):
@@ -711,8 +709,12 @@ def self_test() -> None:
   }
   ins = UOp(Ops.INS, dtypes.int32, src=(UOp.const(1, dtypes.int32),), arg="mock.mov")
   assert canonical_graph("self-test", (ins,))["nodes"][-1]["arg"]["opcode"] == "mock.mov"
-  call = UOp(Ops.CALL, src=(UOp.custom_function("graph"),), arg=CallInfo(name="named", precompile=True, aux=("a", "b")))
-  assert canonical_graph("self-test", (call,))["nodes"][-1]["arg"]["metadata"] == ["a", "b"]
+  call = UOp(Ops.CALL, src=(UOp.custom_function("graph"),), arg=CallInfo(name="named", precompile=True))
+  assert canonical_graph("self-test", (call,))["nodes"][-1]["arg"]["metadata"] == []
+  aux_call = UOp(Ops.CALL, src=(UOp.custom_function("graph"),), arg=CallInfo(name="named", aux=("a", "b")))
+  try: canonical_graph("self-test", (aux_call,))
+  except UnsupportedDivergenceError: pass
+  else: raise AssertionError("CALL aux strings must be rejected")
   a, b, c = (UOp.stack(UOp.const(value, dtypes.float16)) for value in (1.0, 2.0, 0.0))
   wmma = UOp.wmma(a, b, c, (16, 8, 16), "CPU", 1, (((3, 4),), ((4, 2),), ((5, 8),)))
   assert canonical_graph("self-test", (wmma,))["nodes"][-1]["arg"]["upcast_a"][0]["axis"]["path"] == [3]

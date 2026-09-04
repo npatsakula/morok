@@ -64,7 +64,7 @@ pub use leveling::{compute_topological_levels, compute_topological_order};
 pub use llvm::*;
 pub use profiler::{
     KernelAggregate, KernelExport, KernelProfile, KernelShareExport, KernelStaticInfo, OriginAggregate, OriginExport,
-    OriginView, PmcSelection, ProfileExport, ProfileOptions, RunProfile, StageExport, StageProfile, UNATTRIBUTED,
-    aggregate_origins, aggregate_profiles, has_origins, render_histogram, render_origins,
+    OriginNodeExport, OriginView, PmcSelection, ProfileExport, ProfileOptions, RunProfile, StageExport, StageProfile,
+    UNATTRIBUTED, aggregate_origins, aggregate_profiles, has_origins, render_histogram, render_origins,
 };
 pub use svod_device::{CounterSet, KernelResources, PmcCounter};

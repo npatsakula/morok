@@ -131,6 +131,7 @@ let opts = ProfileOptions {
     iters: 50,
     static_analysis: true,
     counters: PmcSelection::Default, // add Tier 4
+    origin_depth: Some(3), // сводить пути происхождения до трёх кадров
 };
 ```
 
@@ -145,7 +146,7 @@ let opts = ProfileOptions {
 | `SVOD_PROFILE_ITERS` | число повторов для слияния по минимуму (но не меньше 1) |
 | `SVOD_PMC` | выбор уровня 4: пусто или `0` → выключено; `1` → набор счётчиков по умолчанию; иначе список токенов через запятую (`sqbusy`, `waves`, `valu`) |
 | `SVOD_ORIGIN` | `1` записывает scope, в котором построена каждая операция (путь модуля, место вызова, узел ONNX), см. ниже |
-| `SVOD_ORIGIN_DEPTH` | сколько сегментов пути оставляют сводки по происхождению (`origin_depth`); не задано — полный путь |
+| `SVOD_ORIGIN_DEPTH` | сколько сегментов пути оставляют сводки по происхождению (`origin_depth`); не задано или `0` — полный путь |
 
 ```bash
 # Profile with 20 replays and the default hardware counters.
@@ -186,7 +187,9 @@ SVOD_DEVICE=AMD:0 SVOD_PMC=valu,sqbusy ...
 
 Обе обрезаются до `origin_depth` сегментов; кадры вызова (`@ add tensor/src/arithmetic.rs:31`)
 остаются деталью в строках ядер и никогда не становятся ключами сводки. Ядра, построенные
-вне любого scope, попадают в строку `<unattributed>`.
+вне любого scope, попадают в строку `<unattributed>`. Глубина едет вместе с `RunProfile`,
+поэтому `render_table()`, `Display` и `to_json()` режут на той глубине, с которой профиль был
+получен (включая `SVOD_ORIGIN_DEPTH`); `render_table_at(d)` / `to_json_at(d)` её переопределяют.
 
 ```
 origin rollup (depth 3, exclusive; rows sum to the total):
@@ -195,8 +198,10 @@ origin rollup (depth 3, exclusive; rows sum to the total):
      8.231      3     2743.7    1.9  ctc_head.GigaAmCtcJit.layers.6
 ```
 
-`RunProfile::to_json(depth)` экспортирует строки ядер, обе сводки и арену происхождений,
-чтобы идентификаторы разрешались офлайн; `gigaam_infer --profile-json out.json --origin-depth 3`
+`RunProfile::to_json()` экспортирует строки ядер — каждая несёт сырые `origin_id` /
+`origin_ids` рядом с отрисованным путём, — обе сводки и только те записи арены, до которых эти
+идентификаторы дотягиваются, в виде `{ id, parent, frame }`: пути разрешаются офлайн, а вся
+процессная арена в файл не попадает; `gigaam_infer --profile-json out.json --origin-depth 3`
 записывает такой файл.
 
 Включение захвата меняет идентичность узлов: два одинаковых подграфа, построенные в разных

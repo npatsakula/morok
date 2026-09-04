@@ -1446,6 +1446,9 @@ impl ExecutionPlan {
                             PreparedOp::CompiledProgram(kernel) => {
                                 let start = Instant::now();
                                 let handle = self.execute_kernel(kernel, /*profile=*/ true)?;
+                                // Stamp before the metadata clones, so the
+                                // origin set never lands inside the timed window.
+                                let wall = start.elapsed();
                                 finalizer.push(
                                     KernelProfile {
                                         kernel: Arc::clone(&kernel.kernel),
@@ -1453,7 +1456,7 @@ impl ExecutionPlan {
                                         origin: kernel.origin,
                                         origins: kernel.origins.clone(),
                                         num_buffers: kernel.buffer_ptrs.len(),
-                                        wall: start.elapsed(),
+                                        wall,
                                         gpu_start_ns: None,
                                         gpu_end_ns: None,
                                         static_info: None,
@@ -1524,7 +1527,10 @@ impl ExecutionPlan {
         // Each pass is one "profile" stage; merge passes by per-kernel min time.
         // Match from_env(): zero iterations still means one profiling pass.
         let result: Result<RunProfile> = (|| {
-            let run = |kernels| RunProfile { stages: vec![StageProfile::gpu("profile", start.elapsed(), kernels)] };
+            let run = |kernels| RunProfile {
+                stages: vec![StageProfile::gpu("profile", start.elapsed(), kernels)],
+                origin_depth: opts.origin_depth,
+            };
             let mut report = run(self.execute_profiled()?);
             for _ in 1..opts.iters.max(1) {
                 report.merge_min(run(self.execute_profiled()?));

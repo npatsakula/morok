@@ -101,6 +101,7 @@ let opts = ProfileOptions {
     iters: 50,
     static_analysis: true,
     counters: PmcSelection::Default, // add Tier 4
+    origin_depth: Some(3), // 来源路径汇总到三层
 };
 ```
 
@@ -113,7 +114,7 @@ let opts = ProfileOptions {
 | `SVOD_PROFILE_ITERS` | 用于取最小合并的重放次数（钳制为至少 1） |
 | `SVOD_PMC` | 第 4 层的选择：空或 `0` → 关闭；`1` → 默认计数器组；否则为一份逗号分隔的 token 列表（`sqbusy`、`waves`、`valu`） |
 | `SVOD_ORIGIN` | `1` 记录每个操作构建时所在的作用域（模块路径、调用点、ONNX 节点），见下文 |
-| `SVOD_ORIGIN_DEPTH` | 来源汇总保留的路径段数（`origin_depth`）；未设置则保留完整路径 |
+| `SVOD_ORIGIN_DEPTH` | 来源汇总保留的路径段数（`origin_depth`）；未设置或为 `0` 则保留完整路径 |
 
 ```bash
 # Profile with 20 replays and the default hardware counters.
@@ -146,7 +147,9 @@ SVOD_DEVICE=AMD:0 SVOD_PMC=valu,sqbusy ...
   互相重叠。
 
 两者都截断到 `origin_depth` 段；调用帧（`@ add tensor/src/arithmetic.rs:31`）作为细节留在内核
-行里，绝不成为汇总键。在任何作用域之外构建的内核落到 `<unattributed>` 行。
+行里，绝不成为汇总键。在任何作用域之外构建的内核落到 `<unattributed>` 行。深度随 `RunProfile`
+一起走，因此 `render_table()`、`Display` 和 `to_json()` 都按该 profile 产出时的深度截断（含
+`SVOD_ORIGIN_DEPTH`）；`render_table_at(d)` / `to_json_at(d)` 可以覆盖它。
 
 ```
 origin rollup (depth 3, exclusive; rows sum to the total):
@@ -155,7 +158,9 @@ origin rollup (depth 3, exclusive; rows sum to the total):
      8.231      3     2743.7    1.9  ctc_head.GigaAmCtcJit.layers.6
 ```
 
-`RunProfile::to_json(depth)` 导出内核行、两份汇总以及来源 arena，便于离线解析 id；
+`RunProfile::to_json()` 导出内核行（每行在渲染好的路径旁还带上原始的 `origin_id` /
+`origin_ids`）、两份汇总，以及这些 id 所能触及的那些 arena 条目——形如 `{ id, parent, frame }`，
+从而既能离线还原路径，又不会把整个进程级 arena 塞进文件；
 `gigaam_infer --profile-json out.json --origin-depth 3` 会写出这样一个文件。
 
 开启捕获会改变节点身份：在不同作用域下构建的两个相同子图，在内核切分之前不再合并。内核程序

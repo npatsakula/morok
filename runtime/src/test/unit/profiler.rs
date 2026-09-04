@@ -1,7 +1,7 @@
 //! Unit tests for the profiler data model, table rendering (GPU-free), lane
 //! metrics, and [`RunProfile::merge`] accumulation semantics.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use svod_device::PmcCounter;
@@ -52,6 +52,30 @@ fn pmc_selection_is_parsed_and_resolved() {
 
     assert_eq!(parse_pmc("valu,waves"), PmcSelection::Custom(vec![PmcCounter::SqInstsValu, PmcCounter::SqWaves]));
     assert_eq!(PmcSelection::Custom(vec![PmcCounter::SqInstsValu]).counters(), vec![PmcCounter::SqInstsValu]);
+}
+
+/// `SVOD_ORIGIN_DEPTH` parsing. Only a positive count is a depth: zero would key
+/// every rollup row on nothing and render the whole run `<unattributed>`, so it
+/// is rejected like any other non-depth value.
+#[test_case(None, None; "unset keeps the leaf")]
+#[test_case(Some(""), None; "empty")]
+#[test_case(Some("0"), None; "zero is no cut")]
+#[test_case(Some("3"), Some(3); "a positive depth")]
+#[test_case(Some(" 2 "), Some(2); "surrounding space")]
+#[test_case(Some("x"), None; "garbage")]
+fn from_env_parses_the_origin_depth(value: Option<&str>, expected: Option<usize>) {
+    // `set_var` mutates the whole process; these cases are the only readers.
+    static ENV: Mutex<()> = Mutex::new(());
+    let _guard = ENV.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    unsafe {
+        match value {
+            Some(value) => std::env::set_var("SVOD_ORIGIN_DEPTH", value),
+            None => std::env::remove_var("SVOD_ORIGIN_DEPTH"),
+        }
+    }
+    let parsed = ProfileOptions::from_env().origin_depth;
+    unsafe { std::env::remove_var("SVOD_ORIGIN_DEPTH") };
+    assert_eq!(parsed, expected, "SVOD_ORIGIN_DEPTH={value:?}");
 }
 
 #[test]
@@ -437,7 +461,7 @@ fn render_without_origins_is_byte_identical() {
          cast    1     0.050      50.0  11.1  \n"
     );
     assert_eq!(profile.render_table(), profile.render_table_at(Some(2)), "depth is moot without origins");
-    assert_eq!(profile.to_string(), profile.render_report(None), "Display is the leaf-depth report");
+    assert_eq!(profile.to_string(), profile.render_report_at(None), "Display is the leaf-depth report");
     assert!(!profile.to_string().contains("origin"), "no origin section: {}", profile);
     assert_eq!(
         profile.to_string(),
@@ -467,24 +491,68 @@ fn render_with_origins_adds_both_views_and_kernel_detail() {
     assert!(table.contains("· ffn1_gemm"), "exclusive rows list their kernels: {table}");
 
     // The report path (GigaAM's `Display`) carries the same section.
-    let report = profile.render_report(Some(1));
+    let report = profile.render_report_at(Some(1));
     assert!(report.contains("origin rollup (depth 1"), "{report}");
     assert!(report.contains("profiled exec GPU"), "the histogram is still there: {report}");
+}
+
+/// A profile carries the depth it was produced at, so every no-argument
+/// renderer cuts the rollups without the caller repeating it — this is what
+/// makes `SVOD_ORIGIN_DEPTH` reach `cargo bench`'s `render_table()`.
+#[test]
+fn stored_origin_depth_drives_the_default_renderers() {
+    let mut profile = RunProfile { origin_depth: Some(2), ..Default::default() };
+    profile.push(StageProfile::gpu("encoder", Duration::from_millis(7), stage_kernels()));
+
+    let table = profile.render_table();
+    assert_eq!(table, profile.render_table_at(Some(2)), "render_table() is the stored depth");
+    assert!(table.contains("origin rollup (depth 2"), "{table}");
+    assert!(table.contains("encoder.layers.0"), "{table}");
+    assert!(!table.contains("encoder.layers.0.ffn1"), "the leaf rows are cut away: {table}");
+    assert_eq!(profile.to_string(), profile.render_report_at(Some(2)), "Display is the stored depth");
+    assert_eq!(profile.to_json(), profile.to_json_at(Some(2)), "the export too");
+
+    // The explicit variants still override it, in both directions.
+    assert!(profile.render_table_at(None).contains("encoder.layers.0.ffn1"), "leaf override");
+    assert!(profile.render_table_at(Some(1)).contains("origin rollup (depth 1"));
+    assert_ne!(profile.render_table_at(None), table);
+}
+
+/// Both merges carry the depth, so an accumulator seeded with
+/// `RunProfile::default()` still renders at the depth its passes were made with.
+#[test]
+fn merges_carry_the_origin_depth() {
+    let deep = || RunProfile { origin_depth: Some(3), ..Default::default() };
+
+    let mut merged = RunProfile::default();
+    merged.merge(deep());
+    assert_eq!(merged.origin_depth, Some(3), "merge adopts the incoming depth");
+
+    let mut min_merged = RunProfile::default();
+    min_merged.merge_min(deep());
+    assert_eq!(min_merged.origin_depth, Some(3), "merge_min too");
+
+    let mut own = RunProfile { origin_depth: Some(1), ..Default::default() };
+    own.merge(deep());
+    assert_eq!(own.origin_depth, Some(1), "an explicit depth is never overwritten");
 }
 
 // ── JSON export ────────────────────────────────────────────────────────────
 
 /// The export round-trips through `serde_json::Value`, resolves every id it
-/// mentions through the embedded arena, and carries both rollups.
+/// mentions through the embedded origin nodes, and carries both rollups.
 #[test]
-fn json_export_round_trips_and_embeds_the_origin_arena() {
+fn json_export_round_trips_and_embeds_the_referenced_origins() {
     let mut profile = RunProfile::default();
     profile.push(StageProfile::host("mel", Duration::from_millis(2)));
     let mut stage = StageProfile::gpu("encoder", Duration::from_millis(7), stage_kernels());
     stage.meta.insert("rtf".into(), "0.02".into());
     profile.push(stage);
+    // Interned but never dispatched: it must not reach the export.
+    let unreferenced = module(None, "not_dispatched");
+    let s = scopes();
 
-    let json: serde_json::Value = serde_json::from_str(&profile.to_json(Some(2))).expect("valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&profile.to_json_at(Some(2))).expect("valid JSON");
     assert_eq!(json["origin_depth"], serde_json::json!(2));
     assert_eq!(json["stages"][0]["name"], "mel");
     assert_eq!(json["stages"][0]["dispatches"], 0);
@@ -497,6 +565,7 @@ fn json_export_round_trips_and_embeds_the_origin_arena() {
     assert_eq!(kernels[0]["count"], 1);
     assert!((kernels[0]["total_ms"].as_f64().unwrap() - 0.3).abs() < 1e-9);
     assert_eq!(kernels[0]["origin"], "ctc_head");
+    assert_eq!(kernels[0]["origin_id"], s.ctc_head.get(), "the raw id sits beside the rendered path");
     // The full path keeps the call frame the rollup key drops.
     let ffn1 = kernels.iter().find(|k| k["name"] == "ffn1_gemm").expect("ffn1 row");
     assert!(
@@ -504,6 +573,7 @@ fn json_export_round_trips_and_embeds_the_origin_arena() {
         "{ffn1}"
     );
     assert_eq!(ffn1["origins"].as_array().unwrap().len(), 2);
+    assert_eq!(ffn1["origin_ids"], serde_json::json!([s.ffn1.get(), s.ffn1_call.get()]), "ids match, id-ordered");
 
     let exclusive = json["stages"][1]["origins_exclusive"].as_array().expect("exclusive rows");
     assert!(exclusive.iter().all(|r| r["path"] != serde_json::Value::Null));
@@ -511,18 +581,29 @@ fn json_export_round_trips_and_embeds_the_origin_arena() {
     let inclusive = json["stages"][1]["origins_inclusive"].as_array().expect("inclusive rows");
     assert!(inclusive.len() >= exclusive.len(), "ancestors add rows");
 
-    // The arena resolves every id minted so far, so paths are reconstructible
-    // offline from the ids a consumer finds elsewhere.
-    let arena = json["origins"].as_array().expect("arena snapshot");
-    assert!(!arena.is_empty());
-    let s = scopes();
-    assert_eq!(arena.len(), origin::snapshot().len());
-    assert!(arena.len() >= s.encoder.get() as usize);
-    assert_eq!(json["origin_depth"], 2);
-    let first = origin::get(s.encoder).expect("interned");
-    assert_eq!(
-        arena[s.encoder.get() as usize - 1],
-        serde_json::to_value(&first).unwrap(),
-        "arena entries are the interned origins"
-    );
+    // The exported origins are the ancestor closure of the referenced ids — not
+    // the process-global arena — and every parent link resolves inside it, so a
+    // consumer rebuilds any path offline.
+    let nodes = json["origins"].as_array().expect("origin nodes");
+    let by_id: std::collections::HashMap<u64, &serde_json::Value> =
+        nodes.iter().map(|node| (node["id"].as_u64().expect("id"), node)).collect();
+    let ids: Vec<u64> = nodes.iter().map(|node| node["id"].as_u64().unwrap()).collect();
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "id-ordered and deduplicated: {ids:?}");
+    for node in nodes {
+        if let Some(parent) = node["parent"].as_u64() {
+            assert!(by_id.contains_key(&parent), "closed under parents: {node}");
+        }
+    }
+
+    // Ancestors of a referenced leaf are pulled in; unreferenced scopes are not.
+    assert!(ids.contains(&(s.encoder.get() as u64)), "the root of a referenced leaf: {ids:?}");
+    assert!(!ids.contains(&(unreferenced.get() as u64)), "an unreferenced scope: {ids:?}");
+    assert!(nodes.len() < origin::snapshot().len(), "narrower than the whole arena");
+
+    // A row's id resolves to the frame the path was rendered from.
+    let head = by_id[&(s.ctc_head.get() as u64)];
+    assert_eq!(head["frame"], serde_json::json!({ "Module": { "name": "ctc_head" } }));
+    assert_eq!(head["parent"], serde_json::Value::Null, "a root scope");
+    let call = by_id[&(s.ffn1_call.get() as u64)];
+    assert_eq!(call["parent"], s.ffn1.get(), "call frames keep their module parent");
 }

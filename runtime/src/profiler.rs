@@ -27,7 +27,8 @@
 //! [`ExecutionPlan::profile`](crate::ExecutionPlan::profile) or a tensor directly
 //! with `Tensor::profile` (which wraps it). Behavior is configured
 //! through [`ProfileOptions`] (and [`ProfileOptions::from_env`], reading
-//! `SVOD_PMC` and `SVOD_PROFILE_ITERS`). The underlying per-kernel timing path is
+//! `SVOD_PMC`, `SVOD_PROFILE_ITERS` and `SVOD_ORIGIN_DEPTH`). The underlying
+//! per-kernel timing path is
 //! [`ExecutionPlan::execute_profiled`](crate::ExecutionPlan::execute_profiled).
 //! The library never prints; callers render a finished [`RunProfile`] with
 //! [`RunProfile::render_table`].
@@ -368,9 +369,10 @@ impl Default for ProfileOptions {
 }
 
 impl ProfileOptions {
-    /// Build from the `SVOD_PROFILE_ITERS` / `SVOD_PMC` env vars (defaults
-    /// otherwise). This is the single place profiling env vars are read; callers
-    /// that want explicit control construct [`ProfileOptions`] directly.
+    /// Build from the `SVOD_PROFILE_ITERS` / `SVOD_PMC` / `SVOD_ORIGIN_DEPTH`
+    /// env vars (defaults otherwise). This is the single place profiling env vars
+    /// are read; callers that want explicit control construct [`ProfileOptions`]
+    /// directly.
     pub fn from_env() -> Self {
         let mut o = Self::default();
         if let Ok(n) = std::env::var("SVOD_PROFILE_ITERS").unwrap_or_default().trim().parse::<u32>() {
@@ -379,9 +381,7 @@ impl ProfileOptions {
         if let Ok(v) = std::env::var("SVOD_PMC") {
             o.counters = parse_pmc(&v);
         }
-        if let Ok(d) = std::env::var("SVOD_ORIGIN_DEPTH").unwrap_or_default().trim().parse::<usize>() {
-            o.origin_depth = Some(d);
-        }
+        o.origin_depth = parse_origin_depth(&std::env::var("SVOD_ORIGIN_DEPTH").unwrap_or_default());
         o
     }
 }
@@ -397,6 +397,14 @@ pub(crate) fn parse_pmc(v: &str) -> PmcSelection {
             if counters.is_empty() { PmcSelection::Default } else { PmcSelection::Custom(counters) }
         }
     }
+}
+
+/// Parse a `SVOD_ORIGIN_DEPTH` value into a rollup depth: a positive segment
+/// count, else no cut. Zero is rejected rather than honoured — [`PathCache::key`]
+/// keys a zero-depth row on nothing, which would render an entire run
+/// [`UNATTRIBUTED`].
+pub(crate) fn parse_origin_depth(value: &str) -> Option<usize> {
+    value.trim().parse::<usize>().ok().filter(|&depth| depth > 0)
 }
 
 /// Per-kernel-name aggregate over a profiled execution, sorted by total time
@@ -744,6 +752,11 @@ impl StageProfile {
 #[derive(Debug, Default)]
 pub struct RunProfile {
     pub stages: Vec<StageProfile>,
+    /// Rollup depth this profile was produced at, from
+    /// [`ProfileOptions::origin_depth`]; `None` rolls up to the leaf scope. The
+    /// no-argument renderers ([`Self::render_table`], [`Display`],
+    /// [`Self::to_json`]) use it; the `_at` variants override it.
+    pub origin_depth: Option<usize>,
 }
 
 impl RunProfile {
@@ -764,6 +777,7 @@ impl RunProfile {
     /// This is the single min-merge policy used to accumulate repeated passes
     /// (the `profile()` `iters` loop and the criterion `--profile-time` hook).
     pub fn merge_min(&mut self, other: RunProfile) {
+        self.origin_depth = self.origin_depth.or(other.origin_depth);
         for (stage, incoming) in self.stages.iter_mut().zip(other.stages) {
             for (best, sample) in stage.kernels.iter_mut().zip(incoming.kernels) {
                 if sample.gpu_or_wall() < best.gpu_or_wall() {
@@ -776,14 +790,16 @@ impl RunProfile {
     /// Rich per-kernel table: device time plus any populated Tier-2/3/4 metrics
     /// (GFLOP/s, GB/s, VGPR/SGPR/LDS, HW counters). Columns appear only when the
     /// underlying data is present, so a Tier-1-only run shows just timing.
+    /// Origin rollups use [`Self::origin_depth`].
     pub fn render_table(&self) -> String {
-        self.render_table_at(None)
+        self.render_table_at(self.origin_depth)
     }
 
     /// [`Self::render_table`] with an explicit origin rollup depth (`None` =
-    /// leaf). The origin section is appended per stage only when that stage's
-    /// dispatches carry scopes, so a capture-off profile renders exactly as it
-    /// did before origin tracking existed.
+    /// leaf), overriding [`Self::origin_depth`]. The origin section is appended
+    /// per stage only when that stage's dispatches carry scopes, so a
+    /// capture-off profile renders exactly as it did before origin tracking
+    /// existed.
     pub fn render_table_at(&self, origin_depth: Option<usize>) -> String {
         let mut out = String::new();
         for s in &self.stages {
@@ -796,9 +812,15 @@ impl RunProfile {
         out
     }
 
-    /// The [`Display`](std::fmt::Display) rendering (per-stage wall plus a
-    /// kernel-name histogram) with an explicit origin rollup depth.
-    pub fn render_report(&self, origin_depth: Option<usize>) -> String {
+    /// The [`Display`](std::fmt::Display) rendering: per-stage wall plus a
+    /// kernel-name histogram, rolled up at [`Self::origin_depth`].
+    pub fn render_report(&self) -> String {
+        self.render_report_at(self.origin_depth)
+    }
+
+    /// [`Self::render_report`] with an explicit origin rollup depth (`None` =
+    /// leaf), overriding [`Self::origin_depth`].
+    pub fn render_report_at(&self, origin_depth: Option<usize>) -> String {
         let mut out = String::new();
         for s in &self.stages {
             if s.kernels.is_empty() {
@@ -831,6 +853,7 @@ impl RunProfile {
     /// must therefore emit one profile for the run and not also rely on this
     /// per-window merge, or the total double-counts.
     pub fn merge(&mut self, other: RunProfile) {
+        self.origin_depth = self.origin_depth.or(other.origin_depth);
         for stage in other.stages {
             match self.stages.iter_mut().find(|s| s.name == stage.name) {
                 Some(existing) => {
@@ -1000,7 +1023,7 @@ fn fmt_columns(header: &[String], rows: &[Vec<String>]) -> String {
 
 impl std::fmt::Display for RunProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.render_report(None))
+        f.write_str(&self.render_report())
     }
 }
 
@@ -1009,16 +1032,24 @@ impl std::fmt::Display for RunProfile {
 // ============================================================================
 
 /// A profiled run in a serializable, id-resolvable form: every stage with its
-/// kernel rows and both origin rollups, plus a snapshot of the origin arena so
-/// a consumer can resolve [`OriginId`]s offline.
+/// kernel rows and both origin rollups, plus the arena entries those rows
+/// reference so a consumer can resolve [`OriginId`]s offline.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProfileExport {
     /// Depth the origin rollups were computed at; `null` is the leaf scope.
     pub origin_depth: Option<usize>,
     pub stages: Vec<StageExport>,
-    /// Every origin interned in this process, in id order: entry `i` is id
-    /// `i + 1` ([`origin::snapshot`]). Empty when capture was off.
-    pub origins: Vec<svod_ir::origin::Origin>,
+    /// The ancestor closure of every id the kernel rows carry, id-ordered — not
+    /// the whole process arena. Empty when capture was off.
+    pub origins: Vec<OriginNodeExport>,
+}
+
+/// One origin arena entry: enough to rebuild a path from an id offline.
+#[derive(Debug, Clone, Serialize)]
+pub struct OriginNodeExport {
+    pub id: u32,
+    pub parent: Option<u32>,
+    pub frame: OriginFrame,
 }
 
 /// One stage of a [`ProfileExport`].
@@ -1045,8 +1076,12 @@ pub struct KernelExport {
     pub mean_us: f64,
     /// Full primary origin path, call frames included; `null` when unattributed.
     pub origin: Option<String>,
+    /// Raw id of `origin`, resolvable through [`ProfileExport::origins`].
+    pub origin_id: Option<u32>,
     /// Full paths of every scope fused into these dispatches.
     pub origins: Vec<String>,
+    /// Raw ids of `origins`, same order.
+    pub origin_ids: Vec<u32>,
 }
 
 /// One origin rollup row.
@@ -1108,7 +1143,9 @@ fn export_kernels(profiles: &[KernelProfile]) -> Vec<KernelExport> {
             total_ms: total.as_secs_f64() * 1e3,
             mean_us: total.as_secs_f64() * 1e6 / count as f64,
             origin: primary.map(origin::path),
+            origin_id: primary.map(OriginId::get),
             origins: origins.iter().map(|&id| origin::path(id)).collect(),
+            origin_ids: origins.iter().map(|&id| id.get()).collect(),
         })
         .collect();
     out.sort_by(|a, b| {
@@ -1117,36 +1154,59 @@ fn export_kernels(profiles: &[KernelProfile]) -> Vec<KernelExport> {
     out
 }
 
-impl RunProfile {
-    /// Serializable form of this profile, with origin rollups at `origin_depth`
-    /// (`None` = leaf).
-    pub fn export(&self, origin_depth: Option<usize>) -> ProfileExport {
-        ProfileExport {
-            origin_depth,
-            stages: self
-                .stages
-                .iter()
-                .map(|stage| {
-                    let total = stage.gpu_total();
-                    StageExport {
-                        name: stage.name.clone(),
-                        wall_ms: stage.wall.as_secs_f64() * 1e3,
-                        gpu_ms: total.as_secs_f64() * 1e3,
-                        dispatches: stage.kernels.len(),
-                        meta: stage.meta.clone(),
-                        kernels: export_kernels(&stage.kernels),
-                        origins_exclusive: export_origins(stage.origins(OriginView::Exclusive, origin_depth), total),
-                        origins_inclusive: export_origins(stage.origins(OriginView::Inclusive, origin_depth), total),
-                    }
-                })
-                .collect(),
-            origins: origin::snapshot(),
+/// The arena entries reachable from the ids the kernel rows carry, id-ordered.
+fn export_origin_nodes(stages: &[StageExport]) -> Vec<OriginNodeExport> {
+    let mut ids = std::collections::BTreeSet::new();
+    for kernel in stages.iter().flat_map(|stage| &stage.kernels) {
+        for &raw in kernel.origin_id.iter().chain(&kernel.origin_ids) {
+            ids.extend(OriginId::from_raw(raw).into_iter().flat_map(origin::chain).map(OriginId::get));
         }
+    }
+    ids.into_iter()
+        .filter_map(|id| {
+            let node = origin::get(OriginId::from_raw(id)?)?;
+            Some(OriginNodeExport { id, parent: node.parent.map(OriginId::get), frame: node.frame })
+        })
+        .collect()
+}
+
+impl RunProfile {
+    /// Serializable form of this profile, rolled up at [`Self::origin_depth`].
+    pub fn export(&self) -> ProfileExport {
+        self.export_at(self.origin_depth)
+    }
+
+    /// [`Self::export`] with an explicit origin rollup depth (`None` = leaf),
+    /// overriding [`Self::origin_depth`].
+    pub fn export_at(&self, origin_depth: Option<usize>) -> ProfileExport {
+        let stages: Vec<StageExport> = self
+            .stages
+            .iter()
+            .map(|stage| {
+                let total = stage.gpu_total();
+                StageExport {
+                    name: stage.name.clone(),
+                    wall_ms: stage.wall.as_secs_f64() * 1e3,
+                    gpu_ms: total.as_secs_f64() * 1e3,
+                    dispatches: stage.kernels.len(),
+                    meta: stage.meta.clone(),
+                    kernels: export_kernels(&stage.kernels),
+                    origins_exclusive: export_origins(stage.origins(OriginView::Exclusive, origin_depth), total),
+                    origins_inclusive: export_origins(stage.origins(OriginView::Inclusive, origin_depth), total),
+                }
+            })
+            .collect();
+        ProfileExport { origin_depth, origins: export_origin_nodes(&stages), stages }
     }
 
     /// [`Self::export`] as pretty-printed JSON. Serializing plain owned structs
     /// cannot fail, so this does not surface an error.
-    pub fn to_json(&self, origin_depth: Option<usize>) -> String {
-        serde_json::to_string_pretty(&self.export(origin_depth)).expect("profile export is plain owned data")
+    pub fn to_json(&self) -> String {
+        self.to_json_at(self.origin_depth)
+    }
+
+    /// [`Self::to_json`] with an explicit origin rollup depth (`None` = leaf).
+    pub fn to_json_at(&self, origin_depth: Option<usize>) -> String {
+        serde_json::to_string_pretty(&self.export_at(origin_depth)).expect("profile export is plain owned data")
     }
 }

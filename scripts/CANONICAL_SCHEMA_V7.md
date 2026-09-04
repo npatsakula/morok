@@ -1,6 +1,6 @@
-# Canonical UOp Schema Version 6
+# Canonical UOp Schema Version 7
 
-Schema v6 is the non-verbose parity contract for Tinygrad at
+Schema v7 is the non-verbose parity contract for Tinygrad at
 `8c8b43de62515abe6c820b1de5aa26b30f48e43a` and Svod. A graph document has
 exactly `schema_version`, `stage`, ordered `roots`, and `nodes`. Node IDs are dense
 graph-local integers. Every source, symbolic shape, PROGRAM dimension, and
@@ -47,11 +47,14 @@ or `indices` are rejected because Svod `DeviceSpec` cannot represent them.
 
 WMMA preserves the pinned common tuple: dimensions, input and accumulator
 dtypes, device, thread count, and A/B/C upcast axes. Svod-only WMMA `name`
-and `reduce_axes` are not parity fields. CALL/FUNCTION preserves
-Tinygrad `aux` only when it is a sequence of strings; callable `grad_fxn` and
-Svod-only `grad_tag` are rejected. SINK preserves the common `name`,
-`opts_to_apply`, `applied_opts`, and `dont_use_locals`; nondefault
-Tinygrad-only `axis_types`, `estimates`, and `beam` are rejected.
+and `reduce_axes` are not parity fields. CALL/FUNCTION `metadata` is always the
+empty list: Svod has no `aux` field, and nonempty Tinygrad `aux` is rejected the
+way callable `grad_fxn` and Svod-only `grad_tag` are, so a divergence stays an
+explicit error instead of a silently erased one. Svod's CALL origins are not
+parity fields either; per-node origins appear in the verbose form only. SINK
+preserves the common `name`, `opts_to_apply`, `applied_opts`, and
+`dont_use_locals`; nondefault Tinygrad-only `axis_types`, `estimates`, and
+`beam` are rejected.
 ANSI presentation is stripped from names, but semantic name text is retained.
 Only Tinygrad's implicit `KernelInfo.name == "test"` at `kernel_ast` and
 `scheduled` normalizes to Svod's absent generated name; explicit names at other
@@ -63,9 +66,12 @@ erased. Verbose diagnostics may show their payloads but are never parity inputs.
 Tuple devices and tuple targets are rejected because Svod has no multi-device
 `DeviceSpec`. UNIQUE/LUNIQUE are rejected rather than serializing allocation
 IDs. SOURCE/BINARY are rejected in non-verbose mode. Verbose documents may add runtime
-IDs, tags, backend dtype text, and implementation-specific content hashes; the
-comparator rejects verbose documents as parity inputs. Unsupported metadata is
-an explicit typed error, never `repr` or silent erasure.
+IDs, tags, backend dtype text, implementation-specific content hashes, and —
+v7's one addition over v6 — a rendered `origin` path on each Rust node, present
+only when that node was built under a capturing `OriginScope` (`SVOD_ORIGIN=1`).
+Like `content_xxh64` it is an optional key, and the comparator rejects verbose
+documents as parity inputs. Unsupported metadata is an explicit typed error,
+never `repr` or silent erasure.
 
 ## Production Evidence
 
