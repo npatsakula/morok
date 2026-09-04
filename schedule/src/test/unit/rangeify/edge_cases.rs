@@ -12,7 +12,10 @@ use super::helpers::extract_kernel;
 
 fn scalar_stage() -> Arc<UOp> {
     let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
-    UOp::new(Op::Stage { compute: UOp::native_const(42.0f32), ranges: SmallVec::new(), opts }, DType::Float32)
+    UOp::new(
+        Op::Stage { compute: UOp::native_const(42.0f32), ranges: SmallVec::new(), opts: opts.into() },
+        DType::Float32,
+    )
 }
 
 #[test]
@@ -39,7 +42,7 @@ fn rangeless_stage_still_produces_a_kernel() {
 fn zero_sized_range_cannot_be_allocated() {
     let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
     let ranges = smallvec::smallvec![UOp::range_const(0, 0)];
-    let stage = UOp::new(Op::Stage { compute: UOp::native_const(1.0f32), ranges, opts }, DType::Float32);
+    let stage = UOp::new(Op::Stage { compute: UOp::native_const(1.0f32), ranges, opts: opts.into() }, DType::Float32);
 
     bufferize_to_store(&stage, &mut RangeifyBufferContext::new());
 }

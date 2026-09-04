@@ -116,7 +116,7 @@ fn zero_and_nondivisible_moduli_do_not_split_ranges() {
 fn image_store_modulo_split_preserves_structural_coordinates() {
     let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![2usize.into(), 1usize.into(), 4usize.into()]);
     let image = UOp::new(
-        Op::Param { shape, arg: ParamArg::buffer(0, DType::Float32, AddrSpace::Global, None) },
+        Op::Param { shape, arg: ParamArg::buffer(0, DType::Float32, AddrSpace::Global, None).into() },
         DType::Float32,
     );
     let range = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Loop);

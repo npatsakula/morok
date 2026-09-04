@@ -207,7 +207,7 @@ fn only_the_alu_weak_param_is_lowered() {
             device: None,
             volatile: false,
         };
-        UOp::new(Op::Param { shape: shape.clone(), arg }, DType::WeakInt)
+        UOp::new(Op::Param { shape: shape.clone(), arg: arg.into() }, DType::WeakInt)
     };
 
     let alu = lower_weak(make_param(None));

@@ -28,7 +28,7 @@ fn program(
             (Op::Source { identity: Some(source_identity), .. }, Op::ProgramBinary { bytes, identity: None }) => {
                 Some(UOp::binary_with_identity(
                     bytes.clone(),
-                    crate::device::binary_stage_identity(source_identity.clone(), "device-test", bytes),
+                    crate::device::binary_stage_identity(source_identity.as_ref().clone(), "device-test", bytes),
                 ))
             }
             _ => Some(binary),
@@ -363,7 +363,7 @@ fn program_spec_rejects_empty_binary_compiler_key() {
     let Op::ProgramBinary { bytes, identity: Some(identity) } = binary.op() else { unreachable!() };
     let malformed = UOp::binary_with_identity(
         bytes.clone(),
-        svod_ir::BinaryStageIdentity { compiler_key: String::new(), ..identity.clone() },
+        svod_ir::BinaryStageIdentity { compiler_key: String::new(), ..identity.as_ref().clone() },
     );
     let staged = UOp::program(sink.clone(), info.clone(), linear.clone(), source.clone(), Some(malformed));
     let err = crate::device::ProgramSpec::from_uop(&staged).expect_err("empty compiler key must be rejected");

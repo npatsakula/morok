@@ -19,7 +19,7 @@ use crate::rewrite::graph_rewrite;
 fn test_buffer(size: usize, slot: usize) -> Arc<UOp> {
     let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![SInt::Const(size)]);
     let arg = svod_ir::ParamArg::buffer(slot, DType::Float32, AddrSpace::Global, Some(DeviceSpec::Cpu));
-    UOp::new(Op::Buffer { shape, arg }, DType::Float32)
+    UOp::new(Op::Buffer { shape, arg: arg.into() }, DType::Float32)
 }
 
 fn read(slot: usize, range: &Arc<UOp>) -> Arc<UOp> {

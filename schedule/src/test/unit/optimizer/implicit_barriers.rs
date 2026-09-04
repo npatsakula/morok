@@ -13,7 +13,7 @@ fn buffer(slot: usize, addrspace: AddrSpace) -> Arc<UOp> {
     UOp::new(
         Op::Param {
             shape: svod_ir::shape::shape_to_uop(&smallvec::smallvec![8usize.into()]),
-            arg: ParamArg::buffer(slot, DType::Float32, addrspace, None),
+            arg: ParamArg::buffer(slot, DType::Float32, addrspace, None).into(),
         },
         DType::Float32,
     )

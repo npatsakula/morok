@@ -916,7 +916,7 @@ fn new_lunique_buffer(
     // Cache restoration replaces these with fresh runtime slots before execution.
     let slot = (1usize << (usize::BITS - 1)) | ctx.next_lunique();
     let arg = svod_ir::ParamArg::buffer(slot, dtype.clone(), AddrSpace::Global, Some(device));
-    UOp::new(Op::Buffer { shape, arg }, dtype)
+    UOp::new(Op::Buffer { shape, arg: arg.into() }, dtype)
         .with_tag(smallvec::smallvec![svod_ir::uop::canonical::TAG_SCHEDULE_LOCAL_BUFFER])
 }
 

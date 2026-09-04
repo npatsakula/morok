@@ -22,7 +22,7 @@ fn x() -> Arc<UOp> {
 fn image_param() -> Arc<UOp> {
     let shape = svod_ir::shape::shape_to_uop(&smallvec![1usize.into(), 4usize.into(), 4usize.into()]);
     let arg = ParamArg::buffer(0, DType::Float32, AddrSpace::Global, None);
-    UOp::new(Op::Param { shape, arg }, DType::Float32)
+    UOp::new(Op::Param { shape, arg: arg.into() }, DType::Float32)
 }
 
 fn gated_index(index: &Arc<UOp>) -> (&Arc<UOp>, &Arc<UOp>) {

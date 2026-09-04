@@ -15,7 +15,7 @@ fn render_linearized(root: &std::sync::Arc<UOp>, name: Option<&str>) -> crate::R
 fn volatile_param(slot: usize, size: usize) -> std::sync::Arc<UOp> {
     let mut arg = ParamArg::buffer(slot, DType::Float32, AddrSpace::Global, None);
     arg.volatile = true;
-    UOp::new(Op::Param { shape: UOp::native_const(size as i32), arg }, DType::Float32)
+    UOp::new(Op::Param { shape: UOp::native_const(size as i32), arg: arg.into() }, DType::Float32)
 }
 
 fn shrink4(src: std::sync::Arc<UOp>) -> std::sync::Arc<UOp> {

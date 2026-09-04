@@ -206,7 +206,7 @@ impl OptimizerWireOp {
             Op::Unique(value) => Self::Unique(*value),
             Op::LUnique(value) => Self::LUnique(*value),
             Op::Noop => Self::Noop,
-            Op::Sink { info, .. } => Self::Sink(info.clone()),
+            Op::Sink { info, .. } => Self::Sink(info.as_deref().cloned()),
             Op::Group { .. } => Self::Group,
             Op::Unary(op, ..) => Self::Unary(*op),
             Op::Binary(op, ..) => Self::Binary(*op),
@@ -215,10 +215,10 @@ impl OptimizerWireOp {
             Op::BitCast { dtype, .. } => Self::BitCast(dtype.clone()),
             Op::MSelect { device_index, .. } => Self::MSelect(*device_index),
             Op::Special { name, .. } => Self::Special(name.clone()),
-            Op::Param { arg, .. } => Self::Param(arg.clone()),
-            Op::Buffer { arg, .. } => Self::Buffer(arg.clone()),
+            Op::Param { arg, .. } => Self::Param(arg.as_ref().clone()),
+            Op::Buffer { arg, .. } => Self::Buffer(arg.as_ref().clone()),
             Op::Slice { size, .. } => Self::Slice(*size),
-            Op::Stage { opts, .. } => Self::Stage(opts.clone()),
+            Op::Stage { opts, .. } => Self::Stage(opts.as_ref().clone()),
             Op::Index { .. } => Self::Index,
             Op::GetAddr { device, .. } => Self::GetAddr(device.clone()),
             Op::Copy { device, .. } => Self::Copy(device.clone()),
@@ -242,9 +242,9 @@ impl OptimizerWireOp {
             Op::VConst { values } => Self::VConst(values.clone()),
             Op::DefineVar { name, min_val, max_val } => Self::DefineVar(name.clone(), *min_val, *max_val),
             Op::Bind { .. } => Self::Bind,
-            Op::Wmma { metadata, .. } => Self::Wmma(metadata.clone()),
-            Op::Call { info, .. } => Self::Call(info.clone()),
-            Op::Function { info, .. } => Self::Function(info.clone()),
+            Op::Wmma { metadata, .. } => Self::Wmma(metadata.as_ref().clone()),
+            Op::Call { info, .. } => Self::Call(info.as_ref().clone()),
+            Op::Function { info, .. } => Self::Function(info.as_ref().clone()),
             Op::Tuple { .. } => Self::Tuple,
             Op::GetTuple { index, .. } => Self::GetTuple(*index),
             Op::Detach { .. } => Self::Detach,
@@ -296,7 +296,7 @@ impl OptimizerWireOp {
                 exact(0)?;
                 Op::Noop
             }
-            Self::Sink(info) => Op::Sink { sources: src.into_iter().collect(), info: info.clone() },
+            Self::Sink(info) => Op::Sink { sources: src.into_iter().collect(), info: info.clone().map(Box::new) },
             Self::Group => Op::Group { sources: src.into_iter().collect() },
             Self::Unary(op) => {
                 exact(1)?;
@@ -328,11 +328,11 @@ impl OptimizerWireOp {
             }
             Self::Param(arg) => {
                 exact(1)?;
-                Op::Param { shape: one(), arg: arg.clone() }
+                Op::Param { shape: one(), arg: arg.clone().into() }
             }
             Self::Buffer(arg) => {
                 exact(1)?;
-                Op::Buffer { shape: one(), arg: arg.clone() }
+                Op::Buffer { shape: one(), arg: arg.clone().into() }
             }
             Self::Slice(size) => {
                 exact(2)?;
@@ -340,7 +340,7 @@ impl OptimizerWireOp {
             }
             Self::Stage(opts) => {
                 nonempty()?;
-                Op::Stage { compute: one(), ranges: src[1..].iter().cloned().collect(), opts: opts.clone() }
+                Op::Stage { compute: one(), ranges: src[1..].iter().cloned().collect(), opts: opts.clone().into() }
             }
             Self::Index => {
                 nonempty()?;
@@ -440,15 +440,15 @@ impl OptimizerWireOp {
             }
             Self::Wmma(metadata) => {
                 exact(3)?;
-                Op::Wmma { a: src[0].clone(), b: src[1].clone(), c: src[2].clone(), metadata: metadata.clone() }
+                Op::Wmma { a: src[0].clone(), b: src[1].clone(), c: src[2].clone(), metadata: metadata.clone().into() }
             }
             Self::Call(info) => {
                 nonempty()?;
-                Op::Call { body: one(), args: src[1..].iter().cloned().collect(), info: info.clone() }
+                Op::Call { body: one(), args: src[1..].iter().cloned().collect(), info: info.clone().into() }
             }
             Self::Function(info) => {
                 nonempty()?;
-                Op::Function { body: one(), args: src[1..].iter().cloned().collect(), info: info.clone() }
+                Op::Function { body: one(), args: src[1..].iter().cloned().collect(), info: info.clone().into() }
             }
             Self::Tuple => Op::Tuple { src: src.into_iter().collect() },
             Self::GetTuple(index) => {
@@ -461,7 +461,7 @@ impl OptimizerWireOp {
             }
             Self::Contiguous(opts) => {
                 exact(1)?;
-                Op::Contiguous { src: one(), opts: opts.iter().cloned().collect() }
+                Op::Contiguous { src: one(), opts: opts.to_vec() }
             }
             Self::ContiguousBackward => {
                 exact(1)?;

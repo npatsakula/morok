@@ -440,7 +440,7 @@ pub fn validate_source_stage(source: &Arc<UOp>, expected: &SourceStageIdentity) 
         stage: "SOURCE",
         reason: "stage has no semantic identity".into(),
     })?;
-    if actual != expected || actual.source_sha256 != sha256(code.as_bytes()) {
+    if **actual != *expected || actual.source_sha256 != sha256(code.as_bytes()) {
         return Err(Error::ProgramStageMismatch {
             stage: "SOURCE",
             reason: format!("expected {expected:?}, got {actual:?}"),
@@ -461,7 +461,7 @@ pub fn validate_binary_stage(binary: &Arc<UOp>, expected: &BinaryStageIdentity) 
         stage: "BINARY",
         reason: "stage has no semantic identity".into(),
     })?;
-    if actual != expected || actual.binary_sha256 != sha256(bytes) {
+    if **actual != *expected || actual.binary_sha256 != sha256(bytes) {
         return Err(Error::ProgramStageMismatch {
             stage: "BINARY",
             reason: format!("expected {expected:?}, got {actual:?}"),

@@ -133,7 +133,7 @@ fn image_buffers_keep_two_index_addresses() {
     for (dtype, expected_indices) in [(image, 2), (DType::Float32, 1)] {
         let arg =
             svod_ir::ParamArg::buffer(0, dtype.clone(), svod_dtype::AddrSpace::Global, Some(svod_ir::DeviceSpec::Cpu));
-        let buffer = UOp::new(Op::Buffer { shape: shape.clone(), arg }, dtype);
+        let buffer = UOp::new(Op::Buffer { shape: shape.clone(), arg: arg.into() }, dtype);
         let indexed = crate::rangeify::transforms::transform_single_source(
             &UOp::sink(vec![]),
             &buffer,

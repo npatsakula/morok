@@ -28,7 +28,7 @@ fn slotted_var(name: &str, slot: usize) -> std::sync::Arc<UOp> {
 fn volatile_param(slot: usize, size: usize) -> std::sync::Arc<UOp> {
     let mut arg = ParamArg::buffer(slot, DType::Float32, AddrSpace::Global, None);
     arg.volatile = true;
-    UOp::new(Op::Param { shape: UOp::index_const(size as i64), arg }, DType::Float32)
+    UOp::new(Op::Param { shape: UOp::index_const(size as i64), arg: arg.into() }, DType::Float32)
 }
 
 fn shrink4(src: std::sync::Arc<UOp>, dtype: DType) -> std::sync::Arc<UOp> {

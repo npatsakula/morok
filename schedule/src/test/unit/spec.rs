@@ -20,7 +20,7 @@ fn global_param(slot: usize) -> Arc<UOp> {
     UOp::new(
         Op::Param {
             shape: UOp::stack(smallvec![]),
-            arg: ParamArg::buffer(slot, DType::Float32, AddrSpace::Global, None),
+            arg: ParamArg::buffer(slot, DType::Float32, AddrSpace::Global, None).into(),
         },
         DType::Float32,
     )
@@ -41,7 +41,10 @@ fn verify_program_err(root: &Arc<UOp>) -> String {
 
 fn structured_buffer(addrspace: AddrSpace, device: Option<DeviceSpec>) -> Arc<UOp> {
     UOp::new(
-        Op::Buffer { shape: int_const(DType::Int32, 4), arg: ParamArg::buffer(3, DType::Float32, addrspace, device) },
+        Op::Buffer {
+            shape: int_const(DType::Int32, 4),
+            arg: ParamArg::buffer(3, DType::Float32, addrspace, device).into(),
+        },
         DType::Float32,
     )
 }
@@ -230,7 +233,7 @@ fn kernel_param(slot: usize, dtype: DType) -> Arc<UOp> {
     UOp::new(
         Op::Param {
             shape: UOp::stack(smallvec![]),
-            arg: ParamArg::buffer(slot, dtype.clone(), AddrSpace::Global, None),
+            arg: ParamArg::buffer(slot, dtype.clone(), AddrSpace::Global, None).into(),
         },
         dtype,
     )

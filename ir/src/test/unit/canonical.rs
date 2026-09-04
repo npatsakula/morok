@@ -395,7 +395,7 @@ fn canonical_wmma_metadata_preserves_axes_and_target() {
             a: UOp::const_(DType::Float16, ConstValue::Float(1.0)),
             b: UOp::const_(DType::Float16, ConstValue::Float(2.0)),
             c: UOp::native_const(0.0f32),
-            metadata,
+            metadata: metadata.into(),
         },
         DType::Float32,
     );

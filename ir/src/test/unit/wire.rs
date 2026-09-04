@@ -18,7 +18,7 @@ fn optimizer_wire_roundtrips_reduce_symbolic_wmma_multi_and_calls() {
     let param = UOp::new(
         Op::Param {
             shape: shape.clone(),
-            arg: ParamArg::buffer(0, DType::Float16, crate::AddrSpace::Global, Some(DeviceSpec::Cpu)),
+            arg: ParamArg::buffer(0, DType::Float16, crate::AddrSpace::Global, Some(DeviceSpec::Cpu)).into(),
         },
         DType::Float16,
     );
@@ -41,7 +41,7 @@ fn optimizer_wire_roundtrips_reduce_symbolic_wmma_multi_and_calls() {
             a: reduce.clone(),
             b: reduce.clone(),
             c: reduce.clone(),
-            metadata: WmmaMetadata {
+            metadata: Box::new(WmmaMetadata {
                 name: "wmma_test".into(),
                 dims: (16, 16, 16),
                 dtype_in: DType::Float16,
@@ -55,7 +55,7 @@ fn optimizer_wire_roundtrips_reduce_symbolic_wmma_multi_and_calls() {
                 }),
                 reduce_axes: vec![AxisId::RenumberedPath(smallvec![2, 1])],
                 tile_grid: (2, 2),
-            },
+            }),
         },
         DType::Float32,
     );
@@ -63,7 +63,11 @@ fn optimizer_wire_roundtrips_reduce_symbolic_wmma_multi_and_calls() {
         Op::Function {
             body: UOp::new(Op::Tuple { src: smallvec![wmma.clone(), reduce] }, DType::Void),
             args: smallvec![param.clone()],
-            info: CallInfo { name: Some("inner".into()), metadata: vec!["exact".into()], ..Default::default() },
+            info: Box::new(CallInfo {
+                name: Some("inner".into()),
+                metadata: vec!["exact".into()],
+                ..Default::default()
+            }),
         },
         DType::Void,
     );
@@ -71,19 +75,19 @@ fn optimizer_wire_roundtrips_reduce_symbolic_wmma_multi_and_calls() {
         Op::Call {
             body: function,
             args: smallvec![UOp::new(Op::Multi { src: param, axis: 1 }, DType::Float16)],
-            info: CallInfo { name: Some("outer".into()), precompile: true, ..Default::default() },
+            info: Box::new(CallInfo { name: Some("outer".into()), precompile: true, ..Default::default() }),
         },
         DType::Void,
     );
     let root = tagged(
         Op::Sink {
             sources: smallvec![call],
-            info: Some(KernelInfo {
+            info: Some(Box::new(KernelInfo {
                 opts_to_apply: Some(vec![Opt::upcast(0, 4)]),
                 applied_opts: vec![Opt::local(0, 8)],
                 dont_use_locals: true,
                 name: Some("wire_kernel".into()),
-            }),
+            })),
         },
         DType::Void,
         &[11],

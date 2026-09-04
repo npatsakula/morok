@@ -27,9 +27,9 @@ impl UOp {
     ///
     /// Computes D = A × B + C using hardware matrix units.
     /// `metadata` specifies dimensions, dtypes, and upcast axes for vectorization.
-    pub fn wmma(a: Arc<Self>, b: Arc<Self>, c: Arc<Self>, metadata: WmmaMetadata) -> Arc<Self> {
+    pub fn wmma(a: Arc<Self>, b: Arc<Self>, c: Arc<Self>, metadata: impl Into<Box<WmmaMetadata>>) -> Arc<Self> {
         let dtype = c.dtype();
-        Self::new(Op::Wmma { a, b, c, metadata }, dtype)
+        Self::new(Op::Wmma { a, b, c, metadata: metadata.into() }, dtype)
     }
 
     // =========================================================================
@@ -99,8 +99,8 @@ impl UOp {
     /// Callable wrapper around a body UOp and runtime arguments.
     ///
     /// CALL dtype is always void per tinygrad's spec.
-    pub fn call(self: &Arc<Self>, args: SmallVec<[Arc<Self>; 4]>, info: CallInfo) -> Arc<Self> {
-        Self::new(Op::Call { body: self.clone(), args, info }, DType::Void)
+    pub fn call(self: &Arc<Self>, args: SmallVec<[Arc<Self>; 4]>, info: impl Into<Box<CallInfo>>) -> Arc<Self> {
+        Self::new(Op::Call { body: self.clone(), args, info: info.into() }, DType::Void)
     }
 
     /// Typed instruction-style CALL. Its result is scalar and its body remains opaque.
@@ -110,7 +110,7 @@ impl UOp {
         info: CallInfo,
         return_dtype: DType,
     ) -> Arc<Self> {
-        Self::new(Op::Call { body: self.clone(), args, info }, return_dtype)
+        Self::new(Op::Call { body: self.clone(), args, info: info.into() }, return_dtype)
     }
 
     /// FUNCTION wrapper around a value-producing body UOp and runtime arguments.
@@ -119,16 +119,16 @@ impl UOp {
     /// always a TUPLE; non-Tuple bodies are auto-wrapped.
     /// For opaque bodies (SINK / PROGRAM / COPY / SLICE / CUSTOM_FUNCTION) prefer
     /// `.call()` instead — those mirror tinygrad's `_OPAQUE_CALL_BODIES` set.
-    pub fn function(self: &Arc<Self>, args: SmallVec<[Arc<Self>; 4]>, info: CallInfo) -> Arc<Self> {
+    pub fn function(self: &Arc<Self>, args: SmallVec<[Arc<Self>; 4]>, info: impl Into<Box<CallInfo>>) -> Arc<Self> {
         let body = if matches!(self.op(), Op::Tuple { .. }) { self.clone() } else { self.maketuple() };
-        Self::new(Op::Function { body, args, info }, DType::Void)
+        Self::new(Op::Function { body, args, info: info.into() }, DType::Void)
     }
 
     /// Fallible FUNCTION constructor with positional formal/actual validation.
     pub fn try_function(self: &Arc<Self>, args: SmallVec<[Arc<Self>; 4]>, info: CallInfo) -> Result<Arc<Self>> {
         let body = if matches!(self.op(), Op::Tuple { .. }) { self.clone() } else { self.maketuple() };
         crate::shape::function_param_substitutions(&body, &args)?;
-        Ok(Self::new(Op::Function { body, args, info }, DType::Void))
+        Ok(Self::new(Op::Function { body, args, info: info.into() }, DType::Void))
     }
 
     /// Construct a TUPLE from value-producing UOps. dtype is always void.
@@ -175,12 +175,12 @@ impl UOp {
     /// PROGRAM wrapper with optional progressive pipeline stages.
     pub fn program(
         sink: Arc<Self>,
-        info: crate::ProgramInfo,
+        info: impl Into<Box<crate::ProgramInfo>>,
         linear: Option<Arc<Self>>,
         source: Option<Arc<Self>>,
         binary: Option<Arc<Self>>,
     ) -> Arc<Self> {
-        Self::new(Op::Program { sink, info, linear, source, binary }, DType::Void)
+        Self::new(Op::Program { sink, info: info.into(), linear, source, binary }, DType::Void)
     }
 
     /// LINEAR stage payload.
@@ -195,7 +195,7 @@ impl UOp {
 
     /// SOURCE stage payload bound to an executable PROGRAM identity.
     pub fn source_with_identity(code: String, identity: crate::SourceStageIdentity) -> Arc<Self> {
-        Self::new(Op::Source { code, identity: Some(identity) }, DType::Void)
+        Self::new(Op::Source { code, identity: Some(identity.into()) }, DType::Void)
     }
 
     /// BINARY stage payload.
@@ -205,7 +205,7 @@ impl UOp {
 
     /// BINARY stage payload bound to its exact SOURCE and compiler identity.
     pub fn binary_with_identity(bytes: Vec<u8>, identity: crate::BinaryStageIdentity) -> Arc<Self> {
-        Self::new(Op::ProgramBinary { bytes, identity: Some(identity) }, DType::UInt8)
+        Self::new(Op::ProgramBinary { bytes, identity: Some(identity.into()) }, DType::UInt8)
     }
 
     /// Construct a target instruction. INS has no inferred dtype because an

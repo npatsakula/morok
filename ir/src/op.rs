@@ -41,7 +41,7 @@ pub enum Op {
     // Graph organization operations (2 variants)
     Sink {
         sources: SmallVec<[Arc<UOp>; 4]>,
-        info: Option<crate::types::KernelInfo>,
+        info: Option<Box<crate::types::KernelInfo>>,
     },
     Group {
         sources: SmallVec<[Arc<UOp>; 4]>,
@@ -79,11 +79,11 @@ pub enum Op {
     /// Matches Tinygrad's Ops.PARAM (engine/schedule.py:125).
     Param {
         shape: Arc<UOp>,
-        arg: ParamArg,
+        arg: Box<ParamArg>,
     },
     Buffer {
         shape: Arc<UOp>,
-        arg: ParamArg,
+        arg: Box<ParamArg>,
     },
     /// Contiguous typed slice of a buffer. The offset is in source elements.
     /// Concrete allocation aliasing is owned by `svod_device::Buffer`.
@@ -95,7 +95,7 @@ pub enum Op {
     Stage {
         compute: Arc<UOp>,
         ranges: SmallVec<[Arc<UOp>; 4]>,
-        opts: BufferizeOpts,
+        opts: Box<BufferizeOpts>,
     },
     Index {
         buffer: Arc<UOp>,
@@ -210,17 +210,17 @@ pub enum Op {
         a: Arc<UOp>,
         b: Arc<UOp>,
         c: Arc<UOp>,
-        metadata: WmmaMetadata,
+        metadata: Box<WmmaMetadata>,
     },
     Call {
         body: Arc<UOp>,
         args: SmallVec<[Arc<UOp>; 4]>,
-        info: CallInfo,
+        info: Box<CallInfo>,
     },
     Function {
         body: Arc<UOp>,
         args: SmallVec<[Arc<UOp>; 4]>,
-        info: CallInfo,
+        info: Box<CallInfo>,
     },
     /// Heterogeneous tuple of values; dtype is always Void.
     /// Mirrors tinygrad `Ops.TUPLE` — wraps multi-value FUNCTION bodies so FUNCTION dtype stays void.
@@ -236,7 +236,7 @@ pub enum Op {
     },
     Program {
         sink: Arc<UOp>,
-        info: ProgramInfo,
+        info: Box<ProgramInfo>,
         linear: Option<Arc<UOp>>,
         source: Option<Arc<UOp>>,
         binary: Option<Arc<UOp>>,
@@ -246,11 +246,11 @@ pub enum Op {
     },
     Source {
         code: String,
-        identity: Option<SourceStageIdentity>,
+        identity: Option<Box<SourceStageIdentity>>,
     },
     ProgramBinary {
         bytes: Vec<u8>,
-        identity: Option<BinaryStageIdentity>,
+        identity: Option<Box<BinaryStageIdentity>>,
     },
     Detach {
         src: Arc<UOp>,
@@ -258,7 +258,7 @@ pub enum Op {
     Contiguous {
         src: Arc<UOp>,
         /// Optimization hints (Tinygrad: CONTIGUOUS.arg)
-        opts: SmallVec<[crate::types::ContiguousHint; 4]>,
+        opts: Vec<crate::types::ContiguousHint>,
     },
     ContiguousBackward {
         src: Arc<UOp>,

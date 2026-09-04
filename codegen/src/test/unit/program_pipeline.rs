@@ -284,7 +284,7 @@ impl Renderer for MockIsaRenderer {
 
 fn storage_param(slot: usize, addrspace: svod_ir::AddrSpace) -> Arc<UOp> {
     let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![16usize.into()]);
-    UOp::new(Op::Param { shape, arg: ParamArg::buffer(slot, DType::Float32, addrspace, None) }, DType::Float32)
+    UOp::new(Op::Param { shape, arg: ParamArg::buffer(slot, DType::Float32, addrspace, None).into() }, DType::Float32)
 }
 
 fn global(slot: usize) -> Arc<UOp> {
@@ -398,7 +398,7 @@ fn conflicting_and_unassigned_abi_slots_are_typed_errors() {
 fn unnamed_scalar_and_non_param_program_info_var_are_typed_errors() {
     let mut arg = ParamArg::variable("n".into(), DType::Int32, 0, 16);
     arg.name = None;
-    let unnamed = UOp::new(Op::Param { shape: UOp::index_const(1), arg }, DType::Int32);
+    let unnamed = UOp::new(Op::Param { shape: UOp::index_const(1), arg: arg.into() }, DType::Int32);
     let err = program_from_sink(committed_sink(vec![unnamed]), DeviceSpec::Cpu).expect_err("unnamed scalar must fail");
     assert!(matches!(err, svod_device::Error::ProgramAbiMismatch { .. }), "{err:?}");
 
@@ -471,7 +471,7 @@ fn prebuilt_program_accepts_semantically_identical_nonidentical_var() {
 fn opaque_function_formals_stay_out_of_the_outer_abi() {
     let formal = UOp::variable("formal".into(), 0, 16, DType::Int32);
     let outer = UOp::variable("outer".into(), 0, 16, DType::Int32);
-    let call = UOp::sink(vec![formal.clone()]).call(smallvec::smallvec![outer], Default::default());
+    let call = UOp::sink(vec![formal.clone()]).call(smallvec::smallvec![outer], svod_ir::CallInfo::default());
     let sink = number_params(svod_schedule::add_control_flow(committed_sink(vec![call])))
         .expect("opaque formal must not enter PROGRAM ABI");
     let info = svod_ir::ProgramInfo::from_sink(&sink, DeviceSpec::Cpu);
@@ -487,7 +487,8 @@ fn opaque_function_formals_stay_out_of_the_outer_abi() {
         .expect("formal PARAM remains in opaque body");
     assert_eq!(formal_slot, usize::MAX);
 
-    let leaked = UOp::sink(vec![formal.clone()]).call(smallvec::smallvec![UOp::index_const(1)], Default::default());
+    let leaked =
+        UOp::sink(vec![formal.clone()]).call(smallvec::smallvec![UOp::index_const(1)], svod_ir::CallInfo::default());
     let leaked = svod_schedule::add_control_flow(committed_sink(vec![leaked, formal]));
     let err = executable_params(&leaked).expect_err("leaked opaque formal must fail");
     assert!(matches!(err, svod_device::Error::LeakedOpaqueProgramParam { .. }), "{err:?}");
@@ -824,7 +825,7 @@ fn semantic_stage_identity_defeats_preinterned_children_and_parent_programs() {
     let Op::Source { identity: Some(source_identity), .. } = rendered_source.op() else { unreachable!() };
     let different_binary = UOp::binary_with_identity(
         vec![1, 2, 3],
-        svod_device::device::binary_stage_identity(source_identity.clone(), "other", &[1, 2, 3]),
+        svod_device::device::binary_stage_identity(source_identity.as_ref().clone(), "other", &[1, 2, 3]),
     );
     let different_binary_parent = UOp::program(
         sink.clone(),
@@ -1007,7 +1008,7 @@ fn isa_selection_is_bottom_up_after_program_info_and_renders_program_source() {
 
     let program = program_from_sink_with_renderer(sink, &renderer).expect("ISA PROGRAM");
     let Op::Program { sink: selected, info, .. } = program.op() else { panic!("expected PROGRAM") };
-    assert_eq!(info, &expected_info, "ProgramInfo must be discovered before instruction selection");
+    assert_eq!(info.as_ref(), &expected_info, "ProgramInfo must be discovered before instruction selection");
     assert!(selected.toposort().iter().any(|u| matches!(u.op(), Op::Ins { arg, .. } if arg.opcode == "mock.add")));
     svod_schedule::spec::type_verify(selected, &svod_schedule::spec::spec_program()).expect("INS is target-spec legal");
     assert_eq!(

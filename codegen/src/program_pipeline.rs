@@ -27,7 +27,7 @@ fn unpack_program(program: &Arc<UOp>) -> Result<ProgramParts> {
     let Op::Program { sink, info, linear, source, binary } = program.op() else {
         return Err(invalid_program_state(format!("expected PROGRAM op, got {:?}", program.op())));
     };
-    Ok((sink.clone(), info.clone(), linear.clone(), source.clone(), binary.clone()))
+    Ok((sink.clone(), info.as_ref().clone(), linear.clone(), source.clone(), binary.clone()))
 }
 
 /// Structural check on the PROGRAM stage tuple. Deliberately does *not* run

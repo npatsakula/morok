@@ -58,8 +58,8 @@ impl UOp {
     /// The marker participates in hash consing — marked and unmarked sinks
     /// with otherwise identical sources are distinct UOps. Used to mark a
     /// SINK as a fully-formed kernel AST that downstream gates skip over.
-    pub fn sink_with_info(sources: Vec<Arc<Self>>, info: KernelInfo) -> Arc<Self> {
-        Self::new(Op::Sink { sources: SmallVec::from_vec(sources), info: Some(info) }, DType::Void)
+    pub fn sink_with_info(sources: Vec<Arc<Self>>, info: impl Into<Box<KernelInfo>>) -> Arc<Self> {
+        Self::new(Op::Sink { sources: SmallVec::from_vec(sources), info: Some(info.into()) }, DType::Void)
     }
 
     /// Create a group operation (merging/organizing related ops).
@@ -120,19 +120,16 @@ impl UOp {
             return self.clone();
         }
         let dtype = self.dtype();
-        Self::new(Op::Contiguous { src: self.clone(), opts: smallvec::SmallVec::new() }, dtype)
+        Self::new(Op::Contiguous { src: self.clone(), opts: Vec::new() }, dtype)
     }
 
     /// Ensure contiguous memory layout with optimization hints.
     ///
     /// The hints are extracted during rangeify and passed to the optimizer.
     /// Based on Tinygrad's CONTIGUOUS.arg which carries Opt tuples.
-    pub fn contiguous_with_opts(
-        self: &Arc<Self>,
-        opts: smallvec::SmallVec<[crate::types::ContiguousHint; 4]>,
-    ) -> Arc<Self> {
+    pub fn contiguous_with_opts(self: &Arc<Self>, opts: impl Into<Vec<crate::types::ContiguousHint>>) -> Arc<Self> {
         let dtype = self.dtype();
-        Self::new(Op::Contiguous { src: self.clone(), opts }, dtype)
+        Self::new(Op::Contiguous { src: self.clone(), opts: opts.into() }, dtype)
     }
 
     /// Contiguous backward pass.

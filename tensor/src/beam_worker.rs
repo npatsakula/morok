@@ -230,8 +230,8 @@ fn try_compile(
                 other => return Err(BeamWorker::CompileStage { stage: "compile", reason: format!("{other:?}") }),
             };
             match binary.op() {
-                Op::ProgramBinary { identity: Some(identity), .. } if &identity.source == source_identity => {
-                    identity.clone()
+                Op::ProgramBinary { identity: Some(identity), .. } if identity.source == **source_identity => {
+                    identity.as_ref().clone()
                 }
                 other => return Err(BeamWorker::CompileStage { stage: "compile", reason: format!("{other:?}") }),
             }

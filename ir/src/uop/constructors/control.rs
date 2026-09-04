@@ -116,7 +116,7 @@ impl UOp {
     pub fn variable(name: String, min_val: i64, max_val: i64, dtype: DType) -> Arc<Self> {
         let shape = crate::shape::shape_to_uop(&SmallVec::new());
         let arg = crate::ParamArg::variable(name, dtype.clone(), min_val, max_val);
-        Self::new(Op::Param { shape, arg }, dtype)
+        Self::new(Op::Param { shape, arg: arg.into() }, dtype)
     }
 
     /// Bind concrete value to symbolic variable.

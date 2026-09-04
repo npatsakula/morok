@@ -376,8 +376,8 @@ fn test_buffer_hash_consing_distinguishes_slots() {
     let shape = crate::shape::shape_to_uop(&smallvec![SInt::Const(64)]);
     let arg0 = crate::ParamArg::buffer(0, DType::Float32, svod_dtype::AddrSpace::Global, Some(DeviceSpec::Cpu));
     let arg1 = crate::ParamArg::buffer(1, DType::Float32, svod_dtype::AddrSpace::Global, Some(DeviceSpec::Cpu));
-    let buf0 = UOp::new(Op::Buffer { shape: shape.clone(), arg: arg0 }, DType::Float32);
-    let buf1 = UOp::new(Op::Buffer { shape, arg: arg1 }, DType::Float32);
+    let buf0 = UOp::new(Op::Buffer { shape: shape.clone(), arg: arg0.into() }, DType::Float32);
+    let buf1 = UOp::new(Op::Buffer { shape, arg: arg1.into() }, DType::Float32);
     assert!(!Arc::ptr_eq(&buf0, &buf1), "BUFFER slot is part of structural identity");
 }
 
@@ -452,7 +452,7 @@ fn test_call_constructor_and_with_sources() {
         Op::Call { body: call_body, args, info: call_info } => {
             assert!(Arc::ptr_eq(call_body, &body));
             assert_eq!(args.len(), 2);
-            assert_eq!(*call_info, info);
+            assert_eq!(**call_info, info);
         }
         op => panic!("expected Call op, got {op:?}"),
     }
@@ -466,7 +466,7 @@ fn test_call_constructor_and_with_sources() {
             assert_eq!(args.len(), 2);
             assert!(Arc::ptr_eq(&args[0], &c));
             assert!(Arc::ptr_eq(&args[1], &a));
-            assert_eq!(*call_info, info);
+            assert_eq!(**call_info, info);
         }
         op => panic!("expected rewritten Call op, got {op:?}"),
     }
@@ -501,7 +501,7 @@ fn test_function_constructor_with_sources_shape_and_hash() {
             assert_eq!(src.len(), 1);
             assert!(Arc::ptr_eq(&src[0], &body));
             assert_eq!(args.len(), 2);
-            assert_eq!(*fn_info, info);
+            assert_eq!(**fn_info, info);
         }
         op => panic!("expected Function op, got {op:?}"),
     }
@@ -518,7 +518,7 @@ fn test_function_constructor_with_sources_shape_and_hash() {
             assert_eq!(args.len(), 2);
             assert!(Arc::ptr_eq(&args[0], &c));
             assert!(Arc::ptr_eq(&args[1], &a));
-            assert_eq!(*fn_info, info);
+            assert_eq!(**fn_info, info);
         }
         op => panic!("expected rewritten Function op, got {op:?}"),
     }

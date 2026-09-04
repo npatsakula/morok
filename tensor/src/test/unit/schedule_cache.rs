@@ -363,7 +363,7 @@ fn test_post_sched_cache_restore_materializes_runtime_buffers() {
         svod_ir::AddrSpace::Global,
         Some(svod_dtype::DeviceSpec::Cpu),
     );
-    let placeholder = UOp::new(Op::Buffer { shape, arg }, DType::Float32)
+    let placeholder = UOp::new(Op::Buffer { shape, arg: arg.into() }, DType::Float32)
         .with_tag(smallvec::smallvec![svod_ir::uop::canonical::TAG_SCHEDULE_LOCAL_BUFFER]);
     let root = UOp::sink(vec![placeholder]);
 

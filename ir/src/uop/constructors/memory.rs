@@ -241,9 +241,9 @@ impl UOp {
     ///
     /// Marks a computation to be materialized into a buffer.
     /// The computation is evaluated over the given ranges and stored.
-    pub fn stage(compute: Arc<Self>, ranges: Vec<Arc<Self>>, opts: BufferizeOpts) -> Arc<Self> {
+    pub fn stage(compute: Arc<Self>, ranges: Vec<Arc<Self>>, opts: impl Into<Box<BufferizeOpts>>) -> Arc<Self> {
         let dtype = compute.dtype.clone();
-        Self::new(Op::Stage { compute, ranges: SmallVec::from_vec(ranges), opts }, dtype)
+        Self::new(Op::Stage { compute, ranges: SmallVec::from_vec(ranges), opts: opts.into() }, dtype)
     }
 
     /// Create a STAGE operation with Global address space.

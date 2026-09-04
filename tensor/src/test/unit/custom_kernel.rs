@@ -28,7 +28,7 @@ fn test_tensor_custom_kernel_builds_after_call_outputs() {
                     Op::Call { body, args, info } => {
                         assert!(matches!(body.op(), Op::Sink { .. }));
                         assert_eq!(args.len(), 2);
-                        assert_eq!(*info, CallInfo::default());
+                        assert_eq!(**info, CallInfo::default());
                     }
                     op => panic!("expected CALL dep, got {op:?}"),
                 }
@@ -53,7 +53,7 @@ fn test_tensor_custom_kernel_with_call_info() {
         Op::After { deps, .. } => {
             assert_eq!(deps.len(), 1);
             match deps[0].op() {
-                Op::Call { info: call_info, .. } => assert_eq!(*call_info, info),
+                Op::Call { info: call_info, .. } => assert_eq!(**call_info, info),
                 op => panic!("expected CALL dep, got {op:?}"),
             }
         }

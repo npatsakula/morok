@@ -22,7 +22,7 @@ fn buffer(size: usize) -> Arc<UOp> {
 /// `CALL(SINK, args...)` — a hand-written kernel over `args`.
 fn call_with(args: Vec<Arc<UOp>>) -> Arc<UOp> {
     let body = UOp::sink(vec![UOp::param(0, 4, DType::Float32, Some(DeviceSpec::Cpu))]);
-    UOp::new(Op::Call { body, args: args.into_iter().collect(), info: CallInfo::default() }, DType::Void)
+    UOp::new(Op::Call { body, args: args.into_iter().collect(), info: CallInfo::default().into() }, DType::Void)
 }
 
 /// `STORE(INDEX(dest, r), value)` — `dest` is indexed without any movement op.

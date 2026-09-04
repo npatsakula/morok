@@ -18,7 +18,7 @@ fn tinygrad_partial_range_comparison_rejects_path_prefixes() {
 fn tinygrad_partial_param_comparison_stops_at_first_difference() {
     let projected = arg_key(&Op::Param {
         shape: UOp::index_const(1),
-        arg: ParamArg::variable("projected".to_string(), DType::WeakInt, 0, 8),
+        arg: ParamArg::variable("projected".to_string(), DType::WeakInt, 0, 8).into(),
     });
     assert!(matches!(projected, ArgKey::Param(ParamKey { addrspace: Some(4), .. })));
 
@@ -74,7 +74,8 @@ fn tinygrad_wmma_key_omits_svod_only_metadata() {
     right.reduce_axes.clear();
     right.tile_grid = (1, 1);
 
-    let make_op = |metadata| Op::Wmma { a: value.clone(), b: value.clone(), c: value.clone(), metadata };
+    let make_op =
+        |metadata| Op::Wmma { a: value.clone(), b: value.clone(), c: value.clone(), metadata: Box::new(metadata) };
     assert_eq!(arg_key(&make_op(left.clone())), arg_key(&make_op(right.clone())));
 
     right.device = RendererDevice::CudaSm89;
