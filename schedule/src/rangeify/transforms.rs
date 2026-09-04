@@ -17,11 +17,11 @@ use std::sync::{Arc, LazyLock};
 use super::context::RangeifyContext;
 use super::indexing::IndexingContext;
 use super::kernel::RangeifyBufferContext;
-use crate::passes::slice_memo::SliceMemo;
 use rustc_hash::FxHashMap;
 use smallvec::{SmallVec, smallvec};
 use svod_ir::ops;
 use svod_ir::shape::Shape;
+use svod_ir::uop::{Nodes, SliceMemo};
 use svod_ir::{AddrSpace, AxisType, BinaryOp, BufferizeOpts, ConstValue, DType, Op, UOp, UOpKey};
 
 // ============================================================================
@@ -1210,7 +1210,7 @@ pub(crate) fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &svod_dtype::DType) 
 /// every END/REDUCE it visits, memoized so no match toposorts its own slice.
 pub struct SimplifyRangesContext {
     bounds: HashMap<UOpKey, Arc<UOp>>,
-    reduces: SliceMemo,
+    reduces: SliceMemo<Nodes>,
     divmod_counts: FxHashMap<u64, usize>,
 }
 
@@ -1218,7 +1218,7 @@ impl Default for SimplifyRangesContext {
     fn default() -> Self {
         Self {
             bounds: HashMap::new(),
-            reduces: SliceMemo::ungated(|uop| matches!(uop.op(), Op::Reduce(..))),
+            reduces: SliceMemo::new(|uop| matches!(uop.op(), Op::Reduce(..))),
             divmod_counts: FxHashMap::default(),
         }
     }

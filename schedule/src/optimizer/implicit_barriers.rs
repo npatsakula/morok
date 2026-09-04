@@ -4,24 +4,23 @@ use std::sync::{Arc, LazyLock};
 use smallvec::{SmallVec, smallvec};
 use svod_dtype::AddrSpace;
 use svod_ir::ops;
+use svod_ir::uop::{Nodes, SliceMemo, SubtreeMemo};
 use svod_ir::{AxisType, ConstValue, Op, TypedPatternMatcher, UOp, UOpKey};
-
-use crate::passes::slice_memo::SliceMemo;
 
 /// Local STOREs in each node's backward slice, memoized for one `pm_implicit_barriers`
 /// run so neither rule toposorts the slice of every AFTER/END it visits.
 pub struct BarrierContext {
     /// Every local STORE below a node (`add_war_barrier`).
-    stores: SliceMemo,
-    /// Local STOREs reachable without crossing a BARRIER (`add_raw_barrier`).
-    unbarriered_stores: SliceMemo,
+    stores: SliceMemo<Nodes>,
+    /// Whether a local STORE is reachable without crossing a BARRIER (`add_raw_barrier`).
+    unbarriered_store: SubtreeMemo,
 }
 
 impl Default for BarrierContext {
     fn default() -> Self {
         Self {
-            stores: SliceMemo::ungated(is_local_store),
-            unbarriered_stores: SliceMemo::new(is_local_store, |uop| !matches!(uop.op(), Op::Barrier(..))),
+            stores: SliceMemo::new(is_local_store),
+            unbarriered_store: SliceMemo::gated(is_local_store, |uop| !matches!(uop.op(), Op::Barrier(..))),
         }
     }
 }
@@ -59,7 +58,7 @@ fn add_raw_barrier(ctx: &mut BarrierContext, after: &Arc<UOp>) -> Option<Arc<UOp
     }
 
     // Tinygrad gates one toposort over SINK(*after.src[1:]) on "not a BARRIER".
-    if !deps.iter().any(|dep| !ctx.unbarriered_stores.get(dep).is_empty()) {
+    if !deps.iter().any(|dep| ctx.unbarriered_store.contains(dep)) {
         return None;
     }
 

@@ -5,8 +5,9 @@
 
 use std::sync::Arc;
 
-use svod_ir::uop::reaching;
-use svod_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, TernaryOp};
+use smallvec::SmallVec;
+use svod_ir::uop::{reaching, reaching_each};
+use svod_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, TernaryOp, UOp};
 
 use crate::optimizer::config::HeuristicsConfig;
 use crate::optimizer::{Opt, Scheduler, apply_opt};
@@ -165,37 +166,50 @@ pub fn count_strides(scheduler: &Scheduler, axis: usize) -> (usize, usize) {
     if axis >= rngs.len() {
         return (0, 0);
     }
-    let target_rng = &rngs[axis];
+    let mut reaches_target = reaching(&rngs[axis]);
+    strides_of(&linearized_indices(scheduler.bufs()), &rngs[axis], |idx| reaches_target.contains(idx))
+}
+
+/// The combined linearized index of each buffer access, WHERE unwrapped.
+fn linearized_indices(bufs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
+    bufs.iter()
+        .filter_map(|buf| match buf.op() {
+            Op::Index(ops::Index { indices, .. }) => {
+                Some(indices.first().map(|i| i.get_idx()).unwrap_or_else(|| buf.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `count_strides` over precomputed indices; `reaches` answers whether an index
+/// depends on `target_rng`, so one reachability memo can serve every axis.
+fn strides_of(
+    indices: &[Arc<UOp>],
+    target_rng: &Arc<UOp>,
+    mut reaches: impl FnMut(&Arc<UOp>) -> bool,
+) -> (usize, usize) {
     let mut num_strides = 0;
     let mut sum_strides: usize = 0;
-    let mut reaches_target = reaching(target_rng);
+    for idx in indices {
+        num_strides += usize::from(reaches(idx));
 
-    for buf in scheduler.bufs() {
-        if let Op::Index(ops::Index { indices, .. }) = buf.op() {
-            // Get the combined linearized index and unwrap WHERE if present.
-            let idx = indices.first().map(|i| i.get_idx()).unwrap_or_else(|| buf.clone());
-
-            if reaches_target.contains(&idx) {
-                num_strides += 1;
-            }
-
-            for term in idx.split_uop(BinaryOp::Add) {
-                if Arc::ptr_eq(&term, target_rng) {
-                    // c is rng → stride 1
-                    sum_strides += 1;
-                } else if let Op::Binary(BinaryOp::Mul, lhs, rhs) = term.op() {
-                    // c.op is Ops.MUL and one side is rng and other is CONST
-                    if Arc::ptr_eq(lhs, target_rng)
-                        && let Op::Const(cv) = rhs.op()
-                        && let svod_ir::ConstValue::Int(v) = cv.0
-                    {
-                        sum_strides += v as usize;
-                    } else if Arc::ptr_eq(rhs, target_rng)
-                        && let Op::Const(cv) = lhs.op()
-                        && let svod_ir::ConstValue::Int(v) = cv.0
-                    {
-                        sum_strides += v as usize;
-                    }
+        for term in idx.split_uop(BinaryOp::Add) {
+            if Arc::ptr_eq(&term, target_rng) {
+                // c is rng → stride 1
+                sum_strides += 1;
+            } else if let Op::Binary(BinaryOp::Mul, lhs, rhs) = term.op() {
+                // c.op is Ops.MUL and one side is rng and other is CONST
+                if Arc::ptr_eq(lhs, target_rng)
+                    && let Op::Const(cv) = rhs.op()
+                    && let svod_ir::ConstValue::Int(v) = cv.0
+                {
+                    sum_strides += v as usize;
+                } else if Arc::ptr_eq(rhs, target_rng)
+                    && let Op::Const(cv) = lhs.op()
+                    && let svod_ir::ConstValue::Int(v) = cv.0
+                {
+                    sum_strides += v as usize;
                 }
             }
         }
@@ -797,67 +811,56 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
         // for axis × upcast_amount in upcastable_dims × [3, 4].
         let mut choices: Vec<(usize, usize, usize, usize)> = Vec::new();
 
+        // One walk over the buffer indices records which of the existing
+        // UPCAST/UNROLL ranges and candidate axes each node reaches, so every
+        // per-axis question below is a set lookup.
+        let rngs = scheduler.rngs();
+        let candidates: Vec<usize> = upcastable.iter().copied().filter(|axis| !upcasted_axes.contains(axis)).collect();
         let upcast_and_unroll_ranges = scheduler.ranges_of(&[AxisType::Upcast, AxisType::Unroll]);
-
-        // "every existing UPCAST/UNROLL range appears in this buffer's indices"
-        // does not depend on the candidate axis, so it is computed once per
-        // buffer instead of once per (axis, buffer).
+        let targets: Vec<Arc<UOp>> =
+            upcast_and_unroll_ranges.iter().chain(candidates.iter().map(|&axis| &rngs[axis])).cloned().collect();
+        let mut reach = reaching_each(&targets);
         let bufs = scheduler.bufs();
-        let all_upcast_in_idx: Vec<bool> = {
-            let mut reach: Vec<_> = upcast_and_unroll_ranges.iter().map(reaching).collect();
-            bufs.iter()
-                .map(|buf| match buf.op() {
-                    Op::Index(ops::Index { indices, .. }) => {
-                        reach.iter_mut().all(|r2| indices.iter().any(|idx| r2.contains(idx)))
-                    }
-                    _ => false,
-                })
-                .collect()
-        };
+        let indices = linearized_indices(bufs);
 
-        for &axis_idx in &upcastable {
-            if upcasted_axes.contains(&axis_idx) {
-                continue;
-            }
-
-            let rngs = scheduler.rngs();
-            if axis_idx >= rngs.len() {
-                continue;
-            }
-            let rng = &rngs[axis_idx];
-
-            // Stride-0 check: axis must be NOT in some buffer's index
-            // backward_slice AND all existing UPCAST/UNROLL ranges ARE.
-            let has_stride0 = {
-                let mut reaches_rng = reaching(rng);
-                bufs.iter().zip(&all_upcast_in_idx).any(|(buf, &all_upcast)| {
-                    all_upcast
-                        && matches!(buf.op(), Op::Index(ops::Index { indices, .. })
-                            if !indices.iter().any(|idx| reaches_rng.contains(idx)))
-                })
-            };
-
-            if !has_stride0 {
-                continue;
-            }
-
-            for &upcast_amount in &[3usize, 4] {
-                let size = if let Op::Range(ops::Range { end, .. }) = rng.op()
-                    && let Op::Const(cv) = end.op()
-                    && let svod_ir::ConstValue::Int(sz) = cv.0
-                {
-                    sz
-                } else {
-                    continue;
-                };
-
-                if size % upcast_amount as i64 != 0 {
-                    continue;
+        // Stride-0 check: an axis must be NOT in some buffer's index backward
+        // slice in which all existing UPCAST/UNROLL ranges ARE, so only those
+        // buffers matter, as the ids of the targets their indices reach.
+        let full_upcast_bufs: Vec<Vec<u64>> = bufs
+            .iter()
+            .filter_map(|buf| {
+                let Op::Index(ops::Index { indices, .. }) = buf.op() else { return None };
+                let mut reached = Vec::new();
+                for idx in indices {
+                    reached.extend(reach.get(idx).iter().map(|target| target.id));
                 }
+                upcast_and_unroll_ranges.iter().all(|range| reached.contains(&range.id)).then_some(reached)
+            })
+            .collect();
 
-                let (num_strides, sum_strides) = count_strides(scheduler, axis_idx);
-                choices.push((num_strides, sum_strides, axis_idx, upcast_amount));
+        for axis_idx in candidates {
+            let rng = &rngs[axis_idx];
+            if !full_upcast_bufs.iter().any(|reached| !reached.contains(&rng.id)) {
+                continue;
             }
+
+            let size = if let Op::Range(ops::Range { end, .. }) = rng.op()
+                && let Op::Const(cv) = end.op()
+                && let svod_ir::ConstValue::Int(sz) = cv.0
+            {
+                sz
+            } else {
+                continue;
+            };
+            let amounts: SmallVec<[usize; 2]> =
+                [3, 4].into_iter().filter(|&amount| size % amount as i64 == 0).collect();
+            if amounts.is_empty() {
+                continue;
+            }
+
+            let (num_strides, sum_strides) =
+                strides_of(&indices, rng, |idx| reach.get(idx).iter().any(|target| target.id == rng.id));
+            choices.extend(amounts.into_iter().map(|amount| (num_strides, sum_strides, axis_idx, amount)));
         }
 
         if choices.is_empty() {

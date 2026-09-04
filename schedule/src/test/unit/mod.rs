@@ -7,7 +7,6 @@ pub mod multi;
 pub mod optimizer;
 pub mod phi_dominance;
 pub mod rangeify;
-pub mod slice_memo;
 pub mod spec;
 pub mod symbolic;
 
