@@ -205,3 +205,56 @@ fn fallback_engages_when_library_is_missing() {
         .unwrap();
     assert!(status.success());
 }
+
+/// Every file name a distribution installs for one major is generated, the
+/// runtime SONAMEs ahead of the dev/compat symlink, so a runtime package
+/// without the `libLLVM.so` dev symlink is found.
+#[test_case::test_case(18, "so" => vec!["libLLVM.so.18.1", "libLLVM-18.so.1", "libLLVM-18.so", "libLLVM.so.18"]; "elf, newer soname scheme")]
+#[test_case::test_case(16, "so" => vec!["libLLVM.so.16.1", "libLLVM-16.so.1", "libLLVM-16.so", "libLLVM.so.16"]; "elf, older soname scheme")]
+#[test_case::test_case(20, "dylib" => vec!["libLLVM-20.dylib", "libLLVM.20.dylib"]; "mach-o")]
+fn versioned_names_cover_distro_layouts(major: u32, extension: &str) -> Vec<String> {
+    versioned_names(major, extension).collect()
+}
+
+/// The dev symlink is tried first, then every supported major newest-first.
+#[test]
+fn candidate_names_try_the_dev_symlink_then_newest_major_first() {
+    let names = candidate_names("so");
+    assert_eq!(names[0], "libLLVM.so");
+    assert_eq!(names[1], format!("libLLVM.so.{MAX_PROBED_MAJOR_VERSION}.1"));
+    assert_eq!(names.last().unwrap(), &format!("libLLVM.so.{MIN_MAJOR_VERSION}"));
+    assert_eq!(names.len(), 1 + 4 * (MAX_PROBED_MAJOR_VERSION - MIN_MAJOR_VERSION + 1) as usize);
+}
+
+/// `llvm-config --libdir` is searched before the loader's default path, which
+/// stays in the list for hosts without `llvm-config`.
+#[test]
+fn llvm_config_libdir_is_searched_before_the_loader_path() {
+    let candidates = default_candidates();
+    let dev_symlink = format!("libLLVM.{LIBRARY_EXTENSION}");
+    let loader_path_at = candidates
+        .iter()
+        .position(|candidate| candidate.as_os_str() == dev_symlink.as_str())
+        .expect("bare name present");
+    match llvm_config_libdir() {
+        Some(libdir) => {
+            assert_eq!(candidates[0], libdir.join(&dev_symlink));
+            assert!(loader_path_at > 0, "{candidates:?}");
+        }
+        None => assert_eq!(loader_path_at, 0, "{candidates:?}"),
+    }
+}
+
+/// The versioned runtime SONAME of the loaded libLLVM, which a distribution's
+/// runtime package installs without the dev symlink, loads on its own.
+#[cfg(target_os = "linux")]
+#[test]
+fn runtime_soname_of_host_library_loads() {
+    let Some(library) = host_library() else { return };
+    let directory = library.path.parent().filter(|directory| !directory.as_os_str().is_empty());
+    let major = library.version[0];
+    let loaded = versioned_names(major, "so")
+        .map(|name| directory.map_or_else(|| PathBuf::from(&name), |directory| directory.join(&name)))
+        .find(|path| LlvmLibrary::discover(Some(path.clone().into_os_string())).is_ok());
+    assert!(loaded.is_some(), "no versioned name of LLVM {major} loads beside {}", library.path.display());
+}

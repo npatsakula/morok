@@ -294,14 +294,38 @@ impl LlvmLibrary {
     }
 }
 
+const LIBRARY_EXTENSION: &str = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+
+/// File names one LLVM major is installed under, by extension. ELF: the ≥ 18
+/// upstream SONAME `libLLVM.so.18.1`, Debian's multiarch runtime SONAME
+/// `libLLVM-18.so.1`, `libLLVM-18.so` (the ≤ 17 SONAME, kept by later
+/// releases as a compatibility symlink) and the major-only `libLLVM.so.18`;
+/// runtime packages install these without the `libLLVM.so` dev symlink.
+/// Mach-O: Homebrew's `libLLVM-18.dylib` keg symlink and `libLLVM.18.dylib`.
+fn versioned_names(major: u32, extension: &str) -> impl Iterator<Item = String> {
+    let forms: &[&str] = match extension {
+        "dylib" => &["libLLVM-{major}.dylib", "libLLVM.{major}.dylib"],
+        _ => &["libLLVM.so.{major}.1", "libLLVM-{major}.so.1", "libLLVM-{major}.so", "libLLVM.so.{major}"],
+    };
+    forms.iter().map(move |form| form.replace("{major}", &major.to_string()))
+}
+
+/// The dev symlink, then every supported major's names, newest first.
+fn candidate_names(extension: &str) -> Vec<String> {
+    std::iter::once(format!("libLLVM.{extension}"))
+        .chain((MIN_MAJOR_VERSION..=MAX_PROBED_MAJOR_VERSION).rev().flat_map(|major| versioned_names(major, extension)))
+        .collect()
+}
+
+/// `llvm-config --libdir` when present, then the loader's default search
+/// path, then Homebrew's keg-only kegs on macOS.
 fn default_candidates() -> Vec<PathBuf> {
-    let extension = if cfg!(target_os = "macos") { "dylib" } else { "so" };
-    let mut names = vec![format!("libLLVM.{extension}")];
-    for major in (MIN_MAJOR_VERSION..=MAX_PROBED_MAJOR_VERSION).rev() {
-        names.push(format!("libLLVM-{major}.{extension}"));
-        names.push(format!("libLLVM.{extension}.{major}"));
-    }
-    let mut candidates = names.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let names = candidate_names(LIBRARY_EXTENSION);
+    let mut candidates = llvm_config_libdir()
+        .iter()
+        .flat_map(|libdir| names.iter().map(|name| libdir.join(name)))
+        .chain(names.iter().map(PathBuf::from))
+        .collect::<Vec<_>>();
     if cfg!(target_os = "macos") {
         candidates.push("/opt/homebrew/opt/llvm/lib/libLLVM.dylib".into());
         candidates.extend(
@@ -309,9 +333,6 @@ fn default_candidates() -> Vec<PathBuf> {
                 .rev()
                 .map(|major| PathBuf::from(format!("/opt/homebrew/opt/llvm@{major}/lib/libLLVM.dylib"))),
         );
-    }
-    if let Some(libdir) = llvm_config_libdir() {
-        candidates.extend(names.iter().map(|name| libdir.join(name)));
     }
     candidates
 }
@@ -413,9 +434,11 @@ impl Session {
 
         let mut message: *mut c_char = null_mut();
         // SAFETY: live module and a valid out-pointer for the message.
-        if unsafe { (api.LLVMVerifyModule)(module.handle, LLVM_RETURN_STATUS_ACTION, &mut message) } != 0 {
-            // SAFETY: LLVM allocated `message` for us to release.
-            let reason = unsafe { api.take_message(message) };
+        let invalid = unsafe { (api.LLVMVerifyModule)(module.handle, LLVM_RETURN_STATUS_ACTION, &mut message) } != 0;
+        // SAFETY: LLVM `strdup`s the (possibly empty) verifier output on both
+        // outcomes, so it is released on both.
+        let reason = unsafe { api.take_message(message) };
+        if invalid {
             return Err(Error::LlvmError { reason: format!("IR verification failed: {reason}") });
         }
 
