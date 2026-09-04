@@ -73,6 +73,9 @@ fn traversal_sources(node: &Arc<UOp>, mode: TraversalMode) -> SmallVec<[&Arc<UOp
     }
 }
 
+/// Sorted, deduplicated RANGE ids; inline for the common handful of loops.
+pub type RangeIds = SmallVec<[u64; 4]>;
+
 /// Wrapper for `Arc<UOp>` that implements Hash and Eq based on stable ID.
 ///
 /// This allows using `Arc<UOp>` as HashMap keys without implementing
@@ -123,7 +126,7 @@ pub struct UOp {
     /// Cached shape - computed lazily on first access.
     /// OnceLock provides thread-safe lazy initialization.
     #[debug(skip)]
-    pub(crate) shape_cache: std::sync::OnceLock<crate::Result<Option<shape::Shape>>>,
+    pub(crate) shape_cache: std::sync::OnceLock<Result<Option<shape::Shape>, Box<crate::error::Error>>>,
     /// Cached list of RANGE operations in this UOp's graph.
     /// Computed lazily via toposort to collect all RANGE ops.
     #[debug(skip)]
@@ -136,7 +139,7 @@ pub struct UOp {
     /// ended). Ids rather than `Arc`s: a RANGE's own cache entry would
     /// otherwise be a refcount cycle (permanent leak).
     #[debug(skip)]
-    pub(crate) in_scope_ranges_cache: std::sync::OnceLock<HashSet<u64>>,
+    pub(crate) in_scope_ranges_cache: std::sync::OnceLock<RangeIds>,
     /// Cached vmin/vmax range analysis values.
     /// Computed lazily via range propagation through the computation graph.
     /// Returns (vmin, vmax) as ConstValue types.
@@ -454,7 +457,7 @@ impl UOp {
         use crate::uop::properties::ShapeProperty;
         match ShapeProperty::get(self) {
             Ok(opt) => Ok(opt.as_ref()),
-            Err(e) => Err(e.clone()),
+            Err(e) => Err((**e).clone()),
         }
     }
 
@@ -939,7 +942,7 @@ impl UOp {
     /// // After END, range is no longer in scope
     /// assert!(!end_op.in_scope_ranges().contains(&range.id));
     /// ```
-    pub fn in_scope_ranges(self: &Arc<Self>) -> &HashSet<u64> {
+    pub fn in_scope_ranges(self: &Arc<Self>) -> &[u64] {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::InScopeRangesProperty;
         InScopeRangesProperty::get(self)

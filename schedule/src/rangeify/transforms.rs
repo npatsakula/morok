@@ -1069,7 +1069,7 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut RangeifyBufferConte
 /// Partition ranges into parented and unparented.
 pub(crate) fn partition_reduce_ranges(
     ranges: &SmallVec<[Arc<UOp>; 4]>,
-    src_ranges: &HashSet<u64>,
+    src_ranges: &[u64],
 ) -> (SmallVec<[Arc<UOp>; 4]>, Vec<Arc<UOp>>) {
     let mut parented = SmallVec::new();
     let mut unparented = Vec::new();

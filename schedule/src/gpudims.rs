@@ -319,7 +319,7 @@ fn compute_store_masks(
         // Find local ranges NOT used in the index computation.
         // Use in_scope_ranges() to get only active (not ended) ranges,
         // rather than toposort().filter(Range) which returns ALL ranges in the graph.
-        let index_ranges: HashSet<u64> = index.in_scope_ranges().clone();
+        let index_ranges: HashSet<u64> = index.in_scope_ranges().iter().copied().collect();
 
         let mut missing_locals: Vec<Arc<UOp>> = Vec::new();
         for (axis_id, axis_type) in local_dims {

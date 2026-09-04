@@ -13,7 +13,6 @@
 use crate::Op;
 use crate::cached_property;
 use crate::types::ConstValue;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 // ============================================================================
@@ -35,9 +34,9 @@ cached_property! {
     ///
     /// let shape_result = ShapeProperty::get(&my_uop);
     /// ```
-    ShapeProperty: crate::Result<Option<crate::shape::Shape>> {
+    ShapeProperty: Result<Option<crate::shape::Shape>, Box<crate::error::Error>> {
         cache_field: shape_cache,
-        compute: |uop| crate::shape::infer_shape_from_op(uop)
+        compute: |uop| crate::shape::infer_shape_from_op(uop).map_err(Box::new)
     }
 }
 
@@ -96,27 +95,25 @@ cached_property! {
     ///
     /// This is O(N) total for the first access on a graph, then O(1) for
     /// subsequent accesses on overlapping subgraphs (cached per-node).
-    InScopeRangesProperty: HashSet<u64> {
+    InScopeRangesProperty: crate::uop::core::RangeIds {
         cache_field: in_scope_ranges_cache,
         compute: |uop| {
-            let mut result: HashSet<u64> = HashSet::new();
+            // Sorted, deduplicated ids: a few entries at most, so a linear scan
+            // beats a hash table and the inline buffer avoids a heap allocation
+            // per node.
+            let mut result = crate::uop::core::RangeIds::new();
 
             // Step 1: Merge from all sources' cached in_scope_ranges
-            uop.op.map_child(|src| {
-                result.extend(InScopeRangesProperty::get(src).iter().copied());
-            });
+            uop.op.map_child(|src| result.extend_from_slice(InScopeRangesProperty::get(src)));
 
             // Step 2: Remove ended ranges (using existing op.ended_ranges())
             for ended in uop.op.ended_ranges() {
                 match ended.op() {
-                    Op::Range { .. } => {
-                        result.remove(&ended.id);
-                    }
+                    Op::Range { .. } => result.retain(|id| *id != ended.id),
+                    // Non-RANGE ended (like AFTER) — remove all its in-scope ranges
                     _ => {
-                        // Non-RANGE ended (like AFTER) — remove all its in-scope ranges
-                        for r in InScopeRangesProperty::get(ended).iter() {
-                            result.remove(r);
-                        }
+                        let ended_scope = InScopeRangesProperty::get(ended);
+                        result.retain(|id| !ended_scope.contains(id));
                     }
                 }
             }
@@ -125,9 +122,11 @@ cached_property! {
             // self-`Arc` in the node's own cache would be a refcount cycle
             // (permanent leak); ids pin nothing.
             if matches!(uop.op, Op::Range { .. }) {
-                result.insert(uop.id);
+                result.push(uop.id);
             }
 
+            result.sort_unstable();
+            result.dedup();
             result
         }
     }
