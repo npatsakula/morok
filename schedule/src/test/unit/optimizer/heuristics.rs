@@ -9,18 +9,25 @@ use crate::optimizer::heuristics::{
     apply_default_upcast, apply_heuristic_upcasts, apply_image_upcasts, apply_matvec_fast_path, try_tensor_cores,
 };
 use crate::optimizer::{Opt, OptOps, Renderer, Scheduler};
+use crate::test::helpers::create_typed_matmul_pattern;
 use svod_ir::ops;
 
-fn create_matvec_like_pattern(rows: i64, cols: i64) -> Arc<UOp> {
+/// Matvec-shaped `sum_k A[k] * B[k]` over `stored` buffers; with `wide`, both
+/// loads are cast to it before the product.
+fn create_matvec_like_pattern(rows: i64, cols: i64, stored: DType, wide: Option<DType>) -> Arc<UOp> {
     let row = UOp::range_axis(UOp::index_const(rows), AxisId::Renumbered(0), AxisType::Global);
     let reduce = UOp::range_axis(UOp::index_const(cols), AxisId::Renumbered(1), AxisType::Reduce);
 
-    let a_buf = UOp::new_buffer(DeviceSpec::Cpu, (rows * cols) as usize, DType::Float32);
-    let b_buf = UOp::new_buffer(DeviceSpec::Cpu, (rows * cols) as usize, DType::Float32);
-
     let idx_expr = row.try_add(&reduce).expect("index add should succeed");
-    let a = UOp::index().buffer(a_buf).indices(vec![idx_expr.clone()]).call().expect("A index should build");
-    let b = UOp::index().buffer(b_buf).indices(vec![idx_expr]).call().expect("B index should build");
+    let load = || {
+        let buffer = UOp::new_buffer(DeviceSpec::Cpu, (rows * cols) as usize, stored.clone());
+        let value = UOp::index().buffer(buffer).indices(vec![idx_expr.clone()]).call().expect("index should build");
+        match &wide {
+            Some(wide) => value.cast(wide.clone()),
+            None => value,
+        }
+    };
+    let (a, b) = (load(), load());
 
     let mul = a.try_mul(&b).expect("mul should succeed");
     let red = mul.reduce(vec![reduce].into(), ReduceOp::Add);
@@ -47,18 +54,47 @@ fn create_tc_retry_pattern() -> Arc<UOp> {
     UOp::sink(vec![red, m_range, n_good_range, n_bad_range])
 }
 
+/// A widening integer cast on the operands is exact under the int8→int32 WMMA,
+/// so it must not hide the tensor core; float casts keep the generic path.
+#[test_case(DType::Int8, DType::Int32, true; "int8 operands widened to int32 use the integer wmma")]
+#[test_case(DType::Float16, DType::Float32, false; "float16 operands widened to float32 stay scalar")]
+fn try_tensor_cores_sees_through_widening_integer_casts(stored: DType, wide: DType, uses_tc: bool) {
+    let sink = create_typed_matmul_pattern(16, 16, 16, stored.clone(), Some(wide));
+    let mut scheduler = Scheduler::new(sink, Renderer::amd_rdna3());
+
+    assert_eq!(try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().build()), uses_tc);
+
+    let wmma = scheduler.ast().toposort().into_iter().find_map(|u| match u.op() {
+        Op::Wmma(ops::Wmma { metadata, .. }) => Some(metadata.dtype_in.clone()),
+        _ => None,
+    });
+    assert_eq!(wmma, uses_tc.then_some(stored));
+}
+
 /// The matvec fast path applies GROUP + LOCAL + UPCAST in one shot, unless
 /// `matvec_enabled` turns it off.
 #[test_case(true; "enabled")]
 #[test_case(false; "disabled by config")]
 fn test_apply_matvec_fast_path(enabled: bool) {
-    let mut scheduler = Scheduler::new(create_matvec_like_pattern(64, 128), Renderer::cuda());
+    let sink = create_matvec_like_pattern(64, 128, DType::Float32, None);
+    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
     let config = HeuristicsConfig::builder().matvec_enabled(enabled).build();
 
     assert_eq!(apply_matvec_fast_path(&mut scheduler, &config), enabled);
     for axis in [AxisType::GroupReduce, AxisType::Local, AxisType::Upcast] {
         assert_eq!(!scheduler.axes_of(&[axis]).is_empty(), enabled, "{axis:?}");
     }
+}
+
+/// Widened int8 operands, the shape every integer contraction takes after the
+/// early `Cast(Mul)` rewrite, still qualify for the matvec fast path.
+#[test]
+fn matvec_fast_path_accepts_widened_integer_operands() {
+    let sink = create_matvec_like_pattern(64, 128, DType::Int8, Some(DType::Int32));
+    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
+
+    assert!(apply_matvec_fast_path(&mut scheduler, &HeuristicsConfig::builder().build()));
+    assert!(!scheduler.axes_of(&[AxisType::GroupReduce]).is_empty());
 }
 
 #[test_case(DType::Image { kind: svod_dtype::ImageKind::Float, shape: vec![2, 8, 4] }, true; "image buffer")]

@@ -1,7 +1,23 @@
 //! Tests for tensor core (TC) optimization.
 
 use crate::optimizer::{Opt, Renderer, Scheduler, apply_opt, tc::*};
+use svod_dtype::{DType, DeviceSpec};
 use svod_ir::{AxisId, AxisType, ReduceOp, UOp};
+use test_case::test_case;
+
+/// Only a value-preserving integer widening is peeled off a MUL operand: the
+/// tensor core reproduces it exactly, anything else would change the product.
+#[test_case(DType::Int8, DType::Int32, true; "int8 to int32")]
+#[test_case(DType::UInt8, DType::Int32, true; "uint8 to int32")]
+#[test_case(DType::Int8, DType::UInt16, false; "sign change")]
+#[test_case(DType::Int32, DType::Int8, false; "narrowing")]
+#[test_case(DType::Float16, DType::Float32, false; "float widening")]
+fn tc_operand_peels_only_exact_integer_widening(stored: DType, wide: DType, peeled: bool) {
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 16, stored.clone());
+    let load = UOp::index().buffer(buffer).indices(vec![UOp::index_const(0)]).call().unwrap();
+    let operand = load.cast(wide.clone());
+    assert_eq!(tc_operand(&operand).dtype(), if peeled { stored } else { wide });
+}
 
 // ===== Matching Tests =====
 
@@ -271,7 +287,6 @@ fn test_apply_tc_invalid_use_tc() {
 // =============================================================================
 
 use std::sync::Arc;
-use svod_dtype::DType;
 
 /// Helper to create a proper matmul pattern for TC padding tests.
 /// Creates: C[m,n] = sum_k A[m,k] * B[k,n]
