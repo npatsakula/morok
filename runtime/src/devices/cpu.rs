@@ -36,13 +36,35 @@ pub enum CpuBackend {
 }
 
 impl CpuBackend {
-    /// Select backend from environment variable SVOD_CPU_BACKEND.
-    pub fn from_env() -> Self {
-        match std::env::var("SVOD_CPU_BACKEND").as_deref() {
-            Ok("clang") | Ok("CLANG") => CpuBackend::Clang,
-            Ok("llvm") | Ok("LLVM") => CpuBackend::Llvm,
-            _ => CpuBackend::default(),
+    /// Accepted `SVOD_CPU_BACKEND` spellings.
+    const SPELLINGS: &str = "clang, CLANG, llvm, LLVM";
+
+    /// Parse a `SVOD_CPU_BACKEND` value; `None` for anything but [`Self::SPELLINGS`].
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "clang" | "CLANG" => Some(CpuBackend::Clang),
+            "llvm" | "LLVM" => Some(CpuBackend::Llvm),
+            _ => None,
         }
+    }
+
+    /// Select the backend from `SVOD_CPU_BACKEND`. Unset or empty selects the
+    /// default (LLVM); an unrecognised value warns and selects it too.
+    pub fn from_env() -> Self {
+        let value = std::env::var_os("SVOD_CPU_BACKEND").unwrap_or_default();
+        let value = value.to_string_lossy();
+        if value.is_empty() {
+            return Self::default();
+        }
+        Self::parse(&value).unwrap_or_else(|| {
+            tracing::warn!(
+                %value,
+                accepted = Self::SPELLINGS,
+                "unrecognised SVOD_CPU_BACKEND, using the default {:?} backend",
+                Self::default()
+            );
+            Self::default()
+        })
     }
 }
 
@@ -386,9 +408,8 @@ fn create_llvm_program(spec: &svod_device::device::CompiledSpec) -> Result<Box<d
 
 /// Create a CPU device with the default backend.
 ///
-/// The default backend is selected by:
-/// 1. `SVOD_CPU_BACKEND` environment variable ("clang" or "llvm")
-/// 2. If not set, defaults to Clang
+/// The backend is selected by [`CpuBackend::from_env`]: `SVOD_CPU_BACKEND`
+/// when set to an accepted spelling, otherwise LLVM.
 pub fn create_cpu_device(registry: &DeviceRegistry) -> Result<Device> {
     create_cpu_device_with_backend(registry, CpuBackend::from_env())
 }

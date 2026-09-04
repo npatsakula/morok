@@ -18,7 +18,7 @@ kernel.execute(&[buf_a.ptr(), buf_b.ptr(), buf_out.ptr()])?;
 | **LLVM** (default) | Compiles LLVM IR in-process through `libLLVM` (falls back to `clang -x ir`), loads via JIT ELF loader | always |
 | **Clang** | Compiles C via `clang -c`, loads via JIT ELF loader | always |
 
-Select at runtime: `SVOD_CPU_BACKEND=clang|llvm`
+Select at runtime: `SVOD_CPU_BACKEND=clang|llvm` (any other value warns and keeps the LLVM default).
 
 libLLVM is taken from `SVOD_LLVM_LIB` when set, else searched in `llvm-config --libdir`, then on the
 loader's default path (dev symlink and runtime SONAMEs such as `libLLVM.so.18.1`, `libLLVM-18.so.1`),

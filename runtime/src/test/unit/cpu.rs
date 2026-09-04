@@ -205,6 +205,21 @@ fn cpu_dispatch_passes_scalars_at_their_declared_width(value: i32) {
     assert_eq!(out, value);
 }
 
+/// `SVOD_CPU_BACKEND` accepts exactly the lower- and upper-case names; other
+/// casings and garbage parse to `None` so `from_env` can warn and fall back.
+#[test_case::test_case("clang" => Some(CpuBackend::Clang); "clang")]
+#[test_case::test_case("CLANG" => Some(CpuBackend::Clang); "upper clang")]
+#[test_case::test_case("llvm" => Some(CpuBackend::Llvm); "llvm")]
+#[test_case::test_case("LLVM" => Some(CpuBackend::Llvm); "upper llvm")]
+#[test_case::test_case("Clang" => None; "mixed case clang")]
+#[test_case::test_case("Llvm" => None; "mixed case llvm")]
+#[test_case::test_case(" llvm" => None; "leading space")]
+#[test_case::test_case("" => None; "empty")]
+#[test_case::test_case("gcc" => None; "garbage")]
+fn cpu_backend_parses_only_accepted_spellings(value: &str) -> Option<CpuBackend> {
+    CpuBackend::parse(value)
+}
+
 #[test]
 fn cpu_device_is_memoized_per_backend() {
     use crate::devices::cpu::cpu_device_with_backend;

@@ -158,13 +158,31 @@ fn in_process_compiles_concurrently() {
     assert_eq!(outputs, 32);
 }
 
-/// An explicit library path that does not exist is a load error, not a panic.
+/// An explicit library path that does not exist is a load error carrying the
+/// `libloading` source and the path, not a panic or a flattened string.
 #[test]
 fn discover_rejects_missing_override() {
     let Err(error) = LlvmLibrary::discover(Some("/nonexistent/libLLVM.so".into())) else {
         panic!("missing library loaded")
     };
-    assert!(error.to_string().contains("/nonexistent/libLLVM.so"), "{error}");
+    let Error::LlvmUnavailable { failures } = &error else { panic!("{error:?}") };
+    let [Error::LibraryLoad { path, source }] = failures.as_slice() else { panic!("{failures:?}") };
+    assert_eq!(path, Path::new("/nonexistent/libLLVM.so"));
+    assert!(std::error::Error::source(&failures[0]).is_some_and(|s| s.to_string() == source.to_string()));
+    let text = error.to_string();
+    assert!(text.starts_with("no usable libLLVM: cannot load library /nonexistent/libLLVM.so: "), "{text}");
+}
+
+/// A library without the LLVM C API fails to bind on the first missing
+/// symbol, naming the symbol and the library.
+#[cfg(unix)]
+#[test]
+fn bind_reports_missing_symbol() {
+    let library = Library::from(libloading::os::unix::Library::this());
+    let Err(error) = LlvmApi::bind(&library, Path::new("<self>")) else { panic!("bound LLVM against the test binary") };
+    let Error::LibrarySymbol { path, symbol, .. } = &error else { panic!("{error:?}") };
+    assert_eq!((path.as_path(), symbol.as_str()), (Path::new("<self>"), "LLVMGetVersion"));
+    assert!(error.to_string().starts_with("cannot resolve symbol `LLVMGetVersion` in <self>: "), "{error}");
 }
 
 /// With `SVOD_LLVM_LIB` pointing at a nonexistent file the LLVM backend falls

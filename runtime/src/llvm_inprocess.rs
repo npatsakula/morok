@@ -9,13 +9,15 @@
 
 use std::cell::{OnceCell, RefCell};
 use std::ffi::{CStr, CString, OsString, c_char, c_int, c_uint, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::sync::OnceLock;
 
 use libloading::Library;
+use snafu::ResultExt;
 use tracing::debug;
 
+use crate::error::{LibraryLoadSnafu, LibrarySymbolSnafu};
 use crate::{Error, Result};
 
 type LlvmBool = c_int;
@@ -51,7 +53,7 @@ macro_rules! llvm_c_api {
         struct LlvmApi { $($symbol: unsafe extern "C" fn($($arg),*) $(-> $ret)?),* }
 
         impl LlvmApi {
-            fn bind(library: &Library) -> std::result::Result<Self, libloading::Error> {
+            fn bind(library: &Library, path: &Path) -> Result<Self> {
                 // SAFETY: every field is declared with its signature from the
                 // LLVM-C headers, so each resolved pointer is called with the
                 // ABI it was compiled for. The pointers are copied out of the
@@ -59,7 +61,7 @@ macro_rules! llvm_c_api {
                 // by the owning `LlvmLibrary` for the rest of the process.
                 Ok(Self { $($symbol: *unsafe {
                     library.get::<unsafe extern "C" fn($($arg),*) $(-> $ret)?>(concat!(stringify!($symbol), "\0").as_bytes())
-                }?),* })
+                }.context(LibrarySymbolSnafu { path, symbol: stringify!($symbol) })?),* })
             }
         }
     };
@@ -171,26 +173,20 @@ impl LlvmLibrary {
         for path in candidates {
             // SAFETY: loading libLLVM only runs its own static initialisers,
             // which register LLVM's internal state; nothing else executes.
-            let library = match unsafe { Library::new(&path) } {
-                Ok(library) => library,
-                Err(error) => {
-                    failures.push(format!("{}: {error}", path.display()));
-                    continue;
-                }
-            };
-            match Self::bind(library, path.clone()) {
+            let loaded = unsafe { Library::new(&path) }.context(LibraryLoadSnafu { path: &path });
+            match loaded.and_then(|library| Self::bind(library, path)) {
                 Ok(library) => {
                     debug!(path = %library.path.display(), version = %library.version_string(), "loaded libLLVM");
                     return Ok(library);
                 }
-                Err(error) => failures.push(format!("{}: {error}", path.display())),
+                Err(error) => failures.push(error),
             }
         }
-        Err(Error::LlvmError { reason: format!("no usable libLLVM: {}", failures.join("; ")) })
+        Err(Error::LlvmUnavailable { failures })
     }
 
     fn bind(library: Library, path: PathBuf) -> Result<Self> {
-        let api = LlvmApi::bind(&library).map_err(|error| Error::LlvmError { reason: error.to_string() })?;
+        let api = LlvmApi::bind(&library, &path)?;
         let mut version = [0u32; 3];
         // SAFETY: three valid out-pointers, as the C signature requires.
         unsafe { (api.LLVMGetVersion)(&mut version[0], &mut version[1], &mut version[2]) };
@@ -199,7 +195,7 @@ impl LlvmLibrary {
                 reason: format!("LLVM {} is older than the supported {MIN_MAJOR_VERSION}", version[0]),
             });
         }
-        initialize_host_target(&library)?;
+        initialize_host_target(&library, &path)?;
 
         let triple = CString::new(crate::jit_loader::elf_triple()).expect("triple has no NUL");
         let mut target: TargetRef = null_mut();
@@ -345,7 +341,7 @@ fn llvm_config_libdir() -> Option<PathBuf> {
 /// Register the host architecture's target, MC layer, asm printer and asm
 /// parser — the `LLVMInitializeNative*` helpers are header-only, so the
 /// per-architecture entry points are looked up by name.
-fn initialize_host_target(library: &Library) -> Result<()> {
+fn initialize_host_target(library: &Library, path: &Path) -> Result<()> {
     let target = match std::env::consts::ARCH {
         "x86_64" => "X86",
         "aarch64" => "AArch64",
@@ -355,11 +351,11 @@ fn initialize_host_target(library: &Library) -> Result<()> {
         arch => return Err(Error::LlvmError { reason: format!("no LLVM target initialiser for {arch}") }),
     };
     for component in ["TargetInfo", "Target", "TargetMC", "AsmPrinter", "AsmParser"] {
-        let symbol = format!("LLVMInitialize{target}{component}\0");
+        let symbol = format!("LLVMInitialize{target}{component}");
         // SAFETY: the initialisers take no arguments and return nothing; they
         // are idempotent and safe to call from any thread.
         let initialize = unsafe { library.get::<unsafe extern "C" fn()>(symbol.as_bytes()) }
-            .map_err(|error| Error::LlvmError { reason: error.to_string() })?;
+            .context(LibrarySymbolSnafu { path, symbol: &symbol })?;
         unsafe { initialize() };
     }
     Ok(())

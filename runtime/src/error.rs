@@ -1,5 +1,7 @@
 //! Error types for runtime execution.
 
+use std::path::PathBuf;
+
 use snafu::Snafu;
 
 /// Result type for runtime operations.
@@ -59,6 +61,18 @@ pub enum Error {
     /// LLVM error.
     #[snafu(display("LLVM error: {reason}"))]
     LlvmError { reason: String },
+
+    /// No libLLVM candidate could be loaded and bound; one failure per candidate.
+    #[snafu(display("no usable libLLVM: {}", failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")))]
+    LlvmUnavailable { failures: Vec<Error> },
+
+    /// A shared library could not be loaded.
+    #[snafu(display("cannot load library {}: {source}", path.display()))]
+    LibraryLoad { source: libloading::Error, path: PathBuf },
+
+    /// A symbol could not be resolved in a loaded shared library.
+    #[snafu(display("cannot resolve symbol `{symbol}` in {}: {source}", path.display()))]
+    LibrarySymbol { source: libloading::Error, path: PathBuf, symbol: String },
 
     /// Unsupported device type.
     #[snafu(display("Unsupported device type: {device}"))]

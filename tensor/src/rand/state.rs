@@ -6,7 +6,12 @@
 //!   same kernel input Tinygrad's `_device_rng_counters[device]` is. Keeping
 //!   the counter out of the AST makes every same-shape draw one program
 //!   (the seed BUFFER already keeps the graph non-foldable); stamping it as a
-//!   CONST minted a distinct kernel per draw.
+//!   CONST minted a distinct kernel per draw. The 8-byte BUFFER per draw is
+//!   deliberate: Tinygrad's alternative — one counter BUFFER per device,
+//!   bumped lazily through `assign` inside each draw's graph — chains every
+//!   draw onto the previous one, so realizing a later draw first runs the
+//!   earlier draw's increment too and the earlier draw then reads the moved
+//!   counter (with equal sizes both draws yield the same stream).
 //!
 //! - **`manual_seed` does not clear the map.** Existing rand graphs captured
 //!   their seed Tensor via `Arc<Buffer>`, so they remain numerically valid
