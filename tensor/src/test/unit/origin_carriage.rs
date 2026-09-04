@@ -13,7 +13,7 @@ use svod_runtime::execution_plan::ExecutionPlan;
 use crate::Tensor;
 
 fn module(name: &str) -> OriginId {
-    origin::intern(Origin { parent: None, frame: OriginFrame::Module { name: Arc::from(name) } })
+    origin::intern(Origin { parent: None, frame: OriginFrame::Module { name: name.to_owned() } })
 }
 
 /// Whether an attribution sits under `ancestor`. Op entry points push their own

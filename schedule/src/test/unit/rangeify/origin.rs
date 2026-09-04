@@ -146,7 +146,11 @@ fn every_kernel_is_attributed_and_its_body_stripped(build: fn() -> Arc<UOp>) {
     for call in &kernels {
         let info = call_info(call);
         assert_eq!(info.origin, Some(id), "kernel is charged to the scope it was built under");
-        assert_eq!(info.origins.as_ref(), [id], "single-scope kernel carries exactly one origin");
+        assert_eq!(
+            info.origins.iter().copied().collect::<Vec<_>>(),
+            [id],
+            "single-scope kernel carries exactly one origin"
+        );
         assert!(
             body_of(call).toposort().iter().all(|node| node.origin().is_none()),
             "the kernel body must be origin-free so identical kernels share one program"
@@ -232,7 +236,7 @@ fn a_kernel_fusing_two_scopes_carries_both_origins() {
     let call = calls(&graph).first().cloned().expect("one kernel");
     let info = call_info(&call);
     assert_eq!(info.origin, Some(right_id), "the stored value's scope is the primary");
-    assert_eq!(info.origins.len(), 2, "a fused kernel lists every scope it consumed: {}", info.origins);
+    assert_eq!(info.origins.len(), 2, "a fused kernel lists every scope it consumed: {:?}", info.origins);
     assert!(info.origins.contains(&left_id) && info.origins.contains(&right_id));
 }
 

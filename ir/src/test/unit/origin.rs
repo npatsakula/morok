@@ -5,11 +5,11 @@ use std::sync::Arc;
 use proptest::prelude::*;
 use test_case::test_case;
 
-use crate::origin::{self, Origin, OriginFrame, OriginId, OriginScope, OriginSet, SourceLocation};
+use crate::origin::{self, Origin, OriginFrame, OriginId, OriginScope, SourceLocation};
 use crate::{ConstValue, DType, Op, ParamArg, UOp, ops};
 
 fn module(name: &str) -> Origin {
-    Origin { parent: None, frame: OriginFrame::Module { name: Arc::from(name) } }
+    Origin { parent: None, frame: OriginFrame::Module { name: name.to_owned() } }
 }
 
 // =========================================================================
@@ -21,7 +21,7 @@ fn interning_is_idempotent_and_round_trips() {
     let root = origin::intern(module("interning-root"));
     assert_eq!(root, origin::intern(module("interning-root")));
 
-    let child = Origin { parent: Some(root), frame: OriginFrame::Label { text: Arc::from("child") } };
+    let child = Origin { parent: Some(root), frame: OriginFrame::Label { text: String::from("child") } };
     let child_id = origin::intern(child.clone());
     assert_ne!(root, child_id);
     assert_eq!(child_id, origin::intern(child.clone()));
@@ -57,7 +57,7 @@ proptest! {
         let mut first = Vec::new();
         let mut parent = None;
         for name in &names {
-            let origin = Origin { parent, frame: OriginFrame::Module { name: Arc::from(format!("prop.{name}").as_str()) } };
+            let origin = Origin { parent, frame: OriginFrame::Module { name: format!("prop.{name}") } };
             let id = origin::intern(origin.clone());
             prop_assert_eq!(origin::get(id), Some(origin));
             first.push(id);
@@ -66,7 +66,7 @@ proptest! {
 
         let mut parent = None;
         for (name, expected) in names.iter().zip(&first) {
-            let origin = Origin { parent, frame: OriginFrame::Module { name: Arc::from(format!("prop.{name}").as_str()) } };
+            let origin = Origin { parent, frame: OriginFrame::Module { name: format!("prop.{name}") } };
             prop_assert_eq!(origin::intern(origin), *expected);
             parent = Some(*expected);
         }
@@ -164,14 +164,14 @@ fn constructors_are_no_ops_while_capture_is_off(kind: &str) {
 fn rendering_chain() -> Vec<OriginId> {
     let encoder = origin::intern(module("render.encoder"));
     let layers =
-        origin::intern(Origin { parent: Some(encoder), frame: OriginFrame::Module { name: Arc::from("layers.3") } });
+        origin::intern(Origin { parent: Some(encoder), frame: OriginFrame::Module { name: String::from("layers.3") } });
     let node = origin::intern(Origin {
         parent: Some(layers),
         frame: OriginFrame::Onnx {
             index: 7,
             name: None,
-            op_type: Arc::from("MatMul"),
-            domain: Arc::from("ai.onnx"),
+            op_type: String::from("MatMul"),
+            domain: String::from("ai.onnx"),
             version: 17,
         },
     });
@@ -196,9 +196,9 @@ fn a_named_onnx_node_renders_by_name() {
         parent: None,
         frame: OriginFrame::Onnx {
             index: 2,
-            name: Some(Arc::from("/encoder/Conv")),
-            op_type: Arc::from("Conv"),
-            domain: Arc::from("ai.onnx"),
+            name: Some(String::from("/encoder/Conv")),
+            op_type: String::from("Conv"),
+            domain: String::from("ai.onnx"),
             version: 17,
         },
     });
@@ -225,15 +225,21 @@ fn chain_is_root_first_and_truncate_walks_it() {
 
 fn frames() -> Vec<OriginFrame> {
     vec![
-        OriginFrame::Module { name: Arc::from("encoder") },
-        OriginFrame::Label { text: Arc::from("initializer") },
+        OriginFrame::Module { name: String::from("encoder") },
+        OriginFrame::Label { text: String::from("initializer") },
         OriginFrame::Call { op: "add", at: SourceLocation::new("tensor/src/traits.rs", 24, 9) },
-        OriginFrame::Onnx { index: 3, name: None, op_type: Arc::from("Gemm"), domain: Arc::from(""), version: 21 },
+        OriginFrame::Onnx {
+            index: 3,
+            name: None,
+            op_type: String::from("Gemm"),
+            domain: String::from(""),
+            version: 21,
+        },
         OriginFrame::Onnx {
             index: 4,
-            name: Some(Arc::from("/head/Gemm")),
-            op_type: Arc::from("Gemm"),
-            domain: Arc::from("ai.onnx"),
+            name: Some(String::from("/head/Gemm")),
+            op_type: String::from("Gemm"),
+            domain: String::from("ai.onnx"),
             version: 21,
         },
     ]
@@ -244,29 +250,14 @@ fn frames() -> Vec<OriginFrame> {
 #[test_case(2; "call")]
 #[test_case(3; "onnx anonymous")]
 #[test_case(4; "onnx named")]
-fn origin_frames_round_trip_through_serde(index: usize) {
+fn origin_frames_serialize_with_their_parent(index: usize) {
     let frame = frames()[index].clone();
-    let origin = Origin { parent: OriginId::from_raw(9), frame };
-    let json = serde_json::to_string(&origin).unwrap();
-    assert_eq!(serde_json::from_str::<Origin>(&json).unwrap(), origin);
-}
-
-#[test]
-fn origin_sets_round_trip_and_stay_sorted() {
-    let ids: Vec<OriginId> = [4, 1, 7, 1, 4].iter().map(|&raw| OriginId::from_raw(raw).unwrap()).collect();
-    let mut set: OriginSet = ids.iter().copied().collect();
-    assert_eq!(set.len(), 3);
-    assert!(set.windows(2).all(|pair| pair[0] < pair[1]));
-    assert!(!set.insert(ids[0]));
-
-    let mut other = OriginSet::new();
-    assert!(other.is_empty());
-    assert!(other.insert(OriginId::from_raw(2).unwrap()));
-    other.union(&set);
-    assert_eq!(other.len(), 4);
-
-    let json = serde_json::to_string(&other).unwrap();
-    assert_eq!(serde_json::from_str::<OriginSet>(&json).unwrap(), other);
+    let origin = Origin { parent: OriginId::from_raw(9), frame: frame.clone() };
+    let json = serde_json::to_value(&origin).unwrap();
+    assert_eq!(json["parent"], 9);
+    let variant = json["frame"].as_object().and_then(|frame| frame.keys().next().cloned()).unwrap();
+    assert!(["Module", "Label", "Call", "Onnx"].contains(&variant.as_str()), "{json}");
+    assert_eq!(json["frame"], serde_json::to_value(&frame).unwrap());
 }
 
 // =========================================================================

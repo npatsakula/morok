@@ -238,7 +238,7 @@ impl UOp {
         } else {
             let mut info = info;
             info.origin = info.origin.or(primary);
-            info.origins.union(&origins);
+            info.origins.extend(&origins);
             body = body.without_origins();
             info
         };

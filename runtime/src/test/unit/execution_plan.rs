@@ -862,7 +862,7 @@ fn profiles_carry_the_dispatch_origins() {
     let profiles = plan.execute_profiled().unwrap();
     assert_eq!(profiles.len(), 1);
     assert_eq!(profiles[0].origin, Some(origin));
-    assert_eq!(profiles[0].origins.as_ref(), [origin]);
+    assert_eq!(profiles[0].origins.iter().copied().collect::<Vec<_>>(), [origin]);
 }
 
 /// With a graph backend attached, profiling reads the replay's own timestamps

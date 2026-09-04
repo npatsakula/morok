@@ -17,8 +17,8 @@ use test_case::test_case;
 
 use crate::kernel_cache::CachedKernel;
 use crate::profiler::{
-    KernelProfile, OperationTiming, OriginView, PmcSelection, ProfileExport, ProfileOptions, RunProfile, StageProfile,
-    UNATTRIBUTED, aggregate_origins, analyze_execution_lanes, has_origins, parse_pmc,
+    KernelProfile, OperationTiming, OriginView, PmcSelection, ProfileOptions, RunProfile, StageProfile, UNATTRIBUTED,
+    aggregate_origins, analyze_execution_lanes, has_origins, parse_pmc,
 };
 
 #[test]
@@ -518,7 +518,11 @@ fn json_export_round_trips_and_embeds_the_origin_arena() {
     let s = scopes();
     assert_eq!(arena.len(), origin::snapshot().len());
     assert!(arena.len() >= s.encoder.get() as usize);
-    let export: ProfileExport = serde_json::from_value(json).expect("round-trips back into the export type");
-    assert_eq!(export.origin_depth, Some(2));
-    assert_eq!(export.origins, origin::snapshot()[..export.origins.len()], "arena entries are the interned origins");
+    assert_eq!(json["origin_depth"], 2);
+    let first = origin::get(s.encoder).expect("interned");
+    assert_eq!(
+        arena[s.encoder.get() as usize - 1],
+        serde_json::to_value(&first).unwrap(),
+        "arena entries are the interned origins"
+    );
 }

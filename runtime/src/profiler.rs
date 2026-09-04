@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use svod_device::hcq::{CopyLeg, DeviceQueue, SemanticLinkedPlan};
 use svod_device::{CounterSet, KernelResources, PmcCounter};
 use svod_dtype::DeviceSpec;
@@ -1011,7 +1011,7 @@ impl std::fmt::Display for RunProfile {
 /// A profiled run in a serializable, id-resolvable form: every stage with its
 /// kernel rows and both origin rollups, plus a snapshot of the origin arena so
 /// a consumer can resolve [`OriginId`]s offline.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProfileExport {
     /// Depth the origin rollups were computed at; `null` is the leaf scope.
     pub origin_depth: Option<usize>,
@@ -1022,7 +1022,7 @@ pub struct ProfileExport {
 }
 
 /// One stage of a [`ProfileExport`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StageExport {
     pub name: String,
     pub wall_ms: f64,
@@ -1037,7 +1037,7 @@ pub struct StageExport {
 
 /// Dispatches sharing an entry point *and* a primary origin. Without origins
 /// this is exactly the entry-point grouping the rendered table shows.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct KernelExport {
     pub name: String,
     pub count: usize,
@@ -1050,7 +1050,7 @@ pub struct KernelExport {
 }
 
 /// One origin rollup row.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OriginExport {
     pub path: String,
     pub count: usize,
@@ -1062,7 +1062,7 @@ pub struct OriginExport {
 }
 
 /// An entry point's share of one origin row.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct KernelShareExport {
     pub name: String,
     pub count: usize,
@@ -1098,7 +1098,7 @@ fn export_kernels(profiles: &[KernelProfile]) -> Vec<KernelExport> {
             .or_insert_with(|| (0, Duration::ZERO, svod_ir::OriginSet::new()));
         row.0 += 1;
         row.1 += profile.gpu_or_wall();
-        row.2.union(&profile.origins);
+        row.2.extend(&profile.origins);
     }
     let mut out: Vec<KernelExport> = rows
         .into_iter()
