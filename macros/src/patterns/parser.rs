@@ -310,7 +310,7 @@ fn peek_value_extractor(input: ParseStream) -> Option<&'static str> {
     ["const", "vconst", "anyconst"].into_iter().find(|name| ident == name)
 }
 
-fn is_lowercase(ident: &Ident) -> bool {
+pub(super) fn is_lowercase(ident: &Ident) -> bool {
     ident.to_string().starts_with(|c: char| c.is_lowercase() || c == '_')
 }
 

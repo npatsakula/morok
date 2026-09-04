@@ -20,7 +20,9 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote, quote_spanned};
 use syn::{Error, Ident, Pat, Result};
 
-use super::parser::{FieldPat, ForBlock, OpRef, Pattern, PatternItem, PatternList, PatternRule, RewriteExpr};
+use super::parser::{
+    FieldPat, ForBlock, OpRef, Pattern, PatternItem, PatternList, PatternRule, RewriteExpr, is_lowercase,
+};
 
 fn no_match() -> TokenStream2 {
     quote! { __Result::NoMatch }
@@ -30,29 +32,38 @@ fn op_mask() -> TokenStream2 {
     quote! { __OpMask }
 }
 
+/// How two occurrences of one name must agree: nodes by identity, extracted values
+/// (`@const(v)`, `@vconst(vs)`) by `==`.
+#[derive(Clone, Copy)]
+enum Equality {
+    Ptr,
+    Value,
+}
+
 /// Renames repeated binding names (`Add(x, x)`) so every occurrence is bound and the
-/// pairs can be checked with `Arc::ptr_eq`.
+/// pairs can be checked for equality.
 #[derive(Default, Clone)]
 struct DuplicateTracker {
     seen: HashSet<String>,
-    duplicates: Vec<(Ident, Ident)>,
+    duplicates: Vec<(Ident, Ident, Equality)>,
 }
 
 impl DuplicateTracker {
-    fn bind(&mut self, name: &Ident) -> Ident {
+    fn bind(&mut self, name: &Ident, equality: Equality) -> Ident {
         let key = name.to_string();
         if !self.seen.insert(key.clone()) {
-            let count = self.duplicates.iter().filter(|(original, _)| original == name).count();
+            let count = self.duplicates.iter().filter(|(original, ..)| original == name).count();
             let dup = if count == 0 { format_ident!("{key}_dup") } else { format_ident!("{key}_dup_{}", count + 1) };
-            self.duplicates.push((name.clone(), dup.clone()));
+            self.duplicates.push((name.clone(), dup.clone(), equality));
             return dup;
         }
         name.clone()
     }
 
-    fn ptr_eq_checks(&self, fail: &TokenStream2) -> TokenStream2 {
-        let checks = self.duplicates.iter().map(|(original, dup)| {
-            quote! { if !std::sync::Arc::ptr_eq(#original, #dup) { #fail } }
+    fn checks(&self, fail: &TokenStream2) -> TokenStream2 {
+        let checks = self.duplicates.iter().map(|(original, dup, equality)| match equality {
+            Equality::Ptr => quote! { if !std::sync::Arc::ptr_eq(#original, #dup) { #fail } },
+            Equality::Value => quote! { if #original != #dup { #fail } },
         });
         quote! { #(#checks)* }
     }
@@ -106,20 +117,24 @@ impl Emitter {
         }
     }
 
-    fn bind(&mut self, name: &Ident, value: &Ident) {
-        let name = self.dup.bind(name);
+    fn bind(&mut self, name: &Ident, value: TokenStream2, equality: Equality) {
+        let name = self.dup.bind(name, equality);
         self.code.push(quote! { let #name = #value; });
         self.bound.push(name);
+    }
+
+    fn bind_node(&mut self, name: &Ident, node: &Ident) {
+        self.bind(name, quote! { #node }, Equality::Ptr);
     }
 
     fn emit(&mut self, pattern: &Pattern, var: &Ident) -> Result<()> {
         let fail = self.fail();
         match pattern {
             Pattern::Wildcard => {}
-            Pattern::Var(name) => self.bind(name, var),
+            Pattern::Var(name) => self.bind_node(name, var),
             Pattern::Binding { name, pattern } => {
                 self.emit(pattern, var)?;
-                self.bind(name, var);
+                self.bind_node(name, var);
             }
             Pattern::Unit(op) => {
                 self.code.push(quote! { let __Op::#op = #var.op() else { #fail }; });
@@ -169,43 +184,39 @@ impl Emitter {
             }
             Pattern::Const(pat) => {
                 let value = format_ident!("{var}_cv");
+                self.bind_verbatim(pat);
                 self.code.push(quote! {
                     let __Op::Const(#value) = #var.op() else { #fail };
                     #[allow(irrefutable_let_patterns)]
                     let #pat = #value.0 else { #fail };
                 });
-                self.bind_verbatim(pat);
             }
             Pattern::Zero => self.code.push(quote! { if !__helpers::is_zero(#var) { #fail } }),
             Pattern::One => self.code.push(quote! { if !__helpers::is_one(#var) { #fail } }),
             Pattern::ConstValue { uop, value } => {
                 let cv = format_ident!("{var}_cv");
-                self.code.push(quote! {
-                    let __Op::Const(#cv) = #var.op() else { #fail };
-                    let #value = #cv.0;
-                });
-                self.bound.push(value.clone());
-                self.bind(uop, var);
+                self.code.push(quote! { let __Op::Const(#cv) = #var.op() else { #fail }; });
+                self.bind(value, quote! { #cv.0 }, Equality::Value);
+                self.bind_node(uop, var);
             }
             Pattern::VConst { uop, values } => {
                 let vals = format_ident!("{var}_values");
                 self.code.push(quote! {
                     let __Op::VConst(__ops::VConst { values: #vals }) = #var.op() else { #fail };
-                    let #values = #vals.clone();
                 });
-                self.bound.push(values.clone());
-                self.bind(uop, var);
+                self.bind(values, quote! { #vals.clone() }, Equality::Value);
+                self.bind_node(uop, var);
             }
             Pattern::AnyConst { uop, values } => {
-                self.code.push(quote! {
-                    let #values: Vec<svod_ir::ConstValue> = match #var.op() {
+                let lanes = quote! {
+                    match #var.op() {
                         __Op::Const(cv) => vec![cv.0],
                         __Op::VConst(__ops::VConst { values }) => values.clone(),
                         _ => { #fail }
-                    };
-                });
-                self.bound.push(values.clone());
-                self.bind(uop, var);
+                    }
+                };
+                self.bind(values, lanes, Equality::Value);
+                self.bind_node(uop, var);
             }
             Pattern::Some(inner) => {
                 let some = format_ident!("{var}_some");
@@ -218,10 +229,13 @@ impl Emitter {
 
     /// Register the names a verbatim Rust pattern binds, so they reach the rewrite body
     /// through an ordering tuple and clash with DSL bindings instead of shadowing them.
+    /// Every bare capitalized identifier is first referenced as a value, so one that
+    /// resolves to nothing is an error instead of an irrefutable binding.
     fn bind_verbatim(&mut self, pat: &Pat) {
-        let mut names = Vec::new();
-        verbatim_bindings(pat, &mut names);
-        for name in names {
+        let mut names = VerbatimNames::default();
+        verbatim_names(pat, &mut names);
+        self.code.extend(names.paths.iter().map(|path| quote_spanned! {path.span()=> let _ = &#path; }));
+        for name in names.bindings {
             self.dup.seen.insert(name.to_string());
             self.bound.push(name);
         }
@@ -242,29 +256,42 @@ fn op_span(op: &OpRef) -> Span {
     }
 }
 
-/// Snake-case identifiers bound by a Rust pattern; `Pat::Or` branches bind the same set.
-fn verbatim_bindings(pat: &Pat, out: &mut Vec<Ident>) {
+/// The identifiers of a verbatim Rust pattern: the ones that bind, and the bare
+/// capitalized ones that must resolve to a unit variant, unit struct or const.
+#[derive(Default)]
+struct VerbatimNames {
+    bindings: Vec<Ident>,
+    paths: Vec<Ident>,
+}
+
+/// Identifiers named by a Rust pattern; `Pat::Or` branches bind the same set.
+fn verbatim_names(pat: &Pat, out: &mut VerbatimNames) {
     match pat {
         Pat::Ident(ident) => {
-            if ident.ident.to_string().starts_with(|c: char| c.is_lowercase() || c == '_') {
-                out.push(ident.ident.clone());
+            let name = &ident.ident;
+            let explicit = ident.by_ref.is_some() || ident.mutability.is_some() || ident.subpat.is_some();
+            if explicit || is_lowercase(name) {
+                out.bindings.push(name.clone());
+            } else if name != "None" {
+                // The prelude's generic unit variant has no inferable type as a value.
+                out.paths.push(name.clone());
             }
             if let Some((_, sub)) = &ident.subpat {
-                verbatim_bindings(sub, out);
+                verbatim_names(sub, out);
             }
         }
         Pat::Or(or) => {
             if let Some(first) = or.cases.first() {
-                verbatim_bindings(first, out);
+                verbatim_names(first, out);
             }
         }
-        Pat::Paren(paren) => verbatim_bindings(&paren.pat, out),
-        Pat::Reference(reference) => verbatim_bindings(&reference.pat, out),
-        Pat::Type(typed) => verbatim_bindings(&typed.pat, out),
-        Pat::Tuple(tuple) => tuple.elems.iter().for_each(|p| verbatim_bindings(p, out)),
-        Pat::TupleStruct(tuple) => tuple.elems.iter().for_each(|p| verbatim_bindings(p, out)),
-        Pat::Slice(slice) => slice.elems.iter().for_each(|p| verbatim_bindings(p, out)),
-        Pat::Struct(strukt) => strukt.fields.iter().for_each(|f| verbatim_bindings(&f.pat, out)),
+        Pat::Paren(paren) => verbatim_names(&paren.pat, out),
+        Pat::Reference(reference) => verbatim_names(&reference.pat, out),
+        Pat::Type(typed) => verbatim_names(&typed.pat, out),
+        Pat::Tuple(tuple) => tuple.elems.iter().for_each(|p| verbatim_names(p, out)),
+        Pat::TupleStruct(tuple) => tuple.elems.iter().for_each(|p| verbatim_names(p, out)),
+        Pat::Slice(slice) => slice.elems.iter().for_each(|p| verbatim_names(p, out)),
+        Pat::Struct(strukt) => strukt.fields.iter().for_each(|f| verbatim_names(&f.pat, out)),
         _ => {}
     }
 }
@@ -461,7 +488,7 @@ fn compile_rule(rule: &PatternRule, iter: Option<Iter<'_>>) -> Result<CompiledRu
     let guard = &rule.guard;
 
     let body = if emitter.permutes.is_empty() {
-        let checks = emitter.dup.ptr_eq_checks(&fail);
+        let checks = emitter.dup.checks(&fail);
         let guard = guard.as_ref().map(|guard| quote! { if !(#guard) { #fail } });
         quote! {
             #(#shared)*
@@ -474,7 +501,7 @@ fn compile_rule(rule: &PatternRule, iter: Option<Iter<'_>>) -> Result<CompiledRu
         }
     } else {
         let tail = |dup: &DuplicateTracker| {
-            let checks = dup.ptr_eq_checks(&quote! { continue; });
+            let checks = dup.checks(&quote! { continue; });
             let guard = guard.as_ref().map(|guard| quote! { if !(#guard) { continue; } });
             quote! {
                 #checks

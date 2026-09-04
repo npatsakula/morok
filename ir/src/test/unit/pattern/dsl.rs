@@ -457,6 +457,67 @@ fn non_child_fields_are_verbatim_rust_patterns() {
     assert_no_match(by_index.rewrite(&get(1), &mut ()));
 }
 
+/// A value name repeated across `@const`/`@vconst`/`@anyconst` extractions must extract
+/// equal payloads, in the positional and the commutative form alike. The comparison is by
+/// value: two distinct nodes (different dtypes) holding the same payload match.
+#[test]
+fn repeated_value_name_requires_equal_values() {
+    let scalar = patterns! { Add(a @const(v), _b @const(v)) => a };
+    let scalar_commutative = patterns! { Add[a @const(v), _b @const(v)] => a };
+    let vector = patterns! { Add(a @vconst(vs), _b @vconst(vs)) => a };
+    let any_commutative = patterns! { Add[a @anyconst(vs), _b @anyconst(vs)] => a };
+
+    for (lhs, rhs, equal) in [
+        (ConstValue::Int(2), ConstValue::Int(2), true),
+        (ConstValue::Int(2), ConstValue::Int(3), false),
+        (ConstValue::Int(0), ConstValue::Int(-1), false),
+    ] {
+        let a = UOp::const_(DType::Int32, lhs);
+        let b = UOp::const_(DType::Int64, rhs);
+        assert!(!Arc::ptr_eq(&a, &b), "the payloads must live in distinct nodes");
+        let va = UOp::vconst(vec![lhs, lhs], DType::Int32);
+        let vb = UOp::vconst(vec![rhs, rhs], DType::Int64);
+        for (matcher, x, y) in
+            [(&scalar, &a, &b), (&scalar_commutative, &a, &b), (&vector, &va, &vb), (&any_commutative, &va, &vb)]
+        {
+            let result = matcher.rewrite(&binary(BinaryOp::Add, x.clone(), y.clone()), &mut ());
+            if equal {
+                assert_rewrites_to(result, x);
+            } else {
+                assert_no_match(result);
+            }
+        }
+    }
+}
+
+/// A bare capitalized identifier in a verbatim field is a path, never a binding: brought
+/// into scope with `use AxisType::*` it matches exactly like the qualified spelling, so a
+/// Loop range never satisfies an `Upcast` rule. An identifier that resolves to nothing
+/// is a compile error (verified by hand; the workspace has no compile-fail harness).
+#[test]
+fn bare_variant_in_verbatim_field_is_a_path() {
+    use crate::types::{AxisId, AxisType, AxisType::*};
+
+    let bare = patterns! { Range { end, axis_type: Upcast, .. } => end };
+    let qualified = patterns! { Range { end, axis_type: AxisType::Upcast, .. } => end };
+    let alternatives = patterns! { Range { end, axis_type: Loop | Reduce, .. } => end };
+
+    let end = UOp::index_const(8);
+    let range = |axis_type| UOp::range_axis(end.clone(), AxisId::Renumbered(0), axis_type);
+    for matcher in [&bare, &qualified] {
+        assert_rewrites_to(matcher.rewrite(&range(Upcast), &mut ()), &end);
+        for other in [Loop, Reduce, Global, Unroll] {
+            assert_no_match(matcher.rewrite(&range(other), &mut ()));
+        }
+    }
+    for kind in [Loop, Reduce] {
+        assert_rewrites_to(alternatives.rewrite(&range(kind), &mut ()), &end);
+    }
+    for other in [Upcast, Global, Unroll] {
+        assert_no_match(alternatives.rewrite(&range(other), &mut ()));
+    }
+}
+
 /// `Op[a, b]` tries both source orderings — including under `graph_rewrite`, which is where
 /// a permuted match first failed.
 #[test]

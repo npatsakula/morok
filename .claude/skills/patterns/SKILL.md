@@ -36,7 +36,8 @@ or a `RewriteResult` (so `Gate` is expressible); `?` works inside a block body.
 | `c @const(cv)` | Bind UOp to `c`, its `ConstValue` to `cv` | `Add(x, c @const(cv))` |
 | `c @vconst(vs)` / `c @anyconst(vs)` | VCONST lanes / CONST-or-VCONST as `Vec<ConstValue>` | `Mul(x, c @anyconst(vs))` |
 
-A name used twice must be the same node: `Add(x, x)` generates `Arc::ptr_eq`.
+A name used twice must be the same node: `Add(x, x)` generates `Arc::ptr_eq`. A value
+name used twice (`Add[_a @const(v), _b @const(v)]`) must extract equal values.
 
 ### Constant Patterns
 
@@ -71,7 +72,9 @@ Noop                                         // unit variant
 ```
 A field is a child pattern when it is `_`, `@..`, a snake_case binding, or an
 identifier applied to `(..)`/`[..]`/`{..}`/`@`; anything else is passed through
-as a Rust pattern. There is no positional form for struct ops.
+as a Rust pattern, where a bare capitalized identifier (`axis_type: Upcast`) must
+resolve to a variant or const — an unresolved one is a compile error, never a
+binding. There is no positional form for struct ops.
 
 ### Rewrite Expressions
 
