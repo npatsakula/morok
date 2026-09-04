@@ -201,7 +201,6 @@ impl Renderer {
 
     /// Create a CPU renderer configuration.
     pub fn cpu() -> Self {
-        let cores = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8);
         Self {
             device: RendererDevice::Cpu,
             target: None,
@@ -209,7 +208,7 @@ impl Renderer {
             has_shared: false,
             has_threads: true,
             shared_max: 0,
-            global_max: Some(vec![cores]), // Actual available CPU cores
+            global_max: Some(vec![super::config::thread_budget()]),
             global_prod_max: None,
             local_max: None,
             upcast_max: 16, // AVX512 can do 16-wide float

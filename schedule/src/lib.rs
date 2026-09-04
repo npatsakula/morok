@@ -65,7 +65,7 @@ pub use optimizer::{
     apply_post_optimization_with_config, apply_post_optimization_with_renderer, beam_search_cached_with_behavior,
     compute_ops_estimate, finalize_kernel_name, hand_coded_optimizations, hash_post_codegen_ir, optimize_kernel,
     optimize_kernel_with_config, optimize_kernel_with_config_and_final_rewrite, optimize_kernel_with_naming,
-    optimize_kernel_with_strategy, prepare_scheduler, unique_kernel_name,
+    optimize_kernel_with_strategy, prepare_scheduler, thread_budget, unique_kernel_name,
 };
 
 // Re-export UOp for macro usage

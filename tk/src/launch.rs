@@ -318,6 +318,8 @@ impl CompiledLaunch {
 /// `ProgramSpec.globals`. PARAM slots select signature positions and are never
 /// used as indexes into this vector.
 pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<CompiledLaunch> {
+    // This path bypasses the tensor scheduler, so size the execution pool here.
+    svod_runtime::ensure_thread_pool(svod_schedule::thread_budget());
     let optimizer_renderer = match device.device {
         DeviceSpec::Cpu => svod_schedule::OptimizerRenderer::cpu(),
         DeviceSpec::Cuda { .. } => svod_schedule::OptimizerRenderer::cuda(),

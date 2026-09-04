@@ -58,7 +58,9 @@ pub use beam::{
     BeamResult, CandidateMetrics, apply_remote_candidate, beam_search, beam_search_cached_remote,
     beam_search_cached_with_behavior, clear_cache, compute_ops_estimate, hash_post_codegen_ir, replay_opts,
 };
-pub use config::{BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcOpt as TcOptLevel, TcSelect, TcUsage};
+pub use config::{
+    BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcOpt as TcOptLevel, TcSelect, TcUsage, thread_budget,
+};
 pub use error::OptError;
 pub use heuristics::hand_coded_optimizations;
 pub use kernel_info::KernelInfo;

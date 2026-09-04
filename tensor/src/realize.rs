@@ -1195,7 +1195,7 @@ impl KernelSite {
         let has_explicit_opts =
             matches!(self.ast.op(), Op::Sink(ops::Sink { info: Some(ki), .. }) if ki.opts_to_apply.is_some());
         if !has_explicit_opts && matches!(config.optimizer.strategy, svod_schedule::OptStrategy::Beam { .. }) {
-            beam_search_optimize(self.ast.clone(), &self.renderer, &self.device, &self.buffers, &config.optimizer)
+            beam_search_optimize(self.ast.clone(), &self.renderer, &self.device, &self.buffers, config)
         } else {
             svod_schedule::optimize_kernel_with_naming(
                 self.ast.clone(),
@@ -1252,21 +1252,15 @@ impl KernelSite {
     }
 }
 
+/// `1` runs inline in order; anything else fans out over the global pool
+/// sized by `prepare_execution_plan`.
 fn map_on_threads<T: Send, R: Send>(threads: usize, items: Vec<T>, f: impl Fn(T) -> R + Sync + Send) -> Vec<R> {
-    match threads {
-        1 => items.into_iter().map(f).collect(),
-        0 => items.into_par_iter().map(f).collect(),
-        n => rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build()
-            .expect("compile thread pool")
-            .install(|| items.into_par_iter().map(f).collect()),
-    }
+    if threads == 1 { items.into_iter().map(f).collect() } else { items.into_par_iter().map(f).collect() }
 }
 
 /// Optimize, name, render and compile every distinct kernel this plan misses
 /// in the optimized-kernel cache. Optimizing and compiling fan out over
-/// `config.compile_threads`; naming runs in schedule order in between, so the
+/// `config.threads`; naming runs in schedule order in between, so the
 /// `nK` suffixes — part of the source text and hence of the object-cache key —
 /// never depend on thread scheduling. Keys another prepare is already
 /// computing are skipped here and awaited by the caller through `opt_flight`.
@@ -1287,11 +1281,8 @@ fn compile_missing_kernels(
         return Ok(HashMap::new());
     }
     // Beam already fans out over its own worker processes.
-    let threads = if matches!(config.optimizer.strategy, svod_schedule::OptStrategy::Beam { .. }) {
-        1
-    } else {
-        config.compile_threads
-    };
+    let threads =
+        if matches!(config.optimizer.strategy, svod_schedule::OptStrategy::Beam { .. }) { 1 } else { config.threads };
 
     let optimized = map_on_threads(threads, jobs.iter().collect(), |(site, _)| site.optimize(config));
     let mut failed = None;
@@ -1362,6 +1353,9 @@ fn prepare_execution_plan(
     schedule_result: &crate::schedule::ScheduleResult,
     config: &PrepareConfig,
 ) -> Result<ExecutionPlan> {
+    // Every prepare and, through the plan it returns, every execution passes
+    // here: size the shared pool before either can use it.
+    svod_runtime::ensure_thread_pool(config.threads);
     // Schedule items are already fully expanded by strict scheduler unroll.
     let mut schedule_items = schedule_result.items.clone();
 
@@ -1770,22 +1764,19 @@ fn beam_search_optimize(
     renderer: &svod_schedule::OptimizerRenderer,
     device: &Device,
     buffers: &[Buffer],
-    optimizer_config: &svod_schedule::OptimizerConfig,
+    config: &PrepareConfig,
 ) -> Result<Arc<UOp>> {
+    let optimizer_config = &config.optimizer;
     let mut resolved_beam_config = optimizer_config.beam.clone();
+    // `PARALLEL` overrides for tinygrad parity; GPUs otherwise fan out over the
+    // thread budget, CPU compiles in-process.
+    let default_workers = match device.device {
+        _ if resolved_beam_config.compile_workers > 0 => resolved_beam_config.compile_workers,
+        DeviceSpec::Cuda { .. } | DeviceSpec::Amd { .. } | DeviceSpec::Metal { .. } => config.threads,
+        _ => 0,
+    };
     resolved_beam_config.compile_workers =
-        std::env::var("PARALLEL").ok().and_then(|value| value.parse().ok()).unwrap_or_else(|| {
-            if resolved_beam_config.compile_workers > 0 {
-                resolved_beam_config.compile_workers
-            } else if matches!(
-                device.device,
-                DeviceSpec::Cuda { .. } | DeviceSpec::Amd { .. } | DeviceSpec::Metal { .. }
-            ) {
-                std::thread::available_parallelism().map(|count| count.get()).unwrap_or(1)
-            } else {
-                0
-            }
-        });
+        std::env::var("PARALLEL").ok().and_then(|value| value.parse().ok()).unwrap_or(default_workers);
     let beam_config = &resolved_beam_config;
     let beam_debug = std::env::var("BEAM_DEBUG").ok().and_then(|value| value.parse::<u8>().ok()).unwrap_or(0);
     if beam_debug > 0 {

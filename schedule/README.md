@@ -57,7 +57,7 @@ let optimized = graph_rewrite(&matcher, graph, &mut ());
 | Local memory | ✅ | GPU shared memory allocation |
 | Grouped reduction | ✅ | 2-stage GROUP/GROUPTOP |
 | Matvec optimization | ✅ | Specialized MV pattern |
-| CPU threading | ✅ | Multi-threaded execution |
+| CPU threading | ✅ | `core_id` split, `SVOD_THREADS` ways by default |
 | Axis reordering | ✅ | SWAP for memory access |
 | **RANGEIFY** | | |
 | Movement op removal | ✅ | RESHAPE, PERMUTE, EXPAND, etc. |

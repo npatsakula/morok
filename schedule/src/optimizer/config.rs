@@ -337,9 +337,10 @@ pub struct HeuristicsConfig {
     pub disable_locals: bool,
 
     // Threading
-    /// Maximum thread count for CPU parallelization.
-    /// Default: std::thread::available_parallelism().
-    /// Set to 1 to disable threading.
+    /// Number of `core_id` chunks a CPU kernel is split into; baked into the
+    /// kernel and its cache identity. Defaults to [`thread_budget`] and may
+    /// legitimately differ from the runtime pool size: a kernel split N ways
+    /// runs correctly on fewer threads. Set to 1 to disable threading.
     pub thread_count: usize,
 
     // Vectorization
@@ -360,9 +361,18 @@ pub struct HeuristicsConfig {
     pub debug_level: u8,
 }
 
-/// Get default thread count from system (used by Default and builder).
-fn default_thread_count() -> usize {
-    std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8)
+/// The process-wide thread budget: `SVOD_THREADS` as a positive integer, else
+/// the host's available parallelism. Shared by kernel preparation (parallel
+/// optimise/compile), CPU execution, and the default kernel `core_id` split.
+pub fn thread_budget() -> usize {
+    parse_thread_budget(std::env::var("SVOD_THREADS").ok().as_deref())
+}
+
+fn parse_thread_budget(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&threads| threads > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8))
 }
 
 impl HeuristicsConfig {
@@ -370,7 +380,7 @@ impl HeuristicsConfig {
     ///
     /// # Environment Variables
     ///
-    /// * `SVOD_THREADS` - Maximum thread count (default: available_parallelism)
+    /// * `SVOD_THREADS` - Kernel `core_id` split, the process thread budget (default: available_parallelism)
     /// * `SVOD_MV` - Enable/disable matvec fast-path (`0` disables)
     /// * `SVOD_MV_BLOCKSIZE` / `MV_BLOCKSIZE` - Matvec local block size
     /// * `SVOD_MV_THREADS_PER_ROW` / `MV_THREADS_PER_ROW` - Matvec reduce split
@@ -386,8 +396,7 @@ impl HeuristicsConfig {
             keys.iter().find_map(|k| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok())).unwrap_or(default)
         };
 
-        let thread_count =
-            std::env::var("SVOD_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or_else(default_thread_count);
+        let thread_count = thread_budget();
         let matvec_enabled = std::env::var("SVOD_MV").map(|v| v != "0").unwrap_or(true);
         let matvec_blocksize = parse_usize(&["SVOD_MV_BLOCKSIZE", "MV_BLOCKSIZE"], 4);
         let threads_per_row = parse_usize(&["SVOD_MV_THREADS_PER_ROW", "MV_THREADS_PER_ROW"], 8);
@@ -446,7 +455,7 @@ impl Default for HeuristicsConfig {
             grouped_threshold: 256,
             unroll_threshold: 32,
             disable_locals: false,
-            thread_count: default_thread_count(),
+            thread_count: thread_budget(),
             k_vectorize: false,
             output_upcast: true,
             debug_level: 0,
@@ -469,7 +478,7 @@ impl HeuristicsConfig {
         #[builder(default = 256)] grouped_threshold: usize,
         #[builder(default = 32)] unroll_threshold: usize,
         #[builder(default = false)] disable_locals: bool,
-        #[builder(default = default_thread_count())] thread_count: usize,
+        #[builder(default = thread_budget())] thread_count: usize,
         #[builder(default = false)] k_vectorize: bool,
         #[builder(default = true)] output_upcast: bool,
         #[builder(default = 0)] debug_level: u8,

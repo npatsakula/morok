@@ -830,9 +830,10 @@ fn buffers_expire_automatically_with_their_graphs() {
 }
 
 /// The `nK` name suffix is drawn from a process-wide counter as kernels are
-/// finished. A parallel prepare must draw it in schedule order, exactly like
-/// a single-threaded one, or the object cache (keyed on source text) would
-/// miss on every run.
+/// finished. A prepare fanned out over the global pool (`threads: 4`) must
+/// draw it in schedule order and reach the same kernel ABI as an inline one
+/// (`threads: 1`), or the object cache (keyed on source text) would miss on
+/// every run.
 #[test]
 fn test_parallel_prepare_names_kernels_in_schedule_order() {
     const KERNELS: usize = 6;
@@ -847,7 +848,7 @@ fn test_parallel_prepare_names_kernels_in_schedule_order() {
                 (&x * &scale).sum(0).unwrap()
             })
             .collect();
-        let config = PrepareConfig { compile_threads: threads, ..Default::default() };
+        let config = PrepareConfig { threads, ..Default::default() };
         let plan = Tensor::prepare_batch_with(outputs.iter_mut(), &config).unwrap();
         plan.prepared_kernels().iter().map(|k| (k.kernel.entry_point.clone(), k.kernel.globals.clone())).collect()
     }
@@ -925,7 +926,7 @@ fn constant_store_site(value: f32, opts: Vec<svod_ir::Opt>, config: &PrepareConf
 #[test_case(1; "failing middle")]
 #[test_case(2; "failing last")]
 fn compile_missing_kernels_publishes_the_survivors_of_a_failed_optimize(failing: usize) {
-    let config = PrepareConfig { compile_threads: 2, ..PrepareConfig::for_cpu_backend(crate::CpuBackend::Clang) };
+    let config = PrepareConfig { threads: 2, ..PrepareConfig::for_cpu_backend(crate::CpuBackend::Clang) };
     let sites: Vec<_> = (0..3)
         .map(|i| {
             // The kernel has no unrollable axis, so UNROLL is rejected.

@@ -50,6 +50,22 @@ impl CpuBackend {
 // Shared parallel execution
 // =============================================================================
 
+/// Size rayon's global pool — the one that runs `core_id`-split CPU kernels
+/// and parallel kernel preparation — to `threads`. Rayon builds its global
+/// pool once, so the first caller wins; a later call asking for a different
+/// size keeps the existing pool and warns once.
+pub fn ensure_thread_pool(threads: usize) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().is_err() {
+        let current = rayon::current_num_threads();
+        if current != threads {
+            WARNED.call_once(|| {
+                tracing::warn!(requested = threads, current, "rayon's global pool is already sized; keeping it")
+            });
+        }
+    }
+}
+
 /// Execute a kernel function pointer in parallel across multiple threads.
 ///
 /// # Safety

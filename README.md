@@ -102,6 +102,12 @@ nix fmt # Format source files
 | libxml2 | >=2.13 | yes | XML parsing |
 | Z3 | >=4.15 | no | SMT solver for optimization verification |
 
+### Threads
+
+`SVOD_THREADS` (default: host parallelism) is the single thread budget: it sizes
+the pool that compiles kernels and executes CPU kernels, and is the default
+`core_id` split of CPU kernels. `RAYON_NUM_THREADS` is not consulted.
+
 ## Test
 
 ```bash

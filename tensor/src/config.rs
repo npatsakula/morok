@@ -66,15 +66,13 @@ pub struct PrepareConfig {
     /// (staged over the copy engine — SDMA on AMD, ~PCIe speed) instead of
     /// the uncached host mapping. Use for big outputs read back in bulk.
     pub device_local_outputs: bool,
-    /// Threads for optimizing/rendering/compiling the kernels one prepare
-    /// misses in the optimized-kernel cache: `0` uses rayon's default pool,
-    /// `1` runs them inline in schedule order (`SVOD_COMPILE_THREADS`).
-    pub compile_threads: usize,
-}
-
-/// `SVOD_COMPILE_THREADS`; unset, unparsable or `0` means rayon's default.
-pub fn compile_threads_from_env() -> usize {
-    std::env::var("SVOD_COMPILE_THREADS").ok().and_then(|value| value.parse().ok()).unwrap_or(0)
+    /// The thread budget this prepare sizes the process-wide pool to — the
+    /// pool that optimizes/renders/compiles the kernels it misses in the
+    /// optimized-kernel cache and later runs `core_id`-split CPU kernels.
+    /// Defaults to [`svod_schedule::thread_budget`] (`SVOD_THREADS`); `1`
+    /// compiles inline in schedule order. The pool is built by the first
+    /// prepare in the process; later values only warn if they differ.
+    pub threads: usize,
 }
 
 impl std::fmt::Debug for PrepareConfig {
@@ -84,7 +82,7 @@ impl std::fmt::Debug for PrepareConfig {
             .field("planner_mode", &self.planner_mode)
             .field("disable_schedule_cache", &self.disable_schedule_cache)
             .field("device_local_outputs", &self.device_local_outputs)
-            .field("compile_threads", &self.compile_threads)
+            .field("threads", &self.threads)
             .finish_non_exhaustive()
     }
 }
@@ -97,7 +95,7 @@ impl Default for PrepareConfig {
             planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
-            compile_threads: compile_threads_from_env(),
+            threads: svod_schedule::thread_budget(),
         }
     }
 }
@@ -111,7 +109,7 @@ impl PrepareConfig {
             planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
-            compile_threads: compile_threads_from_env(),
+            threads: svod_schedule::thread_budget(),
         }
     }
 
@@ -127,7 +125,7 @@ impl PrepareConfig {
             planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
-            compile_threads: compile_threads_from_env(),
+            threads: svod_schedule::thread_budget(),
         }
     }
 
@@ -164,7 +162,7 @@ impl From<OptimizerConfig> for PrepareConfig {
             planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
-            compile_threads: compile_threads_from_env(),
+            threads: svod_schedule::thread_budget(),
         }
     }
 }

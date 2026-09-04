@@ -52,8 +52,8 @@ fn bench_matmul(c: &mut Criterion) {
     let mut group = c.benchmark_group("matmul_optimization");
 
     // Typed optimizer configurations (no environment variables needed).
-    // Don't override thread_count — the default is `available_parallelism()`,
-    // matching the `renderer.global_max[0]` behavior on CPU.
+    // Don't override thread_count — the default is the `SVOD_THREADS` budget,
+    // matching `renderer.global_max[0]` on CPU.
     let heuristic_config: PrepareConfig = OptimizerConfig::builder()
         .strategy(OptStrategy::Heuristic)
         // TC_OPT is pinned: the heuristic default (Strict, tinygrad `helpers.py:238`)
