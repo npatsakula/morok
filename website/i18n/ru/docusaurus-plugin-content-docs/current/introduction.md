@@ -62,13 +62,13 @@ use svod_schedule::patterns;
 
 let optimizer = patterns! {
     // Identity folding (commutative)
-    Add[x, @zero] ~> x,
-    Mul[x, @one] ~> x,
+    Add[x, @zero] => x,
+    Mul[x, @one] => x,
 
     // Constant folding
     for op in binary [Add, Mul, Sub] {
         op(a @const(av), _b @const(bv))
-          => |a, av, bv| eval_binary_op(op, av, bv).map(|r| UOp::const_(a.dtype(), r)),
+          => eval_binary_op(op, av, bv).map(|r| UOp::const_(a.dtype(), r)),
     },
 };
 ```

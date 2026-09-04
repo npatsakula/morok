@@ -1,1886 +1,708 @@
 //! Code generation for the pattern DSL.
 //!
-//! Converts the parsed pattern AST into Rust code that constructs
-//! a `TypedPatternMatcher` using the new TypedPattern infrastructure.
+//! A block compiles to one closure `Fn(&Arc<UOp>, OpMask, &mut C) -> RewriteResult`
+//! that dispatches on the root's dense `OpKey` index with a `match` over constant keys,
+//! then tries that kind's rules in source order; each rule first tests its constant
+//! early-reject mask against the children mask it is handed. Rules that cannot be keyed
+//! statically — wildcard roots, `for op in kind [*]`, `@anyconst` — become sequential
+//! steps between the `match`es so source order is preserved exactly.
+//!
+//! Inside a rule, matching is a chain of `let ... else` destructures, since a Rust
+//! pattern cannot cross an `Arc<UOp>` edge. A commutative `Op[a, b]` matches its
+//! children lazily per ordering: each ordering is a candidate yielding its bindings,
+//! nested commutative nodes become nested candidate loops, and the guard and rewrite
+//! body — emitted once at the innermost level — run per candidate until one rewrites,
+//! which is Tinygrad's per-permutation retry.
 
-use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote};
-use syn::{Error, Ident, Result};
+use std::collections::{BTreeMap, HashSet};
+
+use proc_macro2::{Span, TokenStream as TokenStream2};
+use quote::{format_ident, quote, quote_spanned};
+use syn::{Error, Ident, Pat, Result};
 
 use super::parser::{
-    ArrowKind, ConstPattern, FieldPattern, ForBlock, IterKind, Pattern, PatternItem, PatternList, PatternRule,
-    RewriteExpr,
+    FieldPat, ForBlock, OpRef, Pattern, PatternItem, PatternList, PatternRule, RewriteExpr, is_lowercase,
 };
 
-/// Internal binding names used by the code generator.
-mod binding_names {
-    /// Name for any constant binding
-    pub const CONST: &str = "__const";
-    /// Name for zero constant binding
-    pub const ZERO: &str = "__zero";
-    /// Name for one constant binding
-    pub const ONE: &str = "__one";
+fn no_match() -> TokenStream2 {
+    quote! { __Result::NoMatch }
 }
 
-/// Tracks duplicate variable names for auto ptr_eq generation.
-///
-/// When a pattern like `Add(x, x)` is used, this tracker:
-/// 1. Records the first `x` normally
-/// 2. Renames the second `x` to `x__dup` and records the pair
-///
-/// The rewrite function then generates `Arc::ptr_eq(&x, &x__dup)` checks.
+fn op_mask() -> TokenStream2 {
+    quote! { __OpMask }
+}
+
+/// How two occurrences of one name must agree: nodes by identity, extracted values
+/// (`@const(v)`, `@vconst(vs)`) by `==`.
+#[derive(Clone, Copy)]
+enum Equality {
+    Ptr,
+    Value,
+}
+
+/// Renames repeated binding names (`Add(x, x)`) so every occurrence is bound and the
+/// pairs can be checked for equality.
 #[derive(Default, Clone)]
 struct DuplicateTracker {
-    /// Variable names we've seen so far
-    seen: std::collections::HashSet<String>,
-    /// Pairs of (original_name, duplicate_name) for ptr_eq generation
-    duplicates: Vec<(String, String)>,
+    seen: HashSet<String>,
+    duplicates: Vec<(Ident, Ident, Equality)>,
 }
 
 impl DuplicateTracker {
-    /// Process a variable name, returning the name to use in the pattern.
-    /// If this is a duplicate, returns a renamed version and records the pair.
-    ///
-    /// For patterns with 3+ occurrences of the same variable (e.g., `Where(x, x, x)`),
-    /// generates unique names: x, x_dup, x_dup_2, x_dup_3, etc.
-    fn process_name(&mut self, name: &str) -> String {
-        if self.seen.contains(name) {
-            // Count existing duplicates of this name to generate unique suffix
-            let count = self.duplicates.iter().filter(|(orig, _)| orig == name).count();
-            let dup_name = if count == 0 { format!("{}_dup", name) } else { format!("{}_dup_{}", name, count + 1) };
-            self.duplicates.push((name.to_string(), dup_name.clone()));
-            dup_name
-        } else {
-            self.seen.insert(name.to_string());
-            name.to_string()
+    fn bind(&mut self, name: &Ident, equality: Equality) -> Ident {
+        let key = name.to_string();
+        if !self.seen.insert(key.clone()) {
+            let count = self.duplicates.iter().filter(|(original, ..)| original == name).count();
+            let dup = if count == 0 { format_ident!("{key}_dup") } else { format_ident!("{key}_dup_{}", count + 1) };
+            self.duplicates.push((name.clone(), dup.clone(), equality));
+            return dup;
         }
+        name.clone()
     }
 
-    /// Get the duplicate pairs for ptr_eq generation.
-    fn get_duplicates(&self) -> &[(String, String)] {
-        &self.duplicates
-    }
-}
-
-// =============================================================================
-// Closure Parameter Validation
-// =============================================================================
-
-/// Information about a single closure parameter.
-struct ClosureParamInfo {
-    name: Ident,
-    is_ctx: bool,
-}
-
-/// Analysis result for a user closure.
-struct ClosureAnalysis {
-    params: Vec<ClosureParamInfo>,
-}
-
-/// Extract name from a closure parameter pattern.
-fn extract_pat_name(pat: &syn::Pat) -> Result<Ident> {
-    match pat {
-        syn::Pat::Ident(pat_ident) => Ok(pat_ident.ident.clone()),
-        syn::Pat::Type(pat_type) => extract_pat_name(&pat_type.pat),
-        syn::Pat::Reference(pat_ref) => extract_pat_name(&pat_ref.pat),
-        _ => Err(Error::new_spanned(pat, "Closure parameters must be simple identifiers")),
+    fn checks(&self, fail: &TokenStream2) -> TokenStream2 {
+        let checks = self.duplicates.iter().map(|(original, dup, equality)| match equality {
+            Equality::Ptr => quote! { if !std::sync::Arc::ptr_eq(#original, #dup) { #fail } },
+            Equality::Value => quote! { if #original != #dup { #fail } },
+        });
+        quote! { #(#checks)* }
     }
 }
 
-/// Extract parameter information from a user closure.
-fn extract_closure_params(closure: &syn::ExprClosure) -> Result<ClosureAnalysis> {
-    let params = closure
-        .inputs
-        .iter()
-        .map(|pat| {
-            let name = extract_pat_name(pat)?;
-            let is_ctx = name == "ctx";
-            Ok(ClosureParamInfo { name, is_ctx })
-        })
-        .collect::<Result<_>>()?;
-    Ok(ClosureAnalysis { params })
-}
-
-/// Validate that closure parameters match requirements.
-/// Main purpose: catch `ctx` without `@context` declaration early.
-fn validate_closure_params(analysis: &ClosureAnalysis, _lhs_bindings: &[Ident], has_context: bool) -> Result<()> {
-    for param in &analysis.params {
-        if param.is_ctx && !has_context {
-            return Err(Error::new_spanned(
-                &param.name,
-                "`ctx` parameter requires `@context Type;` declaration at start of patterns!",
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Context for iteration variable substitution.
-#[derive(Clone)]
-struct IterContext {
-    var_name: Ident,
-    op_ident: Ident,
-    op_kind: OpKind,
-}
-
-/// The kind of operation being iterated over.
+/// The for-block a rule belongs to: its variable, grouped variant, and listed ops
+/// (`None` for `[*]`). The variable is bound at runtime from the root, so one copy of
+/// the rule serves every listed op.
 #[derive(Clone, Copy)]
-enum OpKind {
-    Unary,
-    Binary,
-    Ternary,
+struct Iter<'a> {
+    var: &'a Ident,
+    kind: &'a Ident,
+    ops: Option<&'a [Ident]>,
 }
 
-/// Classification of operations for code generation.
-enum OpClass {
-    /// Binary IR operations (Add, Sub, etc.) - uses BinaryOp enum
-    Binary,
-    /// Unary IR operations (Neg, Sqrt, etc.) - uses UnaryOp enum
-    Unary,
-    /// Ternary IR operations (Where, MulAcc) - uses TernaryOp enum
-    Ternary,
-    /// Single-source operations (cast, reshape, etc.)
-    SingleSource,
-    /// Operations with special handling (Store, Load, etc.)
-    Special,
-}
-
-/// Binary IR operations.
-/// NOTE: Must stay in sync with svod_ir::types::BinaryOp variants.
-/// The generated metadata at svod_ir::op::pattern_derived::pattern_metadata::BINARY_OPS
-/// can be used for runtime validation.
-const BINARY_OPS: &[&str] = &[
-    "Add", "Mul", "Sub", "FloorMod", "CMod", "Max", "Pow", "FloorDiv", "CDiv", "Fdiv", "Lt", "Le", "Eq", "Ne", "Gt",
-    "Ge", "And", "Or", "Xor", "Shl", "Shr", "Threefry",
-];
-
-/// Unary IR operations.
-/// NOTE: Must stay in sync with svod_ir::types::UnaryOp variants.
-const UNARY_OPS: &[&str] = &[
-    "Neg",
-    "Not",
-    "Abs",
-    "Sqrt",
-    "Rsqrt",
-    "Exp",
-    "Exp2",
-    "Log",
-    "Log2",
-    "Sin",
-    "Cos",
-    "Tan",
-    "Reciprocal",
-    "Trunc",
-    "Floor",
-    "Ceil",
-    "Round",
-    "Sign",
-    "Erf",
-    "Square",
-];
-
-/// Ternary IR operations.
-/// NOTE: Must stay in sync with svod_ir::types::TernaryOp variants.
-const TERNARY_OPS: &[&str] = &["Where", "MulAcc"];
-
-/// Single-source operations mapped to their pattern helper method names.
-/// NOTE: These ops must have `src` as their first child field.
-const SINGLE_SOURCE_OPS: &[(&str, &str)] = &[
-    ("GetAddr", "get_addr"),
-    ("Detach", "detach"),
-    ("ContiguousBackward", "contiguous_backward"),
-    ("Cast", "cast"),
-    ("Reshape", "reshape"),
-    ("Permute", "permute"),
-    ("Expand", "expand"),
-    ("Pad", "pad"),
-    ("Shrink", "shrink"),
-    ("Flip", "flip"),
-    ("Contiguous", "contiguous"),
-    ("Precast", "precast"),
-    ("BitCast", "bitcast"),
-    ("ReduceAxis", "reduce_axis"),
-    ("Multi", "multi"),
-];
-
-/// Map of operation names to their child field names (in positional order).
-///
-/// This is used for tuple-style pattern matching: `Op(x, y)` where we need
-/// to know that positional memory patterns map to their required operands.
-///
-/// Ops not in this list default to single `src` field handling via SINGLE_SOURCE_OPS.
-const OP_CHILD_FIELDS: &[(&str, &[&str])] = &[
-    // Control flow
-    ("Range", &["end"]),
-    ("Special", &["end"]),
-    ("After", &["passthrough"]),
-    ("EndIf", &["if_op"]),
-    ("End", &["computation"]),
-    ("If", &["condition"]),
-    ("Barrier", &["src"]),
-    // Buffer ops
-    ("Buffer", &["unique", "device"]),
-    ("Slice", &["buffer", "offset"]),
-    ("MSelect", &["buffer"]),
-    ("Index", &["buffer"]),
-    ("Copy", &["src"]),
-    ("Stage", &["compute"]),
-    // Memory ops
-    ("Load", &["index"]),
-    ("Store", &["index", "value"]),
-    // Symbolic
-    ("Bind", &["var", "value"]),
-    // Callable
-    ("Call", &["body"]),
-    ("Function", &["body"]),
-    // Tuple
-    ("GetTuple", &["src"]),
-    // Reduction
-    ("Reduce", &["src"]),
-    ("AllReduce", &["src"]),
-    // WMMA
-    ("Wmma", &["a", "b", "c"]),
-];
-
-/// Get child field names for an operation.
-///
-/// Returns the field names from OP_CHILD_FIELDS, or &["src"] for single-source ops.
-fn get_child_field_names(op_name: &str) -> Option<&'static [&'static str]> {
-    OP_CHILD_FIELDS.iter().find(|(name, _)| *name == op_name).map(|(_, fields)| *fields)
-}
-
-/// Classify an operation name into its category.
-fn classify_op(op_name: &str) -> OpClass {
-    if BINARY_OPS.contains(&op_name) {
-        OpClass::Binary
-    } else if UNARY_OPS.contains(&op_name) {
-        OpClass::Unary
-    } else if TERNARY_OPS.contains(&op_name) {
-        OpClass::Ternary
-    } else if SINGLE_SOURCE_OPS.iter().any(|(name, _)| *name == op_name) {
-        OpClass::SingleSource
-    } else {
-        OpClass::Special
-    }
-}
-
-// =============================================================================
-// Compile-Time Op Name Validation
-// =============================================================================
-
-/// Collect all operation names used in a pattern list.
-fn collect_op_names(patterns: &PatternList) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
-    for item in &patterns.items {
-        match item {
-            PatternItem::Rule(rule) => collect_op_names_from_pattern(&rule.lhs, &mut names),
-            PatternItem::ForBlock(for_block) => {
-                for rule in &for_block.body {
-                    collect_op_names_from_pattern(&rule.lhs, &mut names);
-                }
-            }
-        }
-    }
-    names
-}
-
-/// Recursively collect op names from a pattern.
-fn collect_op_names_from_pattern(pattern: &Pattern, names: &mut std::collections::HashSet<String>) {
-    match pattern {
-        Pattern::OpStruct { op, fields, .. } => {
-            names.insert(op.to_string());
-            for field in fields {
-                collect_op_names_from_field_pattern(field, names);
-            }
-        }
-        Pattern::OpTuple { op, args, .. } => {
-            names.insert(op.to_string());
-            for arg in args {
-                collect_op_names_from_pattern(arg, names);
-            }
-        }
-        Pattern::OpPermute { op, args } => {
-            names.insert(op.to_string());
-            for arg in args {
-                collect_op_names_from_pattern(arg, names);
-            }
-        }
-        Pattern::Binding { pattern, .. } => {
-            collect_op_names_from_pattern(pattern, names);
-        }
-        Pattern::Any(alternatives) => {
-            for alt in alternatives {
-                collect_op_names_from_pattern(alt, names);
-            }
-        }
-        // Constants, variables, wildcards, op variables don't have op names to validate
-        // (OpVar uses iteration context which is separately validated)
-        Pattern::Const(_)
-        | Pattern::Var(_)
-        | Pattern::OpVar { .. }
-        | Pattern::ConstWithValue { .. }
-        | Pattern::VConstWithValue { .. }
-        | Pattern::AnyConstWithValue { .. }
-        | Pattern::Wildcard
-        | Pattern::OptionNone => {}
-        // OptionSome has an inner pattern that may contain ops
-        Pattern::OptionSome(inner) => {
-            collect_op_names_from_pattern(inner, names);
-        }
-    }
-}
-
-/// Collect op names from a field pattern.
-fn collect_op_names_from_field_pattern(field: &FieldPattern, names: &mut std::collections::HashSet<String>) {
-    collect_op_names_from_pattern(&field.pattern, names);
-}
-
-/// Generate compile-time validation assertions for op names.
-///
-/// This ensures typos like `Addd(x, y)` fail at compile time with a clear error.
-fn generate_op_validation(op_names: &std::collections::HashSet<String>) -> TokenStream2 {
-    let validations: Vec<TokenStream2> = op_names
-        .iter()
-        .map(|name| {
-            let op_class = classify_op(name);
-            let op_ident = format_ident!("{}", name);
-            match op_class {
-                OpClass::Binary => quote! {
-                    let _ = svod_ir::BinaryOp::#op_ident;
-                },
-                OpClass::Unary => quote! {
-                    let _ = svod_ir::UnaryOp::#op_ident;
-                },
-                OpClass::Ternary => quote! {
-                    let _ = svod_ir::TernaryOp::#op_ident;
-                },
-                OpClass::SingleSource | OpClass::Special => quote! {
-                    let _ = svod_ir::op::pattern_derived::OpKey::#op_ident;
-                },
-            }
-        })
-        .collect();
-
-    if validations.is_empty() {
-        quote! {}
-    } else {
-        quote! {
-            // Compile-time validation: ensure all op names exist
-            const _: () = {
-                #(#validations)*
-            };
-        }
-    }
-}
-
-// =============================================================================
-// SimplifiedPatternMatcher Code Generation (Phase 3)
-// =============================================================================
-
-/// Compute OpKey(s) for a pattern.
-///
-/// Returns TokenStream for the OpKey array used by SimplifiedPatternMatcher.
-/// For wildcard patterns (bare variables), returns an empty array.
-fn compute_op_keys(pattern: &Pattern, iter_ctx: Option<&IterContext>) -> Vec<TokenStream2> {
-    match pattern {
-        // Bare variable or wildcard - matches any op (wildcard pattern)
-        Pattern::Var(_) | Pattern::Wildcard => vec![],
-
-        // Binding - delegate to inner pattern
-        Pattern::Binding { pattern, .. } => compute_op_keys(pattern, iter_ctx),
-
-        // Op tuple - extract OpKey from op name
-        Pattern::OpTuple { op, .. } => {
-            let op_name = op.to_string();
-            compute_op_key_for_op(&op_name)
-        }
-
-        // Op struct - extract OpKey from op name
-        Pattern::OpStruct { op, .. } => {
-            let op_name = op.to_string();
-            compute_op_key_for_op(&op_name)
-        }
-
-        // Constants - OpKey::Const
-        Pattern::Const(_) | Pattern::ConstWithValue { .. } => {
-            vec![quote! { svod_ir::op::pattern_derived::OpKey::Const }]
-        }
-
-        // VConst - OpKey::VConst
-        Pattern::VConstWithValue { .. } => {
-            vec![quote! { svod_ir::op::pattern_derived::OpKey::VConst }]
-        }
-
-        // AnyConst - matches both Const and VConst
-        Pattern::AnyConstWithValue { .. } => {
-            vec![
-                quote! { svod_ir::op::pattern_derived::OpKey::Const },
-                quote! { svod_ir::op::pattern_derived::OpKey::VConst },
-            ]
-        }
-
-        // Op variable (in for-loop) - get OpKey from iteration context
-        Pattern::OpVar { var_name, .. } => {
-            if let Some(ctx) = iter_ctx {
-                if var_name == &ctx.var_name {
-                    let op_ident = &ctx.op_ident;
-                    match ctx.op_kind {
-                        OpKind::Unary => vec![quote! {
-                            svod_ir::op::pattern_derived::OpKey::Unary(svod_ir::UnaryOp::#op_ident)
-                        }],
-                        OpKind::Binary => vec![quote! {
-                            svod_ir::op::pattern_derived::OpKey::Binary(svod_ir::BinaryOp::#op_ident)
-                        }],
-                        OpKind::Ternary => vec![quote! {
-                            svod_ir::op::pattern_derived::OpKey::Ternary(svod_ir::TernaryOp::#op_ident)
-                        }],
-                    }
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![]
-            }
-        }
-
-        // Alternatives - collect all OpKeys from all alternatives
-        Pattern::Any(alternatives) => {
-            let mut keys = Vec::new();
-            for alt in alternatives {
-                keys.extend(compute_op_keys(alt, iter_ctx));
-            }
-            // Deduplicate by string representation
-            let mut seen = std::collections::HashSet::new();
-            keys.retain(|k| seen.insert(k.to_string()));
-            keys
-        }
-
-        // Permutation - same OpKey as non-permuted
-        Pattern::OpPermute { op, .. } => {
-            let op_name = op.to_string();
-            compute_op_key_for_op(&op_name)
-        }
-
-        // Option patterns - these are for matching Option<T> fields, not top-level ops
-        // They act like wildcards at the top level (shouldn't be used as top-level patterns)
-        Pattern::OptionSome(inner) => compute_op_keys(inner, iter_ctx),
-        Pattern::OptionNone => vec![],
-    }
-}
-
-/// Op kinds the root pattern demands of its direct children.
-///
-/// Tinygrad's `UPat.early_reject` (uop/ops.py:1349-1352): the union of the `op` sets of the
-/// fixed-position source patterns, taking only those constrained to exactly one op kind.
-/// Sources that are wildcards, bindings to wildcards, or alternatives over several kinds
-/// constrain nothing and contribute nothing.
-fn compute_early_reject_keys(pattern: &Pattern, iter_ctx: Option<&IterContext>) -> Vec<TokenStream2> {
-    match pattern {
-        Pattern::Binding { pattern, .. } => compute_early_reject_keys(pattern, iter_ctx),
-        // A top-level alternative matches if *any* branch does, so only kinds demanded by
-        // every branch are guaranteed present.
-        Pattern::Any(alternatives) => {
-            let mut branches = alternatives.iter().map(|alt| compute_early_reject_keys(alt, iter_ctx));
-            let first = branches.next().unwrap_or_default();
-            branches.fold(first, |acc, branch| {
-                let keep: std::collections::HashSet<String> = branch.iter().map(TokenStream2::to_string).collect();
-                acc.into_iter().filter(|key| keep.contains(&key.to_string())).collect()
-            })
-        }
-        _ => {
-            // Every source position below binds one of the root's direct children: tuple and
-            // op-variable args map onto child fields, struct fields that carry an op-shaped
-            // sub-pattern are child fields by construction.
-            let sources: Vec<&Pattern> = match pattern {
-                Pattern::OpTuple { args, .. } | Pattern::OpVar { args, .. } | Pattern::OpPermute { args, .. } => {
-                    args.iter().collect()
-                }
-                Pattern::OpStruct { fields, .. } => fields.iter().map(|field| &field.pattern).collect(),
-                _ => Vec::new(),
-            };
-            let mut seen = std::collections::HashSet::new();
-            sources
-                .into_iter()
-                .filter_map(|source| {
-                    let keys = compute_op_keys(source, iter_ctx);
-                    (keys.len() == 1).then(|| keys.into_iter().next().expect("one key"))
-                })
-                .filter(|key| seen.insert(key.to_string()))
-                .collect()
-        }
-    }
-}
-
-/// Get OpKey for a named operation.
-fn compute_op_key_for_op(op_name: &str) -> Vec<TokenStream2> {
-    // Check if it's a binary op
-    if BINARY_OPS.contains(&op_name) {
-        let op_ident = format_ident!("{}", op_name);
-        return vec![quote! {
-            svod_ir::op::pattern_derived::OpKey::Binary(svod_ir::BinaryOp::#op_ident)
-        }];
-    }
-
-    // Check if it's a unary op
-    if UNARY_OPS.contains(&op_name) {
-        let op_ident = format_ident!("{}", op_name);
-        return vec![quote! {
-            svod_ir::op::pattern_derived::OpKey::Unary(svod_ir::UnaryOp::#op_ident)
-        }];
-    }
-
-    // Check if it's a ternary op
-    if TERNARY_OPS.contains(&op_name) {
-        let op_ident = format_ident!("{}", op_name);
-        return vec![quote! {
-            svod_ir::op::pattern_derived::OpKey::Ternary(svod_ir::TernaryOp::#op_ident)
-        }];
-    }
-
-    // For other ops, use the variant-specific OpKey
-    let op_ident = format_ident!("{}", op_name);
-    vec![quote! {
-        svod_ir::op::pattern_derived::OpKey::#op_ident
-    }]
-}
-
-/// Represents one possible ordering for pattern matching.
-/// For non-commutative patterns, there's exactly 1 ordering.
-/// For commutative patterns, there are 2+ orderings (cross-product of nested commutative).
+/// A commutative node whose children are matched per ordering.
 #[derive(Clone)]
-struct Ordering {
-    /// Code to match children in this ordering
-    child_match_code: TokenStream2,
-    /// Variable bindings for this ordering
-    bindings: Vec<(Ident, TokenStream2)>,
+struct PermuteSite {
+    left: Ident,
+    right: Ident,
+    args: Vec<Pattern>,
 }
 
-/// Output from inline match generation.
-struct InlineMatchOutput {
-    /// Code to destructure the outer UOp (independent of orderings)
-    match_code: TokenStream2,
-    /// All possible orderings to try (1 for non-commutative, 2+ for commutative)
-    orderings: Vec<Ordering>,
+/// Emits the match code of one pattern into a straight-line chain, deferring the
+/// children of commutative nodes to [`PermuteSite`]s.
+struct Emitter {
+    code: Vec<TokenStream2>,
+    dup: DuplicateTracker,
+    /// Names bound so far, in order — the tuple an ordering candidate yields.
+    bound: Vec<Ident>,
+    permutes: Vec<PermuteSite>,
+    /// Statement run when a check fails; `None` means the chain is inside an
+    /// `Option`-returning closure and a failed `Option` destructure uses `?`.
+    fail: Option<TokenStream2>,
 }
 
-impl InlineMatchOutput {
-    /// Create a simple non-commutative output with one ordering
-    fn simple(match_code: TokenStream2, bindings: Vec<(Ident, TokenStream2)>) -> Self {
-        Self { match_code, orderings: vec![Ordering { child_match_code: quote! {}, bindings }] }
+impl Emitter {
+    fn new(fail: Option<TokenStream2>, dup: DuplicateTracker) -> Self {
+        Self { code: Vec::new(), dup, bound: Vec::new(), permutes: Vec::new(), fail }
     }
 
-    /// Convenience: get bindings from first ordering (for non-commutative or normal ordering)
-    fn bindings(&self) -> &[(Ident, TokenStream2)] {
-        &self.orderings[0].bindings
+    fn fail(&self) -> TokenStream2 {
+        self.fail.clone().unwrap_or_else(|| quote! { return None; })
     }
-}
 
-/// Generate inline match code for a pattern.
-///
-/// This generates Rust code that destructures the UOp and binds variables.
-/// Returns the match code and a list of bindings.
-fn generate_inline_match(
-    pattern: &Pattern,
-    tree_var: &Ident,
-    iter_ctx: Option<&IterContext>,
-    dup_tracker: &mut DuplicateTracker,
-) -> Result<InlineMatchOutput> {
-    match pattern {
-        Pattern::Var(name) => {
-            // Variable binds the whole tree
-            let actual_name = dup_tracker.process_name(&name.to_string());
-            let name_ident = Ident::new(&actual_name, name.span());
-            Ok(InlineMatchOutput::simple(quote! {}, vec![(name_ident, quote! { #tree_var })]))
-        }
-
-        Pattern::Wildcard => {
-            // Wildcard matches anything, no bindings
-            Ok(InlineMatchOutput::simple(quote! {}, vec![]))
-        }
-
-        Pattern::Binding { name, pattern } => {
-            // Named binding wraps inner pattern
-            let inner = generate_inline_match(pattern, tree_var, iter_ctx, dup_tracker)?;
-            let actual_name = dup_tracker.process_name(&name.to_string());
-            let name_ident = Ident::new(&actual_name, name.span());
-
-            // Add the binding to all orderings
-            let orderings = inner
-                .orderings
-                .into_iter()
-                .map(|mut ord| {
-                    ord.bindings.push((name_ident.clone(), quote! { #tree_var }));
-                    ord
-                })
-                .collect();
-
-            Ok(InlineMatchOutput { match_code: inner.match_code, orderings })
-        }
-
-        Pattern::OpTuple { op, args, rest: _ } => {
-            generate_inline_op_tuple_match(op, args, tree_var, iter_ctx, dup_tracker)
-        }
-
-        Pattern::OpStruct { op, fields, rest: _ } => generate_inline_op_struct_match(op, fields, tree_var, dup_tracker),
-
-        Pattern::Const(const_pat) => generate_inline_const_match(const_pat, tree_var),
-
-        Pattern::ConstWithValue { uop_name, value_name } => {
-            // Match Const and extract both the UOp and the value
-            let actual_name = dup_tracker.process_name(&uop_name.to_string());
-            let uop_ident = Ident::new(&actual_name, uop_name.span());
-            Ok(InlineMatchOutput::simple(
-                quote! {
-                    let svod_ir::Op::Const(__cv) = #tree_var.op() else {
-                        return svod_ir::pattern::RewriteResult::NoMatch;
-                    };
-                    let #value_name = __cv.0.clone();
-                },
-                vec![(uop_ident, quote! { #tree_var })],
-            ))
-        }
-
-        Pattern::VConstWithValue { uop_name, values_name } => {
-            // Match VConst and extract both the UOp and the values
-            let actual_name = dup_tracker.process_name(&uop_name.to_string());
-            let uop_ident = Ident::new(&actual_name, uop_name.span());
-            Ok(InlineMatchOutput::simple(
-                quote! {
-                    let svod_ir::Op::VConst { values: __vconst_values } = #tree_var.op() else {
-                        return svod_ir::pattern::RewriteResult::NoMatch;
-                    };
-                    let #values_name = __vconst_values.clone();
-                },
-                vec![(uop_ident, quote! { #tree_var })],
-            ))
-        }
-
-        Pattern::AnyConstWithValue { uop_name, values_name } => {
-            // Match either Const or VConst and extract values as Vec<ConstValue>
-            let actual_name = dup_tracker.process_name(&uop_name.to_string());
-            let uop_ident = Ident::new(&actual_name, uop_name.span());
-            Ok(InlineMatchOutput::simple(
-                quote! {
-                    let #values_name: Vec<svod_ir::ConstValue> = match #tree_var.op() {
-                        svod_ir::Op::Const(cv) => vec![cv.0.clone()],
-                        svod_ir::Op::VConst { values } => values.clone(),
-                        _ => return svod_ir::pattern::RewriteResult::NoMatch,
-                    };
-                },
-                vec![(uop_ident, quote! { #tree_var })],
-            ))
-        }
-
-        Pattern::OpVar { var_name, args } => {
-            generate_inline_op_var_match(var_name, args, tree_var, iter_ctx, dup_tracker)
-        }
-
-        Pattern::Any(alternatives) => generate_inline_alternatives_match(alternatives, tree_var, iter_ctx, dup_tracker),
-
-        Pattern::OpPermute { op, args } => generate_inline_commutative_match(op, args, tree_var, iter_ctx, dup_tracker),
-
-        Pattern::OptionNone => {
-            // Match Option::None - reject if value is Some
-            Ok(InlineMatchOutput::simple(
-                quote! {
-                    if #tree_var.is_some() {
-                        return svod_ir::pattern::RewriteResult::NoMatch;
-                    }
-                },
-                vec![],
-            ))
-        }
-
-        Pattern::OptionSome(inner) => {
-            // Match Option::Some and recursively match inner pattern
-            let inner_var = format_ident!("{}_some", tree_var);
-            let inner_match = generate_inline_match(inner, &inner_var, iter_ctx, dup_tracker)?;
-            let inner_code = &inner_match.match_code;
-
-            // Prepend the Option unwrap to match_code, keep inner's orderings
-            let match_code = quote! {
-                let Some(#inner_var) = #tree_var else {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
-                };
-                #inner_code
-            };
-
-            Ok(InlineMatchOutput { match_code, orderings: inner_match.orderings })
+    /// `let #pat = #option else { fail }`, as `?` where the closure returns an `Option`.
+    fn unwrap_or_fail(&self, pat: TokenStream2, option: TokenStream2) -> TokenStream2 {
+        match &self.fail {
+            Some(fail) => quote! { let Some(#pat) = #option else { #fail }; },
+            None => quote! { let #pat = #option?; },
         }
     }
-}
 
-/// Generate inline match for tuple-style ops like Add(x, y).
-fn generate_inline_op_tuple_match(
-    op: &Ident,
-    args: &[Pattern],
-    tree_var: &Ident,
-    iter_ctx: Option<&IterContext>,
-    dup_tracker: &mut DuplicateTracker,
-) -> Result<InlineMatchOutput> {
-    let op_name = op.to_string();
+    fn bind(&mut self, name: &Ident, value: TokenStream2, equality: Equality) {
+        let name = self.dup.bind(name, equality);
+        self.code.push(quote! { let #name = #value; });
+        self.bound.push(name);
+    }
 
-    match classify_op(&op_name) {
-        OpClass::Binary => {
-            if args.len() != 2 {
-                return Err(Error::new_spanned(op, format!("{} requires exactly 2 arguments", op_name)));
+    fn bind_node(&mut self, name: &Ident, node: &Ident) {
+        self.bind(name, quote! { #node }, Equality::Ptr);
+    }
+
+    fn emit(&mut self, pattern: &Pattern, var: &Ident) -> Result<()> {
+        let fail = self.fail();
+        match pattern {
+            Pattern::Wildcard => {}
+            Pattern::Var(name) => self.bind_node(name, var),
+            Pattern::Binding { name, pattern } => {
+                self.emit(pattern, var)?;
+                self.bind_node(name, var);
             }
-
-            let binary_op = format_ident!("{}", op_name);
-            // Use unique names based on tree_var to avoid shadowing in nested patterns
-            let left_var = format_ident!("{}_left", tree_var);
-            let right_var = format_ident!("{}_right", tree_var);
-
-            // Generate match code
-            let match_code = quote! {
-                let svod_ir::Op::Binary(svod_ir::BinaryOp::#binary_op, #left_var, #right_var) = #tree_var.op() else {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
-                };
-            };
-
-            // Recursively match children
-            let left_match = generate_inline_match(&args[0], &left_var, iter_ctx, dup_tracker)?;
-            let right_match = generate_inline_match(&args[1], &right_var, iter_ctx, dup_tracker)?;
-
-            let left_code = &left_match.match_code;
-            let right_code = &right_match.match_code;
-
-            // Cross-product all orderings from children
-            // For each left ordering × each right ordering, create a combined ordering
-            let orderings: Vec<Ordering> = left_match
-                .orderings
-                .iter()
-                .flat_map(|left_ord| {
-                    let left_child = &left_ord.child_match_code;
-                    right_match.orderings.iter().map(move |right_ord| {
-                        let right_child = &right_ord.child_match_code;
-                        let mut bindings = left_ord.bindings.clone();
-                        bindings.extend(right_ord.bindings.clone());
-                        Ordering {
-                            child_match_code: quote! {
-                                #left_code
-                                #left_child
-                                #right_code
-                                #right_child
-                            },
-                            bindings,
-                        }
-                    })
-                })
-                .collect();
-
-            Ok(InlineMatchOutput { match_code, orderings })
-        }
-
-        OpClass::Unary => {
-            if args.len() != 1 {
-                return Err(Error::new_spanned(op, format!("{} requires exactly 1 argument", op_name)));
+            Pattern::Unit(op) => {
+                self.code.push(quote! { let __Op::#op = #var.op() else { #fail }; });
             }
-
-            let unary_op = format_ident!("{}", op_name);
-            // Use unique names based on tree_var to avoid shadowing
-            let src_var = format_ident!("{}_src", tree_var);
-
-            let match_code = quote! {
-                let svod_ir::Op::Unary(svod_ir::UnaryOp::#unary_op, #src_var) = #tree_var.op() else {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
-                };
-            };
-
-            let src_match = generate_inline_match(&args[0], &src_var, iter_ctx, dup_tracker)?;
-            let src_code = &src_match.match_code;
-
-            // Propagate all orderings from child, prepending its match_code
-            let orderings = src_match
-                .orderings
-                .into_iter()
-                .map(|ord| {
-                    let ord_child = &ord.child_match_code;
-                    Ordering {
-                        child_match_code: quote! {
-                            #src_code
-                            #ord_child
-                        },
-                        bindings: ord.bindings,
-                    }
-                })
-                .collect();
-
-            Ok(InlineMatchOutput { match_code, orderings })
-        }
-
-        OpClass::Ternary => {
-            if args.len() != 3 {
-                return Err(Error::new_spanned(op, format!("{} requires exactly 3 arguments", op_name)));
-            }
-
-            let ternary_op = format_ident!("{}", op_name);
-            // Use unique names based on tree_var to avoid shadowing
-            let a_var = format_ident!("{}_a", tree_var);
-            let b_var = format_ident!("{}_b", tree_var);
-            let c_var = format_ident!("{}_c", tree_var);
-
-            let match_code = quote! {
-                let svod_ir::Op::Ternary(svod_ir::TernaryOp::#ternary_op, #a_var, #b_var, #c_var) = #tree_var.op() else {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
-                };
-            };
-
-            let a_match = generate_inline_match(&args[0], &a_var, iter_ctx, dup_tracker)?;
-            let b_match = generate_inline_match(&args[1], &b_var, iter_ctx, dup_tracker)?;
-            let c_match = generate_inline_match(&args[2], &c_var, iter_ctx, dup_tracker)?;
-
-            let a_code = &a_match.match_code;
-            let b_code = &b_match.match_code;
-            let c_code = &c_match.match_code;
-
-            // Cross-product all three children's orderings using explicit loops
-            let mut orderings = Vec::new();
-            for a_ord in &a_match.orderings {
-                let a_child = &a_ord.child_match_code;
-                for b_ord in &b_match.orderings {
-                    let b_child = &b_ord.child_match_code;
-                    for c_ord in &c_match.orderings {
-                        let c_child = &c_ord.child_match_code;
-                        let mut bindings = a_ord.bindings.clone();
-                        bindings.extend(b_ord.bindings.clone());
-                        bindings.extend(c_ord.bindings.clone());
-                        orderings.push(Ordering {
-                            child_match_code: quote! {
-                                #a_code
-                                #a_child
-                                #b_code
-                                #b_child
-                                #c_code
-                                #c_child
-                            },
-                            bindings,
-                        });
+            Pattern::Alu { op, args, commutative } => {
+                let op_expr = op_expr(op);
+                let span = op_span(op);
+                if *commutative && args.len() != 2 {
+                    return Err(Error::new(span, "commutative pattern takes exactly two arguments"));
+                }
+                let children: Vec<Ident> = (0..args.len()).map(|i| format_ident!("{var}_{i}")).collect();
+                let tuple = quote_spanned! {span=> (#(#children,)*) };
+                let destructure = quote! { __alu::AluOp::destructure(#op_expr, #var.op()) };
+                self.code.push(self.unwrap_or_fail(tuple, destructure));
+                if *commutative {
+                    let (left, right) = (children[0].clone(), children[1].clone());
+                    self.permutes.push(PermuteSite { left, right, args: args.clone() });
+                } else {
+                    for (arg, child) in args.iter().zip(&children) {
+                        self.emit(arg, child)?;
                     }
                 }
             }
-
-            Ok(InlineMatchOutput { match_code, orderings })
-        }
-
-        OpClass::SingleSource => generate_inline_single_source_match(&op_name, args, tree_var, iter_ctx, dup_tracker),
-
-        OpClass::Special => generate_inline_special_op_match(op, &op_name, args, tree_var, iter_ctx, dup_tracker),
-    }
-}
-
-/// Generate inline match for single-source ops (Cast, Reshape, etc.)
-fn generate_inline_single_source_match(
-    op_name: &str,
-    args: &[Pattern],
-    tree_var: &Ident,
-    iter_ctx: Option<&IterContext>,
-    dup_tracker: &mut DuplicateTracker,
-) -> Result<InlineMatchOutput> {
-    if args.len() != 1 {
-        return Err(Error::new(proc_macro2::Span::call_site(), format!("{} requires exactly 1 argument", op_name)));
-    }
-
-    let op_ident = format_ident!("{}", op_name);
-    // Use unique names based on tree_var to avoid shadowing
-    let src_var = format_ident!("{}_src", tree_var);
-
-    let match_code = quote! {
-        let svod_ir::Op::#op_ident { src: #src_var, .. } = #tree_var.op() else {
-            return svod_ir::pattern::RewriteResult::NoMatch;
-        };
-    };
-
-    let src_match = generate_inline_match(&args[0], &src_var, iter_ctx, dup_tracker)?;
-    let src_code = &src_match.match_code;
-
-    // Propagate all orderings from child
-    let orderings = src_match
-        .orderings
-        .into_iter()
-        .map(|ord| {
-            let ord_child = &ord.child_match_code;
-            Ordering {
-                child_match_code: quote! {
-                    #src_code
-                    #ord_child
-                },
-                bindings: ord.bindings,
+            Pattern::Struct { op, fields } => {
+                let mut field_pats = Vec::new();
+                let mut children = Vec::new();
+                for field in fields {
+                    let name = &field.name;
+                    match &field.pattern {
+                        FieldPat::Child(pattern) => {
+                            let child = format_ident!("{var}_{name}");
+                            field_pats.push(quote! { #name: #child });
+                            children.push((pattern, child));
+                        }
+                        FieldPat::Verbatim(pat) => {
+                            field_pats.push(quote! { #name: #pat });
+                            self.bind_verbatim(pat);
+                        }
+                    }
+                }
+                self.code.push(quote! {
+                    let __Op::#op(__ops::#op { #(#field_pats,)* .. }) = #var.op() else { #fail };
+                });
+                for (pattern, child) in children {
+                    self.emit(pattern, &child)?;
+                }
             }
-        })
-        .collect();
-
-    Ok(InlineMatchOutput { match_code, orderings })
-}
-
-/// Generate inline match for special ops using field metadata from OP_CHILD_FIELDS.
-///
-/// This uses the generic field mapping to destructure ops like Store, Load, Range, etc.
-/// The field names are looked up from `get_child_field_names()` and used to generate
-/// appropriate match patterns.
-fn generate_inline_special_op_match(
-    op: &Ident,
-    op_name: &str,
-    args: &[Pattern],
-    tree_var: &Ident,
-    iter_ctx: Option<&IterContext>,
-    dup_tracker: &mut DuplicateTracker,
-) -> Result<InlineMatchOutput> {
-    let op_ident = format_ident!("{}", op_name);
-
-    // Handle zero-argument case: match any op of this type
-    if args.is_empty() {
-        let match_code = quote! {
-            let svod_ir::Op::#op_ident { .. } = #tree_var.op() else {
-                return svod_ir::pattern::RewriteResult::NoMatch;
-            };
-        };
-        return Ok(InlineMatchOutput::simple(match_code, vec![]));
-    }
-
-    // Look up field names for this op
-    let field_names = get_child_field_names(op_name).ok_or_else(|| {
-        Error::new_spanned(
-            op,
-            format!(
-                "Op '{}' not found in OP_CHILD_FIELDS. Add it to the map or use struct syntax `{} {{ field: pattern }}`",
-                op_name, op_name
-            ),
-        )
-    })?;
-
-    // Validate argument count
-    if args.len() > field_names.len() {
-        return Err(Error::new_spanned(
-            op,
-            format!(
-                "{} has {} child fields ({:?}), but {} arguments were provided",
-                op_name,
-                field_names.len(),
-                field_names,
-                args.len()
-            ),
-        ));
-    }
-
-    // Generate temp variables for each field (unique based on tree_var)
-    let field_vars: Vec<Ident> =
-        field_names.iter().take(args.len()).map(|name| format_ident!("{}_{}", tree_var, name)).collect();
-
-    // Generate field bindings for the match pattern
-    let field_bindings: Vec<TokenStream2> = field_names
-        .iter()
-        .take(args.len())
-        .zip(&field_vars)
-        .map(|(name, var)| {
-            let field_ident = format_ident!("{}", name);
-            quote! { #field_ident: #var }
-        })
-        .collect();
-
-    // Generate the match code
-    let match_code = quote! {
-        let svod_ir::Op::#op_ident { #(#field_bindings,)* .. } = #tree_var.op() else {
-            return svod_ir::pattern::RewriteResult::NoMatch;
-        };
-    };
-
-    // Recursively match each child pattern and collect their orderings
-    let mut child_matches: Vec<(TokenStream2, InlineMatchOutput)> = Vec::new();
-    for (arg, var) in args.iter().zip(&field_vars) {
-        let child_match = generate_inline_match(arg, var, iter_ctx, dup_tracker)?;
-        child_matches.push((child_match.match_code.clone(), child_match));
-    }
-
-    // Compute cross-product of all children's orderings
-    let orderings = compute_ordering_cross_product(&child_matches);
-
-    Ok(InlineMatchOutput { match_code, orderings })
-}
-
-/// Compute cross-product of orderings from multiple children.
-/// Each child has a match_code and N orderings. We produce all combinations.
-fn compute_ordering_cross_product(children: &[(TokenStream2, InlineMatchOutput)]) -> Vec<Ordering> {
-    if children.is_empty() {
-        return vec![Ordering { child_match_code: quote! {}, bindings: vec![] }];
-    }
-
-    // Start with orderings from first child
-    let (first_code, first_match) = &children[0];
-    let mut result: Vec<Ordering> = first_match
-        .orderings
-        .iter()
-        .map(|ord| {
-            let child_code = &ord.child_match_code;
-            Ordering {
-                child_match_code: quote! {
-                    #first_code
-                    #child_code
-                },
-                bindings: ord.bindings.clone(),
-            }
-        })
-        .collect();
-
-    // Cross with each subsequent child
-    for (child_code, child_match) in children.iter().skip(1) {
-        let mut new_result = Vec::new();
-        for existing in &result {
-            for child_ord in &child_match.orderings {
-                let existing_code = &existing.child_match_code;
-                let child_child = &child_ord.child_match_code;
-                let mut bindings = existing.bindings.clone();
-                bindings.extend(child_ord.bindings.clone());
-                new_result.push(Ordering {
-                    child_match_code: quote! {
-                        #existing_code
-                        #child_code
-                        #child_child
-                    },
-                    bindings,
+            Pattern::Const(pat) => {
+                let value = format_ident!("{var}_cv");
+                self.bind_verbatim(pat);
+                self.code.push(quote! {
+                    let __Op::Const(#value) = #var.op() else { #fail };
+                    #[allow(irrefutable_let_patterns)]
+                    let #pat = #value.0 else { #fail };
                 });
             }
-        }
-        result = new_result;
-    }
-
-    result
-}
-
-/// Generate inline match for struct-style ops like Stage { compute: x, .. }
-fn generate_inline_op_struct_match(
-    op: &Ident,
-    fields: &[FieldPattern],
-    tree_var: &Ident,
-    dup_tracker: &mut DuplicateTracker,
-) -> Result<InlineMatchOutput> {
-    let op_name = op.to_string();
-    let op_ident = format_ident!("{}", op_name);
-
-    if fields.is_empty() {
-        return Err(Error::new_spanned(op, "Struct pattern must have at least one field"));
-    }
-
-    // Generate field extraction for all fields at once
-    let field_vars: Vec<Ident> = fields.iter().map(|f| format_ident!("{}_{}", tree_var, f.name)).collect();
-    let field_bindings: Vec<TokenStream2> = fields
-        .iter()
-        .zip(&field_vars)
-        .map(|(f, var)| {
-            let name = &f.name;
-            quote! { #name: #var }
-        })
-        .collect();
-
-    let match_code = quote! {
-        let svod_ir::Op::#op_ident { #(#field_bindings,)* .. } = #tree_var.op() else {
-            return svod_ir::pattern::RewriteResult::NoMatch;
-        };
-    };
-
-    // Collect matches for all fields
-    let mut child_matches: Vec<(TokenStream2, InlineMatchOutput)> = Vec::new();
-    for (field, var) in fields.iter().zip(&field_vars) {
-        let field_match = generate_inline_match(&field.pattern, var, None, dup_tracker)?;
-        child_matches.push((field_match.match_code.clone(), field_match));
-    }
-
-    // Compute cross-product of all fields' orderings
-    let orderings = compute_ordering_cross_product(&child_matches);
-
-    Ok(InlineMatchOutput { match_code, orderings })
-}
-
-/// Generate inline match for constant patterns.
-fn generate_inline_const_match(const_pat: &ConstPattern, tree_var: &Ident) -> Result<InlineMatchOutput> {
-    match const_pat {
-        ConstPattern::Any => {
-            let match_code = quote! {
-                let svod_ir::Op::Const(_) = #tree_var.op() else {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
-                };
-            };
-            let const_ident = Ident::new(binding_names::CONST, proc_macro2::Span::call_site());
-            Ok(InlineMatchOutput::simple(match_code, vec![(const_ident, quote! { #tree_var })]))
-        }
-
-        ConstPattern::Zero | ConstPattern::Int(0) => {
-            let match_code = quote! {
-                if !svod_ir::pattern::helpers::is_zero(#tree_var) {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
-                }
-            };
-            let zero_ident = Ident::new(binding_names::ZERO, proc_macro2::Span::call_site());
-            Ok(InlineMatchOutput::simple(match_code, vec![(zero_ident, quote! { #tree_var })]))
-        }
-
-        ConstPattern::One => {
-            let match_code = quote! {
-                if !svod_ir::pattern::helpers::is_one(#tree_var) {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
-                }
-            };
-            let one_ident = Ident::new(binding_names::ONE, proc_macro2::Span::call_site());
-            Ok(InlineMatchOutput::simple(match_code, vec![(one_ident, quote! { #tree_var })]))
-        }
-
-        ConstPattern::Int(value) => {
-            let match_code = quote! {
-                let svod_ir::Op::Const(cv) = #tree_var.op() else {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
-                };
-                if cv.0.try_int().map(|v| v == #value).unwrap_or(false) == false {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
-                }
-            };
-            Ok(InlineMatchOutput::simple(match_code, vec![]))
-        }
-
-        ConstPattern::Float(value) => {
-            let match_code = quote! {
-                let svod_ir::Op::Const(cv) = #tree_var.op() else {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
-                };
-                if cv.0.try_float().map(|v| (v - #value).abs() < 1e-10).unwrap_or(false) == false {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
-                }
-            };
-            Ok(InlineMatchOutput::simple(match_code, vec![]))
-        }
-    }
-}
-
-/// Generate inline match for op variable (in for-loop context).
-fn generate_inline_op_var_match(
-    var_name: &Ident,
-    args: &[Pattern],
-    tree_var: &Ident,
-    iter_ctx: Option<&IterContext>,
-    dup_tracker: &mut DuplicateTracker,
-) -> Result<InlineMatchOutput> {
-    let ctx = iter_ctx.ok_or_else(|| Error::new_spanned(var_name, "Operation variable used outside of for-block"))?;
-
-    if var_name != &ctx.var_name {
-        return Err(Error::new_spanned(
-            var_name,
-            format!("Unknown operation variable '{}', expected '{}'", var_name, ctx.var_name),
-        ));
-    }
-
-    let op_ident = &ctx.op_ident;
-
-    match ctx.op_kind {
-        OpKind::Unary => {
-            if args.len() != 1 {
-                return Err(Error::new_spanned(var_name, "Unary op variable requires 1 argument"));
+            Pattern::Zero => self.code.push(quote! { if !__helpers::is_zero(#var) { #fail } }),
+            Pattern::One => self.code.push(quote! { if !__helpers::is_one(#var) { #fail } }),
+            Pattern::ConstValue { uop, value } => {
+                let cv = format_ident!("{var}_cv");
+                self.code.push(quote! { let __Op::Const(#cv) = #var.op() else { #fail }; });
+                self.bind(value, quote! { #cv.0 }, Equality::Value);
+                self.bind_node(uop, var);
             }
-            let src_var = format_ident!("__src");
-            let match_code = quote! {
-                let svod_ir::Op::Unary(svod_ir::UnaryOp::#op_ident, #src_var) = #tree_var.op() else {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
-                };
-            };
-
-            let src_match = generate_inline_match(&args[0], &src_var, iter_ctx, dup_tracker)?;
-            let src_code = &src_match.match_code;
-
-            // Propagate all orderings from child
-            let orderings = src_match
-                .orderings
-                .into_iter()
-                .map(|ord| {
-                    let ord_child = &ord.child_match_code;
-                    Ordering {
-                        child_match_code: quote! {
-                            #src_code
-                            #ord_child
-                        },
-                        bindings: ord.bindings,
+            Pattern::VConst { uop, values } => {
+                let vals = format_ident!("{var}_values");
+                self.code.push(quote! {
+                    let __Op::VConst(__ops::VConst { values: #vals }) = #var.op() else { #fail };
+                });
+                self.bind(values, quote! { #vals.clone() }, Equality::Value);
+                self.bind_node(uop, var);
+            }
+            Pattern::AnyConst { uop, values } => {
+                let lanes = quote! {
+                    match #var.op() {
+                        __Op::Const(cv) => vec![cv.0],
+                        __Op::VConst(__ops::VConst { values }) => values.clone(),
+                        _ => { #fail }
                     }
-                })
-                .collect();
-
-            Ok(InlineMatchOutput { match_code, orderings })
-        }
-
-        OpKind::Binary => {
-            if args.len() != 2 {
-                return Err(Error::new_spanned(var_name, "Binary op variable requires 2 arguments"));
-            }
-            let left_var = format_ident!("__left");
-            let right_var = format_ident!("__right");
-            let match_code = quote! {
-                let svod_ir::Op::Binary(svod_ir::BinaryOp::#op_ident, #left_var, #right_var) = #tree_var.op() else {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
                 };
-            };
-
-            let left_match = generate_inline_match(&args[0], &left_var, iter_ctx, dup_tracker)?;
-            let right_match = generate_inline_match(&args[1], &right_var, iter_ctx, dup_tracker)?;
-
-            let left_code = &left_match.match_code;
-            let right_code = &right_match.match_code;
-
-            // Cross-product orderings from children
-            let orderings: Vec<Ordering> = left_match
-                .orderings
-                .iter()
-                .flat_map(|left_ord| {
-                    let left_child = &left_ord.child_match_code;
-                    right_match.orderings.iter().map(move |right_ord| {
-                        let right_child = &right_ord.child_match_code;
-                        let mut bindings = left_ord.bindings.clone();
-                        bindings.extend(right_ord.bindings.clone());
-                        Ordering {
-                            child_match_code: quote! {
-                                #left_code
-                                #left_child
-                                #right_code
-                                #right_child
-                            },
-                            bindings,
-                        }
-                    })
-                })
-                .collect();
-
-            Ok(InlineMatchOutput { match_code, orderings })
-        }
-
-        OpKind::Ternary => {
-            if args.len() != 3 {
-                return Err(Error::new_spanned(var_name, "Ternary op variable requires 3 arguments"));
+                self.bind(values, lanes, Equality::Value);
+                self.bind_node(uop, var);
             }
-            let a_var = format_ident!("__a");
-            let b_var = format_ident!("__b");
-            let c_var = format_ident!("__c");
-            let match_code = quote! {
-                let svod_ir::Op::Ternary(svod_ir::TernaryOp::#op_ident, #a_var, #b_var, #c_var) = #tree_var.op() else {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
-                };
-            };
-
-            let a_match = generate_inline_match(&args[0], &a_var, iter_ctx, dup_tracker)?;
-            let b_match = generate_inline_match(&args[1], &b_var, iter_ctx, dup_tracker)?;
-            let c_match = generate_inline_match(&args[2], &c_var, iter_ctx, dup_tracker)?;
-
-            let a_code = &a_match.match_code;
-            let b_code = &b_match.match_code;
-            let c_code = &c_match.match_code;
-
-            // Cross-product of all three children's orderings using explicit loops
-            let mut orderings = Vec::new();
-            for a_ord in &a_match.orderings {
-                let a_child = &a_ord.child_match_code;
-                for b_ord in &b_match.orderings {
-                    let b_child = &b_ord.child_match_code;
-                    for c_ord in &c_match.orderings {
-                        let c_child = &c_ord.child_match_code;
-                        let mut bindings = a_ord.bindings.clone();
-                        bindings.extend(b_ord.bindings.clone());
-                        bindings.extend(c_ord.bindings.clone());
-                        orderings.push(Ordering {
-                            child_match_code: quote! {
-                                #a_code
-                                #a_child
-                                #b_code
-                                #b_child
-                                #c_code
-                                #c_child
-                            },
-                            bindings,
-                        });
-                    }
-                }
+            Pattern::Some(inner) => {
+                let some = format_ident!("{var}_some");
+                self.code.push(self.unwrap_or_fail(quote! { #some }, quote! { #var.as_ref() }));
+                self.emit(inner, &some)?;
             }
+        }
+        Ok(())
+    }
 
-            Ok(InlineMatchOutput { match_code, orderings })
+    /// Register the names a verbatim Rust pattern binds, so they reach the rewrite body
+    /// through an ordering tuple and clash with DSL bindings instead of shadowing them.
+    /// Every bare capitalized identifier is first referenced as a value, so one that
+    /// resolves to nothing is an error instead of an irrefutable binding.
+    fn bind_verbatim(&mut self, pat: &Pat) {
+        let mut names = VerbatimNames::default();
+        verbatim_names(pat, &mut names);
+        self.code.extend(names.paths.iter().map(|path| quote_spanned! {path.span()=> let _ = &#path; }));
+        for name in names.bindings {
+            self.dup.seen.insert(name.to_string());
+            self.bound.push(name);
         }
     }
 }
 
-/// Generate inline match for alternative patterns (A | B | C).
-///
-/// Supports two cases:
-/// 1. Simple identifier alternatives in struct fields (e.g., `reduce_op: Add | Mul`)
-///    - All alternatives must be `Pattern::Var` (identifiers)
-///    - Generates `matches!(field, Enum::A | Enum::B)` check
-///    - Enum type is inferred from the tree_var name (e.g., `__tree_reduce_op` → `ReduceOp`)
-///    - Binds the field value as a closure parameter (e.g., `reduce_op`)
-///
-/// 2. Top-level alternatives are handled by `generate_simplified_alternatives_rule`
-fn generate_inline_alternatives_match(
-    alternatives: &[Pattern],
-    tree_var: &Ident,
-    _iter_ctx: Option<&IterContext>,
-    dup_tracker: &mut DuplicateTracker,
-) -> Result<InlineMatchOutput> {
-    // Check if all alternatives are simple Var patterns (enum discriminants)
-    let variant_names: Vec<&Ident> = alternatives
-        .iter()
-        .map(|p| match p {
-            Pattern::Var(ident) => Ok(ident),
-            _ => Err(Error::new(
-                proc_macro2::Span::call_site(),
-                "Nested alternatives must be simple identifiers (e.g., Add | Mul). Complex patterns in alternatives are not yet supported.",
-            )),
-        })
-        .collect::<Result<Vec<_>>>()?;
+/// The expression naming an ALU op: a path into `alu`, or the for-block variable.
+fn op_expr(op: &OpRef) -> TokenStream2 {
+    match op {
+        OpRef::Named(ident) => quote! { __alu::#ident },
+        OpRef::Var(ident) => quote! { #ident },
+    }
+}
 
-    // Infer enum type and field name from tree_var name (e.g., `__tree_reduce_op` → `ReduceOp`, `reduce_op`)
-    // Convention: field names like `reduce_op`, `unary_op`, `binary_op` map to their enum types
-    let tree_var_str = tree_var.to_string();
-    let (enum_type, field_name) = if tree_var_str.ends_with("_reduce_op") || tree_var_str == "reduce_op" {
-        (quote! { svod_ir::ReduceOp }, "reduce_op")
-    } else if tree_var_str.ends_with("_unary_op") || tree_var_str == "unary_op" {
-        (quote! { svod_ir::UnaryOp }, "unary_op")
-    } else if tree_var_str.ends_with("_binary_op") || tree_var_str == "binary_op" {
-        (quote! { svod_ir::BinaryOp }, "binary_op")
-    } else if tree_var_str.ends_with("_ternary_op") || tree_var_str == "ternary_op" {
-        (quote! { svod_ir::TernaryOp }, "ternary_op")
-    } else {
-        return Err(Error::new(
-            proc_macro2::Span::call_site(),
-            format!(
-                "Cannot infer enum type for field '{}'. Nested alternatives are only supported for known discriminant fields (reduce_op, unary_op, binary_op, ternary_op).",
-                tree_var_str
-            ),
-        ));
-    };
+fn op_span(op: &OpRef) -> Span {
+    match op {
+        OpRef::Named(ident) | OpRef::Var(ident) => ident.span(),
+    }
+}
 
-    // Generate matches! check: matches!(field_var, Enum::A | Enum::B | ...)
-    let variant_patterns: Vec<TokenStream2> = variant_names.iter().map(|name| quote! { #enum_type::#name }).collect();
+/// The identifiers of a verbatim Rust pattern: the ones that bind, and the bare
+/// capitalized ones that must resolve to a unit variant, unit struct or const.
+#[derive(Default)]
+struct VerbatimNames {
+    bindings: Vec<Ident>,
+    paths: Vec<Ident>,
+}
 
-    let match_code = quote! {
-        if !matches!(#tree_var, #(#variant_patterns)|*) {
-            return svod_ir::pattern::RewriteResult::NoMatch;
+/// Identifiers named by a Rust pattern; `Pat::Or` branches bind the same set.
+fn verbatim_names(pat: &Pat, out: &mut VerbatimNames) {
+    match pat {
+        Pat::Ident(ident) => {
+            let name = &ident.ident;
+            let explicit = ident.by_ref.is_some() || ident.mutability.is_some() || ident.subpat.is_some();
+            if explicit || is_lowercase(name) {
+                out.bindings.push(name.clone());
+            } else if name != "None" {
+                // The prelude's generic unit variant has no inferable type as a value.
+                out.paths.push(name.clone());
+            }
+            if let Some((_, sub)) = &ident.subpat {
+                verbatim_names(sub, out);
+            }
         }
-    };
-
-    // Create binding for the field (e.g., reduce_op → &ReduceOp)
-    let actual_name = dup_tracker.process_name(field_name);
-    let binding_ident = Ident::new(&actual_name, proc_macro2::Span::call_site());
-
-    Ok(InlineMatchOutput::simple(match_code, vec![(binding_ident, quote! { #tree_var })]))
+        Pat::Or(or) => {
+            if let Some(first) = or.cases.first() {
+                verbatim_names(first, out);
+            }
+        }
+        Pat::Paren(paren) => verbatim_names(&paren.pat, out),
+        Pat::Reference(reference) => verbatim_names(&reference.pat, out),
+        Pat::Type(typed) => verbatim_names(&typed.pat, out),
+        Pat::Tuple(tuple) => tuple.elems.iter().for_each(|p| verbatim_names(p, out)),
+        Pat::TupleStruct(tuple) => tuple.elems.iter().for_each(|p| verbatim_names(p, out)),
+        Pat::Slice(slice) => slice.elems.iter().for_each(|p| verbatim_names(p, out)),
+        Pat::Struct(strukt) => strukt.fields.iter().for_each(|f| verbatim_names(&f.pat, out)),
+        _ => {}
+    }
 }
 
-/// Generate inline match for commutative patterns [x, y].
-///
-/// For commutative patterns like `Add[Mul[a, b], c]`, we generate ALL possible orderings:
-/// - Outer Add: 2 orderings (left, right) and (right, left)
-/// - Inner Mul: 2 orderings (a, b) and (b, a)
-/// - Total: 2 × 2 = 4 orderings to try
-///
-/// This is computed as a cross-product of the outer ordering with all children's orderings.
-fn generate_inline_commutative_match(
-    op: &Ident,
-    args: &[Pattern],
-    tree_var: &Ident,
-    iter_ctx: Option<&IterContext>,
-    dup_tracker: &mut DuplicateTracker,
-) -> Result<InlineMatchOutput> {
-    let op_name = op.to_string();
-
-    if args.len() != 2 {
-        return Err(Error::new_spanned(op, "Commutative pattern requires exactly 2 arguments"));
-    }
-
-    if !BINARY_OPS.contains(&op_name.as_str()) {
-        return Err(Error::new_spanned(op, format!("Commutative pattern requires binary op, got: {}", op_name)));
-    }
-
-    let binary_op = format_ident!("{}", op_name);
-    // Use unique names based on tree_var to avoid shadowing in nested commutative patterns
-    let left_var = format_ident!("{}_left", tree_var);
-    let right_var = format_ident!("{}_right", tree_var);
-
-    // Generate ONLY the outer op match (shared across all orderings)
-    let match_code = quote! {
-        let svod_ir::Op::Binary(svod_ir::BinaryOp::#binary_op, #left_var, #right_var) = #tree_var.op() else {
-            return svod_ir::pattern::RewriteResult::NoMatch;
-        };
-    };
-
-    // Clone the tracker BEFORE processing either ordering.
-    // Both orderings need independent duplicate detection, and both should start
-    // from the same initial state (variables seen by parent patterns).
-    let mut dup_tracker_swapped = dup_tracker.clone();
-
-    // Generate matches for normal ordering: args[0] matches left, args[1] matches right
-    let left_match = generate_inline_match(&args[0], &left_var, iter_ctx, dup_tracker)?;
-    let right_match = generate_inline_match(&args[1], &right_var, iter_ctx, dup_tracker)?;
-
-    let left_code = &left_match.match_code;
-    let right_code = &right_match.match_code;
-
-    // Cross-product all orderings for normal outer ordering: left × right
-    let normal_orderings: Vec<Ordering> = left_match
-        .orderings
-        .iter()
-        .flat_map(|left_ord| {
-            let left_child = &left_ord.child_match_code;
-            right_match.orderings.iter().map(move |right_ord| {
-                let right_child = &right_ord.child_match_code;
-                let mut bindings = left_ord.bindings.clone();
-                bindings.extend(right_ord.bindings.clone());
-                Ordering {
-                    child_match_code: quote! {
-                        #left_code
-                        #left_child
-                        #right_code
-                        #right_child
-                    },
-                    bindings,
-                }
-            })
-        })
-        .collect();
-
-    // Generate matches for swapped ordering: args[0] matches right, args[1] matches left
-    let left_match_swap = generate_inline_match(&args[0], &right_var, iter_ctx, &mut dup_tracker_swapped)?;
-    let right_match_swap = generate_inline_match(&args[1], &left_var, iter_ctx, &mut dup_tracker_swapped)?;
-
-    let left_code_swap = &left_match_swap.match_code;
-    let right_code_swap = &right_match_swap.match_code;
-
-    // Cross-product all orderings for swapped outer ordering: left_swap × right_swap
-    let swapped_orderings: Vec<Ordering> = left_match_swap
-        .orderings
-        .iter()
-        .flat_map(|left_ord| {
-            let left_child = &left_ord.child_match_code;
-            right_match_swap.orderings.iter().map(move |right_ord| {
-                let right_child = &right_ord.child_match_code;
-                let mut bindings = left_ord.bindings.clone();
-                bindings.extend(right_ord.bindings.clone());
-                Ordering {
-                    child_match_code: quote! {
-                        #left_code_swap
-                        #left_child
-                        #right_code_swap
-                        #right_child
-                    },
-                    bindings,
-                }
-            })
-        })
-        .collect();
-
-    // Combine all orderings: normal + swapped
-    let mut all_orderings = normal_orderings;
-    all_orderings.extend(swapped_orderings);
-
-    Ok(InlineMatchOutput { match_code, orderings: all_orderings })
+/// An `OpKey` expression: `name` identifies it for merging match arms, `constant` says
+/// whether it can seed a `const`.
+#[derive(Clone)]
+struct Key {
+    name: String,
+    expr: TokenStream2,
+    constant: bool,
 }
 
-// =============================================================================
-// Simplified Rule Generation
-// =============================================================================
+impl Key {
+    fn named(name: &Ident) -> Self {
+        Self { name: name.to_string(), expr: quote! { __keys::OpKey::#name }, constant: true }
+    }
 
-/// Generate a rule for alternative patterns (A | B | C) at the top level.
-///
-/// For each alternative, we generate a separate attempt block. The first
-/// alternative that matches will execute and return the rewrite result.
-fn generate_simplified_alternatives_rule(
-    alternatives: &[Pattern],
-    rule: &PatternRule,
-    iter_ctx: Option<&IterContext>,
-    has_context: bool,
-) -> Result<TokenStream2> {
-    let tree_var = format_ident!("__tree");
+    fn alu(ident: &Ident) -> Self {
+        Self { name: ident.to_string(), expr: quote! { __alu::#ident.op_key() }, constant: true }
+    }
 
-    // Collect OpKeys from all alternatives
-    let op_keys = compute_op_keys(&rule.lhs, iter_ctx);
-    let early_reject = compute_early_reject_keys(&rule.lhs, iter_ctx);
+    fn mask(&self) -> TokenStream2 {
+        let (op_mask, expr) = (op_mask(), &self.expr);
+        quote! { #op_mask::of_key(&#expr) }
+    }
+}
 
-    // Generate attempt blocks for each alternative
-    // Each alternative is wrapped in an inner closure so that `return NoMatch`
-    // only returns from that alternative's attempt, not the entire pattern closure.
-    let mut alt_blocks = Vec::new();
+/// What a pattern's root can be dispatched under.
+enum Roots<'a> {
+    Any,
+    /// The ops of a for-block, bound to its variable at runtime.
+    Block(Iter<'a>),
+    Keys(Vec<Key>),
+}
 
-    for alt in alternatives {
-        let mut dup_tracker = DuplicateTracker::default();
-        let alt_match = generate_inline_match(alt, &tree_var, iter_ctx, &mut dup_tracker)?;
+fn roots<'a>(pattern: &Pattern, iter: Option<Iter<'a>>) -> Roots<'a> {
+    match pattern {
+        Pattern::Wildcard | Pattern::Var(_) => Roots::Any,
+        Pattern::Binding { pattern, .. } | Pattern::Some(pattern) => roots(pattern, iter),
+        Pattern::Unit(op) | Pattern::Struct { op, .. } => Roots::Keys(vec![Key::named(op)]),
+        Pattern::Alu { op: OpRef::Named(op), .. } => Roots::Keys(vec![Key::alu(op)]),
+        Pattern::Alu { op: OpRef::Var(var), .. } => match iter {
+            Some(iter) if iter.var == var => Roots::Block(iter),
+            _ => Roots::Keys(vec![Key { name: var.to_string(), expr: quote! { #var.op_key() }, constant: false }]),
+        },
+        Pattern::Const(_) | Pattern::Zero | Pattern::One | Pattern::ConstValue { .. } => {
+            Roots::Keys(vec![Key::named(&format_ident!("Const"))])
+        }
+        Pattern::VConst { .. } => Roots::Keys(vec![Key::named(&format_ident!("VConst"))]),
+        Pattern::AnyConst { .. } => {
+            Roots::Keys(vec![Key::named(&format_ident!("Const")), Key::named(&format_ident!("VConst"))])
+        }
+    }
+}
 
-        let match_code = &alt_match.match_code;
-
-        // Generate ptr_eq checks for duplicates (return NoMatch from inner closure)
-        let duplicate_pairs = dup_tracker.get_duplicates();
-        let ptr_eq_checks: Vec<TokenStream2> = duplicate_pairs
+/// Op kinds the root demands of its direct children: the fixed-position sources that pin
+/// exactly one kind (Tinygrad's `UPat.early_reject`, uop/ops.py:1390).
+fn early_reject_keys(pattern: &Pattern, iter: Option<Iter<'_>>) -> Vec<Key> {
+    let sources: Vec<&Pattern> = match pattern {
+        Pattern::Binding { pattern, .. } => return early_reject_keys(pattern, iter),
+        Pattern::Alu { args, .. } => args.iter().collect(),
+        Pattern::Struct { fields, .. } => fields
             .iter()
-            .map(|(orig, dup)| {
-                let orig_ident = format_ident!("{}", orig);
-                let dup_ident = format_ident!("{}", dup);
-                quote! {
-                    if !std::sync::Arc::ptr_eq(#orig_ident, #dup_ident) {
-                        return svod_ir::pattern::RewriteResult::NoMatch;
-                    }
-                }
+            .filter_map(|field| match &field.pattern {
+                FieldPat::Child(pattern) => Some(pattern),
+                FieldPat::Verbatim(_) => None,
             })
-            .collect();
-
-        // Generate rewrite expression (same for all alternatives)
-        let rewrite_expr = generate_simplified_rewrite_expr(&rule.rhs, &rule.guard, rule.arrow);
-
-        // For each alternative, try all its orderings (handles nested commutative)
-        for ord in &alt_match.orderings {
-            let child_code = &ord.child_match_code;
-            let binding_stmts: Vec<TokenStream2> =
-                ord.bindings.iter().map(|(name, expr)| quote! { let #name = #expr; }).collect();
-
-            // Wrap alternative in a closure so `return NoMatch` only exits this attempt
-            alt_blocks.push(quote! {
-                {
-                    let __try_result = (|| {
-                        #match_code
-                        #child_code
-                        #(#binding_stmts)*
-                        #(#ptr_eq_checks)*
-                        #rewrite_expr
-                    })();
-                    if !matches!(__try_result, svod_ir::pattern::RewriteResult::NoMatch) {
-                        return __try_result;
-                    }
-                }
-            });
-        }
-    }
-
-    // Generate context parameter
-    let ctx_param = if has_context {
-        quote! { ctx: &mut _ }
-    } else {
-        quote! { _ctx: &mut () }
+            .collect(),
+        _ => Vec::new(),
     };
-
-    if op_keys.is_empty() {
-        Ok(quote! {
-            __matcher.add_wildcard(
-                |#tree_var: &std::sync::Arc<svod_ir::UOp>, #ctx_param| {
-                    #(#alt_blocks)*
-                    svod_ir::pattern::RewriteResult::NoMatch
-                }
-            );
+    let mut seen = HashSet::new();
+    sources
+        .into_iter()
+        .filter_map(|source| match roots(source, iter) {
+            Roots::Keys(keys) if keys.len() == 1 => keys.into_iter().next(),
+            _ => None,
         })
-    } else {
-        Ok(quote! {
-            __matcher.add_rejecting(
-                &[#(#op_keys),*],
-                &[#(#early_reject),*],
-                |#tree_var: &std::sync::Arc<svod_ir::UOp>, #ctx_param| {
-                    #(#alt_blocks)*
-                    svod_ir::pattern::RewriteResult::NoMatch
-                }
-            );
-        })
-    }
+        .filter(|key| seen.insert(key.name.clone()))
+        .collect()
 }
 
-/// Generate a rule for SimplifiedPatternMatcher with inline matching.
-fn generate_simplified_rule(
-    rule: &PatternRule,
-    iter_ctx: Option<&IterContext>,
-    has_context: bool,
+/// Union of the keys' masks as a single expression.
+fn union_mask(keys: &[Key]) -> TokenStream2 {
+    let mut masks = keys.iter().map(Key::mask);
+    let first = masks.next().unwrap_or_else(|| quote! { __OpMask::EMPTY });
+    masks.fold(first, |acc, mask| quote! { #acc.union(#mask) })
+}
+
+/// Nested candidate loops for the permutation sites, innermost running `tail`.
+///
+/// A site's two orderings become lazy candidates yielding the bindings they make plus
+/// uniformly named handles to the commutative nodes found inside them, so each nested
+/// site is emitted once and iterated in its own loop rather than once per outer
+/// ordering. Enumeration order is outer-ordering-major, nested sites before later
+/// siblings — the same order as enumerating every full ordering up front.
+fn permutation_loops(
+    sites: Vec<PermuteSite>,
+    dup: DuplicateTracker,
+    depth: usize,
+    tail: &dyn Fn(&DuplicateTracker) -> TokenStream2,
 ) -> Result<TokenStream2> {
-    // Check for alternative patterns at the top level - handle specially
-    if let Pattern::Any(alternatives) = &rule.lhs {
-        return generate_simplified_alternatives_rule(alternatives, rule, iter_ctx, has_context);
-    }
-
-    // Compute OpKeys for dispatch and the child op kinds that gate the closure.
-    let op_keys = compute_op_keys(&rule.lhs, iter_ctx);
-    let early_reject = compute_early_reject_keys(&rule.lhs, iter_ctx);
-    let tree_var = format_ident!("__tree");
-
-    // Generate inline match
-    let mut dup_tracker = DuplicateTracker::default();
-    let match_output = generate_inline_match(&rule.lhs, &tree_var, iter_ctx, &mut dup_tracker)?;
-
-    // Get duplicate pairs for ptr_eq generation
-    let duplicate_pairs: Vec<(String, String)> = dup_tracker.get_duplicates().to_vec();
-
-    // Generate ptr_eq checks for duplicates
-    let ptr_eq_checks: Vec<TokenStream2> = duplicate_pairs
-        .iter()
-        .map(|(orig, dup)| {
-            let orig_ident = format_ident!("{}", orig);
-            let dup_ident = format_ident!("{}", dup);
-            quote! {
-                if !std::sync::Arc::ptr_eq(#orig_ident, #dup_ident) {
-                    return svod_ir::pattern::RewriteResult::NoMatch;
-                }
-            }
-        })
-        .collect();
-
-    // Add operation variable binding if in iteration context
-    let op_var_binding = if let Some(ctx) = iter_ctx {
-        let var_name = &ctx.var_name;
-        let op_ident = &ctx.op_ident;
-        match ctx.op_kind {
-            OpKind::Unary => Some(quote! { let #var_name = svod_ir::UnaryOp::#op_ident; }),
-            OpKind::Binary => Some(quote! { let #var_name = svod_ir::BinaryOp::#op_ident; }),
-            OpKind::Ternary => Some(quote! { let #var_name = svod_ir::TernaryOp::#op_ident; }),
-        }
-    } else {
-        None
-    };
-
-    // Validate closure params if RHS is a closure (use bindings from first ordering)
-    if let RewriteExpr::Closure(closure) = &rule.rhs {
-        let analysis = extract_closure_params(closure)?;
-        let var_names: Vec<Ident> = match_output.bindings().iter().map(|(n, _)| n.clone()).collect();
-        validate_closure_params(&analysis, &var_names, has_context)?;
-    }
-
-    // Generate rewrite expression
-    let rewrite_expr = generate_simplified_rewrite_expr(&rule.rhs, &rule.guard, rule.arrow);
-
-    let match_code = &match_output.match_code;
-
-    // Handle patterns with multiple orderings (commutative patterns)
-    let body = if match_output.orderings.len() > 1 {
-        // Multiple orderings - wrap each in closure, try in sequence
-        let num_orderings = match_output.orderings.len();
-        let try_blocks: Vec<TokenStream2> = match_output
-            .orderings
+    let Some((site, rest)) = sites.split_first() else { return Ok(tail(&dup)) };
+    let mut candidates = Vec::new();
+    let mut inner: Option<(Vec<Ident>, Vec<PermuteSite>, DuplicateTracker)> = None;
+    for (first, second) in [(&site.left, &site.right), (&site.right, &site.left)] {
+        let mut emitter = Emitter::new(None, dup.clone());
+        emitter.emit(&site.args[0], first)?;
+        emitter.emit(&site.args[1], second)?;
+        let nested: Vec<PermuteSite> = emitter
+            .permutes
             .iter()
             .enumerate()
-            .map(|(i, ord)| {
-                let binding_stmts: Vec<TokenStream2> =
-                    ord.bindings.iter().map(|(name, expr)| quote! { let #name = #expr; }).collect();
-                let child_match = &ord.child_match_code;
-                let is_last = i == num_orderings - 1;
-
-                if is_last {
-                    // Last ordering: no closure wrapper
-                    quote! {
-                        #child_match
-                        #(#binding_stmts)*
-                        #(#ptr_eq_checks)*
-                        #rewrite_expr
-                    }
-                } else {
-                    // Non-last: wrap in closure so return NoMatch only exits this attempt
-                    quote! {
-                        let __result = (|| {
-                            #child_match
-                            #(#binding_stmts)*
-                            #(#ptr_eq_checks)*
-                            #rewrite_expr
-                        })();
-                        if !matches!(__result, svod_ir::pattern::RewriteResult::NoMatch) {
-                            return __result;
-                        }
-                    }
-                }
+            .map(|(j, nested)| PermuteSite {
+                left: format_ident!("__site{depth}_{j}_l"),
+                right: format_ident!("__site{depth}_{j}_r"),
+                args: nested.args.clone(),
             })
             .collect();
-
-        quote! {
-            #match_code
-            #op_var_binding
-            #(#try_blocks)*
-        }
-    } else {
-        // Single ordering - simple case
-        let ord = &match_output.orderings[0];
-        let binding_stmts: Vec<TokenStream2> =
-            ord.bindings.iter().map(|(name, expr)| quote! { let #name = #expr; }).collect();
-        let child_match = &ord.child_match_code;
-        quote! {
-            #match_code
-            #op_var_binding
-            #child_match
-            #(#binding_stmts)*
-            #(#ptr_eq_checks)*
-            #rewrite_expr
-        }
-    };
-
-    // Generate the closure with appropriate context parameter
-    let ctx_param = if has_context {
-        quote! { ctx: &mut _ }
-    } else {
-        quote! { _ctx: &mut () }
-    };
-
-    if op_keys.is_empty() {
-        // Wildcard pattern
-        Ok(quote! {
-            __matcher.add_wildcard(
-                move |#tree_var: &std::sync::Arc<svod_ir::UOp>, #ctx_param| {
-                    #body
-                }
-            );
-        })
-    } else {
-        Ok(quote! {
-            __matcher.add_rejecting(
-                &[#(#op_keys),*],
-                &[#(#early_reject),*],
-                move |#tree_var: &std::sync::Arc<svod_ir::UOp>, #ctx_param| {
-                    #body
-                }
-            );
-        })
+        let handles = emitter.permutes.iter().zip(&nested).map(|(found, uniform)| {
+            let (l, r, ul, ur) = (&found.left, &found.right, &uniform.left, &uniform.right);
+            quote! { let #ul = #l; let #ur = #r; }
+        });
+        let mut yielded = emitter.bound.clone();
+        yielded.extend(nested.iter().flat_map(|site| [site.left.clone(), site.right.clone()]));
+        let code = &emitter.code;
+        candidates.push(quote! { __once_with(|| { #(#code)* #(#handles)* Some((#(#yielded,)*)) }) });
+        inner.get_or_insert((yielded, nested, emitter.dup));
     }
-}
-
-/// Generate rewrite expression for simplified matcher.
-fn generate_simplified_rewrite_expr(rhs: &RewriteExpr, guard: &Option<syn::Expr>, arrow: ArrowKind) -> TokenStream2 {
-    let rhs_expr = match rhs {
-        RewriteExpr::Var(name) => quote! { std::sync::Arc::clone(#name) },
-        RewriteExpr::Expr(expr) => quote! { #expr },
-        RewriteExpr::Block(block) => quote! { #block },
-        RewriteExpr::Closure(closure) => {
-            let body = &closure.body;
-            quote! { #body }
-        }
-    };
-
-    match arrow {
-        ArrowKind::Infallible => {
-            if let Some(guard_expr) = guard {
-                quote! {
-                    if #guard_expr {
-                        svod_ir::pattern::RewriteResult::Rewritten(#rhs_expr)
-                    } else {
-                        svod_ir::pattern::RewriteResult::NoMatch
-                    }
-                }
-            } else {
-                quote! {
-                    svod_ir::pattern::RewriteResult::Rewritten(#rhs_expr)
-                }
-            }
-        }
-        ArrowKind::Fallible => {
-            let wrapped = match rhs {
-                RewriteExpr::Var(name) => quote! { Some(std::sync::Arc::clone(#name)) },
-                RewriteExpr::Expr(expr) => quote! { (|| #expr)() },
-                RewriteExpr::Block(block) => quote! { (|| #block)() },
-                RewriteExpr::Closure(closure) => {
-                    let body = &closure.body;
-                    quote! { (|| #body)() }
-                }
-            };
-
-            let conversion = quote! {
-                match #wrapped {
-                    Some(__v) => svod_ir::pattern::RewriteResult::Rewritten(__v),
-                    None => svod_ir::pattern::RewriteResult::NoMatch,
-                }
-            };
-
-            if let Some(guard_expr) = guard {
-                quote! {
-                    if #guard_expr {
-                        #conversion
-                    } else {
-                        svod_ir::pattern::RewriteResult::NoMatch
-                    }
-                }
-            } else {
-                conversion
-            }
-        }
-    }
-}
-
-/// Generate a SimplifiedPatternMatcher from the parsed pattern list.
-pub fn generate_simplified_pattern_matcher(patterns: &PatternList) -> Result<TokenStream2> {
-    let mut pattern_exprs = Vec::new();
-    let has_context = patterns.context_type.is_some();
-
-    // Collect all op names for compile-time validation
-    let op_names = collect_op_names(patterns);
-    let validation_code = generate_op_validation(&op_names);
-
-    for item in &patterns.items {
-        match item {
-            PatternItem::Rule(rule) => {
-                pattern_exprs.push(generate_simplified_rule(rule, None, has_context)?);
-            }
-            PatternItem::ForBlock(for_block) => {
-                let expanded = expand_simplified_for_block(for_block, has_context)?;
-                pattern_exprs.extend(expanded);
-            }
-        }
-    }
-
-    // Generate code based on whether context type is declared
-    if let Some(ref ctx_type) = patterns.context_type {
-        Ok(quote! {
-            {
-                #validation_code
-                let mut __matcher = svod_ir::pattern::SimplifiedPatternMatcher::<#ctx_type>::new();
-                #(#pattern_exprs)*
-                __matcher
-            }
-        })
-    } else {
-        Ok(quote! {
-            {
-                #validation_code
-                let mut __matcher = svod_ir::pattern::SimplifiedPatternMatcher::<()>::new();
-                #(#pattern_exprs)*
-                __matcher
-            }
-        })
-    }
-}
-
-/// Generate a `&'static SimplifiedPatternMatcher` cached in a `LazyLock`.
-///
-/// Wraps the output of `generate_simplified_pattern_matcher` in a `std::sync::LazyLock`
-/// static, so the matcher is constructed only once (on first use) and reused thereafter.
-pub fn generate_cached_pattern_matcher(patterns: &PatternList) -> Result<TokenStream2> {
-    let inner = generate_simplified_pattern_matcher(patterns)?;
-    let ctx_type = patterns.context_type.as_ref().map(|t| quote! { #t }).unwrap_or_else(|| quote! { () });
-
+    let (names, mut inner_sites, inner_dup) = inner.expect("two orderings");
+    inner_sites.extend(rest.iter().cloned());
+    let body = permutation_loops(inner_sites, inner_dup, depth + 1, tail)?;
+    let chain = candidates.into_iter().reduce(|acc, next| quote! { #acc.chain(#next) }).expect("two orderings");
+    let orderings = format_ident!("__orderings{depth}");
     Ok(quote! {
-        {
-            use std::sync::LazyLock;
-            static __CACHED: LazyLock<
-                svod_ir::pattern::SimplifiedPatternMatcher<#ctx_type>
-            > = LazyLock::new(|| #inner);
-            &*__CACHED
+        let #orderings = #chain.flatten();
+        for (#(#names,)*) in #orderings {
+            #body
         }
     })
 }
 
-/// Expand a for-block for simplified matcher.
-fn expand_simplified_for_block(for_block: &ForBlock, has_context: bool) -> Result<Vec<TokenStream2>> {
-    let var_name = &for_block.var;
-    let mut results = Vec::new();
+fn rewrite_expr(rhs: &RewriteExpr) -> TokenStream2 {
+    let body = match rhs {
+        RewriteExpr::Var(name) => quote! { std::sync::Arc::clone(#name) },
+        RewriteExpr::Expr(expr) => quote! { #expr },
+    };
+    quote! { __Into::into_rewrite_result((|| #body)()) }
+}
 
-    // Resolve ops and kind - handle both explicit lists and wildcards
-    let (ops, kind): (Vec<Ident>, OpKind) = match &for_block.iter_kind {
-        IterKind::Unary(ops) => (ops.clone(), OpKind::Unary),
-        IterKind::Binary(ops) => (ops.clone(), OpKind::Binary),
-        IterKind::Ternary(ops) => (ops.clone(), OpKind::Ternary),
-        // Expand wildcards to full op lists
-        IterKind::UnaryAll => {
-            let ops = UNARY_OPS.iter().map(|s| format_ident!("{}", s)).collect();
-            (ops, OpKind::Unary)
+/// Where a compiled rule goes in the block's dispatch sequence.
+enum Placement {
+    /// Inside the `match` arm of one constant key.
+    Keyed(Key),
+    /// A sequential step that decides applicability itself.
+    Step,
+}
+
+struct CompiledRule {
+    placement: Placement,
+    /// The rule's code, a labeled block that either returns a result or falls through.
+    code: TokenStream2,
+    /// `const` items the code refers to, by name so blocks can share them.
+    consts: Vec<(String, TokenStream2)>,
+    /// Constant mask of root kinds the rule can match.
+    root: TokenStream2,
+    /// Constant early-reject mask, `EMPTY` when it is computed at runtime.
+    early_reject: TokenStream2,
+}
+
+fn compile_rule(rule: &PatternRule, iter: Option<Iter<'_>>) -> Result<CompiledRule> {
+    let (tree, op_mask, no_match) = (format_ident!("__tree"), op_mask(), no_match());
+    let label = quote! { '__rule };
+    let fail = quote! { break #label; };
+
+    let mut consts = Vec::new();
+    let reject_keys = early_reject_keys(&rule.lhs, iter);
+    let reject_mask = union_mask(&reject_keys);
+    let (reject_check, early_reject) = if reject_keys.is_empty() {
+        (quote! {}, quote! { #op_mask::EMPTY })
+    } else if reject_keys.iter().all(|key| key.constant) {
+        let names: Vec<&str> = reject_keys.iter().map(|key| key.name.as_str()).collect();
+        let name = format_ident!("__REJECT_{}", names.join("_"));
+        consts.push((name.to_string(), quote! { const #name: #op_mask = #reject_mask; }));
+        (quote! { if !#name.is_subset_of(__src_ops) { #fail } }, quote! { #name })
+    } else {
+        (quote! { if !#reject_mask.is_subset_of(__src_ops) { #fail } }, quote! { #op_mask::EMPTY })
+    };
+
+    let mut emitter = Emitter::new(Some(fail.clone()), DuplicateTracker::default());
+    emitter.emit(&rule.lhs, &tree)?;
+    let shared = &emitter.code;
+    let rewrite = rewrite_expr(&rule.rhs);
+    let guard = &rule.guard;
+
+    let body = if emitter.permutes.is_empty() {
+        let checks = emitter.dup.checks(&fail);
+        let guard = guard.as_ref().map(|guard| quote! { if !(#guard) { #fail } });
+        quote! {
+            #(#shared)*
+            #checks
+            #guard
+            match #rewrite {
+                #no_match => break #label,
+                __result => return __result,
+            }
         }
-        IterKind::BinaryAll => {
-            let ops = BINARY_OPS.iter().map(|s| format_ident!("{}", s)).collect();
-            (ops, OpKind::Binary)
-        }
-        IterKind::TernaryAll => {
-            let ops = TERNARY_OPS.iter().map(|s| format_ident!("{}", s)).collect();
-            (ops, OpKind::Ternary)
+    } else {
+        let tail = |dup: &DuplicateTracker| {
+            let checks = dup.checks(&quote! { continue; });
+            let guard = guard.as_ref().map(|guard| quote! { if !(#guard) { continue; } });
+            quote! {
+                #checks
+                #guard
+                match #rewrite {
+                    #no_match => continue,
+                    __result => return __result,
+                }
+            }
+        };
+        let loops = permutation_loops(emitter.permutes.clone(), emitter.dup.clone(), 0, &tail)?;
+        quote! {
+            #(#shared)*
+            #loops
+            break #label;
         }
     };
 
-    for op_ident in &ops {
-        for rule in &for_block.body {
-            let ctx = IterContext { var_name: var_name.clone(), op_ident: op_ident.clone(), op_kind: kind };
-            results.push(generate_simplified_rule(rule, Some(&ctx), has_context)?);
+    let (placement, root, wrap): (Placement, TokenStream2, Box<dyn Fn(TokenStream2) -> TokenStream2>) =
+        match roots(&rule.lhs, iter) {
+            Roots::Any => (Placement::Step, quote! { #op_mask::ALL }, Box::new(|code| code)),
+            Roots::Block(Iter { var, kind, ops }) => {
+                let (root, member) = match ops {
+                    Some(ops) => {
+                        let keys: Vec<Key> = ops.iter().map(Key::alu).collect();
+                        (union_mask(&keys), quote! { && matches!(*#var, #(__alu::#ops)|*) })
+                    }
+                    None => {
+                        let (base, end) = kind_bounds(kind);
+                        (quote! { #op_mask::of_range(#base, #end) }, quote! {})
+                    }
+                };
+                let wrap = move |code| {
+                    quote! { if let __Op::#kind(#var, ..) = #tree.op() #member { let #var = *#var; #code } }
+                };
+                (Placement::Step, root, Box::new(wrap))
+            }
+            Roots::Keys(keys) if keys.len() == 1 && keys[0].constant => {
+                let key = keys.into_iter().next().expect("one key");
+                let root = key.mask();
+                (Placement::Keyed(key), root, Box::new(|code| code))
+            }
+            Roots::Keys(keys) => {
+                let root = union_mask(&keys);
+                let tests = keys.iter().map(|key| {
+                    let expr = &key.expr;
+                    quote! { __key == #expr.index() }
+                });
+                let test = quote! { #(#tests)||* };
+                (Placement::Step, root, Box::new(move |code| quote! { if #test { #code } }))
+            }
+        };
+
+    let code = wrap(quote! {
+        #label: {
+            #reject_check
+            #body
+        }
+    });
+    Ok(CompiledRule { placement, code, consts, root, early_reject })
+}
+
+fn kind_bounds(kind: &Ident) -> (TokenStream2, TokenStream2) {
+    let upper = kind.to_string().to_uppercase();
+    let (base, end) = (format_ident!("OP_KEY_BASE_{upper}"), format_ident!("OP_KEY_END_{upper}"));
+    (quote! { __keys::#base }, quote! { __keys::#end })
+}
+
+/// Compile every rule of a block in source order, expanding for-blocks.
+fn compile_block(patterns: &PatternList) -> Result<Vec<CompiledRule>> {
+    let mut compiled = Vec::new();
+    let mut push = |rule: &PatternRule, iter: Option<Iter<'_>>| -> Result<()> {
+        compiled.push(compile_rule(rule, iter)?);
+        Ok(())
+    };
+    for item in &patterns.items {
+        match item {
+            PatternItem::Rule(rule) => push(rule, None)?,
+            PatternItem::ForBlock(ForBlock { var, kind, ops, body }) => {
+                for rule in body {
+                    push(rule, Some(Iter { var, kind, ops: ops.as_deref() }))?;
+                }
+            }
         }
     }
+    Ok(compiled)
+}
 
-    Ok(results)
+/// The `[T; N]` check that every listed op of a for-block is of the block's kind.
+fn for_block_checks(patterns: &PatternList) -> Vec<TokenStream2> {
+    patterns
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            PatternItem::ForBlock(ForBlock { kind, ops: Some(ops), .. }) => {
+                let count = ops.len();
+                Some(quote! { const _: [__alu::#kind; #count] = [#(__alu::#ops),*]; })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Generate a `SimplifiedPatternMatcher` holding this block as one segment.
+pub fn generate_simplified_pattern_matcher(patterns: &PatternList) -> Result<TokenStream2> {
+    let has_context = patterns.context_type.is_some();
+    let ctx_type = patterns.context_type.as_ref().map_or_else(|| quote! { () }, |ty| quote! { #ty });
+    let op_mask = op_mask();
+    let rules = compile_block(patterns)?;
+
+    // Consecutive keyed rules share one `match`; every other rule is its own step.
+    let mut key_consts: BTreeMap<String, TokenStream2> = BTreeMap::new();
+    let mut steps = Vec::new();
+    let mut arms: Vec<(String, Vec<TokenStream2>)> = Vec::new();
+    let flush = |arms: &mut Vec<(String, Vec<TokenStream2>)>, steps: &mut Vec<TokenStream2>| {
+        if arms.is_empty() {
+            return;
+        }
+        let branches = arms.drain(..).map(|(name, codes)| {
+            let key = format_ident!("__KEY_{name}");
+            quote! { #key => { #(#codes)* } }
+        });
+        steps.push(quote! { match __key { #(#branches)* _ => {} } });
+    };
+    for rule in &rules {
+        match &rule.placement {
+            Placement::Keyed(key) => {
+                let expr = &key.expr;
+                key_consts.entry(key.name.clone()).or_insert_with(|| {
+                    let name = format_ident!("__KEY_{}", key.name);
+                    quote! { const #name: usize = #expr.index(); }
+                });
+                match arms.iter_mut().find(|(name, _)| *name == key.name) {
+                    Some((_, codes)) => codes.push(rule.code.clone()),
+                    None => arms.push((key.name.clone(), vec![rule.code.clone()])),
+                }
+            }
+            Placement::Step => {
+                flush(&mut arms, &mut steps);
+                steps.push(rule.code.clone());
+            }
+        }
+    }
+    flush(&mut arms, &mut steps);
+
+    let uses_key = !key_consts.is_empty() || rules.iter().any(|rule| rule.code.to_string().contains("__key"));
+    let key_binding = uses_key.then(|| quote! { let __key = __keys::OpKey::from_op(__tree.op()).index(); });
+    let key_consts = key_consts.into_values();
+    let rule_consts: BTreeMap<&String, &TokenStream2> =
+        rules.iter().flat_map(|rule| &rule.consts).map(|(name, item)| (name, item)).collect();
+    let rule_consts = rule_consts.into_values();
+    let table = rules.iter().map(|rule| {
+        let (root, reject) = (&rule.root, &rule.early_reject);
+        quote! { (#root, #reject) }
+    });
+    let checks = for_block_checks(patterns);
+    let ctx_param = if has_context {
+        quote! { ctx: &mut _ }
+    } else {
+        quote! { _ctx: &mut () }
+    };
+    let src_ops = if rules.iter().any(|rule| rule.code.to_string().contains("__src_ops")) {
+        quote! { __src_ops }
+    } else {
+        quote! { _src_ops }
+    };
+    let no_match = no_match();
+    Ok(quote! {
+        {
+            use svod_ir::op::{OpMask as __OpMask, alu as __alu, pattern_derived as __keys};
+            use svod_ir::pattern::{IntoRewriteResult as __Into, RewriteResult as __Result, helpers as __helpers};
+            use std::iter::once_with as __once_with;
+            use svod_ir::{Op as __Op, ops as __ops};
+            #(#checks)*
+            #(#key_consts)*
+            #(#rule_consts)*
+            const __RULES: &[(#op_mask, #op_mask)] = &[#(#table),*];
+            let mut __matcher = svod_ir::pattern::SimplifiedPatternMatcher::<#ctx_type>::new();
+            __matcher.add_block(
+                __RULES,
+                move |__tree: &std::sync::Arc<svod_ir::UOp>, #src_ops: #op_mask, #ctx_param| {
+                    #key_binding
+                    #(#steps)*
+                    #no_match
+                },
+            );
+            __matcher
+        }
+    })
+}
+
+/// Like [`generate_simplified_pattern_matcher`], but the matcher is built once into a
+/// `LazyLock` and borrowed as `&'static`.
+pub fn generate_cached_pattern_matcher(patterns: &PatternList) -> Result<TokenStream2> {
+    let inner = generate_simplified_pattern_matcher(patterns)?;
+    let ctx_type = patterns.context_type.as_ref().map_or_else(|| quote! { () }, |ty| quote! { #ty });
+    Ok(quote! {
+        {
+            static __CACHED: std::sync::LazyLock<svod_ir::pattern::SimplifiedPatternMatcher<#ctx_type>> =
+                std::sync::LazyLock::new(|| #inner);
+            &*__CACHED
+        }
+    })
 }

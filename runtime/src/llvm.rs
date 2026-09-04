@@ -1,7 +1,9 @@
-//! LLVM JIT compilation via external clang + ELF loader.
+//! LLVM JIT compilation: IR text → relocatable object → ELF loader.
 //!
-//! Compiles LLVM IR text via `clang -x ir -c -O2` stdin→stdout and loads the
-//! resulting object via the shared JIT ELF loader. No linked LLVM required.
+//! Objects come from libLLVM in process when it can be loaded (see
+//! `llvm_inprocess`), otherwise from `clang -x ir -c -O2` stdin→stdout. Either
+//! way the result goes through the shared JIT ELF loader; no linked LLVM
+//! required.
 
 use tracing::debug;
 
@@ -36,7 +38,7 @@ impl LlvmKernel {
         let name = name.into();
         let buffer_count = abi.iter().filter(|arg| arg.is_storage()).count();
         svod_device::device::validate_abi_descriptors(abi, buffer_count, &var_names)?;
-        debug!(kernel.name = %name, ir.length = ir.len(), "Compiling LLVM IR via external clang");
+        debug!(kernel.name = %name, ir.length = ir.len(), "Compiling LLVM IR");
         if let Ok(dir) = std::env::var("SVOD_DUMP_LLVM_IR") {
             let path = std::path::Path::new(&dir).join(format!("{name}.ll"));
             let _ = std::fs::create_dir_all(&dir);
@@ -112,14 +114,83 @@ impl LlvmKernel {
     }
 }
 
-/// Compile LLVM IR text to a relocatable object via `clang -x ir`.
-///
-/// Uses `--target=<arch>-none-unknown-elf` to produce a relocatable ELF object
-/// (same as the C path in jit_loader), so the JIT ELF loader can handle
-/// relocations consistently.
+/// Compile LLVM IR text to a relocatable object with whichever producer is
+/// available.
 fn compile_ir_to_object(ir: &str) -> Result<Vec<u8>> {
-    let toolchain = crate::clang::ClangToolchain::discover(None)?;
-    compile_ir_to_object_with(&toolchain, ir, &llvm_object_flags())
+    llvm_object_producer(None)?.0.compile(ir)
+}
+
+/// Where LLVM-backend objects come from. Both emit `<arch>-none-unknown-elf`
+/// relocatable objects for the JIT ELF loader.
+pub(crate) enum LlvmObjectProducer {
+    InProcess(&'static crate::llvm_inprocess::LlvmLibrary),
+    Clang { toolchain: crate::clang::ClangToolchain, flags: Vec<String> },
+}
+
+impl LlvmObjectProducer {
+    pub(crate) fn compile(&self, ir: &str) -> Result<Vec<u8>> {
+        match self {
+            Self::InProcess(library) => library.compile_ir_to_object(ir),
+            Self::Clang { toolchain, flags } => compile_ir_to_object_with(toolchain, ir, flags),
+        }
+    }
+}
+
+/// Pick the object producer and its persisted identity: libLLVM in process
+/// when it loads (and `SVOD_LLVM_INPROCESS` is not `0`), else the clang
+/// subprocess. The identities differ so cached objects never cross producers.
+pub(crate) fn llvm_object_producer(
+    cache: Option<&crate::object_cache::ObjectCache>,
+) -> Result<(LlvmObjectProducer, crate::object_cache::CompilerIdentity)> {
+    use crate::llvm_inprocess::LlvmLibrary;
+    use crate::object_cache::{CompilerIdentity, OBJECT_CACHE_SCHEMA};
+
+    let abi = format!(
+        "svod-llvm-kernel-abi-v1;pointer-width={};endian={}",
+        usize::BITS,
+        if cfg!(target_endian = "little") { "little" } else { "big" }
+    );
+    let identity =
+        |backend: &str, target_architecture: String, toolchain: String, flags: Vec<String>| CompilerIdentity {
+            schema: OBJECT_CACHE_SCHEMA,
+            backend: backend.into(),
+            target_architecture,
+            toolchain,
+            flags,
+            abi: abi.clone(),
+            object_format: "elf-relocatable-svod-jit-loader-v1".into(),
+        };
+    match crate::llvm_inprocess::library() {
+        Ok(library) => {
+            debug!(version = %library.version_string(), "LLVM backend compiles in process through libLLVM");
+            let identity = identity(
+                "cpu-llvm-inprocess",
+                library.target_identity(),
+                library.toolchain_identity(),
+                LlvmLibrary::pipeline_flags(),
+            );
+            Ok((LlvmObjectProducer::InProcess(library), identity))
+        }
+        Err(error) if crate::llvm_inprocess::disabled_by_env() => {
+            debug!(%error, "LLVM backend compiles through the clang subprocess");
+            clang_producer(cache, identity)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "LLVM backend falls back to the clang subprocess");
+            clang_producer(cache, identity)
+        }
+    }
+}
+
+fn clang_producer(
+    cache: Option<&crate::object_cache::ObjectCache>,
+    identity: impl FnOnce(&str, String, String, Vec<String>) -> crate::object_cache::CompilerIdentity,
+) -> Result<(LlvmObjectProducer, crate::object_cache::CompilerIdentity)> {
+    let toolchain = crate::clang::ClangToolchain::discover(cache)?;
+    let flags = llvm_object_flags();
+    let target_architecture = toolchain.target_identity(cache, &flags)?;
+    let identity = identity("cpu-llvm-clang", target_architecture, toolchain.identity().into(), flags.clone());
+    Ok((LlvmObjectProducer::Clang { toolchain, flags }, identity))
 }
 
 pub(crate) fn llvm_object_flags() -> Vec<String> {

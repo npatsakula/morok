@@ -10,6 +10,7 @@ use svod_ir::{Op, UOp};
 
 use crate::kernels::kmeans::{KMEANS_SUPPORTED_ARCHS, build_kmeans_assign};
 use crate::{ArchCaps, Kernel};
+use svod_ir::ops;
 
 /// Placeholder buffers for a GPU-free build: `ids` (i32), `dist` (f32), then
 /// `x`/`c` (bf16), `c_sq_rep` (f32), in ABI order.
@@ -43,11 +44,11 @@ fn test_kmeans_assign_graph_shape() {
         let topo = kmeans_sink(n, k, d, caps).toposort();
 
         // The score term emits a WMMA.
-        assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "{arch:?}: score WMMA");
+        assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma(..))), "{arch:?}: score WMMA");
 
         // The arg-reduce cross-lane gathers (value + index each ride a ds_bpermute):
         // two reduces per centroid tile (tile-min + running-best) × reduce_tree length.
-        let customs = topo.iter().filter(|u| matches!(u.op(), Op::Custom { .. })).count();
+        let customs = topo.iter().filter(|u| matches!(u.op(), Op::Custom(..))).count();
         assert!(customs >= 4 * caps.reduce_tree().len(), "{arch:?}: arg_reduce ds_bpermute Op::Customs, got {customs}");
 
         // The slot-0 update conditional rewrites are `where` (Ternary) selects.
@@ -57,8 +58,8 @@ fn test_kmeans_assign_graph_shape() {
         // Two outputs: a Store into the i32 ids Param (slot 0) and the f32 dist (slot 1).
         let stores_to = |slot: usize| {
             topo.iter().any(|u| {
-                let Op::Store { .. } = u.op() else { return false };
-                u.toposort().iter().any(|s| matches!(s.op(), Op::Param { arg, .. } if arg.slot == slot))
+                let Op::Store(..) = u.op() else { return false };
+                u.toposort().iter().any(|s| matches!(s.op(), Op::Param(ops::Param { arg, .. }) if arg.slot == slot))
             })
         };
         assert!(stores_to(0), "{arch:?}: store into the ids output (Param 0)");
@@ -251,9 +252,9 @@ fn test_kmeans_assign_public_graph_shape() {
     let (ids, dists) = crate::kmeans_assign(&x, &c).expect("builds").expect("Ok(Some) on a supported device");
 
     let topo = ids.uop().toposort();
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Call { .. })), "ids graph carries the kernel Op::Call");
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::Call(..))), "ids graph carries the kernel Op::Call");
     let dtopo = dists.uop().toposort();
-    assert!(dtopo.iter().any(|u| matches!(u.op(), Op::Call { .. })), "dists graph carries the kernel Op::Call");
+    assert!(dtopo.iter().any(|u| matches!(u.op(), Op::Call(..))), "dists graph carries the kernel Op::Call");
 }
 
 // =============================================================================

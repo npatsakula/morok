@@ -64,6 +64,11 @@ for _ in 0..1000 {
 }
 ```
 
+Kernels a prepare misses in the optimized-kernel cache are optimized and compiled
+in parallel on the same process-wide pool that later runs CPU kernels. `SVOD_THREADS`
+(default: host parallelism) is the one budget for both; `PrepareConfig::threads`
+overrides it per call, `1` compiling inline in schedule order.
+
 ## Batch Execution
 
 Realize multiple tensors together — shares compilation and avoids redundant work.

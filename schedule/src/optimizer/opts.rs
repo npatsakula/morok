@@ -12,6 +12,7 @@ use svod_ir::uop::properties::VminVmaxProperty;
 use svod_ir::{AxisType, ConstValue, Op, UOp, UOpKey};
 
 use crate::optimizer::{Opt, OptArgExt, OptOps, Scheduler, error::*, tc};
+use svod_ir::ops;
 
 // ============================================================================
 // DISPATCHER
@@ -81,7 +82,7 @@ fn resolve_full_axis(rng: &Arc<UOp>, amount: usize, op_name: &'static str) -> Re
     if amount != 0 {
         return Ok(amount);
     }
-    if !matches!(rng.op(), Op::Range { .. }) {
+    if !matches!(rng.op(), Op::Range(..)) {
         return ExpectedRangeOperationSnafu.fail();
     }
     let (_, vmax) = VminVmaxProperty::get(rng);
@@ -105,7 +106,7 @@ fn resolve_full_axis(rng: &Arc<UOp>, amount: usize, op_name: &'static str) -> Re
 /// For reduce axis unrolling, use UNROLL instead.
 fn apply_upcast(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Result<(), OptError> {
     let axis_type = match rng.op() {
-        Op::Range { axis_type, .. } => *axis_type,
+        Op::Range(ops::Range { axis_type, .. }) => *axis_type,
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
@@ -137,7 +138,7 @@ fn apply_local(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resul
     }
 
     let axis_type = match rng.op() {
-        Op::Range { axis_type, .. } => *axis_type,
+        Op::Range(ops::Range { axis_type, .. }) => *axis_type,
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
@@ -166,7 +167,7 @@ fn apply_group(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize, top: boo
     }
 
     let axis_type = match rng.op() {
-        Op::Range { axis_type, .. } => *axis_type,
+        Op::Range(ops::Range { axis_type, .. }) => *axis_type,
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
@@ -179,7 +180,7 @@ fn apply_group(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize, top: boo
         .rngs()
         .iter()
         .filter_map(|r| {
-            if let Op::Range { axis_type, end, .. } = r.op()
+            if let Op::Range(ops::Range { axis_type, end, .. }) = r.op()
                 && matches!(axis_type, AxisType::Upcast | AxisType::Warp | AxisType::Local | AxisType::GroupReduce)
                 && let Op::Const(cv) = end.op()
                 && let ConstValue::Int(sz) = cv.0
@@ -201,7 +202,7 @@ fn apply_group(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize, top: boo
     // Check not inside nested reduction
     let reduce_ptr = Arc::as_ptr(&reduce_uop);
     for node in reduce_uop.backward_slice() {
-        if let Op::Reduce { .. } = node.op()
+        if let Op::Reduce(..) = node.op()
             && Arc::as_ptr(&node) != reduce_ptr
         {
             return ValidationFailedSnafu { op: "GROUP", reason: "cannot apply GROUP inside another reduction" }.fail();
@@ -214,7 +215,7 @@ fn apply_group(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize, top: boo
 
 fn find_reduce_using_range(scheduler: &Scheduler, rng: &Arc<UOp>) -> Result<Arc<UOp>, OptError> {
     for reduce in scheduler.reduceops() {
-        if let Op::Reduce { ranges, .. } = reduce.op()
+        if let Op::Reduce(ops::Reduce { ranges, .. }) = reduce.op()
             && ranges.iter().any(|r| Arc::ptr_eq(r, rng))
         {
             return Ok(reduce.clone());
@@ -275,11 +276,11 @@ fn apply_swap(scheduler: &mut Scheduler, axis: usize, other_axis: usize) -> Resu
         rngs.get(other_axis).ok_or_else(|| AxisOutOfBoundsSnafu { axis: other_axis, max: rngs.len() }.build())?.clone();
 
     let (end1, axis_id1, axis_type1) = match rng.op() {
-        Op::Range { end, axis_id, axis_type, .. } => (end.clone(), axis_id.clone(), *axis_type),
+        Op::Range(ops::Range { end, axis_id, axis_type, .. }) => (end.clone(), axis_id.clone(), *axis_type),
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
     let (end2, axis_id2, axis_type2) = match altrng.op() {
-        Op::Range { end, axis_id, axis_type, .. } => (end.clone(), axis_id.clone(), *axis_type),
+        Op::Range(ops::Range { end, axis_id, axis_type, .. }) => (end.clone(), axis_id.clone(), *axis_type),
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
@@ -307,7 +308,7 @@ fn apply_swap(scheduler: &mut Scheduler, axis: usize, other_axis: usize) -> Resu
 /// Set flag to prevent future LOCAL/WARP/GROUP_REDUCE optimizations.
 fn apply_nolocals(scheduler: &mut Scheduler) -> Result<(), OptError> {
     for rng in scheduler.rngs() {
-        if let Op::Range { axis_type, .. } = rng.op()
+        if let Op::Range(ops::Range { axis_type, .. }) = rng.op()
             && matches!(axis_type, AxisType::Local | AxisType::Warp | AxisType::GroupReduce)
         {
             return ValidationFailedSnafu {
@@ -355,7 +356,7 @@ fn apply_nolocals(scheduler: &mut Scheduler) -> Result<(), OptError> {
 /// 3. Add WHERE-Invalid validity to all INDEX ops using this range
 fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Result<(), OptError> {
     let (end, axis_id, axis_type) = match rng.op() {
-        Op::Range { end, axis_id, axis_type, .. } => (end.clone(), axis_id.clone(), *axis_type),
+        Op::Range(ops::Range { end, axis_id, axis_type, .. }) => (end.clone(), axis_id.clone(), *axis_type),
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
@@ -400,7 +401,7 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
         .backward_slice()
         .into_iter()
         .filter_map(|node| match node.op() {
-            Op::Store { index, .. } => Some(UOpKey(index.clone())),
+            Op::Store(ops::Store { index, .. }) => Some(UOpKey(index.clone())),
             _ => None,
         })
         .collect();
@@ -414,7 +415,7 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
 
     for buf_op in scheduler.bufs() {
         if buf_uses_range(buf_op, &rng)
-            && let Op::Index { buffer, indices } = buf_op.op()
+            && let Op::Index(ops::Index { buffer, indices }) = buf_op.op()
         {
             if indices.len() != 1 {
                 return ValidationFailedSnafu {
@@ -458,7 +459,7 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
 
 /// Check if a buffer INDEX operation uses a specific range.
 fn buf_uses_range(buf_op: &Arc<UOp>, rng: &Arc<UOp>) -> bool {
-    if let Op::Index { indices, .. } = buf_op.op() {
+    if let Op::Index(ops::Index { indices, .. }) = buf_op.op() {
         for idx in indices {
             for node in idx.get_idx().toposort() {
                 if Arc::ptr_eq(&node, rng) {
@@ -511,7 +512,7 @@ fn apply_thread(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resu
 
     // Validate axis type (must be parallelizable)
     let axis_type = match rng.op() {
-        Op::Range { axis_type, .. } => *axis_type,
+        Op::Range(ops::Range { axis_type, .. }) => *axis_type,
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 

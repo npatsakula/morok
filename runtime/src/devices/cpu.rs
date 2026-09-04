@@ -1,8 +1,9 @@
 //! CPU device implementation with selectable JIT backends.
 //!
 //! This module provides a Device instance for CPU execution using either:
-//! - Clang C codegen (default, human-readable, fast debug cycles)
-//! - LLVM JIT (maximum optimization, slower compilation)
+//! - LLVM IR codegen (default): compiled in-process through libLLVM, falling
+//!   back to `clang -x ir` when the library is not found
+//! - Clang C codegen: human-readable source, useful for debugging kernels
 //!
 //! The backend can be selected via:
 //! - `SVOD_CPU_BACKEND` environment variable ("clang" or "llvm")
@@ -27,29 +28,65 @@ use crate::object_cache::{CompilerIdentity, OBJECT_CACHE_SCHEMA, ObjectCache, Ob
 /// CPU backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CpuBackend {
-    /// Clang C codegen backend (default).
-    /// Generates C source, compiles with clang, loads via dlopen.
-    #[default]
+    /// Clang C codegen backend: C source compiled by `clang -c`.
     Clang,
-    /// LLVM JIT backend.
-    /// Maximum optimization, slower compilation.
+    /// LLVM IR backend (default): in-process libLLVM, or `clang -x ir` as fallback.
+    #[default]
     Llvm,
 }
 
 impl CpuBackend {
-    /// Select backend from environment variable SVOD_CPU_BACKEND.
-    pub fn from_env() -> Self {
-        match std::env::var("SVOD_CPU_BACKEND").as_deref() {
-            Ok("clang") | Ok("CLANG") => CpuBackend::Clang,
-            Ok("llvm") | Ok("LLVM") => CpuBackend::Llvm,
-            _ => CpuBackend::default(),
+    /// Accepted `SVOD_CPU_BACKEND` spellings.
+    const SPELLINGS: &str = "clang, CLANG, llvm, LLVM";
+
+    /// Parse a `SVOD_CPU_BACKEND` value; `None` for anything but [`Self::SPELLINGS`].
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "clang" | "CLANG" => Some(CpuBackend::Clang),
+            "llvm" | "LLVM" => Some(CpuBackend::Llvm),
+            _ => None,
         }
+    }
+
+    /// Select the backend from `SVOD_CPU_BACKEND`. Unset or empty selects the
+    /// default (LLVM); an unrecognised value warns and selects it too.
+    pub fn from_env() -> Self {
+        let value = std::env::var_os("SVOD_CPU_BACKEND").unwrap_or_default();
+        let value = value.to_string_lossy();
+        if value.is_empty() {
+            return Self::default();
+        }
+        Self::parse(&value).unwrap_or_else(|| {
+            tracing::warn!(
+                %value,
+                accepted = Self::SPELLINGS,
+                "unrecognised SVOD_CPU_BACKEND, using the default {:?} backend",
+                Self::default()
+            );
+            Self::default()
+        })
     }
 }
 
 // =============================================================================
 // Shared parallel execution
 // =============================================================================
+
+/// Size rayon's global pool — the one that runs `core_id`-split CPU kernels
+/// and parallel kernel preparation — to `threads`. Rayon builds its global
+/// pool once, so the first caller wins; a later call asking for a different
+/// size keeps the existing pool and warns once.
+pub fn ensure_thread_pool(threads: usize) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().is_err() {
+        let current = rayon::current_num_threads();
+        if current != threads {
+            WARNED.call_once(|| {
+                tracing::warn!(requested = threads, current, "rayon's global pool is already sized; keeping it")
+            });
+        }
+    }
+}
 
 /// Execute a kernel function pointer in parallel across multiple threads.
 ///
@@ -279,11 +316,10 @@ impl Program for LlvmProgram {
     }
 }
 
-/// LLVM-text compiler backed by external Clang object emission.
+/// LLVM-text compiler; objects come from libLLVM in process or from clang.
 struct LlvmCompiler {
     cache: Option<Arc<ObjectCache>>,
-    toolchain: ClangToolchain,
-    flags: Vec<String>,
+    producer: crate::llvm::LlvmObjectProducer,
     identity: CompilerIdentity,
     cache_key: String,
 }
@@ -295,10 +331,11 @@ impl Compiler for LlvmCompiler {
             cache.get_or_compile(
                 &key,
                 |bytes| crate::clang::validate_relocatable_object(bytes, &spec.name),
-                || crate::llvm::compile_ir_to_object_with(&self.toolchain, &spec.src, &self.flags),
+                || self.producer.compile(&spec.src),
             )
         } else {
-            crate::llvm::compile_ir_to_object_with(&self.toolchain, &spec.src, &self.flags)
+            self.producer
+                .compile(&spec.src)
                 .and_then(|bytes| crate::clang::validate_relocatable_object(&bytes, &spec.name).map(|()| bytes))
         }
         .map_err(runtime_as_device)?;
@@ -371,9 +408,8 @@ fn create_llvm_program(spec: &svod_device::device::CompiledSpec) -> Result<Box<d
 
 /// Create a CPU device with the default backend.
 ///
-/// The default backend is selected by:
-/// 1. `SVOD_CPU_BACKEND` environment variable ("clang" or "llvm")
-/// 2. If not set, defaults to Clang
+/// The backend is selected by [`CpuBackend::from_env`]: `SVOD_CPU_BACKEND`
+/// when set to an accepted spelling, otherwise LLVM.
 pub fn create_cpu_device(registry: &DeviceRegistry) -> Result<Device> {
     create_cpu_device_with_backend(registry, CpuBackend::from_env())
 }
@@ -453,26 +489,12 @@ pub fn create_cpu_codegen(backend: CpuBackend) -> Result<(Arc<dyn Renderer>, Arc
         }
         CpuBackend::Llvm => {
             let cache = ObjectCache::from_env().map_err(runtime_as_device)?.map(Arc::new);
-            let toolchain = ClangToolchain::discover(cache.as_deref()).map_err(runtime_as_device)?;
-            let flags = crate::llvm::llvm_object_flags();
-            let target_architecture = toolchain.target_identity(cache.as_deref(), &flags).map_err(runtime_as_device)?;
-            let identity = CompilerIdentity {
-                schema: OBJECT_CACHE_SCHEMA,
-                backend: "cpu-llvm-clang".into(),
-                target_architecture,
-                toolchain: toolchain.identity().into(),
-                flags: flags.clone(),
-                abi: format!(
-                    "svod-llvm-kernel-abi-v1;pointer-width={};endian={}",
-                    usize::BITS,
-                    if cfg!(target_endian = "little") { "little" } else { "big" }
-                ),
-                object_format: "elf-relocatable-svod-jit-loader-v1".into(),
-            };
+            let (producer, identity) =
+                crate::llvm::llvm_object_producer(cache.as_deref()).map_err(runtime_as_device)?;
             let cache_key = identity.cache_key();
             Ok((
                 Arc::new(LlvmRendererWrapper { device: device_spec }),
-                Arc::new(LlvmCompiler { cache, toolchain, flags, identity, cache_key }),
+                Arc::new(LlvmCompiler { cache, producer, identity, cache_key }),
             ))
         }
     }

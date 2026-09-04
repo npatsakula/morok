@@ -9,6 +9,7 @@ use svod_tensor::Tensor;
 
 use crate::Kernel;
 use crate::kernels::fa::{FaConfig, FaOpts, build_fa_mw_rdb, flash_attention_with};
+use svod_ir::ops;
 
 /// A non-rank-4 `q`/`k` operand is a structured `Err` (not a panic). The shape
 /// preconditions resolve before any device dispatch, so this runs GPU-free.
@@ -91,7 +92,7 @@ fn test_fa_mw_rdb_renders_bounded() {
         let linear_uop = linearized
             .toposort()
             .into_iter()
-            .find(|u| matches!(u.op(), svod_ir::Op::Linear { .. }))
+            .find(|u| matches!(u.op(), svod_ir::Op::Linear(..)))
             .expect("LINEAR present");
         let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx942);
         // Returns (no OOM/hang) ⇒ the FloorMod-clamped prefetch index renders.
@@ -165,13 +166,10 @@ fn test_fa_graph_path_renders_clean() {
     let program = svod_codegen::program_pipeline::program_from_sink(optimized, svod_dtype::DeviceSpec::Cpu)
         .expect("final target graph");
     let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
-    let linear_uop = linearized
-        .toposort()
-        .into_iter()
-        .find(|u| matches!(u.op(), svod_ir::Op::Linear { .. }))
-        .expect("LINEAR present");
+    let linear_uop =
+        linearized.toposort().into_iter().find(|u| matches!(u.op(), svod_ir::Op::Linear(..))).expect("LINEAR present");
     // This is the verify the real do_render runs (program_pipeline.rs:129-131).
-    let svod_ir::Op::Linear { ops } = linear_uop.op() else { unreachable!() };
+    let svod_ir::Op::Linear(ops::Linear { ops }) = linear_uop.op() else { unreachable!() };
     let verify_root = svod_ir::UOp::sink(ops.iter().cloned().collect());
     svod_schedule::spec::type_verify(&verify_root, &svod_schedule::spec::spec_program())
         .expect("type_verify must pass (the Ptr{vcount:4} failure surfaces here)");
@@ -233,12 +231,9 @@ fn test_fa_graph_path_renders_clean_gfx1151() {
     let program = svod_codegen::program_pipeline::program_from_sink(optimized, svod_dtype::DeviceSpec::Cpu)
         .expect("final target graph");
     let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
-    let linear_uop = linearized
-        .toposort()
-        .into_iter()
-        .find(|u| matches!(u.op(), svod_ir::Op::Linear { .. }))
-        .expect("LINEAR present");
-    let svod_ir::Op::Linear { ops } = linear_uop.op() else { unreachable!() };
+    let linear_uop =
+        linearized.toposort().into_iter().find(|u| matches!(u.op(), svod_ir::Op::Linear(..))).expect("LINEAR present");
+    let svod_ir::Op::Linear(ops::Linear { ops }) = linear_uop.op() else { unreachable!() };
     let verify_root = svod_ir::UOp::sink(ops.iter().cloned().collect());
     svod_schedule::spec::type_verify(&verify_root, &svod_schedule::spec::spec_program())
         .expect("type_verify must pass");
@@ -294,11 +289,8 @@ fn test_fa_mw_rdb_renders_wave32() {
     let program = svod_codegen::program_pipeline::program_from_sink(lowered, svod_dtype::DeviceSpec::Cpu)
         .expect("final target graph");
     let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
-    let linear_uop = linearized
-        .toposort()
-        .into_iter()
-        .find(|u| matches!(u.op(), svod_ir::Op::Linear { .. }))
-        .expect("LINEAR present");
+    let linear_uop =
+        linearized.toposort().into_iter().find(|u| matches!(u.op(), svod_ir::Op::Linear(..))).expect("LINEAR present");
     let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx1151);
     let code = svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some("fa_rdb_w32")).expect("render").code;
 

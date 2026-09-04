@@ -4,6 +4,7 @@ use std::sync::Arc;
 use smallvec::smallvec;
 use svod_dtype::{AddrSpace, DType, DeviceSpec};
 
+use crate::ops;
 use crate::pattern::{Matcher, RewriteResult};
 use crate::{AxisId, BinaryOp, CallInfo, ConstValue, Op, SInt, UOp, UOpKey, shape::Shape}; // ConstValue kept for DType::Index
 
@@ -23,7 +24,7 @@ struct RewriteCallToFirstArg;
 impl Matcher<()> for RewriteCallToFirstArg {
     fn rewrite(&self, uop: &Arc<UOp>, _ctx: &mut ()) -> RewriteResult {
         match uop.op() {
-            Op::Call { args, .. } | Op::Function { args, .. } if !args.is_empty() => {
+            Op::Call(ops::Call { args, .. }) | Op::Function(ops::Function { args, .. }) if !args.is_empty() => {
                 RewriteResult::Rewritten(args[0].clone())
             }
             _ => RewriteResult::NoMatch,
@@ -56,11 +57,11 @@ fn vconst_commits_every_lane() {
         DType::FP8E4M3,
     );
     assert_eq!(vector.dtype(), DType::FP8E4M3.vec(3).unwrap());
-    assert!(matches!(vector.op(), Op::VConst { values }
+    assert!(matches!(vector.op(), Op::VConst(ops::VConst { values })
         if values == &vec![ConstValue::Float(1.0), ConstValue::Float(1.25), ConstValue::Float(-0.0)]));
 
     let fnuz = UOp::vconst(vec![ConstValue::Float(-0.0)], DType::FP8E4M3FNUZ);
-    assert!(matches!(fnuz.op(), Op::VConst { values }
+    assert!(matches!(fnuz.op(), Op::VConst(ops::VConst { values })
         if values[0] == ConstValue::Float(0.0) && values[0] != ConstValue::Float(-0.0)));
 }
 
@@ -93,7 +94,7 @@ fn const_like_expands_independent_receiver_shape() {
 
         assert_eq!(constant.dtype(), DType::Int32);
         assert_eq!(constant.shape().unwrap().unwrap().as_slice(), &[width.into()]);
-        assert!(matches!(constant.op(), Op::Expand { src, .. }
+        assert!(matches!(constant.op(), Op::Expand(ops::Expand { src, .. })
             if matches!(src.op(), Op::Const(value) if value.0 == ConstValue::Int(1))));
         assert!(
             receiver.try_add(&constant).is_ok(),
@@ -113,7 +114,7 @@ fn vconst_like_stacks_after_movement_lowering() {
     let constant = receiver.vconst_like(0);
 
     assert_eq!(constant.dtype(), DType::Float32);
-    assert!(matches!(constant.op(), Op::Stack { sources } if sources.len() == 4));
+    assert!(matches!(constant.op(), Op::Stack(ops::Stack { sources }) if sources.len() == 4));
     assert!(!constant.toposort().iter().any(|node| node.op().is_movement()));
 }
 
@@ -126,7 +127,7 @@ fn const_like_shapes_invalid_without_retyping_it() {
 
         assert_eq!(invalid.dtype(), DType::Bool, "INVALID keeps its own dtype");
         assert_eq!(invalid.shape().unwrap().unwrap().as_slice(), &[width.into()]);
-        assert!(matches!(invalid.op(), Op::Expand { src, .. } if UOp::is_invalid_marker(src)));
+        assert!(matches!(invalid.op(), Op::Expand(ops::Expand { src, .. }) if UOp::is_invalid_marker(src)));
         assert!(UOp::is_invalid_marker(&invalid));
     }
 }
@@ -261,15 +262,15 @@ fn test_toposort_call_aware_boundaries() {
 
     let include_bodies = call.toposort_call_aware(true);
     assert!(
-        include_bodies.iter().any(|u| matches!(u.op(), Op::Param { arg, .. } if arg.slot == 0)),
+        include_bodies.iter().any(|u| matches!(u.op(), Op::Param(ops::Param { arg, .. }) if arg.slot == 0)),
         "expected CALL body params"
     );
 
     let preserve_boundaries = call.toposort_call_aware(false);
-    assert!(preserve_boundaries.iter().any(|u| matches!(u.op(), Op::Call { .. })), "expected CALL node itself");
+    assert!(preserve_boundaries.iter().any(|u| matches!(u.op(), Op::Call(..))), "expected CALL node itself");
     assert!(preserve_boundaries.iter().any(|u| Arc::ptr_eq(u, &arg0)));
     assert!(preserve_boundaries.iter().any(|u| Arc::ptr_eq(u, &arg1)));
-    assert!(!preserve_boundaries.iter().any(|u| matches!(u.op(), Op::Param { .. })), "CALL body should be excluded");
+    assert!(!preserve_boundaries.iter().any(|u| matches!(u.op(), Op::Param(..))), "CALL body should be excluded");
 
     let sink = UOp::sink(vec![call.clone()]);
     let program = program(sink.clone(), DeviceSpec::Cpu, None, None, None);
@@ -291,13 +292,15 @@ fn test_substitute_preserve_calls_keeps_call_body() {
 
     let rewritten_preserve = call.substitute_preserve_calls(&map);
     match rewritten_preserve.op() {
-        Op::Call { body: new_body, .. } => assert!(Arc::ptr_eq(new_body, &body), "CALL body should stay untouched"),
+        Op::Call(ops::Call { body: new_body, .. }) => {
+            assert!(Arc::ptr_eq(new_body, &body), "CALL body should stay untouched")
+        }
         op => panic!("expected Call op, got {op:?}"),
     }
 
     let rewritten_full = call.substitute(&map);
     match rewritten_full.op() {
-        Op::Call { body: new_body, .. } => {
+        Op::Call(ops::Call { body: new_body, .. }) => {
             assert!(!Arc::ptr_eq(new_body, &body), "full substitute should rewrite CALL body")
         }
         op => panic!("expected Call op, got {op:?}"),
@@ -331,7 +334,7 @@ fn test_substitute_preserve_calls_rewrites_args_not_body() {
 
     let rewritten_preserve = call.substitute_preserve_calls(&map);
     match rewritten_preserve.op() {
-        Op::Call { body: new_body, args, .. } => {
+        Op::Call(ops::Call { body: new_body, args, .. }) => {
             assert!(Arc::ptr_eq(new_body, &body), "preserve-calls substitute should keep CALL body untouched");
             assert!(Arc::ptr_eq(&args[0], &arg_replacement), "preserve-calls substitute should rewrite CALL args");
         }
@@ -340,7 +343,7 @@ fn test_substitute_preserve_calls_rewrites_args_not_body() {
 
     let rewritten_full = call.substitute(&map);
     match rewritten_full.op() {
-        Op::Call { body: new_body, args, .. } => {
+        Op::Call(ops::Call { body: new_body, args, .. }) => {
             assert!(!Arc::ptr_eq(new_body, &body), "full substitute should rewrite CALL body");
             assert!(Arc::ptr_eq(&args[0], &arg_replacement), "full substitute should also rewrite CALL args");
         }
@@ -351,10 +354,10 @@ fn test_substitute_preserve_calls_rewrites_args_not_body() {
 #[test]
 fn test_buffer_creation() {
     let buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    assert!(matches!(buf.op(), Op::Buffer { .. }));
+    assert!(matches!(buf.op(), Op::Buffer(..)));
     assert_eq!(buf.dtype(), DType::Float32);
 
-    if let Op::Buffer { arg, .. } = buf.op() {
+    if let Op::Buffer(ops::Buffer { arg, .. }) = buf.op() {
         assert_eq!(arg.device, Some(DeviceSpec::Cpu));
         assert_eq!(buf.shape().unwrap().unwrap().as_slice(), &[SInt::Const(100)]);
     } else {
@@ -376,8 +379,8 @@ fn test_buffer_hash_consing_distinguishes_slots() {
     let shape = crate::shape::shape_to_uop(&smallvec![SInt::Const(64)]);
     let arg0 = crate::ParamArg::buffer(0, DType::Float32, svod_dtype::AddrSpace::Global, Some(DeviceSpec::Cpu));
     let arg1 = crate::ParamArg::buffer(1, DType::Float32, svod_dtype::AddrSpace::Global, Some(DeviceSpec::Cpu));
-    let buf0 = UOp::new(Op::Buffer { shape: shape.clone(), arg: arg0 }, DType::Float32);
-    let buf1 = UOp::new(Op::Buffer { shape, arg: arg1 }, DType::Float32);
+    let buf0 = UOp::new(Op::Buffer(ops::Buffer { shape: shape.clone(), arg: arg0.into() }), DType::Float32);
+    let buf1 = UOp::new(Op::Buffer(ops::Buffer { shape, arg: arg1.into() }), DType::Float32);
     assert!(!Arc::ptr_eq(&buf0, &buf1), "BUFFER slot is part of structural identity");
 }
 
@@ -407,7 +410,7 @@ fn test_index_operation() {
     let idx = UOp::const_(DType::Index, ConstValue::UInt(10));
 
     let indexed = UOp::index().buffer(buf).indices(vec![idx]).call().expect("index should succeed");
-    assert!(matches!(indexed.op(), Op::Index { .. }));
+    assert!(matches!(indexed.op(), Op::Index(..)));
     assert_eq!(indexed.op().children().len(), 2); // buffer + 1 index
 }
 
@@ -416,10 +419,10 @@ fn test_copy_device_metadata_and_unique() {
     let src = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
     let cpu_copy = src.copy_to_device(DeviceSpec::Cpu);
     let cuda_copy = src.copy_to_device(DeviceSpec::Cuda { device_id: 0 });
-    assert!(matches!(cpu_copy.op(), Op::Copy { device: DeviceSpec::Cpu, .. }));
+    assert!(matches!(cpu_copy.op(), Op::Copy(ops::Copy { device: DeviceSpec::Cpu, .. })));
     assert_eq!(cpu_copy.op().children().len(), 1);
     assert!(!Arc::ptr_eq(&cpu_copy, &cuda_copy), "copy target must participate in hash consing");
-    assert!(matches!(cpu_copy.with_sources(vec![src]).op(), Op::Copy { device: DeviceSpec::Cpu, .. }));
+    assert!(matches!(cpu_copy.with_sources(vec![src]).op(), Op::Copy(ops::Copy { device: DeviceSpec::Cpu, .. })));
 
     let uniq = UOp::buffer_id(Some(42));
     assert!(matches!(uniq.op(), Op::Unique(42)));
@@ -449,10 +452,10 @@ fn test_call_constructor_and_with_sources() {
     // Per tinygrad spec, CALL dtype is always void.
     assert_eq!(call.dtype(), DType::Void);
     match call.op() {
-        Op::Call { body: call_body, args, info: call_info } => {
+        Op::Call(ops::Call { body: call_body, args, info: call_info }) => {
             assert!(Arc::ptr_eq(call_body, &body));
             assert_eq!(args.len(), 2);
-            assert_eq!(*call_info, info);
+            assert_eq!(**call_info, info);
         }
         op => panic!("expected Call op, got {op:?}"),
     }
@@ -461,12 +464,12 @@ fn test_call_constructor_and_with_sources() {
     let new_body = b.try_mul(&c).unwrap();
     let rewritten = call.with_sources(vec![new_body.clone(), c.clone(), a.clone()]);
     match rewritten.op() {
-        Op::Call { body: call_body, args, info: call_info } => {
+        Op::Call(ops::Call { body: call_body, args, info: call_info }) => {
             assert!(Arc::ptr_eq(call_body, &new_body));
             assert_eq!(args.len(), 2);
             assert!(Arc::ptr_eq(&args[0], &c));
             assert!(Arc::ptr_eq(&args[1], &a));
-            assert_eq!(*call_info, info);
+            assert_eq!(**call_info, info);
         }
         op => panic!("expected rewritten Call op, got {op:?}"),
     }
@@ -495,13 +498,15 @@ fn test_function_constructor_with_sources_shape_and_hash() {
     assert_eq!(function.op().range_ending_src_index(), Some(1));
 
     match function.op() {
-        Op::Function { body: fn_body, args, info: fn_info } => {
+        Op::Function(ops::Function { body: fn_body, args, info: fn_info }) => {
             // Auto-wrapped non-Tuple body in a single-element TUPLE.
-            let Op::Tuple { src } = fn_body.op() else { panic!("expected TUPLE body, got {:?}", fn_body.op()) };
+            let Op::Tuple(ops::Tuple { src }) = fn_body.op() else {
+                panic!("expected TUPLE body, got {:?}", fn_body.op())
+            };
             assert_eq!(src.len(), 1);
             assert!(Arc::ptr_eq(&src[0], &body));
             assert_eq!(args.len(), 2);
-            assert_eq!(*fn_info, info);
+            assert_eq!(**fn_info, info);
         }
         op => panic!("expected Function op, got {op:?}"),
     }
@@ -513,12 +518,12 @@ fn test_function_constructor_with_sources_shape_and_hash() {
     // [body, args...]; the new body must already be a TUPLE.
     let rewritten = function.with_sources(vec![new_tuple_body.clone(), c.clone(), a.clone()]);
     match rewritten.op() {
-        Op::Function { body: fn_body, args, info: fn_info } => {
+        Op::Function(ops::Function { body: fn_body, args, info: fn_info }) => {
             assert!(Arc::ptr_eq(fn_body, &new_tuple_body));
             assert_eq!(args.len(), 2);
             assert!(Arc::ptr_eq(&args[0], &c));
             assert!(Arc::ptr_eq(&args[1], &a));
-            assert_eq!(*fn_info, info);
+            assert_eq!(**fn_info, info);
         }
         op => panic!("expected rewritten Function op, got {op:?}"),
     }
@@ -538,7 +543,7 @@ fn test_tuple_constructor_void_dtype() {
     let b = UOp::native_const(2i32);
     let t = UOp::tuple(smallvec![a.clone(), b.clone()]);
     assert_eq!(t.dtype(), DType::Void);
-    let Op::Tuple { src } = t.op() else { panic!("expected TUPLE, got {:?}", t.op()) };
+    let Op::Tuple(ops::Tuple { src }) = t.op() else { panic!("expected TUPLE, got {:?}", t.op()) };
     assert_eq!(src.len(), 2);
     assert!(Arc::ptr_eq(&src[0], &a));
     assert!(Arc::ptr_eq(&src[1], &b));
@@ -576,7 +581,7 @@ fn test_function_keeps_tuple_body_as_is() {
     let b = UOp::native_const(2.0f32);
     let t = UOp::tuple(smallvec![a, b]);
     let function = t.clone().function(smallvec![], CallInfo::default());
-    let Op::Function { body, .. } = function.op() else { panic!("expected FUNCTION") };
+    let Op::Function(ops::Function { body, .. }) = function.op() else { panic!("expected FUNCTION") };
     assert!(Arc::ptr_eq(body, &t));
 }
 
@@ -614,7 +619,13 @@ fn test_program_family_constructors_and_with_sources() {
         vec![sink.id, linear.id, source.id, binary.id]
     );
     match program.op() {
-        Op::Program { sink: p_sink, info, linear: Some(p_linear), source: Some(p_source), binary: Some(p_binary) } => {
+        Op::Program(ops::Program {
+            sink: p_sink,
+            info,
+            linear: Some(p_linear),
+            source: Some(p_source),
+            binary: Some(p_binary),
+        }) => {
             assert!(Arc::ptr_eq(p_sink, &sink));
             assert_eq!(info.target, DeviceSpec::Cpu);
             assert!(Arc::ptr_eq(p_linear, &linear));
@@ -630,7 +641,13 @@ fn test_program_family_constructors_and_with_sources() {
     let binary2 = UOp::binary(vec![9, 8]);
     let rewritten = program.with_sources(vec![sink2.clone(), linear2.clone(), source2.clone(), binary2.clone()]);
     match rewritten.op() {
-        Op::Program { sink: p_sink, info, linear: Some(p_linear), source: Some(p_source), binary: Some(p_binary) } => {
+        Op::Program(ops::Program {
+            sink: p_sink,
+            info,
+            linear: Some(p_linear),
+            source: Some(p_source),
+            binary: Some(p_binary),
+        }) => {
             assert!(Arc::ptr_eq(p_sink, &sink2));
             assert_eq!(info.target, DeviceSpec::Cpu);
             assert!(Arc::ptr_eq(p_linear, &linear2));
@@ -767,8 +784,8 @@ fn test_placeholder_like_concrete_shape() {
     assert_eq!(placeholder_shape[1].as_const(), Some(3));
 
     match placeholder.op() {
-        Op::Reshape { src, .. } => match src.op() {
-            Op::Param { shape, arg } => {
+        Op::Reshape(ops::Reshape { src, .. }) => match src.op() {
+            Op::Param(ops::Param { shape, arg }) => {
                 assert_eq!(arg.slot, 7);
                 assert!(matches!(shape.op(), Op::Const(value) if value.0 == ConstValue::Int(6)));
             }
@@ -791,7 +808,7 @@ fn test_placeholder_like_reg_preserves_shape_and_address_space() {
         vec![Some(2), Some(3)]
     );
     assert!(placeholder.toposort().iter().any(
-        |node| matches!(node.op(), Op::Buffer { arg, .. } if arg.slot == 7 && arg.addrspace == Some(AddrSpace::Reg))
+        |node| matches!(node.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.slot == 7 && arg.addrspace == Some(AddrSpace::Reg))
     ));
 }
 
@@ -802,7 +819,7 @@ fn test_placeholder_like_commits_weak_storage_dtype() {
         UOp::placeholder_like(&weak, 2, AddrSpace::Global).expect("weak placeholder should commit storage dtype");
 
     assert_eq!(placeholder.dtype(), DType::Int32);
-    assert!(matches!(placeholder.op(), Op::Param { arg, .. } if arg.dtype == DType::Int32));
+    assert!(matches!(placeholder.op(), Op::Param(ops::Param { arg, .. }) if arg.dtype == DType::Int32));
 }
 
 #[test]
@@ -865,12 +882,12 @@ fn test_custom_kernel_builds_after_call_outputs() {
     assert_eq!(outputs.len(), 2);
     for out in outputs {
         match out.op() {
-            Op::After { passthrough, deps } => {
-                assert!(matches!(passthrough.op(), Op::Buffer { .. }));
+            Op::After(ops::After { passthrough, deps }) => {
+                assert!(matches!(passthrough.op(), Op::Buffer(..)));
                 assert_eq!(deps.len(), 1);
                 match deps[0].op() {
-                    Op::Call { body, args, .. } => {
-                        assert!(matches!(body.op(), Op::Sink { .. }));
+                    Op::Call(ops::Call { body, args, .. }) => {
+                        assert!(matches!(body.op(), Op::Sink(..)));
                         assert_eq!(args.len(), 2);
                     }
                     op => panic!("expected CALL dep, got {op:?}"),
@@ -901,15 +918,15 @@ fn test_custom_kernel_value_body_wraps_in_function() {
 
     assert_eq!(outputs.len(), 2);
     for out in outputs {
-        let Op::After { deps, .. } = out.op() else {
+        let Op::After(ops::After { deps, .. }) = out.op() else {
             panic!("expected AFTER output, got {:?}", out.op());
         };
         assert_eq!(deps.len(), 1);
         match deps[0].op() {
-            Op::Function { body, args, .. } => {
+            Op::Function(ops::Function { body, args, .. }) => {
                 assert_eq!(args.len(), 2, "function should receive contig srcs as args");
                 assert!(
-                    matches!(body.op(), Op::Tuple { .. }),
+                    matches!(body.op(), Op::Tuple(..)),
                     "non-tuple body must auto-wrap into TUPLE for FUNCTION dispatch, got {:?}",
                     body.op()
                 );
@@ -932,11 +949,11 @@ fn test_custom_kernel_opaque_call_function_body_uses_call() {
     )
     .expect("custom kernel with custom_function body should build");
 
-    let Op::After { deps, .. } = outputs[0].op() else {
+    let Op::After(ops::After { deps, .. }) = outputs[0].op() else {
         panic!("expected AFTER output, got {:?}", outputs[0].op());
     };
     assert!(
-        matches!(deps[0].op(), Op::Call { .. }),
+        matches!(deps[0].op(), Op::Call(..)),
         "CustomFunction body is opaque — must dispatch via CALL, got {:?}",
         deps[0].op()
     );

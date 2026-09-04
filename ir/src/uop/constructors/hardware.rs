@@ -15,6 +15,7 @@ use svod_dtype::DType;
 use crate::Result;
 use crate::error::{BroadcastRequiresScalarSnafu, GetTupleIndexOutOfBoundsSnafu, GetTupleNotATupleSnafu};
 use crate::op::Op;
+use crate::ops;
 use crate::types::{CallInfo, WmmaMetadata};
 use crate::uop::UOp;
 
@@ -27,9 +28,9 @@ impl UOp {
     ///
     /// Computes D = A × B + C using hardware matrix units.
     /// `metadata` specifies dimensions, dtypes, and upcast axes for vectorization.
-    pub fn wmma(a: Arc<Self>, b: Arc<Self>, c: Arc<Self>, metadata: WmmaMetadata) -> Arc<Self> {
+    pub fn wmma(a: Arc<Self>, b: Arc<Self>, c: Arc<Self>, metadata: impl Into<Box<WmmaMetadata>>) -> Arc<Self> {
         let dtype = c.dtype();
-        Self::new(Op::Wmma { a, b, c, metadata }, dtype)
+        Self::new(Op::Wmma(ops::Wmma { a, b, c, metadata: metadata.into() }), dtype)
     }
 
     // =========================================================================
@@ -81,7 +82,7 @@ impl UOp {
     /// Used for distributed/multi-GPU tensor operations.
     pub fn mstack(buffers: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
         let dtype = buffers.first().map(|b| b.dtype()).unwrap_or(DType::Void);
-        Self::new(Op::MStack { buffers }, dtype)
+        Self::new(Op::MStack(ops::MStack { buffers }), dtype)
     }
 
     /// Select buffer by device index (multi-device access).
@@ -89,7 +90,7 @@ impl UOp {
     /// MSelect retrieves a specific device's buffer from a multi-device tensor.
     pub fn mselect(self: &Arc<Self>, device_index: usize) -> Arc<Self> {
         let dtype = self.dtype();
-        Self::new(Op::MSelect { buffer: self.clone(), device_index }, dtype)
+        Self::new(Op::MSelect(ops::MSelect { buffer: self.clone(), device_index }), dtype)
     }
 
     // =========================================================================
@@ -99,8 +100,8 @@ impl UOp {
     /// Callable wrapper around a body UOp and runtime arguments.
     ///
     /// CALL dtype is always void per tinygrad's spec.
-    pub fn call(self: &Arc<Self>, args: SmallVec<[Arc<Self>; 4]>, info: CallInfo) -> Arc<Self> {
-        Self::new(Op::Call { body: self.clone(), args, info }, DType::Void)
+    pub fn call(self: &Arc<Self>, args: SmallVec<[Arc<Self>; 4]>, info: impl Into<Box<CallInfo>>) -> Arc<Self> {
+        Self::new(Op::Call(ops::Call { body: self.clone(), args, info: info.into() }), DType::Void)
     }
 
     /// Typed instruction-style CALL. Its result is scalar and its body remains opaque.
@@ -110,7 +111,7 @@ impl UOp {
         info: CallInfo,
         return_dtype: DType,
     ) -> Arc<Self> {
-        Self::new(Op::Call { body: self.clone(), args, info }, return_dtype)
+        Self::new(Op::Call(ops::Call { body: self.clone(), args, info: info.into() }), return_dtype)
     }
 
     /// FUNCTION wrapper around a value-producing body UOp and runtime arguments.
@@ -119,22 +120,22 @@ impl UOp {
     /// always a TUPLE; non-Tuple bodies are auto-wrapped.
     /// For opaque bodies (SINK / PROGRAM / COPY / SLICE / CUSTOM_FUNCTION) prefer
     /// `.call()` instead — those mirror tinygrad's `_OPAQUE_CALL_BODIES` set.
-    pub fn function(self: &Arc<Self>, args: SmallVec<[Arc<Self>; 4]>, info: CallInfo) -> Arc<Self> {
-        let body = if matches!(self.op(), Op::Tuple { .. }) { self.clone() } else { self.maketuple() };
-        Self::new(Op::Function { body, args, info }, DType::Void)
+    pub fn function(self: &Arc<Self>, args: SmallVec<[Arc<Self>; 4]>, info: impl Into<Box<CallInfo>>) -> Arc<Self> {
+        let body = if matches!(self.op(), Op::Tuple(..)) { self.clone() } else { self.maketuple() };
+        Self::new(Op::Function(ops::Function { body, args, info: info.into() }), DType::Void)
     }
 
     /// Fallible FUNCTION constructor with positional formal/actual validation.
     pub fn try_function(self: &Arc<Self>, args: SmallVec<[Arc<Self>; 4]>, info: CallInfo) -> Result<Arc<Self>> {
-        let body = if matches!(self.op(), Op::Tuple { .. }) { self.clone() } else { self.maketuple() };
+        let body = if matches!(self.op(), Op::Tuple(..)) { self.clone() } else { self.maketuple() };
         crate::shape::function_param_substitutions(&body, &args)?;
-        Ok(Self::new(Op::Function { body, args, info }, DType::Void))
+        Ok(Self::new(Op::Function(ops::Function { body, args, info: info.into() }), DType::Void))
     }
 
     /// Construct a TUPLE from value-producing UOps. dtype is always void.
     /// Mirrors tinygrad `Ops.TUPLE`.
     pub fn tuple(srcs: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
-        Self::new(Op::Tuple { src: srcs }, DType::Void)
+        Self::new(Op::Tuple(ops::Tuple { src: srcs }), DType::Void)
     }
 
     /// Wrap `self` in a single-element TUPLE. Mirrors tinygrad `UOp.maketuple(self)`.
@@ -150,9 +151,9 @@ impl UOp {
     /// - `GetTupleIndexOutOfBounds` if `index` is out of bounds for the tuple
     pub fn try_gettuple(self: &Arc<Self>, index: usize) -> Result<Arc<Self>> {
         let inner_tuple_src: &SmallVec<[Arc<UOp>; 4]> = match self.op() {
-            Op::Tuple { src } => src,
-            Op::Function { body, .. } => match body.op() {
-                Op::Tuple { src } => src,
+            Op::Tuple(ops::Tuple { src }) => src,
+            Op::Function(ops::Function { body, .. }) => match body.op() {
+                Op::Tuple(ops::Tuple { src }) => src,
                 _ => return GetTupleNotATupleSnafu { op: "FUNCTION body (expected TUPLE)" }.fail(),
             },
             _ => return GetTupleNotATupleSnafu { op: "non-TUPLE/non-FUNCTION source" }.fail(),
@@ -161,7 +162,7 @@ impl UOp {
             .get(index)
             .context(GetTupleIndexOutOfBoundsSnafu { index, len: inner_tuple_src.len(), kind: "tuple" })?
             .dtype();
-        Ok(Self::new(Op::GetTuple { src: self.clone(), index }, elem_dtype))
+        Ok(Self::new(Op::GetTuple(ops::GetTuple { src: self.clone(), index }), elem_dtype))
     }
 
     /// Extract element `index` from a TUPLE (or a FUNCTION whose body is a TUPLE).
@@ -175,42 +176,42 @@ impl UOp {
     /// PROGRAM wrapper with optional progressive pipeline stages.
     pub fn program(
         sink: Arc<Self>,
-        info: crate::ProgramInfo,
+        info: impl Into<Box<crate::ProgramInfo>>,
         linear: Option<Arc<Self>>,
         source: Option<Arc<Self>>,
         binary: Option<Arc<Self>>,
     ) -> Arc<Self> {
-        Self::new(Op::Program { sink, info, linear, source, binary }, DType::Void)
+        Self::new(Op::Program(ops::Program { sink, info: info.into(), linear, source, binary }), DType::Void)
     }
 
     /// LINEAR stage payload.
     pub fn linear(ops: SmallVec<[Arc<Self>; 8]>) -> Arc<Self> {
-        Self::new(Op::Linear { ops }, DType::Void)
+        Self::new(Op::Linear(ops::Linear { ops }), DType::Void)
     }
 
     /// SOURCE stage payload.
     pub fn source(code: String) -> Arc<Self> {
-        Self::new(Op::Source { code, identity: None }, DType::Void)
+        Self::new(Op::Source(ops::Source { code, identity: None }), DType::Void)
     }
 
     /// SOURCE stage payload bound to an executable PROGRAM identity.
     pub fn source_with_identity(code: String, identity: crate::SourceStageIdentity) -> Arc<Self> {
-        Self::new(Op::Source { code, identity: Some(identity) }, DType::Void)
+        Self::new(Op::Source(ops::Source { code, identity: Some(identity.into()) }), DType::Void)
     }
 
     /// BINARY stage payload.
     pub fn binary(bytes: Vec<u8>) -> Arc<Self> {
-        Self::new(Op::ProgramBinary { bytes, identity: None }, DType::UInt8)
+        Self::new(Op::ProgramBinary(ops::ProgramBinary { bytes, identity: None }), DType::UInt8)
     }
 
     /// BINARY stage payload bound to its exact SOURCE and compiler identity.
     pub fn binary_with_identity(bytes: Vec<u8>, identity: crate::BinaryStageIdentity) -> Arc<Self> {
-        Self::new(Op::ProgramBinary { bytes, identity: Some(identity) }, DType::UInt8)
+        Self::new(Op::ProgramBinary(ops::ProgramBinary { bytes, identity: Some(identity.into()) }), DType::UInt8)
     }
 
     /// Construct a target instruction. INS has no inferred dtype because an
     /// instruction may define a value of any target type or be void.
     pub fn ins(sources: impl IntoIterator<Item = Arc<Self>>, dtype: DType, arg: crate::InsArg) -> Arc<Self> {
-        Self::new(Op::Ins { sources: sources.into_iter().collect(), arg }, dtype)
+        Self::new(Op::Ins(ops::Ins { sources: sources.into_iter().collect(), arg }), dtype)
     }
 }

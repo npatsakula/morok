@@ -9,6 +9,7 @@ use test_case::test_case;
 
 use svod_dtype::DType;
 
+use crate::ops;
 use crate::{ConstValue, Op, UOp};
 
 fn lane(dtype: DType, value: i64) -> Arc<UOp> {
@@ -16,7 +17,7 @@ fn lane(dtype: DType, value: i64) -> Arc<UOp> {
 }
 
 fn sources(stack: &Arc<UOp>) -> &[Arc<UOp>] {
-    let Op::Stack { sources } = stack.op() else { panic!("expected STACK, got {:?}", stack.op()) };
+    let Op::Stack(ops::Stack { sources }) = stack.op() else { panic!("expected STACK, got {:?}", stack.op()) };
     sources
 }
 
@@ -34,7 +35,7 @@ fn stack_casts_only_the_lanes_that_need_promoting() {
 
     assert_eq!(stack.dtype(), DType::Int16);
     assert!(
-        matches!(sources(&stack)[0].op(), Op::Cast { src, dtype } if Arc::ptr_eq(src, &weak) && *dtype == DType::Int16)
+        matches!(sources(&stack)[0].op(), Op::Cast(ops::Cast { src, dtype }) if Arc::ptr_eq(src, &weak) && *dtype == DType::Int16)
     );
     assert!(Arc::ptr_eq(&sources(&stack)[1], &strong));
 }
@@ -139,5 +140,5 @@ fn stack_reconstruction_preserves_hash_cons_identity() {
     let stack = UOp::stack(smallvec![UOp::native_const(1i32), UOp::native_const(2i32)]);
     let rebuilt = stack.with_sources(stack.op().sources().into_vec());
     assert!(Arc::ptr_eq(&stack, &rebuilt));
-    assert!(matches!(rebuilt.op(), Op::Stack { .. }));
+    assert!(matches!(rebuilt.op(), Op::Stack(..)));
 }

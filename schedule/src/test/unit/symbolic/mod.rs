@@ -19,6 +19,7 @@ use crate::{
 use smallvec::smallvec;
 use std::{f32::consts::PI, sync::Arc};
 use svod_dtype::DType;
+use svod_ir::ops;
 use svod_ir::pattern::TypedPatternMatcher;
 use svod_ir::uop::cached_property::CachedProperty;
 use svod_ir::uop::properties::HasWeakFloatProperty;
@@ -233,7 +234,7 @@ fn cast_chains_collapse_only_when_every_hop_is_lossless() {
     }
     // Float32 cannot hold every Int32, so neither the round trip nor a lone widening cast folds.
     for hops in [&[DType::Float32, DType::Int32][..], &[DType::Float32][..]] {
-        assert!(matches!(rewrite(symbolic_simple(), chain(&wide, hops)).op(), Op::Cast { .. }));
+        assert!(matches!(rewrite(symbolic_simple(), chain(&wide, hops)).op(), Op::Cast(..)));
     }
 }
 
@@ -435,7 +436,7 @@ fn reduced_float_vconst_folding_commits_each_result_lane() {
     let values = UOp::vconst(vec![ConstValue::Float(1.0), ConstValue::Float(1.125)], DType::FP8E4M3);
     let increments = UOp::vconst(vec![ConstValue::Float(0.0625), ConstValue::Float(0.0625)], DType::FP8E4M3);
     let folded = rewrite(symbolic_simple(), values.add(&increments));
-    assert!(matches!(folded.op(), Op::VConst { values }
+    assert!(matches!(folded.op(), Op::VConst(ops::VConst { values })
         if values == &vec![ConstValue::Float(1.0), ConstValue::Float(1.25)]));
 }
 
@@ -597,7 +598,7 @@ fn eval_closed_typed(expr: &Arc<UOp>) -> Option<ConstValue> {
 
     match expr.op() {
         Op::Const(value) => Some(value.0),
-        Op::DefineVar { min_val, max_val, .. } if min_val == max_val => {
+        Op::DefineVar(ops::DefineVar { min_val, max_val, .. }) if min_val == max_val => {
             ConstValue::Int(*min_val).cast(&expr.dtype().scalar_dtype())
         }
         Op::Binary(op, lhs, rhs) => {
@@ -947,7 +948,7 @@ type InnerCheck = fn(&Arc<UOp>) -> bool;
 /// `propagate_invalid` pushes the operation inside the gate and re-types the
 /// INVALID lane to the result dtype (tinygrad `uop/symbolic.py:29-38`).
 #[test_case(|v| v.where_(&v.p, UOp::var("f16", DType::Float16, 0, 100), UOp::invalid_marker()).cast(DType::Float32),
-    |value| matches!(value.op(), Op::Cast { .. }) ; "through a cast")]
+    |value| matches!(value.op(), Op::Cast(..)) ; "through a cast")]
 #[test_case(|v| v.where_(&v.p, v.bounded.clone(), UOp::invalid_marker()).lt(&v.f(1.0)),
     |value| matches!(value.op(), Op::Binary(BinaryOp::Lt, ..)) ; "through a comparison")]
 #[test_case(|v| v.where_(&v.p, UOp::var("ix", DType::Index, 0, 100), UOp::invalid_marker()).neg(),
@@ -988,7 +989,7 @@ fn remove_invalid_replaces_a_typed_lane_with_zero() {
     let result = rewrite(pm_remove_invalid(), UOp::stack(vec![UOp::invalid_marker(), one].into()));
 
     assert!(!result.any_in_subtree(UOp::is_invalid_marker));
-    let Op::Stack { sources } = result.op() else { panic!("expected VECTORIZE, got: {}", result.tree()) };
+    let Op::Stack(ops::Stack { sources }) = result.op() else { panic!("expected VECTORIZE, got: {}", result.tree()) };
     assert!(matches!(sources[0].op(), Op::Const(cv) if cv.0 == ConstValue::Float(0.0)));
 }
 
@@ -1071,7 +1072,7 @@ fn uop_given_valid_does_not_leak_fake_params() {
     let result = uop_given_valid(&valid, &x.add(&UOp::native_const(1i32)), false);
 
     assert!(!result.toposort().iter().any(|node| {
-        matches!(node.op(), Op::Param { arg, .. } if arg.name.as_deref().is_some_and(|name| name.starts_with("fake")))
+        matches!(node.op(), Op::Param(ops::Param { arg, .. }) if arg.name.as_deref().is_some_and(|name| name.starts_with("fake")))
     }));
 }
 

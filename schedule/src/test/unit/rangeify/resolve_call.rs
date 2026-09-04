@@ -6,12 +6,13 @@ use svod_ir::{BinaryOp, CallInfo, Error, Op, UOp};
 use test_case::test_case;
 
 use crate::rangeify::{rangeify, transforms::resolve_calls};
+use svod_ir::ops;
 
 /// Helper: peel a TUPLE wrapper. Per tinygrad, FUNCTION bodies are TUPLE-wrapped
 /// value producers; the inlined result of `resolve_function` is the substituted TUPLE.
 fn peel_tuple(uop: &Arc<UOp>) -> &Arc<UOp> {
     match uop.op() {
-        Op::Tuple { src } if src.len() == 1 => &src[0],
+        Op::Tuple(ops::Tuple { src }) if src.len() == 1 => &src[0],
         _ => uop,
     }
 }
@@ -36,7 +37,7 @@ fn test_resolve_call_inlines_function() {
         }
         op => panic!("expected inlined add body, got {op:?}"),
     }
-    assert!(!resolved.toposort().iter().any(|u| matches!(u.op(), Op::Function { .. })));
+    assert!(!resolved.toposort().iter().any(|u| matches!(u.op(), Op::Function(..))));
 }
 
 fn value_body() -> Arc<UOp> {
@@ -79,7 +80,7 @@ fn a_call_body_is_never_inlined(build: fn() -> Arc<UOp>) {
     let call = body.clone().call(args.clone(), CallInfo::default());
 
     let resolved = resolve_calls(call).expect("resolve_calls should succeed");
-    let Op::Call { body: resolved_body, args: resolved_args, .. } = resolved.op() else {
+    let Op::Call(ops::Call { body: resolved_body, args: resolved_args, .. }) = resolved.op() else {
         panic!("expected the CALL to survive, got {}", resolved.tree())
     };
     assert!(Arc::ptr_eq(resolved_body, &body), "the body must be untouched");
@@ -96,9 +97,9 @@ fn test_resolve_call_preserves_precompile_function() {
 
     let resolved = resolve_calls(function).expect("resolve_calls should succeed");
     match resolved.op() {
-        Op::Function { body, args, info } => {
+        Op::Function(ops::Function { body, args, info }) => {
             // FUNCTION body is now TUPLE-wrapped per tinygrad invariant.
-            let Op::Tuple { src } = body.op() else {
+            let Op::Tuple(ops::Tuple { src }) = body.op() else {
                 panic!("expected FUNCTION body to be TUPLE, got {:?}", body.op())
             };
             assert_eq!(src.len(), 1);
@@ -120,8 +121,8 @@ fn test_resolve_call_preserves_precompile_gettuple_and_actual() {
     let gettuple = function.try_gettuple(0).unwrap();
 
     let resolved = resolve_calls(gettuple).expect("precompiled FUNCTION must remain opaque");
-    let Op::GetTuple { src, index: 0 } = resolved.op() else { panic!("expected GETTUPLE root") };
-    let Op::Function { args, info, .. } = src.op() else { panic!("expected preserved FUNCTION source") };
+    let Op::GetTuple(ops::GetTuple { src, index: 0 }) = resolved.op() else { panic!("expected GETTUPLE root") };
+    let Op::Function(ops::Function { args, info, .. }) = src.op() else { panic!("expected preserved FUNCTION source") };
     assert!(info.precompile);
     assert_eq!(args.len(), 1);
     assert!(Arc::ptr_eq(&args[0], &actual));
@@ -136,9 +137,13 @@ fn test_resolve_call_keeps_nested_function_under_opaque_outer_function() {
     let outer = nested.function(smallvec![], outer_info);
 
     let resolved = resolve_calls(outer).expect("opaque outer FUNCTION must preserve its body");
-    let Op::Function { body, info, .. } = resolved.op() else { panic!("expected outer FUNCTION") };
+    let Op::Function(ops::Function { body, info, .. }) = resolved.op() else { panic!("expected outer FUNCTION") };
     assert!(info.precompile);
-    assert!(body.toposort().iter().any(|node| matches!(node.op(), Op::Function { info, .. } if !info.precompile)));
+    assert!(
+        body.toposort()
+            .iter()
+            .any(|node| matches!(node.op(), Op::Function(ops::Function { info, .. }) if !info.precompile))
+    );
 }
 
 /// Tinygrad parity: BIND is value-producing (not in `_OPAQUE_CALL_BODIES`), so a
@@ -152,8 +157,8 @@ fn test_resolve_call_inlines_bind_body_function() {
 
     let resolved = resolve_calls(function).expect("resolve_calls should succeed");
     let inlined = peel_tuple(&resolved);
-    assert!(matches!(inlined.op(), Op::Bind { .. }));
-    assert!(!resolved.toposort().iter().any(|u| matches!(u.op(), Op::Function { .. })));
+    assert!(matches!(inlined.op(), Op::Bind(..)));
+    assert!(!resolved.toposort().iter().any(|u| matches!(u.op(), Op::Function(..))));
 }
 
 /// SINK with non-kernel metadata still requires CALL (opaque body).
@@ -169,7 +174,7 @@ fn test_resolve_call_allows_non_contiguous_param_slots_with_unused_args() {
     let function = body.function(smallvec![a0.clone(), a1, a2.clone()], CallInfo::default());
 
     let resolved = resolve_calls(function).expect("unused argument slots should be allowed");
-    assert!(resolved.toposort().iter().all(|u| !matches!(u.op(), Op::Param { .. })));
+    assert!(resolved.toposort().iter().all(|u| !matches!(u.op(), Op::Param(..))));
     assert!(resolved.toposort().iter().any(|u| Arc::ptr_eq(u, &a0)));
     assert!(resolved.toposort().iter().any(|u| Arc::ptr_eq(u, &a2)));
 }
@@ -206,7 +211,7 @@ fn test_rangeify_pipeline_runs_resolve_call() {
     let function = body.function(smallvec![a0, a1], CallInfo::default());
 
     let (out, _ctx) = rangeify(function).expect("rangeify should succeed");
-    assert!(!out.toposort().iter().any(|u| matches!(u.op(), Op::Function { .. })));
+    assert!(!out.toposort().iter().any(|u| matches!(u.op(), Op::Function(..))));
 }
 
 #[test]
@@ -222,7 +227,7 @@ fn test_rangeify_consumes_expression_valued_function_result_shape() {
 
     assert_eq!(output.shape().unwrap().unwrap().as_slice(), &[svod_ir::SInt::Symbolic(actual_extent)]);
     let (resolved, _) = rangeify(output).expect("rangeify should consume substituted call shape");
-    assert!(resolved.toposort().iter().all(|node| !matches!(node.op(), Op::Function { .. })));
+    assert!(resolved.toposort().iter().all(|node| !matches!(node.op(), Op::Function(..))));
 }
 
 #[test]
@@ -232,15 +237,12 @@ fn test_rangeify_preserves_kernel_call_body_boundaries() {
     let function = body.call(smallvec![], CallInfo::default());
 
     let (out, _ctx) = rangeify(function).expect("rangeify should succeed");
-    let call_node = out
-        .toposort()
-        .into_iter()
-        .find(|u| matches!(u.op(), Op::Call { .. }))
-        .expect("kernel call should be preserved");
+    let call_node =
+        out.toposort().into_iter().find(|u| matches!(u.op(), Op::Call(..))).expect("kernel call should be preserved");
 
-    let Op::Call { body, .. } = call_node.op() else { unreachable!("filtered to call node") };
+    let Op::Call(ops::Call { body, .. }) = call_node.op() else { unreachable!("filtered to call node") };
     assert!(
-        body.toposort().iter().any(|u| matches!(u.op(), Op::Detach { .. })),
+        body.toposort().iter().any(|u| matches!(u.op(), Op::Detach(..))),
         "call-preserving rangeify should not rewrite inside preserved kernel call bodies"
     );
 }
@@ -260,9 +262,9 @@ fn test_resolve_call_does_not_inline_function_inside_opaque_call_body() {
     let opaque_call = nested_function.call(smallvec![], CallInfo::default());
 
     let resolved = resolve_calls(opaque_call).expect("resolve_calls should preserve call body");
-    let Op::Call { body, .. } = resolved.op() else { panic!("expected CALL root") };
+    let Op::Call(ops::Call { body, .. }) = resolved.op() else { panic!("expected CALL root") };
     assert!(
-        body.toposort().iter().any(|u| matches!(u.op(), Op::Function { .. })),
+        body.toposort().iter().any(|u| matches!(u.op(), Op::Function(..))),
         "FUNCTION inside CALL body must remain unresolved"
     );
 }

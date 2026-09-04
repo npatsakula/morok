@@ -7,6 +7,7 @@ use svod_dtype::{AddrSpace, DType, ScalarDType};
 use svod_ir::{Op, UOp};
 
 use super::helpers::*;
+use svod_ir::ops;
 
 /// Register reads sharing a range collapse into one END; an unrelated END over the
 /// same range is left alone.
@@ -36,13 +37,13 @@ fn register_reads_merge_only_their_shared_range_ends() {
         .toposort()
         .into_iter()
         .filter(
-            |node| matches!(node.op(), Op::End { ranges, .. } if ranges.len() == 1 && Arc::ptr_eq(&ranges[0], &range)),
+            |node| matches!(node.op(), Op::End(ops::End { ranges, .. }) if ranges.len() == 1 && Arc::ptr_eq(&ranges[0], &range)),
         )
         .collect();
     assert_eq!(matching.len(), 2);
     assert!(matching.iter().any(|node| Arc::ptr_eq(node, &unrelated)));
-    assert!(matching.iter().any(|node| matches!(node.op(), Op::End { computation, .. }
-        if matches!(computation.op(), Op::Group { sources } if sources.len() == 2))));
+    assert!(matching.iter().any(|node| matches!(node.op(), Op::End(ops::End { computation, .. })
+        if matches!(computation.op(), Op::Group(ops::Group { sources }) if sources.len() == 2))));
     assert!(!result.toposort().iter().any(|node| Arc::ptr_eq(node, &left_end) || Arc::ptr_eq(node, &right_end)));
 }
 
@@ -52,8 +53,8 @@ fn register_reads_merge_only_their_shared_range_ends() {
 fn shaped_index_keeps_its_selected_positions() {
     let indexed = create_vector_float_iota(8).index_axes(vec![1, 3, 5, 7]);
 
-    let Op::Index { indices, .. } = indexed.op() else { panic!("expected INDEX") };
-    let Op::Stack { sources } = indices[0].op() else { panic!("expected a shaped index") };
+    let Op::Index(ops::Index { indices, .. }) = indexed.op() else { panic!("expected INDEX") };
+    let Op::Stack(ops::Stack { sources }) = indices[0].op() else { panic!("expected a shaped index") };
     let positions: Vec<_> = sources
         .iter()
         .map(|source| match source.op() {

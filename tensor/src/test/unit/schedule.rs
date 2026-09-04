@@ -8,6 +8,7 @@ use svod_ir::{AxisId, AxisType, CallInfo, DType, DeviceSpec, Op, ReduceOp, UOp};
 use crate::schedule::{
     InputBuffers, KernelInvocation, PreSchedule, PreScheduleItem, ScheduleItem, create_schedule, instantiate_schedule,
 };
+use svod_ir::ops;
 
 fn cpu_buffer(numel: usize) -> Buffer {
     let alloc = svod_device::registry::cpu().expect("cpu allocator");
@@ -93,7 +94,7 @@ fn test_schedule_item_creation() {
         instance_dependencies: vec![],
     };
 
-    assert!(matches!(item.kernel.op(), Op::Call { .. }));
+    assert!(matches!(item.kernel.op(), Op::Call(..)));
 }
 
 #[test]
@@ -283,7 +284,10 @@ fn host_collective_schedule_item_depends_on_every_shard_producer() {
     let mut expected = vec![producer0.id, producer1.id];
     expected.sort_unstable();
     assert_eq!(item.dependencies, expected);
-    assert!(matches!(item.ast.op(), Op::CustomFunction { kind: svod_ir::CustomFunctionKind::AllReduce { .. }, .. }));
+    assert!(matches!(
+        item.ast.op(),
+        Op::CustomFunction(ops::CustomFunction { kind: svod_ir::CustomFunctionKind::AllReduce { .. }, .. })
+    ));
 }
 
 #[test]
@@ -327,7 +331,7 @@ fn test_create_schedule_supports_call_wrapper() {
 
     assert_eq!(result.items.len(), 1);
     assert_eq!(result.items[0].kernel.id, call.id);
-    assert!(matches!(result.items[0].kernel.op(), Op::Call { .. }));
+    assert!(matches!(result.items[0].kernel.op(), Op::Call(..)));
 }
 
 #[test]
@@ -420,7 +424,7 @@ fn test_create_schedule_unrolls_call_bound_ranges() {
 
     let schedule_result = create_schedule(transformed, &input_buffers, &HashMap::new()).expect("create schedule");
     assert_eq!(schedule_result.items.len(), 3);
-    assert!(schedule_result.items.iter().all(|it| matches!(it.kernel.op(), Op::Call { .. })));
+    assert!(schedule_result.items.iter().all(|it| matches!(it.kernel.op(), Op::Call(..))));
 
     let mut fixed: Vec<i64> =
         schedule_result.items.iter().map(|it| *it.fixedvars.get("outer_i").expect("outer_i fixedvar")).collect();
@@ -768,12 +772,12 @@ fn test_create_schedule_treats_unended_bound_range_as_runtime_bind() {
 fn test_create_schedule_rejects_non_concrete_outer_range_bounds() {
     let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
     let malformed_outer_range = UOp::new(
-        Op::Range {
+        Op::Range(ops::Range {
             end: UOp::native_const(3.0f32),
             axis_id: AxisId::Renumbered(0),
             axis_type: AxisType::Loop,
             deps: SmallVec::new(),
-        },
+        }),
         DType::Float32,
     );
     let bind = UOp::define_var("outer_i".to_string(), 0, 2).bind(malformed_outer_range.clone());
@@ -823,4 +827,29 @@ fn test_instantiate_schedule_rejects_invocation_with_unknown_kernel_id() {
         Err(err) => err,
     };
     assert_ir_construction_error_contains(err, "invocation references unknown kernel id");
+}
+
+#[test]
+fn reach_once_visits_shared_producers_a_single_time() {
+    let shared = UOp::native_const(1.0f32);
+    let roots = [
+        UOp::sink(vec![shared.clone(), UOp::native_const(2.0f32)]),
+        UOp::sink(vec![shared.clone(), UOp::native_const(3.0f32)]),
+    ];
+
+    let mut reach = crate::schedule::ReachOnce::new();
+    let mut visited = Vec::new();
+    for root in &roots {
+        reach
+            .walk(root, |node| {
+                visited.push(node.id);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    assert_eq!(visited.len(), 5, "{visited:?}");
+    assert_eq!(visited.iter().filter(|&&id| id == shared.id).count(), 1);
+    let expected: HashSet<u64> = roots.iter().flat_map(|root| root.toposort()).map(|node| node.id).collect();
+    assert_eq!(visited.into_iter().collect::<HashSet<_>>(), expected);
 }

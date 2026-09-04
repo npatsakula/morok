@@ -90,29 +90,29 @@ pub fn get_transcendental_patterns(supported: &crate::RendererOps, force: bool) 
     if force || !supported.supports_unary(UnaryOp::Exp2) {
         pm = pm
             + patterns! {
-                Exp2(src) if approximation_dtype(&src.dtype()) ~> |src| xexp2(src),
+                Exp2(src) if approximation_dtype(&src.dtype()) => xexp2(src),
                 node @ Exp2(src) if other_float(&src.dtype())
-                    ~> |node, src| src.cast(DType::Float32).try_exp2().expect("float32 exp2").cast(node.dtype()),
+                    => src.cast(DType::Float32).try_exp2().expect("float32 exp2").cast(node.dtype()),
             };
     }
     if force || !supported.supports_unary(UnaryOp::Log2) {
         pm = pm
             + patterns! {
-                Log2(src) if approximation_dtype(&src.dtype()) ~> |src| xlog2(src),
+                Log2(src) if approximation_dtype(&src.dtype()) => xlog2(src),
                 node @ Log2(src) if other_float(&src.dtype())
-                    ~> |node, src| src.cast(DType::Float32).try_log2().expect("float32 log2").cast(node.dtype()),
+                    => src.cast(DType::Float32).try_log2().expect("float32 log2").cast(node.dtype()),
             };
     }
     if force || !supported.supports_unary(UnaryOp::Sin) {
         pm = pm
             + patterns! {
-                Sin(src) if approximation_dtype(&src.dtype()) ~> |src| xsin(src),
+                Sin(src) if approximation_dtype(&src.dtype()) => xsin(src),
                 node @ Sin(src) if other_float(&src.dtype())
-                    ~> |node, src| src.cast(DType::Float32).try_sin().expect("float32 sin").cast(node.dtype()),
+                    => src.cast(DType::Float32).try_sin().expect("float32 sin").cast(node.dtype()),
             };
     }
     if force || !supported.supports_unary(UnaryOp::Sqrt) {
-        pm = pm + patterns! { Sqrt(src) ~> |src| xpow(src, &src.const_like(0.5)), };
+        pm = pm + patterns! { Sqrt(src) => xpow(src, &src.const_like(0.5)), };
     }
     pm
 }
@@ -175,22 +175,22 @@ pub fn amd_decomposition_patterns() -> TypedPatternMatcher<()> {
         matches!(d.base(), Float16 | Float32 | Float64)
     }
     patterns! {
-        Exp(src)  if transc(&src.dtype()) ~> |src| xexp(src),
-        Log(src)  if transc(&src.dtype()) ~> |src| xlog(src),
-        Cos(src)  if transc(&src.dtype()) ~> |src| xcos(src),
-        Tan(src)  if transc(&src.dtype()) ~> |src| xtan(src),
+        Exp(src)  if transc(&src.dtype()) => xexp(src),
+        Log(src)  if transc(&src.dtype()) => xlog(src),
+        Cos(src)  if transc(&src.dtype()) => xcos(src),
+        Tan(src)  if transc(&src.dtype()) => xtan(src),
 
         // Binary pow: x^y = exp2(y * log2(x))
-        Pow(base, exp) if transc(&base.dtype()) ~> |base, exp| xpow(base, exp),
+        Pow(base, exp) if transc(&base.dtype()) => xpow(base, exp),
 
         // bf16/fp8/int fall back to f32 then cast back (tinygrad's cast arm).
         // Int `Pow` would otherwise hit `@llvm.pow.f64`, which amdgcn can't
         // select; bf16/fp8 transcendentals have no native intrinsic either.
-        Exp(src)  ~> |src| xexp(&src.cast(DType::Float32)).cast(src.dtype()),
-        Log(src)  ~> |src| xlog(&src.cast(DType::Float32)).cast(src.dtype()),
-        Cos(src)  ~> |src| xcos(&src.cast(DType::Float32)).cast(src.dtype()),
-        Tan(src)  ~> |src| xtan(&src.cast(DType::Float32)).cast(src.dtype()),
-        Pow(base, exp) ~> |base, exp| xpow(&base.cast(DType::Float32), &exp.cast(DType::Float32)).cast(base.dtype()),
+        Exp(src)  => xexp(&src.cast(DType::Float32)).cast(src.dtype()),
+        Log(src)  => xlog(&src.cast(DType::Float32)).cast(src.dtype()),
+        Cos(src)  => xcos(&src.cast(DType::Float32)).cast(src.dtype()),
+        Tan(src)  => xtan(&src.cast(DType::Float32)).cast(src.dtype()),
+        Pow(base, exp) => xpow(&base.cast(DType::Float32), &exp.cast(DType::Float32)).cast(base.dtype()),
 
         // f32 → bf16: integer round (see `cast_float_to_bf16`) instead of the
         // `fptrunc` whose vectorized truncstore amdgcn can't select. The result
@@ -198,7 +198,7 @@ pub fn amd_decomposition_patterns() -> TypedPatternMatcher<()> {
         node @ Cast { src, .. }
             if node.dtype().base() == svod_dtype::ScalarDType::BFloat16
                 && src.dtype().base() == svod_dtype::ScalarDType::Float32
-            ~> cast_float_to_bf16(src),
+            => cast_float_to_bf16(src),
     }
 }
 

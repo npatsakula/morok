@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use svod_dtype::{DType, DeviceSpec};
-use svod_ir::{ConstValue, KernelInfo, Op, UOp};
+use svod_ir::ops;
+use svod_ir::{ConstValue, Op, UOp};
 use svod_schedule::optimizer::{OptStrategy, OptimizerConfig, Renderer};
 
 fn tensor_graph(multi_output: bool) -> Arc<UOp> {
@@ -29,7 +30,7 @@ fn kernel_body(root: &Arc<UOp>, index: usize) -> Arc<UOp> {
     root.toposort_call_aware(false)
         .into_iter()
         .filter_map(|node| match node.op() {
-            Op::Call { body, .. } => Some(body.clone()),
+            Op::Call(ops::Call { body, .. }) => Some(body.clone()),
             _ => None,
         })
         .nth(index)
@@ -63,8 +64,8 @@ fn canonical_schedule_slot(buffer: &Arc<UOp>, slot: usize) -> i128 {
 fn schedule_buffer(source: &Arc<UOp>, argument_index: usize) -> serde_json::Value {
     let buffer = source.buf_uop();
     let (origin, slot) = match buffer.op() {
-        Op::Param { arg, .. } => ("PARAM", arg.slot),
-        Op::Buffer { arg, .. } => ("BUFFER", arg.slot),
+        Op::Param(ops::Param { arg, .. }) => ("PARAM", arg.slot),
+        Op::Buffer(ops::Buffer { arg, .. }) => ("BUFFER", arg.slot),
         other => panic!("scheduled buffer argument must resolve to PARAM or BUFFER, got {other:?}"),
     };
     serde_json::json!({
@@ -80,13 +81,15 @@ fn ast_output_slots(ast: &Arc<UOp>) -> Vec<i128> {
         .toposort()
         .into_iter()
         .filter_map(|node| {
-            let Op::Store { index, .. } = node.op() else { return None };
+            let Op::Store(ops::Store { index, .. }) = node.op() else { return None };
             let buffer = match index.op() {
-                Op::Index { buffer, .. } => buffer.buf_uop(),
+                Op::Index(ops::Index { buffer, .. }) => buffer.buf_uop(),
                 _ => index.buf_uop(),
             };
             match buffer.op() {
-                Op::Param { arg, .. } | Op::Buffer { arg, .. } => Some(canonical_slot(arg.slot)),
+                Op::Param(ops::Param { arg, .. }) | Op::Buffer(ops::Buffer { arg, .. }) => {
+                    Some(canonical_slot(arg.slot))
+                }
                 _ => None,
             }
         })
@@ -100,8 +103,8 @@ fn current_var_vals(root: &Arc<UOp>) -> HashMap<String, i64> {
     root.toposort()
         .into_iter()
         .filter_map(|node| {
-            let Op::Bind { var, value } = node.op() else { return None };
-            let Op::Param { arg, .. } = var.op() else { return None };
+            let Op::Bind(ops::Bind { var, value }) = node.op() else { return None };
+            let Op::Param(ops::Param { arg, .. }) = var.op() else { return None };
             let name = arg.name.as_ref()?;
             let Op::Const(value) = value.op() else { return None };
             Some((name.clone(), value.0.try_int()?))
@@ -126,14 +129,14 @@ fn capture_schedule(
         let buffers: Vec<_> = descriptor
             .sources
             .iter()
-            .filter(|source| !matches!(source.op(), Op::Bind { .. }))
+            .filter(|source| !matches!(source.op(), Op::Bind(..)))
             .enumerate()
             .map(|(argument_index, source)| schedule_buffer(source, argument_index))
             .collect();
         let buffer_ids: Vec<_> = descriptor
             .sources
             .iter()
-            .filter(|source| !matches!(source.op(), Op::Bind { .. }))
+            .filter(|source| !matches!(source.op(), Op::Bind(..)))
             .map(|source| source.buf_uop().id)
             .collect();
         let mut dependencies: Vec<_> = descriptor
@@ -260,7 +263,7 @@ fn main() {
         let calls = kernel_graph
             .toposort_call_aware(false)
             .into_iter()
-            .filter(|node| matches!(node.op(), Op::Call { .. }))
+            .filter(|node| matches!(node.op(), Op::Call(..)))
             .count();
         assert!(calls >= 2, "multi-output production fixture must callify both outputs");
         assert!(finish_if_requested(&requested, "multi_output_callified", &capture_path));
@@ -294,8 +297,8 @@ fn main() {
     }
 
     let mut ast = kernel_body(&kernel_graph, body_index);
-    if let Op::Sink { sources, info } = ast.op() {
-        ast = UOp::sink_with_info(sources.iter().cloned().collect(), info.clone().unwrap_or_else(KernelInfo::default));
+    if let Op::Sink(ops::Sink { sources, info }) = ast.op() {
+        ast = UOp::sink_with_info(sources.iter().cloned().collect(), info.clone().unwrap_or_default());
     }
     assert!(!pre_schedule.items.is_empty());
 
@@ -307,7 +310,7 @@ fn main() {
         optimized
             .toposort_call_aware(false)
             .iter()
-            .any(|node| matches!(node.op(), Op::Param { arg, .. } if arg.slot == usize::MAX)),
+            .any(|node| matches!(node.op(), Op::Param(ops::Param { arg, .. }) if arg.slot == usize::MAX)),
         "canonical production fixture must reach PROGRAM with an unnumbered PARAM"
     );
     if matches!(requested.as_str(), "optimized" | "postrange" | "expanded" | "coalesced" | "gated") {
@@ -320,7 +323,7 @@ fn main() {
         program
             .toposort_call_aware(false)
             .iter()
-            .all(|node| !matches!(node.op(), Op::Param { arg, .. } if arg.slot == usize::MAX)),
+            .all(|node| !matches!(node.op(), Op::Param(ops::Param { arg, .. }) if arg.slot == usize::MAX)),
         "PROGRAM boundary must number every outer executable PARAM"
     );
     if finish_if_requested(&requested, "program", &capture_path) {

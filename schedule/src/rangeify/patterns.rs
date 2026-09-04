@@ -26,9 +26,10 @@ use crate::TypedPatternMatcher;
 use crate::rangeify::transforms::{cast_to_dtype, get_range_size, partition_reduce_ranges};
 
 pub use crate::devectorize::pm_add_loads;
+use svod_ir::ops;
 
 fn is_codegen_param(node: &Arc<UOp>) -> bool {
-    matches!(node.op(), Op::Param { .. })
+    matches!(node.op(), Op::Param(..))
         && node.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_CODEGEN_PARAM))
 }
 
@@ -62,7 +63,7 @@ fn has_zero_size(uop: &Arc<UOp>) -> bool {
 
 /// Ops whose buffers must materialize and therefore cannot be inlined.
 pub fn is_always_run_op(op: &Op) -> bool {
-    matches!(op, Op::Contiguous { .. } | Op::Copy { .. } | Op::Noop)
+    matches!(op, Op::Contiguous(..) | Op::Copy(..) | Op::Noop)
 }
 
 /// Element count of a shaped UOp, or `None` when a dimension is symbolic.
@@ -86,12 +87,12 @@ fn copy_needs_contiguous(src: &Arc<UOp>) -> bool {
     let mut node = src.clone();
     loop {
         match node.op() {
-            Op::Permute { .. } | Op::Flip { .. } => return true,
-            Op::Reshape { src, .. }
-            | Op::Expand { src, .. }
-            | Op::Pad { src, .. }
-            | Op::Shrink { src, .. }
-            | Op::Multi { src, .. } => node = src.clone(),
+            Op::Permute(..) | Op::Flip(..) => return true,
+            Op::Reshape(ops::Reshape { src, .. })
+            | Op::Expand(ops::Expand { src, .. })
+            | Op::Pad(ops::Pad { src, .. })
+            | Op::Shrink(ops::Shrink { src, .. })
+            | Op::Multi(ops::Multi { src, .. }) => node = src.clone(),
             _ => return false,
         }
     }
@@ -115,34 +116,34 @@ pub fn is_elementwise(uop: &Arc<UOp>) -> bool {
 pub fn early_rewrites() -> TypedPatternMatcher {
     crate::patterns! {
         // mop_cleanup: merge adjacent untagged RESHAPEs.
-        x @ Reshape { src: x2, new_shape } if x.tag().is_none() && x2.tag().is_none() && matches!(x2.op(), Op::Reshape { .. }) => {
-            let Op::Reshape { src, .. } = x2.op() else { return None };
-            Some(UOp::new(Op::Reshape { src: src.clone(), new_shape: new_shape.clone() }, x.dtype()))
+        x @ Reshape { src: x2, new_shape } if x.tag().is_none() && x2.tag().is_none() && matches!(x2.op(), Op::Reshape(..)) => {
+            let Op::Reshape(ops::Reshape { src, .. }) = x2.op() else { return None };
+            Some(UOp::new(Op::Reshape(ops::Reshape { src: src.clone(), new_shape: new_shape.clone() }), x.dtype()))
         },
-        Detach(x) ~> |x| x.clone(),
-        ContiguousBackward(x) ~> |x| x.clone(),
+        Detach { src: x } => x.clone(),
+        ContiguousBackward { src: x } => x.clone(),
         // A COPY transfers one contiguous range, so a source that is resized or
         // reordered by a movement op must be materialised first (tinygrad
         // `schedule/rangeify.py:149`). Without this the transfer is sized by the
         // base, not the moved view, and the destination is under-allocated.
         copy @ Copy { src, .. } if src.op().is_movement() && copy_needs_contiguous(src)
-            => |copy, src| Some(copy.with_sources(vec![src.contiguous()])),
+            => Some(copy.with_sources(vec![src.contiguous()])),
         // Same-device COPY is a no-op and returns its source verbatim, tag included
         // (tinygrad `schedule/rangeify.py:153`). The barrier role a tagged COPY used
         // to carry is covered by `is_always_run_op(Copy)`.
         Copy { src, device } if src.device_spec().as_ref() == Some(device)
-            ~> |src| src.clone(),
+            => src.clone(),
         // Reduce of zero-sized input → identity element.
         reduce @ Reduce { src: x, ranges: _, reduce_op: _, num_axes: _ }
             if has_zero_size(x) && !has_zero_size(reduce) => {
-            let Op::Reduce { reduce_op, .. } = reduce.op() else { return None };
+            let Op::Reduce(ops::Reduce { reduce_op, .. }) = reduce.op() else { return None };
             let identity = crate::symbolic::dce::reduce_identity(*reduce_op, reduce.dtype());
             let Op::Const(value) = identity.op() else { unreachable!("reduction identity must be constant") };
             Some(reduce.const_like(value.0))
         },
 
         // Any non-SINK op with zero size → const 0.
-        x if !matches!(x.op(), Op::Sink { .. }) && has_zero_size(x) => {
+        x if !matches!(x.op(), Op::Sink(..)) && has_zero_size(x) => {
             let replacement = x.const_like(0).rtag(x.tag().clone());
             (!Arc::ptr_eq(&replacement, x)).then_some(replacement)
         }
@@ -165,15 +166,15 @@ pub fn apply_rangeify_patterns() -> TypedPatternMatcher<IndexingContext> {
         @context IndexingContext;
         // Tensor REDUCE conversion MUST come first, before STAGE wraps it.
         x @ Reduce { src: _, ranges: _, reduce_op: _, num_axes: _ }
-            => |x, ctx| convert_reduce_with_context(x, ctx),
+            => convert_reduce_with_context(x, ctx),
         // PAD → WHERE conversion BEFORE bufferization.
-        x @ Pad { src: _, begin_pads: _, end_pads: _ } => |x, ctx| convert_pad_to_where(x, ctx),
+        x @ Pad { src: _, begin_pads: _, end_pads: _ } => convert_pad_to_where(x, ctx),
         // STACK → WHERE select on the leading range, BEFORE bufferization.
-        x @ Stack { sources: _ } => |x, ctx| convert_stack_to_where(x, ctx),
+        x @ Stack { sources: _ } => convert_stack_to_where(x, ctx),
         // ALL ops (including movement) get source bufferization.
-        x => |x, ctx| apply_bufferize_transform(x, ctx),
+        x => apply_bufferize_transform(x, ctx),
         // Movement ops get removed AFTER bufferization - simple logic
-        x if x.op().is_movement() => |x, ctx| remove_movement_op(x, ctx),
+        x if x.op().is_movement() => remove_movement_op(x, ctx),
     }
 }
 
@@ -241,7 +242,7 @@ fn convert_stack_to_where(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc
 fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
     let src = x.op().sources().first()?.clone();
 
-    if ctx.get_ranges(x).is_some() || matches!(src.op(), Op::Index { .. }) {
+    if ctx.get_ranges(x).is_some() || matches!(src.op(), Op::Index(..)) {
         return Some(src);
     }
 
@@ -254,7 +255,7 @@ fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp
 /// - Loop form carries the leading input ranges and has `num_axes == 0`.
 /// - Transfer range_map + realize_map to new identity
 fn convert_reduce_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
-    let Op::Reduce { src, ranges, reduce_op, num_axes } = x.op() else {
+    let Op::Reduce(ops::Reduce { src, ranges, reduce_op, num_axes }) = x.op() else {
         return None;
     };
     if *num_axes == 0 {
@@ -287,12 +288,12 @@ fn convert_reduce_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Optio
 #[tracing::instrument]
 pub fn buffer_folding() -> TypedPatternMatcher {
     crate::patterns! {
-        Stage { compute: c @ Const(_), .. } ~> |c| c.clone(),
-        Index { buffer: c @ Const(_), .. } ~> |c| c.clone(),
-        Copy { src: c @ Const(_), .. } ~> |c| c.clone(),
+        Stage { compute: c @ Const(_), .. } => c.clone(),
+        Index { buffer: c @ Const(_), .. } => c.clone(),
+        Copy { src: c @ Const(_), .. } => c.clone(),
         idx @ Index { buffer: MStack { buffers }, .. }
             if !buffers.is_empty() && matches!(buffers[0].base().op(), Op::Const(_))
-            => |idx, buffers| {
+            => {
                 let base = buffers[0].base();
                 if let Op::Const(cv) = base.op() {
                     Some(idx.const_like(cv.0))
@@ -301,8 +302,8 @@ pub fn buffer_folding() -> TypedPatternMatcher {
                 }
             },
         Index { buffer: buf @ Stage { compute, ranges, .. }, indices }
-            if ranges_equal(ranges, indices) && !matches!(compute.op(), Op::Slice { .. })
-            => |compute, buf, ranges| {
+            if ranges_equal(ranges, indices) && !matches!(compute.op(), Op::Slice(..))
+            => {
                 // Merge tags, shrink to stage shape.
                 let mut merged = SmallVec::<[usize; 2]>::new();
                 if let Some(t) = compute.tag() { merged.extend(t.iter().copied()); }
@@ -330,7 +331,7 @@ pub fn buffer_folding() -> TypedPatternMatcher {
 pub fn dead_axis_removal() -> TypedPatternMatcher {
     crate::patterns! {
         // Filter dead axes from STAGE with shape preservation
-        stage @ Stage { compute, ranges, opts } => |stage, compute, ranges, opts| {
+        stage @ Stage { compute, ranges, opts } => {
             cleanup_dead_axes_bufferize(stage, compute, ranges, opts)
         },
     }
@@ -359,7 +360,7 @@ fn cleanup_dead_axes_bufferize(
     // semantics. COPY joins them via `is_always_run_op`, matching the guard
     // `remove_bufferize` already applies: shrinking a copy's destination would
     // under-allocate the transfer.
-    if !opts.removable || is_always_run_op(compute.op()) || matches!(compute.op(), Op::After { .. }) {
+    if !opts.removable || is_always_run_op(compute.op()) || matches!(compute.op(), Op::After(..)) {
         return None;
     }
 
@@ -376,7 +377,7 @@ fn cleanup_dead_axes_bufferize(
     for (i, range) in ranges.iter().enumerate() {
         // Skip symbolic range ends — dead-axis cleanup cannot prove
         // shape/range equivalence before binding values.
-        if let Op::Range { end, .. } = range.op()
+        if let Op::Range(ops::Range { end, .. }) = range.op()
             && !matches!(end.op(), Op::Const(_))
         {
             return None;
@@ -387,7 +388,7 @@ fn cleanup_dead_axes_bufferize(
         // 2. OR it's a RANGE with size 1
         // 3. OR it's a RANGE not in compute's ranges
         let is_const = matches!(range.op(), Op::Const(_));
-        let is_unused = matches!(range.op(), Op::Range { .. }) && !compute_ranges.iter().any(|r| Arc::ptr_eq(r, range));
+        let is_unused = matches!(range.op(), Op::Range(..)) && !compute_ranges.iter().any(|r| Arc::ptr_eq(r, range));
 
         if is_const || is_unused {
             reshape_dims.push(SInt::Const(1)); // Dead axis → size 1
@@ -427,11 +428,11 @@ fn cleanup_dead_axes_bufferize(
 pub fn pm_remove_bufferize() -> TypedPatternMatcher {
     crate::patterns! {
         Index { buffer: Stage { compute: src, ranges: buf_ranges, opts }, indices: idx_ranges, .. }
-            => |src, buf_ranges, idx_ranges, opts| {
+            => {
                 remove_bufferize(src, buf_ranges, idx_ranges, opts)
             },
-        Store { index: x, value: y, .. } if Arc::ptr_eq(x, y) => |_x| Some(UOp::noop()),
-        End { computation: noop, .. } if matches!(noop.op(), Op::Noop) => |noop| Some(noop.clone()),
+        Store { index: x, value: y, .. } if Arc::ptr_eq(x, y) => Some(UOp::noop()),
+        End { computation: noop, .. } if matches!(noop.op(), Op::Noop) => Some(noop.clone()),
     }
 }
 
@@ -455,7 +456,7 @@ fn remove_bufferize(
 
     debug_assert_eq!(buf_ranges.len(), idx_ranges.len(), "INDEX/STAGE range arity mismatch");
     debug_assert!(
-        buf_ranges.iter().all(|r| matches!(r.op(), Op::Range { .. } | Op::Const(_))),
+        buf_ranges.iter().all(|r| matches!(r.op(), Op::Range(..) | Op::Const(_))),
         "STAGE ranges must be Range or Const"
     );
 
@@ -479,26 +480,26 @@ fn remove_bufferize(
         match uop.op() {
             // AFTER is a buffer identity: it costs its own buffer, once, and the
             // producers it orders against are not read by this compute.
-            Op::After { .. } => {
+            Op::After(..) => {
                 buffers.push(uop.buf_uop());
                 return;
             }
             // STORE doesn't count, and we don't look inside it.
-            Op::Store { .. } => return,
+            Op::Store(..) => return,
             // GLOBAL Stage and MStack count + stop traversal.
-            Op::Stage { opts, .. } if opts.addrspace == AddrSpace::Global => {
+            Op::Stage(ops::Stage { opts, .. }) if opts.addrspace == AddrSpace::Global => {
                 buffers.push(Arc::clone(uop));
                 return;
             }
-            Op::MStack { .. } => {
+            Op::MStack(..) => {
                 buffers.push(Arc::clone(uop));
                 return;
             }
             // PARAM (and pre-normalize BUFFER) count but traversal continues.
-            Op::Param { .. } | Op::Buffer { .. } => {
+            Op::Param(..) | Op::Buffer(..) => {
                 buffers.push(Arc::clone(uop));
             }
-            Op::Reduce { .. } => reduces.push(Arc::clone(uop)),
+            Op::Reduce(..) => reduces.push(Arc::clone(uop)),
             _ => {}
         }
         for child in uop.op().sources() {
@@ -523,12 +524,12 @@ fn remove_bufferize(
     if !reduces.is_empty() {
         let reduce_sources: Vec<Arc<UOp>> = reduces
             .iter()
-            .filter_map(|r| if let Op::Reduce { src, .. } = r.op() { Some(Arc::clone(src)) } else { None })
+            .filter_map(|r| if let Op::Reduce(ops::Reduce { src, .. }) = r.op() { Some(Arc::clone(src)) } else { None })
             .collect();
         if !reduce_sources.is_empty() {
             let sink = UOp::sink(reduce_sources);
             let buffer_in_reduce =
-                sink.any_in_subtree(|n| matches!(n.op(), Op::Param { .. } | Op::Buffer { .. } | Op::Stage { .. }));
+                sink.any_in_subtree(|n| matches!(n.op(), Op::Param(..) | Op::Buffer(..) | Op::Stage(..)));
             if buffer_in_reduce {
                 tracing::debug!(
                     src_id = src.id,
@@ -561,7 +562,7 @@ pub fn split_reduceop_patterns() -> TypedPatternMatcher<SplitReduceOpConfig> {
     crate::patterns! {
         @context SplitReduceOpConfig;
         reduce @ Reduce { src: _, ranges: _, reduce_op: _, num_axes: _ }
-            => |reduce, ctx| split_reduceop(reduce, ctx),
+            => split_reduceop(reduce, ctx),
     }
 }
 
@@ -571,9 +572,9 @@ pub fn split_reduceop_patterns() -> TypedPatternMatcher<SplitReduceOpConfig> {
 /// `reduce_collapse` pattern matchers without duplication.
 pub(crate) fn pm_reduce_unparented() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        reduce @ Reduce { src, ranges, reduce_op: Add | Max | Mul, num_axes } => |reduce, src, ranges, reduce_op, num_axes| {
+        reduce @ Reduce { src, ranges, reduce_op: reduce_op @ (ReduceOp::Add | ReduceOp::Max | ReduceOp::Mul), num_axes } => {
             assert!(
-                ranges.iter().all(|r| matches!(r.op(), Op::Range { .. })),
+                ranges.iter().all(|r| matches!(r.op(), Op::Range(..))),
                 "reduce_unparented: all reduce ranges must be RANGE ops, got: {:?}",
                 ranges.iter().map(|r| r.op().as_ref().to_string()).collect::<Vec<_>>()
             );
@@ -710,12 +711,12 @@ pub fn pm_reduce_simplify() -> &'static TypedPatternMatcher {
         pm_reduce_unparented()
             + crate::patterns! {
                 Reduce { src, ranges, reduce_op, num_axes } if *reduce_op == ReduceOp::Add && *num_axes == 0
-                    => |src, ranges, _num_axes| super::transforms::reduce_collapse(src, ranges),
+                    => super::transforms::reduce_collapse(src, ranges),
 
                 Reduce { src, ranges, reduce_op, num_axes }
                     if matches!(reduce_op, ReduceOp::Add | ReduceOp::Max)
                     && matches!(src.op(), Op::Binary(BinaryOp::Mul, _, _))
-                    => |src, ranges, reduce_op, num_axes| reduce_mul_chain(src, ranges, *reduce_op, *num_axes),
+                    => reduce_mul_chain(src, ranges, *reduce_op, *num_axes),
             }
     });
     &CACHED
@@ -730,16 +731,16 @@ pub fn pm_reduce_simplify() -> &'static TypedPatternMatcher {
 /// loop-range arithmetic.
 pub fn movement_op_patterns() -> TypedPatternMatcher {
     crate::patterns! {
-        idx @ Index { buffer: mop, indices } if mop.op().is_movement() => |idx, mop, indices| {
+        idx @ Index { buffer: mop, indices } if mop.op().is_movement() => {
             transform_movement_through_index(mop, indices, idx)
         },
         after @ After { passthrough: r, deps }
-            if r.op().is_movement() || matches!(r.op(), Op::Index { .. })
-            => |after, r, deps| {
+            if r.op().is_movement() || matches!(r.op(), Op::Index(..))
+            => {
                 super::transforms::push_op_through_after(after, r, deps)
             },
         end @ End { computation: mop, ranges } if mop.op().is_movement()
-            => |end, mop, ranges| {
+            => {
                 let src = &mop.op().sources()[0];
                 Some(end.with_sources(std::iter::once(src.clone()).chain(ranges.iter().cloned()).collect()))
             },
@@ -763,7 +764,7 @@ pub(crate) fn transform_movement_through_index(
         return UOp::index().buffer(src.clone()).indices(transformed).dtype(index.dtype()).call().ok();
     }
 
-    if !matches!(mop.op(), Op::Reshape { .. }) {
+    if !matches!(mop.op(), Op::Reshape(..)) {
         return None;
     }
 
@@ -809,11 +810,11 @@ pub fn rangeify_codegen_patterns() -> TypedPatternMatcher<LocalAddBufferContext>
     crate::patterns! {
         @context LocalAddBufferContext;
         // NOOP → zero constant (scalar or vector)
-        noop @ Noop() if noop.dtype().base() != svod_dtype::ScalarDType::Void => |noop, _ctx| {
+        noop @ Noop if noop.dtype().base() != svod_dtype::ScalarDType::Void => {
             Some(dtype_zero(noop.dtype()))
         },
         // CONTIGUOUS: extract hints and return source.
-        Contiguous { src, opts } => |src, opts, ctx| {
+        Contiguous { src, opts } => {
             if !opts.is_empty() {
                 ctx.opts.extend(opts.iter().cloned());
             }
@@ -830,11 +831,11 @@ pub fn rangeify_codegen_patterns() -> TypedPatternMatcher<LocalAddBufferContext>
 pub fn rangeify_codegen_simple() -> TypedPatternMatcher {
     crate::patterns! {
         // NOOP → zero constant (scalar or vector)
-        noop @ Noop() if noop.dtype().base() != svod_dtype::ScalarDType::Void => |noop| {
+        noop @ Noop if noop.dtype().base() != svod_dtype::ScalarDType::Void => {
             Some(dtype_zero(noop.dtype()))
         },
         // CONTIGUOUS → source (strip wrapper, no opts to extract at this stage)
-        Contiguous { src, .. } => |src| {
+        Contiguous { src, .. } => {
             Some(src.clone())
         },
     }
@@ -855,18 +856,18 @@ fn extract_base_dtype(dtype: DType) -> DType {
 /// Extract buffer from AFTER passthrough (handles MStack/MSelect).
 fn extract_buffer_from_after(passthrough: &Arc<UOp>) -> Arc<UOp> {
     match passthrough.op() {
-        Op::MStack { buffers } if !buffers.is_empty() => buffers[0].clone(),
-        Op::MSelect { buffer, .. } => buffer.clone(),
+        Op::MStack(ops::MStack { buffers }) if !buffers.is_empty() => buffers[0].clone(),
+        Op::MSelect(ops::MSelect { buffer, .. }) => buffer.clone(),
         _ => passthrough.clone(),
     }
 }
 
 fn storage_addrspace(node: &Arc<UOp>) -> Option<AddrSpace> {
     match node.op() {
-        Op::Buffer { arg, .. } | Op::Param { arg, .. } => arg.addrspace,
-        Op::Slice { buffer, .. } | Op::MSelect { buffer, .. } => storage_addrspace(buffer),
-        Op::After { passthrough, .. } => storage_addrspace(passthrough),
-        Op::MStack { buffers } => buffers.first().and_then(storage_addrspace),
+        Op::Buffer(ops::Buffer { arg, .. }) | Op::Param(ops::Param { arg, .. }) => arg.addrspace,
+        Op::Slice(ops::Slice { buffer, .. }) | Op::MSelect(ops::MSelect { buffer, .. }) => storage_addrspace(buffer),
+        Op::After(ops::After { passthrough, .. }) => storage_addrspace(passthrough),
+        Op::MStack(ops::MStack { buffers }) => buffers.first().and_then(storage_addrspace),
         _ => None,
     }
 }
@@ -877,7 +878,7 @@ fn find_kernel_output(ast: &Arc<UOp>) -> Option<Arc<UOp>> {
         // Use store_buffer() helper to get buffer from STORE via its INDEX child
         if let Some(buffer) = node.store_buffer() {
             let output_buf = match buffer.op() {
-                Op::Index { buffer: inner_buf, .. } => inner_buf.clone(),
+                Op::Index(ops::Index { buffer: inner_buf, .. }) => inner_buf.clone(),
                 _ => buffer.clone(),
             };
             if is_codegen_param(&output_buf) {
@@ -892,8 +893,8 @@ fn map_after_like_node(node: &Arc<UOp>, ctx: &mut LocalAddBufferContext) -> Opti
     // buf = after.buf_uop(); if buf is MSTACK/MSELECT, descend into its first source.
     let mut buf = node.buf_uop();
     buf = match buf.op() {
-        Op::MStack { buffers } if !buffers.is_empty() => buffers[0].clone(),
-        Op::MSelect { buffer, .. } => buffer.clone(),
+        Op::MStack(ops::MStack { buffers }) if !buffers.is_empty() => buffers[0].clone(),
+        Op::MSelect(ops::MSelect { buffer, .. }) => buffer.clone(),
         _ => buf,
     };
 
@@ -920,14 +921,14 @@ pub fn to_param_patterns() -> TypedPatternMatcher<RangeifyBufferContext> {
     crate::patterns! {
         @context RangeifyBufferContext;
         // Only global buffers participate in the CALL ABI.
-        buf @ Buffer { arg } if arg.addrspace == Some(AddrSpace::Global) => |buf, ctx| {
+        buf @ Buffer { arg } if arg.addrspace == Some(AddrSpace::Global) => {
             let size = buf.buffer_size()?;
             let replacement = UOp::param(ctx.next_global(), size, extract_base_dtype(buf.dtype()), arg.device.clone());
             ctx.map_buffer(buf.clone(), replacement.clone());
             Some(replacement)
         },
         // Remove BIND: extract var and track it with its bound value
-        Bind { var, value } => |var, value, ctx| {
+        Bind { var, value } => {
             let bound_val = match value.op() {
                 Op::Const(cv) => cv.0.try_int(),
                 _ => None,
@@ -936,7 +937,7 @@ pub fn to_param_patterns() -> TypedPatternMatcher<RangeifyBufferContext> {
             Some(var.clone())
         },
         // Handle AFTER: extract buffer and track dependency
-        after @ After { passthrough } => |after, passthrough, ctx| {
+        after @ After { passthrough } => {
             let buf = extract_buffer_from_after(passthrough);
             if matches!(storage_addrspace(&buf), Some(AddrSpace::Local | AddrSpace::Reg)) {
                 return Some(buf);
@@ -945,16 +946,16 @@ pub fn to_param_patterns() -> TypedPatternMatcher<RangeifyBufferContext> {
             Some(buf)
         },
         // Replace RANGE(end=0) with CONST(0)
-        Range { end } if matches!(end.op(), Op::Const(v) if v.0.is_zero()) => |_r, ctx| {
+        Range { end } if matches!(end.op(), Op::Const(v) if v.0.is_zero()) => {
             ctx.next_range();
             Some(UOp::index_const(0))
         },
         // Renumber RANGE axis_id (Unrenumbered → Renumbered)
-        Range { end, axis_id, axis_type } if matches!(axis_id, AxisId::Unrenumbered(_)) => |_r, end, axis_type, ctx| {
+        Range { end, axis_id, axis_type } if matches!(axis_id, AxisId::Unrenumbered(_)) => {
             Some(UOp::range_axis(end.clone(), AxisId::Renumbered(ctx.next_range()), *axis_type))
         },
         // Replace CALL references with their output buffer
-        Call { body, args: _, info: _ } => |_c, body, _ctx| find_kernel_output(body),
+        Call { body, args: _, info: _ } => find_kernel_output(body),
     }
 }
 
@@ -966,7 +967,7 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
         @context LocalAddBufferContext;
         // Only global storage is part of the CALL ABI. REG/LOCAL BUFFERs remain
         // structured compiler-managed allocations and must not consume slots.
-        buf @ Buffer { arg } if arg.addrspace == Some(AddrSpace::Global) => |buf, ctx| {
+        buf @ Buffer { arg } if arg.addrspace == Some(AddrSpace::Global) => {
             let size = buf.buffer_size()?;
             let replacement = mark_codegen_param(UOp::param(
                 ctx.next_param_slot(),
@@ -983,18 +984,18 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
         // this rule from repeatedly matching its own replacement.
         buf @ Param { arg }
             if !is_codegen_param(buf) && arg.device.is_some() && arg.addrspace == Some(AddrSpace::Global)
-            => |buf, arg, ctx| {
-            let Op::Param { shape, .. } = buf.op() else { unreachable!() };
+            => {
+            let Op::Param(ops::Param { shape, .. }) = buf.op() else { unreachable!() };
             let mut arg = arg.clone();
             arg.slot = ctx.next_param_slot();
-            let replacement = mark_codegen_param(UOp::new(Op::Param { shape: shape.clone(), arg }, buf.dtype()).rtag(buf.tag().clone()));
+            let replacement = mark_codegen_param(UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg }), buf.dtype()).rtag(buf.tag().clone()));
             if !ctx.has_buffer(buf) {
                 ctx.map_buffer(buf.clone(), buf.clone());
             }
             Some(replacement)
         },
         // Remove BIND in AST while preserving the binding as a CALL source.
-        b @ Bind { var, value } => |b, var, value, ctx| {
+        b @ Bind { var, value } => {
             let _ = b;
             let bound_val = match value.op() {
                 Op::Const(cv) => cv.0.try_int(),
@@ -1009,16 +1010,16 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
             Some(var.clone())
         },
         // Handle AFTER, MSTACK, MSELECT uniformly.
-        after @ After { passthrough: _ } => |after, _ctx_passthrough, ctx| map_after_like_node(after, ctx),
-        m @ MStack { buffers: _ } => |m, ctx| map_after_like_node(m, ctx),
-        m @ MSelect { buffer: _, device_index: _ } => |m, ctx| map_after_like_node(m, ctx),
+        after @ After { passthrough: _ } => map_after_like_node(after, ctx),
+        m @ MStack { buffers: _ } => map_after_like_node(m, ctx),
+        m @ MSelect { buffer: _, device_index: _ } => map_after_like_node(m, ctx),
         // Replace RANGE(end=0) with CONST(0)
-        Range { end } if matches!(end.op(), Op::Const(v) if v.0.is_zero()) => |_r, ctx| {
+        Range { end } if matches!(end.op(), Op::Const(v) if v.0.is_zero()) => {
             ctx.next_range();
             Some(UOp::index_const(0))
         },
         // Renumber Unrenumbered Range axis_id.
-        Range { end, axis_id, axis_type } if matches!(axis_id, AxisId::Unrenumbered(_)) => |_r, end, axis_type, ctx| {
+        Range { end, axis_id, axis_type } if matches!(axis_id, AxisId::Unrenumbered(_)) => {
             Some(UOp::range_axis(end.clone(), AxisId::Renumbered(ctx.next_range()), *axis_type))
         },
     }
@@ -1031,8 +1032,8 @@ pub fn split_kernels_pattern() -> TypedPatternMatcher<Vec<Arc<UOp>>> {
     use super::kernel::split_store;
     crate::patterns! {
         @context Vec<Arc<UOp>>;
-        x @ Store { index: _, value: _, .. } => |x, ctx| split_store(ctx, x),
-        x @ End { computation: _ } => |x, ctx| split_store(ctx, x),
+        x @ Store { index: _, value: _, .. } => split_store(ctx, x),
+        x @ End { computation: _ } => split_store(ctx, x),
     }
 }
 
@@ -1051,9 +1052,11 @@ pub fn extract_device_from_graph(root: &Arc<UOp>) -> Option<DeviceSpec> {
         }
 
         match uop.op() {
-            Op::Buffer { arg, .. } => return arg.device.clone(),
-            Op::Copy { device, .. } | Op::AllReduce { device, .. } => return Some(device.clone()),
-            Op::Stage { opts, .. } => {
+            Op::Buffer(ops::Buffer { arg, .. }) => return arg.device.clone(),
+            Op::Copy(ops::Copy { device, .. }) | Op::AllReduce(ops::AllReduce { device, .. }) => {
+                return Some(device.clone());
+            }
+            Op::Stage(ops::Stage { opts, .. }) => {
                 if let Some(device_spec) = &opts.device {
                     return Some(device_spec.clone());
                 }
@@ -1083,13 +1086,13 @@ pub fn buffer_limit_patterns(max_buffers: usize) -> TypedPatternMatcher<Indexing
     crate::patterns! {
         @context IndexingContext;
         for op in binary [*] {
-            tree@op(a, b) => |tree, a, b, ctx| {
+            tree@op(a, b) => {
                 check_buffer_limit(tree, &[a.clone(), b.clone()], max_buffers, ctx)
             },
         }
 
         for op in ternary [*] {
-            tree@op(a, b, c) => |tree, a, b, c, ctx| {
+            tree@op(a, b, c) => {
                 check_buffer_limit(tree, &[a.clone(), b.clone(), c.clone()], max_buffers, ctx)
             },
         }
@@ -1140,11 +1143,11 @@ fn collect_accessed_buffers(sources: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
             return;
         }
         match uop.op() {
-            Op::Stage { opts, .. } if opts.addrspace == AddrSpace::Global => {
+            Op::Stage(ops::Stage { opts, .. }) if opts.addrspace == AddrSpace::Global => {
                 buffers.push(Arc::clone(uop));
                 return; // Stop at GLOBAL stage
             }
-            Op::Buffer { .. } | Op::MStack { .. } | Op::MSelect { .. } => {
+            Op::Buffer(..) | Op::MStack(..) | Op::MSelect(..) => {
                 buffers.push(Arc::clone(uop));
             }
             _ => {}
@@ -1173,8 +1176,8 @@ fn force_bufferize(src: &Arc<UOp>, ctx: &mut IndexingContext) -> Arc<UOp> {
     let end_ranges: Vec<_> = original_ranges
         .iter()
         .map(|range| match range.op() {
-            Op::Range { axis_type: AxisType::Device, .. } => range.clone(),
-            Op::Range { end, .. } => ctx.new_range_from_uop(end, AxisType::Weak),
+            Op::Range(ops::Range { axis_type: AxisType::Device, .. }) => range.clone(),
+            Op::Range(ops::Range { end, .. }) => ctx.new_range_from_uop(end, AxisType::Weak),
             _ => range.clone(),
         })
         .collect();
@@ -1268,8 +1271,8 @@ fn devectorize_generic(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
             // that must be updated to scalar, not just the UOp's result dtype.
             // The generic replace chain doesn't update Op::Cast::dtype.
             match uop.op() {
-                Op::Cast { .. } => new_sources[0].cast(scalar_dtype.clone()),
-                Op::BitCast { .. } => new_sources[0].bitcast(scalar_dtype.clone()),
+                Op::Cast(..) => new_sources[0].cast(scalar_dtype.clone()),
+                Op::BitCast(..) => new_sources[0].bitcast(scalar_dtype.clone()),
                 _ => uop.replace().dtype(scalar_dtype.clone()).src(new_sources).call(),
             }
         })
@@ -1295,20 +1298,20 @@ pub fn pm_bool_devectorize() -> &'static TypedPatternMatcher<()> {
         // Any binary op that produces vectorized bool output
         // Covers: And, Or, Xor, Max on bool vectors AND Lt, Le, Eq, Ne, Gt, Ge comparisons
         for op in binary [*] {
-            result @ op(a, b) if is_vectorized_bool(&result.dtype()) => |result, a, b| {
+            result @ op(a, b) if is_vectorized_bool(&result.dtype()) => {
                 devectorize_binary(&op, result, a, b)
             },
         },
 
         // Any unary op that produces vectorized bool (only Not applies)
         for op in unary [*] {
-            result @ op(src) if is_vectorized_bool(&result.dtype()) => |result, src| {
+            result @ op(src) if is_vectorized_bool(&result.dtype()) => {
                 devectorize_unary(&op, result, src)
             },
         },
 
         // WHERE with vectorized condition (output may not be bool, but condition is).
-        Where(cond, t, f) if cond.dtype().vcount() > 1 => |cond, t, f| {
+        Where(cond, t, f) if cond.dtype().vcount() > 1 => {
             devectorize_where(cond, t, f)
         },
 
@@ -1357,7 +1360,7 @@ fn devectorize_where(cond: &Arc<UOp>, t: &Arc<UOp>, f: &Arc<UOp>) -> Option<Arc<
 /// Check for a vectorized bool reduction that must use scalar accumulators to
 /// avoid LLVM `<N x i1>` accumulator issues.
 fn needs_reduce_devectorize(reduce: &Arc<UOp>) -> bool {
-    let Op::Reduce { src, .. } = reduce.op() else {
+    let Op::Reduce(ops::Reduce { src, .. }) = reduce.op() else {
         return false;
     };
 
@@ -1377,7 +1380,7 @@ fn is_bool_reduce(reduce: &Arc<UOp>, src: &Arc<UOp>) -> bool {
 /// Devectorize matching bool reductions into scalar REDUCEs plus STACK.
 pub fn pm_reduce_devectorize() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
-        reduce @ Reduce { src } if needs_reduce_devectorize(reduce) => |reduce, src| {
+        reduce @ Reduce { src } if needs_reduce_devectorize(reduce) => {
             is_bool_reduce(reduce, src).then(|| devectorize_bool_reduce(reduce)).flatten()
         },
     }
@@ -1401,7 +1404,7 @@ pub fn pm_reduce_devectorize() -> &'static TypedPatternMatcher<()> {
 ///   )
 /// ```
 fn devectorize_bool_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Reduce { src, ranges, reduce_op, num_axes } = reduce.op() else {
+    let Op::Reduce(ops::Reduce { src, ranges, reduce_op, num_axes }) = reduce.op() else {
         return None;
     };
 
@@ -1424,7 +1427,12 @@ fn devectorize_bool_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         .map(|i| {
             let src_elem = src.index_axes(vec![i]);
             UOp::new(
-                Op::Reduce { src: src_elem, ranges: ranges.clone(), reduce_op: *reduce_op, num_axes: *num_axes },
+                Op::Reduce(ops::Reduce {
+                    src: src_elem,
+                    ranges: ranges.clone(),
+                    reduce_op: *reduce_op,
+                    num_axes: *num_axes,
+                }),
                 scalar_dtype.clone(),
             )
         })
@@ -1447,7 +1455,7 @@ pub fn pm_fma_decomposition() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
         // (a*b)+c or c+(a*b) → MulAcc(a,b,c) using commutative matching
         // Dtype equality guard is an early-out; try_mulacc also validates matching dtypes.
-        Add[Mul(a, b), c] if a.dtype().is_float() && a.dtype() == b.dtype() && a.dtype() == c.dtype() => |a, b, c| {
+        Add[Mul(a, b), c] if a.dtype().is_float() && a.dtype() == b.dtype() && a.dtype() == c.dtype() => {
             UOp::try_mulacc(a.clone(), b.clone(), c.clone()).ok()
         },
     }
@@ -1522,7 +1530,7 @@ fn try_reduce_collapse(
     }
 
     let range = &ranges[0];
-    let Op::Range { end, .. } = range.op() else {
+    let Op::Range(ops::Range { end, .. }) = range.op() else {
         return None;
     };
 
@@ -1615,7 +1623,7 @@ fn try_reduce_collapse(
             _ => None,
         }?;
 
-        let actual_range = if let Op::Cast { src, .. } = cmp_range.op() { src } else { cmp_range };
+        let actual_range = if let Op::Cast(ops::Cast { src, .. }) = cmp_range.op() { src } else { cmp_range };
         if Arc::ptr_eq(actual_range, range) {
             return gated_collapse_core(idx, range, end, expr);
         }
@@ -1700,7 +1708,7 @@ fn try_param_factor(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option<
         return None;
     };
 
-    let is_alu_param = |u: &Arc<UOp>| matches!(u.op(), Op::Param { arg, .. } if arg.addrspace.is_none());
+    let is_alu_param = |u: &Arc<UOp>| matches!(u.op(), Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none());
     let (define_var, other) = if is_alu_param(and_lhs) {
         (and_lhs.clone(), and_rhs.clone())
     } else if is_alu_param(and_rhs) {
@@ -1737,7 +1745,7 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // Unwrap optional CAST to get the inner expression (or_casted pattern).
     // When CAST is present, we need to cast the rhs constant to the inner dtype.
-    let (inner_lhs, effective_rhs) = if let Op::Cast { src, .. } = lhs.op() {
+    let (inner_lhs, effective_rhs) = if let Op::Cast(ops::Cast { src, .. }) = lhs.op() {
         let inner_dtype = src.dtype();
         let casted_rhs = rhs.cast(inner_dtype);
         (src.as_ref(), casted_rhs)
@@ -1809,7 +1817,7 @@ fn try_lift_arithmetic_from_eq(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
     };
 
     // Unwrap optional CAST, adjusting rhs to inner dtype
-    let (inner_lhs, effective_rhs) = if let Op::Cast { src, .. } = lhs.op() {
+    let (inner_lhs, effective_rhs) = if let Op::Cast(ops::Cast { src, .. }) = lhs.op() {
         (src.as_ref(), rhs.cast(src.dtype()))
     } else {
         (lhs.as_ref(), rhs.clone())
@@ -1873,7 +1881,7 @@ pub fn pm_load_collapse() -> &'static TypedPatternMatcher<()> {
         // (build_reduce_load_collapse_matcher), not at this level.
         _reduce @ Reduce { src, ranges, reduce_op, num_axes }
             if ranges.len() == 1 && *reduce_op == ReduceOp::Add && *num_axes == 0
-            => |src, ranges, _num_axes| {
+            => {
                 super::transforms::reduce_load_collapse(src, ranges)
             },
 
@@ -1883,7 +1891,7 @@ pub fn pm_load_collapse() -> &'static TypedPatternMatcher<()> {
         // applied when the lifted form risks integer overflow on loaded values.
         Lt(Add(x, y), c)
             if x.dtype() == DType::WeakInt && !no_load(x) && no_load(y) && no_load(c)
-            => |x, y, c| {
+            => {
                 let new_c = c.try_sub(y).ok()?;
                 x.try_cmplt(&new_c).ok()
             },
@@ -1931,13 +1939,13 @@ pub fn build_reduce_load_collapse_matcher() -> &'static TypedPatternMatcher<()> 
 fn ne_lifting_patterns() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // NE lifting: (x + y) != c → x != (c - y) when no_range(y, c)
-        Ne(Add(x, y), c) if no_range(y) && no_range(c) => |x, y, c| {
+        Ne(Add(x, y), c) if no_range(y) && no_range(c) => {
             let new_c = c.try_sub(y).ok()?;
             x.try_cmpne(&new_c).ok()
         },
 
         // .or_casted() NE: Cast(x + y) != c → x != (c.cast(inner_dtype) - y)
-        Ne(Cast { src: inner, .. }, c) if no_range(c) => |inner, c| {
+        Ne(Cast { src: inner, .. }, c) if no_range(c) => {
             let Op::Binary(BinaryOp::Add, x, y) = inner.op() else { return None };
             if !no_range(y) { return None; }
             let casted_c = c.cast(inner.dtype());
@@ -1963,11 +1971,11 @@ fn reduce_collapse_inner_patterns() -> TypedPatternMatcher<()> {
     // Lt/Ge arithmetic lifting: push range-free operands to rhs of comparison.
     // Handles direct and .or_casted() (CAST-wrapped) Add/Mul forms.
     + crate::patterns! {
-        cond @ Lt(_, rhs) if no_range(rhs) => |cond| try_lift_arithmetic_from_lt(cond),
-        cond @ Ge(_, rhs) if no_range(rhs) => |cond| try_lift_arithmetic_from_ge(cond),
+        cond @ Lt(_, rhs) if no_range(rhs) => try_lift_arithmetic_from_lt(cond),
+        cond @ Ge(_, rhs) if no_range(rhs) => try_lift_arithmetic_from_ge(cond),
 
         // Distributive: (x+y).reduce(ADD) → x.reduce(ADD) + y.reduce(ADD)
-        Reduce { src, ranges, reduce_op, num_axes } if *reduce_op == ReduceOp::Add => |src, ranges, num_axes| {
+        Reduce { src, ranges, reduce_op, num_axes } if *reduce_op == ReduceOp::Add => {
             let Op::Binary(BinaryOp::Add, x, y) = src.op() else { return None };
             let x_reduced = x.reduce_with_num_axes(ranges.clone(), ReduceOp::Add, *num_axes);
             let y_reduced = y.reduce_with_num_axes(ranges.clone(), ReduceOp::Add, *num_axes);
@@ -1979,13 +1987,13 @@ fn reduce_collapse_inner_patterns() -> TypedPatternMatcher<()> {
         // Patterns: bound-from-below, bound-from-above, two-sided, gated NE/EQ collapse.
         reduce @ Reduce { src, ranges, reduce_op, num_axes }
             if !ranges.is_empty() && *reduce_op == ReduceOp::Add && *num_axes == 0
-            => |reduce, src, ranges, _num_axes| {
+            => {
                 try_reduce_collapse(reduce, src, ranges, ReduceOp::Add)
                     .or_else(|| try_param_factor(src, ranges))
             },
 
         // MUL casted bool: x * gate:bool.cast() → gate.where(x, 0)
-        Mul[x, Cast { src: gate, .. }] if gate.dtype() == DType::Bool => |x, gate| {
+        Mul[x, Cast { src: gate, .. }] if gate.dtype() == DType::Bool => {
             let zero = UOp::const_(x.dtype(), ConstValue::zero(x.dtype().base()));
             UOp::try_where(gate.clone(), x.clone(), zero).ok()
         },
@@ -1995,7 +2003,7 @@ fn reduce_collapse_inner_patterns() -> TypedPatternMatcher<()> {
         // because the mega-pass buffer_folding inlines arange constants
         // beforehand; per-kernel pm_load_collapse runs before buffer_folding
         // and can't see through LOADs.
-        cond @ Eq[_, c] if no_range(c) => |cond| try_lift_arithmetic_from_eq(cond),
+        cond @ Eq[_, c] if no_range(c) => try_lift_arithmetic_from_eq(cond),
     }
 }
 
@@ -2014,7 +2022,7 @@ pub fn pm_mod_to_and() -> &'static TypedPatternMatcher<()> {
     use svod_ir::types::ConstValue;
     crate::cached_patterns! {
         // x % c where c is power of two → x & (c - 1)
-        FloorMod(x, _c @const(c_val)) => |x, c_val| {
+        FloorMod(x, _c @const(c_val)) => {
             // Only apply to integer types
             if !x.dtype().is_int() { return None; }
 
@@ -2041,7 +2049,7 @@ pub fn pm_mul_to_shl() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
         // x * c where c is power of two → x << log2(c)
         // Note: Only applies to integer types, but we check inside the closure
-        Mul[x, _c @const(c_val)] => |x, c_val| {
+        Mul[x, _c @const(c_val)] => {
             // Only apply to integer types
             if !x.dtype().is_int() { return None; }
 
@@ -2064,12 +2072,12 @@ pub fn pm_neg_from_mul() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
         // x * -1 → NEG(x)
         // Uses raw UOp::new to avoid infinite loop since .neg() now produces MUL(x, -1).
-        Mul[x, _c @const(c_val)] if c_val.is_neg_one() => |x| {
+        Mul[x, _c @const(c_val)] if c_val.is_neg_one() => {
             let dtype = x.dtype();
             Some(UOp::new(Op::Unary(UnaryOp::Neg, x.clone()), dtype))
         },
         // x + NEG(y) → SUB(x, y).
-        Add[x, Neg(y)] ~> UOp::alu(BinaryOp::Sub, x.clone(), y.clone()),
+        Add[x, Neg(y)] => UOp::alu(BinaryOp::Sub, x.clone(), y.clone()),
     }
 }
 
@@ -2080,7 +2088,7 @@ pub fn pm_neg_from_mul() -> &'static TypedPatternMatcher<()> {
 /// recombine to uint64.
 pub fn pm_threefry_decomp() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
-        Threefry(x, key) if x.dtype() == DType::UInt64 => |x, key| {
+        Threefry(x, key) if x.dtype() == DType::UInt64 => {
             Some(threefry2x32(x, key))
         },
     }
@@ -2136,7 +2144,7 @@ fn threefry2x32(x: &Arc<UOp>, key: &Arc<UOp>) -> Arc<UOp> {
 /// Reduces one NOT instruction by factoring out negation.
 pub fn pm_demorgan() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
-        And[Not(x), Not(y)] if x.dtype().is_bool() ~> x.or_(y).not(),
+        And[Not(x), Not(y)] if x.dtype().is_bool() => x.or_(y).not(),
     }
 }
 
@@ -2146,7 +2154,7 @@ pub fn pm_demorgan() -> &'static TypedPatternMatcher<()> {
 /// `(x << n) + c` can fuse to MULACC(x, 2^n, c) for backends with FMA.
 pub fn pm_shl_add_to_mulacc() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
-        Add[Shl(x, _n @const(nv)), c] => |x, nv, c| {
+        Add[Shl(x, _n @const(nv)), c] => {
             let ConstValue::Int(v) = nv else { return None };
             if !(0..64).contains(&v) { return None; }
             let multiplier = UOp::const_(x.dtype(), ConstValue::Int(1i64 << v));
@@ -2169,7 +2177,7 @@ pub fn pm_div_to_shr() -> &'static TypedPatternMatcher<()> {
 
     crate::cached_patterns! {
         // C-style x / c where c is power of two.
-        CDiv(x, _c @const(c_val)) => |x, c_val| {
+        CDiv(x, _c @const(c_val)) => {
             // Only apply to integer types
             if !x.dtype().is_int() { return None; }
 
@@ -2218,7 +2226,7 @@ pub fn pm_div_to_shr() -> &'static TypedPatternMatcher<()> {
 pub fn pm_max_decomposition() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
         // MAX(a, b) → (a < b).where(b, a)
-        Max(a, b) => |a, b| {
+        Max(a, b) => {
             let cond = a.try_cmplt(b).ok()?;
             UOp::try_where(cond, b.clone(), a.clone()).ok()
         },
@@ -2232,7 +2240,7 @@ pub fn pm_max_decomposition() -> &'static TypedPatternMatcher<()> {
 pub fn pm_sqrt_decomposition() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
         // SQRT(x) → POW(x, 0.5)
-        Sqrt(x) if x.dtype().is_float() => |x| {
+        Sqrt(x) if x.dtype().is_float() => {
             let half = UOp::const_(x.dtype(), svod_ir::types::ConstValue::Float(0.5));
             x.try_pow(&half).ok()
         },
@@ -2250,7 +2258,7 @@ pub fn pm_sqrt_decomposition() -> &'static TypedPatternMatcher<()> {
 ///       P(t) = polyN(t, [1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592])
 pub fn pm_erf_decomposition() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
-        Erf(x) if x.dtype().is_float() => |x| {
+        Erf(x) if x.dtype().is_float() => {
             let dt = x.dtype();
             let f = |v: f64| UOp::const_(dt.clone(), ConstValue::Float(v));
 
@@ -2284,7 +2292,7 @@ pub fn pm_fdiv_to_mul() -> &'static TypedPatternMatcher<()> {
     use svod_ir::types::ConstValue;
     crate::cached_patterns! {
         // x / c → x * (1/c) for float constants
-        Fdiv(x, _c @const(c_val)) => |x, c_val| {
+        Fdiv(x, _c @const(c_val)) => {
             // Only apply to float types
             if !x.dtype().is_float() { return None; }
 
@@ -2318,7 +2326,7 @@ pub fn pm_comparison_negations() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
         // !(x < c) → (c-1) < x for integers
         // When x >= c, that's equivalent to (c-1) < x
-        Not(Lt(x, _c @const(c_val))) if x.dtype().is_int() => |x, c_val| {
+        Not(Lt(x, _c @const(c_val))) if x.dtype().is_int() => {
             let v = match c_val {
                 ConstValue::Int(v) => v,
                 ConstValue::UInt(v) => i64::try_from(v).ok()?,
@@ -2332,7 +2340,7 @@ pub fn pm_comparison_negations() -> &'static TypedPatternMatcher<()> {
 
         // !(c < x) → x < (c+1) for integers
         // When x <= c, that's equivalent to x < (c+1)
-        Not(Lt(_c @const(c_val), x)) if x.dtype().is_int() => |x, c_val| {
+        Not(Lt(_c @const(c_val), x)) if x.dtype().is_int() => {
             let v = match c_val {
                 ConstValue::Int(v) => v,
                 ConstValue::UInt(v) => i64::try_from(v).ok()?,
@@ -2348,7 +2356,7 @@ pub fn pm_comparison_negations() -> &'static TypedPatternMatcher<()> {
         // When x is in the open interval (c1, c2) and c2 - c1 == 2, x must be c1+1
         And[Lt(_c1 @const(c1_val), x), Lt(x2, _c2 @const(c2_val))]
             if x.dtype().is_int() && Arc::ptr_eq(x, x2)
-            => |x, c1_val, c2_val| {
+            => {
                 let v1 = match c1_val {
                     ConstValue::Int(v) => v,
                     ConstValue::UInt(v) => i64::try_from(v).ok()?,
@@ -2367,7 +2375,7 @@ pub fn pm_comparison_negations() -> &'static TypedPatternMatcher<()> {
 
         // x*-1 < c → -c < x for integers.
         // When comparing a negated value with a constant, flip the comparison.
-        Lt(Mul(x, _neg1 @const(neg_val)), _c @const(c_val)) if x.dtype().is_int() => |x, neg_val, c_val| {
+        Lt(Mul(x, _neg1 @const(neg_val)), _c @const(c_val)) if x.dtype().is_int() => {
             // Check that we're multiplying by -1
             if !matches!(neg_val, ConstValue::Int(-1)) { return None; }
 
@@ -2385,7 +2393,7 @@ pub fn pm_comparison_negations() -> &'static TypedPatternMatcher<()> {
 
         // x*-1 < y*c → y*(-c) < x for integers
         // When comparing negated x with scaled y, flip and negate scale
-        Lt(Mul(x, _neg1 @const(neg_val)), Mul(y, _c @const(c_val))) if x.dtype().is_int() => |x, neg_val, y, c_val| {
+        Lt(Mul(x, _neg1 @const(neg_val)), Mul(y, _c @const(c_val))) if x.dtype().is_int() => {
             // Check that we're multiplying x by -1
             if !matches!(neg_val, ConstValue::Int(-1)) { return None; }
 

@@ -26,12 +26,41 @@ pub enum RewriteResult {
     Gate(Arc<UOp>),
 }
 
+/// What a rule's right-hand side may evaluate to.
+///
+/// `Arc<UOp>` always rewrites, `Option<Arc<UOp>>` declines with `None`, and a
+/// `RewriteResult` passes through so a rule can also `Gate`.
+pub trait IntoRewriteResult {
+    fn into_rewrite_result(self) -> RewriteResult;
+}
+
+impl IntoRewriteResult for Arc<UOp> {
+    #[inline]
+    fn into_rewrite_result(self) -> RewriteResult {
+        RewriteResult::Rewritten(self)
+    }
+}
+
+impl IntoRewriteResult for Option<Arc<UOp>> {
+    #[inline]
+    fn into_rewrite_result(self) -> RewriteResult {
+        self.map_or(RewriteResult::NoMatch, RewriteResult::Rewritten)
+    }
+}
+
+impl IntoRewriteResult for RewriteResult {
+    #[inline]
+    fn into_rewrite_result(self) -> RewriteResult {
+        self
+    }
+}
+
 // =============================================================================
 // Pattern Exports
 // =============================================================================
 
 pub use helpers::{const_matches, is_any_const, is_neg_one, is_nonzero, is_one, is_zero, try_const};
-pub use simplified::{PatternClosure, SimplifiedPatternMatcher};
+pub use simplified::{BlockFn, RuleMeta, SimplifiedPatternMatcher};
 
 /// Type alias for backwards compatibility.
 pub type TypedPatternMatcher<C = ()> = SimplifiedPatternMatcher<C>;

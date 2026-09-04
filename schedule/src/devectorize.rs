@@ -14,6 +14,7 @@ use svod_ir::{AxisId, BinaryOp, ConstValue, Op, ReduceOp, UOp, UOpKey};
 
 use crate::TypedPatternMatcher;
 use smallvec::SmallVec;
+use svod_ir::ops;
 
 /// Sentinel `UOp::tag` value marking an END as merge-eligible.
 ///
@@ -25,7 +26,7 @@ pub const TAG_MERGEABLE: usize = 0xFFFF_FFFF_FFFF_FFFE;
 
 #[inline]
 fn is_mergeable_end(uop: &Arc<UOp>) -> bool {
-    matches!(uop.op(), Op::End { .. }) && uop.tag().as_ref().is_some_and(|t| t.contains(&TAG_MERGEABLE))
+    matches!(uop.op(), Op::End(..)) && uop.tag().as_ref().is_some_and(|t| t.contains(&TAG_MERGEABLE))
 }
 
 /// Sorted ids of the END's *enclosing* (still-in-scope) ranges. Two ENDs
@@ -50,7 +51,7 @@ fn next_axis_after(sink: &Arc<UOp>) -> usize {
     sink.toposort()
         .iter()
         .filter_map(|n| match n.op() {
-            Op::Range { axis_id, .. } => Some(axis_id.value()),
+            Op::Range(ops::Range { axis_id, .. }) => Some(axis_id.value()),
             _ => None,
         })
         .max()
@@ -62,9 +63,9 @@ fn next_axis_after(sink: &Arc<UOp>) -> usize {
 /// Used by the merge step when two ENDs share reduce ranges but live at
 /// different nesting depths — the inner group must own its own RANGEs.
 fn clone_range_with_axis(range: &Arc<UOp>, new_axis_id: AxisId) -> Arc<UOp> {
-    if let Op::Range { end, axis_type, deps, .. } = range.op() {
+    if let Op::Range(ops::Range { end, axis_type, deps, .. }) = range.op() {
         UOp::new(
-            Op::Range { end: end.clone(), axis_id: new_axis_id, axis_type: *axis_type, deps: deps.clone() },
+            Op::Range(ops::Range { end: end.clone(), axis_id: new_axis_id, axis_type: *axis_type, deps: deps.clone() }),
             range.dtype(),
         )
     } else {
@@ -96,7 +97,7 @@ impl ReduceContext {
         if !is_mergeable_end(end) {
             return;
         }
-        if let Op::End { ranges, .. } = end.op() {
+        if let Op::End(ops::End { ranges, .. }) = end.op() {
             let mut key: SmallVec<[u64; 4]> = ranges.iter().map(|r| r.id).collect();
             key.sort_unstable();
             self.range_to_ends.entry(key).or_default().push(end.clone());
@@ -131,7 +132,7 @@ fn build_end_merge_subs(
     let mut subs = HashMap::new();
     let mut range_groups: Vec<_> = range_to_ends.values().collect();
     range_groups.sort_by_cached_key(|ends| {
-        let Op::End { ranges, .. } = ends[0].op() else { unreachable!() };
+        let Op::End(ops::End { ranges, .. }) = ends[0].op() else { unreachable!() };
         structural_node_keys(ranges.iter().cloned())
     });
     for ends in range_groups {
@@ -139,7 +140,7 @@ fn build_end_merge_subs(
             continue;
         }
         let original_ranges: SmallVec<[Arc<UOp>; 4]> = match ends[0].op() {
-            Op::End { ranges, .. } => ranges.clone(),
+            Op::End(ops::End { ranges, .. }) => ranges.clone(),
             _ => unreachable!(),
         };
 
@@ -192,7 +193,7 @@ fn build_end_merge_subs(
                 let computations: Vec<Arc<UOp>> = mapped
                     .iter()
                     .map(|e| match e.op() {
-                        Op::End { computation, .. } => computation.clone(),
+                        Op::End(ops::End { computation, .. }) => computation.clone(),
                         _ => unreachable!(),
                     })
                     .collect();
@@ -210,13 +211,13 @@ fn build_end_merge_subs(
 pub(crate) fn merge_register_read_ends(root: Arc<UOp>) -> Arc<UOp> {
     let mut range_to_ends: HashMap<SmallVec<[u64; 4]>, Vec<Arc<UOp>>> = HashMap::new();
     for node in root.toposort() {
-        let Op::After { passthrough, deps } = node.op() else { continue };
+        let Op::After(ops::After { passthrough, deps }) = node.op() else { continue };
         if passthrough.addrspace() != Some(AddrSpace::Reg) {
             continue;
         }
         for dep in deps {
-            let Op::End { ranges, .. } = dep.op() else { continue };
-            if !ranges.iter().all(|range| matches!(range.op(), Op::Range { .. })) {
+            let Op::End(ops::End { ranges, .. }) = dep.op() else { continue };
+            if !ranges.iter().all(|range| matches!(range.op(), Op::Range(..))) {
                 continue;
             }
             let mut key: SmallVec<[u64; 4]> = ranges.iter().map(|range| range.id).collect();
@@ -265,7 +266,7 @@ pub fn bool_storage_patterns() -> &'static TypedPatternMatcher {
         Store { index, value, gate } if value.dtype().base().is_bool() && !UOp::is_invalid_marker(value) => {
             let uint8_dtype = value.dtype().with_base(ScalarDType::UInt8);
             Some(UOp::new(
-                Op::Store { index: index.clone(), value: value.cast(uint8_dtype), gate: gate.clone() },
+                Op::Store(ops::Store { index: index.clone(), value: value.cast(uint8_dtype), gate: gate.clone() }),
                 DType::Void,
             ))
         },
@@ -455,21 +456,21 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
         @context Fp8DecompCtx;
 
         // Defines, INDEX, and SHRINK retain the emulated storage dtype as a tag.
-        x if matches!(x.op(), Op::Param { .. } | Op::Buffer { .. } | Op::Index { .. } | Op::Shrink { .. })
+        x if matches!(x.op(), Op::Param(..) | Op::Buffer(..) | Op::Index(..) | Op::Shrink(..))
             && ctx.should_decomp(x)
         => {
             let uint = DType::Scalar(ctx.from.float_to_uint()?);
             let dtype = if matches!(x.dtype(), DType::Ptr { .. }) { x.dtype().with_ptr_base(uint)? } else { uint };
             let rewritten = match x.op() {
-                Op::Param { shape, arg } => {
+                Op::Param(ops::Param { shape, arg }) => {
                     let mut arg = arg.clone();
                     arg.dtype = DType::Scalar(ctx.from.float_to_uint()?);
-                    UOp::new(Op::Param { shape: shape.clone(), arg }, dtype)
+                    UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg }), dtype)
                 }
-                Op::Buffer { shape, arg } => {
+                Op::Buffer(ops::Buffer { shape, arg }) => {
                     let mut arg = arg.clone();
                     arg.dtype = DType::Scalar(ctx.from.float_to_uint()?);
-                    UOp::new(Op::Buffer { shape: shape.clone(), arg }, dtype)
+                    UOp::new(Op::Buffer(ops::Buffer { shape: shape.clone(), arg }), dtype)
                 }
                 _ => x.with_dtype(dtype),
             };
@@ -501,12 +502,12 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
                 let reindex = |value: &Arc<UOp>| {
                     let lane = lane as i64;
                     match value.op() {
-                        Op::Shrink { src, offsets, .. } => UOp::index()
+                        Op::Shrink(ops::Shrink { src, offsets, .. }) => UOp::index()
                             .buffer(src.clone())
                             .indices(vec![offsets.try_add(&offsets.const_like(lane)).expect("late FP8 offset must add")])
                             .call()
                             .expect("late FP8 SHRINK reindex must be valid"),
-                        Op::Index { buffer, indices } => {
+                        Op::Index(ops::Index { buffer, indices }) => {
                             let mut indices = indices.clone();
                             indices[0] = indices[0]
                                 .try_add(&indices[0].const_like(lane))
@@ -535,7 +536,7 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
         },
 
         // A bitcasted load reads the raw storage word directly.
-        _bc @ BitCast { src: ld, dtype } if matches!(ld.op(), Op::Load { .. }) && ld.dtype().base() == ctx.from => {
+        _bc @ BitCast { src: ld, dtype } if matches!(ld.op(), Op::Load(..)) && ld.dtype().base() == ctx.from => {
             Some(ld.with_dtype(DType::Scalar(ctx.from.float_to_uint()?)).bitcast(dtype.clone()))
         },
 
@@ -560,7 +561,7 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
         },
 
         // Pattern 6: Any op with FP8 output dtype → promote to target float, cast FP8 sources
-        x if !matches!(x.op(), Op::BitCast { .. })
+        x if !matches!(x.op(), Op::BitCast(..))
             && x.dtype().is_float()
             && ctx.should_decomp(x)
         => {
@@ -582,10 +583,10 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
 
         // STORE of a raw bitcast can keep the word directly.
         Store { index, value, gate } if (has_dtype_decomp_tag(index, ctx.from) || index.dtype().base() == ctx.from)
-            && matches!(value.op(), Op::BitCast { .. }) && value.dtype().base() == ctx.from => {
+            && matches!(value.op(), Op::BitCast(..)) && value.dtype().base() == ctx.from => {
             let index = index.with_dtype(DType::Scalar(ctx.from.float_to_uint()?)).with_tag(dtype_decomp_tag(ctx.from));
             Some(UOp::new(
-                Op::Store { index, value: value.with_dtype(DType::Scalar(ctx.from.float_to_uint()?)), gate: gate.clone() },
+                Op::Store(ops::Store { index, value: value.with_dtype(DType::Scalar(ctx.from.float_to_uint()?)), gate: gate.clone() }),
                 DType::Void,
             ))
         },
@@ -595,7 +596,7 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
             let index = index.with_dtype(DType::Scalar(ctx.from.float_to_uint()?)).with_tag(dtype_decomp_tag(ctx.from));
             let value = value.cast(DType::Scalar(ctx.to));
             let raw = f2f(&value.bitcast(DType::Scalar(ctx.to.float_to_uint()?)), ctx.to, ctx.from);
-            Some(UOp::new(Op::Store { index, value: raw, gate: gate.clone() }, DType::Void))
+            Some(UOp::new(Op::Store(ops::Store { index, value: raw, gate: gate.clone() }), DType::Void))
         },
     }
 }
@@ -625,10 +626,10 @@ fn widen_non_native_fp8(node: &Arc<UOp>) -> Option<Arc<UOp>> {
         Op::Ternary(op, first, second, third) if is_ocp_fp8(&node.dtype()) => Some(
             UOp::new(Op::Ternary(*op, widen(first), widen(second), widen(third)), float_dtype()).cast(node.dtype()),
         ),
-        Op::Cast { src, dtype } if is_ocp_fp8(dtype) && src.dtype().base() != ScalarDType::Float32 => {
+        Op::Cast(ops::Cast { src, dtype }) if is_ocp_fp8(dtype) && src.dtype().base() != ScalarDType::Float32 => {
             Some(src.cast(src.dtype().with_base(ScalarDType::Float32)).cast(dtype.clone()))
         }
-        Op::Cast { src, dtype } if is_ocp_fp8(&src.dtype()) && dtype.base() != ScalarDType::Float32 => {
+        Op::Cast(ops::Cast { src, dtype }) if is_ocp_fp8(&src.dtype()) && dtype.base() != ScalarDType::Float32 => {
             Some(src.cast(src.dtype().with_base(ScalarDType::Float32)).cast(dtype.clone()))
         }
         _ => None,
@@ -640,7 +641,7 @@ fn widen_non_native_fp8(node: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// `create_non_native_float_pats`; WMMA and memory nodes remain untouched.
 pub fn amd_non_native_fp8_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        node if matches!(node.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast { .. })
+        node if matches!(node.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast(..))
             => widen_non_native_fp8(node),
     }
 }
@@ -808,7 +809,7 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
     use BinaryOp::*;
 
     // Definitions become twice as many 32-bit words.
-    if matches!(x.op(), Op::Param { .. } | Op::Buffer { .. })
+    if matches!(x.op(), Op::Param(..) | Op::Buffer(..))
         && let Some(from) = long_word_dtype(x.dtype().base())
     {
         let sources = x.op().sources();
@@ -820,15 +821,15 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
         };
         let shape = doubled?;
         let op = match x.op() {
-            Op::Param { arg, .. } => {
+            Op::Param(ops::Param { arg, .. }) => {
                 let mut arg = arg.clone();
                 arg.dtype = DType::Scalar(from);
-                Op::Param { shape, arg }
+                Op::Param(ops::Param { shape, arg })
             }
-            Op::Buffer { arg, .. } => {
+            Op::Buffer(ops::Buffer { arg, .. }) => {
                 let mut arg = arg.clone();
                 arg.dtype = DType::Scalar(from);
-                Op::Buffer { shape, arg }
+                Op::Buffer(ops::Buffer { shape, arg })
             }
             _ => unreachable!(),
         };
@@ -837,7 +838,7 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // A tagged INDEX selects one of the two adjacent words.
     if let Some((word, from)) = tagged_long(x)
-        && let Op::Index { buffer, indices } = x.op()
+        && let Op::Index(ops::Index { buffer, indices }) = x.op()
     {
         // Re-type exactly as the buffer above: INDEX over a global buffer carries the
         // element dtype, and `with_ptr_base` is `None` for anything but a Ptr -- which
@@ -851,11 +852,11 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
         let mut indices = indices.clone();
         let index = indices.last_mut()?;
         *index = index.mul(&index.const_like(2)).add(&index.const_like(word as i64));
-        return Some(UOp::new(Op::Index { buffer: buffer.clone(), indices }, dtype));
+        return Some(UOp::new(Op::Index(ops::Index { buffer: buffer.clone(), indices }), dtype));
     }
 
     // Split each 64-bit STORE into low/high 32-bit stores.
-    if let Op::Store { index, value, gate } = x.op()
+    if let Op::Store(ops::Store { index, value, gate }) = x.op()
         && let Some(from) = long_word_dtype(index.dtype().base())
         && tagged_long(value).is_none()
     {
@@ -865,7 +866,7 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
                 let idx = long_part(index, word, original);
                 let val = long_part(value, word, original);
                 UOp::new_tagged(
-                    Op::Store { index: idx, value: val, gate: gate.clone() },
+                    Op::Store(ops::Store { index: idx, value: val, gate: gate.clone() }),
                     DType::Void,
                     Some(long_tag(word, original)),
                 )
@@ -874,7 +875,7 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
         let _ = from;
         return Some(UOp::group(stores));
     }
-    if matches!(x.op(), Op::Store { .. }) {
+    if matches!(x.op(), Op::Store(..)) {
         return None;
     }
 
@@ -899,7 +900,7 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     // Cast away from a long reconstructs the value from its two words.
-    if let Op::Cast { src, dtype } = x.op()
+    if let Op::Cast(ops::Cast { src, dtype }) = x.op()
         && let Some(word) = long_word_dtype(src.dtype().base())
         && long_word_dtype(dtype.base()).is_none()
     {
@@ -944,7 +945,7 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
     let (word, from) = tagged_long(x)?;
     let word_dt = DType::Scalar(long_word_dtype(from)?);
 
-    if let Op::Load { index, alt, gate } = x.op() {
+    if let Op::Load(ops::Load { index, alt, gate }) = x.op() {
         let index = long_part(index, word, from);
         let alt = alt.as_ref().map(|v| long_part(v, word, from));
         return Some(UOp::load().index(index).maybe_alt(alt).maybe_gate(gate.clone()).call());
@@ -967,7 +968,7 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
         ));
     }
 
-    if let Op::Cast { src, .. } = x.op() {
+    if let Op::Cast(ops::Cast { src, .. }) = x.op() {
         if let Some(src_word) = long_word_dtype(src.dtype().base()) {
             return Some(long_part(src, word, src.dtype().base()).bitcast(DType::Scalar(src_word)).cast(word_dt));
         }
@@ -991,7 +992,7 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
         return UOp::try_where(negative, lo.const_like(-1), lo.const_like(0)).ok();
     }
 
-    if let Op::BitCast { src, .. } = x.op() {
+    if let Op::BitCast(ops::BitCast { src, .. }) = x.op() {
         return Some(long_part(src, word, src.dtype().base()).bitcast(word_dt));
     }
 
@@ -1177,14 +1178,14 @@ fn decompose_long_node(x: &Arc<UOp>) -> Option<Arc<UOp>> {
 #[allow(unused_variables)]
 pub fn pm_long_decomp() -> crate::TypedPatternMatcher {
     crate::patterns! {
-        x @ Param { shape, arg } => |x, shape, arg| { let _ = (shape, arg); decompose_long_node(x) },
-        x @ Buffer { shape, arg } => |x, shape, arg| { let _ = (shape, arg); decompose_long_node(x) },
-        x @ Index { buffer, indices } => |x, buffer, indices| { let _ = (buffer, indices); decompose_long_node(x) },
-        x @ Store { index, value, gate } => |x, index, value, gate| { let _ = (index, value, gate); decompose_long_node(x) },
-        x @ Load { index, alt, gate } => |x, index, alt, gate| { let _ = (index, alt, gate); decompose_long_node(x) },
+        x @ Param { shape, arg } => { let _ = (shape, arg); decompose_long_node(x) },
+        x @ Buffer { shape, arg } => { let _ = (shape, arg); decompose_long_node(x) },
+        x @ Index { buffer, indices } => { let _ = (buffer, indices); decompose_long_node(x) },
+        x @ Store { index, value, gate } => { let _ = (index, value, gate); decompose_long_node(x) },
+        x @ Load { index, alt, gate } => { let _ = (index, alt, gate); decompose_long_node(x) },
         x @ Const(_) => decompose_long_node(x),
-        x @ Cast { src, dtype } => |x, src, dtype| { let _ = (src, dtype); decompose_long_node(x) },
-        x @ BitCast { src, dtype } => |x, src, dtype| { let _ = (src, dtype); decompose_long_node(x) },
+        x @ Cast { src, dtype } => { let _ = (src, dtype); decompose_long_node(x) },
+        x @ BitCast { src, dtype } => { let _ = (src, dtype); decompose_long_node(x) },
         for op in unary [Neg] { x @ op(_) => decompose_long_node(x), }
         for op in binary [Add, Sub, Mul, CDiv, CMod, Max, Lt, Eq, Ne, And, Or, Xor, Shl, Shr] {
             x @ op(_, _) => decompose_long_node(x),
@@ -1246,23 +1247,25 @@ fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
                 .map(|(source_index, source)| {
                     if let Some(invalid) = invalid_base(source) {
                         Ok(invalid)
-                    } else if matches!(alu.op(), Op::Store { .. }) && source_index == 0 {
+                    } else if matches!(alu.op(), Op::Store(..)) && source_index == 0 {
                         let indices: SmallVec<[Arc<UOp>; 4]> =
                             coordinate.iter().map(|&index| UOp::index_const(index as i64)).collect();
                         let (selected, deps) = match source.op() {
-                            Op::Stack { sources } => (const_index_into_stack(sources, &indices), None),
-                            Op::After { passthrough, deps } if matches!(passthrough.op(), Op::Stack { .. }) => {
-                                let Op::Stack { sources } = passthrough.op() else { unreachable!() };
+                            Op::Stack(ops::Stack { sources }) => (const_index_into_stack(sources, &indices), None),
+                            Op::After(ops::After { passthrough, deps })
+                                if matches!(passthrough.op(), Op::Stack(..)) =>
+                            {
+                                let Op::Stack(ops::Stack { sources }) = passthrough.op() else { unreachable!() };
                                 (const_index_into_stack(sources, &indices), Some(deps))
                             }
                             _ => (UOp::index().buffer(source.clone()).indices(indices).call().ok(), None),
                         };
                         let selected = selected.ok_or(svod_ir::Error::IndexOutOfBounds)?;
                         let selected = match selected.op() {
-                            Op::Load { index, .. } => index.clone(),
+                            Op::Load(ops::Load { index, .. }) => index.clone(),
                             _ => selected,
                         };
-                        if let (Some(deps), Op::Index { buffer, indices }) = (deps, selected.op()) {
+                        if let (Some(deps), Op::Index(ops::Index { buffer, indices })) = (deps, selected.op()) {
                             let ordered = buffer.after(deps.clone());
                             Ok(selected.with_sources(std::iter::once(ordered).chain(indices.iter().cloned()).collect()))
                         } else {
@@ -1277,7 +1280,7 @@ fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
                 .collect::<svod_ir::Result<_>>()
                 .ok()?;
             let dtype = if alu.dtype() == DType::Void { DType::Void } else { DType::Scalar(alu.dtype().base()) };
-            if matches!(alu.op(), Op::Cast { .. } | Op::BitCast { .. })
+            if matches!(alu.op(), Op::Cast(..) | Op::BitCast(..))
                 && new_sources.len() == 1
                 && new_sources[0].dtype() == dtype
             {
@@ -1287,7 +1290,7 @@ fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
         })
         .collect::<Option<_>>()?;
 
-    if matches!(alu.op(), Op::Store { .. }) {
+    if matches!(alu.op(), Op::Store(..)) {
         Some(UOp::group(elements.into_vec()))
     } else {
         stack_with_shape(elements.into_vec(), &shape)
@@ -1388,7 +1391,7 @@ pub fn pm_expand_broadcast() -> &'static TypedPatternMatcher {
     static PM: LazyLock<TypedPatternMatcher> = LazyLock::new(|| {
         pm_wmma_add().clone()
             + crate::patterns! {
-                x if matches!(x.op(), Op::Binary(..) | Op::Ternary(..) | Op::Store { .. }) => expand_broadcast(x),
+                x if matches!(x.op(), Op::Binary(..) | Op::Ternary(..) | Op::Store(..)) => expand_broadcast(x),
                 wmma @ Wmma { a: _, b: _, c: _, metadata: _ } => broadcast_and_devec_wmma(wmma),
             }
     });
@@ -1421,7 +1424,7 @@ pub fn no_vectorized_alu() -> &'static TypedPatternMatcher {
 pub fn mixed_representation_alu() -> &'static TypedPatternMatcher {
     fn is_mixed(uop: &Arc<UOp>) -> bool {
         let sources = uop.op().sources();
-        sources.iter().any(|source| matches!(source.op(), Op::Stack { .. }))
+        sources.iter().any(|source| matches!(source.op(), Op::Stack(..)))
             && (uop.dtype().vcount() > 1 || sources.iter().any(|source| source.dtype().vcount() > 1))
     }
 
@@ -1485,14 +1488,14 @@ pub fn devectorize_patterns() -> &'static TypedPatternMatcher {
                 // `devectorize_alu` on the enclosing LOAD or STORE is what materialises the
                 // per-lane LOAD(INDEX) / STORE(INDEX).
                 Index { buffer, indices }
-                    if matches!(buffer.op(), Op::Param { .. } | Op::Buffer { .. })
-                        && indices.len() == 1 && matches!(indices[0].op(), Op::Stack { .. })
+                    if matches!(buffer.op(), Op::Param(..) | Op::Buffer(..))
+                        && indices.len() == 1 && matches!(indices[0].op(), Op::Stack(..))
                     => stack_index(buffer, &indices[0]),
 
                 // INDEX(buffer, RESHAPE(index)) moves RESHAPE outside INDEX.
                 Index { buffer, indices }
-                    if matches!(buffer.op(), Op::Param { .. } | Op::Buffer { .. })
-                        && indices.len() == 1 && matches!(indices[0].op(), Op::Reshape { .. })
+                    if matches!(buffer.op(), Op::Param(..) | Op::Buffer(..))
+                        && indices.len() == 1 && matches!(indices[0].op(), Op::Reshape(..))
                     => index_through_reshape(buffer, &indices[0]),
 
                 // RESHAPE(void) is only shape bookkeeping around AFTER/STORE.
@@ -1528,7 +1531,7 @@ fn materialize_leading_singletons(reshape: &Arc<UOp>, src: &Arc<UOp>) -> Option<
 }
 
 fn materialize_stack_broadcast(expand: &Arc<UOp>, src: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Stack { sources } = src.op() else { return None };
+    let Op::Stack(ops::Stack { sources }) = src.op() else { return None };
     let source_shape = src.shape().ok().flatten()?;
     let target_shape = expand.shape().ok().flatten()?;
     if sources.len() != 1 || source_shape.len() != target_shape.len() || source_shape[1..] != target_shape[1..] {
@@ -1555,7 +1558,7 @@ pub(crate) fn mop_cleanup_patterns() -> TypedPatternMatcher {
     crate::cached_patterns! {
         // movement.py mop_cleanup, in source order.
         reshape @ Reshape { src: _inner @ Reshape { src, .. }, new_shape }
-            => Some(UOp::new(Op::Reshape { src: src.clone(), new_shape: new_shape.clone() }, reshape.dtype())),
+            => Some(UOp::new(Op::Reshape(ops::Reshape { src: src.clone(), new_shape: new_shape.clone() }), reshape.dtype())),
         reshape @ Reshape { src, .. }
             if src.shape().ok().flatten().zip(reshape.shape().ok().flatten()).is_some_and(|(a, b)| a == b)
             => Some(src.clone()),
@@ -1582,11 +1585,11 @@ pub(crate) fn mop_cleanup_patterns() -> TypedPatternMatcher {
 
 fn collapse_sequential_stack_indices(stack: &Arc<UOp>, sources: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
     let first = sources.first()?;
-    let Op::Index { buffer, indices } = first.op() else { return None };
+    let Op::Index(ops::Index { buffer, indices }) = first.op() else { return None };
     if indices.len() != 1
         || stack.shape().ok().flatten()? != buffer.shape().ok().flatten()?
         || sources.iter().enumerate().any(|(position, source)| {
-            !matches!(source.op(), Op::Index { buffer: candidate, indices }
+            !matches!(source.op(), Op::Index(ops::Index { buffer: candidate, indices })
                 if Arc::ptr_eq(candidate, buffer)
                     && indices.len() == 1
                     && matches!(indices[0].op(), Op::Const(value)
@@ -1603,11 +1606,11 @@ pub(crate) fn pm_scalarize_register_stack_index_preserve_deps() -> &'static Type
         Index { buffer: After { passthrough: Stack { sources }, deps }, indices }
             => {
                 let selected = const_index_into_stack(sources, indices)?;
-                let Op::Load { index, alt, gate } = selected.op() else { return None };
+                let Op::Load(ops::Load { index, alt, gate }) = selected.op() else { return None };
                 if index.addrspace() != Some(AddrSpace::Reg) {
                     return None;
                 }
-                let Op::Index { buffer, indices } = index.op() else { return None };
+                let Op::Index(ops::Index { buffer, indices }) = index.op() else { return None };
                 let ordered = buffer.after(deps.clone());
                 let index = index.with_sources(std::iter::once(ordered).chain(indices.iter().cloned()).collect());
                 Some(selected.with_sources(
@@ -1618,14 +1621,14 @@ pub(crate) fn pm_scalarize_register_stack_index_preserve_deps() -> &'static Type
 }
 
 pub(crate) fn is_register_stack_index(node: &Arc<UOp>) -> bool {
-    matches!(node.op(), Op::Index { buffer, .. }
-        if matches!(buffer.op(), Op::After { passthrough, .. }
-            if matches!(passthrough.op(), Op::Stack { .. })))
+    matches!(node.op(), Op::Index(ops::Index { buffer, .. })
+        if matches!(buffer.op(), Op::After(ops::After { passthrough, .. })
+            if matches!(passthrough.op(), Op::Stack(..))))
 }
 
 fn merge_permutes(src: &Arc<UOp>, inner_axes: &[usize], outer_axes: &[usize]) -> Option<Arc<UOp>> {
     let axes = outer_axes.iter().map(|axis| inner_axes.get(*axis).copied()).collect::<Option<Vec<_>>>()?;
-    Some(UOp::new(Op::Permute { src: src.clone(), axes }, src.dtype()))
+    Some(UOp::new(Op::Permute(ops::Permute { src: src.clone(), axes }), src.dtype()))
 }
 
 fn const_index_into_stack(sources: &SmallVec<[Arc<UOp>; 4]>, indices: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
@@ -1634,7 +1637,7 @@ fn const_index_into_stack(sources: &SmallVec<[Arc<UOp>; 4]>, indices: &SmallVec<
     let selected = sources.get(usize::try_from(value.0.try_int()?).ok()?)?.clone();
     if rest.is_empty() {
         Some(selected)
-    } else if let Op::Stack { sources } = selected.op() {
+    } else if let Op::Stack(ops::Stack { sources }) = selected.op() {
         const_index_into_stack(sources, &rest.iter().cloned().collect())
     } else {
         UOp::index().buffer(selected).indices(rest.to_vec()).call().ok()
@@ -1642,7 +1645,7 @@ fn const_index_into_stack(sources: &SmallVec<[Arc<UOp>; 4]>, indices: &SmallVec<
 }
 
 fn stack_index(buffer: &Arc<UOp>, stack: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Stack { sources } = stack.op() else { return None };
+    let Op::Stack(ops::Stack { sources }) = stack.op() else { return None };
     Some(UOp::stack(
         sources
             .iter()
@@ -1653,7 +1656,7 @@ fn stack_index(buffer: &Arc<UOp>, stack: &Arc<UOp>) -> Option<Arc<UOp>> {
 }
 
 fn index_through_reshape(buffer: &Arc<UOp>, reshape: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Reshape { src, .. } = reshape.op() else { return None };
+    let Op::Reshape(ops::Reshape { src, .. }) = reshape.op() else { return None };
     let indexed = UOp::index().buffer(buffer.clone()).indices(vec![src.clone()]).call().ok()?;
     indexed.try_reshape(reshape.shape().ok().flatten()?).ok()
 }
@@ -1677,7 +1680,7 @@ fn expand_scalar_to_stack(expand: &Arc<UOp>, src: &Arc<UOp>) -> Option<Arc<UOp>>
 
 fn stack_wmma_sources(wmma: &Arc<UOp>) -> Option<Arc<UOp>> {
     let sources = wmma.op().sources();
-    if sources.iter().all(|source| matches!(source.op(), Op::Stack { .. } | Op::Wmma { .. })) {
+    if sources.iter().all(|source| matches!(source.op(), Op::Stack(..) | Op::Wmma(..))) {
         return None;
     }
     if wmma.shape().ok().flatten()?.len() != 1 {
@@ -1686,7 +1689,7 @@ fn stack_wmma_sources(wmma: &Arc<UOp>) -> Option<Arc<UOp>> {
     let rewritten = sources
         .iter()
         .map(|source| {
-            if matches!(source.op(), Op::Stack { .. }) {
+            if matches!(source.op(), Op::Stack(..)) {
                 return Some(source.clone());
             }
             let shape = source.shape().ok().flatten()?;
@@ -1719,13 +1722,13 @@ pub fn pm_add_loads() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         x if matches!(x.op(),
             Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) |
-            Op::Cast { .. } | Op::BitCast { .. } |
-            Op::Reduce { .. } | Op::Wmma { .. } | Op::Stack { .. }
+            Op::Cast(..) | Op::BitCast(..) |
+            Op::Reduce(..) | Op::Wmma(..) | Op::Stack(..)
         ) => add_loads_to_value_sources(x),
 
         Store { index, value, gate } if value.addrspace().is_some()
             => Some(UOp::new(
-                Op::Store { index: index.clone(), value: maybe_load(value), gate: gate.clone() },
+                Op::Store(ops::Store { index: index.clone(), value: maybe_load(value), gate: gate.clone() }),
                 DType::Void,
             )),
     }
@@ -1755,9 +1758,9 @@ fn maybe_load(value: &Arc<UOp>) -> Arc<UOp> {
 /// leaves the WMMA unfused instead of aborting.
 pub fn pm_wmma_add() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        Add[wmma @ Wmma { a, b, c, metadata }, add] => |wmma, a, b, c, metadata, add| {
+        Add[wmma @ Wmma { a, b, c, metadata }, add] => {
             Some(UOp::new(
-                Op::Wmma { a: a.clone(), b: b.clone(), c: c.try_add(add).ok()?, metadata: metadata.clone() },
+                Op::Wmma(ops::Wmma { a: a.clone(), b: b.clone(), c: c.try_add(add).ok()?, metadata: metadata.clone() }),
                 wmma.dtype(),
             ))
         },
@@ -1816,10 +1819,10 @@ pub fn pm_reduce_local() -> TypedPatternMatcher<ReduceContext> {
             @context ReduceContext;
 
             // Ranged reduction conversion precedes horizontal-only reduction.
-            red @ Reduce(_, ..) if matches!(red.op(), Op::Reduce { ranges, .. } if !ranges.is_empty())
+            red @ Reduce { .. } if matches!(red.op(), Op::Reduce(ops::Reduce { ranges, .. }) if !ranges.is_empty())
                 => reduce_to_acc(red, ctx),
 
-            red @ Reduce(_, ..) if matches!(red.op(), Op::Reduce { ranges, .. } if ranges.is_empty())
+            red @ Reduce { .. } if matches!(red.op(), Op::Reduce(ops::Reduce { ranges, .. }) if ranges.is_empty())
                 => expand_horizontal_reduce(red),
 
             // Merge END nodes sharing the same reduce ranges.
@@ -1840,11 +1843,11 @@ fn clean_up_group_sink() -> TypedPatternMatcher {
         Group { sources } if sources.len() == 1 => Some(sources[0].clone()),
 
         root @ Sink { sources }
-            if sources.iter().any(|source| matches!(source.op(), Op::Noop | Op::Stack { .. } | Op::Sink { .. } | Op::Group { .. }))
+            if sources.iter().any(|source| matches!(source.op(), Op::Noop | Op::Stack(..) | Op::Sink(..) | Op::Group(..)))
             => clean_up_sink_like(root, sources),
 
         root @ Group { sources }
-            if sources.iter().any(|source| matches!(source.op(), Op::Noop | Op::Stack { .. } | Op::Sink { .. } | Op::Group { .. }))
+            if sources.iter().any(|source| matches!(source.op(), Op::Noop | Op::Stack(..) | Op::Sink(..) | Op::Group(..)))
             => clean_up_sink_like(root, sources),
     }
 }
@@ -1853,7 +1856,7 @@ fn clean_up_sink_like(root: &Arc<UOp>, sources: &[Arc<UOp>]) -> Option<Arc<UOp>>
     let flattened = sources
         .iter()
         .flat_map(|source| {
-            if matches!(source.op(), Op::Noop | Op::Stack { .. } | Op::Sink { .. } | Op::Group { .. }) {
+            if matches!(source.op(), Op::Noop | Op::Stack(..) | Op::Sink(..) | Op::Group(..)) {
                 source.op().sources().into_iter().collect()
             } else {
                 vec![source.clone()]
@@ -1884,18 +1887,20 @@ fn horizontal_reduce(inp: &Arc<UOp>, reduce_op: ReduceOp, num_axes: usize, targe
 
     indices
         .into_iter()
-        .map(|indices| UOp::new(Op::Index { buffer: inp.clone(), indices: indices.into() }, target_dtype.clone()))
+        .map(|indices| {
+            UOp::new(Op::Index(ops::Index { buffer: inp.clone(), indices: indices.into() }), target_dtype.clone())
+        })
         .reduce(|a, b| apply_reduce_binary(reduce_op, a, b))
 }
 
 fn expand_horizontal_reduce(red: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Reduce { src, reduce_op, num_axes, .. } = red.op() else { return None };
+    let Op::Reduce(ops::Reduce { src, reduce_op, num_axes, .. }) = red.op() else { return None };
     horizontal_reduce(src, *reduce_op, *num_axes, &red.dtype())
 }
 
 /// Convert REDUCE to explicit accumulator pattern.
 fn reduce_to_acc(red: &Arc<UOp>, ctx: &mut ReduceContext) -> Option<Arc<UOp>> {
-    let Op::Reduce { src: inp, ranges: reduce_range, reduce_op, num_axes } = red.op() else { return None };
+    let Op::Reduce(ops::Reduce { src: inp, ranges: reduce_range, reduce_op, num_axes }) = red.op() else { return None };
     let out_dtype = red.dtype();
     let horizontal_inp =
         if *num_axes != 0 { horizontal_reduce(inp, *reduce_op, *num_axes, &out_dtype)? } else { inp.clone() };
@@ -1904,13 +1909,15 @@ fn reduce_to_acc(red: &Arc<UOp>, ctx: &mut ReduceContext) -> Option<Arc<UOp>> {
     let topo = inp.toposort();
     let ended: HashSet<u64> = topo
         .iter()
-        .filter_map(|n| if let Op::End { ranges, .. } = n.op() { Some(ranges.iter().map(|r| r.id)) } else { None })
+        .filter_map(|n| {
+            if let Op::End(ops::End { ranges, .. }) = n.op() { Some(ranges.iter().map(|r| r.id)) } else { None }
+        })
         .flatten()
         .collect();
     let reduce_ids: HashSet<u64> = reduce_range.iter().map(|r| r.id).collect();
     let input_ranges: SmallVec<[Arc<UOp>; 4]> = topo
         .iter()
-        .filter(|n| matches!(n.op(), Op::Range { .. }) && !reduce_ids.contains(&n.id) && !ended.contains(&n.id))
+        .filter(|n| matches!(n.op(), Op::Range(..)) && !reduce_ids.contains(&n.id) && !ended.contains(&n.id))
         .cloned()
         .collect();
 

@@ -22,7 +22,7 @@ pub fn is_empty_range(uop: &Arc<UOp>) -> bool {
     use svod_ir::uop::properties::VminVmaxProperty;
 
     match uop.op() {
-        Op::Range { .. } => {
+        Op::Range(..) => {
             // Get the RANGE's vmin_vmax (not the end's!)
             // RANGE vmax = end_max - 1, so:
             // - end=0 → vmax=-1 (empty, 0 iterations)

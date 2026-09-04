@@ -38,6 +38,7 @@ use svod_ir::{Op, UOp};
 use tracing::{debug, trace};
 
 use crate::schedule::Schedule;
+use svod_ir::ops;
 
 /// Minimum block size for buffer pooling (256-byte alignment, matching tinygrad).
 const MIN_BLOCK_SIZE: usize = 256;
@@ -280,7 +281,7 @@ fn collect_excluded_buffer_ids(schedule: &Schedule) -> ExcludedBufferIds {
         let by_uop_id: HashMap<u64, u64> =
             item.buffer_uop_ids.iter().copied().zip(item.buffers.iter().map(|b| b.id().0)).collect();
         for node in item.ast.toposort() {
-            let Op::Store { index, gate: Some(_), .. } = node.op() else { continue };
+            let Op::Store(ops::Store { index, gate: Some(_), .. }) = node.op() else { continue };
             gated_store.extend(indexed_buffer(index).and_then(|uop| by_uop_id.get(&uop.buf_uop().id)).copied());
         }
     }
@@ -299,7 +300,7 @@ fn collect_excluded_buffer_ids(schedule: &Schedule) -> ExcludedBufferIds {
 
     let non_sink = schedule
         .iter()
-        .filter(|item| !matches!(item.ast.op(), Op::Sink { .. }))
+        .filter(|item| !matches!(item.ast.op(), Op::Sink(..)))
         .flat_map(|item| item.buffers.iter().map(|b| b.id().0))
         .collect();
     ExcludedBufferIds { aliased: aliased_ids.collect(), non_sink, gated_store }
@@ -309,7 +310,7 @@ fn collect_excluded_buffer_ids(schedule: &Schedule) -> ExcludedBufferIds {
 /// lowered store index can carry.
 fn indexed_buffer(index: &Arc<UOp>) -> Option<&Arc<UOp>> {
     match index.op() {
-        Op::Index { buffer, .. } => Some(buffer),
+        Op::Index(ops::Index { buffer, .. }) => Some(buffer),
         other => other.children().into_iter().find_map(indexed_buffer),
     }
 }

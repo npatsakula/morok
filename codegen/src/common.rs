@@ -7,6 +7,7 @@ use svod_dtype::DType;
 use svod_ir::{ConstValue, Op, UOp};
 
 use crate::{Error, Result};
+use svod_ir::ops;
 
 /// FNUZ FP8 formats have different bias, zero, NaN, and saturation semantics
 /// from the OCP formats. No renderer currently implements those semantics.
@@ -26,7 +27,7 @@ pub fn reject_unsupported_fnuz(nodes: &[Arc<UOp>], renderer: &str) -> Result<()>
 /// pre-shape-migration, in a vector dtype).
 pub fn access_width(index: &Arc<UOp>) -> usize {
     match index.op() {
-        Op::Shrink { sizes, .. } => match sizes.op() {
+        Op::Shrink(ops::Shrink { sizes, .. }) => match sizes.op() {
             Op::Const(value) => match value.0 {
                 ConstValue::Int(value) if value > 0 => value as usize,
                 ConstValue::UInt(value) if value > 0 => value as usize,
@@ -34,7 +35,7 @@ pub fn access_width(index: &Arc<UOp>) -> usize {
             },
             _ => 1,
         },
-        Op::Cast { src, .. } => access_width(src),
+        Op::Cast(ops::Cast { src, .. }) => access_width(src),
         _ => index.dtype().vcount(),
     }
 }
@@ -47,16 +48,14 @@ pub fn value_width(value: &Arc<UOp>) -> usize {
         return value.dtype().vcount();
     }
     match value.op() {
-        Op::Stack { sources } => sources.len(),
-        Op::Load { index, .. } => access_width(index),
-        Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast { .. } | Op::BitCast { .. } | Op::Wmma { .. } => {
-            value
-                .shape()
-                .ok()
-                .flatten()
-                .and_then(|shape| shape.iter().try_fold(1usize, |count, dim| count.checked_mul(dim.as_const()?)))
-                .unwrap_or(1)
-        }
+        Op::Stack(ops::Stack { sources }) => sources.len(),
+        Op::Load(ops::Load { index, .. }) => access_width(index),
+        Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast(..) | Op::BitCast(..) | Op::Wmma(..) => value
+            .shape()
+            .ok()
+            .flatten()
+            .and_then(|shape| shape.iter().try_fold(1usize, |count, dim| count.checked_mul(dim.as_const()?)))
+            .unwrap_or(1),
         _ => 1,
     }
 }
@@ -92,7 +91,7 @@ pub fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
             if buffer.id == buffer_id {
                 return true;
             }
-            if let Op::Index { buffer: idx_buf, .. } = buffer.op()
+            if let Op::Index(ops::Index { buffer: idx_buf, .. }) = buffer.op()
                 && idx_buf.id == buffer_id
             {
                 return true;
@@ -115,7 +114,9 @@ pub type BuffersAndVars = (Vec<Arc<UOp>>, Vec<Arc<UOp>>);
 pub fn collect_buffers_and_vars(root: &Arc<UOp>) -> Result<BuffersAndVars> {
     let nodes = root.toposort();
     let params = collect_abi_params(&nodes)?;
-    Ok(params.into_iter().partition(|param| matches!(param.op(), Op::Param { arg, .. } if arg.addrspace.is_some())))
+    Ok(params
+        .into_iter()
+        .partition(|param| matches!(param.op(), Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_some())))
 }
 
 /// Collect PARAMs in the canonical external ABI order. All PARAM address
@@ -125,7 +126,7 @@ pub(crate) fn collect_abi_params(nodes: &[Arc<UOp>]) -> Result<Vec<Arc<UOp>>> {
     let mut params = Vec::new();
     let mut occupied = HashMap::new();
     for node in nodes {
-        let Op::Param { arg, .. } = node.op() else { continue };
+        let Op::Param(ops::Param { arg, .. }) = node.op() else { continue };
         if arg.slot == usize::MAX {
             return Err(Error::InvalidGraph { reason: "unassigned PARAM reached renderer ABI collection".into() });
         }
@@ -140,7 +141,7 @@ pub(crate) fn collect_abi_params(nodes: &[Arc<UOp>]) -> Result<Vec<Arc<UOp>>> {
         params.push(node.clone());
     }
     params.sort_by_key(|param| match param.op() {
-        Op::Param { arg, .. } => arg.slot,
+        Op::Param(ops::Param { arg, .. }) => arg.slot,
         _ => usize::MAX,
     });
     Ok(params)

@@ -9,6 +9,7 @@ use crate::rangeify::indexing::is_dead_axis;
 use crate::rangeify::transforms::rangeify;
 
 use super::helpers::{create_bufferize, create_const, create_range, create_range_symbolic};
+use svod_ir::ops;
 
 fn symbolic_range_size() -> Arc<UOp> {
     create_bufferize(UOp::native_const(1.0f32), vec![create_range_symbolic(UOp::var("size", DType::Index, 0, 1024), 0)])
@@ -68,7 +69,7 @@ fn permuted_buffer() -> Arc<UOp> {
 fn index_over_all_stage_ranges() -> Arc<UOp> {
     let ranges = vec![create_range(10, 0), create_range(20, 1), create_range(5, 2)];
     let staged = create_bufferize(UOp::native_const(1.0f32), ranges.clone());
-    UOp::new(Op::Index { buffer: staged, indices: ranges.into() }, DType::Float32)
+    UOp::new(Op::Index(ops::Index { buffer: staged, indices: ranges.into() }), DType::Float32)
 }
 
 #[test_case(super::symbolic_range_size ; "symbolic range size")]

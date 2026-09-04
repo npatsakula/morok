@@ -1,10 +1,17 @@
 //! Per-device RNG state: seed Tensor + host-side AtomicU64 counter.
 //!
 //! - **Counter is host-side `AtomicU64`**, not a device BUFFER. Each
-//!   `Tensor::rand` call does a lock-free `fetch_add(num)` and stamps the value
-//!   as a CONST u64 into the THREEFRY graph. The graph stays non-foldable
-//!   because the **seed Tensor is a BUFFER**, so rand output depends on a
-//!   runtime read.
+//!   `Tensor::rand` call does a lock-free `fetch_add(num)` and hands the
+//!   value to the THREEFRY graph as a `[lo, hi]` u32 BUFFER Tensor — the
+//!   same kernel input Tinygrad's `_device_rng_counters[device]` is. Keeping
+//!   the counter out of the AST makes every same-shape draw one program
+//!   (the seed BUFFER already keeps the graph non-foldable); stamping it as a
+//!   CONST minted a distinct kernel per draw. The 8-byte BUFFER per draw is
+//!   deliberate: Tinygrad's alternative — one counter BUFFER per device,
+//!   bumped lazily through `assign` inside each draw's graph — chains every
+//!   draw onto the previous one, so realizing a later draw first runs the
+//!   earlier draw's increment too and the earlier draw then reads the moved
+//!   counter (with equal sizes both draws yield the same stream).
 //!
 //! - **`manual_seed` does not clear the map.** Existing rand graphs captured
 //!   their seed Tensor via `Arc<Buffer>`, so they remain numerically valid
@@ -97,12 +104,16 @@ fn current_seed_lo() -> u32 {
     (GLOBAL_SEED.load(Ordering::Acquire) & 0xFFFF_FFFF) as u32
 }
 
-fn build_fresh_state(device_index: usize, seed_epoch: u64) -> DeviceRngState {
+fn build_fresh_state(device: &DeviceSpec, device_index: usize, seed_epoch: u64) -> DeviceRngState {
     let seed_hi = SEED_HI_BY_DEVICE_IDX.get(device_index).copied().unwrap_or_else(|| {
         panic!("svod_tensor::rand: device index {device_index} exceeds hardcoded SHA256 table (16 entries)")
     });
     let seed_lo = current_seed_lo();
-    DeviceRngState { seed: Tensor::from_slice([seed_hi, seed_lo]), counter: AtomicU64::new(0), seed_epoch }
+    DeviceRngState { seed: u32_pair(device, [seed_hi, seed_lo]), counter: AtomicU64::new(0), seed_epoch }
+}
+
+fn u32_pair(device: &DeviceSpec, words: [u32; 2]) -> Tensor {
+    Tensor::from_slice_with().source(words).device(device.clone()).call()
 }
 
 fn get_or_init_state(device: &DeviceSpec) -> Arc<DeviceRngState> {
@@ -136,16 +147,16 @@ fn get_or_init_state(device: &DeviceSpec) -> Arc<DeviceRngState> {
         return state.clone();
     }
     let device_index = DEVICE_INDEX_COUNTER.fetch_add(1, Ordering::AcqRel) as usize;
-    let fresh = Arc::new(build_fresh_state(device_index, current_epoch));
+    let fresh = Arc::new(build_fresh_state(device, device_index, current_epoch));
     pinned.insert(device.clone(), fresh.clone());
     fresh
 }
 
-/// Returns `(seed_tensor, counter_value)` for an upcoming draw of `num`
-/// uint32 words. `counter_value` is stamped into the THREEFRY graph as a
-/// `CONST u64` by the caller.
-pub(crate) fn next_counter(device: &DeviceSpec, num: u64) -> (Tensor, u64) {
+/// Returns `(seed, counter)` for an upcoming draw of `num` uint32 words, both
+/// `[2]` u32 BUFFER Tensors on `device`; `counter` holds `[lo, hi]` of the
+/// pre-advance value.
+pub(crate) fn next_counter(device: &DeviceSpec, num: u64) -> (Tensor, Tensor) {
     let state = get_or_init_state(device);
     let counter = state.counter.fetch_add(num, Ordering::AcqRel);
-    (state.seed.clone(), counter)
+    (state.seed.clone(), u32_pair(device, [counter as u32, (counter >> 32) as u32]))
 }

@@ -9,15 +9,15 @@ use svod_schedule::{patterns, graph_rewrite};
 
 let matcher = patterns! {
     // Identity folding
-    Add[x, @zero] ~> x,
-    Mul[x, @one] ~> x,
+    Add[x, @zero] => x,
+    Mul[x, @one] => x,
 
     // Constant folding (fallible)
     Add(a @const(a_val), b @const(b_val))
       => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 
     // Self-folding
-    Neg(Neg(x)) ~> Rc::clone(x),
+    Neg(Neg(x)) => x,
 };
 let optimized = graph_rewrite(&matcher, graph, &mut ());
 ```
@@ -57,7 +57,7 @@ let optimized = graph_rewrite(&matcher, graph, &mut ());
 | Local memory | ✅ | GPU shared memory allocation |
 | Grouped reduction | ✅ | 2-stage GROUP/GROUPTOP |
 | Matvec optimization | ✅ | Specialized MV pattern |
-| CPU threading | ✅ | Multi-threaded execution |
+| CPU threading | ✅ | `core_id` split, `SVOD_THREADS` ways by default |
 | Axis reordering | ✅ | SWAP for memory access |
 | **RANGEIFY** | | |
 | Movement op removal | ✅ | RESHAPE, PERMUTE, EXPAND, etc. |

@@ -333,7 +333,7 @@ impl Kernel {
 fn flat_param(slot: usize, src: &Arc<UOp>) -> Arc<UOp> {
     let base = src.base();
     match base.op() {
-        Op::Buffer { .. } => {
+        Op::Buffer(..) => {
             let size = base.buffer_size().expect("flat_param requires a concrete BUFFER shape");
             let elem = base.dtype();
             UOp::param(slot, size, elem, None)

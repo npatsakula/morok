@@ -38,17 +38,17 @@ Svod ऑप्टिमाइज़ेशन पैटर्न लिखने 
 ```rust
 patterns! {
     // Identity folding: x + 0 → x
-    Add[x, @zero] ~> |x| x.clone(),
+    Add[x, @zero] => x,
 
     // Constant folding: 3 + 4 → 7
-    Add(a @const(a_val), b @const(b_val))
-        => |a, a_val, b_val| eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
+    Add(a @const(a_val), _b @const(b_val))
+        => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 
     // Self-folding: x / x → 1
-    Idiv(x, x) ~> |x| UOp::one(x.dtype()),
+    Idiv(x, x) => UOp::one(x.dtype()),
 
     // Dead code elimination: if(true) { t } else { f } → t
-    Where(@true, t, _f) ~> |t| t.clone(),
+    Where(Const(ConstValue::Bool(true)), t, _f) => t,
 }
 ```
 
@@ -56,14 +56,13 @@ patterns! {
 
 | सिंटैक्स | मतलब | उदाहरण |
 |----------|------|--------|
-| `(x, y)` | **Ordered।** एक्ज़ैक्ट ऑर्डर में मैच। | `Sub(x, @zero) ~> x` |
-| `[x, y]` | **Commutative।** दोनों orderings ट्राई करे। | `Add[x, @zero] ~> x` |
-| `@zero` | **ज़ीरो कॉन्स्टेंट।** 0 या 0.0 मैच करे। | `Mul[_, z @ @zero] ~> z` |
-| `@one` | **वन कॉन्स्टेंट।** 1 या 1.0 मैच करे। | `Mul[x, @one] ~> x` |
-| `@const(val)` | **कॉन्स्टेंट एक्सट्रैक्ट।** वैल्यू बाइंड करे। | `Add(@const(a), @const(b))` |
-| `x, x` | **Same operand।** ptr_eq चेक ऑटो-जनरेट। | `Idiv(x, x) ~> UOp::one(...)` |
-| `~>` | **Infallible।** हमेशा सफ़ल, `Arc<UOp>` रिटर्न। | `Add[x, @zero] ~> x` |
-| `=>` | **Fallible।** फ़ेल हो सकता है, `Option<Arc<UOp>>` रिटर्न। | `=> eval(...).map(...)` |
+| `(x, y)` | **Ordered।** एक्ज़ैक्ट ऑर्डर में मैच। | `Sub(x, @zero) => x` |
+| `[x, y]` | **Commutative।** दोनों orderings ट्राई करे। | `Add[x, @zero] => x` |
+| `@zero` | **ज़ीरो कॉन्स्टेंट।** 0 या 0.0 मैच करे। | `Mul[_, z @ @zero] => z` |
+| `@one` | **वन कॉन्स्टेंट।** 1 या 1.0 मैच करे। | `Mul[x, @one] => x` |
+| `c @const(val)` | **कॉन्स्टेंट एक्सट्रैक्ट।** वैल्यू बाइंड करे। | `Add(a @const(av), _b @const(bv))` |
+| `x, x` | **Same operand।** ptr_eq चेक ऑटो-जनरेट। | `Idiv(x, x) => UOp::one(...)` |
+| `=>` | **रीराइट।** `Arc<UOp>`, `Option<Arc<UOp>>` (`None` का मतलब स्किप) या `RewriteResult` रिटर्न। | `=> eval(...).map(...)` |
 | `for op in binary [...]` | **Template।** मल्टीपल ops के लिए पैटर्न जनरेट। | नीचे देखें |
 | `@context Type` | **Stateful।** पैटर्न में mutable context एक्सेस। | नीचे देखें |
 
@@ -74,8 +73,8 @@ patterns! {
 ```rust
 patterns! {
     for op in binary [Add, Mul, Sub, Idiv, Fdiv, Max] {
-        op(a @const(a_val), b @const(b_val))
-            => |a, a_val, b_val| eval_binary(op, a_val, b_val)
+        op(a @const(a_val), _b @const(b_val))
+            => eval_binary(op, a_val, b_val)
                 .map(|r| UOp::const_(a.dtype(), r))
     }
 }
@@ -91,7 +90,7 @@ patterns! {
 patterns! {
     @context KernelContext;
 
-    ReduceAxis { src } => |reduce, src, ctx| {
+    reduce @ ReduceAxis { src, .. } => {
         ctx.record_reduction(reduce);
         transform_reduce(reduce, src, ctx)
     }
@@ -114,26 +113,26 @@ let mega_pass = symbolic().with_context::<PcontigConfig>()
 
 ## पैटर्न मैचिंग कैसे काम करता है
 
-`patterns!` मैक्रो एक `SimplifiedPatternMatcher` जनरेट करता है जो **O(1)** टाइम में HashMap lookup के ज़रिये पैटर्न को सही bucket में डिस्पैच करता है, फिर bucket में हर पैटर्न sequentially ट्राई करता है।
+`patterns!` मैक्रो एक ब्लॉक को एक फ़ंक्शन में कम्पाइल करता है जो रूट के operation kind पर `match` से डिस्पैच करता है, फिर उस kind के पैटर्न source order में ट्राई करता है।
 
 ### OpKey इंडेक्स
 
 हर UOp का एक ऑपरेशन टाइप होता है (Add, Mul, Load, वगैरह)। मैक्रो एक `OpKey` enum जनरेट करता है जो ऑपरेशन को hashable keys में मैप करता है:
 
 ```rust
-pub struct SimplifiedPatternMatcher<C = ()> {
-    indexed: HashMap<OpKey, Vec<PatternClosure<C>>>,  // O(1) lookup
-    wildcards: Vec<PatternClosure<C>>,                 // patterns matching any op
+match OpKey::from_op(tree.op()).index() {
+    KEY_ADD => { /* rules rooted at Add, in source order */ }
+    KEY_MUL => { /* rules rooted at Mul */ }
+    _ => {}
 }
+// wildcard rules (`x if cond`) run as sequential steps between the matches
 ```
 
 UOp मैच करते समय:
 1. UOp के ऑपरेशन से **OpKey एक्सट्रैक्ट** करें
-2. HashMap में **लुकअप** करें — O(1)
+2. उस kind के `match` arm पर **जंप** करें
 3. हर closure **ट्राई** करें जब तक कोई मैच न हो
 4. कोई indexed पैटर्न मैच न हो तो **wildcards पर फ़ॉलबैक**
-
-यह सभी पैटर्न को linearly स्कैन करने से 5-10x तेज़ है।
 
 ### Commutative हैंडलिंग
 
@@ -204,7 +203,6 @@ flowchart TD
 ### सेफ़्टी लिमिट्स
 
 इन्फ़िनिट लूप रोकने के लिए:
-- प्रति नोड मैक्सिमम **1000 iterations**
 - कुल मैक्सिमम **500,000 iterations**
 - लिमिट पार होने पर डायग्नोस्टिक इन्फ़ो के साथ panic
 

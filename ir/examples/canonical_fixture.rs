@@ -1,4 +1,5 @@
 use svod_dtype::{AddrSpace, DType, DeviceSpec};
+use svod_ir::ops;
 use svod_ir::{
     AxisId, AxisType, BufferizeOpts, CallInfo, CanonicalGraph, ConstValue, KernelInfo, Op, ProgramInfo, ReduceOp,
     RendererDevice, SInt, UOp, WmmaMetadata,
@@ -106,7 +107,6 @@ fn fixture(name: &str) -> std::sync::Arc<UOp> {
                     threads: 1,
                     upcast_axes: None,
                     reduce_axes: vec![],
-                    tile_grid: (1, 1),
                 },
             )
         }
@@ -145,10 +145,10 @@ fn fixture(name: &str) -> std::sync::Arc<UOp> {
                 UOp::load().index(UOp::index().buffer(input).indices(vec![index.clone()]).call().unwrap()).call();
             let store = UOp::index().buffer(output).indices(vec![index]).call().unwrap().store(load);
             let variable = UOp::variable("n".into(), 1, 16, DType::Int32);
-            let Op::Param { shape, arg } = variable.op() else { unreachable!() };
+            let Op::Param(ops::Param { shape, arg }) = variable.op() else { unreachable!() };
             let mut arg = arg.clone();
             arg.slot = 1;
-            let variable = UOp::new(Op::Param { shape: shape.clone(), arg }, DType::Int32);
+            let variable = UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg }), DType::Int32);
             let sink = UOp::sink_with_info(
                 vec![store, variable.clone()],
                 KernelInfo { name: Some("non_default".into()), ..Default::default() },

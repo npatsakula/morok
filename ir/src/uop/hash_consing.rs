@@ -1,36 +1,34 @@
 //! Hash consing infrastructure for UOp deduplication.
 //!
-//! This module implements the caching system that ensures structurally identical
-//! UOps share the same memory allocation (hash consing).
+//! Structurally identical UOps share one allocation, so `Arc::ptr_eq` (and the
+//! id-based `PartialEq`) is exact structural equality.
 //!
-//! # Thread Safety
+//! # Table layout
 //!
-//! Uses a global lock-free concurrent HashMap (papaya) for cross-thread deduplication.
-//! Creating the same UOp in different threads returns the same `Arc<UOp>`, so
-//! `Arc::ptr_eq` works correctly across thread boundaries.
+//! The global lock-free table (papaya) maps each live node's structural hash to a
+//! `Weak` handle on the node itself; there is no second copy of the node's
+//! identity. Lookups probe with the candidate `(op, dtype, tag)` and compare
+//! against the live node behind each colliding entry. Equality is the derived
+//! `Op` equality: children compare by interned id, payloads by value.
 //!
-//! # Memory Management (Tinygrad-aligned)
+//! # Memory lifecycle (Tinygrad `ucache` + `__del__`)
 //!
-//! UOps are stored as `Weak<UOp>` references in the cache. When no strong references
-//! remain (outside the cache), the UOp is automatically eligible for cleanup.
-//! Dead weak references are cleaned up lazily on next access or via `gc_dead_refs()`.
-//!
-//! This matches Tinygrad's approach using `weakref.WeakKeyDictionary` - no manual
-//! cleanup calls required in user code.
+//! A node's entry lives exactly as long as the node: `UOp::drop` removes it by
+//! allocation identity, so the table never accumulates dead entries.
 
 use std::hash::{Hash, Hasher};
-use std::mem::discriminant;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
-use papaya::HashMap;
+use papaya::{Equivalent, HashMap};
 use smallvec::SmallVec;
 
 use crate::op::Op;
-use crate::types::*;
+use crate::ops;
 use crate::uop::core::UOp;
 use svod_dtype::DType;
-use svod_dtype::DeviceSpec;
+
+type Tag = Option<SmallVec<[usize; 2]>>;
 
 // Global atomic counter for unique identifiers.
 //
@@ -52,39 +50,32 @@ pub(crate) fn next_uop_id() -> u64 {
     UOP_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Cache key for hash consing.
-///
-/// Uses stable UOp IDs for child UOps to avoid infinite recursion during hashing.
-/// IDs are monotonic and never reused, eliminating ABA problem from pointer-based approach.
-///
-/// Performance: hash is pre-computed during construction and cached in `cached_hash`.
-/// This avoids re-hashing on every HashMap lookup (the previous bottleneck: 57% of CPU
-/// in xxhash). Follows Tinygrad's approach where UOp hash is `id()`-based (~nanoseconds).
-#[derive(Clone)]
-struct UOpKey {
-    op_discriminant: std::mem::Discriminant<Op>,
-    dtype: DType,
-    src_ids: SmallVec<[u64; 4]>,
-    op_data: OpData,
-    tag: Option<SmallVec<[usize; 2]>>,
-    /// Pre-computed hash — avoids re-hashing on every HashMap operation.
-    cached_hash: u64,
+/// Structural hash of `(dtype, op)`: children contribute their own content hash,
+/// so the value is deterministic across runs and independent of interning order.
+fn content_hash(op: &Op, dtype: &DType) -> u64 {
+    let mut h = xxhash_rust::xxh64::Xxh64::new(0);
+    dtype.hash(&mut h);
+    op.hash(&mut h);
+    h.finish()
 }
 
-impl Hash for UOpKey {
-    #[inline]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Use pre-computed hash directly — O(1) regardless of OpData complexity
-        state.write_u64(self.cached_hash);
+/// Table hash: the content hash mixed with the tag, which participates in
+/// interning but not in the cross-run content hash.
+fn intern_hash(content_hash: u64, tag: &Tag) -> u64 {
+    match tag {
+        None => content_hash,
+        Some(tag) => {
+            let mut h = xxhash_rust::xxh64::Xxh64::new(content_hash);
+            tag.hash(&mut h);
+            h.finish()
+        }
     }
 }
 
-/// Forwards the single pre-computed xxh64 value `UOpKey::hash` writes.
+/// Forwards the single pre-computed hash every key and probe writes.
 ///
-/// The table's `BuildHasher` was `RandomState`, so every probe ran SipHash over
-/// an 8-byte buffer holding a digest we had already computed. Tinygrad's `ucache`
-/// has the same property for free: its key is a tuple of five pointers hashed by
-/// CPython's identity hash.
+/// Tinygrad's `ucache` has the same property for free: its key is a tuple of
+/// pointers hashed by CPython's identity hash.
 #[derive(Default)]
 struct PrecomputedHasher(u64);
 
@@ -96,7 +87,7 @@ impl Hasher for PrecomputedHasher {
 
     #[inline]
     fn write(&mut self, _bytes: &[u8]) {
-        unreachable!("UOpKey::hash must write exactly one pre-computed u64");
+        unreachable!("intern keys must write exactly one pre-computed u64");
     }
 
     #[inline]
@@ -107,257 +98,92 @@ impl Hasher for PrecomputedHasher {
 
 type PrecomputedHash = std::hash::BuildHasherDefault<PrecomputedHasher>;
 
-impl PartialEq for UOpKey {
+/// Table entry: the node's intern hash plus a weak handle on the node.
+struct InternKey {
+    hash: u64,
+    node: Weak<UOp>,
+}
+
+impl Hash for InternKey {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+/// Two entries are equal when they are the same allocation or both nodes are
+/// alive and structurally equal. A dead entry equals nothing but itself, so a
+/// node created while its predecessor is mid-teardown never aliases it.
+impl PartialEq for InternKey {
     fn eq(&self, other: &Self) -> bool {
-        // Fast path: different hashes → definitely not equal
-        self.cached_hash == other.cached_hash
-            && self.op_discriminant == other.op_discriminant
-            && self.dtype == other.dtype
-            && self.src_ids == other.src_ids
-            && self.op_data == other.op_data
-            && self.tag == other.tag
+        Weak::ptr_eq(&self.node, &other.node)
+            || match (self.node.upgrade(), other.node.upgrade()) {
+                (Some(a), Some(b)) => same_structure(&a, &b),
+                _ => false,
+            }
     }
 }
 
-impl Eq for UOpKey {}
+impl Eq for InternKey {}
 
-/// Non-recursive data from Op variants for hashing.
-///
-/// Captures operation-specific data that std::mem::discriminant doesn't include.
-/// This is critical for hash consing correctness - without this, operations like
-/// Add and Mul would be treated as identical since they have the same discriminant.
-#[derive(Eq, PartialEq, Hash, Clone)]
-enum OpData {
-    // Nullary operations
-    Const(ConstValueHash),
-    Unique(usize),
-    LUnique(usize),
-    CopyDevice(DeviceSpec),
-
-    // Grouped operations
-    Unary(UnaryOp),
-    Binary(BinaryOp),
-    Ternary(TernaryOp),
-
-    // Type operations
-    CastDType(DType),
-    BitCastDType(DType),
-
-    // Special operations
-    MSelectIdx(usize),
-    SpecialName(String),
-    ParamData(Box<ParamArg>),
-    SliceSize(usize),
-    Stage(BufferizeOpts),
-
-    // Movement/Reshape operations
-    PermuteAxes(Vec<usize>),
-    FlipAxes(Vec<bool>),
-    MultiAxis(usize),
-
-    // Reduction operations
-    ReduceAxisData(ReduceOp, Vec<usize>),
-    ReduceData(ReduceOp, usize),
-    AllReduceData(ReduceOp, DeviceSpec),
-
-    // Control flow operations
-    RangeData(AxisId, AxisType),
-
-    // Vector operations
-    VConstValues(Vec<ConstValueHash>),
-
-    // Symbolic/Define operations
-    DefineVarData(String, i64, i64), // (name, min_val, max_val)
-
-    // Advanced operations
-    WmmaData(Box<WmmaMetadata>),
-    CustomCode(String),
-    CustomFunctionKind(CustomFunctionKind),
-    CallInfoData(CallInfo),
-    SourceData(Box<(String, Option<SourceStageIdentity>)>),
-    ProgramBinaryData(Box<(Vec<u8>, Option<BinaryStageIdentity>)>),
-    ProgramData(Box<(ProgramInfo, Option<SourceStageIdentity>, Option<BinaryStageIdentity>)>),
-    SinkInfo(Option<crate::types::KernelInfo>),
-
-    // Movement operations with extra data
-    ContiguousOpts(Vec<crate::types::ContiguousHint>),
-
-    // Tuple operations
-    GetTupleIndex(usize),
-
-    // Operations with only children (no extra semantic data)
-    None,
-
-    GetAddrDevice(DeviceSpec),
-    // Tail variant preserves all pre-existing OpData hash discriminants.
-    InsArg(InsArg),
+fn same_structure(a: &UOp, b: &UOp) -> bool {
+    a.dtype == b.dtype && a.tag == b.tag && a.op == b.op
 }
 
-// The hash-cons table stores one `UOpKey` per live UOp, and every `UOp::new`
-// probes it with a freshly built key, so `OpData`'s footprint is paid on the
-// hottest path in the compiler. Keep the rare, fat payloads behind a `Box`.
-const _: () = assert!(size_of::<OpData>() <= 128, "OpData grew: box the new payload");
-
-/// Child identities for in-process hash consing. Children are already
-/// hash-consed, while IDs distinguish equal-content nodes with different tags
-/// and cannot alias on a content-hash collision.
-fn src_ids(op: &Op) -> SmallVec<[u64; 4]> {
-    op.children().into_iter().map(|child| child.id).collect()
+/// Lookup probe for a candidate that has not been allocated yet.
+struct Probe<'a> {
+    hash: u64,
+    op: &'a Op,
+    dtype: &'a DType,
+    tag: &'a Tag,
 }
 
-impl UOpKey {
-    fn new(op: &Op, dtype: DType, tag: &Option<SmallVec<[usize; 2]>>) -> Self {
-        let op_discriminant = discriminant(op);
-        let src_ids = src_ids(op);
-
-        let op_data = match op {
-            Op::Const(c) => OpData::Const(*c),
-            Op::Unique(id) => OpData::Unique(*id),
-            Op::LUnique(id) => OpData::LUnique(*id),
-            Op::Unary(unary_op, _) => OpData::Unary(*unary_op),
-            Op::Binary(binary_op, _, _) => OpData::Binary(*binary_op),
-            Op::Ternary(ternary_op, _, _, _) => OpData::Ternary(*ternary_op),
-            Op::Cast { dtype, .. } => OpData::CastDType(dtype.clone()),
-            Op::BitCast { dtype, .. } => OpData::BitCastDType(dtype.clone()),
-            Op::MSelect { device_index, .. } => OpData::MSelectIdx(*device_index),
-            Op::Special { name, .. } => OpData::SpecialName(name.clone()),
-            Op::GetAddr { device, .. } => OpData::GetAddrDevice(device.clone()),
-            Op::Copy { device, .. } => OpData::CopyDevice(device.clone()),
-            Op::Buffer { arg, .. } | Op::Param { arg, .. } => OpData::ParamData(arg.clone().into()),
-            Op::Slice { size, .. } => OpData::SliceSize(*size),
-            Op::Stage { opts, .. } => OpData::Stage(opts.clone()),
-            Op::Permute { axes, .. } => OpData::PermuteAxes(axes.clone()),
-            Op::Flip { axes, .. } => OpData::FlipAxes(axes.clone()),
-            Op::Multi { axis, .. } => OpData::MultiAxis(*axis),
-            Op::ReduceAxis { reduce_op, axes, .. } => OpData::ReduceAxisData(*reduce_op, axes.clone()),
-            Op::Reduce { reduce_op, num_axes, .. } => OpData::ReduceData(*reduce_op, *num_axes),
-            Op::AllReduce { reduce_op, device, .. } => OpData::AllReduceData(*reduce_op, device.clone()),
-            Op::Range { axis_id, axis_type, .. } => OpData::RangeData(axis_id.clone(), *axis_type),
-            Op::VConst { values } => OpData::VConstValues(values.iter().map(|v| ConstValueHash(*v)).collect()),
-            Op::DefineVar { name, min_val, max_val } => OpData::DefineVarData(name.clone(), *min_val, *max_val),
-            Op::Wmma { metadata, .. } => OpData::WmmaData(metadata.clone().into()),
-            Op::Custom { code, .. } | Op::CustomI { code, .. } => OpData::CustomCode(code.clone()),
-            Op::CustomFunction { kind, .. } => OpData::CustomFunctionKind(kind.clone()),
-            Op::Call { info, .. } | Op::Function { info, .. } => OpData::CallInfoData(info.clone()),
-            Op::Sink { info, .. } => OpData::SinkInfo(info.clone()),
-            Op::Source { code, identity } => OpData::SourceData((code.clone(), identity.clone()).into()),
-            Op::ProgramBinary { bytes, identity } => {
-                OpData::ProgramBinaryData((bytes.clone(), identity.clone()).into())
-            }
-            Op::Program { info, source, binary, .. } => OpData::ProgramData(
-                (
-                    info.clone(),
-                    source.as_ref().and_then(|stage| match stage.op() {
-                        Op::Source { identity, .. } => identity.clone(),
-                        _ => None,
-                    }),
-                    binary.as_ref().and_then(|stage| match stage.op() {
-                        Op::ProgramBinary { identity, .. } => identity.clone(),
-                        _ => None,
-                    }),
-                )
-                    .into(),
-            ),
-            Op::Ins { arg, .. } => OpData::InsArg(arg.clone()),
-            Op::Contiguous { opts, .. } => OpData::ContiguousOpts(opts.to_vec()),
-            // All remaining ops encode semantic data entirely through children
-            // (captured by src_ids) — no extra OpData needed.
-            Op::Noop => OpData::None,
-            // Multi-child ops: children ARE the data
-            Op::Group { .. }
-            | Op::Stack { .. }
-            | Op::MStack { .. }
-            | Op::Barrier { .. }
-            | Op::Linear { .. }
-            | Op::Tuple { .. } => OpData::None,
-            Op::GetTuple { index, .. } => OpData::GetTupleIndex(*index),
-            // Movement ops: shape/bounds are Arc<UOp> children
-            Op::Reshape { .. } | Op::Expand { .. } | Op::Pad { .. } | Op::Shrink { .. } => OpData::None,
-            // Memory/control: all fields are Arc<UOp> children
-            Op::Index { .. } | Op::Load { .. } | Op::Store { .. } => OpData::None,
-            Op::If { .. } | Op::EndIf { .. } | Op::End { .. } | Op::After { .. } => OpData::None,
-            // Single-source ops with no extra data
-            Op::Detach { .. } | Op::ContiguousBackward { .. } | Op::Precast { .. } => OpData::None,
-            // Binding: children encode all semantics
-            Op::Bind { .. } => OpData::None,
-        };
-
-        // Pre-compute hash using xxhash (fast, non-cryptographic).
-        // Cached to avoid re-hashing on every HashMap lookup — the previous
-        // bottleneck was 57% of CPU time spent in xxhash due to repeated hashing.
-        let cached_hash = {
-            use xxhash_rust::xxh64::Xxh64;
-            let mut h = Xxh64::new(0);
-            op_discriminant.hash(&mut h);
-            dtype.hash(&mut h);
-            for id in &src_ids {
-                h.write_u64(*id);
-            }
-            op_data.hash(&mut h);
-            tag.hash(&mut h);
-            h.finish()
-        };
-
-        Self { op_discriminant, dtype, src_ids, op_data, tag: tag.clone(), cached_hash }
+impl Hash for Probe<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
     }
 }
 
-// Global hash consing cache using lock-free concurrent HashMap.
-//
-// Design: Stores Weak<UOp> for automatic memory management (Tinygrad-aligned).
-// - Cross-thread deduplication: same UOpKey → same Arc<UOp> across all threads
-// - Lock-free reads and writes via papaya's epoch-based reclamation
-// - Automatic cleanup: when no strong refs remain, weak ref becomes dead
-// - Dead refs cleaned lazily on next access or via gc_dead_refs()
-//
-// Memory lifecycle (matches Tinygrad's weakref.WeakKeyDictionary):
-// 1. UOps created via UOp::new() store Weak refs in cache
-// 2. Strong refs held by Tensor, Scheduler, etc. keep UOps alive
-// 3. When all strong refs dropped, UOp deallocated, weak ref becomes dead
-// 4. Dead weak refs cleaned up lazily or via gc_dead_refs()
-static UOPS: OnceLock<HashMap<UOpKey, Weak<UOp>, PrecomputedHash>> = OnceLock::new();
+impl Equivalent<InternKey> for Probe<'_> {
+    fn equivalent(&self, key: &InternKey) -> bool {
+        key.node.upgrade().is_some_and(|node| node.dtype == *self.dtype && node.tag == *self.tag && node.op == *self.op)
+    }
+}
 
-fn uops() -> &'static HashMap<UOpKey, Weak<UOp>, PrecomputedHash> {
+/// Removal probe: matches an entry by allocation identity, live or dead.
+struct ByPtr {
+    hash: u64,
+    ptr: *const UOp,
+}
+
+impl Hash for ByPtr {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+impl Equivalent<InternKey> for ByPtr {
+    fn equivalent(&self, key: &InternKey) -> bool {
+        std::ptr::eq(Weak::as_ptr(&key.node), self.ptr)
+    }
+}
+
+static UOPS: OnceLock<HashMap<InternKey, (), PrecomputedHash>> = OnceLock::new();
+
+fn uops() -> &'static HashMap<InternKey, (), PrecomputedHash> {
     UOPS.get_or_init(HashMap::default)
-}
-
-/// Remove dead weak references from the cache.
-///
-/// This is optional - dead refs are also cleaned lazily on next access.
-/// Call this if you want to proactively free cache memory.
-///
-/// # Example
-///
-/// ```ignore
-/// // After dropping many tensors, optionally clean up cache
-/// gc_dead_refs();
-/// ```
-pub fn gc_dead_refs() {
-    let map = uops();
-    let guard = map.guard();
-
-    // Collect keys with dead weak refs
-    let to_remove: Vec<UOpKey> =
-        map.iter(&guard).filter(|(_, weak)| weak.upgrade().is_none()).map(|(k, _)| k.clone()).collect();
-
-    // Remove dead entries
-    for key in to_remove {
-        map.remove(&key, &guard);
-    }
 }
 
 /// Get the set of IDs for UOps currently alive in the cache.
 ///
 /// This is used by kernel cache GC to determine which compiled kernels
 /// can be safely removed (those whose AST IDs are no longer live).
-///
-/// # Returns
-///
-/// A HashSet containing the IDs of all currently cached UOps (only live ones).
 pub fn live_uop_ids() -> std::collections::HashSet<u64> {
     let map = uops();
     let guard = map.guard();
-    map.iter(&guard).filter_map(|(_, weak)| weak.upgrade().map(|arc| arc.id)).collect()
+    map.keys(&guard).filter_map(|key| key.node.upgrade().map(|arc| arc.id)).collect()
 }
 
 impl UOp {
@@ -370,11 +196,6 @@ impl UOp {
     ///
     /// This function is thread-safe. Creating the same UOp from different threads
     /// will return the same `Arc<UOp>`, so `Arc::ptr_eq` works across threads.
-    ///
-    /// # Memory Management
-    ///
-    /// The cache stores weak references. UOps are automatically cleaned up when
-    /// no strong references remain (Tinygrad-aligned behavior).
     #[inline]
     #[track_caller]
     pub fn new(op: Op, dtype: DType) -> Arc<Self> {
@@ -384,10 +205,10 @@ impl UOp {
     /// Create a UOp with an explicit tag (Tinygrad: `UOp(op, dtype, src, arg, tag)`).
     /// Tag participates in hash consing — same structure + different tag = different UOp.
     #[track_caller]
-    pub fn new_tagged(op: Op, dtype: DType, tag: Option<SmallVec<[usize; 2]>>) -> Arc<Self> {
+    pub fn new_tagged(op: Op, dtype: DType, tag: Tag) -> Arc<Self> {
         use papaya::{Compute, Operation};
 
-        if let Op::Load { index, alt, gate } = &op {
+        if let Op::Load(ops::Load { index, alt, gate }) = &op {
             assert_eq!(dtype, index.dtype(), "LOAD dtype must match its address dtype");
             assert_eq!(alt.is_some(), gate.is_some(), "LOAD requires either index only or index, alt, and gate");
             if let (Some(alt), Some(gate)) = (alt, gate) {
@@ -397,73 +218,35 @@ impl UOp {
         }
 
         let caller_location = std::panic::Location::caller();
-        let key = UOpKey::new(&op, dtype.clone(), &tag);
+        let content_hash = content_hash(&op, &dtype);
+        let hash = intern_hash(content_hash, &tag);
         let guard = uops().guard();
 
-        // Fast path: check if valid entry exists
+        // Fast path: a live structurally equal node already exists.
         // No provenance capture here: an interning hit returns a node that already
         // has its `Created` event, and this branch is the majority of the ~1M
         // `UOp::new` calls in one resnet50 schedule.
-        if let Some(weak) = uops().get(&key, &guard)
-            && let Some(arc) = weak.upgrade()
+        if let Some((key, _)) = uops().get_key_value(&Probe { hash, op: &op, dtype: &dtype, tag: &tag }, &guard)
+            && let Some(arc) = key.node.upgrade()
         {
             return arc;
         }
 
-        // One walk feeds both the structural hash and the early-reject mask of child op kinds.
-        let (content_hash, src_ops) = {
-            use xxhash_rust::xxh64::Xxh64;
-            let mut h = Xxh64::new(0);
-            let mut src_ops = crate::op::OpMask::EMPTY;
-            std::mem::discriminant(&op).hash(&mut h);
-            dtype.hash(&mut h);
-            for child in op.children() {
-                h.write_u64(child.content_hash);
-                src_ops = src_ops.union(crate::op::OpMask::of_op(child.op()));
-            }
-            key.op_data.hash(&mut h);
-            (h.finish(), src_ops)
-        };
+        let mut src_ops = crate::op::OpMask::EMPTY;
+        op.map_child(|child| src_ops = src_ops.union(crate::op::OpMask::of_op(child.op())));
 
-        let new_arc = Arc::new(Self {
-            id: next_uop_id(),
-            op,
-            dtype,
-            content_hash,
-            src_ops,
-            tag,
-            shape_cache: std::sync::OnceLock::new(),
-            ranges_cache: std::sync::OnceLock::new(),
-            in_scope_ranges_cache: std::sync::OnceLock::new(),
-            vmin_vmax_cache: std::sync::OnceLock::new(),
-            sound_vmin_vmax_cache: std::sync::OnceLock::new(),
-            has_index_in_sources_cache: std::sync::OnceLock::new(),
-            backward_slice_cache: std::sync::OnceLock::new(),
-            has_weak_float_cache: std::sync::OnceLock::new(),
-            device_spec_cache: std::sync::OnceLock::new(),
-            addrspace_cache: std::sync::OnceLock::new(),
-            metadata: None,
-        });
-        let new_weak = Arc::downgrade(&new_arc);
-
+        let new_arc = Arc::new(Self::fresh(op, dtype, tag, content_hash, src_ops, None));
         let result = uops().compute(
-            key,
-            |entry| match entry {
-                Some((_, existing_weak)) => {
-                    if let Some(existing_arc) = existing_weak.upgrade() {
-                        Operation::Abort(existing_arc)
-                    } else {
-                        Operation::Insert(new_weak.clone())
-                    }
-                }
-                None => Operation::Insert(new_weak.clone()),
+            InternKey { hash, node: Arc::downgrade(&new_arc) },
+            |entry| match entry.and_then(|(existing, _)| existing.node.upgrade()) {
+                Some(existing) => Operation::Abort(existing),
+                None => Operation::Insert(()),
             },
             &guard,
         );
 
         let final_arc = match result {
-            Compute::Inserted(_, _) | Compute::Updated { .. } => new_arc,
-            Compute::Aborted(existing_arc) => existing_arc,
+            Compute::Aborted(existing) => existing,
             _ => new_arc,
         };
 
@@ -477,13 +260,6 @@ impl UOp {
     /// Metadata is NOT part of hash consing - this method creates a new UOp
     /// with a different ID but the same operation structure. This allows
     /// attaching metadata (like kernel info) after optimization.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let ast = /* ... optimized AST ... */;
-    /// let with_info = ast.with_metadata(KernelInfo::new("r_g16l16", vec![], false));
-    /// ```
     pub fn with_metadata<T: std::any::Any + Send + Sync + 'static>(self: &Arc<Self>, metadata: T) -> Arc<Self> {
         self.with_metadata_raw(Arc::new(metadata))
     }
@@ -491,14 +267,6 @@ impl UOp {
     /// Get metadata of a specific type if it exists.
     ///
     /// Returns `None` if no metadata is attached or if the metadata is of a different type.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// if let Some(info) = ast.metadata::<KernelInfo>() {
-    ///     println!("Kernel name: {}", info.name);
-    /// }
-    /// ```
     pub fn metadata<T: std::any::Any + Send + Sync>(&self) -> Option<std::sync::Arc<T>> {
         self.metadata.as_ref()?.clone().downcast::<T>().ok()
     }
@@ -512,27 +280,17 @@ impl UOp {
 
     /// Attach raw metadata (type-erased), creating a new instance.
     ///
-    /// Used to re-attach metadata that was saved before graph rewrites.
+    /// The result is deliberately not interned: it shares structure and content
+    /// hash with `self` but carries its own identity.
     pub fn with_metadata_raw(self: &Arc<Self>, metadata: Arc<dyn std::any::Any + Send + Sync>) -> Arc<Self> {
-        Arc::new(Self {
-            id: next_uop_id(),
-            op: self.op.clone(),
-            dtype: self.dtype.clone(),
-            content_hash: self.content_hash, // same structure, same content hash
-            src_ops: self.src_ops,
-            tag: self.tag.clone(),
-            shape_cache: std::sync::OnceLock::new(),
-            ranges_cache: std::sync::OnceLock::new(),
-            in_scope_ranges_cache: std::sync::OnceLock::new(),
-            vmin_vmax_cache: std::sync::OnceLock::new(),
-            sound_vmin_vmax_cache: std::sync::OnceLock::new(),
-            has_index_in_sources_cache: std::sync::OnceLock::new(),
-            backward_slice_cache: std::sync::OnceLock::new(),
-            has_weak_float_cache: std::sync::OnceLock::new(),
-            device_spec_cache: std::sync::OnceLock::new(),
-            addrspace_cache: std::sync::OnceLock::new(),
-            metadata: Some(metadata),
-        })
+        Arc::new(Self::fresh(
+            self.op.clone(),
+            self.dtype.clone(),
+            self.tag.clone(),
+            self.content_hash,
+            self.src_ops,
+            Some(metadata),
+        ))
     }
 }
 
@@ -566,13 +324,14 @@ thread_local! {
 
 impl Drop for UOp {
     fn drop(&mut self) {
+        // Retire the intern entry by allocation identity. Nodes that were never
+        // interned (metadata copies, losers of an insertion race) simply miss.
+        uops().pin().remove(&ByPtr { hash: intern_hash(self.content_hash, &self.tag), ptr: self });
+
         // Buffer nodes only: the hook exists for buffer-lifetime tracking, and
         // graph rewriting churns millions of transient non-buffer nodes per
         // prepare — their drop must stay allocation-free and branch-cheap.
-        // The intern table is deliberately NOT touched here: dead `Weak`
-        // tombstones are overwritten lazily by `new_tagged`, and rebuilding a
-        // `UOpKey` in every drop frame would allocate.
-        if matches!(self.op, Op::Buffer { .. })
+        if matches!(self.op, Op::Buffer(..))
             && let Some(hook) = UOP_DROP_HOOK.get()
         {
             hook(self.id);

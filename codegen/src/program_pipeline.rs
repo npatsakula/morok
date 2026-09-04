@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use svod_device::device::{
-    AbiParamDescriptor, CompiledSpec, Compiler, ProgramSpec, Renderer, binary_stage_identity, source_stage_identity,
-    validate_binary_stage, validate_source_stage,
+    AbiParamDescriptor, CompiledSpec, Compiler, ProgramSpec, Renderer, binary_stage_identity,
+    minted_source_stage_identity, source_stage_identity, validate_binary_stage, validate_source_stage,
 };
 use svod_device::{Error, Result};
 use svod_dtype::DeviceSpec;
+use svod_ir::ops;
 use svod_ir::{Op, ProgramInfo, UOp, UOpKey};
 use svod_schedule::linearize::line_rewrite_cleanups;
 
@@ -24,10 +25,10 @@ fn invalid_program_state(details: impl Into<String>) -> Error {
 }
 
 fn unpack_program(program: &Arc<UOp>) -> Result<ProgramParts> {
-    let Op::Program { sink, info, linear, source, binary } = program.op() else {
+    let Op::Program(ops::Program { sink, info, linear, source, binary }) = program.op() else {
         return Err(invalid_program_state(format!("expected PROGRAM op, got {:?}", program.op())));
     };
-    Ok((sink.clone(), info.clone(), linear.clone(), source.clone(), binary.clone()))
+    Ok((sink.clone(), info.as_ref().clone(), linear.clone(), source.clone(), binary.clone()))
 }
 
 /// Structural check on the PROGRAM stage tuple. Deliberately does *not* run
@@ -56,24 +57,24 @@ fn validate_program_shape(program: &Arc<UOp>) -> Result<()> {
         )));
     }
 
-    if !matches!(sink.op(), Op::Sink { .. }) {
+    if !matches!(sink.op(), Op::Sink(..)) {
         return Err(invalid_program_state(format!("PROGRAM sink must be SINK op, got {:?}", sink.op())));
     }
 
     if let Some(linear) = &linear
-        && !matches!(linear.op(), Op::Linear { .. })
+        && !matches!(linear.op(), Op::Linear(..))
     {
         return Err(invalid_program_state(format!("PROGRAM linear stage must be LINEAR op, got {:?}", linear.op())));
     }
 
     if let Some(source) = &source
-        && !matches!(source.op(), Op::Source { .. })
+        && !matches!(source.op(), Op::Source(..))
     {
         return Err(invalid_program_state(format!("PROGRAM source stage must be SOURCE op, got {:?}", source.op())));
     }
 
     if let Some(binary) = &binary
-        && !matches!(binary.op(), Op::ProgramBinary { .. })
+        && !matches!(binary.op(), Op::ProgramBinary(..))
     {
         return Err(invalid_program_state(format!(
             "PROGRAM binary stage must be ProgramBinary op, got {:?}",
@@ -117,7 +118,7 @@ fn preserve_program_context(new_program: Arc<UOp>, old_program: &Arc<UOp>) -> Ar
 }
 
 fn param_class(node: &Arc<UOp>) -> String {
-    let Op::Param { arg, .. } = node.op() else { return format!("{:?}", node.op()) };
+    let Op::Param(ops::Param { arg, .. }) = node.op() else { return format!("{:?}", node.op()) };
     match arg.addrspace {
         None if arg.name.as_deref() == Some("_device_num") => "device scalar PARAM".to_string(),
         None => format!("scalar PARAM {}", arg.name.as_deref().unwrap_or("<unnamed>")),
@@ -130,7 +131,7 @@ fn param_class(node: &Arc<UOp>) -> String {
 fn validate_param_slots(nodes: &[Arc<UOp>], stage: &'static str) -> Result<()> {
     let mut occupied: HashMap<usize, Arc<UOp>> = HashMap::new();
     for node in nodes {
-        let Op::Param { arg, .. } = node.op() else { continue };
+        let Op::Param(ops::Param { arg, .. }) = node.op() else { continue };
         if arg.slot == usize::MAX {
             return Err(Error::UnassignedProgramParam { stage, param: param_class(node) });
         }
@@ -149,25 +150,25 @@ pub(crate) fn executable_params(sink: &Arc<UOp>) -> Result<Vec<Arc<UOp>>> {
     let executable = sink.toposort_call_aware(false);
     let executable_keys = executable.iter().map(|node| UOpKey(node.clone())).collect::<HashSet<_>>();
     for node in &executable {
-        if let Op::Special { name, .. } = node.op()
+        if let Op::Special(ops::Special { name, .. }) = node.op()
             && !matches!(name.chars().last().and_then(|axis| axis.to_digit(10)), Some(0..=2))
         {
             return Err(Error::ProgramAbiMismatch { reason: format!("invalid SPECIAL axis name {name:?}") });
         }
         let body = match node.op() {
-            Op::Call { body, .. } | Op::Function { body, .. } => body,
+            Op::Call(ops::Call { body, .. }) | Op::Function(ops::Function { body, .. }) => body,
             _ => continue,
         };
         for formal in body.toposort_call_aware(true) {
-            if matches!(formal.op(), Op::Param { .. }) && executable_keys.contains(&UOpKey(formal.clone())) {
+            if matches!(formal.op(), Op::Param(..)) && executable_keys.contains(&UOpKey(formal.clone())) {
                 return Err(Error::LeakedOpaqueProgramParam { param: param_class(&formal) });
             }
         }
     }
-    let mut params = executable.into_iter().filter(|node| matches!(node.op(), Op::Param { .. })).collect::<Vec<_>>();
+    let mut params = executable.into_iter().filter(|node| matches!(node.op(), Op::Param(..))).collect::<Vec<_>>();
     validate_param_slots(&params, "final PROGRAM ABI validation")?;
     params.sort_by_key(|node| match node.op() {
-        Op::Param { arg, .. } => arg.slot,
+        Op::Param(ops::Param { arg, .. }) => arg.slot,
         _ => usize::MAX,
     });
     Ok(params)
@@ -196,7 +197,7 @@ pub(crate) fn number_params(sink: Arc<UOp>) -> Result<Arc<UOp>> {
     let mut occupied = HashSet::new();
     let mut authored = Vec::new();
     for node in &nodes {
-        if let Op::Param { arg, .. } = node.op()
+        if let Op::Param(ops::Param { arg, .. }) = node.op()
             && arg.slot != usize::MAX
         {
             authored.push(node.clone());
@@ -207,12 +208,14 @@ pub(crate) fn number_params(sink: Arc<UOp>) -> Result<Arc<UOp>> {
 
     // Pinned Tinygrad seeds numbering with the full authored topological count,
     // including opaque bodies, but its numbering rewrite preserves boundaries.
-    let mut next_slot =
-        all_nodes.iter().filter(|node| matches!(node.op(), Op::Param { arg, .. } if arg.slot != usize::MAX)).count();
+    let mut next_slot = all_nodes
+        .iter()
+        .filter(|node| matches!(node.op(), Op::Param(ops::Param { arg, .. }) if arg.slot != usize::MAX))
+        .count();
     let mut replacements = HashMap::new();
 
     for node in nodes {
-        let Op::Param { shape, arg } = node.op() else { continue };
+        let Op::Param(ops::Param { shape, arg }) = node.op() else { continue };
         if arg.slot != usize::MAX {
             continue;
         }
@@ -229,7 +232,7 @@ pub(crate) fn number_params(sink: Arc<UOp>) -> Result<Arc<UOp>> {
             stage: "PARAM numbering slot exhaustion",
             param: param_class(&node),
         })?;
-        let replacement = UOp::new(Op::Param { shape: shape.clone(), arg: numbered }, node.dtype());
+        let replacement = UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg: numbered }), node.dtype());
         replacements.insert(UOpKey(node), replacement);
     }
 
@@ -261,12 +264,12 @@ pub fn program_from_sink_with_renderer(sink: Arc<UOp>, renderer: &dyn Renderer) 
 }
 
 fn program_from_sink_impl(sink: Arc<UOp>, device: DeviceSpec, renderer: Option<&dyn Renderer>) -> Result<Arc<UOp>> {
-    let sink = if matches!(sink.op(), Op::Sink { .. }) { sink } else { UOp::sink(vec![sink]) };
+    let sink = if matches!(sink.op(), Op::Sink(..)) { sink } else { UOp::sink(vec![sink]) };
     // Hand-authored kernels carry their stable name in structured SINK info.
     // Optimizer metadata may also be present with an auto-generated shape name;
     // it is only the fallback for ordinary scheduled kernels.
     let kernel_name = match sink.op() {
-        Op::Sink { info: Some(info), .. } if info.name.is_some() => info.name.clone(),
+        Op::Sink(ops::Sink { info: Some(info), .. }) if info.name.is_some() => info.name.clone(),
         _ => sink.metadata::<svod_schedule::optimizer::KernelInfo>().map(|info| info.function_name()),
     };
     // Tinygrad's target boundary is final rewrite -> implicit barriers -> CFG ->
@@ -355,7 +358,7 @@ pub fn do_render(program: &Arc<UOp>, renderer: &dyn Renderer) -> Result<(Arc<UOp
     let linear_uop = linear.clone().ok_or_else(|| invalid_program_state("PROGRAM has no LINEAR stage"))?;
 
     if let Some(source_uop) = source {
-        let Op::Source { code, .. } = source_uop.op() else {
+        let Op::Source(ops::Source { code, .. }) = source_uop.op() else {
             return Err(invalid_program_state("PROGRAM source stage is not a SOURCE UOp"));
         };
         let expected = source_stage_identity(&info, &expected_abi, &linear_uop, code)?;
@@ -405,18 +408,16 @@ pub fn do_compile(program: &Arc<UOp>, compiler: &dyn Compiler) -> Result<(Arc<UO
     validate_program_shape(program)?;
     let (sink, info, linear, source, binary) = unpack_program(program)?;
     let source = source.ok_or_else(|| invalid_program_state("PROGRAM has no SOURCE stage"))?;
-    let linear_uop = linear.clone().ok_or_else(|| invalid_program_state("PROGRAM has no LINEAR stage"))?;
-    if matches!(source.op(), Op::Source { code, .. } if code.is_empty()) {
+    if matches!(source.op(), Op::Source(ops::Source { code, .. }) if code.is_empty()) {
         return Err(invalid_program_state("PROGRAM has empty SOURCE stage"));
     }
 
     let spec = ProgramSpec::from_uop(program)?;
-    let expected_source = source_stage_identity(&info, &spec.abi, &linear_uop, &spec.src)?;
-    validate_source_stage(&source, &expected_source)?;
+    let expected_source = minted_source_stage_identity(&info, &spec.abi, &source)?;
 
     if let Some(binary_uop) = binary {
         let bytes = match binary_uop.op() {
-            Op::ProgramBinary { bytes, .. } => bytes,
+            Op::ProgramBinary(ops::ProgramBinary { bytes, .. }) => bytes,
             _ => return Err(invalid_program_state("PROGRAM binary stage is not a ProgramBinary UOp")),
         };
         let expected_binary = binary_stage_identity(expected_source, compiler.cache_key(), bytes);
@@ -425,7 +426,7 @@ pub fn do_compile(program: &Arc<UOp>, compiler: &dyn Compiler) -> Result<(Arc<UO
         compiled.src = Some(spec.src.clone());
         compiled.global_size = spec.global_size.clone();
         compiled.local_size = spec.local_size.clone();
-        compiled.bind_program_stage(linear_uop, &info.target, compiler.cache_key(), expected_binary)?;
+        compiled.bind_program_stage(&info.target, compiler.cache_key(), expected_binary)?;
         return Ok((program.clone(), compiled));
     }
 
@@ -447,7 +448,7 @@ pub fn do_compile(program: &Arc<UOp>, compiler: &dyn Compiler) -> Result<(Arc<UO
 
     compiled.src = Some(spec.src.clone());
     let binary_identity = binary_stage_identity(expected_source, compiler.cache_key(), &compiled.bytes);
-    compiled.bind_program_stage(linear_uop, &info.target, compiler.cache_key(), binary_identity.clone())?;
+    compiled.bind_program_stage(&info.target, compiler.cache_key(), binary_identity.clone())?;
     let binary_uop = UOp::binary_with_identity(compiled.bytes.clone(), binary_identity.clone());
     validate_binary_stage(&binary_uop, &binary_identity)?;
     let compiled_program = rebuild_program(program, linear, Some(source), Some(binary_uop))?;
@@ -469,21 +470,19 @@ pub fn do_compile(program: &Arc<UOp>, compiler: &dyn Compiler) -> Result<(Arc<UO
 /// worker for this exact SOURCE-stage PROGRAM.
 pub fn adopt_compiled_bytes(program: &Arc<UOp>, compiler_key: &str, bytes: Vec<u8>) -> Result<CompiledSpec> {
     validate_program_shape(program)?;
-    let (sink, info, linear, source, binary) = unpack_program(program)?;
+    let (sink, info, _, source, binary) = unpack_program(program)?;
     if binary.is_some() {
         return Err(invalid_program_state("cannot adopt bytes into an already compiled PROGRAM"));
     }
-    let linear = linear.ok_or_else(|| invalid_program_state("PROGRAM has no LINEAR stage"))?;
     let source = source.ok_or_else(|| invalid_program_state("PROGRAM has no SOURCE stage"))?;
     let spec = ProgramSpec::from_uop(program)?;
-    let expected_source = source_stage_identity(&info, &spec.abi, &linear, &spec.src)?;
-    validate_source_stage(&source, &expected_source)?;
+    let expected_source = minted_source_stage_identity(&info, &spec.abi, &source)?;
     let identity = binary_stage_identity(expected_source, compiler_key, &bytes);
     let mut compiled = CompiledSpec::from_bytes(spec.name, bytes, sink, spec.abi)?;
     compiled.src = Some(spec.src);
     compiled.global_size = spec.global_size;
     compiled.local_size = spec.local_size;
-    compiled.bind_program_stage(linear, &info.target, compiler_key, identity)?;
+    compiled.bind_program_stage(&info.target, compiler_key, identity)?;
     Ok(compiled)
 }
 
@@ -495,7 +494,7 @@ pub fn get_program(
     target: ProgramTarget,
 ) -> Result<Arc<UOp>> {
     let mut program = match input.op() {
-        Op::Program { .. } => {
+        Op::Program(..) => {
             validate_program_shape(input)?;
             let (sink, info, _, _, _) = unpack_program(input)?;
             // The only `spec_program` check on an externally supplied PROGRAM:

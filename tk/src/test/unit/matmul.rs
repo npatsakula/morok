@@ -11,6 +11,7 @@ use svod_tensor::Tensor;
 use crate::kernels::matmul::*;
 use crate::tiles::{RT_16X16, TileLayout};
 use crate::{Kernel, MoveIdx};
+use svod_ir::ops;
 
 /// Dummy `(c, a, b)` BUFFER UOps for GPU-free graph-shape kernel builds.
 fn dummy_buffers(n: usize) -> Vec<Arc<UOp>> {
@@ -50,10 +51,10 @@ fn test_mma_ab_wmma_graph_shape() {
     let c0 = warp.zero(c);
     let out = warp.mma_ab(c0, &a, &b);
 
-    let wmmas: Vec<_> = out.uop().toposort().into_iter().filter(|u| matches!(u.op(), Op::Wmma { .. })).collect();
+    let wmmas: Vec<_> = out.uop().toposort().into_iter().filter(|u| matches!(u.op(), Op::Wmma(..))).collect();
     assert_eq!(wmmas.len(), 1, "exactly one symbolic WMMA per K-iteration");
 
-    let Op::Wmma { a: wa, b: wb, c: wc, metadata } = wmmas[0].op() else { unreachable!() };
+    let Op::Wmma(ops::Wmma { a: wa, b: wb, c: wc, metadata }) = wmmas[0].op() else { unreachable!() };
     assert_eq!(wa.dtype(), DType::BFloat16, "A operand keeps its scalar dtype");
     assert_eq!(wb.dtype(), DType::BFloat16, "B operand keeps its scalar dtype");
     assert_eq!(wc.dtype(), DType::Float32, "C operand keeps its scalar dtype");
@@ -98,7 +99,7 @@ fn test_mma_unroll_flattens_mfma() {
         ker.finish(1)
     };
 
-    let wmma_count = |sink: &Arc<UOp>| sink.toposort().iter().filter(|u| matches!(u.op(), Op::Wmma { .. })).count();
+    let wmma_count = |sink: &Arc<UOp>| sink.toposort().iter().filter(|u| matches!(u.op(), Op::Wmma(..))).count();
     assert_eq!(wmma_count(&build(false)), 1, "looped mma → one symbolic WMMA node");
     assert_eq!(wmma_count(&build(true)), 8, "unrolled mma → 8 flat WMMA nodes (2×2 output × 2 K-steps)");
 
@@ -111,7 +112,7 @@ fn test_mma_unroll_flattens_mfma() {
             svod_codegen::program_pipeline::program_from_sink(lowered, DeviceSpec::Cpu).expect("final target graph");
         let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
         let linear_uop =
-            linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear { .. })).expect("LINEAR present");
+            linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear(..))).expect("LINEAR present");
         let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx942);
         svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some("mma_unroll_probe")).expect("render").code
     };
@@ -150,7 +151,7 @@ fn test_matmul_rdna_renders_wmma() {
         svod_codegen::program_pipeline::program_from_sink(lowered, DeviceSpec::Cpu).expect("final target graph");
     let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
     let linear_uop =
-        linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear { .. })).expect("LINEAR present");
+        linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear(..))).expect("LINEAR present");
     let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx1151);
     // Renders (no OOM/panic) ⇒ the wave32 fragment shapes lower cleanly.
     let code =

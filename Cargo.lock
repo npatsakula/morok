@@ -3496,7 +3496,6 @@ dependencies = [
 name = "svod-macros"
 version = "0.1.0-alpha.5"
 dependencies = [
- "convert_case 0.10.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -3630,6 +3629,7 @@ dependencies = [
  "papaya",
  "parking_lot 0.12.5",
  "proptest",
+ "rayon",
  "serde",
  "serde_json",
  "smallvec",

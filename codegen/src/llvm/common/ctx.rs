@@ -9,6 +9,7 @@ use std::sync::Arc;
 use svod_ir::{ConstValue, Op, prelude::*};
 
 use super::types::{lconst, ldt};
+use svod_ir::ops;
 
 /// Maps UOp ID → LLVM variable name.
 pub struct RenderContext {
@@ -81,18 +82,18 @@ impl RenderContext {
 
         let name = match uop.op() {
             Op::Const(cv) => lconst(&cv.0, &uop.dtype()),
-            Op::VConst { values } => self.render_vconst(values, uop),
-            Op::Param { arg, .. } => format!("%data{}", arg.slot),
-            Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
+            Op::VConst(ops::VConst { values }) => self.render_vconst(values, uop),
+            Op::Param(ops::Param { arg, .. }) => format!("%data{}", arg.slot),
+            Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
                 format!("%local{}", arg.slot)
             }
-            Op::DefineVar { name, .. } => format!("%{name}"),
-            Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => {
+            Op::DefineVar(ops::DefineVar { name, .. }) => format!("%{name}"),
+            Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => {
                 let n = format!("%reg{}", self.counter);
                 self.counter += 1;
                 n
             }
-            Op::Range { axis_id, .. } => {
+            Op::Range(ops::Range { axis_id, .. }) => {
                 // Range variables are named by axis_id
                 format!("%r{}", axis_id.name())
             }

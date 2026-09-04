@@ -14,6 +14,7 @@ use svod_dtype::ext::HasDType;
 
 use crate::IntoUOp;
 use crate::op::Op;
+use crate::ops;
 use crate::types::{ConstValue, ConstValueHash};
 use crate::uop::core::UOp;
 use crate::uop::hash_consing::next_unique_id;
@@ -135,7 +136,7 @@ impl UOp {
             value: committed.first().copied().unwrap_or(ConstValue::Invalid),
             dtype: scalar_dtype.clone(),
         })?;
-        Ok(Self::new(Op::VConst { values: committed }, vec_dtype))
+        Ok(Self::new(Op::VConst(ops::VConst { values: committed }), vec_dtype))
     }
 
     // =========================================================================
@@ -175,7 +176,7 @@ impl UOp {
         assert!(!matches!(dtype, DType::Ptr { .. }), "BUFFER dtype is the stored element dtype, not a pointer");
         let shape = crate::shape::shape_to_uop(&smallvec::smallvec![crate::SInt::Const(size)]);
         let arg = crate::ParamArg::buffer(slot, dtype.clone(), addrspace, device);
-        Self::new(Op::Buffer { shape, arg }, dtype)
+        Self::new(Op::Buffer(ops::Buffer { shape, arg: arg.into() }), dtype)
     }
 
     /// Create a normalized buffer parameter with positional slot.
@@ -186,7 +187,7 @@ impl UOp {
         assert!(!matches!(dtype, DType::Ptr { .. }), "PARAM dtype is the stored element dtype, not a pointer");
         let shape = crate::shape::shape_to_uop(&smallvec::smallvec![crate::SInt::Const(size)]);
         let arg = crate::ParamArg::buffer(slot, dtype.clone(), svod_dtype::AddrSpace::Global, device);
-        Self::new(Op::Param { shape, arg }, dtype)
+        Self::new(Op::Param(ops::Param { shape, arg: arg.into() }), dtype)
     }
 
     /// Create a positional global PARAM with a logical, possibly symbolic shape.
@@ -200,14 +201,14 @@ impl UOp {
         assert!(!matches!(dtype, DType::Ptr { .. }), "PARAM dtype is the stored element dtype, not a pointer");
         let shape = crate::shape::shape_to_uop(shape);
         let arg = crate::ParamArg::buffer(slot, dtype.clone(), svod_dtype::AddrSpace::Global, device);
-        Self::new(Op::Param { shape, arg }, dtype)
+        Self::new(Op::Param(ops::Param { shape, arg: arg.into() }), dtype)
     }
 
     /// Create a positional scalar PARAM for a FUNCTION body.
     pub fn scalar_param(slot: usize, name: Option<String>, dtype: DType, min_val: i64, max_val: i64) -> Arc<Self> {
         let shape = crate::shape::shape_to_uop(&smallvec::SmallVec::new());
         let arg = crate::ParamArg::scalar(slot, name, dtype.clone(), min_val, max_val);
-        Self::new(Op::Param { shape, arg }, dtype)
+        Self::new(Op::Param(ops::Param { shape, arg: arg.into() }), dtype)
     }
 
     /// Create flattened storage and restore its logical shape, matching Tinygrad's
@@ -243,7 +244,7 @@ impl UOp {
 
     /// Create a contiguous typed slice. `offset` is measured in source elements.
     pub fn contiguous_slice(self: &Arc<Self>, size: usize, offset: usize, dtype: DType) -> Arc<Self> {
-        Self::new(Op::Slice { buffer: self.clone(), offset: Self::index_const(offset as i64), size }, dtype)
+        Self::new(Op::Slice(ops::Slice { buffer: self.clone(), offset: Self::index_const(offset as i64), size }), dtype)
     }
 
     // =========================================================================
@@ -276,11 +277,11 @@ impl UOp {
             return self.clone();
         }
 
-        Self::new(Op::Cast { src: self.clone(), dtype: dtype.clone() }, dtype)
+        Self::new(Op::Cast(ops::Cast { src: self.clone(), dtype: dtype.clone() }), dtype)
     }
 
     /// Bitcast: reinterpret bits as different type.
     pub fn bitcast(self: &Arc<Self>, dtype: DType) -> Arc<Self> {
-        Self::new(Op::BitCast { src: self.clone(), dtype: dtype.clone() }, dtype)
+        Self::new(Op::BitCast(ops::BitCast { src: self.clone(), dtype: dtype.clone() }), dtype)
     }
 }

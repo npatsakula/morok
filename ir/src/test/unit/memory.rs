@@ -3,6 +3,7 @@
 use svod_dtype::DType;
 use svod_dtype::DeviceSpec;
 
+use crate::ops;
 use crate::types::{AddrSpace, AxisId, AxisType, BufferizeOpts};
 use crate::{Op, UOp};
 
@@ -18,7 +19,7 @@ fn getaddr_is_a_scalar_device_address() {
     assert_eq!(address.addrspace(), None);
     assert!(address.tree().contains("GETADDR(CPU)"));
     match address.op() {
-        Op::GetAddr { src, device } => {
+        Op::GetAddr(ops::GetAddr { src, device }) => {
             assert!(std::sync::Arc::ptr_eq(src, &buffer));
             assert_eq!(device, &DeviceSpec::Cpu);
             assert_eq!(src.addrspace(), Some(AddrSpace::Global));
@@ -48,7 +49,7 @@ fn test_stage_records_ranges_and_address_space() {
 
     let stage = UOp::stage(compute.clone(), vec![r1, r2], BufferizeOpts::new(DeviceSpec::Cpu));
     assert_eq!(stage.dtype(), DType::Float32, "STAGE keeps the computed dtype");
-    let Op::Stage { compute: staged, ranges, opts } = stage.op() else {
+    let Op::Stage(ops::Stage { compute: staged, ranges, opts }) = stage.op() else {
         panic!("expected STAGE, got {:?}", stage.op())
     };
     assert!(std::sync::Arc::ptr_eq(staged, &compute));
@@ -57,7 +58,7 @@ fn test_stage_records_ranges_and_address_space() {
     assert_eq!(opts.addrspace, AddrSpace::Global);
 
     let local = UOp::stage(compute, vec![], BufferizeOpts::local());
-    let Op::Stage { opts, .. } = local.op() else { panic!("expected STAGE, got {:?}", local.op()) };
+    let Op::Stage(ops::Stage { opts, .. }) = local.op() else { panic!("expected STAGE, got {:?}", local.op()) };
     assert_eq!(opts.addrspace, AddrSpace::Local);
 }
 
@@ -72,10 +73,10 @@ fn test_load() {
 
     assert_eq!(load.dtype(), DType::Float32, "LOAD has the buffer's dtype");
     match load.op() {
-        Op::Load { index: i, alt: None, gate: None } => assert!(std::sync::Arc::ptr_eq(i, &index)),
+        Op::Load(ops::Load { index: i, alt: None, gate: None }) => assert!(std::sync::Arc::ptr_eq(i, &index)),
         op => panic!("expected an ungated Load, got {op:?}"),
     }
-    assert!(matches!(gated.op(), Op::Load { alt: Some(_), gate: Some(_), .. }));
+    assert!(matches!(gated.op(), Op::Load(ops::Load { alt: Some(_), gate: Some(_), .. })));
 }
 
 #[test]
@@ -94,7 +95,7 @@ fn test_store() {
     assert_eq!(store.dtype(), DType::Void);
 
     // Should be Store op with index pointing to buffer
-    if let Op::Store { index: i, value: v, .. } = store.op() {
+    if let Op::Store(ops::Store { index: i, value: v, .. }) = store.op() {
         assert!(std::sync::Arc::ptr_eq(i, &index));
         assert!(std::sync::Arc::ptr_eq(v, &value));
         // Verify buffer can be accessed via store_buffer()
@@ -112,7 +113,7 @@ fn test_codegen_param() {
     assert_eq!(p.dtype(), DType::Float32);
     assert_eq!(p.shape().unwrap().unwrap()[0].as_const(), Some(1024));
 
-    if let Op::Param { arg, .. } = p.op() {
+    if let Op::Param(ops::Param { arg, .. }) = p.op() {
         assert_eq!(arg.slot, 0);
         assert_eq!(arg.dtype, DType::Float32);
         assert_eq!(arg.addrspace, Some(svod_dtype::AddrSpace::Global));
@@ -146,7 +147,7 @@ fn test_local_buffer() {
 
     assert_eq!(dl.dtype(), DType::Int32);
 
-    if let Op::Buffer { arg, .. } = dl.op() {
+    if let Op::Buffer(ops::Buffer { arg, .. }) = dl.op() {
         assert_eq!(arg.slot, 1);
         assert_eq!(arg.addrspace, Some(AddrSpace::Local));
         assert_eq!(dl.shape().unwrap().unwrap().as_slice(), &[crate::SInt::Const(4)]);

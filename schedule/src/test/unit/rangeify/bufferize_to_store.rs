@@ -8,6 +8,7 @@ use std::sync::Arc;
 use svod_ir::{Op, UOp};
 
 use crate::rangeify::{RangeifyBufferContext, bufferize_to_store};
+use svod_ir::ops;
 
 #[test]
 fn a_staged_compute_becomes_a_buffer_backed_store() {
@@ -18,18 +19,22 @@ fn a_staged_compute_becomes_a_buffer_backed_store() {
 
     let result = bufferize_to_store(&stage, &mut ctx).expect("a global STAGE converts");
 
-    let Op::After { passthrough, deps } = result.op() else { panic!("expected AFTER, got {}", result.tree()) };
-    assert!(matches!(passthrough.op(), Op::Buffer { .. }), "the passthrough is the allocated BUFFER");
+    let Op::After(ops::After { passthrough, deps }) = result.op() else {
+        panic!("expected AFTER, got {}", result.tree())
+    };
+    assert!(matches!(passthrough.op(), Op::Buffer(..)), "the passthrough is the allocated BUFFER");
     let [dep] = deps.as_slice() else { panic!("expected exactly one dep") };
 
-    let Op::End { computation, ranges } = dep.op() else { panic!("expected END, got {}", dep.tree()) };
+    let Op::End(ops::End { computation, ranges }) = dep.op() else { panic!("expected END, got {}", dep.tree()) };
     assert_eq!(ranges.as_slice().len(), 1);
     assert!(Arc::ptr_eq(&ranges[0], &range), "END closes the STAGE's own range");
 
-    let Op::Store { index, value, gate } = computation.op() else { panic!("expected STORE inside the END") };
+    let Op::Store(ops::Store { index, value, gate }) = computation.op() else {
+        panic!("expected STORE inside the END")
+    };
     assert!(gate.is_none());
     assert!(Arc::ptr_eq(value, &compute));
-    let Op::Index { buffer, .. } = index.op() else { panic!("expected INDEX, got {}", index.tree()) };
+    let Op::Index(ops::Index { buffer, .. }) = index.op() else { panic!("expected INDEX, got {}", index.tree()) };
     assert!(Arc::ptr_eq(buffer, passthrough), "the STORE writes the buffer the AFTER passes through");
 
     let tracked = ctx.get_buffer(&stage).expect("the STAGE is tracked");

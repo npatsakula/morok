@@ -54,9 +54,10 @@ fn deterministic_hit_and_corruption_recovery() {
         }
     };
     let first = cache.get_or_compile(&key, validate, compile(b"OBJ-one")).unwrap();
-    let second = cache.get_or_compile(&key, validate, || panic!("cache hit must not compile")).unwrap();
-    assert_eq!(first, second);
-    assert_eq!(calls.get(), 1);
+    let second = cache.get_or_compile(&key, validate, compile(b"OBJ-other")).unwrap();
+    assert_eq!(first, b"OBJ-one");
+    assert_eq!(second, first, "a hit serves the published bytes, not the new closure's");
+    assert_eq!(calls.get(), 1, "a hit must not invoke the compile closure");
 
     fs::write(cache.entry_path(&key.digest()), b"corrupt").unwrap();
     let recovered = cache.get_or_compile(&key, validate, compile(b"OBJ-two")).unwrap();
@@ -64,8 +65,18 @@ fn deterministic_hit_and_corruption_recovery() {
     assert_eq!(calls.get(), 2, "a validation failure must recompile, not fail");
 }
 
+fn staging_files(dir: &std::path::Path) -> usize {
+    fs::read_dir(dir)
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().path().extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+        .count()
+}
+
+/// Nothing serialises concurrent compilers of one key: each compiles and
+/// publishes atomically, and whichever rename lands last leaves one valid,
+/// readable entry behind.
 #[test]
-fn concurrent_writers_compile_once() {
+fn concurrent_writers_leave_one_valid_entry() {
     let dir = tempfile::tempdir().unwrap();
     let cache = Arc::new(ObjectCache::open(dir.path(), 4096).unwrap());
     let key = Arc::new(ObjectCacheKey::new(b"shared", identity()));
@@ -94,13 +105,32 @@ fn concurrent_writers_compile_once() {
     for thread in threads {
         assert_eq!(thread.join().unwrap(), b"object");
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(
-        !fs::read_dir(dir.path())
-            .unwrap()
-            .any(|entry| entry.unwrap().path().extension().and_then(|ext| ext.to_str()) == Some("tmp")),
-        "publication must leave no staging files behind"
-    );
+    assert!((1..=8).contains(&calls.load(Ordering::SeqCst)));
+    assert_eq!(staging_files(dir.path()), 0, "publication must leave no staging files behind");
+    assert_eq!(cache.get_or_compile(&key, |_| Ok(()), || panic!("must be a cache hit")).unwrap(), b"object");
+}
+
+/// Another compiler publishing the same key between this one's read and
+/// publish is overwritten by a whole entry, never a torn one.
+#[test]
+fn publish_over_a_concurrent_publication_keeps_a_readable_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ObjectCache::open(dir.path(), 4096).unwrap();
+    let key = ObjectCacheKey::new(b"raced", identity());
+    let outer = cache
+        .get_or_compile(
+            &key,
+            |_| Ok(()),
+            || {
+                assert_eq!(cache.get_or_compile(&key, |_| Ok(()), || Ok(b"OBJ-inner".to_vec())).unwrap(), b"OBJ-inner");
+                Ok(b"OBJ-outer".to_vec())
+            },
+        )
+        .unwrap();
+    assert_eq!(outer, b"OBJ-outer", "a compiler returns what it compiled, not what raced it");
+    assert_eq!(staging_files(dir.path()), 0);
+    let entry = cache.get_or_compile(&key, |_| Ok(()), || panic!("must be a cache hit")).unwrap();
+    assert_eq!(entry, b"OBJ-outer", "the last rename wins");
 }
 
 #[test]
@@ -156,24 +186,4 @@ fn uncreatable_cache_directory_disables_the_cache() {
     let cache = ObjectCache::from_env();
     unsafe { std::env::remove_var("SVOD_OBJECT_CACHE_DIR") };
     assert!(matches!(cache, Ok(None)), "an unopenable store must disable the cache, not fail: {cache:?}");
-}
-
-/// The lock is ownership of the file, not its existence: an abandoned lock file
-/// naming a live pid (this process) used to spin for the 120 s stale-lock age.
-#[test]
-fn abandoned_lock_file_does_not_stall_compilation() {
-    let dir = tempfile::tempdir().unwrap();
-    let cache = ObjectCache::open(dir.path(), 4096).unwrap();
-    let key = ObjectCacheKey::new(b"abandoned", identity());
-    let digest = key.digest();
-    let lock_path =
-        dir.path().join(format!("{}.lock", digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()));
-    fs::write(&lock_path, format!("{}\n", std::process::id())).unwrap();
-
-    let start = std::time::Instant::now();
-    let bytes = cache.get_or_compile(&key, |_| Ok(()), || Ok(b"object".to_vec())).unwrap();
-    assert_eq!(bytes, b"object");
-    assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
-    // The entry is published: an unheld lock file never blocked publication.
-    assert_eq!(cache.get_or_compile(&key, |_| Ok(()), || panic!("must be a cache hit")).unwrap(), b"object");
 }

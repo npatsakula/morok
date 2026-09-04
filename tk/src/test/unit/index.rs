@@ -57,9 +57,9 @@ fn test_flat_ptr_unwraps_reshape_to_param() {
     let ph = ph
         .try_reshape(&svod_ir::shape::Shape::from_iter([svod_ir::SInt::Const(3), svod_ir::SInt::Const(4)]))
         .expect("reshape");
-    assert!(matches!(ph.op(), Op::Reshape { .. }), "precondition: placeholder view is a reshape");
+    assert!(matches!(ph.op(), Op::Reshape(..)), "precondition: placeholder view is a reshape");
 
     let (buf, elem) = flat_ptr(&ph);
-    assert!(!matches!(buf.op(), Op::Reshape { .. }), "flat_ptr must unwrap the reshape");
+    assert!(!matches!(buf.op(), Op::Reshape(..)), "flat_ptr must unwrap the reshape");
     assert_eq!(elem, DType::Float32, "element dtype is the pointer base");
 }

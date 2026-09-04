@@ -3,12 +3,13 @@
 //! `extract_device_from_graph` is covered by the rows in `buffer_limits.rs`.
 
 use svod_dtype::{DType, DeviceSpec};
+use svod_ir::ops;
 use svod_ir::{Op, UOp};
 
 #[test]
 fn copy_records_its_target_device() {
     let copy = UOp::native_const(1.0f32).copy_to_device(DeviceSpec::Cpu);
-    assert!(matches!(copy.op(), Op::Copy { device: DeviceSpec::Cpu, .. }));
+    assert!(matches!(copy.op(), Op::Copy(ops::Copy { device: DeviceSpec::Cpu, .. })));
 }
 
 /// Only a COPY may straddle devices; a compute kernel must read and write one.

@@ -44,7 +44,7 @@ pub mod test;
 pub use dtype_rule::dtype_from_op;
 pub use error::{Error, IndexTypeMismatchSnafu, Result};
 pub use indexing::IndexSpec;
-pub use op::Op;
+pub use op::{Op, ops};
 pub use opt::{Opt, OptArg, OptOps};
 pub use sint::{IntoShrinkRange, SInt, ShrinkRange, sint_max, sint_min, sint_prod};
 pub use types::{

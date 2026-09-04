@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::*;
+use svod_ir::ops;
 
 fn cfg() -> PrepareConfig {
     PrepareConfig::from(svod_schedule::OptimizerConfig::default())
@@ -284,7 +285,7 @@ fn test_normalize_for_schedule_cache_collects_var_vals_and_strips_bind_values() 
     assert_eq!(normalized.var_vals.get("N"), Some(&5));
 
     assert!(
-        normalized.normalized.toposort().iter().all(|node| !matches!(node.op(), Op::Bind { .. })),
+        normalized.normalized.toposort().iter().all(|node| !matches!(node.op(), Op::Bind(..))),
         "normalized graph should replace BIND placeholders with PARAM for reversible restore"
     );
     assert!(
@@ -292,7 +293,7 @@ fn test_normalize_for_schedule_cache_collects_var_vals_and_strips_bind_values() 
             .normalized
             .toposort()
             .iter()
-            .any(|node| matches!(node.op(), Op::Param { arg, .. } if arg.device.is_some())),
+            .any(|node| matches!(node.op(), Op::Param(ops::Param { arg, .. }) if arg.device.is_some())),
         "normalized graph should include PARAM placeholders for stripped runtime BIND values"
     );
 }
@@ -331,10 +332,10 @@ fn test_normalize_for_schedule_cache_preserves_internal_buffers() {
 
     assert_eq!(normalized.param_values.len(), 1, "only global storage is a positional input");
     assert!(normalized.normalized.toposort().iter().any(
-        |u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local) && arg.slot == 909)
+        |u| matches!(u.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local) && arg.slot == 909)
     ));
     assert!(normalized.normalized.toposort().iter().any(
-        |u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Reg) && arg.slot == 707)
+        |u| matches!(u.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Reg) && arg.slot == 707)
     ));
 }
 
@@ -344,12 +345,12 @@ fn test_post_sched_cache_restore_replaces_params() {
     let sink = UOp::sink(vec![c.uop().contiguous()]);
 
     let normalized = crate::realize::normalize_for_schedule_cache(&sink).expect("normalize param restore sink");
-    assert!(normalized.normalized.toposort().iter().any(|n| matches!(n.op(), Op::Param { .. })));
+    assert!(normalized.normalized.toposort().iter().any(|n| matches!(n.op(), Op::Param(..))));
 
     let restored = crate::realize::restore_post_schedule_cache(&normalized.normalized, &normalized);
-    assert!(restored.toposort().iter().any(|n| matches!(n.op(), Op::Buffer { .. })));
+    assert!(restored.toposort().iter().any(|n| matches!(n.op(), Op::Buffer(..))));
     assert!(
-        restored.toposort().iter().all(|n| !matches!(n.op(), Op::Param { .. })),
+        restored.toposort().iter().all(|n| !matches!(n.op(), Op::Param(..))),
         "restored graph should not retain PARAM placeholders"
     );
 }
@@ -363,7 +364,7 @@ fn test_post_sched_cache_restore_materializes_runtime_buffers() {
         svod_ir::AddrSpace::Global,
         Some(svod_dtype::DeviceSpec::Cpu),
     );
-    let placeholder = UOp::new(Op::Buffer { shape, arg }, DType::Float32)
+    let placeholder = UOp::new(Op::Buffer(ops::Buffer { shape, arg: arg.into() }), DType::Float32)
         .with_tag(smallvec::smallvec![svod_ir::uop::canonical::TAG_SCHEDULE_LOCAL_BUFFER]);
     let root = UOp::sink(vec![placeholder]);
 
@@ -376,8 +377,18 @@ fn test_post_sched_cache_restore_materializes_runtime_buffers() {
     };
 
     let restored = crate::realize::restore_post_schedule_cache(&root, &normalization);
-    assert!(restored.toposort().iter().any(|n| matches!(n.op(), Op::Buffer { arg, .. } if arg.slot != usize::MAX)));
-    assert!(restored.toposort().iter().all(|n| !matches!(n.op(), Op::Buffer { arg, .. } if arg.slot == usize::MAX)));
+    assert!(
+        restored
+            .toposort()
+            .iter()
+            .any(|n| matches!(n.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.slot != usize::MAX))
+    );
+    assert!(
+        restored
+            .toposort()
+            .iter()
+            .all(|n| !matches!(n.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.slot == usize::MAX))
+    );
 }
 
 #[test]
@@ -395,22 +406,18 @@ fn test_post_sched_cache_restore_keeps_codegen_params_inside_call_body() {
     let restored = crate::realize::restore_post_schedule_pre_schedule(&pre_schedule, &normalization);
 
     assert!(
-        restored.items.iter().flat_map(|item| &item.sources).all(|source| matches!(source.op(), Op::Buffer { .. })),
+        restored.items.iter().flat_map(|item| &item.sources).all(|source| matches!(source.op(), Op::Buffer(..))),
         "CALL arguments must restore to runtime buffers"
     );
     assert!(
         restored.items.iter().all(|item| item.ast.toposort().iter().any(|node| {
-            matches!(node.op(), Op::Param { .. })
+            matches!(node.op(), Op::Param(..))
                 && node.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_CODEGEN_PARAM))
         })),
         "callable bodies must retain codegen PARAM formals"
     );
     assert!(
-        restored.items.iter().all(|item| item
-            .ast
-            .toposort()
-            .iter()
-            .all(|node| !matches!(node.op(), Op::Buffer { .. }))),
+        restored.items.iter().all(|item| item.ast.toposort().iter().all(|node| !matches!(node.op(), Op::Buffer(..)))),
         "codegen AST must not contain runtime BUFFERs"
     );
 }
@@ -460,9 +467,9 @@ fn test_schedule_cache_normalization_preserves_opaque_call_body() {
         .normalized
         .toposort_call_aware(false)
         .into_iter()
-        .find(|node| matches!(node.op(), Op::Call { .. }))
+        .find(|node| matches!(node.op(), Op::Call(..)))
         .unwrap();
-    let Op::Call { body: normalized_body, .. } = normalized_call.op() else { unreachable!() };
+    let Op::Call(ops::Call { body: normalized_body, .. }) = normalized_call.op() else { unreachable!() };
     assert!(Arc::ptr_eq(normalized_body, &body));
 }
 

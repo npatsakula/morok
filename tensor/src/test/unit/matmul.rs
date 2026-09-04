@@ -1,6 +1,7 @@
 use crate::*;
 use ndarray::{Array2, array};
 use svod_dtype::DType;
+use svod_ir::ops;
 use svod_schedule::{
     BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcOptLevel, TcSelect, testing::setup_test_tracing,
 };
@@ -434,7 +435,7 @@ fn pinned_tc_config(tc_index: usize, tc_opt: TcOptLevel) -> OptimizerConfig {
 }
 
 fn find_wmma<'a>(nodes: impl IntoIterator<Item = &'a Arc<UOp>>) -> &'a Arc<UOp> {
-    nodes.into_iter().find(|u| matches!(u.op(), Op::Wmma { .. })).expect("lowered matmul must emit a tensor-core op")
+    nodes.into_iter().find(|u| matches!(u.op(), Op::Wmma(..))).expect("lowered matmul must emit a tensor-core op")
 }
 
 /// PROGRAM → LINEAR → LLVM text for `arch`, asserting the object assembles when
@@ -443,7 +444,7 @@ fn render_amd(optimized: Arc<UOp>, arch: AmdArch, name: &str) -> (Arc<UOp>, svod
     let program = svod_codegen::program_pipeline::program_from_sink(optimized, DeviceSpec::Amd { device_id: 0 })
         .expect("final target graph");
     let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("linearize");
-    let linear = linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear { .. })).expect("LINEAR stage");
+    let linear = linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear(..))).expect("LINEAR stage");
     let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(arch);
     let rendered = svod_codegen::traits::Renderer::render(&renderer, &linear, Some(name)).expect("render LLVM text");
     if svod_runtime::amd::compile::has_amdgpu_target() {
@@ -472,7 +473,7 @@ fn test_matmul_fp8_gfx1201_decomposes_to_f16_wmma_compile_only() {
         .expect("gfx1201 FP8 decomposition and TC optimization");
 
         let nodes = optimized.toposort();
-        let Op::Wmma { metadata: wmma, .. } = find_wmma(&nodes).op() else { unreachable!() };
+        let Op::Wmma(ops::Wmma { metadata: wmma, .. }) = find_wmma(&nodes).op() else { unreachable!() };
         assert_eq!((wmma.dtype_in.clone(), wmma.dtype_out.clone()), (DType::Float16, DType::Float32));
         assert_eq!((wmma.device, wmma.threads), (RendererDevice::AmdRdna4, 32));
         assert!(
@@ -480,7 +481,9 @@ fn test_matmul_fp8_gfx1201_decomposes_to_f16_wmma_compile_only() {
             "{dtype:?} arithmetic must be fully decomposed"
         );
         assert!(
-            nodes.iter().any(|u| matches!(u.op(), Op::Param { arg, .. } if arg.dtype.base() == ScalarDType::UInt8)),
+            nodes
+                .iter()
+                .any(|u| matches!(u.op(), Op::Param(ops::Param { arg, .. }) if arg.dtype.base() == ScalarDType::UInt8)),
             "{dtype:?} storage must remain byte-addressed"
         );
 
@@ -510,7 +513,7 @@ fn test_matmul_ocp_fp8_gfx950_native_mfma_compile_only() {
             .expect("gfx950 native FP8 TC optimization");
 
         let nodes = optimized.toposort();
-        let Op::Wmma { metadata, .. } = find_wmma(&nodes).op() else { unreachable!() };
+        let Op::Wmma(ops::Wmma { metadata, .. }) = find_wmma(&nodes).op() else { unreachable!() };
         assert_eq!(
             (metadata.dims, metadata.dtype_in.clone(), metadata.dtype_out.clone()),
             ((16, 16, 128), dtype.clone(), DType::Float32)
@@ -526,8 +529,8 @@ fn test_matmul_ocp_fp8_gfx950_native_mfma_compile_only() {
 fn eval_lane(u: &Arc<UOp>, lane: i64) -> i64 {
     match u.op() {
         Op::Const(value) => value.0.try_int().expect("integer constant"),
-        Op::Special { name, .. } if name == "lidx0" => lane,
-        Op::Cast { src, .. } => eval_lane(src, lane),
+        Op::Special(ops::Special { name, .. }) if name == "lidx0" => lane,
+        Op::Cast(ops::Cast { src, .. }) => eval_lane(src, lane),
         Op::Binary(op, a, b) => {
             let (a, b) = (eval_lane(a, lane), eval_lane(b, lane));
             match op {
@@ -555,26 +558,26 @@ fn eval_gate(u: &Arc<UOp>, lane: i64) -> bool {
 
 fn memory_param_slot(index: &Arc<UOp>) -> Option<usize> {
     let buffer = match index.op() {
-        Op::Index { buffer, .. } => buffer,
-        Op::Shrink { src, .. } => src,
+        Op::Index(ops::Index { buffer, .. }) => buffer,
+        Op::Shrink(ops::Shrink { src, .. }) => src,
         _ => return None,
     };
     match buffer.op() {
-        Op::Param { arg, .. } => Some(arg.slot),
+        Op::Param(ops::Param { arg, .. }) => Some(arg.slot),
         _ => None,
     }
 }
 
 fn is_zero_stack(u: &Arc<UOp>, lanes: usize) -> bool {
     let is_zero = |u: &Arc<UOp>| matches!(u.op(), Op::Const(value) if value.0 == ConstValue::Float(0.0));
-    matches!(u.op(), Op::Stack { sources } if sources.len() == lanes && sources.iter().all(is_zero))
+    matches!(u.op(), Op::Stack(ops::Stack { sources }) if sources.len() == lanes && sources.iter().all(is_zero))
 }
 
 fn is_lidx_lt(gate: &Arc<UOp>, bound: i64) -> bool {
     matches!(gate.op(), Op::Binary(BinaryOp::Lt, lhs, rhs)
         if rhs.vmin().try_int() == Some(bound)
             && rhs.vmax().try_int() == Some(bound)
-            && lhs.toposort().iter().any(|u| matches!(u.op(), Op::Special { end, name }
+            && lhs.toposort().iter().any(|u| matches!(u.op(), Op::Special(ops::Special { end, name })
                 if name == "lidx0" && end.vmax().try_int() == Some(32))))
 }
 
@@ -609,10 +612,10 @@ impl Fragments {
     ) -> Self {
         let mut fragments = Fragments { a: Vec::new(), b: Vec::new(), c: Vec::new() };
         for u in ops {
-            if let Op::Load { index, alt, gate } = u.op() {
+            if let Op::Load(ops::Load { index, alt, gate }) = u.op() {
                 match memory_param_slot(index) {
                     Some(1) => {
-                        let Op::Shrink { offsets, sizes, .. } = index.op() else {
+                        let Op::Shrink(ops::Shrink { offsets, sizes, .. }) = index.op() else {
                             panic!("every A load must use a shaped SHRINK address: {}", u.tree())
                         };
                         let shape = u
@@ -641,7 +644,7 @@ impl Fragments {
                         });
                     }
                     Some(2) => {
-                        let Op::Index { indices, .. } = index.op() else {
+                        let Op::Index(ops::Index { indices, .. }) = index.op() else {
                             panic!("every B load must use a scalar INDEX address: {}", u.tree())
                         };
                         assert_eq!(indices.len(), 1, "B loads must have one address expression");
@@ -652,11 +655,13 @@ impl Fragments {
                     slot => panic!("unexpected or malformed load (slot {slot:?}): {}", u.tree()),
                 }
             }
-            if let Op::Store { index, value, gate } = u.op() {
+            if let Op::Store(ops::Store { index, value, gate }) = u.op() {
                 assert_eq!(memory_param_slot(index), Some(0), "only C stores are permitted: {}", u.tree());
-                let Op::Index { indices, .. } = index.op() else { panic!("C stores must use scalar INDEX addresses") };
+                let Op::Index(ops::Index { indices, .. }) = index.op() else {
+                    panic!("C stores must use scalar INDEX addresses")
+                };
                 assert_eq!(indices.len(), 1);
-                let Op::Index { buffer, indices: value_indices } = value.op() else {
+                let Op::Index(ops::Index { buffer, indices: value_indices }) = value.op() else {
                     panic!("C store value must index the WMMA result: {}", value.tree())
                 };
                 assert!(Arc::ptr_eq(buffer, wmma), "C store must consume this graph's WMMA accumulator");
@@ -742,13 +747,13 @@ fn test_matmul_m5_gfx1151_padded_wmma_compile_only() {
 
     let nodes = optimized.toposort();
     assert!(
-        nodes.iter().all(|u| !matches!(u.op(), Op::Reduce { .. })),
+        nodes.iter().all(|u| !matches!(u.op(), Op::Reduce(..))),
         "pre-coalescing M=5 WMMA must not retain an operand-side range as a residual REDUCE",
     );
     let params = nodes
         .iter()
         .filter_map(|u| match u.op() {
-            Op::Param { shape, arg } => Some((arg.slot, u.dtype(), shape.vmax().try_int())),
+            Op::Param(ops::Param { shape, arg }) => Some((arg.slot, u.dtype(), shape.vmax().try_int())),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -759,7 +764,7 @@ fn test_matmul_m5_gfx1151_padded_wmma_compile_only() {
     );
 
     let wmma_node = find_wmma(&nodes);
-    let Op::Wmma { metadata: wmma, c: accumulator, .. } = wmma_node.op() else { unreachable!() };
+    let Op::Wmma(ops::Wmma { metadata: wmma, c: accumulator, .. }) = wmma_node.op() else { unreachable!() };
     assert_eq!(wmma.dims, (16, 16, 16));
     assert_eq!((wmma.dtype_in.clone(), wmma.dtype_out.clone()), (DType::Float16, DType::Float32));
     assert_eq!((wmma.device, wmma.threads), (RendererDevice::AmdRdna3, 32));
@@ -772,23 +777,23 @@ fn test_matmul_m5_gfx1151_padded_wmma_compile_only() {
     Fragments::collect(&nodes, wmma_node, |_, gate| gate.clone()).assert_padded_5x16("optimized");
 
     let (linear, rendered) = render_amd(optimized, AmdArch::Gfx1151, "matmul_m5_gfx1151");
-    let Op::Linear { ops } = linear.op() else { unreachable!() };
+    let Op::Linear(ops::Linear { ops }) = linear.op() else { unreachable!() };
 
     let positions = |wanted: fn(&Op) -> bool| {
         ops.iter().enumerate().filter(|(_, u)| wanted(u.op())).map(|(position, _)| position).collect::<Vec<_>>()
     };
-    let ifs = positions(|op| matches!(op, Op::If { .. }));
-    let endifs = positions(|op| matches!(op, Op::EndIf { .. }));
+    let ifs = positions(|op| matches!(op, Op::If(..)));
+    let endifs = positions(|op| matches!(op, Op::EndIf(..)));
     assert_eq!((ifs.len(), endifs.len()), (1, 1), "LINEAR must contain exactly the partial C store IF/ENDIF");
     let (if_position, if_node) = (ifs[0], &ops[ifs[0]]);
-    let Op::If { condition: if_condition, body: if_body } = if_node.op() else { unreachable!() };
-    let Op::EndIf { if_op: endif_owner } = ops[endifs[0]].op() else { unreachable!() };
+    let Op::If(ops::If { condition: if_condition, body: if_body }) = if_node.op() else { unreachable!() };
+    let Op::EndIf(ops::EndIf { if_op: endif_owner }) = ops[endifs[0]].op() else { unreachable!() };
     assert!(is_lidx_lt(if_condition, 16), "partial C store IF must be lane<16");
     assert!(Arc::ptr_eq(endif_owner, if_node), "ENDIF must reference the partial-store IF by source identity");
     assert_eq!(if_body.len(), 1, "partial-store IF must own exactly one address dependency");
     assert_eq!(endifs[0], if_position + 2, "ENDIF must immediately follow the partial C store");
     let guarded_store = &ops[if_position + 1];
-    let Op::Store { index: guarded_address, value: guarded_value, .. } = guarded_store.op() else {
+    let Op::Store(ops::Store { index: guarded_address, value: guarded_value, .. }) = guarded_store.op() else {
         panic!("the partial C store must immediately follow its IF")
     };
     assert!(Arc::ptr_eq(&if_body[0], guarded_address), "IF body must own the partial store address by identity");

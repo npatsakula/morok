@@ -9,6 +9,7 @@
 
 use crate::optimizer::{Opt, Renderer, Scheduler, apply_opt};
 use crate::test::helpers::*;
+use svod_ir::ops;
 use svod_ir::{AxisId, AxisType, DType, ReduceOp, UOp};
 
 /// Port of Tinygrad test_kernel_opts.py::test_upcasts (lines 37-47)
@@ -523,12 +524,12 @@ fn test_full_upcast_no_longer_pre_rejects_symbolic_end() {
     let const_val = UOp::native_const(1.0f32);
     let symbolic_end = UOp::variable("b".into(), 1, 4, DType::Int32);
     let range = UOp::new(
-        svod_ir::Op::Range {
+        svod_ir::Op::Range(ops::Range {
             end: symbolic_end.clone(),
             axis_id: AxisId::Renumbered(0),
             axis_type: AxisType::Global,
             deps: smallvec::smallvec![],
-        },
+        }),
         symbolic_end.dtype(),
     );
     let pattern = UOp::sink(vec![const_val, range]);

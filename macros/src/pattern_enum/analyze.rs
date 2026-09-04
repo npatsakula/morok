@@ -8,10 +8,8 @@ use syn::Ident;
 pub enum VariantKind {
     /// Grouped operation (Binary, Unary, Ternary) - first field is sub-enum filter.
     Grouped,
-    /// Regular variant with children and filters.
+    /// Any other variant that takes part in pattern matching.
     Regular,
-    /// Nullary variant (no children).
-    Nullary,
     /// Skipped variant (no pattern generation).
     Skipped,
 }
@@ -21,34 +19,12 @@ pub enum VariantKind {
 pub struct AnalyzedVariant {
     pub name: Ident,
     pub kind: VariantKind,
-    /// Fixed child fields (Arc<UOp>).
+    /// Fixed child fields (`Arc<UOp>`); for grouped variants, everything after the kind.
     pub children: Vec<FieldInfo>,
-    /// Variadic child field if present (SmallVec<...> or Vec<...>).
-    pub variadic: Option<FieldInfo>,
-    /// Filter/metadata fields.
-    pub filters: Vec<FieldInfo>,
-    /// Whether this is a struct variant (vs tuple).
-    pub is_struct: bool,
-    /// For grouped variants, the name of the sub-enum filter type.
+    /// Whether the variant carries no fields at all.
+    pub is_unit: bool,
+    /// For grouped variants, the sub-enum type carrying the operation kind.
     pub filter_enum_type: Option<syn::Type>,
-}
-
-impl AnalyzedVariant {
-    /// Number of fixed children (used for arity).
-    pub fn fixed_arity(&self) -> usize {
-        self.children.len()
-    }
-
-    /// Whether this variant has variadic children.
-    pub fn has_variadic(&self) -> bool {
-        self.variadic.is_some()
-    }
-
-    /// Snake_case name for use in function names.
-    pub fn snake_name(&self) -> String {
-        use convert_case::{Case, Casing};
-        self.name.to_string().to_case(Case::Snake)
-    }
 }
 
 /// Analyze all variants given the enum attributes.
@@ -57,87 +33,16 @@ pub fn analyze_variants(enum_attrs: &EnumAttrs, variants: Vec<VariantInfo>) -> V
 }
 
 fn analyze_variant(enum_attrs: &EnumAttrs, variant: VariantInfo) -> AnalyzedVariant {
-    // Check if skipped
-    if variant.attrs.skip {
-        return AnalyzedVariant {
-            name: variant.name,
-            kind: VariantKind::Skipped,
-            children: vec![],
-            variadic: None,
-            filters: vec![],
-            is_struct: variant.is_struct,
-            filter_enum_type: None,
-        };
-    }
-
-    // Check if grouped
-    let is_grouped = enum_attrs.grouped.contains(&variant.name);
-
-    if is_grouped {
-        return analyze_grouped_variant(variant);
-    }
-
-    analyze_regular_variant(variant)
-}
-
-fn analyze_grouped_variant(variant: VariantInfo) -> AnalyzedVariant {
-    // For grouped variants (Binary, Unary, Ternary):
-    // - First field is the sub-enum filter (e.g., BinaryOp)
-    // - Remaining fields are children
-    let mut fields = variant.fields.into_iter();
-    let filter_field = fields.next();
-    let children: Vec<FieldInfo> = fields.collect();
-
-    AnalyzedVariant {
-        name: variant.name,
-        kind: VariantKind::Grouped,
-        filter_enum_type: filter_field.as_ref().map(|f| f.ty.clone()),
-        children,
-        variadic: None,
-        filters: filter_field.into_iter().collect(),
-        is_struct: variant.is_struct,
-    }
-}
-
-fn analyze_regular_variant(variant: VariantInfo) -> AnalyzedVariant {
-    let mut children = vec![];
-    let mut variadic = None;
-    let mut has_optional = false;
-    let mut filters = vec![];
-
-    for field in variant.fields {
-        match field.classification {
-            FieldClass::Child => children.push(field),
-            FieldClass::VariadicChildren => variadic = Some(field),
-            FieldClass::OptionalChild => has_optional = true,
-            FieldClass::Filter => filters.push(field),
-        }
-    }
-
-    let kind = if children.is_empty() && variadic.is_none() && !has_optional {
-        VariantKind::Nullary
+    let is_unit = variant.fields.is_empty();
+    let (kind, children, filter_enum_type) = if variant.attrs.skip {
+        (VariantKind::Skipped, vec![], None)
+    } else if enum_attrs.grouped.contains(&variant.name) {
+        let mut fields = variant.fields.into_iter();
+        let filter = fields.next().map(|f| f.ty);
+        (VariantKind::Grouped, fields.collect(), filter)
     } else {
-        VariantKind::Regular
+        let children = variant.fields.into_iter().filter(|f| f.classification == FieldClass::Child).collect();
+        (VariantKind::Regular, children, None)
     };
-
-    AnalyzedVariant {
-        name: variant.name,
-        kind,
-        children,
-        variadic,
-        filters,
-        is_struct: variant.is_struct,
-        filter_enum_type: None,
-    }
-}
-
-/// Group variants by kind for generation.
-pub fn group_by_kind(variants: &[AnalyzedVariant]) -> VariantGroups<'_> {
-    VariantGroups { grouped: variants.iter().filter(|v| v.kind == VariantKind::Grouped).collect() }
-}
-
-/// Variants grouped by kind for code generation.
-pub struct VariantGroups<'a> {
-    /// Grouped operations (Binary, Unary, Ternary) where first field is sub-enum filter.
-    pub grouped: Vec<&'a AnalyzedVariant>,
+    AnalyzedVariant { name: variant.name, kind, children, is_unit, filter_enum_type }
 }

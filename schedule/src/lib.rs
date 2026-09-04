@@ -56,15 +56,16 @@ pub use expand::{build_range_map, expander2, pm_group_for_reduce, pre_expand};
 pub use devectorize::devectorize;
 
 // Re-export gpudims pass
-pub use gpudims::{pm_add_gpudims, pm_lower_device_ranges};
+pub use gpudims::{GpuDimsContext, pm_add_gpudims, pm_lower_device_ranges};
 
 // Re-export optimizer entry points
 pub use optimizer::{
-    BeamConfig, BeamResult, CandidateMetrics, HeuristicsConfig, OptError, OptStrategy, OptimizerConfig,
+    BeamConfig, BeamResult, CandidateMetrics, HeuristicsConfig, KernelNaming, OptError, OptStrategy, OptimizerConfig,
     Renderer as OptimizerRenderer, Scheduler, TcOptLevel, TcSelect, TcUsage, apply_post_optimization,
     apply_post_optimization_with_config, apply_post_optimization_with_renderer, beam_search_cached_with_behavior,
-    compute_ops_estimate, hand_coded_optimizations, hash_post_codegen_ir, optimize_kernel, optimize_kernel_with_config,
-    optimize_kernel_with_config_and_final_rewrite, optimize_kernel_with_strategy, prepare_scheduler,
+    compute_ops_estimate, finalize_kernel_name, hand_coded_optimizations, hash_post_codegen_ir, optimize_kernel,
+    optimize_kernel_with_config, optimize_kernel_with_config_and_final_rewrite, optimize_kernel_with_naming,
+    optimize_kernel_with_strategy, prepare_scheduler, thread_budget, unique_kernel_name,
 };
 
 // Re-export UOp for macro usage

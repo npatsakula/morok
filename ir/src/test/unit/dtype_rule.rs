@@ -1,3 +1,4 @@
+use crate::ops;
 use crate::{BinaryOp, ConstValue, ConstValueHash, DType, Op, TernaryOp, UOp, UnaryOp, dtype_from_op};
 use svod_dtype::{AddrSpace, DeviceSpec};
 
@@ -117,13 +118,13 @@ fn index_dtype_matches_target_param_image_exception() {
     let shape = |dims: &[usize]| crate::shape::shape_to_uop(&dims.iter().map(|d| (*d).into()).collect());
     let param = |slot, dims: &[usize]| {
         let arg = crate::ParamArg::buffer(slot, DType::Float16, AddrSpace::Global, None);
-        UOp::new(Op::Param { shape: shape(dims), arg }, DType::Float16)
+        UOp::new(Op::Param(ops::Param { shape: shape(dims), arg: arg.into() }), DType::Float16)
     };
     let offset = UOp::index_const(0);
     let index_dtype = |buffer| UOp::index().buffer(buffer).indices(vec![offset.clone()]).call().unwrap().dtype();
 
     let image_arg = crate::ParamArg::buffer(0, DType::Float16, AddrSpace::Global, None);
-    let buffer = UOp::new(Op::Buffer { shape: shape(&[2, 3, 4]), arg: image_arg }, DType::Float16);
+    let buffer = UOp::new(Op::Buffer(ops::Buffer { shape: shape(&[2, 3, 4]), arg: image_arg.into() }), DType::Float16);
 
     assert_eq!(index_dtype(param(0, &[2, 3, 4])), DType::Float32, "image-shaped PARAM");
     assert_eq!(index_dtype(buffer), DType::Float16, "BUFFER is never image-shaped");

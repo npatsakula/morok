@@ -23,22 +23,24 @@ mod stage_local_tests {
         let lowered = add_local_buffer(&stage, &mut ctx).unwrap();
         assert_eq!(lowered.dtype(), DType::Float32);
 
-        let Op::After { passthrough, deps } = lowered.op() else { panic!("expected AFTER") };
+        let Op::After(svod_ir::ops::After { passthrough, deps }) = lowered.op() else { panic!("expected AFTER") };
         let storage = passthrough.base();
-        assert!(matches!(storage.op(), Op::Buffer { arg, .. }
+        assert!(matches!(storage.op(), Op::Buffer(svod_ir::ops::Buffer { arg, .. })
             if arg.slot == 0 && arg.dtype == DType::Float32 && arg.addrspace == Some(AddrSpace::Local)));
         let [end] = deps.as_slice() else { panic!("expected one dependency") };
-        let Op::End { computation, ranges } = end.op() else { panic!("expected END") };
+        let Op::End(svod_ir::ops::End { computation, ranges }) = end.op() else { panic!("expected END") };
         assert!(ranges.iter().zip([&r0, &r1]).all(|(actual, expected)| Arc::ptr_eq(actual, expected)));
-        let Op::Store { index, value, gate: None } = computation.op() else { panic!("expected STORE") };
+        let Op::Store(svod_ir::ops::Store { index, value, gate: None }) = computation.op() else {
+            panic!("expected STORE")
+        };
         assert!(Arc::ptr_eq(value, &compute));
-        let Op::Index { buffer, indices } = index.op() else { panic!("expected INDEX") };
+        let Op::Index(svod_ir::ops::Index { buffer, indices }) = index.op() else { panic!("expected INDEX") };
         assert!(Arc::ptr_eq(buffer, passthrough));
         assert!(indices.iter().zip([&r0, &r1]).all(|(actual, expected)| Arc::ptr_eq(actual, expected)));
 
         let second = UOp::stage_local(UOp::native_const(8.0f32), vec![]);
         let second = add_local_buffer(&second, &mut ctx).unwrap();
-        assert!(matches!(second.buf_uop().op(), Op::Buffer { arg, .. } if arg.slot == 1));
+        assert!(matches!(second.buf_uop().op(), Op::Buffer(svod_ir::ops::Buffer { arg, .. }) if arg.slot == 1));
     }
 
     #[test]
@@ -55,11 +57,11 @@ mod stage_local_tests {
         let scalar = add_local_buffer(&scalar, &mut ctx).unwrap();
         let nested = add_local_buffer(&nested, &mut ctx).unwrap();
         let scalar_slot = match scalar.buf_uop().op() {
-            Op::Buffer { arg, .. } => arg.slot,
+            Op::Buffer(svod_ir::ops::Buffer { arg, .. }) => arg.slot,
             _ => unreachable!(),
         };
         let nested_slot = match nested.buf_uop().op() {
-            Op::Buffer { arg, .. } => arg.slot,
+            Op::Buffer(svod_ir::ops::Buffer { arg, .. }) => arg.slot,
             _ => unreachable!(),
         };
         assert_eq!(scalar_slot, 7);
@@ -81,7 +83,7 @@ mod stage_local_tests {
             stages
                 .iter()
                 .map(|stage| match add_local_buffer(stage, &mut ctx).unwrap().buf_uop().op() {
-                    Op::Buffer { arg, .. } => arg.slot,
+                    Op::Buffer(svod_ir::ops::Buffer { arg, .. }) => arg.slot,
                     _ => unreachable!(),
                 })
                 .collect()
@@ -113,14 +115,14 @@ mod lower_index_stage_tests {
         let root = graph_rewrite(extra_symbolic_patterns(), UOp::sink(vec![value]), &mut ());
         let root = graph_rewrite(lower_index_patterns(), root, &mut crate::symbolic::WeakMemo::default());
         let lowered = graph_rewrite(symbolic(), root, &mut ());
-        let Op::Sink { sources, .. } = lowered.op() else { panic!("expected SINK") };
+        let Op::Sink(svod_ir::ops::Sink { sources, .. }) = lowered.op() else { panic!("expected SINK") };
         sources[0].clone()
     }
 
     fn lower_value(value: Arc<UOp>) -> Arc<UOp> {
         let lowered =
             graph_rewrite(lower_index_patterns(), UOp::sink(vec![value]), &mut crate::symbolic::WeakMemo::default());
-        let Op::Sink { sources, .. } = lowered.op() else { panic!("expected SINK") };
+        let Op::Sink(svod_ir::ops::Sink { sources, .. }) = lowered.op() else { panic!("expected SINK") };
         sources[0].clone()
     }
 
@@ -132,7 +134,7 @@ mod lower_index_stage_tests {
         let index = UOp::index().buffer(buffer).indices(vec![x.valid(valid).cast(DType::Int64)]).call().unwrap();
 
         let lowered = graph_rewrite(lower_index_patterns(), index, &mut crate::symbolic::WeakMemo::default());
-        let Op::Index { indices, .. } = lowered.op() else { panic!("expected INDEX") };
+        let Op::Index(svod_ir::ops::Index { indices, .. }) = lowered.op() else { panic!("expected INDEX") };
         let Op::Ternary(_, _, value, invalid) = indices[0].op() else { panic!("expected gated index") };
         assert_eq!(value.dtype(), DType::Int32, "{}", lowered.tree());
         assert!(UOp::is_invalid_marker(invalid));
@@ -157,7 +159,7 @@ mod lower_index_stage_tests {
         let index = UOp::index().buffer(buffer).indices(vec![index_expr]).call().unwrap();
 
         let distributed = graph_rewrite(extra_symbolic_patterns(), index, &mut ());
-        let Op::Index { indices, .. } = distributed.op() else { panic!("expected INDEX") };
+        let Op::Index(svod_ir::ops::Index { indices, .. }) = distributed.op() else { panic!("expected INDEX") };
         assert!(matches!(indices[0].op(), Op::Binary(BinaryOp::Add, ..)), "{}", distributed.tree());
 
         let lowered = graph_rewrite(lower_index_patterns(), distributed, &mut crate::symbolic::WeakMemo::default());
@@ -182,12 +184,12 @@ mod lower_index_stage_tests {
 
         let comparison = production_value(vconst([midpoint(), neighbor]).try_cmpeq(&vconst([1.0, 1.0])).unwrap());
         assert_eq!(comparison.dtype(), DType::Bool.vec(3).unwrap(), "{}", comparison.tree());
-        assert!(matches!(comparison.op(), Op::VConst { values }
+        assert!(matches!(comparison.op(), Op::VConst(svod_ir::ops::VConst { values })
             if values == &vec![ConstValue::Bool(true), ConstValue::Bool(false), ConstValue::Invalid]));
 
         let sum = production_value(vconst([midpoint(), neighbor]).try_add(&vconst([midpoint(); 2])).unwrap());
         assert_eq!(sum.dtype(), DType::Float32.vec(3).unwrap());
-        assert!(matches!(sum.op(), Op::VConst { values }
+        assert!(matches!(sum.op(), Op::VConst(svod_ir::ops::VConst { values })
             if values == &vec![ConstValue::Float(2.0), ConstValue::Float(2.0), ConstValue::Invalid]));
 
         let scalar_comparison = production_value(weak_float(midpoint()).try_cmpeq(&weak_float(1.0)).unwrap());
@@ -213,7 +215,7 @@ mod lower_index_stage_tests {
         };
         for stack in [lhs, rhs] {
             assert_eq!(stack.dtype(), DType::Float32);
-            let Op::Stack { sources } = stack.op() else { panic!("expected STACK") };
+            let Op::Stack(svod_ir::ops::Stack { sources }) = stack.op() else { panic!("expected STACK") };
             assert!(matches!(sources[0].op(), Op::Const(value) if value.0 == ConstValue::Float(1.0)));
             assert!(UOp::is_invalid_marker(&sources[1]));
         }

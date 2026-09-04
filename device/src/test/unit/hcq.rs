@@ -7,6 +7,7 @@ use crate::hcq::{
     SystemField, SystemPatchValues, TopologyOperation, TopologyOperationKind, TopologyResource, schedule_device_lanes,
 };
 use svod_dtype::{AddrSpace, DType, DeviceSpec};
+use svod_ir::ops;
 
 fn storage(slot: usize) -> AbiParamDescriptor {
     AbiParamDescriptor { slot, kind: AbiParamKind::Storage(AddrSpace::Global), dtype: DType::Float32, name: None }
@@ -46,10 +47,10 @@ fn clike_kernargs_pack_in_slot_order_at_natural_alignment() {
 fn program_kernargs_interleave_storage_and_scalars_by_slot() {
     let slotted = |name: &str, slot: usize| {
         let var = svod_ir::UOp::variable(name.into(), 0, 16, DType::Int32);
-        let svod_ir::Op::Param { shape, arg } = var.op() else { panic!("variable PARAM") };
+        let svod_ir::Op::Param(ops::Param { shape, arg }) = var.op() else { panic!("variable PARAM") };
         let mut arg = arg.clone();
         arg.slot = slot;
-        svod_ir::UOp::new(svod_ir::Op::Param { shape: shape.clone(), arg }, DType::Int32)
+        svod_ir::UOp::new(svod_ir::Op::Param(ops::Param { shape: shape.clone(), arg }), DType::Int32)
     };
     let mut info = svod_ir::ProgramInfo { globals: vec![0, 2], ..Default::default() };
     info.vars = vec![slotted("low", 1), slotted("high", 3)];

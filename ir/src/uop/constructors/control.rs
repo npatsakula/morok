@@ -13,6 +13,7 @@ use smallvec::SmallVec;
 use svod_dtype::DType;
 
 use crate::op::Op;
+use crate::ops;
 use crate::types::{AxisId, AxisType};
 use crate::uop::UOp;
 
@@ -31,7 +32,7 @@ impl UOp {
         assert!(end.dtype().is_int(), "range_axis: end must be integer, got {:?}", end.dtype());
         assert!(dtype.is_int(), "range_axis: dtype must be integer, got {dtype:?}");
         let end = end.cast(dtype.clone());
-        Self::new(Op::Range { end, axis_id, axis_type, deps: SmallVec::new() }, dtype)
+        Self::new(Op::Range(ops::Range { end, axis_id, axis_type, deps: SmallVec::new() }), dtype)
     }
 
     /// Create a RANGE operation with Loop axis type (convenience for tests).
@@ -58,12 +59,12 @@ impl UOp {
     ///
     /// Body contains operations to execute; use `endif` to close the block.
     pub fn if_(condition: Arc<Self>, body: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
-        Self::new(Op::If { condition, body }, DType::Void)
+        Self::new(Op::If(ops::If { condition, body }), DType::Void)
     }
 
     /// End if block.
     pub fn endif(if_op: Arc<Self>) -> Arc<Self> {
-        Self::new(Op::EndIf { if_op }, DType::Void)
+        Self::new(Op::EndIf(ops::EndIf { if_op }), DType::Void)
     }
 
     /// End of range or reduce scope.
@@ -78,7 +79,7 @@ impl UOp {
         if ranges.is_empty() {
             return self.clone();
         }
-        Self::new(Op::End { computation: self.clone(), ranges }, DType::Void)
+        Self::new(Op::End(ops::End { computation: self.clone(), ranges }), DType::Void)
     }
 
     // =========================================================================
@@ -90,7 +91,7 @@ impl UOp {
     /// Self passes through; `deps` are operations that must complete before
     /// any consumer of this barrier executes.
     pub fn barrier(self: &Arc<Self>, deps: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
-        Self::new(Op::Barrier { src: self.clone(), deps }, DType::Void)
+        Self::new(Op::Barrier(ops::Barrier { src: self.clone(), deps }), DType::Void)
     }
 
     // =========================================================================
@@ -102,7 +103,7 @@ impl UOp {
     /// Used in testing and symbolic analysis to define variables with known ranges.
     /// Range is [min_val, max_val] inclusive.
     pub fn var(name: impl Into<String>, dtype: DType, min_val: i64, max_val: i64) -> Arc<Self> {
-        Self::new(Op::DefineVar { name: name.into(), min_val, max_val }, dtype)
+        Self::new(Op::DefineVar(ops::DefineVar { name: name.into(), min_val, max_val }), dtype)
     }
 
     /// Define a symbolic variable with known bounds for range analysis.
@@ -116,13 +117,13 @@ impl UOp {
     pub fn variable(name: String, min_val: i64, max_val: i64, dtype: DType) -> Arc<Self> {
         let shape = crate::shape::shape_to_uop(&SmallVec::new());
         let arg = crate::ParamArg::variable(name, dtype.clone(), min_val, max_val);
-        Self::new(Op::Param { shape, arg }, dtype)
+        Self::new(Op::Param(ops::Param { shape, arg: arg.into() }), dtype)
     }
 
     /// Bind concrete value to symbolic variable.
     pub fn bind(self: &Arc<Self>, value: Arc<Self>) -> Arc<Self> {
         let dtype = self.dtype();
-        Self::new(Op::Bind { var: self.clone(), value }, dtype)
+        Self::new(Op::Bind(ops::Bind { var: self.clone(), value }), dtype)
     }
 
     // =========================================================================
@@ -142,6 +143,6 @@ impl UOp {
         assert!(end.dtype().is_int(), "special: end must be integer, got {:?}", end.dtype());
         assert!(dtype.is_int(), "special: dtype must be integer, got {dtype:?}");
         let end = end.cast(dtype.clone());
-        Self::new(Op::Special { end, name }, dtype)
+        Self::new(Op::Special(ops::Special { end, name }), dtype)
     }
 }

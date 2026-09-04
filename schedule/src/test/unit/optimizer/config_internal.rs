@@ -48,6 +48,17 @@ fn test_beam_min_progress_matches_tinygrad_microseconds_env(raw: Option<&str>, e
     assert_eq!(parse_beam_min_progress(raw), expected);
 }
 
+/// `SVOD_THREADS` is the one thread budget; only a positive integer overrides
+/// the host's parallelism.
+#[test_case::test_case(Some("4"), Some(4); "positive integer")]
+#[test_case::test_case(Some("0"), None; "zero falls back")]
+#[test_case::test_case(Some("many"), None; "unparseable falls back")]
+#[test_case::test_case(None, None; "unset falls back")]
+fn test_thread_budget_parsing(raw: Option<&str>, expected: Option<usize>) {
+    let fallback = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8);
+    assert_eq!(parse_thread_budget(raw), expected.unwrap_or(fallback));
+}
+
 #[test]
 fn test_heuristics_config_default_and_builder() {
     let config = HeuristicsConfig::default();

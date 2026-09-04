@@ -1,7 +1,7 @@
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ImageKind};
 
+use crate::ops;
 use crate::uop::canonical::CanonicalAxis;
-use crate::uop::gc_dead_refs;
 use crate::{
     AxisId, AxisType, BinaryOp, BufferizeOpts, CallInfo, CanonicalArg, CanonicalConst, CanonicalDType, CanonicalGraph,
     CanonicalProgramValue, CanonicalShapeDim, ConstValue, InsArg, KernelInfo, Op, ProgramInfo, ReduceOp,
@@ -29,7 +29,6 @@ fn range_arg(axis: AxisId, axis_type: AxisType) -> CanonicalArg {
 #[test]
 fn canonical_json_is_stable_generic_json_free_of_runtime_ids() {
     let first = graph_json();
-    gc_dead_refs();
     let second = graph_json();
     assert_eq!(first, second);
     assert!(!first.contains("runtime_id"));
@@ -38,6 +37,27 @@ fn canonical_json_is_stable_generic_json_free_of_runtime_ids() {
     assert_eq!(parsed["schema_version"], 6);
     assert_eq!(parsed["stage"], "tensor");
     assert_eq!(parsed["nodes"][2]["op"], "SUB");
+}
+
+/// The binary encoding carries the JSON oracle's content: equal graphs encode
+/// identically across interning generations, a semantic change (another
+/// constant) changes the bytes, and the layout is fixed-width little-endian
+/// bincode so digests over it are machine-independent.
+#[test]
+fn canonical_binary_encoding_is_stable_and_content_sensitive() {
+    let encode = |value: i64| {
+        let lhs = UOp::const_(DType::Int32, ConstValue::Int(value));
+        let rhs = UOp::const_(DType::Int32, ConstValue::Int(2));
+        let sub = UOp::new(Op::Binary(BinaryOp::Sub, lhs, rhs), DType::Int32);
+        let mut bytes = Vec::new();
+        CanonicalGraph::from_root("tensor", &sub).unwrap().encode_into(&mut bytes).unwrap();
+        bytes
+    };
+    let first = encode(7);
+    assert_eq!(first, encode(7));
+    assert_ne!(first, encode(8));
+    // schema_version as u32, then the u64 length-prefixed stage.
+    assert_eq!(first[..16], [6, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, b't', b'e', b'n', b's']);
 }
 
 #[test]
@@ -339,11 +359,11 @@ fn canonical_call_sink_and_allreduce_metadata_are_typed() {
         },
     );
     let allreduce = UOp::new(
-        Op::AllReduce {
+        Op::AllReduce(ops::AllReduce {
             src: UOp::native_const(2.0f32),
             device: DeviceSpec::Cuda { device_id: 2 },
             reduce_op: ReduceOp::Max,
-        },
+        }),
         DType::Float32,
     );
     let sink = UOp::sink_with_info(
@@ -390,15 +410,14 @@ fn canonical_wmma_metadata_preserves_axes_and_target() {
             c: vec![(AxisId::Unrenumbered(5), 8)],
         }),
         reduce_axes: vec![axis],
-        tile_grid: (2, 1),
     };
     let wmma = UOp::new(
-        Op::Wmma {
+        Op::Wmma(ops::Wmma {
             a: UOp::const_(DType::Float16, ConstValue::Float(1.0)),
             b: UOp::const_(DType::Float16, ConstValue::Float(2.0)),
             c: UOp::native_const(0.0f32),
-            metadata,
-        },
+            metadata: metadata.into(),
+        }),
         DType::Float32,
     );
     let graph = CanonicalGraph::from_root("wmma", &wmma).unwrap();
@@ -581,7 +600,7 @@ fn canonical_reduce_records_and_hash_conses_leading_shaped_axis_count() {
     assert!(!std::sync::Arc::ptr_eq(&scalar, &horizontal));
     let rebuilt = horizontal.with_sources(horizontal.op().sources().into_vec());
     assert!(std::sync::Arc::ptr_eq(&horizontal, &rebuilt));
-    assert!(matches!(rebuilt.op(), Op::Reduce { num_axes: 1, .. }));
+    assert!(matches!(rebuilt.op(), Op::Reduce(ops::Reduce { num_axes: 1, .. })));
 
     let too_many = src.reduce_with_num_axes(smallvec::smallvec![], ReduceOp::Add, 2);
     assert!(matches!(too_many.shape(), Err(crate::Error::ReduceInvalidNumAxes { num_axes: 2, shape_dims: 1 })));

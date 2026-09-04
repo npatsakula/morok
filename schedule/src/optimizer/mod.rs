@@ -58,21 +58,24 @@ pub use beam::{
     BeamResult, CandidateMetrics, apply_remote_candidate, beam_search, beam_search_cached_remote,
     beam_search_cached_with_behavior, clear_cache, compute_ops_estimate, hash_post_codegen_ir, replay_opts,
 };
-pub use config::{BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcOpt as TcOptLevel, TcSelect, TcUsage};
+pub use config::{
+    BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcOpt as TcOptLevel, TcSelect, TcUsage, thread_budget,
+};
 pub use error::OptError;
 pub use heuristics::hand_coded_optimizations;
 pub use kernel_info::KernelInfo;
 pub use opts::apply_opt;
 pub use renderer::{Renderer, TcOpt, TensorCore};
-pub use scheduler::Scheduler;
 #[cfg(test)]
 pub use scheduler::clear_kernel_name_counts;
+pub use scheduler::{KernelNaming, Scheduler, finalize_kernel_name, unique_kernel_name};
+use svod_ir::ops;
 pub use types::{AxisType, Opt, OptArg, OptArgExt, OptOps};
 
 use crate::devectorize::{
     Fp8DecompCtx, pm_add_loads, pm_expand_broadcast, pm_float_decomp, pm_long_decomp, pm_reduce_local,
 };
-use crate::gpudims::pm_add_gpudims;
+use crate::gpudims::{GpuDimsContext, pm_add_gpudims};
 use crate::rangeify::patterns::{
     pm_comparison_negations, pm_demorgan, pm_div_to_shr, pm_fdiv_to_mul, pm_fma_decomposition, pm_half_bf16_cast,
     pm_load_collapse, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_shl_add_to_mulacc, pm_threefry_decomp,
@@ -81,7 +84,7 @@ use crate::rangeify::transforms::{SimplifyRangesContext, pm_flatten_range, pm_si
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::index_lowering::WeakMemo;
 use crate::symbolic::patterns::{pm_fold_cast_const, sym, symbolic, symbolic_simple};
-use implicit_barriers::pm_implicit_barriers;
+use implicit_barriers::add_implicit_barriers;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 use svod_ir::{AxisId, Op, UOp};
@@ -122,7 +125,7 @@ impl LocalBufferContext {
 }
 
 pub(crate) fn add_local_buffer(stage: &Arc<UOp>, ctx: &mut LocalBufferContext) -> Option<Arc<UOp>> {
-    let Op::Stage { compute, ranges, opts } = stage.op() else { return None };
+    let Op::Stage(ops::Stage { compute, ranges, opts }) = stage.op() else { return None };
     let shape = stage.shape().ok().flatten()?.clone();
     let max_shape =
         shape.iter().map(|dim| dim.vmax().map(svod_ir::SInt::Const)).collect::<Option<svod_ir::shape::Shape>>()?;
@@ -138,7 +141,7 @@ fn pm_add_local_buffers() -> &'static crate::TypedPatternMatcher<LocalBufferCont
     static PM: LazyLock<crate::TypedPatternMatcher<LocalBufferContext>> = LazyLock::new(|| {
         let add_local_buffers = crate::patterns! {
             @context LocalBufferContext;
-            stage @ Stage { compute: _ } => |stage, ctx| add_local_buffer(stage, ctx),
+            stage @ Stage { compute: _ } => add_local_buffer(stage, ctx),
         };
         add_local_buffers + crate::rangeify::patterns::movement_op_patterns().with_context::<LocalBufferContext>()
     });
@@ -356,7 +359,7 @@ fn apply_post_optimization_configured_with_capture(
     let t_stage = std::time::Instant::now();
     let with_device_ranges = graph_rewrite(&crate::gpudims::pm_lower_device_ranges(), with_local_buffers, &mut ());
     let with_gpudims = if renderer.has_local || renderer.has_threads {
-        graph_rewrite(&pm_add_gpudims(), with_device_ranges, &mut renderer.clone())
+        graph_rewrite(&pm_add_gpudims(), with_device_ranges, &mut GpuDimsContext::from(renderer.clone()))
     } else {
         with_device_ranges
     };
@@ -569,7 +572,7 @@ fn apply_post_optimization_configured_with_capture(
     }
     // Renderer rewrites can create local-memory dependencies, so barriers are
     // inferred after the captured late-final-rewrite boundary.
-    let rendered = graph_rewrite(pm_implicit_barriers(), final_rewrite, &mut ());
+    let rendered = add_implicit_barriers(final_rewrite);
     tracing::debug!(
         ast.optimized = rendered.tree(),
         node_count = rendered.node_count(),
@@ -595,13 +598,13 @@ fn assert_target_renderer_boundary(root: &Arc<UOp>) {
     }
     for node in root.toposort() {
         match node.op() {
-            Op::Index { buffer, indices } if indices.len() > 1 => {
+            Op::Index(ops::Index { buffer, indices }) if indices.len() > 1 => {
                 let static_tensor_index = buffer.shape().ok().flatten().is_some_and(|shape| {
                     shape.len() == indices.len() && shape.iter().all(|dim| dim.as_const().is_some())
                 });
                 assert!(!static_tensor_index, "static multi-index INDEX survived rangeify/indexing: {}", node.tree());
             }
-            Op::Reshape { src, .. } => {
+            Op::Reshape(ops::Reshape { src, .. }) => {
                 let source_shape = src.shape().ok().flatten();
                 let target_shape = node.shape().ok().flatten();
                 let residual = source_shape.zip(target_shape).is_some_and(|(source, target)| {
@@ -611,7 +614,8 @@ fn assert_target_renderer_boundary(root: &Arc<UOp>) {
                 });
                 assert!(!residual, "singleton-prefix broadcast survived devectorize: {}", node.tree());
             }
-            Op::Expand { src, .. } if matches!(src.op(), Op::Stack { sources } if sources.len() == 1) => {
+            Op::Expand(ops::Expand { src, .. }) if matches!(src.op(), Op::Stack(ops::Stack { sources }) if sources.len() == 1) =>
+            {
                 let source_shape = src.shape().ok().flatten();
                 let target_shape = node.shape().ok().flatten();
                 let residual = source_shape
@@ -620,7 +624,7 @@ fn assert_target_renderer_boundary(root: &Arc<UOp>) {
                 assert!(!residual, "singleton STACK broadcast survived devectorize: {}", node.tree());
             }
             Op::Binary(..) | Op::Ternary(..)
-                if node.op().sources().iter().any(|src| matches!(src.op(), Op::Stack { .. }))
+                if node.op().sources().iter().any(|src| matches!(src.op(), Op::Stack(..)))
                     && (node.dtype().vcount() > 1
                         || node.op().sources().iter().any(|src| src.dtype().vcount() > 1)) =>
             {
@@ -719,7 +723,7 @@ fn pm_dtype_decomps() -> crate::TypedPatternMatcher<DTypeDecompCtx> {
             | svod_dtype::ScalarDType::Float16
             | svod_dtype::ScalarDType::BFloat16
             | svod_dtype::ScalarDType::Int64
-            | svod_dtype::ScalarDType::UInt64) => |x, ctx| {
+            | svod_dtype::ScalarDType::UInt64) => {
                 let dtype = if x.dtype().base() == svod_dtype::ScalarDType::UInt64 {
                     svod_dtype::ScalarDType::Int64
                 } else {
@@ -729,7 +733,7 @@ fn pm_dtype_decomps() -> crate::TypedPatternMatcher<DTypeDecompCtx> {
                 None
             },
 
-        sink @ Sink { sources: _ } if ctx.selected.iter().any(|dtype| ctx.should_emulate(*dtype)) => |sink, ctx| {
+        sink @ Sink { sources: _ } if ctx.selected.iter().any(|dtype| ctx.should_emulate(*dtype)) => {
             use svod_dtype::ScalarDType;
             let selected = std::mem::take(&mut ctx.selected);
             let mut result = sink.clone();
@@ -760,7 +764,7 @@ pub(crate) fn apply_dtype_decomps(root: Arc<UOp>, renderer: Renderer) -> Arc<UOp
 #[cfg(test)]
 pub(crate) fn finish_final_rewrite(root: Arc<UOp>) -> Arc<UOp> {
     let root = graph_rewrite(crate::symbolic::patterns::pm_remove_invalid(), root, &mut ());
-    graph_rewrite(pm_implicit_barriers(), root, &mut ())
+    add_implicit_barriers(root)
 }
 
 #[cfg(test)]
@@ -964,7 +968,17 @@ pub fn optimize_kernel_with_config(
     renderer: &Renderer,
     config: &OptimizerConfig,
 ) -> Result<Arc<svod_ir::UOp>, OptError> {
-    optimize_kernel_with_config_impl(ast, renderer, config, None)
+    optimize_kernel_with_config_impl(ast, renderer, config, None, KernelNaming::Unique)
+}
+
+/// `optimize_kernel_with_config` with the kernel-name step chosen by the caller.
+pub fn optimize_kernel_with_naming(
+    ast: Arc<svod_ir::UOp>,
+    renderer: &Renderer,
+    config: &OptimizerConfig,
+    naming: KernelNaming,
+) -> Result<Arc<svod_ir::UOp>, OptError> {
+    optimize_kernel_with_config_impl(ast, renderer, config, None, naming)
 }
 
 /// Run the production optimizer and also return its graph immediately after
@@ -976,7 +990,8 @@ pub fn optimize_kernel_with_config_and_final_rewrite(
     config: &OptimizerConfig,
 ) -> Result<(Arc<svod_ir::UOp>, Arc<svod_ir::UOp>), OptError> {
     let mut final_rewrite = None;
-    let optimized = optimize_kernel_with_config_impl(ast, renderer, config, Some(&mut final_rewrite))?;
+    let optimized =
+        optimize_kernel_with_config_impl(ast, renderer, config, Some(&mut final_rewrite), KernelNaming::Unique)?;
     Ok((final_rewrite.expect("post-optimization must capture final rewrite"), optimized))
 }
 
@@ -985,6 +1000,7 @@ fn optimize_kernel_with_config_impl(
     renderer: &Renderer,
     config: &OptimizerConfig,
     final_rewrite_capture: Option<&mut Option<Arc<svod_ir::UOp>>>,
+    naming: KernelNaming,
 ) -> Result<Arc<svod_ir::UOp>, OptError> {
     if renderer.supported_ops().is_none() {
         return Err(OptError::MissingRendererCapabilities);
@@ -999,16 +1015,16 @@ fn optimize_kernel_with_config_impl(
     let pre_optimized = apply_pre_optimization(ast)?;
 
     let optimized = if let Some(opts) = explicit_opts {
-        apply_explicit_opts(pre_optimized, renderer, &opts)?
+        apply_explicit_opts(pre_optimized, renderer, &opts, naming)?
     } else {
         match config.strategy {
             OptStrategy::None => pre_optimized, // No heuristic optimization, but post-optimization still needed
-            OptStrategy::Heuristic => optimize_heuristic(pre_optimized, renderer, &config.heuristics),
+            OptStrategy::Heuristic => optimize_heuristic(pre_optimized, renderer, &config.heuristics, naming),
             OptStrategy::Beam { .. } => {
                 // Beam search requires a compile_and_time function.
                 // Use optimize_kernel_beam() for actual beam search.
                 // Fall back to heuristics for the simple API.
-                optimize_heuristic(pre_optimized, renderer, &config.heuristics)
+                optimize_heuristic(pre_optimized, renderer, &config.heuristics, naming)
             }
         }
     };
@@ -1047,7 +1063,7 @@ pub(crate) fn apply_late_rewrites(
 /// carries an explicit list.
 fn kernel_opts_to_apply(ast: &Arc<svod_ir::UOp>) -> Option<Vec<Opt>> {
     match ast.op() {
-        svod_ir::Op::Sink { info: Some(ki), .. } => ki.opts_to_apply.clone(),
+        svod_ir::Op::Sink(ops::Sink { info: Some(ki), .. }) => ki.opts_to_apply.clone(),
         _ => None,
     }
 }
@@ -1064,13 +1080,14 @@ fn apply_explicit_opts(
     ast: Arc<svod_ir::UOp>,
     renderer: &Renderer,
     opts: &[Opt],
+    naming: KernelNaming,
 ) -> Result<Arc<svod_ir::UOp>, OptError> {
     let mut scheduler = Scheduler::new(ast, renderer.clone());
     scheduler.convert_loop_to_global()?;
     for opt in opts {
         apply_opt(&mut scheduler, opt, true)?;
     }
-    Ok(scheduler.get_optimized_ast(None))
+    Ok(scheduler.get_optimized_ast_with_naming(naming))
 }
 
 /// Apply optimizations with explicit strategy selection (legacy API).
@@ -1168,7 +1185,12 @@ pub fn prepare_scheduler(ast: Arc<svod_ir::UOp>, renderer: &Renderer) -> Result<
 }
 
 /// Apply heuristic-based optimizations.
-fn optimize_heuristic(ast: Arc<svod_ir::UOp>, renderer: &Renderer, config: &HeuristicsConfig) -> Arc<svod_ir::UOp> {
+fn optimize_heuristic(
+    ast: Arc<svod_ir::UOp>,
+    renderer: &Renderer,
+    config: &HeuristicsConfig,
+    naming: KernelNaming,
+) -> Arc<svod_ir::UOp> {
     // Step 1: Create scheduler (AST already simplified by apply_pre_optimization Stage 3)
     let mut scheduler = Scheduler::new(ast, renderer.clone());
 
@@ -1179,5 +1201,5 @@ fn optimize_heuristic(ast: Arc<svod_ir::UOp>, renderer: &Renderer, config: &Heur
     heuristics::hand_coded_optimizations(&mut scheduler, config);
 
     // Step 5: Extract optimized AST
-    scheduler.get_optimized_ast(None)
+    scheduler.get_optimized_ast_with_naming(naming)
 }

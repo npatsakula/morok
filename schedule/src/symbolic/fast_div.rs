@@ -107,7 +107,7 @@ pub fn fast_division_patterns(supported_dtypes: HashSet<ScalarDType>) -> TypedPa
     patterns! {
         CDiv(x, _d @const(d_val))
             if x.dtype().is_int() && (x.dtype().is_unsigned() || value_as_i64(x.vmin()).is_some_and(|v| v >= 0))
-            => |x, d_val| {
+            => {
                 let divisor = value_as_i64(&d_val)?;
                 (divisor > 0 && !(divisor as u64).is_power_of_two()).then_some(())?;
                 fast_idiv(x, divisor, false, &supported_dtypes)

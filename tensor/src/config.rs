@@ -66,6 +66,13 @@ pub struct PrepareConfig {
     /// (staged over the copy engine — SDMA on AMD, ~PCIe speed) instead of
     /// the uncached host mapping. Use for big outputs read back in bulk.
     pub device_local_outputs: bool,
+    /// The thread budget this prepare sizes the process-wide pool to — the
+    /// pool that optimizes/renders/compiles the kernels it misses in the
+    /// optimized-kernel cache and later runs `core_id`-split CPU kernels.
+    /// Defaults to [`svod_schedule::thread_budget`] (`SVOD_THREADS`); `1`
+    /// compiles inline in schedule order. The pool is built by the first
+    /// prepare in the process; later values only warn if they differ.
+    pub threads: usize,
 }
 
 impl std::fmt::Debug for PrepareConfig {
@@ -75,6 +82,7 @@ impl std::fmt::Debug for PrepareConfig {
             .field("planner_mode", &self.planner_mode)
             .field("disable_schedule_cache", &self.disable_schedule_cache)
             .field("device_local_outputs", &self.device_local_outputs)
+            .field("threads", &self.threads)
             .finish_non_exhaustive()
     }
 }
@@ -87,6 +95,7 @@ impl Default for PrepareConfig {
             planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
+            threads: svod_schedule::thread_budget(),
         }
     }
 }
@@ -100,6 +109,7 @@ impl PrepareConfig {
             planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
+            threads: svod_schedule::thread_budget(),
         }
     }
 
@@ -115,6 +125,7 @@ impl PrepareConfig {
             planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
+            threads: svod_schedule::thread_budget(),
         }
     }
 
@@ -151,6 +162,7 @@ impl From<OptimizerConfig> for PrepareConfig {
             planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
+            threads: svod_schedule::thread_budget(),
         }
     }
 }

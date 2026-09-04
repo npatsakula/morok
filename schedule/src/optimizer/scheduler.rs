@@ -14,6 +14,7 @@ use svod_ir::{AxisId, AxisType, Op, UOp, UOpKey};
 use super::error::*;
 use super::renderer::Renderer;
 use super::types::{Opt, OptOps};
+use svod_ir::ops;
 
 /// Global kernel name counter for deduplication.
 ///
@@ -32,6 +33,46 @@ pub fn clear_kernel_name_counts() {
     if let Some(counts) = KERNEL_NAME_COUNTS.get() {
         counts.lock().unwrap().clear();
     }
+}
+
+/// Make a shape name unique for this process: the n-th kernel sharing a
+/// function name gets the `n{n-1}` suffix. The suffix is the only part of a
+/// kernel's identity that depends on the order kernels are finished in.
+pub fn unique_kernel_name(shape_name: &str) -> String {
+    let mut counts = kernel_name_counts().lock().unwrap();
+    let count = counts.entry(svod_ir::to_function_name(shape_name)).or_insert(0);
+    *count += 1;
+    if *count > 1 { format!("{shape_name}n{}", *count - 1) } else { shape_name.to_string() }
+}
+
+/// When a finished kernel receives its unique name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelNaming {
+    /// Suffix the shape name through the process-wide counter immediately.
+    Unique,
+    /// Leave the bare shape name; the caller applies [`finalize_kernel_name`]
+    /// once it knows the order — kernels optimized concurrently would
+    /// otherwise draw suffixes in scheduling-dependent order.
+    Deferred,
+}
+
+/// Give a kernel finished under [`KernelNaming::Deferred`] its unique name, on
+/// both channels the optimizer writes it to: the SINK's structural
+/// `KernelInfo.name` and the attached optimizer metadata. Kernels without
+/// optimizer metadata were never named and stay as they are.
+pub fn finalize_kernel_name(ast: &Arc<UOp>) -> Arc<UOp> {
+    use crate::optimizer::KernelInfo;
+    let Some(info) = ast.metadata::<KernelInfo>() else { return ast.clone() };
+    let name = unique_kernel_name(&info.name);
+    let renamed = match ast.op() {
+        Op::Sink(ops::Sink { sources, info }) => {
+            let mut structural = info.clone().unwrap_or_default();
+            structural.name = Some(name.clone());
+            UOp::sink_with_info(sources.iter().cloned().collect(), structural).rtag(ast.tag().clone())
+        }
+        _ => ast.clone(),
+    };
+    renamed.with_metadata(KernelInfo { name, ..(*info).clone() })
 }
 
 /// Scheduler for kernel optimization.
@@ -195,7 +236,7 @@ impl Scheduler {
             .toposort()
             .into_iter()
             .filter(|node| {
-                if let Op::Range { .. } = node.op() {
+                if let Op::Range(..) = node.op() {
                     // Include only ranges with vmax > 0 (size > 1)
                     // vmax = size - 1, so vmax > 0 means size > 1
                     use svod_ir::ConstValue;
@@ -212,7 +253,7 @@ impl Scheduler {
 
         // Sort by (axis_type.priority(), axis_id)
         ranges.sort_by_key(|rng| {
-            if let Op::Range { axis_id, axis_type, .. } = rng.op() {
+            if let Op::Range(ops::Range { axis_id, axis_type, .. }) = rng.op() {
                 (axis_type.priority(), axis_id.clone())
             } else {
                 unreachable!("Filtered to only Range ops")
@@ -238,7 +279,9 @@ impl Scheduler {
         *self.maxarg_cache.get_or_init(|| {
             self.rngs()
                 .iter()
-                .filter_map(|rng| if let Op::Range { axis_id, .. } = rng.op() { Some(axis_id.value()) } else { None })
+                .filter_map(|rng| {
+                    if let Op::Range(ops::Range { axis_id, .. }) = rng.op() { Some(axis_id.value()) } else { None }
+                })
                 .max()
                 .unwrap_or(0)
         })
@@ -261,15 +304,13 @@ impl Scheduler {
     }
 
     pub fn reduceops(&self) -> &[Arc<UOp>] {
-        self.reduceops_cache.get_or_init(|| {
-            self.ast_toposort().iter().filter(|n| matches!(n.op(), Op::Reduce { .. })).cloned().collect()
-        })
+        self.reduceops_cache
+            .get_or_init(|| self.ast_toposort().iter().filter(|n| matches!(n.op(), Op::Reduce(..))).cloned().collect())
     }
 
     pub fn bufs(&self) -> &[Arc<UOp>] {
-        self.bufs_cache.get_or_init(|| {
-            self.ast_toposort().iter().filter(|n| matches!(n.op(), Op::Index { .. })).cloned().collect()
-        })
+        self.bufs_cache
+            .get_or_init(|| self.ast_toposort().iter().filter(|n| matches!(n.op(), Op::Index(..))).cloned().collect())
     }
 
     /// Get the output shape (dimensions without reduction axes).
@@ -282,9 +323,13 @@ impl Scheduler {
     pub fn output_shape(&self) -> Vec<i64> {
         self.rngs()
             .iter()
-            .filter(|rng| if let Op::Range { axis_type, .. } = rng.op() { !axis_type.is_reduce() } else { false })
+            .filter(
+                |rng| {
+                    if let Op::Range(ops::Range { axis_type, .. }) = rng.op() { !axis_type.is_reduce() } else { false }
+                },
+            )
             .filter_map(|rng| {
-                if let Op::Range { end, .. } = rng.op()
+                if let Op::Range(ops::Range { end, .. }) = rng.op()
                     && let Op::Const(cv) = end.op()
                     && let svod_ir::ConstValue::Int(sz) = cv.0
                 {
@@ -304,7 +349,7 @@ impl Scheduler {
         self.rngs()
             .iter()
             .map(|rng| {
-                if let Op::Range { end, .. } = rng.op()
+                if let Op::Range(ops::Range { end, .. }) = rng.op()
                     && let Op::Const(cv) = end.op()
                     && let svod_ir::ConstValue::Int(sz) = cv.0
                 {
@@ -347,14 +392,14 @@ impl Scheduler {
         self.rngs()
             .iter()
             .filter(|rng| {
-                if let Op::Range { axis_type, .. } = rng.op() {
+                if let Op::Range(ops::Range { axis_type, .. }) = rng.op() {
                     matches!(axis_type, AxisType::Upcast | AxisType::Unroll)
                 } else {
                     false
                 }
             })
             .filter_map(|rng| {
-                if let Op::Range { end, .. } = rng.op()
+                if let Op::Range(ops::Range { end, .. }) = rng.op()
                     && let Op::Const(cv) = end.op()
                     && let svod_ir::ConstValue::Int(sz) = cv.0
                 {
@@ -377,7 +422,11 @@ impl Scheduler {
         self.rngs()
             .iter()
             .filter(|rng| {
-                if let Op::Range { axis_type, .. } = rng.op() { *axis_type == AxisType::GroupReduce } else { false }
+                if let Op::Range(ops::Range { axis_type, .. }) = rng.op() {
+                    *axis_type == AxisType::GroupReduce
+                } else {
+                    false
+                }
             })
             .count()
     }
@@ -409,7 +458,7 @@ impl Scheduler {
             .iter()
             .enumerate()
             .filter_map(|(i, rng)| {
-                if let Op::Range { axis_type, .. } = rng.op() {
+                if let Op::Range(ops::Range { axis_type, .. }) = rng.op() {
                     if types.contains(axis_type) { Some(i) } else { None }
                 } else {
                     None
@@ -446,7 +495,7 @@ impl Scheduler {
             .iter()
             .enumerate()
             .filter_map(|(i, rng)| {
-                if let Op::Range { axis_type, end, .. } = rng.op() {
+                if let Op::Range(ops::Range { axis_type, end, .. }) = rng.op() {
                     if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Weak) {
                         return None;
                     }
@@ -480,7 +529,7 @@ impl Scheduler {
             .iter()
             .enumerate()
             .filter_map(|(i, rng)| {
-                if let Op::Range { axis_type, end, .. } = rng.op() {
+                if let Op::Range(ops::Range { axis_type, end, .. }) = rng.op() {
                     // Check type
                     if !matches!(axis_type, AxisType::GroupReduce | AxisType::Reduce) {
                         return None;
@@ -592,7 +641,7 @@ impl Scheduler {
         self.rngs()
             .iter()
             .filter_map(|rng| {
-                if let Op::Range { axis_type, end, .. } = rng.op() {
+                if let Op::Range(ops::Range { axis_type, end, .. }) = rng.op() {
                     // Get size
                     if let Op::Const(cv) = end.op()
                         && let svod_ir::ConstValue::Int(sz) = cv.0
@@ -620,7 +669,7 @@ impl Scheduler {
         self.rngs()
             .iter()
             .filter_map(|rng| {
-                if let Op::Range { axis_type, end, .. } = rng.op() {
+                if let Op::Range(ops::Range { axis_type, end, .. }) = rng.op() {
                     if let Op::Const(cv) = end.op()
                         && let svod_ir::ConstValue::Int(sz) = cv.0
                     {
@@ -714,7 +763,7 @@ impl Scheduler {
         // axis size is symbolic (e.g. `T*4`), the quotient is a UOp (e.g. `T`)
         // that must propagate through the substituted index expression — not a
         // collapsed integer that drops the symbolic factor.
-        let old_end = if let Op::Range { end, .. } = rng.op() {
+        let old_end = if let Op::Range(ops::Range { end, .. }) = rng.op() {
             end.divides(amount as i64).ok_or_else(|| {
                 if let Op::Const(cv) = end.op()
                     && let ConstValue::Int(sz) = cv.0
@@ -735,7 +784,7 @@ impl Scheduler {
         });
 
         // 3. Create reduced old range (same axis_id and type, symbolic end allowed)
-        let replaced_rng = if let Op::Range { axis_id, axis_type, .. } = rng.op() {
+        let replaced_rng = if let Op::Range(ops::Range { axis_id, axis_type, .. }) = rng.op() {
             UOp::range_axis(old_end.clone(), axis_id.clone(), *axis_type)
         } else {
             return ExpectedRangeOperationSnafu.fail();
@@ -788,12 +837,8 @@ impl Scheduler {
     /// parallelization since they represent independent output elements.
     fn output_rngs(&self) -> Vec<Arc<UOp>> {
         // Find all STORE operations (outputs)
-        let stores: Vec<_> = self
-            .ast
-            .toposort()
-            .into_iter()
-            .filter(|node| matches!(node.op(), Op::Store { .. } | Op::Sink { .. }))
-            .collect();
+        let stores: Vec<_> =
+            self.ast.toposort().into_iter().filter(|node| matches!(node.op(), Op::Store(..) | Op::Sink(..))).collect();
 
         if stores.is_empty() {
             return vec![];
@@ -804,7 +849,7 @@ impl Scheduler {
         let mut output_ranges: Vec<Arc<UOp>> = Vec::new();
         for store in stores {
             for range in store.ranges() {
-                if matches!(range.op(), Op::Range { axis_type, .. } if *axis_type != AxisType::Reduce)
+                if matches!(range.op(), Op::Range(ops::Range { axis_type, .. }) if *axis_type != AxisType::Reduce)
                     && !output_ranges.iter().any(|r| Arc::ptr_eq(r, &range))
                 {
                     output_ranges.push(range.clone());
@@ -827,16 +872,14 @@ impl Scheduler {
         let mut candidates: Vec<_> = self
             .output_rngs()
             .into_iter()
-            .filter(|r| if let Op::Range { axis_type, .. } = r.op() { *axis_type == AxisType::Weak } else { false })
+            .filter(|r| {
+                if let Op::Range(ops::Range { axis_type, .. }) = r.op() { *axis_type == AxisType::Weak } else { false }
+            })
             .collect();
 
         // Find all STORE and SINK operations
-        let stores: Vec<_> = self
-            .ast
-            .toposort()
-            .into_iter()
-            .filter(|node| matches!(node.op(), Op::Store { .. } | Op::Sink { .. }))
-            .collect();
+        let stores: Vec<_> =
+            self.ast.toposort().into_iter().filter(|node| matches!(node.op(), Op::Store(..) | Op::Sink(..))).collect();
 
         if stores.is_empty() {
             return candidates;
@@ -923,11 +966,21 @@ impl Scheduler {
     /// println!("Kernel: {}", info.name); // "r_16_16_32_4"
     /// ```
     pub fn get_optimized_ast(&self, name_override: Option<String>) -> Arc<UOp> {
-        use crate::optimizer::KernelInfo;
+        let name = name_override.unwrap_or_else(|| unique_kernel_name(&self.shape_name()));
+        self.finish(name)
+    }
 
-        // 1. Generate kernel name
-        let custom_name = name_override.is_some();
-        let name = name_override.unwrap_or_else(|| {
+    /// `get_optimized_ast(None)` with the naming step chosen by the caller.
+    pub fn get_optimized_ast_with_naming(&self, naming: KernelNaming) -> Arc<UOp> {
+        match naming {
+            KernelNaming::Unique => self.get_optimized_ast(None),
+            KernelNaming::Deferred => self.finish(self.shape_name()),
+        }
+    }
+
+    /// Auto-generated kernel name from the optimized loop structure.
+    fn shape_name(&self) -> String {
+        {
             // Prefix: "r" for reduce, "E" for elementwise
             let prefix = if self.reduceop().is_some() { "r" } else { "E" };
 
@@ -943,7 +996,7 @@ impl Scheduler {
                 .toposort()
                 .into_iter()
                 .filter_map(|node| match node.op() {
-                    Op::Special { end, name } => Some((name.clone(), extent_name(end))),
+                    Op::Special(ops::Special { end, name }) => Some((name.clone(), extent_name(end))),
                     _ => None,
                 })
                 .collect();
@@ -953,32 +1006,25 @@ impl Scheduler {
                 self.rngs()
                     .iter()
                     .filter_map(|rng| {
-                        let Op::Range { end, .. } = rng.op() else { return None };
+                        let Op::Range(ops::Range { end, .. }) = rng.op() else { return None };
                         Some(extent_name(end))
                     })
                     .collect::<Vec<_>>(),
             );
 
             if shape_parts.is_empty() { prefix.to_string() } else { format!("{}_{}", prefix, shape_parts.join("_")) }
-        });
+        }
+    }
 
-        // Deduplicate kernel names
-        let name = if custom_name {
-            name
-        } else {
-            let mut counts = kernel_name_counts().lock().unwrap();
-            let count = counts.entry(svod_ir::to_function_name(&name)).or_insert(0);
-            *count += 1;
-
-            if *count > 1 { format!("{}n{}", name, *count - 1) } else { name }
-        };
+    fn finish(&self, name: String) -> Arc<UOp> {
+        use crate::optimizer::KernelInfo;
 
         // 2. Flatten ranges (top-down graph_rewrite default).
         let flattened_ast =
             crate::rewrite::graph_rewrite(crate::rangeify::pm_flatten_range(), self.ast.clone(), &mut ());
 
         let flattened_ast = match flattened_ast.op() {
-            Op::Sink { sources, info } => {
+            Op::Sink(ops::Sink { sources, info }) => {
                 let mut structural = info.clone().unwrap_or_default();
                 structural.name = Some(name.clone());
                 structural.applied_opts = self.applied_opts.clone();

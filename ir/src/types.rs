@@ -7,13 +7,15 @@ use std::hash::{Hash, Hasher};
 use std::mem::discriminant;
 use std::sync::Arc;
 
+use crate::ops;
 use smallvec::SmallVec;
 use svod_dtype::DeviceSpec;
 use svod_dtype::cast::commit_float;
 use svod_dtype::{DType, ScalarDType};
 
-/// Schema version for semantic SOURCE stage identities.
-pub const SOURCE_STAGE_IDENTITY_VERSION: u32 = 1;
+/// Schema version for semantic SOURCE stage identities. v2 hashes the LINEAR
+/// canonical graph as bincode instead of pretty JSON.
+pub const SOURCE_STAGE_IDENTITY_VERSION: u32 = 2;
 
 /// Schema version for semantic BINARY stage identities.
 pub const BINARY_STAGE_IDENTITY_VERSION: u32 = 1;
@@ -725,7 +727,7 @@ impl ProgramInfo {
         };
 
         match rewritten.op() {
-            Op::Cast { src, dtype } if src.dtype() == *dtype => src.clone(),
+            Op::Cast(ops::Cast { src, dtype }) if src.dtype() == *dtype => src.clone(),
             Op::Binary(op, lhs, rhs) => {
                 if let (Some(a), Some(b)) = (const_value(lhs), const_value(rhs))
                     && let Some(value) = crate::uop::eval::eval_binary_op(*op, a, b)
@@ -762,10 +764,10 @@ impl ProgramInfo {
         fn buf_param_slot(mut uop: &Arc<crate::UOp>) -> Option<usize> {
             loop {
                 match uop.op() {
-                    Op::Param { arg, .. } => return Some(arg.slot),
-                    Op::Index { buffer, .. } => uop = buffer,
-                    Op::Shrink { src, .. } | Op::Cast { src, .. } => uop = src,
-                    Op::After { passthrough, .. } => uop = passthrough,
+                    Op::Param(ops::Param { arg, .. }) => return Some(arg.slot),
+                    Op::Index(ops::Index { buffer, .. }) => uop = buffer,
+                    Op::Shrink(ops::Shrink { src, .. }) | Op::Cast(ops::Cast { src, .. }) => uop = src,
+                    Op::After(ops::After { passthrough, .. }) => uop = passthrough,
                     _ => return None,
                 }
             }
@@ -773,13 +775,13 @@ impl ProgramInfo {
 
         fn param_slot(index: &Arc<crate::UOp>) -> Option<usize> {
             let index = match index.op() {
-                Op::Index { .. } | Op::Shrink { .. } => index,
-                Op::Cast { src, .. } if matches!(src.op(), Op::Index { .. } | Op::Shrink { .. }) => src,
+                Op::Index(..) | Op::Shrink(..) => index,
+                Op::Cast(ops::Cast { src, .. }) if matches!(src.op(), Op::Index(..) | Op::Shrink(..)) => src,
                 _ => return None,
             };
             let buffer_or_value = match index.op() {
-                Op::Index { buffer, .. } => buffer,
-                Op::Shrink { src, .. } => src,
+                Op::Index(ops::Index { buffer, .. }) => buffer,
+                Op::Shrink(ops::Shrink { src, .. }) => src,
                 _ => return None,
             };
             buf_param_slot(buffer_or_value)
@@ -789,7 +791,7 @@ impl ProgramInfo {
         // arguments belong to the enclosing executable PROGRAM ABI.
         for u in sink.toposort_call_aware(false) {
             match u.op() {
-                Op::Param { arg, .. } if arg.addrspace.is_none() => {
+                Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => {
                     vars.push(u.clone());
                     if arg.name.as_deref() == Some("core_id")
                         && let Some((_, ConstValueHash(ConstValue::Int(max_val)))) = arg.vmin_vmax
@@ -797,18 +799,18 @@ impl ProgramInfo {
                         global_size[0] = crate::UOp::index_const(max_val + 1);
                     }
                 }
-                Op::Param { arg, .. } => globals.push(arg.slot),
-                Op::Store { index, .. } => {
+                Op::Param(ops::Param { arg, .. }) => globals.push(arg.slot),
+                Op::Store(ops::Store { index, .. }) => {
                     if let Some(slot) = param_slot(index) {
                         outs.push(slot);
                     }
                 }
-                Op::Load { index, .. } => {
+                Op::Load(ops::Load { index, .. }) => {
                     if let Some(slot) = param_slot(index) {
                         ins.push(slot);
                     }
                 }
-                Op::Special { end, name } => {
+                Op::Special(ops::Special { end, name }) => {
                     let Some(axis) = name.chars().last().and_then(|c| c.to_digit(10)).map(|axis| axis as usize) else {
                         continue;
                     };
@@ -828,7 +830,7 @@ impl ProgramInfo {
         }
 
         vars.sort_by_key(|u| match u.op() {
-            Op::Param { arg, .. } => arg.slot,
+            Op::Param(ops::Param { arg, .. }) => arg.slot,
             _ => usize::MAX,
         });
         vars.dedup_by_key(|u| u.content_hash);
@@ -840,7 +842,7 @@ impl ProgramInfo {
         ins.dedup();
 
         let name = match sink.op() {
-            Op::Sink { info: Some(info), .. } => info.name.clone().unwrap_or_else(|| "test".to_string()),
+            Op::Sink(ops::Sink { info: Some(info), .. }) => info.name.clone().unwrap_or_else(|| "test".to_string()),
             _ => "test".to_string(),
         };
         Self { name, global_size, local_size, vars, globals, outs, ins, target }
@@ -1358,15 +1360,12 @@ impl WmmaUpcastAxes {
 
 /// Identifies which renderer / TC backend a kernel or WMMA op was generated for.
 ///
-/// More granular than [`DeviceSpec`] (which describes the runtime target) — a
-/// CPU+AMX kernel runs on `DeviceSpec::Cpu` but its renderer is
-/// `RendererDevice::AppleAmx`, and the distinction matters for codegen
-/// gating (e.g., wider load/store folds only apply to AMX TC accumulators).
+/// More granular than [`DeviceSpec`] (which describes the runtime target): the
+/// renderer selects the tensor-core table and codegen gating for that target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum RendererDevice {
     Cpu,
-    AppleAmx,
     CudaSm75,
     CudaSm80,
     CudaSm89,
@@ -1384,7 +1383,6 @@ impl RendererDevice {
     pub const fn canonical(&self) -> &'static str {
         match self {
             Self::Cpu => "CPU",
-            Self::AppleAmx => "AppleAMX",
             Self::CudaSm75 => "CUDA_SM75",
             Self::CudaSm80 => "CUDA_SM80",
             Self::CudaSm89 => "CUDA_SM89",
@@ -1398,13 +1396,9 @@ impl RendererDevice {
         }
     }
 
-    pub const fn is_apple_amx(&self) -> bool {
-        matches!(self, Self::AppleAmx)
-    }
-
     /// True if the device exposes a hardware cache-invalidation primitive.
     /// Only NV CUDA and AMD runtimes implement `invalidate_caches`; Metal,
-    /// IntelXe, WebGpu, CPU, and Apple AMX have no such primitive and must
+    /// IntelXe, WebGpu, and CPU have no such primitive and must
     /// rely on the software fallback (or run warm-cache).
     pub const fn has_hardware_cache_invalidate(&self) -> bool {
         matches!(
@@ -1447,11 +1441,6 @@ pub struct WmmaMetadata {
     pub upcast_axes: Option<WmmaUpcastAxes>,
     /// TC reduce axis IDs (used for exclude_args in expansion).
     pub reduce_axes: Vec<AxisId>,
-    /// Tile grid for multi-FMA batching (tile_y_count, tile_x_count).
-    ///
-    /// When > (1, 1), uses load-pair mode and emits multiple FMAs per K iteration
-    /// to compute a 2×2 grid of output tiles. Default is (1, 1).
-    pub tile_grid: (usize, usize),
 }
 
 /// Wrapper for ConstValue that implements Eq and Hash.

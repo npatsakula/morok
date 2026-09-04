@@ -10,6 +10,7 @@ use svod_ir::{Op, ReduceOp, SInt, UOp};
 use test_case::test_case;
 
 use crate::rangeify::kernel::{SplitReduceOpConfig, collect_range_ids, split_reduceop};
+use svod_ir::ops;
 
 fn tensor(shape: &[usize]) -> Arc<UOp> {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, shape.iter().product(), DType::Float32);
@@ -21,11 +22,11 @@ fn tensor(shape: &[usize]) -> Arc<UOp> {
 
 fn expanded(base: &[usize], to: &[usize]) -> Arc<UOp> {
     let new_shape = UOp::stack(to.iter().map(|&d| UOp::index_const(d as i64)).collect());
-    UOp::new(Op::Expand { src: tensor(base), new_shape }, DType::Float32)
+    UOp::new(Op::Expand(ops::Expand { src: tensor(base), new_shape }), DType::Float32)
 }
 
 fn has_contiguous(uop: &Arc<UOp>) -> bool {
-    uop.toposort().iter().any(|node| matches!(node.op(), Op::Contiguous { .. }))
+    uop.toposort().iter().any(|node| matches!(node.op(), Op::Contiguous(..)))
 }
 
 /// Ratio of total elements to output elements decides the split; the default
@@ -78,7 +79,7 @@ fn the_split_keeps_the_original_reduce_op(reduce_op: ReduceOp) {
         transformed
             .toposort()
             .iter()
-            .any(|node| matches!(node.op(), Op::Reduce { reduce_op: op, .. } if *op == reduce_op)),
+            .any(|node| matches!(node.op(), Op::Reduce(ops::Reduce { reduce_op: op, .. }) if *op == reduce_op)),
         "{reduce_op:?} must survive the split"
     );
 }

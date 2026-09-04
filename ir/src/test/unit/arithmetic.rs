@@ -29,7 +29,7 @@ fn weak_sources_remain_uncast_until_lowering() {
         assert!(lhs.dtype().is_weak());
         assert!(!rhs.dtype().is_weak());
         assert_eq!(result.dtype(), rhs.dtype());
-        assert!(!result.toposort().iter().any(|node| matches!(node.op(), Op::Cast { .. })));
+        assert!(!result.toposort().iter().any(|node| matches!(node.op(), Op::Cast(..))));
     }
 }
 

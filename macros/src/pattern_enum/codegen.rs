@@ -1,6 +1,8 @@
-//! Code generation for PatternEnum derive macro.
+//! Code generation for the `Op` pattern infrastructure: `OpKey`, its dense index, and
+//! the `alu` module that lets pattern code destructure grouped operations by kind
+//! without any per-arity tables.
 
-use super::analyze::{AnalyzedVariant, VariantGroups, VariantKind, analyze_variants, group_by_kind};
+use super::analyze::{AnalyzedVariant, VariantKind, analyze_variants};
 use super::parse::parse_input;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -10,76 +12,44 @@ use syn::{DeriveInput, Ident, Result};
 pub fn generate(input: &DeriveInput) -> Result<TokenStream> {
     let (enum_attrs, variants) = parse_input(input)?;
     let analyzed = analyze_variants(&enum_attrs, variants);
-    let groups = group_by_kind(&analyzed);
-
     let enum_name = &input.ident;
 
-    // Generate OpKey enum and from_op method
-    let op_key = generate_op_key(&analyzed, &groups, enum_name);
-    let metadata = generate_metadata(&analyzed, &groups);
+    let op_key = generate_op_key(&analyzed, enum_name);
+    let alu = generate_alu(&analyzed, enum_name);
 
-    // Wrap in module
     Ok(quote! {
         /// Generated pattern matching infrastructure for Op enum.
         pub mod pattern_derived {
             use super::*;
 
             #op_key
-            #metadata
         }
+
+        #alu
     })
 }
 
-/// Generate the OpKey enum and from_op method.
-fn generate_op_key(variants: &[AnalyzedVariant], _groups: &VariantGroups, enum_name: &Ident) -> TokenStream {
-    // Generate OpKey variants (including skipped ones so from_op can return a valid key)
+/// Generate the OpKey enum, `from_op` and the dense `index`.
+fn generate_op_key(variants: &[AnalyzedVariant], enum_name: &Ident) -> TokenStream {
     let key_variants: Vec<_> = variants
         .iter()
         .map(|v| {
             let name = &v.name;
-            if v.kind == VariantKind::Grouped {
-                let filter_type = v.filter_enum_type.as_ref().unwrap();
-                quote! { #name(#filter_type) }
-            } else {
-                quote! { #name }
+            match &v.filter_enum_type {
+                Some(filter_type) => quote! { #name(#filter_type) },
+                None => quote! { #name },
             }
         })
         .collect();
 
-    // Generate from_op match arms (ALL variants, including skipped)
     let from_op_arms: Vec<_> = variants
         .iter()
         .map(|v| {
             let name = &v.name;
-
-            // For skipped variants, return their OpKey (no patterns are indexed under these keys)
-            if v.kind == VariantKind::Skipped {
-                if v.is_struct {
-                    return quote! { #enum_name::#name { .. } => OpKey::#name };
-                } else {
-                    return quote! { #enum_name::#name => OpKey::#name };
-                }
-            }
-
             match v.kind {
-                VariantKind::Grouped => {
-                    if v.is_struct {
-                        quote! { #enum_name::#name { .. } => unreachable!() }
-                    } else {
-                        quote! { #enum_name::#name(op, ..) => OpKey::#name(*op) }
-                    }
-                }
-                _ => {
-                    if v.is_struct {
-                        quote! { #enum_name::#name { .. } => OpKey::#name }
-                    } else if v.children.is_empty() && v.filters.is_empty() && v.variadic.is_none() {
-                        // Unit variant with no fields
-                        quote! { #enum_name::#name => OpKey::#name }
-                    } else {
-                        // Tuple variant with fields
-                        quote! { #enum_name::#name(..) => OpKey::#name }
-                    }
-                }
+                VariantKind::Grouped => quote! { #enum_name::#name(op, ..) => OpKey::#name(*op) },
+                _ if v.is_unit => quote! { #enum_name::#name => OpKey::#name },
+                _ => quote! { #enum_name::#name(..) => OpKey::#name },
             }
         })
         .collect();
@@ -101,14 +71,20 @@ fn generate_op_key(variants: &[AnalyzedVariant], _groups: &VariantGroups, enum_n
         let name = &v.name;
         let ty = v.filter_enum_type.as_ref().expect("grouped variant has a filter enum");
         let base = format_ident!("OP_KEY_BASE_{}", name.to_string().to_uppercase());
-        base_defs.push(quote! { const #base: usize = #count; });
+        let end = format_ident!("OP_KEY_END_{}", name.to_string().to_uppercase());
+        base_defs.push(quote! {
+            /// First dense key index of this grouped variant.
+            pub const #base: usize = #count;
+            /// One past the last dense key index of this grouped variant.
+            pub const #end: usize = #base + <#ty as ::strum::VariantArray>::VARIANTS.len();
+        });
         index_arms.push(quote! { OpKey::#name(sub) => #base + *sub as usize });
-        count = quote! { #base + <#ty as ::strum::VariantArray>::VARIANTS.len() };
+        count = quote! { #end };
     }
 
     quote! {
         /// Operation key for pattern indexing.
-        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum OpKey {
             #(#key_variants),*
         }
@@ -137,69 +113,67 @@ fn generate_op_key(variants: &[AnalyzedVariant], _groups: &VariantGroups, enum_n
     }
 }
 
-/// Generate metadata constants.
-fn generate_metadata(variants: &[AnalyzedVariant], groups: &VariantGroups) -> TokenStream {
-    let grouped_names: Vec<_> = groups.grouped.iter().map(|v| v.name.to_string()).collect();
+/// Generate the `alu` module: every grouped kind's variants as values (`alu::Add`), one
+/// type alias per grouped variant (`alu::Binary`), a `const fn op_key` on each kind
+/// type, and the `AluOp` trait that destructures an op by kind. Pattern code names an
+/// ALU op through this module, so a typo is a resolution error at the author's span,
+/// the arity is a tuple type, and `alu::Add.op_key().index()` is a constant.
+fn generate_alu(variants: &[AnalyzedVariant], enum_name: &Ident) -> TokenStream {
+    let grouped: Vec<_> = variants.iter().filter(|v| v.kind == VariantKind::Grouped).collect();
+    let reexports = grouped.iter().map(|v| {
+        let (name, ty) = (&v.name, v.filter_enum_type.as_ref().expect("grouped variant has a filter enum"));
+        quote! {
+            pub use #ty::*;
+            pub type #name = #ty;
+        }
+    });
+    let impls = grouped.iter().map(|v| {
+        let (name, ty) = (&v.name, v.filter_enum_type.as_ref().expect("grouped variant has a filter enum"));
+        let child_tys = v.children.iter().map(|f| &f.ty);
+        let vars: Vec<Ident> = (0..v.children.len()).map(|i| format_ident!("child{i}")).collect();
+        quote! {
+            impl #ty {
+                /// The dispatch key of ops of this kind.
+                #[inline]
+                pub const fn op_key(self) -> pattern_derived::OpKey {
+                    pattern_derived::OpKey::#name(self)
+                }
+            }
 
-    let single_source: Vec<_> = variants
-        .iter()
-        .filter(|v| v.kind == VariantKind::Regular && v.fixed_arity() == 1)
-        .map(|v| {
-            let name = v.name.to_string();
-            let snake = v.snake_name();
-            quote! { (#name, #snake) }
-        })
-        .collect();
+            impl AluOp for #ty {
+                type Children<'a> = (#(&'a #child_tys,)*);
+                const ALL: &'static [Self] = <Self as ::strum::VariantArray>::VARIANTS;
 
-    let variadic: Vec<_> = variants
-        .iter()
-        .filter(|v| v.has_variadic())
-        .map(|v| {
-            let name = v.name.to_string();
-            let fixed = v.fixed_arity();
-            quote! { (#name, #fixed) }
-        })
-        .collect();
-
-    let all_ops: Vec<_> =
-        variants.iter().filter(|v| v.kind != VariantKind::Skipped).map(|v| v.name.to_string()).collect();
-
-    // Generate child field metadata for struct variants
-    let child_fields: Vec<_> = variants
-        .iter()
-        .filter(|v| v.is_struct && !v.children.is_empty())
-        .map(|v| {
-            let name = v.name.to_string();
-            let fields: Vec<_> = v.children.iter().filter_map(|f| f.name.as_named()).map(|n| n.to_string()).collect();
-            quote! { (#name, &[#(#fields),*]) }
-        })
-        .collect();
+                #[inline]
+                fn destructure(self, op: &#enum_name) -> Option<Self::Children<'_>> {
+                    match op {
+                        #enum_name::#name(kind, #(#vars),*) if *kind == self => Some((#(#vars,)*)),
+                        _ => None,
+                    }
+                }
+            }
+        }
+    });
 
     quote! {
-        /// Metadata for pattern DSL.
-        pub mod pattern_metadata {
-            /// Grouped operation names (Binary, Unary, Ternary).
-            pub const GROUPED_OPS: &[&str] = &[#(#grouped_names),*];
+        /// Grouped (ALU) operation kinds as first-class values, plus [`alu::AluOp`] to
+        /// dispatch and destructure an op by kind.
+        pub mod alu {
+            use super::*;
 
-            /// Single-source ops: (name, snake_name).
-            pub const SINGLE_SOURCE_OPS: &[(&str, &str)] = &[#(#single_source),*];
+            #(#reexports)*
 
-            /// Variadic ops: (name, fixed_arity).
-            pub const VARIADIC_OPS: &[(&str, usize)] = &[#(#variadic),*];
+            /// An operation kind that selects a grouped `Op` variant.
+            pub trait AluOp: Copy + PartialEq + Send + Sync + 'static {
+                /// The children of a matching op, as a tuple of references.
+                type Children<'a>;
+                /// Every kind, in declaration order.
+                const ALL: &'static [Self];
+                /// The children of `op` when it is of this kind.
+                fn destructure(self, op: &#enum_name) -> Option<Self::Children<'_>>;
+            }
 
-            /// All operation names.
-            pub const ALL_OPS: &[&str] = &[#(#all_ops),*];
-
-            /// Child field names for struct variants: (op_name, &[field_names]).
-            pub const CHILD_FIELDS: &[(&str, &[&str])] = &[#(#child_fields),*];
-
-            // Re-export variant names from sub-enums (requires strum::VariantNames)
-            /// Binary operation variant names.
-            pub const BINARY_OPS: &[&str] = <super::super::BinaryOp as strum::VariantNames>::VARIANTS;
-            /// Unary operation variant names.
-            pub const UNARY_OPS: &[&str] = <super::super::UnaryOp as strum::VariantNames>::VARIANTS;
-            /// Ternary operation variant names.
-            pub const TERNARY_OPS: &[&str] = <super::super::TernaryOp as strum::VariantNames>::VARIANTS;
+            #(#impls)*
         }
     }
 }

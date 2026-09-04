@@ -14,6 +14,7 @@ use z3::Solver;
 use z3::ast::{Bool, Dynamic, Int};
 
 use crate::z3::alu::{z3_cdiv, z3_cmod};
+use svod_ir::ops;
 
 /// Z3 conversion context with solver.
 pub struct Z3Context {
@@ -59,9 +60,9 @@ impl Z3Context {
         let z3_expr = match uop.op() {
             Op::Const(cv) => Self::convert_const(&cv.0)?,
 
-            Op::DefineVar { name, min_val, max_val } => self.convert_var(name, *min_val, *max_val)?,
+            Op::DefineVar(ops::DefineVar { name, min_val, max_val }) => self.convert_var(name, *min_val, *max_val)?,
 
-            Op::Range { end, .. } => {
+            Op::Range(ops::Range { end, .. }) => {
                 // Range represents loop variable: [0, end)
                 let end_z3 = self.convert_uop_cached(end, cache)?;
 
@@ -117,7 +118,7 @@ impl Z3Context {
                 }
             }
 
-            Op::Cast { src, dtype } => {
+            Op::Cast(ops::Cast { src, dtype }) => {
                 // Bind the cast result to the source expression so distinct casts of
                 // distinct sources stay distinct in the solver. Without an equality
                 // constraint, two `Op::Cast` nodes both produce fresh unconstrained

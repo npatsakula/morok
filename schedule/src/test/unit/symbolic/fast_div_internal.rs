@@ -1,5 +1,6 @@
 use super::*;
 
+use svod_ir::ops;
 use test_case::test_case;
 
 /// `magic_unsigned(max, d)` returns `(m, s)` with `(x * m) >> s == x / d` for every
@@ -186,7 +187,9 @@ fn divmod_case(case: &str) -> DivmodCase {
 fn divmod_points(vars: &[Arc<UOp>]) -> Vec<Vec<i64>> {
     let mut points = vec![Vec::new()];
     for var in vars {
-        let svod_ir::Op::DefineVar { min_val, max_val, .. } = var.op() else { panic!("expected a variable") };
+        let svod_ir::Op::DefineVar(ops::DefineVar { min_val, max_val, .. }) = var.op() else {
+            panic!("expected a variable")
+        };
         points = points
             .iter()
             .flat_map(|point| {

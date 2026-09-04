@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
+use svod_ir::ops;
 use svod_ir::{
     BINARY_STAGE_IDENTITY_VERSION, BinaryOp, BinaryStageIdentity, ConstValue, Op, SOURCE_STAGE_IDENTITY_VERSION,
     SourceStageIdentity, StageAbiParam, StageAbiParamKind, StageDigest, TernaryOp, UOp, UnaryOp,
@@ -298,7 +299,6 @@ pub struct CompiledSpec {
     /// Complete kernel argument ABI in source-signature order.
     pub abi: Vec<AbiParamDescriptor>,
 
-    linear_stage: Option<Arc<UOp>>,
     stage_identity: Option<BinaryStageIdentity>,
 }
 
@@ -320,7 +320,7 @@ pub struct AbiParamDescriptor {
 
 impl AbiParamDescriptor {
     pub fn from_param(param: &Arc<UOp>) -> Result<Self> {
-        let Op::Param { arg, .. } = param.op() else {
+        let Op::Param(ops::Param { arg, .. }) = param.op() else {
             return Err(Error::ProgramAbiMismatch {
                 reason: format!("ABI descriptor source is non-PARAM {:?}", param.op()),
             });
@@ -381,14 +381,15 @@ fn sha256(bytes: &[u8]) -> StageDigest {
 }
 
 fn linear_sha256(linear: &Arc<UOp>) -> Result<StageDigest> {
-    let graph = svod_ir::CanonicalGraph::from_root("source-stage-linear-v1", linear).map_err(|error| {
+    let graph = svod_ir::CanonicalGraph::from_root("source-stage-linear-v2", linear).map_err(|error| {
         Error::ProgramStageMismatch { stage: "SOURCE", reason: format!("cannot encode LINEAR identity: {error}") }
     })?;
-    let encoded = graph.to_pretty_json().map_err(|error| Error::ProgramStageMismatch {
+    let mut hasher = Sha256::new();
+    graph.encode_into(&mut hasher).map_err(|error| Error::ProgramStageMismatch {
         stage: "SOURCE",
         reason: format!("cannot serialize LINEAR identity: {error}"),
     })?;
-    Ok(sha256(encoded.as_bytes()))
+    Ok(StageDigest(hasher.finalize().into()))
 }
 
 fn source_stage_identity_from_parts(
@@ -408,7 +409,9 @@ fn source_stage_identity_from_parts(
     })
 }
 
-/// Construct the semantic identity for one rendered SOURCE stage.
+/// Construct the semantic identity for one rendered SOURCE stage. This is the
+/// only place the LINEAR digest is computed; later stages read it back through
+/// [`minted_source_stage_identity`].
 pub fn source_stage_identity(
     info: &svod_ir::ProgramInfo,
     abi: &[AbiParamDescriptor],
@@ -416,6 +419,42 @@ pub fn source_stage_identity(
     source: &str,
 ) -> Result<SourceStageIdentity> {
     source_stage_identity_from_parts(abi, &info.target, info.function_name(), linear, source)
+}
+
+/// The identity a SOURCE stage was minted with, re-checked against the PROGRAM
+/// that now carries it. Every field except the LINEAR digest is re-derived
+/// here; the digest is the one computed when the stage was rendered, so a
+/// PROGRAM flowing render → compile → load hashes its LINEAR exactly once.
+pub fn minted_source_stage_identity(
+    info: &svod_ir::ProgramInfo,
+    abi: &[AbiParamDescriptor],
+    source: &Arc<UOp>,
+) -> Result<SourceStageIdentity> {
+    let Op::Source(ops::Source { code, identity }) = source.op() else {
+        return Err(Error::ProgramStageMismatch {
+            stage: "SOURCE",
+            reason: format!("expected SOURCE, got {:?}", source.op()),
+        });
+    };
+    let minted = identity.as_ref().ok_or_else(|| Error::ProgramStageMismatch {
+        stage: "SOURCE",
+        reason: "stage has no semantic identity".into(),
+    })?;
+    let expected = SourceStageIdentity {
+        version: SOURCE_STAGE_IDENTITY_VERSION,
+        abi: stage_abi(abi),
+        target: info.target.clone(),
+        entry_name: info.function_name(),
+        linear_sha256: minted.linear_sha256,
+        source_sha256: sha256(code.as_bytes()),
+    };
+    if **minted != expected {
+        return Err(Error::ProgramStageMismatch {
+            stage: "SOURCE",
+            reason: format!("expected {expected:?}, got {minted:?}"),
+        });
+    }
+    Ok(expected)
 }
 
 /// Construct the semantic identity for one compiled BINARY stage.
@@ -430,7 +469,7 @@ pub fn binary_stage_identity(source: SourceStageIdentity, compiler_key: &str, by
 
 /// Validate a SOURCE UOp against an independently derived identity.
 pub fn validate_source_stage(source: &Arc<UOp>, expected: &SourceStageIdentity) -> Result<()> {
-    let Op::Source { code, identity } = source.op() else {
+    let Op::Source(ops::Source { code, identity }) = source.op() else {
         return Err(Error::ProgramStageMismatch {
             stage: "SOURCE",
             reason: format!("expected SOURCE, got {:?}", source.op()),
@@ -440,7 +479,7 @@ pub fn validate_source_stage(source: &Arc<UOp>, expected: &SourceStageIdentity) 
         stage: "SOURCE",
         reason: "stage has no semantic identity".into(),
     })?;
-    if actual != expected || actual.source_sha256 != sha256(code.as_bytes()) {
+    if **actual != *expected || actual.source_sha256 != sha256(code.as_bytes()) {
         return Err(Error::ProgramStageMismatch {
             stage: "SOURCE",
             reason: format!("expected {expected:?}, got {actual:?}"),
@@ -451,7 +490,7 @@ pub fn validate_source_stage(source: &Arc<UOp>, expected: &SourceStageIdentity) 
 
 /// Validate a BINARY UOp against an independently derived identity.
 pub fn validate_binary_stage(binary: &Arc<UOp>, expected: &BinaryStageIdentity) -> Result<Vec<u8>> {
-    let Op::ProgramBinary { bytes, identity } = binary.op() else {
+    let Op::ProgramBinary(ops::ProgramBinary { bytes, identity }) = binary.op() else {
         return Err(Error::ProgramStageMismatch {
             stage: "BINARY",
             reason: format!("expected BINARY, got {:?}", binary.op()),
@@ -461,7 +500,7 @@ pub fn validate_binary_stage(binary: &Arc<UOp>, expected: &BinaryStageIdentity) 
         stage: "BINARY",
         reason: "stage has no semantic identity".into(),
     })?;
-    if actual != expected || actual.binary_sha256 != sha256(bytes) {
+    if **actual != *expected || actual.binary_sha256 != sha256(bytes) {
         return Err(Error::ProgramStageMismatch {
             stage: "BINARY",
             reason: format!("expected {expected:?}, got {actual:?}"),
@@ -599,7 +638,6 @@ impl CompiledSpec {
             local_size: None,
             buf_count,
             abi,
-            linear_stage: None,
             stage_identity: Some(identity),
         };
         spec.validate_stage_identity(target, compiler_key)?;
@@ -625,7 +663,6 @@ impl CompiledSpec {
             local_size: Some(default_launch_size()),
             buf_count,
             abi,
-            linear_stage: None,
             stage_identity: None,
         })
     }
@@ -649,7 +686,6 @@ impl CompiledSpec {
             local_size: Some(default_launch_size()),
             buf_count,
             abi,
-            linear_stage: None,
             stage_identity: None,
         })
     }
@@ -680,25 +716,24 @@ impl CompiledSpec {
             local_size: local_size.map(concrete_launch_size),
             buf_count,
             abi,
-            linear_stage: None,
             stage_identity: None,
         })
     }
 
-    /// Bind compiler output to the exact staged PROGRAM that produced it.
+    /// Bind compiler output to the staged PROGRAM identity that produced it.
     pub fn bind_program_stage(
         &mut self,
-        linear: Arc<UOp>,
         target: &DeviceSpec,
         compiler_key: &str,
         identity: BinaryStageIdentity,
     ) -> Result<()> {
-        self.linear_stage = Some(linear);
         self.stage_identity = Some(identity);
         self.validate_stage_identity(target, compiler_key)
     }
 
     /// Validate all semantic stage fields required before executable loading.
+    /// The LINEAR digest is the minted one (see `minted_source_stage_identity`);
+    /// every other field is re-derived from this specification.
     pub fn validate_stage_identity(&self, target: &DeviceSpec, compiler_key: &str) -> Result<()> {
         let identity = self.stage_identity.as_ref().ok_or_else(|| Error::ProgramStageMismatch {
             stage: "BINARY",
@@ -708,17 +743,13 @@ impl CompiledSpec {
             stage: "SOURCE",
             reason: "compiled specification does not retain its source payload".into(),
         })?;
-        let expected_source = if let Some(linear) = self.linear_stage.as_ref() {
-            source_stage_identity_from_parts(&self.abi, target, self.name.clone(), linear, source)?
-        } else {
-            SourceStageIdentity {
-                version: SOURCE_STAGE_IDENTITY_VERSION,
-                abi: stage_abi(&self.abi),
-                target: target.clone(),
-                entry_name: self.name.clone(),
-                linear_sha256: identity.source.linear_sha256,
-                source_sha256: sha256(source.as_bytes()),
-            }
+        let expected_source = SourceStageIdentity {
+            version: SOURCE_STAGE_IDENTITY_VERSION,
+            abi: stage_abi(&self.abi),
+            target: target.clone(),
+            entry_name: self.name.clone(),
+            linear_sha256: identity.source.linear_sha256,
+            source_sha256: sha256(source.as_bytes()),
         };
         if identity.source != expected_source {
             return Err(Error::ProgramStageMismatch {
@@ -843,7 +874,7 @@ fn checked_launch_ternary(op: TernaryOp, a: i64, b: i64, c: i64) -> Result<i64> 
 fn eval_launch_expr(expr: &Arc<UOp>, vars: &HashMap<&str, i64>) -> Result<i64> {
     match expr.op() {
         Op::Const(value) => const_value_to_i64(value.0),
-        Op::Param { arg, .. } if arg.addrspace.is_none() => {
+        Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => {
             let name = arg
                 .name
                 .as_deref()
@@ -858,9 +889,9 @@ fn eval_launch_expr(expr: &Arc<UOp>, vars: &HashMap<&str, i64>) -> Result<i64> {
             }
             Ok(value)
         }
-        Op::Bind { var, value } => {
+        Op::Bind(ops::Bind { var, value }) => {
             let bound = eval_launch_expr(value, vars)?;
-            if let Op::Param { arg, .. } = var.op()
+            if let Op::Param(ops::Param { arg, .. }) = var.op()
                 && let (Some(name), Some((min, max))) = (&arg.name, &arg.vmin_vmax)
                 && let (Some(min), Some(max)) = (min.0.try_int(), max.0.try_int())
             {
@@ -883,9 +914,9 @@ fn eval_launch_expr(expr: &Arc<UOp>, vars: &HashMap<&str, i64>) -> Result<i64> {
             eval_launch_expr(c, vars)?,
         ),
         Op::Unary(op, src) => checked_launch_unary(*op, eval_launch_expr(src, vars)?),
-        Op::Cast { src, .. } | Op::BitCast { src, .. } | Op::After { passthrough: src, .. } => {
-            eval_launch_expr(src, vars)
-        }
+        Op::Cast(ops::Cast { src, .. })
+        | Op::BitCast(ops::BitCast { src, .. })
+        | Op::After(ops::After { passthrough: src, .. }) => eval_launch_expr(src, vars),
         other => Err(Error::Runtime { message: format!("unsupported launch-size expression op: {other:?}") }),
     }
 }
@@ -1243,8 +1274,8 @@ impl ProgramSpec {
     fn same_param_semantics(actual: &Arc<UOp>, expected: &Arc<UOp>) -> bool {
         match (actual.op(), expected.op()) {
             (
-                Op::Param { shape: actual_shape, arg: actual_arg },
-                Op::Param { shape: expected_shape, arg: expected_arg },
+                Op::Param(ops::Param { shape: actual_shape, arg: actual_arg }),
+                Op::Param(ops::Param { shape: expected_shape, arg: expected_arg }),
             ) => {
                 actual.dtype() == expected.dtype()
                     && actual_arg == expected_arg
@@ -1263,17 +1294,17 @@ impl ProgramSpec {
         let executable_ids = executable.iter().map(|node| node.id).collect::<std::collections::HashSet<_>>();
 
         for node in &executable {
-            if let Op::Special { name, .. } = node.op()
+            if let Op::Special(ops::Special { name, .. }) = node.op()
                 && !matches!(name.chars().last().and_then(|axis| axis.to_digit(10)), Some(0..=2))
             {
                 return Err(Error::ProgramAbiMismatch { reason: format!("invalid SPECIAL axis name {name:?}") });
             }
             let body = match node.op() {
-                Op::Call { body, .. } | Op::Function { body, .. } => body,
+                Op::Call(ops::Call { body, .. }) | Op::Function(ops::Function { body, .. }) => body,
                 _ => continue,
             };
             for formal in body.toposort_call_aware(true) {
-                if matches!(formal.op(), Op::Param { .. }) && executable_ids.contains(&formal.id) {
+                if matches!(formal.op(), Op::Param(..)) && executable_ids.contains(&formal.id) {
                     return Err(Error::LeakedOpaqueProgramParam {
                         param: format!("UOp {} {:?}", formal.id, formal.op()),
                     });
@@ -1283,7 +1314,7 @@ impl ProgramSpec {
 
         let mut abi = Vec::new();
         for node in executable {
-            let Op::Param { arg, .. } = node.op() else { continue };
+            let Op::Param(ops::Param { arg, .. }) = node.op() else { continue };
             let descriptor = AbiParamDescriptor::from_param(&node)?;
             let class = format!("{:?} {:?}", descriptor.kind, descriptor.name);
             if let Some(first) = occupied.insert(arg.slot, class.clone()) {
@@ -1437,12 +1468,12 @@ impl ProgramSpec {
     ///
     /// Validates PROGRAM stage shape and derives metadata from PROGRAM itself.
     pub fn from_uop(program: &Arc<UOp>) -> Result<Self> {
-        let Op::Program { sink, info, linear, source, binary } = program.op() else {
+        let Op::Program(ops::Program { sink, info, linear, source, binary }) = program.op() else {
             return WrongStageSnafu { expected: "PROGRAM", got: format!("{:?}", program.op()) }.fail();
         };
 
         snafu::ensure!(
-            matches!(sink.op(), Op::Sink { .. }),
+            matches!(sink.op(), Op::Sink(..)),
             WrongStageSnafu { expected: "PROGRAM sink stage SINK", got: format!("{:?}", sink.op()) }
         );
 
@@ -1450,7 +1481,7 @@ impl ProgramSpec {
             .as_ref()
             .context(WrongStageSnafu { expected: "PROGRAM LINEAR stage", got: "missing".to_string() })?;
         snafu::ensure!(
-            matches!(linear.op(), Op::Linear { .. }),
+            matches!(linear.op(), Op::Linear(..)),
             WrongStageSnafu { expected: "PROGRAM linear stage LINEAR", got: format!("{:?}", linear.op()) }
         );
 
@@ -1458,18 +1489,17 @@ impl ProgramSpec {
             .as_ref()
             .context(WrongStageSnafu { expected: "PROGRAM SOURCE stage", got: "missing".to_string() })?;
         let source_code = match source.op() {
-            Op::Source { code, .. } => code.clone(),
+            Op::Source(ops::Source { code, .. }) => code.clone(),
             other => {
                 return WrongStageSnafu { expected: "PROGRAM source stage SOURCE", got: format!("{other:?}") }.fail();
             }
         };
 
         let abi = Self::validate_program_param_abi(sink, info)?;
-        let expected_source = source_stage_identity(info, &abi, linear, &source_code)?;
-        validate_source_stage(source, &expected_source)?;
+        let expected_source = minted_source_stage_identity(info, &abi, source)?;
 
         if let Some(binary) = binary {
-            let Op::ProgramBinary { bytes, identity } = binary.op() else {
+            let Op::ProgramBinary(ops::ProgramBinary { bytes, identity }) = binary.op() else {
                 return WrongStageSnafu {
                     expected: "PROGRAM binary stage ProgramBinary",
                     got: format!("{:?}", binary.op()),
@@ -1494,7 +1524,7 @@ impl ProgramSpec {
             .vars
             .iter()
             .filter_map(|u| match u.op() {
-                Op::Param { arg, .. } => Some(Variable::new(
+                Op::Param(ops::Param { arg, .. }) => Some(Variable::new(
                     arg.name.clone().unwrap_or_else(|| format!("p{}", arg.slot)),
                     arg.vmin_vmax
                         .as_ref()

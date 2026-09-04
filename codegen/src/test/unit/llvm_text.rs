@@ -4,13 +4,14 @@ use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, RendererDevice, WmmaMe
 use super::*;
 use crate::Renderer;
 use crate::llvm::LlvmTextRenderer;
+use svod_ir::ops;
 
 fn slotted_var(name: &str, slot: usize) -> std::sync::Arc<UOp> {
     let var = UOp::variable(name.to_string(), 0, 16, DType::Int32);
-    let Op::Param { shape, arg } = var.op() else { unreachable!() };
+    let Op::Param(ops::Param { shape, arg }) = var.op() else { unreachable!() };
     let mut arg = arg.clone();
     arg.slot = slot;
-    UOp::new(Op::Param { shape: shape.clone(), arg }, DType::Int32)
+    UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg }), DType::Int32)
 }
 
 fn render_linearized(root: std::sync::Arc<UOp>, name: &str) -> crate::RenderedKernel {
@@ -258,58 +259,18 @@ fn amd_define_local_emits_addrspace3_module_global() {
 
 // ── WMMA emission (parity with tinygrad's AMDLLVMRenderer) ──────────────────
 
-fn wmma_meta(
-    name: &str,
-    dims: (usize, usize, usize),
-    in_dt: DType,
-    out_dt: DType,
-    ab_count: usize,
-    c_count: usize,
-    threads: usize,
-) -> WmmaMetadata {
+fn amd_wmma_meta(k: usize, in_dt: DType, out_dt: DType, c_count: usize) -> WmmaMetadata {
     let axes = |count| vec![(svod_ir::AxisId::Renumbered(2), count)];
     WmmaMetadata {
-        name: name.to_string(),
-        dims,
+        name: "WMMA_test".to_string(),
+        dims: (16, 16, k),
         dtype_in: in_dt,
         dtype_out: out_dt,
-        device: RendererDevice::AppleAmx, // unused by the AMD path (keyed on `arch`)
-        threads,
-        upcast_axes: Some(WmmaUpcastAxes { a: axes(ab_count), b: axes(ab_count), c: axes(c_count) }),
+        device: RendererDevice::AmdRdna3, // unused by the AMD path (keyed on `arch`)
+        threads: 32,
+        upcast_axes: Some(WmmaUpcastAxes { a: axes(16), b: axes(16), c: axes(c_count) }),
         reduce_axes: vec![],
-        tile_grid: (1, 1),
     }
-}
-
-fn amd_wmma_meta(k: usize, in_dt: DType, out_dt: DType, c_count: usize) -> WmmaMetadata {
-    wmma_meta("WMMA_test", (16, 16, k), in_dt, out_dt, 16, c_count, 32)
-}
-
-/// The AMD path lowers WMMA to `llvm.amdgcn.wmma.*` over SSA vectors, so the
-/// CPU/AMX scratch allocas must not be emitted there — and must still be
-/// emitted on the CPU path. Both sides of the `LlvmTarget::Cpu` gate.
-#[test]
-fn amx_scratch_is_emitted_only_on_the_cpu_path() {
-    let splat = |dt: DType, lanes| UOp::const_(dt, ConstValue::Float(0.0)).broadcast(lanes);
-
-    let amd = UOp::wmma(
-        splat(DType::Float16, 16),
-        splat(DType::Float16, 16),
-        splat(DType::Float32, 8),
-        amd_wmma_meta(16, DType::Float16, DType::Float32, 8),
-    );
-    let amd = render_amd_linearized(&UOp::sink(vec![amd]), AmdArch::Gfx1100, "amd_wmma");
-    assert!(amd.code.contains("@llvm.amdgcn.wmma.f32.16x16x16.f16"), "missing WMMA intrinsic:\n{}", amd.code);
-    assert!(!amd.code.contains("_amx"), "AMD WMMA must not emit AMX scratch allocas:\n{}", amd.code);
-
-    let cpu = UOp::wmma(
-        splat(DType::Float32, 16),
-        splat(DType::Float32, 16),
-        splat(DType::Float32, 256),
-        wmma_meta("WMMA_16_16_1_float_float", (16, 16, 1), DType::Float32, DType::Float32, 256, 256, 1),
-    );
-    let cpu = render_linearized(UOp::sink(vec![cpu]), "cpu_wmma");
-    assert!(cpu.code.contains("_amx"), "CPU WMMA must emit AMX scratch:\n{}", cpu.code);
 }
 
 /// WMMA over SSA operands (buffer loads, not the const splats above): A/B are
@@ -420,7 +381,7 @@ fn f32_param(slot: usize) -> std::sync::Arc<UOp> {
 }
 
 fn shrink4(src: std::sync::Arc<UOp>, dtype: DType) -> std::sync::Arc<UOp> {
-    UOp::new(Op::Shrink { src, offsets: UOp::native_const(0i32), sizes: UOp::native_const(4i32) }, dtype)
+    UOp::new(Op::Shrink(ops::Shrink { src, offsets: UOp::native_const(0i32), sizes: UOp::native_const(4i32) }), dtype)
 }
 
 fn element(buffer: std::sync::Arc<UOp>, lane: i64) -> std::sync::Arc<UOp> {

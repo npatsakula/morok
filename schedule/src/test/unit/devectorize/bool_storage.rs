@@ -7,6 +7,7 @@ use svod_ir::{Op, UOp};
 use test_case::test_case;
 
 use super::helpers::*;
+use svod_ir::ops;
 
 /// A bool LOAD becomes `CAST(LOAD<uint8>, bool)`; every other element type is left alone.
 #[test_case(ScalarDType::Bool; "bool loads through uint8")]
@@ -21,7 +22,7 @@ fn load_uses_uint8_storage_only_for_bool(scalar: ScalarDType) {
         assert_eq!(result.dtype(), DType::Scalar(scalar));
         return;
     }
-    let Op::Cast { src, dtype } = result.op() else { panic!("expected CAST(LOAD), got {}", result.tree()) };
+    let Op::Cast(ops::Cast { src, dtype }) = result.op() else { panic!("expected CAST(LOAD), got {}", result.tree()) };
     assert_eq!(*dtype, DType::Bool);
     assert_is_load(src);
     assert_eq!(src.dtype(), DType::UInt8);
@@ -35,7 +36,7 @@ fn store_uses_uint8_storage_only_for_bool(value: std::sync::Arc<UOp>, buffer: Sc
     let store = create_store(create_index(create_buffer_typed(64, buffer), 0), value);
     let result = apply_bool_storage(&store);
 
-    let Op::Store { value, .. } = result.op() else { panic!("expected STORE, got {}", result.tree()) };
+    let Op::Store(ops::Store { value, .. }) = result.op() else { panic!("expected STORE, got {}", result.tree()) };
     assert_eq!(value.dtype().base(), expected, "{}", result.tree());
 }
 
@@ -59,8 +60,8 @@ fn gated_bool_load_keeps_gate_and_converts_alt() {
 
     let result = apply_bool_storage(&load);
 
-    let Op::Cast { src, .. } = result.op() else { panic!("expected CAST(LOAD), got {}", result.tree()) };
-    let Op::Load { alt: Some(alt), gate: Some(_), .. } = src.op() else {
+    let Op::Cast(ops::Cast { src, .. }) = result.op() else { panic!("expected CAST(LOAD), got {}", result.tree()) };
+    let Op::Load(ops::Load { alt: Some(alt), gate: Some(_), .. }) = src.op() else {
         panic!("the late LOAD gate and alt must both survive: {}", src.tree())
     };
     assert_eq!(alt.dtype(), DType::UInt8);
@@ -71,11 +72,12 @@ fn gated_bool_load_keeps_gate_and_converts_alt() {
 #[test]
 fn devectorize_lowers_bool_loads_and_bitcasts() {
     let load = apply_devectorize(&create_load(create_index(create_bool_buffer(64), 0)));
-    assert!(matches!(load.op(), Op::Cast { src, .. } if src.dtype() == DType::UInt8), "{}", load.tree());
+    assert!(matches!(load.op(), Op::Cast(ops::Cast { src, .. }) if src.dtype() == DType::UInt8), "{}", load.tree());
     assert_eq!(load.dtype(), DType::Bool);
 
-    let bitcast = UOp::new(Op::BitCast { src: create_bool_const(true), dtype: DType::UInt8 }, DType::UInt8);
+    let bitcast =
+        UOp::new(Op::BitCast(ops::BitCast { src: create_bool_const(true), dtype: DType::UInt8 }), DType::UInt8);
     let result = apply_devectorize(&bitcast);
-    assert!(!result.toposort().iter().any(|uop| matches!(uop.op(), Op::BitCast { .. })));
+    assert!(!result.toposort().iter().any(|uop| matches!(uop.op(), Op::BitCast(..))));
     assert_eq!(result.dtype(), DType::UInt8);
 }

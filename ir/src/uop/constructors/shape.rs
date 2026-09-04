@@ -10,6 +10,7 @@ use svod_dtype::DType;
 
 use crate::Result;
 use crate::op::Op;
+use crate::ops;
 use crate::uop::UOp;
 
 // Low-level constructors (pub(crate) - not yet used but will be needed for optimization passes)
@@ -20,14 +21,14 @@ impl UOp {
         let dtype = if sources.is_empty() {
             DType::Void
         } else {
-            crate::dtype_from_op(&Op::Stack { sources: sources.clone() })
+            crate::dtype_from_op(&Op::Stack(ops::Stack { sources: sources.clone() }))
                 .expect("STACK sources must have a promotable dtype")
         };
         let sources = sources
             .into_iter()
             .map(|source| if Self::is_invalid_marker(&source) { source } else { source.cast(dtype.clone()) })
             .collect();
-        Self::new(Op::Stack { sources }, dtype)
+        Self::new(Op::Stack(ops::Stack { sources }), dtype)
     }
 
     /// Reshape tensor to new shape (low-level, UOp-based constructor).
@@ -36,7 +37,7 @@ impl UOp {
     /// For the public API with validation, use `try_reshape`.
     pub(crate) fn reshape(src: Arc<Self>, new_shape: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype();
-        Self::new(Op::Reshape { src, new_shape }, dtype)
+        Self::new(Op::Reshape(ops::Reshape { src, new_shape }), dtype)
     }
 
     /// Permute dimensions (low-level, UOp-based constructor).
@@ -44,7 +45,7 @@ impl UOp {
     /// For the public API with validation, use `try_permute`.
     pub(crate) fn permute(src: Arc<Self>, axes: Vec<usize>) -> Arc<Self> {
         let dtype = src.dtype();
-        Self::new(Op::Permute { src, axes }, dtype)
+        Self::new(Op::Permute(ops::Permute { src, axes }), dtype)
     }
 
     /// Expand (broadcast) dimensions (low-level, UOp-based constructor).
@@ -53,7 +54,7 @@ impl UOp {
     /// For the public API with validation, use `try_expand`.
     pub(crate) fn expand(src: Arc<Self>, new_shape: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype();
-        Self::new(Op::Expand { src, new_shape }, dtype)
+        Self::new(Op::Expand(ops::Expand { src, new_shape }), dtype)
     }
 
     /// Pad tensor (low-level, UOp-based constructor).
@@ -62,7 +63,7 @@ impl UOp {
     /// For the public API with validation, use `try_pad`.
     pub(crate) fn pad(src: Arc<Self>, begin_pads: Arc<Self>, end_pads: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype();
-        Self::new(Op::Pad { src, begin_pads, end_pads }, dtype)
+        Self::new(Op::Pad(ops::Pad { src, begin_pads, end_pads }), dtype)
     }
 
     /// Shrink (slice) tensor (low-level, UOp-based constructor).
@@ -71,7 +72,7 @@ impl UOp {
     /// For the public API with validation, use `try_shrink`.
     pub(crate) fn shrink(src: Arc<Self>, offsets: Arc<Self>, sizes: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype();
-        Self::new(Op::Shrink { src, offsets, sizes }, dtype)
+        Self::new(Op::Shrink(ops::Shrink { src, offsets, sizes }), dtype)
     }
 
     /// Flip (reverse) axes (low-level, UOp-based constructor).
@@ -79,7 +80,7 @@ impl UOp {
     /// For the public API with validation, use `try_flip`.
     pub(crate) fn flip(src: Arc<Self>, axes: Vec<bool>) -> Arc<Self> {
         let dtype = src.dtype();
-        Self::new(Op::Flip { src, axes }, dtype)
+        Self::new(Op::Flip(ops::Flip { src, axes }), dtype)
     }
 }
 
@@ -115,7 +116,7 @@ impl UOp {
 
         let shape_uop = shape_to_uop(new_shape);
         let dtype = self.dtype();
-        Ok(Self::new(Op::Reshape { src: self.clone(), new_shape: shape_uop }, dtype))
+        Ok(Self::new(Op::Reshape(ops::Reshape { src: self.clone(), new_shape: shape_uop }), dtype))
     }
 
     /// Expand (broadcast) with strict validation.
@@ -153,7 +154,7 @@ impl UOp {
 
         let shape_uop = shape_to_uop(new_shape);
         let dtype = self.dtype();
-        Ok(Self::new(Op::Expand { src: self.clone(), new_shape: shape_uop }, dtype))
+        Ok(Self::new(Op::Expand(ops::Expand { src: self.clone(), new_shape: shape_uop }), dtype))
     }
 
     /// Permute with strict validation.
@@ -172,7 +173,7 @@ impl UOp {
         }
 
         let dtype = self.dtype();
-        Ok(Self::new(Op::Permute { src: self.clone(), axes }, dtype))
+        Ok(Self::new(Op::Permute(ops::Permute { src: self.clone(), axes }), dtype))
     }
 
     /// Pad with strict validation.
@@ -211,7 +212,7 @@ impl UOp {
 
         let (begin_pads, end_pads) = ranges_to_uops(padding);
         let dtype = self.dtype();
-        Ok(Self::new(Op::Pad { src: self.clone(), begin_pads, end_pads }, dtype))
+        Ok(Self::new(Op::Pad(ops::Pad { src: self.clone(), begin_pads, end_pads }), dtype))
     }
 
     /// Shrink (slice) with strict validation.
@@ -251,7 +252,7 @@ impl UOp {
         let offsets_and_sizes: Vec<_> = ranges.iter().map(|(begin, end)| (begin.clone(), end - begin)).collect();
         let (offsets, sizes) = ranges_to_uops(&offsets_and_sizes);
         let dtype = self.dtype();
-        let result = Self::new(Op::Shrink { src: self.clone(), offsets, sizes }, dtype);
+        let result = Self::new(Op::Shrink(ops::Shrink { src: self.clone(), offsets, sizes }), dtype);
         // Tinygrad (movement.py:128): return self if ret.shape == self.shape else ret
         if result.shape().ok().flatten() == self.shape().ok().flatten() {
             return Ok(self.clone());
@@ -274,7 +275,7 @@ impl UOp {
         }
 
         let dtype = self.dtype();
-        Ok(Self::new(Op::Flip { src: self.clone(), axes }, dtype))
+        Ok(Self::new(Op::Flip(ops::Flip { src: self.clone(), axes }), dtype))
     }
 
     /// Split tensor across multiple devices along specified axis.
@@ -283,6 +284,6 @@ impl UOp {
     /// Use with MSTACK/MSELECT for distributed tensor operations.
     pub fn multi(src: Arc<Self>, axis: usize) -> Arc<Self> {
         let dtype = src.dtype();
-        Self::new(Op::Multi { src, axis }, dtype)
+        Self::new(Op::Multi(ops::Multi { src, axis }), dtype)
     }
 }

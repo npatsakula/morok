@@ -11,9 +11,9 @@ to build the optimization engine.
 use svod_schedule::patterns;
 
 let matcher = patterns! {
-    Add[x, @zero] ~> x,
-    Mul[x, @one] ~> x,
-    Neg(Neg(x)) ~> Rc::clone(x),
+    Add[x, @zero] => x,
+    Mul[x, @one] => x,
+    Neg(Neg(x)) => x,
 };
 ```
 

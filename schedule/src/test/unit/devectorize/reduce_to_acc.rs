@@ -10,6 +10,7 @@ use svod_ir::{AxisType, BinaryOp, Op, ReduceOp, RendererDevice, SInt, UOp, WmmaM
 use test_case::test_case;
 
 use super::helpers::*;
+use svod_ir::ops;
 
 fn test_wmma(c: Arc<UOp>) -> Arc<UOp> {
     let operand = UOp::stack((0..6).map(|i| UOp::var(format!("operand_{i}"), DType::Float32, -100, 100)).collect());
@@ -26,7 +27,6 @@ fn test_wmma(c: Arc<UOp>) -> Arc<UOp> {
             threads: 32,
             upcast_axes: None,
             reduce_axes: vec![],
-            tile_grid: (1, 1),
         },
     )
 }
@@ -48,7 +48,7 @@ fn test_wmma_add_direct_moves_into_accumulator() {
     let add = shaped_values("add", &[6]);
     let result = fuse_wmma_add(test_wmma(accumulator.clone()).add(&add));
 
-    let Op::Wmma { c, .. } = result.op() else { panic!("direct WMMA add must fuse") };
+    let Op::Wmma(ops::Wmma { c, .. }) = result.op() else { panic!("direct WMMA add must fuse") };
     assert!(matches!(c.op(), Op::Binary(BinaryOp::Add, lhs, rhs)
         if Arc::ptr_eq(lhs, &accumulator) && Arc::ptr_eq(rhs, &add)));
 }
@@ -68,11 +68,13 @@ fn test_wmma_add_moves_through_permute() {
     let permuted = test_wmma(shaped_values("acc", &[2, 3])).try_permute(vec![1, 0]).unwrap();
     let result = fuse_wmma_add(permuted.add(&shaped_values("add", &[3, 2])));
 
-    let Op::Permute { src, axes } = result.op() else { panic!("output permutation must remain outside WMMA") };
+    let Op::Permute(ops::Permute { src, axes }) = result.op() else {
+        panic!("output permutation must remain outside WMMA")
+    };
     assert_eq!(axes, &[1, 0]);
-    let Op::Wmma { c, .. } = src.op() else { panic!("permuted add must fuse into WMMA") };
+    let Op::Wmma(ops::Wmma { c, .. }) = src.op() else { panic!("permuted add must fuse into WMMA") };
     assert!(
-        matches!(c.op(), Op::Binary(BinaryOp::Add, _, moved) if matches!(moved.op(), Op::Permute { axes, .. } if axes == &[1, 0]))
+        matches!(c.op(), Op::Binary(BinaryOp::Add, _, moved) if matches!(moved.op(), Op::Permute(ops::Permute { axes, .. }) if axes == &[1, 0]))
     );
 }
 
@@ -82,11 +84,13 @@ fn test_wmma_add_moves_through_permute_reshape() {
         test_wmma(shaped_values("acc", &[6])).try_reshape(&smallvec![SInt::Const(2), SInt::Const(3)]).unwrap();
     let result = fuse_wmma_add(reshaped.try_permute(vec![1, 0]).unwrap().add(&shaped_values("add", &[3, 2])));
 
-    let Op::Permute { src, .. } = result.op() else { panic!("output permutation must remain") };
-    let Op::Reshape { src, .. } = src.op() else { panic!("output reshape must remain") };
-    let Op::Wmma { c, .. } = src.op() else { panic!("reshape-permute add must fuse into WMMA") };
-    assert!(matches!(c.op(), Op::Binary(BinaryOp::Add, _, moved) if matches!(moved.op(), Op::Reshape { src, .. }
-        if matches!(src.op(), Op::Permute { .. }))));
+    let Op::Permute(ops::Permute { src, .. }) = result.op() else { panic!("output permutation must remain") };
+    let Op::Reshape(ops::Reshape { src, .. }) = src.op() else { panic!("output reshape must remain") };
+    let Op::Wmma(ops::Wmma { c, .. }) = src.op() else { panic!("reshape-permute add must fuse into WMMA") };
+    assert!(
+        matches!(c.op(), Op::Binary(BinaryOp::Add, _, moved) if matches!(moved.op(), Op::Reshape(ops::Reshape { src, .. })
+        if matches!(src.op(), Op::Permute(..))))
+    );
 }
 
 #[test]
@@ -104,7 +108,7 @@ fn test_movement_cleanup_must_precede_reduce_local() {
         + crate::devectorize::pm_reduce_local();
     let mut ctx = crate::devectorize::ReduceContext::default();
     let ordered = crate::rewrite::graph_rewrite(&matcher, root, &mut ctx);
-    assert!(ordered.toposort().iter().any(|node| matches!(node.op(), Op::Wmma { c, .. }
+    assert!(ordered.toposort().iter().any(|node| matches!(node.op(), Op::Wmma(ops::Wmma { c, .. })
         if matches!(c.op(), Op::Binary(BinaryOp::Add, ..)))));
 }
 
@@ -120,10 +124,10 @@ fn reduce_lowers_to_an_accumulator_loop(reduce_op: ReduceOp, extent: i64) {
 
     let result = apply_pm_reduce(&reduce);
 
-    assert!(!matches!(result.op(), Op::Reduce { .. }), "REDUCE must be replaced by the accumulator pattern");
+    assert!(!matches!(result.op(), Op::Reduce(..)), "REDUCE must be replaced by the accumulator pattern");
     assert_eq!(result.dtype(), DType::Float32);
     assert!(
-        result.toposort().iter().any(|node| matches!(node.op(), Op::Buffer { arg, .. }
+        result.toposort().iter().any(|node| matches!(node.op(), Op::Buffer(ops::Buffer { arg, .. })
             if arg.addrspace == Some(svod_ir::AddrSpace::Reg) && arg.slot == 0)),
         "the first accumulator must use dense REG slot 0"
     );
@@ -135,7 +139,7 @@ fn test_reduce_multiple_ranges() {
     let ranges = vec![create_range_reduce(8, 0), create_range_reduce(4, 1)];
     let result = apply_pm_reduce(&create_reduce(create_float_const(1.0), ranges, ReduceOp::Add));
 
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
+    assert!(!matches!(result.op(), Op::Reduce(..)));
     assert!(count_define_regs(&result) > 0);
     assert!(count_ends(&result) > 0);
 }
@@ -150,7 +154,7 @@ fn test_reduce_over_load_lowers_to_an_accumulator() {
 
     let result = apply_pm_reduce(&load.reduce(smallvec![range], ReduceOp::Add));
 
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
+    assert!(!matches!(result.op(), Op::Reduce(..)));
     assert!(count_define_regs(&result) > 0);
 }
 
@@ -163,7 +167,7 @@ fn test_invalid_padded_lane_survives_reduction_removal() {
 
     let result = apply_pm_reduce(&reduce);
 
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
+    assert!(!matches!(result.op(), Op::Reduce(..)));
     assert!(
         result.any_in_subtree(UOp::is_invalid_marker),
         "reduction removal must preserve Invalid for the later gater"
@@ -177,10 +181,10 @@ fn test_reduce_shaped_to_scalar() {
 
     let result = apply_pm_reduce(&reduce);
 
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
+    assert!(!matches!(result.op(), Op::Reduce(..)));
     assert!(count_define_regs(&result) > 0);
     assert!(result.toposort().iter().any(|node| {
-        matches!(node.op(), Op::Index { buffer, indices } if Arc::ptr_eq(buffer, &src) && indices.len() == 1)
+        matches!(node.op(), Op::Index(ops::Index { buffer, indices }) if Arc::ptr_eq(buffer, &src) && indices.len() == 1)
     }));
 }
 
@@ -192,11 +196,14 @@ fn test_horizontal_reduce_no_ranges() {
 
     let result = apply_pm_reduce(&src.reduce_with_num_axes(smallvec![], ReduceOp::Add, 1));
 
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
+    assert!(!matches!(result.op(), Op::Reduce(..)));
     assert_eq!(count_define_regs(&result), 0, "a horizontal-only reduce needs no DEFINE_REG");
     assert_eq!(result.dtype(), DType::Float32);
     assert_eq!(
-        count_ops(&result, |node| matches!(node.op(), Op::Index { buffer, .. } if Arc::ptr_eq(buffer, &src))),
+        count_ops(
+            &result,
+            |node| matches!(node.op(), Op::Index(ops::Index { buffer, .. }) if Arc::ptr_eq(buffer, &src))
+        ),
         4
     );
 }
@@ -207,12 +214,12 @@ fn test_horizontal_reduce_uses_target_dtype() {
     let target_dtype = DType::BFloat16.vec(4).unwrap();
     let src = UOp::stack((0..4).map(|i| UOp::const_(source_dtype.clone(), ConstValue::Float(i as f64))).collect());
     let reduce = UOp::new(
-        Op::Reduce {
+        Op::Reduce(ops::Reduce {
             src: src.clone(),
             ranges: smallvec![create_range_reduce(16, 0)],
             reduce_op: ReduceOp::Add,
             num_axes: 1,
-        },
+        }),
         target_dtype.clone(),
     );
 
@@ -220,7 +227,7 @@ fn test_horizontal_reduce_uses_target_dtype() {
 
     assert_eq!(result.dtype(), target_dtype);
     for node in result.toposort() {
-        if let Op::Index { buffer, .. } = node.op()
+        if let Op::Index(ops::Index { buffer, .. }) = node.op()
             && Arc::ptr_eq(buffer, &src)
         {
             assert_eq!(node.dtype(), target_dtype);
@@ -229,7 +236,7 @@ fn test_horizontal_reduce_uses_target_dtype() {
             assert_eq!(lhs.dtype(), rhs.dtype());
         }
     }
-    assert!(!result.toposort().iter().any(|node| matches!(node.op(), Op::Cast { .. })));
+    assert!(!result.toposort().iter().any(|node| matches!(node.op(), Op::Cast(..))));
 }
 
 /// tinygrad puts every RANGE reachable from the source into `input_ranges`, whatever
@@ -252,6 +259,6 @@ fn input_ranges_accept_every_axis_type(outer: &[AxisType]) {
 
     let result = apply_pm_reduce(&reduce);
 
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
+    assert!(!matches!(result.op(), Op::Reduce(..)));
     assert!(count_define_regs(&result) > 0);
 }

@@ -569,7 +569,6 @@ Wmma {
 | `threads` | `usize` | प्रति warp threads (आमतौर पर 32) |
 | `upcast_axes` | `WmmaUpcastAxes` | प्रति-ऑपरेंड वेक्टराइज़ेशन (फ़ील्ड्स: `a`, `b`, `c`) |
 | `reduce_axes` | `Vec<(usize, usize)>` | कॉन्ट्रैक्शन axes |
-| `tile_grid` | `(usize, usize)` | मल्टी-FMA बैचिंग ग्रिड (डिफ़ॉल्ट (1,1)) |
 
 **उदाहरण:**
 ```mermaid

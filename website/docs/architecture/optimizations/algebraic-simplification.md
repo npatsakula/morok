@@ -17,7 +17,7 @@ Svod's symbolic simplifier rewrites UOp computation graphs using 140+ algebraic 
 
 **Range analysis**: Each UOp tracks the minimum (`vmin`) and maximum (`vmax`) values it can take at runtime, computed eagerly during node construction from its inputs' bounds. Many patterns use these bounds to prove conditions at compile time (e.g., "x is always non-negative" or "x < n for all values").
 
-**Notation**: `OP[a, b]` denotes a commutative pattern (both operand orderings tried). `OP(a, b)` is ordered. `@zero`/`@one`/`@const` match constant values. When the same variable name appears twice (e.g., `Idiv(x, x)`), both operands must be the same node (`Arc::ptr_eq` — i.e., structurally deduplicated via hash consing).
+**Notation**: `OP[a, b]` denotes a commutative pattern (both operand orderings tried). `OP(a, b)` is ordered. `@zero`/`@one`/`c @const(v)` match constant values. When the same variable name appears twice (e.g., `Idiv(x, x)`), both operands must be the same node (`Arc::ptr_eq` — i.e., structurally deduplicated via hash consing).
 
 **Tinygrad reference**: `tinygrad/uop/symbolic.py`, `tinygrad/uop/divandmod.py`
 

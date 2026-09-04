@@ -9,6 +9,7 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use svod_ir::UOp;
+use svod_ir::ops;
 use svod_ir::types::{BinaryOp, ConstValue};
 use svod_ir::uop::cached_property::CachedProperty;
 use svod_ir::uop::helpers::gcd;
@@ -198,7 +199,7 @@ pub(crate) fn fold_divmod_general(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> O
     }
 
     // A parameter that is a known multiple of a constant divisor is irreducible.
-    if let svod_ir::Op::Param { arg, .. } = x.op()
+    if let svod_ir::Op::Param(ops::Param { arg, .. }) = x.op()
         && let Some(multiple_of) = arg.multiple_of.and_then(|m| i64::try_from(m).ok())
         && let Some(c) = const_int(y).filter(|c| *c != 0)
         && multiple_of.checked_rem(c) == Some(0)
@@ -340,7 +341,7 @@ fn nest_by_factor(
             let Ok(high) = nested.try_mod(&outer).and_then(|rest| rest.try_mul(&divisor_uop)) else { continue };
             if low.is_empty() { high } else { high.try_add(&digit).ok()? }
         };
-        let cost = candidate.backward_slice_ids().len();
+        let cost = candidate.node_count();
         if best.as_ref().is_none_or(|(best_cost, _)| cost < *best_cost) {
             best = Some((cost, candidate));
         }

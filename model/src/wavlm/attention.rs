@@ -303,10 +303,10 @@ impl GatedRelPosAttention {
         let weights = weights.try_add(&attn_mask).context(TensorSnafu)?;
 
         // Py:467  weights = weights - weights.max(dim=-1, keepdim=True)[0]
-        let row_max = weights.max_with().axes(AxisSpec::Single(-1)).keepdim(true).call().context(TensorSnafu)?;
-        let weights = weights.try_sub(&row_max).context(TensorSnafu)?;
-
         // Py:469  weights = torch.nn.functional.softmax(weights, dim=-1)
+        // `softmax` subtracts the row max itself, and the reference's explicit
+        // subtraction changes nothing bit-for-bit: the row max of `x - m` is
+        // exactly 0, so it would only add a second (all-zero) reduce.
         let weights = weights.softmax(-1).context(TensorSnafu)?;
 
         // Py:472  output = weights @ v  # B, nH, L, Hd

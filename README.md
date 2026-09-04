@@ -61,13 +61,13 @@ use svod_schedule::patterns;
 
 let optimizer = patterns! {
     // Identity folding (commutative)
-    Add[x, @zero] ~> x,
-    Mul[x, @one] ~> x,
+    Add[x, @zero] => x,
+    Mul[x, @one] => x,
 
     // Constant folding
     for op in binary [Add, Mul, Sub] {
         op(a @const(av), _b @const(bv))
-          => |a, av, bv| eval_binary_op(op, av, bv).map(|r| UOp::const_(a.dtype(), r)),
+          => eval_binary_op(op, av, bv).map(|r| UOp::const_(a.dtype(), r)),
     },
 };
 ```
@@ -101,6 +101,12 @@ nix fmt # Format source files
 | libffi | >=3.4 | yes | Foreign function interface |
 | libxml2 | >=2.13 | yes | XML parsing |
 | Z3 | >=4.15 | no | SMT solver for optimization verification |
+
+### Threads
+
+`SVOD_THREADS` (default: host parallelism) is the single thread budget: it sizes
+the pool that compiles kernels and executes CPU kernels, and is the default
+`core_id` split of CPU kernels. `RAYON_NUM_THREADS` is not consulted.
 
 ## Test
 

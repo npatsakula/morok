@@ -7,6 +7,7 @@ use snafu::{OptionExt, ResultExt};
 use svod_device::Buffer;
 use svod_dtype::DType;
 use svod_dtype::ext::HasDType;
+use svod_ir::ops;
 use svod_ir::{CallInfo, ConstValue, ConstValueHash, DeviceSpec, Op, SInt, UOp, UOpKey, shape::Shape};
 
 /// Extract max value from an SInt for buffer allocation.
@@ -18,16 +19,16 @@ fn sint_vmax(s: &SInt) -> usize {
     match s {
         SInt::Const(v) => *v,
         SInt::Symbolic(uop) => match uop.op() {
-            Op::DefineVar { max_val, .. } => *max_val as usize,
-            Op::Param { arg, .. } if arg.addrspace.is_none() => arg
+            Op::DefineVar(ops::DefineVar { max_val, .. }) => *max_val as usize,
+            Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => arg
                 .vmin_vmax
                 .as_ref()
                 .and_then(|(_, max)| max.0.try_int())
                 .and_then(|max| usize::try_from(max).ok())
                 .unwrap_or(1),
-            Op::Bind { var, .. } => match var.op() {
-                Op::DefineVar { max_val, .. } => *max_val as usize,
-                Op::Param { arg, .. } if arg.addrspace.is_none() => arg
+            Op::Bind(ops::Bind { var, .. }) => match var.op() {
+                Op::DefineVar(ops::DefineVar { max_val, .. }) => *max_val as usize,
+                Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => arg
                     .vmin_vmax
                     .as_ref()
                     .and_then(|(_, max)| max.0.try_int())
@@ -804,7 +805,7 @@ impl Tensor {
 
         let assign_effect = target_uop.after(smallvec![target_uop.store(value_uop)]);
         let base = target_uop.base();
-        if matches!(base.op(), Op::Buffer { .. } | Op::After { .. })
+        if matches!(base.op(), Op::Buffer(..) | Op::After(..))
             && target_uop.id != base.id
             && !target_uop.has_buffer_identity()
         {
@@ -849,7 +850,7 @@ impl Tensor {
     /// ```
     pub fn contiguous(&self) -> Self {
         let uop = self.uop();
-        if matches!(uop.op(), svod_ir::Op::Contiguous { .. }) {
+        if matches!(uop.op(), svod_ir::Op::Contiguous(..)) {
             return self.clone();
         }
         let contiguous_uop = uop.contiguous();

@@ -38,17 +38,17 @@ Svod предоставляет предметно-ориентированны�
 ```rust
 patterns! {
     // Identity folding: x + 0 → x
-    Add[x, @zero] ~> |x| x.clone(),
+    Add[x, @zero] => x,
 
     // Constant folding: 3 + 4 → 7
-    Add(a @const(a_val), b @const(b_val))
-        => |a, a_val, b_val| eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
+    Add(a @const(a_val), _b @const(b_val))
+        => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 
     // Self-folding: x / x → 1
-    Idiv(x, x) ~> |x| UOp::one(x.dtype()),
+    Idiv(x, x) => UOp::one(x.dtype()),
 
     // Dead code elimination: if(true) { t } else { f } → t
-    Where(@true, t, _f) ~> |t| t.clone(),
+    Where(Const(ConstValue::Bool(true)), t, _f) => t,
 }
 ```
 
@@ -56,14 +56,13 @@ patterns! {
 
 | Синтаксис | Значение | Пример |
 |-----------|----------|--------|
-| `(x, y)` | **Упорядочено.** Сопоставляется в точном порядке. | `Sub(x, @zero) ~> x` |
-| `[x, y]` | **Коммутативно.** Пробуются оба порядка. | `Add[x, @zero] ~> x` |
-| `@zero` | **Нулевая константа.** Совпадает с 0 или 0.0. | `Mul[_, z @ @zero] ~> z` |
-| `@one` | **Единичная константа.** Совпадает с 1 или 1.0. | `Mul[x, @one] ~> x` |
-| `@const(val)` | **Извлечение константы.** Связывает значение. | `Add(@const(a), @const(b))` |
-| `x, x` | **Один и тот же операнд.** Автогенерируется проверка ptr_eq. | `Idiv(x, x) ~> UOp::one(...)` |
-| `~>` | **Безусловный.** Всегда успешен, возвращает `Arc<UOp>`. | `Add[x, @zero] ~> x` |
-| `=>` | **Условный.** Может не сработать, возвращает `Option<Arc<UOp>>`. | `=> eval(...).map(...)` |
+| `(x, y)` | **Упорядочено.** Сопоставляется в точном порядке. | `Sub(x, @zero) => x` |
+| `[x, y]` | **Коммутативно.** Пробуются оба порядка. | `Add[x, @zero] => x` |
+| `@zero` | **Нулевая константа.** Совпадает с 0 или 0.0. | `Mul[_, z @ @zero] => z` |
+| `@one` | **Единичная константа.** Совпадает с 1 или 1.0. | `Mul[x, @one] => x` |
+| `c @const(val)` | **Извлечение константы.** Связывает значение. | `Add(a @const(av), _b @const(bv))` |
+| `x, x` | **Один и тот же операнд.** Автогенерируется проверка ptr_eq. | `Idiv(x, x) => UOp::one(...)` |
+| `=>` | **Перезапись.** Возвращает `Arc<UOp>`, `Option<Arc<UOp>>` (`None` — отказ) или `RewriteResult`. | `=> eval(...).map(...)` |
 | `for op in binary [...]` | **Шаблон.** Генерация паттернов для нескольких операций. | См. ниже |
 | `@context Type` | **С состоянием.** Доступ к мутабельному контексту в паттернах. | См. ниже |
 
@@ -74,8 +73,8 @@ patterns! {
 ```rust
 patterns! {
     for op in binary [Add, Mul, Sub, Idiv, Fdiv, Max] {
-        op(a @const(a_val), b @const(b_val))
-            => |a, a_val, b_val| eval_binary(op, a_val, b_val)
+        op(a @const(a_val), _b @const(b_val))
+            => eval_binary(op, a_val, b_val)
                 .map(|r| UOp::const_(a.dtype(), r))
     }
 }
@@ -91,7 +90,7 @@ patterns! {
 patterns! {
     @context KernelContext;
 
-    ReduceAxis { src } => |reduce, src, ctx| {
+    reduce @ ReduceAxis { src, .. } => {
         ctx.record_reduction(reduce);
         transform_reduce(reduce, src, ctx)
     }
@@ -112,23 +111,25 @@ let mega_pass = symbolic().with_context::<PcontigConfig>()
 
 ## Как работает сопоставление паттернов
 
-Макрос `patterns!` генерирует `SimplifiedPatternMatcher`, который диспатчит паттерны в соответствующий бакет за **O(1)** через HashMap-поиск, а затем последовательно пробует каждый паттерн в бакете.
+Макрос `patterns!` компилирует блок в одну функцию, которая диспатчит по виду корневой операции через `match`, а затем пробует паттерны этого вида в порядке исходника.
 
 ### Индекс OpKey
 
 У каждого UOp есть тип операции (Add, Mul, Load и т.д.). Макрос генерирует enum `OpKey`, отображающий операции в хэшируемые ключи:
 
 ```rust
-pub struct SimplifiedPatternMatcher<C = ()> {
-    indexed: HashMap<OpKey, Vec<PatternClosure<C>>>,  // O(1) lookup
-    wildcards: Vec<PatternClosure<C>>,                 // patterns matching any op
+match OpKey::from_op(tree.op()).index() {
+    KEY_ADD => { /* rules rooted at Add, in source order */ }
+    KEY_MUL => { /* rules rooted at Mul */ }
+    _ => {}
 }
+// wildcard rules (`x if cond`) run as sequential steps between the matches
 ```
 
 При сопоставлении UOp:
 
 1. **Извлекаем OpKey** из операции UOp
-2. **Ищем** в HashMap — O(1)
+2. **Переходим** в ветку `match` этого вида
 3. **Пробуем каждое замыкание**, пока одно не сработает
 4. **Откатываемся** на wildcards, если ни один индексированный паттерн не совпал
 
@@ -203,7 +204,6 @@ flowchart TD
 ### Ограничения безопасности
 
 Для предотвращения бесконечных циклов:
-- **1000 итераций** максимум на узел
 - **500 000 итераций** максимум в сумме
 - Panic с диагностикой при превышении лимитов
 

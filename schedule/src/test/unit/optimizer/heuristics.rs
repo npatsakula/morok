@@ -6,9 +6,10 @@ use test_case::test_case;
 
 use crate::optimizer::config::{HeuristicsConfig, TcOpt};
 use crate::optimizer::heuristics::{
-    apply_default_upcast, apply_image_upcasts, apply_matvec_fast_path, try_tensor_cores,
+    apply_default_upcast, apply_heuristic_upcasts, apply_image_upcasts, apply_matvec_fast_path, try_tensor_cores,
 };
-use crate::optimizer::{OptOps, Renderer, Scheduler};
+use crate::optimizer::{Opt, OptOps, Renderer, Scheduler};
+use svod_ir::ops;
 
 fn create_matvec_like_pattern(rows: i64, cols: i64) -> Arc<UOp> {
     let row = UOp::range_axis(UOp::index_const(rows), AxisId::Renumbered(0), AxisType::Global);
@@ -66,7 +67,7 @@ fn test_apply_image_upcasts_non_stub_behavior(dtype: DType, expected: bool) {
     let g = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Global);
     let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![2usize.into(), 8usize.into(), 4usize.into()]);
     let arg = ParamArg::buffer(0, dtype.clone(), AddrSpace::Global, Some(DeviceSpec::Cpu));
-    let img = UOp::new(Op::Buffer { shape, arg }, dtype);
+    let img = UOp::new(Op::Buffer(ops::Buffer { shape, arg: arg.into() }), dtype);
     let indexed = UOp::index().buffer(img).indices(vec![g.clone()]).call().expect("image index should build");
     let sink = UOp::sink(vec![indexed, g]);
 
@@ -77,9 +78,6 @@ fn test_apply_image_upcasts_non_stub_behavior(dtype: DType, expected: bool) {
 
 #[test]
 fn test_try_tensor_cores_retries_axis_choices() {
-    // Use a non-AMX renderer so a successful trial commits — on AMX
-    // `try_tensor_cores` discards the TC'd copy (see
-    // `test_try_tensor_cores_amx_discards_trial`).
     let sink = create_tc_retry_pattern();
     let mut scheduler = Scheduler::new(sink, Renderer::metal());
 
@@ -89,24 +87,6 @@ fn test_try_tensor_cores_retries_axis_choices() {
 
     let tc_opt = scheduler.applied_opts.iter().find(|opt| opt.op == OptOps::TC).expect("TC opt should be recorded");
     assert_eq!(tc_opt.axis, Some(1), "retry should commit the passing axis choice");
-}
-
-#[test]
-fn test_try_tensor_cores_amx_discards_trial() {
-    // On AMX, even when TC would apply successfully, the trial copy is
-    // discarded so the heuristic falls through to the regular
-    // UPCAST/THREAD/LOCAL chain on the untouched scheduler.
-    let sink = create_tc_retry_pattern();
-    let mut scheduler = Scheduler::new(sink, Renderer::apple_amx());
-    let snapshot_opts_before = scheduler.applied_opts.clone();
-
-    let config = HeuristicsConfig::builder().tc_opt(TcOpt::Relaxed).build();
-    let applied = try_tensor_cores(&mut scheduler, &config);
-    assert!(!applied, "try_tensor_cores must return false on AMX (TC is intentionally discarded)");
-    assert_eq!(
-        scheduler.applied_opts, snapshot_opts_before,
-        "AMX path must leave the scheduler's applied_opts untouched (no TC commit)"
-    );
 }
 
 /// Elementwise SINK with one WEAK axis plus an optional extra axis of `extra`
@@ -156,4 +136,40 @@ fn default_upcast_picks_the_innermost_upcastable_axis() {
     assert!(apply_default_upcast(&mut scheduler));
     let opt = scheduler.applied_opts.iter().find(|opt| opt.op == OptOps::UPCAST).expect("UPCAST recorded");
     assert_eq!(opt.axis, Some(innermost));
+}
+
+/// Elementwise SINK over `axes` GLOBAL axes of extent `size`, summing `axes`
+/// row-major buffers; with `stride0`, buffer `i` skips axis `i`.
+fn create_stride0_pattern(axes: usize, size: i64, stride0: bool) -> Arc<UOp> {
+    let ranges: Vec<Arc<UOp>> =
+        (0..axes).map(|i| UOp::range_axis(UOp::index_const(size), AxisId::Renumbered(i), AxisType::Global)).collect();
+    let loads: Vec<Arc<UOp>> = (0..axes)
+        .map(|skip| {
+            let idx = ranges
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !(stride0 && *i == skip))
+                .map(|(i, rng)| rng.try_mul(&UOp::index_const(size.pow((axes - 1 - i) as u32))).expect("index mul"))
+                .reduce(|acc, term| acc.try_add(&term).expect("index add"))
+                .expect("at least one axis");
+            let buf = UOp::new_buffer(DeviceSpec::Cpu, size.pow(axes as u32) as usize, DType::Float32);
+            UOp::index().buffer(buf).indices(vec![idx]).call().expect("index should build")
+        })
+        .collect();
+    let sum = loads.into_iter().reduce(|acc, load| acc.try_add(&load).expect("add")).expect("one load");
+    UOp::sink(std::iter::once(sum).chain(ranges).collect())
+}
+
+/// The stride ranking picks, per round, the stride-0 axis with the fewest and
+/// smallest strides and the smaller of the amounts 3 and 4 that divide it,
+/// until the output shape drops below 1024 elements.
+#[test_case(3, 12, true, &[(2, 3)]; "innermost axis by stride sum, amount three first")]
+#[test_case(4, 8, true, &[(3, 4), (2, 4)]; "second round after the shape stays large")]
+#[test_case(3, 12, false, &[]; "no stride-0 buffer means no candidate")]
+fn heuristic_upcasts_rank_by_strides(axes: usize, size: i64, stride0: bool, expected: &[(usize, usize)]) {
+    let mut scheduler = Scheduler::new(create_stride0_pattern(axes, size, stride0), Renderer::cpu());
+
+    assert_eq!(apply_heuristic_upcasts(&mut scheduler), !expected.is_empty());
+    let expected: Vec<Opt> = expected.iter().map(|&(axis, amount)| Opt::upcast(axis, amount)).collect();
+    assert_eq!(scheduler.applied_opts, expected);
 }

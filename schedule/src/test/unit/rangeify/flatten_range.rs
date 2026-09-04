@@ -7,6 +7,7 @@ use svod_ir::{Op, UOp};
 use test_case::test_case;
 
 use crate::rangeify::transforms::{flatten_range_impl, flatten_ranges};
+use svod_ir::ops;
 
 fn range(end: i64, axis_id: usize) -> Arc<UOp> {
     UOp::range(UOp::index_const(end), axis_id)
@@ -38,7 +39,9 @@ fn a_range_expression_is_split_into_its_ranges() {
 
     let flattened = flatten_range_impl(&add.clone().end(smallvec![combined])).expect("the expression must flatten");
 
-    let Op::End { computation, ranges } = flattened.op() else { panic!("expected END, got {}", flattened.tree()) };
+    let Op::End(ops::End { computation, ranges }) = flattened.op() else {
+        panic!("expected END, got {}", flattened.tree())
+    };
     assert!(Arc::ptr_eq(computation, &add));
     assert_eq!(ranges.as_slice().len(), 2);
 }

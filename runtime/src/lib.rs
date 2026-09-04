@@ -35,6 +35,7 @@ pub mod jit_loader;
 pub mod kernel_cache;
 pub mod leveling;
 pub mod llvm;
+mod llvm_inprocess;
 pub mod object_cache;
 pub mod profiler;
 
@@ -45,7 +46,10 @@ pub use benchmark::{BenchmarkConfig, BenchmarkResult, benchmark_kernel, warmup_t
 pub use custom_function::run_custom_function;
 pub use device_registry::DEVICE_FACTORIES;
 pub use devices::{
-    cpu::{CpuBackend, cpu_device_with_backend, create_cpu_codegen, create_cpu_device, create_cpu_device_with_backend},
+    cpu::{
+        CpuBackend, cpu_device_with_backend, create_cpu_codegen, create_cpu_device, create_cpu_device_with_backend,
+        ensure_thread_pool,
+    },
     create_amd_codegen,
 };
 pub use error::*;

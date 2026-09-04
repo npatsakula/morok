@@ -8,6 +8,7 @@ use crate::rangeify::{
     IndexingContext,
     transforms::{transform_single_source, transform_sources_with_bufferize},
 };
+use svod_ir::ops;
 
 #[test]
 fn test_transform_buffer_source() {
@@ -32,8 +33,8 @@ fn test_transform_buffer_source() {
     assert_eq!(new_sources.len(), 2);
 
     // Both buffer sources should be wrapped in INDEX
-    assert!(matches!(new_sources[0].op(), Op::Index { .. }));
-    assert!(matches!(new_sources[1].op(), Op::Index { .. }));
+    assert!(matches!(new_sources[0].op(), Op::Index(..)));
+    assert!(matches!(new_sources[1].op(), Op::Index(..)));
 }
 
 #[test]
@@ -45,12 +46,12 @@ fn test_transform_realizable_source() {
 
     // Create ranges
     let range = UOp::new(
-        Op::Range {
+        Op::Range(ops::Range {
             end: UOp::index_const(5),
             axis_id: AxisId::Renumbered(0),
             axis_type: AxisType::Loop,
             deps: smallvec::SmallVec::new(),
-        },
+        }),
         DType::Index,
     );
 
@@ -64,8 +65,8 @@ fn test_transform_realizable_source() {
     let new_src = transform_single_source(&consumer, &x, std::slice::from_ref(&range), &mut ctx);
 
     // Should be INDEX(STAGE(x))
-    if let Op::Index { buffer, .. } = new_src.op() {
-        assert!(matches!(buffer.op(), Op::Stage { .. }));
+    if let Op::Index(ops::Index { buffer, .. }) = new_src.op() {
+        assert!(matches!(buffer.op(), Op::Stage(..)));
     } else {
         panic!("Expected INDEX operation");
     }
@@ -94,14 +95,15 @@ fn test_transform_movement_chain_on_buffer() {
 
     // RESHAPE(BUFFER) to 3x4 shape
     let reshape_shape = UOp::stack(vec![UOp::index_const(3), UOp::index_const(4)].into());
-    let reshape = UOp::new(Op::Reshape { src: buffer.clone(), new_shape: reshape_shape }, DType::Float32);
+    let reshape = UOp::new(Op::Reshape(ops::Reshape { src: buffer.clone(), new_shape: reshape_shape }), DType::Float32);
 
     assert!(reshape.op().is_movement(), "RESHAPE should be identified as movement op");
 
     // Create an ADD that uses the reshaped buffer
     let buffer2 = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
     let reshape_shape2 = UOp::stack(vec![UOp::index_const(3), UOp::index_const(4)].into());
-    let reshape2 = UOp::new(Op::Reshape { src: buffer2.clone(), new_shape: reshape_shape2 }, DType::Float32);
+    let reshape2 =
+        UOp::new(Op::Reshape(ops::Reshape { src: buffer2.clone(), new_shape: reshape_shape2 }), DType::Float32);
     let add = reshape.try_add(&reshape2).unwrap();
 
     // Set up context with ranges for add

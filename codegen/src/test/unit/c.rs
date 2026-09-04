@@ -2,10 +2,11 @@
 
 use smallvec::SmallVec;
 use svod_dtype::{AddrSpace, DType, DeviceSpec};
-use svod_ir::{AxisId, AxisType, ConstValue, Op, ParamArg, ReduceOp, UOp, WmmaMetadata, WmmaUpcastAxes};
+use svod_ir::{AxisId, AxisType, ConstValue, Op, ParamArg, ReduceOp, UOp};
 
 use crate::c::render;
 use crate::c::types::c_const;
+use svod_ir::ops;
 
 fn render_linearized(root: &std::sync::Arc<UOp>, name: Option<&str>) -> crate::Result<crate::RenderedKernel> {
     let linear = UOp::linear(svod_schedule::linearize_with_cfg(root.clone()).into());
@@ -14,30 +15,33 @@ fn render_linearized(root: &std::sync::Arc<UOp>, name: Option<&str>) -> crate::R
 
 fn concrete_range(end: i64, axis_type: AxisType) -> std::sync::Arc<UOp> {
     let end = UOp::const_(DType::Int32, ConstValue::Int(end));
-    UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type, deps: SmallVec::new() }, DType::Int32)
+    UOp::new(
+        Op::Range(ops::Range { end, axis_id: AxisId::Renumbered(0), axis_type, deps: SmallVec::new() }),
+        DType::Int32,
+    )
 }
 
 fn slotted_var(name: &str, slot: usize) -> std::sync::Arc<UOp> {
     let var = UOp::variable(name.to_string(), 0, 16, DType::Int32);
-    let Op::Param { shape, arg } = var.op() else { unreachable!() };
+    let Op::Param(ops::Param { shape, arg }) = var.op() else { unreachable!() };
     let mut arg = arg.clone();
     arg.slot = slot;
-    UOp::new(Op::Param { shape: shape.clone(), arg }, DType::Int32)
+    UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg }), DType::Int32)
 }
 
 fn volatile_param(slot: usize, size: usize) -> std::sync::Arc<UOp> {
     let mut arg = ParamArg::buffer(slot, DType::Float32, AddrSpace::Global, None);
     arg.volatile = true;
-    UOp::new(Op::Param { shape: UOp::index_const(size as i64), arg }, DType::Float32)
+    UOp::new(Op::Param(ops::Param { shape: UOp::index_const(size as i64), arg: arg.into() }), DType::Float32)
 }
 
 fn shrink4(src: std::sync::Arc<UOp>, dtype: DType) -> std::sync::Arc<UOp> {
     UOp::new(
-        Op::Shrink {
+        Op::Shrink(ops::Shrink {
             src,
             offsets: UOp::const_(DType::Int32, ConstValue::Int(0)),
             sizes: UOp::const_(DType::Int32, ConstValue::Int(4)),
-        },
+        }),
         dtype,
     )
 }
@@ -322,88 +326,6 @@ fn test_gated_load_emits_conditional_dereference() {
         "gated load should conditionally evaluate the dereference:\n{}",
         rendered.code
     );
-}
-
-/// AMX WMMA metadata for the `APPLE_AMX` TcConfig: 16×16×1 tiles over 256-wide
-/// upcast axes, single-threaded.
-fn amx_metadata(in_dtype: DType, tile_grid: (usize, usize)) -> WmmaMetadata {
-    let axes = || vec![(AxisId::Renumbered(2), 256)];
-    let suffix = if in_dtype == DType::Float32 { "float_float" } else { "half_float" };
-    WmmaMetadata {
-        name: format!("WMMA_16_16_1_{suffix}"),
-        dims: (16, 16, 1),
-        dtype_in: in_dtype,
-        dtype_out: DType::Float32,
-        device: svod_ir::RendererDevice::AppleAmx,
-        threads: 1,
-        upcast_axes: Some(WmmaUpcastAxes { a: axes(), b: axes(), c: axes() }),
-        reduce_axes: vec![],
-        tile_grid,
-    }
-}
-
-fn render_amx_wmma(metadata: WmmaMetadata) -> String {
-    let splat = |dtype: DType, lanes| UOp::const_(dtype, ConstValue::Float(0.0)).broadcast(lanes);
-    let a = splat(metadata.dtype_in.clone(), 16);
-    let b = splat(metadata.dtype_in.clone(), 16);
-    let c = splat(DType::Float32, 256);
-    let sink = UOp::sink(vec![UOp::wmma(a, b, c, metadata)]);
-    render_linearized(&sink, Some("test_wmma")).expect("C codegen failed").code
-}
-
-/// The AMX preamble: the instruction macros, the vector typedefs for the tile
-/// widths, and the static wrapper holding the ldx/ldy/ldz/fma/stz sequence.
-#[test]
-fn amx_wmma_emits_its_preamble_and_call() {
-    let code = render_amx_wmma(amx_metadata(DType::Float32, (1, 1)));
-
-    for needle in [
-        "#define AMX_SET",
-        "#define AMX(",
-        "typedef float float16",
-        "typedef float float256",
-        "static float256 __WMMA_16_16_1_float_float(float16 data1, float16 data2, float256 data0)",
-        "AMX_SET(0)", // init
-        "AMX_SET(1)", // finalize
-        "AMX(0,",     // ldx
-        "AMX(1,",     // ldy
-        "AMX(4,",     // ldz
-        "AMX(12,",    // fma32
-        "AMX(5,",     // stz
-        "__WMMA_16_16_1_float_float(",
-    ] {
-        assert!(code.contains(needle), "missing {needle}:\n{code}");
-    }
-    assert!(
-        code.lines().any(|line| line.trim_start().starts_with("float256 wmma") && line.contains(" = __WMMA")),
-        "WMMA result width was lost:\n{code}"
-    );
-}
-
-/// Bit 62 of the AMX operand word is overloaded: on FMA it selects mixed
-/// precision (f16 inputs, f32 accumulator), on LDX/LDY it selects load-pair.
-const AMX_BIT62: &str = "4611686018427387904ull";
-
-#[test]
-fn amx_wmma_mixed_precision_uses_fma16_with_the_widening_flag() {
-    let code = render_amx_wmma(amx_metadata(DType::Float16, (1, 1)));
-    assert!(code.contains("AMX(15,"), "missing fma16 opcode:\n{code}");
-    assert!(code.contains(AMX_BIT62), "missing mixed-precision bit 62:\n{code}");
-}
-
-#[test]
-fn amx_wmma_tile_grid_emits_load_pairs_and_one_fma_per_tile() {
-    let code = render_amx_wmma(amx_metadata(DType::Float32, (2, 2)));
-
-    assert!(code.contains(&format!("AMX(0, (int *)(&data2), {AMX_BIT62})")), "missing load-pair on LDX:\n{code}");
-    assert!(code.contains(&format!("AMX(1, (int *)(&data1), {AMX_BIT62})")), "missing load-pair on LDY:\n{code}");
-
-    // encoding = (z_row << 20) | (x_off << 10) | y_off, with x_off = tx * 64
-    // and y_off = ty * 64, one FMA per tile of the 2×2 grid.
-    assert_eq!(code.matches("AMX(12,").count(), 4, "expected one FMA per tile:\n{code}");
-    for (tile, encoding) in [((0, 0), 0u64), ((0, 1), 1_114_112), ((1, 0), 2_097_216), ((1, 1), 3_211_328)] {
-        assert!(code.contains(&format!("AMX(12, 0, {encoding}ull);")), "missing FMA for tile {tile:?}:\n{code}");
-    }
 }
 
 #[test]

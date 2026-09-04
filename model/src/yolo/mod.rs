@@ -15,7 +15,7 @@
 //! ## Recipe
 //!
 //! ```no_run
-//! use svod_model::yolo::{Yolo26Detect, YoloConfig, YoloScale, Yolo26DetectJit, postprocess};
+//! use svod_model::yolo::{Yolo26Detect, YoloConfig, YoloScale, Yolo26DetectJit, postprocess_raw};
 //! use svod_model::jit::InputSpec;
 //!
 //! let model = Yolo26Detect::from_hub("ultralytics/yolo26n",
@@ -25,8 +25,8 @@
 //! jit.prepare(InputSpec::f32(&[1, 3, 640, 640]))?;
 //! // copy NCHW image into jit.images_mut()?, then:
 //! jit.execute()?;
-//! let preds = jit.output()?;
-//! let detections = postprocess(&preds, 80, 300)?;
+//! let preds = jit.output()?.as_array::<f32>()?;
+//! let detections = postprocess_raw(preds.as_slice().unwrap(), preds.shape(), 80, 300)?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 

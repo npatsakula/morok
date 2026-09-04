@@ -46,8 +46,8 @@ accept only Tinygrad's `Target.device`; nonempty `renderer`, `arch`, `interface`
 or `indices` are rejected because Svod `DeviceSpec` cannot represent them.
 
 WMMA preserves the pinned common tuple: dimensions, input and accumulator
-dtypes, device, thread count, and A/B/C upcast axes. Svod-only WMMA `name`,
-`reduce_axes`, and `tile_grid` are not parity fields. CALL/FUNCTION preserves
+dtypes, device, thread count, and A/B/C upcast axes. Svod-only WMMA `name`
+and `reduce_axes` are not parity fields. CALL/FUNCTION preserves
 Tinygrad `aux` only when it is a sequence of strings; callable `grad_fxn` and
 Svod-only `grad_tag` are rejected. SINK preserves the common `name`,
 `opts_to_apply`, `applied_opts`, and `dont_use_locals`; nondefault

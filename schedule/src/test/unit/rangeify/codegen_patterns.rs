@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 
-use smallvec::SmallVec;
 use svod_ir::{ContiguousHint, UOp};
 use test_case::test_case;
 
@@ -27,7 +26,7 @@ fn hint(op: &str, axis: Option<usize>, arg: Option<i64>) -> ContiguousHint {
 #[test]
 fn contiguous_is_stripped_from_the_graph() {
     let tensor = UOp::native_const(42.0f32);
-    let opts = smallvec::smallvec![hint("LOCAL", Some(2), Some(8))];
+    let opts = vec![hint("LOCAL", Some(2), Some(8))];
 
     for wrapped in [tensor.contiguous(), tensor.contiguous_with_opts(opts)] {
         assert!(Arc::ptr_eq(&apply(wrapped).0, &tensor));
@@ -43,26 +42,26 @@ fn void_noops_and_plain_values_are_left_alone() {
     }
 }
 
-fn no_hints() -> SmallVec<[ContiguousHint; 4]> {
-    SmallVec::new()
+fn no_hints() -> Vec<ContiguousHint> {
+    Vec::new()
 }
 
-fn one_hint() -> SmallVec<[ContiguousHint; 4]> {
-    smallvec::smallvec![hint("UPCAST", Some(0), Some(4))]
+fn one_hint() -> Vec<ContiguousHint> {
+    vec![hint("UPCAST", Some(0), Some(4))]
 }
 
 /// An opt with no axis, e.g. NOLOCALS.
-fn axisless_hint() -> SmallVec<[ContiguousHint; 4]> {
-    smallvec::smallvec![hint("NOLOCALS", None, None)]
+fn axisless_hint() -> Vec<ContiguousHint> {
+    vec![hint("NOLOCALS", None, None)]
 }
 
-fn mixed_hints() -> SmallVec<[ContiguousHint; 4]> {
-    smallvec::smallvec![hint("UPCAST", Some(0), Some(4)), hint("UNROLL", Some(1), Some(4))]
+fn mixed_hints() -> Vec<ContiguousHint> {
+    vec![hint("UPCAST", Some(0), Some(4)), hint("UNROLL", Some(1), Some(4))]
 }
 
 /// tinygrad's `test_upcast_01_unroll_01`.
-fn four_hints() -> SmallVec<[ContiguousHint; 4]> {
-    smallvec::smallvec![
+fn four_hints() -> Vec<ContiguousHint> {
+    vec![
         hint("UPCAST", Some(0), Some(4)),
         hint("UPCAST", Some(1), Some(4)),
         hint("UNROLL", Some(0), Some(4)),
@@ -76,7 +75,7 @@ fn four_hints() -> SmallVec<[ContiguousHint; 4]> {
 #[test_case(super::axisless_hint ; "hint without an axis")]
 #[test_case(super::mixed_hints ; "upcast and unroll")]
 #[test_case(super::four_hints ; "four hints")]
-fn contiguous_hints_are_collected_in_order(build: fn() -> SmallVec<[ContiguousHint; 4]>) {
+fn contiguous_hints_are_collected_in_order(build: fn() -> Vec<ContiguousHint>) {
     let hints = build();
     let (_result, ctx) = apply(UOp::native_const(1.0f32).contiguous_with_opts(hints.clone()));
     assert_eq!(ctx.opts.as_slice(), hints.as_slice());

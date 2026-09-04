@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use svod_ir::UOp;
 use svod_ir::op::Op;
+use svod_ir::ops;
 use svod_ir::uop::core::UOpKey;
 
 /// Control flow graph context for linearization.
@@ -83,7 +84,7 @@ impl CFGContext {
             });
 
             // RANGE and END add themselves
-            if matches!(node.op(), Op::Range { .. } | Op::End { .. }) {
+            if matches!(node.op(), Op::Range(..) | Op::End(..)) {
                 node_deps.insert(UOpKey(node.clone()), ());
             }
 
@@ -99,7 +100,7 @@ impl CFGContext {
         let mut nesting: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
         for node in &nodes {
-            if matches!(node.op(), Op::End { .. } | Op::Sink { .. })
+            if matches!(node.op(), Op::End(..) | Op::Sink(..))
                 && let Some(node_deps) = deps.get(&UOpKey(node.clone()))
             {
                 // Python dicts preserve the original topological insertion order.
@@ -109,7 +110,7 @@ impl CFGContext {
                         continue;
                     }
                     // Only consider END nodes
-                    if !matches!(dep_key.0.op(), Op::End { .. }) {
+                    if !matches!(dep_key.0.op(), Op::End(..)) {
                         continue;
                     }
 
@@ -124,9 +125,9 @@ impl CFGContext {
                     }
 
                     // Check nesting condition
-                    let is_nested = if matches!(node.op(), Op::Sink { .. }) {
+                    let is_nested = if matches!(node.op(), Op::Sink(..)) {
                         true
-                    } else if let Op::End { ranges, .. } = node.op() {
+                    } else if let Op::End(ops::End { ranges, .. }) = node.op() {
                         // Check if node's RANGE is in dep's dependencies
                         // node.src[1] in Tinygrad is the RANGE - we get it from ranges
                         if let Some(range) = ranges.first() {
@@ -173,12 +174,12 @@ impl CFGContext {
             // If parent is SINK: zip(order, order[1:])
             // If parent is END: zip([parent.src[1]] + order, order)
             //   where parent.src[1] is the parent's RANGE
-            let zipped: Vec<(Arc<UOp>, Arc<UOp>)> = if matches!(parent.0.op(), Op::Sink { .. }) {
+            let zipped: Vec<(Arc<UOp>, Arc<UOp>)> = if matches!(parent.0.op(), Op::Sink(..)) {
                 // Pair consecutive siblings
                 ordered.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect()
             } else {
                 // Get parent's RANGE
-                if let Op::End { ranges, .. } = parent.0.op() {
+                if let Op::End(ops::End { ranges, .. }) = parent.0.op() {
                     if let Some(parent_range) = ranges.first() {
                         // Pair: parent_range → first, then consecutive siblings
                         let mut pairs = vec![(parent_range.clone(), ordered[0].clone())];
@@ -195,13 +196,14 @@ impl CFGContext {
             // Create edges: y's RANGE → x (predecessor)
             for (x, y) in zipped {
                 // y is an END, get its RANGE from y.src[1] (or ranges field)
-                let y_range = if let Op::End { ranges, .. } = y.op() { ranges.first().cloned() } else { None };
+                let y_range =
+                    if let Op::End(ops::End { ranges, .. }) = y.op() { ranges.first().cloned() } else { None };
 
                 if let Some(range) = y_range {
                     // Tinygrad: assert y.src[1] not in x.backward_slice_with_self
                     // A cycle here indicates a malformed kernel structure.
                     assert!(
-                        !x.backward_slice_ids().contains(&range.id),
+                        !x.any_in_subtree(|n| n.id == range.id),
                         "CFGContext: edge would create cycle (range {} → predecessor {}). \
                          This indicates a malformed kernel — see Tinygrad linearizer.py:81",
                         range.id,

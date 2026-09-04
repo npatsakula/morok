@@ -13,6 +13,7 @@ use super::{Group, MoveIdx, iadd, idiv, idx_mul, imod, imul, lane_rc, wave_offse
 use crate::index::{Idx, cidx, flat_index, flat_offset, index_off, index_off_gated, load_at, load_off, load_off_gated};
 use crate::tile::{GL, RT, ST};
 use crate::tiles::TileLayout;
+use svod_ir::ops;
 
 /// Scalar geometry of the coalesced GLOBAL↔LDS fill for one ST tile (the part
 /// independent of the global source / tile position). Shared by the direct fill
@@ -408,7 +409,9 @@ impl<'k> Group<'k> {
                 let (srow, scol) = st.base.swizzle.swizzle_rc(row.clone(), col, st.base.base.cols, st.elem().base());
                 let didx = [Idx::Uop(height.clone()), Idx::Uop(width.clone()), Idx::Uop(srow), Idx::Uop(scol)];
                 let dst = st_index(&st, &didx);
-                let Op::Index { buffer, indices } = dst.op() else { unreachable!("st_index returns INDEX") };
+                let Op::Index(ops::Index { buffer, indices }) = dst.op() else {
+                    unreachable!("st_index returns INDEX")
+                };
                 let dst_base = indices[0].clone();
                 let dst_offsets = UOp::stack(
                     (0..sw)

@@ -42,7 +42,7 @@ fn a_multi_range_noop_stage_is_removed_but_reindexed() {
     let staged = UOp::stage_global(Arc::clone(&x), ranges.clone());
     let result = fold(UOp::index().buffer(staged).indices(ranges).call().expect("index"));
 
-    assert!(!result.toposort().iter().any(|n| matches!(n.op(), Op::Stage { .. })), "{}", result.tree());
+    assert!(!result.toposort().iter().any(|n| matches!(n.op(), Op::Stage(..))), "{}", result.tree());
     assert!(result.toposort().iter().any(|n| Arc::ptr_eq(n, &x)), "{}", result.tree());
 }
 

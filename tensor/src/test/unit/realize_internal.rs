@@ -828,3 +828,117 @@ fn buffers_expire_automatically_with_their_graphs() {
     drop(c);
     assert!(crate::tensor_registry::get_buffer(out_id).is_none(), "entry must expire with the tensor graph");
 }
+
+/// The `nK` name suffix is drawn from a process-wide counter as kernels are
+/// finished. A prepare fanned out over the global pool (`threads: 4`) must
+/// draw it in schedule order and reach the same kernel ABI as an inline one
+/// (`threads: 1`), or the object cache (keyed on source text) would miss on
+/// every run.
+#[test]
+fn test_parallel_prepare_names_kernels_in_schedule_order() {
+    const KERNELS: usize = 6;
+    // A length no other test reduces over keeps this shape name's counter ours.
+    const LEN: usize = 4099;
+
+    fn plan_kernels(offset: f32, threads: usize) -> Vec<(String, Vec<usize>)> {
+        let mut outputs: Vec<Tensor> = (0..KERNELS)
+            .map(|i| {
+                let x = Tensor::from_slice((0..LEN).map(|v| v as f32).collect::<Vec<_>>());
+                let scale = Tensor::full(&[LEN], offset + i as f32, DType::Float32).unwrap();
+                (&x * &scale).sum(0).unwrap()
+            })
+            .collect();
+        let config = PrepareConfig { threads, ..Default::default() };
+        let plan = Tensor::prepare_batch_with(outputs.iter_mut(), &config).unwrap();
+        plan.prepared_kernels().iter().map(|k| (k.kernel.entry_point.clone(), k.kernel.globals.clone())).collect()
+    }
+    // Position of a name in its shape family: `E_x` -> 0, `E_xn3` -> 3.
+    fn ordinal(name: &str) -> (&str, usize) {
+        match name.rsplit_once('n') {
+            Some((base, digits)) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
+                (base, digits.parse().unwrap())
+            }
+            _ => (name, 0),
+        }
+    }
+    fn assert_schedule_ordered(kernels: &[(String, Vec<usize>)]) -> HashMap<&str, usize> {
+        let mut last: HashMap<&str, usize> = HashMap::new();
+        for (name, _) in kernels {
+            let (base, position) = ordinal(name);
+            if let Some(previous) = last.insert(base, position) {
+                assert_eq!(position, previous + 1, "{name} drawn out of schedule order in {kernels:?}");
+            }
+        }
+        last
+    }
+
+    // Disjoint constants: a kernel shared with the serial run would be an
+    // optimizer-cache hit that keeps its earlier name.
+    let serial = plan_kernels(1.5, 1);
+    let parallel = plan_kernels(101.5, 4);
+    assert!(serial.len() >= KERNELS, "{serial:?}");
+    assert_eq!(serial.len(), parallel.len());
+    assert_schedule_ordered(&serial);
+    assert_schedule_ordered(&parallel);
+    for ((serial_name, serial_globals), (parallel_name, parallel_globals)) in serial.iter().zip(&parallel) {
+        assert_eq!(ordinal(serial_name).0, ordinal(parallel_name).0, "{serial:?} vs {parallel:?}");
+        assert_eq!(serial_globals, parallel_globals, "{serial_name}: ABI must not depend on threading");
+    }
+    // Every family continues exactly where the serial run left it.
+    let mut family_sizes: HashMap<&str, usize> = HashMap::new();
+    for (name, _) in &serial {
+        *family_sizes.entry(ordinal(name).0).or_default() += 1;
+    }
+    for ((serial_name, _), (parallel_name, _)) in serial.iter().zip(&parallel) {
+        let (base, serial_position) = ordinal(serial_name);
+        assert_eq!(ordinal(parallel_name).1, serial_position + family_sizes[base], "{serial:?} vs {parallel:?}");
+    }
+}
+
+/// A hand-lowered `out[0] = value` kernel site, optimized under exactly `opts`.
+fn constant_store_site(value: f32, opts: Vec<svod_ir::Opt>, config: &PrepareConfig) -> KernelSite {
+    let out = UOp::index()
+        .buffer(UOp::param(0, 1, DType::Float32, None))
+        .indices(vec![UOp::index_const(0)])
+        .call()
+        .expect("output index");
+    let body = UOp::sink_with_info(
+        vec![out.store(UOp::native_const(value))],
+        svod_ir::KernelInfo { opts_to_apply: Some(opts), ..Default::default() },
+    );
+    let item = crate::schedule::ScheduleItem {
+        kernel: body.call(SmallVec::new(), svod_ir::CallInfo::default()),
+        ast: body,
+        buffers: vec![],
+        buffer_uop_ids: vec![],
+        fixedvars: HashMap::new(),
+        dependencies: vec![],
+        instance_dependencies: vec![],
+        loop_var_names: HashSet::new(),
+    };
+    KernelSite::resolve(&item, config, optimizer_config_fingerprint(config)).expect("resolve kernel site")
+}
+
+/// One kernel failing to optimize must not cost the rest of the batch their
+/// names: the survivors are published (a retry hits the cache), the failed
+/// key is released unpublished, and its error is what the batch returns.
+#[test_case(0; "failing first")]
+#[test_case(1; "failing middle")]
+#[test_case(2; "failing last")]
+fn compile_missing_kernels_publishes_the_survivors_of_a_failed_optimize(failing: usize) {
+    let config = PrepareConfig { threads: 2, ..PrepareConfig::for_cpu_backend(crate::CpuBackend::Clang) };
+    let sites: Vec<_> = (0..3)
+        .map(|i| {
+            // The kernel has no unrollable axis, so UNROLL is rejected.
+            let opts = if i == failing { vec![svod_ir::Opt::unroll(0, 4)] } else { vec![] };
+            Some(constant_store_site(1000.0 + (failing * 3 + i) as f32, opts, &config))
+        })
+        .collect();
+
+    let Err(err) = compile_missing_kernels(&sites, &config) else { panic!("a failed optimize fails the batch") };
+    assert!(matches!(err, crate::error::Error::Optimize { .. }), "{err}");
+    for (i, site) in sites.iter().flatten().enumerate() {
+        assert_eq!(site.cached().is_some(), i != failing, "kernel {i} published");
+        assert!(opt_flight().try_claim(site.key.clone()).is_some(), "kernel {i} still claimed");
+    }
+}

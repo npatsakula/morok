@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::ConstValue;
 
+use crate::ops;
 use crate::{Op, UOp};
 
 /// Check if a UOp is a zero constant.
@@ -45,7 +46,7 @@ pub fn try_const(uop: &Arc<UOp>) -> Option<&ConstValue> {
 /// Check if a UOp is a VConst (vector constant).
 #[inline]
 pub fn is_vconst(uop: &Arc<UOp>) -> bool {
-    matches!(uop.op(), Op::VConst { .. })
+    matches!(uop.op(), Op::VConst(..))
 }
 
 /// Check if a UOp is a pure constant tree (no buffer references).
@@ -57,15 +58,15 @@ pub fn is_vconst(uop: &Arc<UOp>) -> bool {
 #[inline]
 pub fn is_any_const(uop: &Arc<UOp>) -> bool {
     match uop.op() {
-        Op::Const(_) | Op::VConst { .. } => true,
-        Op::Cast { src, .. }
-        | Op::BitCast { src, .. }
-        | Op::Reshape { src, .. }
-        | Op::Expand { src, .. }
-        | Op::Shrink { src, .. }
-        | Op::Pad { src, .. }
-        | Op::Permute { src, .. }
-        | Op::Flip { src, .. } => is_any_const(src),
+        Op::Const(_) | Op::VConst(..) => true,
+        Op::Cast(ops::Cast { src, .. })
+        | Op::BitCast(ops::BitCast { src, .. })
+        | Op::Reshape(ops::Reshape { src, .. })
+        | Op::Expand(ops::Expand { src, .. })
+        | Op::Shrink(ops::Shrink { src, .. })
+        | Op::Pad(ops::Pad { src, .. })
+        | Op::Permute(ops::Permute { src, .. })
+        | Op::Flip(ops::Flip { src, .. }) => is_any_const(src),
         _ => false,
     }
 }
@@ -74,7 +75,7 @@ pub fn is_any_const(uop: &Arc<UOp>) -> bool {
 #[inline]
 pub fn try_vconst(uop: &Arc<UOp>) -> Option<&Vec<ConstValue>> {
     match uop.op() {
-        Op::VConst { values } => Some(values),
+        Op::VConst(ops::VConst { values }) => Some(values),
         _ => None,
     }
 }
@@ -84,7 +85,7 @@ pub fn try_vconst(uop: &Arc<UOp>) -> Option<&Vec<ConstValue>> {
 pub fn try_any_const_values(uop: &Arc<UOp>) -> Option<Vec<ConstValue>> {
     match uop.op() {
         Op::Const(cv) => Some(vec![cv.0]),
-        Op::VConst { values } => Some(values.clone()),
+        Op::VConst(ops::VConst { values }) => Some(values.clone()),
         _ => None,
     }
 }

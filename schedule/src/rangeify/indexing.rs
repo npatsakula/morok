@@ -11,6 +11,7 @@ use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, SInt, UOp, UOpKey};
 use tracing::{debug, info_span, instrument, trace};
 
 use crate::argsort;
+use svod_ir::ops;
 
 // ============================================================================
 // Context
@@ -46,7 +47,7 @@ impl IndexingContext {
     pub fn new_range(&mut self, size: &SInt, axistype: AxisType) -> Arc<UOp> {
         // If size is already a RANGE UOp, return it unchanged.
         if let SInt::Symbolic(u) = size
-            && matches!(u.op(), Op::Range { .. })
+            && matches!(u.op(), Op::Range(..))
         {
             return Arc::clone(u);
         }
@@ -229,7 +230,7 @@ pub fn run_rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, IndexingContex
     if transformed_sink
         .toposort_call_aware(false)
         .iter()
-        .any(|node| matches!(node.op(), Op::Pad { .. } | Op::ReduceAxis { .. }))
+        .any(|node| matches!(node.op(), Op::Pad(..) | Op::ReduceAxis(..)))
     {
         return Err(svod_ir::Error::SymbolicShapeUnsupported {
             operation: "rangeify left a high-level PAD/ReduceAxis in the kernel graph",
@@ -262,14 +263,14 @@ fn consumer_map_for_data_sources(sink: &Arc<UOp>) -> ConsumerMap {
 /// not consume tensor iteration ranges.
 pub(crate) fn data_sources(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     match uop.op() {
-        Op::Param { .. } | Op::Buffer { .. } | Op::Range { .. } | Op::Special { .. } | Op::Bind { .. } => Vec::new(),
+        Op::Param(..) | Op::Buffer(..) | Op::Range(..) | Op::Special(..) | Op::Bind(..) => Vec::new(),
         op if op.is_movement() => op.sources().first().cloned().into_iter().collect(),
-        Op::Index { buffer, .. } => vec![buffer.clone()],
-        Op::Slice { buffer, .. } => vec![buffer.clone()],
-        Op::Stage { compute, .. } => vec![compute.clone()],
-        Op::Reduce { src, .. } | Op::ReduceAxis { src, .. } => vec![src.clone()],
-        Op::After { passthrough, .. } => vec![passthrough.clone()],
-        Op::End { computation, .. } => vec![computation.clone()],
+        Op::Index(ops::Index { buffer, .. }) => vec![buffer.clone()],
+        Op::Slice(ops::Slice { buffer, .. }) => vec![buffer.clone()],
+        Op::Stage(ops::Stage { compute, .. }) => vec![compute.clone()],
+        Op::Reduce(ops::Reduce { src, .. }) | Op::ReduceAxis(ops::ReduceAxis { src, .. }) => vec![src.clone()],
+        Op::After(ops::After { passthrough, .. }) => vec![passthrough.clone()],
+        Op::End(ops::End { computation, .. }) => vec![computation.clone()],
         _ => uop.op().sources().into_iter().collect(),
     }
 }
@@ -347,10 +348,10 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
         // reads its inputs through PARAM slots, so each one must already be a
         // buffer — and must stay one, hence non-removable.
         _c @ Call { body, args, info: _ }
-            if matches!(body.op(), Op::Sink { .. } | Op::Program { .. }) => |_c, args, ctx| {
+            if matches!(body.op(), Op::Sink(..) | Op::Program(..)) => {
             for arg in args {
                 let mut src = Arc::clone(arg);
-                while let Op::Reshape { src: inner, .. } = src.op() {
+                while let Op::Reshape(ops::Reshape { src: inner, .. }) = src.op() {
                     src = Arc::clone(inner);
                 }
                 if !is_always_contiguous(&src) {
@@ -364,27 +365,28 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
         // same base buffer (WAR hazard: without the temp, overlapping
         // self-assigns can read a value that an earlier loop iteration
         // already overwrote).
-        x @ Store { index, value } => |x, index, value, ctx| {
+        x @ Store { index, value } => {
             ctx.mark_realize_pending(x);
             // `realize_store_after_src` (indexing.py:37-40): a SLICE that is the
             // direct source of the STORE needs no buffer of its own — the store
             // target already is the output. A movement op on the destination
             // means the two do not line up, so the SLICE keeps its buffer.
-            if matches!(value.op(), Op::Slice { .. })
+            if matches!(value.op(), Op::Slice(..))
                 && ctx.should_realize(value)
                 && !index.any_in_subtree(|n| {
-                    matches!(n.op(), Op::Shrink { .. } | Op::Permute { .. } | Op::Flip { .. } | Op::Pad { .. })
+                    matches!(n.op(), Op::Shrink(..) | Op::Permute(..) | Op::Flip(..) | Op::Pad(..))
                 })
             {
                 ctx.clear_realize(value);
             }
-            if value.backward_slice_ids().contains(&index.base().id) {
+            let index_base = index.base().id;
+            if value.any_in_subtree(|n| n.id == index_base) {
                 ctx.mark_realize_non_removable(value);
             }
             None
         },
-        x @ Contiguous { src: _ } => |x, ctx| { ctx.mark_realize_all(x).ok(); None },
-        x @ Copy { src, .. } => |x, src, ctx| {
+        x @ Contiguous { src: _ } => { ctx.mark_realize_all(x).ok(); None },
+        x @ Copy { src, .. } => {
             ctx.mark_realize_all(x).ok();
             if !is_always_contiguous(&src.base()) {
                 ctx.mark_realize_all(src).ok();
@@ -392,7 +394,7 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
             None
         },
         // MStack/MSelect → realize sources
-        x @ MStack { buffers: _ } => |x, ctx| {
+        x @ MStack { buffers: _ } => {
             for src in x.op().sources() {
                 // realize_srcs: guard on src.base.op, realize src.
                 if !is_always_contiguous(&src.base()) {
@@ -401,7 +403,7 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
             }
             None
         },
-        x @ MSelect { device_index: _ } => |x, ctx| {
+        x @ MSelect { device_index: _ } => {
             for src in x.op().sources() {
                 // realize_srcs: guard on src.base.op, realize src.
                 if !is_always_contiguous(&src.base()) {
@@ -421,18 +423,18 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
 pub(crate) fn is_always_contiguous(uop: &Arc<UOp>) -> bool {
     matches!(
         uop.op(),
-        Op::Contiguous { .. }
-            | Op::After { .. }
-            | Op::Buffer { .. }
-            | Op::Slice { .. }
+        Op::Contiguous(..)
+            | Op::After(..)
+            | Op::Buffer(..)
+            | Op::Slice(..)
             | Op::Const(_)
-            | Op::Bind { .. }
-            | Op::MSelect { .. }
-            | Op::MStack { .. }
-            | Op::Param { .. }
-            | Op::Load { .. }
-            | Op::Call { .. }
-            | Op::Function { .. }
+            | Op::Bind(..)
+            | Op::MSelect(..)
+            | Op::MStack(..)
+            | Op::Param(..)
+            | Op::Load(..)
+            | Op::Call(..)
+            | Op::Function(..)
     )
 }
 
@@ -561,12 +563,7 @@ fn assign_ranges(
         // Skip callable boundaries, AFTER, and MSTACK/MSELECT during range assignment.
         if matches!(
             x.op(),
-            Op::Call { .. }
-                | Op::Function { .. }
-                | Op::Linear { .. }
-                | Op::After { .. }
-                | Op::MStack { .. }
-                | Op::MSelect { .. }
+            Op::Call(..) | Op::Function(..) | Op::Linear(..) | Op::After(..) | Op::MStack(..) | Op::MSelect(..)
         ) {
             continue;
         }
@@ -602,7 +599,7 @@ fn assign_ranges(
         // `ended` / `broadcast_ending_ranges` (indexing.py:221-223), plus the
         // "fusion decision: REDUCE before the broadcast" row at :225.
         let broadcast_ending = broadcast_ending_ranges(x, &consumers, ctx);
-        if matches!(x.op(), Op::Reduce { .. }) {
+        if matches!(x.op(), Op::Reduce(..)) {
             inherited_ending.extend(broadcast_ending.iter().cloned());
         }
         ending_ranges.insert(UOpKey(x.clone()), inherited_ending);
@@ -611,7 +608,7 @@ fn assign_ranges(
             // Realized op: create fresh ranges for all dimensions.
             // CONTIGUOUS, COPY, STORE, and ops marked by ending_ranges all land here.
             let shape = match x.op() {
-                Op::Store { index, .. } => {
+                Op::Store(ops::Store { index, .. }) => {
                     let s = index.shape()?.cloned();
                     // STORE without an inferable index shape is ill-formed —
                     // fall-through would leak unrealized stores into later
@@ -656,14 +653,14 @@ fn assign_ranges(
         if !ending.is_empty() {
             debug!(
                 ending_count = ending.len(),
-                triggers_realization = matches!(x.op(), Op::Reduce { .. }) || is_elementwise_op(x),
+                triggers_realization = matches!(x.op(), Op::Reduce(..)) || is_elementwise_op(x),
                 "Ending ranges detected (pre-in_rngs check)"
             );
         }
         // Use ending ranges directly without filtering (matches upstream behavior).
         let filtered_ending = ending.clone();
 
-        if !filtered_ending.is_empty() && (matches!(x.op(), Op::Reduce { .. }) || is_elementwise_op(x)) {
+        if !filtered_ending.is_empty() && (matches!(x.op(), Op::Reduce(..)) || is_elementwise_op(x)) {
             if let Some(shape) = x.shape().ok().flatten() {
                 // Start with existing realize_axes (from merge_consumer_ranges)
                 let mut realize_axes: Vec<usize> = ctx.get_realize_axes(x).cloned().unwrap_or_default();
@@ -725,12 +722,12 @@ fn assign_ranges(
 
         // NOW compute in_rngs from the FINAL out_rngs (after any realization updates)
         let in_rngs = match x.op() {
-            Op::Reshape { src, .. }
-            | Op::Permute { src, .. }
-            | Op::Expand { src, .. }
-            | Op::Pad { src, .. }
-            | Op::Shrink { src, .. }
-            | Op::Flip { src, .. } => {
+            Op::Reshape(ops::Reshape { src, .. })
+            | Op::Permute(ops::Permute { src, .. })
+            | Op::Expand(ops::Expand { src, .. })
+            | Op::Pad(ops::Pad { src, .. })
+            | Op::Shrink(ops::Shrink { src, .. })
+            | Op::Flip(ops::Flip { src, .. }) => {
                 if let Some(in_shape) = src.shape()? {
                     apply_movement_op(x.op(), in_shape, &out_rngs)
                 } else {
@@ -738,8 +735,8 @@ fn assign_ranges(
                 }
             }
             // STACK prepends a selection axis; its sources live one axis below.
-            Op::Stack { .. } => out_rngs.iter().skip(1).cloned().collect(),
-            Op::Reduce { src, num_axes, .. } if *num_axes > 0 => {
+            Op::Stack(..) => out_rngs.iter().skip(1).cloned().collect(),
+            Op::Reduce(ops::Reduce { src, num_axes, .. }) if *num_axes > 0 => {
                 if let Some(in_shape) = src.shape()? {
                     if tracing::enabled!(tracing::Level::TRACE) {
                         let out_shape = x.shape()?;
@@ -768,11 +765,11 @@ fn assign_ranges(
 
         // EXPAND marks ranges as ending when broadcasting to static dimensions
         // "if the EXPAND is used to inject a range, we don't mark it as ending_ranges. otherwise we do."
-        if let Op::Expand { new_shape, .. } = x.op() {
+        if let Op::Expand(ops::Expand { new_shape, .. }) = x.op() {
             // Check if new_shape is all static (no RANGE ops being injected in the shape)
             let shape_is_static = extract_shape_from_uop(new_shape).iter().all(|s| match s {
                 SInt::Const(_) | SInt::Infer => true,
-                SInt::Symbolic(uop) => !matches!(uop.op(), Op::Range { .. }),
+                SInt::Symbolic(uop) => !matches!(uop.op(), Op::Range(..)),
             });
 
             debug!(
@@ -822,8 +819,8 @@ fn assign_ranges(
 /// Transform ranges through a movement op (SHRINK, PERMUTE, FLIP, EXPAND, PAD, RESHAPE).
 fn movement_key(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> MovementKey {
     let arg = match op {
-        Op::Permute { axes, .. } => tuple_key(axes.iter().map(|&a| UOp::index_const(a as i64)).collect()),
-        Op::Flip { axes, .. } => tuple_key(axes.iter().map(|&f| UOp::index_const(i64::from(f))).collect()),
+        Op::Permute(ops::Permute { axes, .. }) => tuple_key(axes.iter().map(|&a| UOp::index_const(a as i64)).collect()),
+        Op::Flip(ops::Flip { axes, .. }) => tuple_key(axes.iter().map(|&f| UOp::index_const(i64::from(f))).collect()),
         // Every other movement arg is itself a UOp source behind the moved one.
         _ => tuple_key(op.sources().iter().skip(1).cloned().collect()),
     };
@@ -836,7 +833,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
 
 fn apply_movement_op_uncached(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
     match op {
-        Op::Shrink { offsets, .. } => {
+        Op::Shrink(ops::Shrink { offsets, .. }) => {
             // Matches upstream:
             // case Ops.SHRINK: rngs = tuple(a if ss == 0 else a+ss for a,(ss,_) in zip(rngs, arg))
             let begin_uops = extract_shape_uops(offsets);
@@ -853,12 +850,12 @@ fn apply_movement_op_uncached(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> 
                 .collect()
         }
 
-        Op::Permute { axes, .. } => {
+        Op::Permute(ops::Permute { axes, .. }) => {
             let inv_perm = argsort(axes);
             inv_perm.iter().map(|&i| Arc::clone(&rngs[i])).collect()
         }
 
-        Op::Flip { axes: flips, .. } => rngs
+        Op::Flip(ops::Flip { axes: flips, .. }) => rngs
             .iter()
             .zip(in_shape.iter())
             .zip(flips.iter())
@@ -873,7 +870,7 @@ fn apply_movement_op_uncached(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> 
             })
             .collect(),
 
-        Op::Expand { new_shape, .. } => {
+        Op::Expand(ops::Expand { new_shape, .. }) => {
             let new_shape_vals = extract_shape_from_uop(new_shape);
 
             // When rngs.len() < new_shape_vals.len(), pad from the left with CONST(0)
@@ -918,7 +915,7 @@ fn apply_movement_op_uncached(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> 
                 .collect()
         }
 
-        Op::Pad { begin_pads, end_pads, .. } => {
+        Op::Pad(ops::Pad { begin_pads, end_pads, .. }) => {
             let begin_uops = extract_shape_uops(begin_pads);
             let end_uops = extract_shape_uops(end_pads);
             rngs.iter()
@@ -945,7 +942,7 @@ fn apply_movement_op_uncached(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> 
                 .collect()
         }
 
-        Op::Reshape { new_shape, .. } => {
+        Op::Reshape(ops::Reshape { new_shape, .. }) => {
             let new_shape_vals = extract_shape_from_uop(new_shape);
 
             // Optimization: If in_shape == new_shape, this is a no-op reshape
@@ -1033,7 +1030,7 @@ fn apply_reshape_core(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<UOp>]) 
     });
     let simplified = graph_rewrite(&*RESHAPE_SIMPLIFY, UOp::sink(axes_out), &mut ());
     let result = match simplified.op() {
-        Op::Sink { sources, .. } => sources.iter().cloned().collect(),
+        Op::Sink(ops::Sink { sources, .. }) => sources.iter().cloned().collect(),
         _ => vec![simplified],
     };
     RESHAPE_CACHE.lock().expect("movement cache poisoned").insert(key, result.clone());
@@ -1059,7 +1056,7 @@ fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp
     let mut reverse_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     let mut reverse_axis_map: HashMap<usize, Arc<UOp>> = HashMap::new();
     for (i, r) in ranges_in_expr.iter().enumerate() {
-        let Op::Range { end, .. } = r.op() else { continue };
+        let Op::Range(ops::Range { end, .. }) = r.op() else { continue };
         let placeholder = UOp::range_axis(end.clone(), AxisId::Renumbered(i), AxisType::Placeholder);
         sub_map.insert(UOpKey(r.clone()), placeholder.clone());
         reverse_map.insert(UOpKey(placeholder), r.clone());
@@ -1072,7 +1069,7 @@ fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp
 
     let canonical_sink = sink.substitute(&sub_map);
     let canonical_rngs: Vec<Arc<UOp>> = match canonical_sink.op() {
-        Op::Sink { sources, .. } => sources.iter().cloned().collect(),
+        Op::Sink(ops::Sink { sources, .. }) => sources.iter().cloned().collect(),
         _ => vec![canonical_sink],
     };
 
@@ -1081,7 +1078,7 @@ fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp
     let result_sink = UOp::sink(result);
     let restored = result_sink.substitute(&reverse_map);
     let mut output: Vec<Arc<UOp>> = match restored.op() {
-        Op::Sink { sources, .. } => sources.iter().cloned().collect(),
+        Op::Sink(ops::Sink { sources, .. }) => sources.iter().cloned().collect(),
         _ => vec![restored],
     };
 
@@ -1089,7 +1086,7 @@ fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp
     // reverse_map can miss restoration. Recover by axis id.
     let mut axis_restore_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     for r in UOp::sink(output.clone()).ranges().iter() {
-        if let Op::Range { axis_id: AxisId::Renumbered(i), axis_type: AxisType::Placeholder, .. } = r.op()
+        if let Op::Range(ops::Range { axis_id: AxisId::Renumbered(i), axis_type: AxisType::Placeholder, .. }) = r.op()
             && let Some(orig) = reverse_axis_map.get(i)
         {
             axis_restore_map.insert(UOpKey(r.clone()), orig.clone());
@@ -1098,7 +1095,7 @@ fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp
     if !axis_restore_map.is_empty() {
         let axis_restored = UOp::sink(output).substitute(&axis_restore_map);
         output = match axis_restored.op() {
-            Op::Sink { sources, .. } => sources.iter().cloned().collect(),
+            Op::Sink(ops::Sink { sources, .. }) => sources.iter().cloned().collect(),
             _ => vec![axis_restored],
         };
     }
@@ -1109,7 +1106,7 @@ fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp
             r.ranges()
                 .into_iter()
                 .filter(|rng| scope.contains(&rng.id))
-                .any(|rng| matches!(rng.op(), Op::Range { axis_type: AxisType::Placeholder, .. }))
+                .any(|rng| matches!(rng.op(), Op::Range(ops::Range { axis_type: AxisType::Placeholder, .. })))
         }),
         "Placeholder-typed ranges leaked into output"
     );
@@ -1127,10 +1124,10 @@ fn is_const_zero(uop: &Arc<UOp>) -> bool {
 /// Matches upstream `marg` which extracts via `sgep`.
 fn extract_shape_uops(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     match uop.op() {
-        Op::Cast { src, .. } | Op::BitCast { src, .. } => extract_shape_uops(src),
-        Op::Stack { sources } => sources.to_vec(),
+        Op::Cast(ops::Cast { src, .. }) | Op::BitCast(ops::BitCast { src, .. }) => extract_shape_uops(src),
+        Op::Stack(ops::Stack { sources }) => sources.to_vec(),
         Op::Const(_) => vec![uop.clone()],
-        Op::VConst { values } => values
+        Op::VConst(ops::VConst { values }) => values
             .iter()
             .map(|cv| match cv {
                 ConstValue::Int(n) => UOp::index_const(*n),
@@ -1146,8 +1143,8 @@ fn extract_shape_uops(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
 /// Extract shape from a UOp (for RESHAPE new_shape, EXPAND new_shape).
 fn extract_shape_from_uop(uop: &Arc<UOp>) -> Vec<SInt> {
     match uop.op() {
-        Op::Cast { src, .. } | Op::BitCast { src, .. } => extract_shape_from_uop(src),
-        Op::Stack { sources } => sources
+        Op::Cast(ops::Cast { src, .. }) | Op::BitCast(ops::BitCast { src, .. }) => extract_shape_from_uop(src),
+        Op::Stack(ops::Stack { sources }) => sources
             .iter()
             .map(|source| match source.op() {
                 Op::Const(cv) => match cv.0 {
@@ -1163,8 +1160,8 @@ fn extract_shape_from_uop(uop: &Arc<UOp>) -> Vec<SInt> {
             _ => panic!("Expected int constant for shape"),
         },
         // VConst with empty values = scalar (0-d tensor)
-        Op::VConst { values } if values.is_empty() => vec![],
-        Op::VConst { values } => values
+        Op::VConst(ops::VConst { values }) if values.is_empty() => vec![],
+        Op::VConst(ops::VConst { values }) => values
             .iter()
             .map(|cv| match cv {
                 ConstValue::Int(n) => SInt::Const(*n as usize),
@@ -1197,7 +1194,7 @@ pub fn all_ranges_same(ranges: &[Arc<UOp>]) -> bool {
 
 /// Check if range is dead (size ≤ 1). Uses vmax analysis.
 pub fn is_dead_axis(range: &Arc<UOp>) -> bool {
-    if !matches!(range.op(), Op::Range { .. }) {
+    if !matches!(range.op(), Op::Range(..)) {
         return false;
     }
     match range.vmax() {
@@ -1217,7 +1214,7 @@ pub fn no_range(uop: &Arc<UOp>) -> bool {
 
 /// Extract RANGE size as i64. Returns None for symbolic ranges.
 pub fn range_size_as_i64(range: &Arc<UOp>) -> Option<i64> {
-    if let Op::Range { end, .. } = range.op() {
+    if let Op::Range(ops::Range { end, .. }) = range.op() {
         match end.op() {
             Op::Const(cv) => match cv.0 {
                 ConstValue::Int(n) => Some(n),
@@ -1287,7 +1284,7 @@ fn collect_ranges_from_uop(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     let mut seen = HashSet::new();
 
     for node in uop.toposort() {
-        if matches!(node.op(), Op::Range { .. }) {
+        if matches!(node.op(), Op::Range(..)) {
             let key = UOpKey(Arc::clone(&node));
             if seen.insert(key) {
                 ranges.push(node);
@@ -1299,5 +1296,5 @@ fn collect_ranges_from_uop(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
 
 /// Check if UOp is an elementwise operation (matches upstream GroupOp.Elementwise).
 fn is_elementwise_op(uop: &Arc<UOp>) -> bool {
-    matches!(uop.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::Cast { .. } | Op::BitCast { .. })
+    matches!(uop.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::Cast(..) | Op::BitCast(..))
 }

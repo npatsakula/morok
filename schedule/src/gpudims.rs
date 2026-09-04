@@ -31,20 +31,31 @@ use svod_ir::{Op, UOp, UOpKey};
 
 use crate::optimizer::Renderer;
 use crate::pattern::TypedPatternMatcher;
+use svod_ir::ops;
+
+/// Device limits plus the SINK this pass already lowered. The engine re-matches
+/// a rewritten SINK; when every GPU range was substituted, that second visit can
+/// only return `None`, so it skips the second full-graph analysis.
+pub struct GpuDimsContext {
+    renderer: Renderer,
+    lowered: Option<u64>,
+}
+
+impl From<Renderer> for GpuDimsContext {
+    fn from(renderer: Renderer) -> Self {
+        Self { renderer, lowered: None }
+    }
+}
 
 /// Pattern matcher for GPU dimension injection.
 ///
 /// Matches SINK operations and transforms GLOBAL/LOCAL ranges to SPECIAL ops.
 /// Must run after pm_reduce and before pm_add_loads.
-///
-/// # Context
-///
-/// Requires `&Renderer` context to access device limits (global_max, local_max).
-pub fn pm_add_gpudims() -> TypedPatternMatcher<Renderer> {
+pub fn pm_add_gpudims() -> TypedPatternMatcher<GpuDimsContext> {
     crate::patterns! {
-        @context Renderer;
+        @context GpuDimsContext;
         // add gpudims must be last
-        sink @ Sink { sources: _sources } => |sink| add_gpudims(ctx, sink),
+        sink @ Sink { sources: _sources } => add_gpudims(ctx, sink),
     }
 }
 
@@ -54,15 +65,15 @@ pub fn pm_lower_device_ranges() -> TypedPatternMatcher {
     crate::patterns! {
         // DEVICE is bound at launch, not dispatched as a program axis.
         range @ Range { end: _, axis_id: _, axis_type }
-            if *axis_type == AxisType::Device => |range| lower_device_range(range),
+            if *axis_type == AxisType::Device => lower_device_range(range),
         // A lowered DEVICE PARAM is not a loop and must not be closed by END.
         end @ End { computation: _, ranges }
-            if ranges.iter().any(is_device_num) => |end| cleanup_device_end(end),
+            if ranges.iter().any(is_device_num) => cleanup_device_end(end),
     }
 }
 
 fn is_device_num(uop: &Arc<UOp>) -> bool {
-    matches!(uop.op(), Op::Param { arg, .. } if arg.name.as_deref() == Some("_device_num"))
+    matches!(uop.op(), Op::Param(ops::Param { arg, .. }) if arg.name.as_deref() == Some("_device_num"))
 }
 
 fn lower_device_range(range: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -70,12 +81,12 @@ fn lower_device_range(range: &Arc<UOp>) -> Option<Arc<UOp>> {
 }
 
 fn cleanup_device_end(end: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::End { computation, ranges } = end.op() else { return None };
+    let Op::End(ops::End { computation, ranges }) = end.op() else { return None };
     Some(UOp::new(
-        Op::End {
+        Op::End(ops::End {
             computation: computation.clone(),
-            ranges: ranges.iter().filter(|uop| !matches!(uop.op(), Op::Param { .. })).cloned().collect(),
-        },
+            ranges: ranges.iter().filter(|uop| !matches!(uop.op(), Op::Param(..))).cloned().collect(),
+        }),
         end.dtype(),
     ))
 }
@@ -88,16 +99,20 @@ fn cleanup_device_end(end: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// 3. Categorize ranges by axis type (GLOBAL/THREAD vs LOCAL/WARP/GROUP_REDUCE)
 /// 4. Create SPECIAL indices with dimension limiting
 /// 5. Substitute RANGE ops with computed indices
-fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Sink { .. } = sink.op() else {
+fn add_gpudims(ctx: &mut GpuDimsContext, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Sink(..) = sink.op() else {
         return None;
     };
+    if ctx.lowered == Some(sink.id) {
+        return None;
+    }
+    let renderer = &ctx.renderer;
 
     // Collect topology (all UOps reachable from sink)
     let topo = sink.toposort();
 
     // Check for existing SPECIAL ops - if found, gpudims already applied
-    if topo.iter().any(|u| matches!(u.op(), Op::Special { .. })) {
+    if topo.iter().any(|u| matches!(u.op(), Op::Special(..))) {
         return None;
     }
 
@@ -105,7 +120,7 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     // We exclude axis_type from the key matching for categorization, but track it
     let mut all_ranges: HashMap<(svod_ir::AxisId, AxisType), Arc<UOp>> = HashMap::new();
     for u in &topo {
-        if let Op::Range { axis_id, axis_type, .. } = u.op() {
+        if let Op::Range(ops::Range { axis_id, axis_type, .. }) = u.op() {
             all_ranges.insert((axis_id.clone(), *axis_type), u.clone());
         }
     }
@@ -156,7 +171,7 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
         ranges
             .iter()
             .filter_map(|r| match r.op() {
-                Op::Range { end, .. } => Some(end.clone()),
+                Op::Range(ops::Range { end, .. }) => Some(end.clone()),
                 _ => None,
             })
             .collect()
@@ -166,28 +181,28 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     let local_shape = extract_shape(&local_ranges);
 
     let dont_use_locals = sink.metadata::<crate::optimizer::KernelInfo>().is_some_and(|info| info.dont_use_locals);
-    let all_idxs: Vec<Arc<UOp>> = if ctx.has_threads {
+    let all_idxs: Vec<Arc<UOp>> = if renderer.has_threads {
         // global_shape contains RANGE extents, not range indices. Match
         // Tinygrad's `int(global_shape[0])-1`: Thread(N) has N core IDs.
         let end = thread_core_bound(&global_dims, &local_dims, &global_shape)?;
         vec![UOp::variable("core_id".to_string(), 0, end - 1, DType::Int32).cast(DType::WeakInt)]
     } else if dont_use_locals {
         assert!(local_dims.is_empty(), "can't use locals if there's no local dims");
-        get_grouped_dims("idx", &global_shape, ctx.global_max.as_deref(), true)
+        get_grouped_dims("idx", &global_shape, renderer.global_max.as_deref(), true)
     } else {
         // Generate GPU indices
         // Renderer keeps the workgroup product cap separate from per-axis caps.
         let local_max: Option<Vec<usize>> =
-            ctx.local_max_axes().map(|axes| axes.to_vec()).or_else(|| ctx.local_max.map(|max| vec![max; 3]));
+            renderer.local_max_axes().map(|axes| axes.to_vec()).or_else(|| renderer.local_max.map(|max| vec![max; 3]));
         let local_max_slice = local_max.as_deref();
 
         // Create local indices (lidx0, lidx1, ...)
         let local_idxs = get_grouped_dims("lidx", &local_shape, local_max_slice, false);
         let hw_local = hardware_local_extents(&local_idxs);
-        let global_max = ctx.global_prod_max.as_ref().map_or_else(
-            || ctx.global_max.clone(),
+        let global_max = renderer.global_prod_max.as_ref().map_or_else(
+            || renderer.global_max.clone(),
             |prod_max| {
-                let base = ctx.global_max.as_ref().unwrap_or(prod_max);
+                let base = renderer.global_max.as_ref().unwrap_or(prod_max);
                 base.iter()
                     .zip(prod_max)
                     .zip(hw_local.iter().copied().chain(std::iter::repeat(1)).take(3))
@@ -235,7 +250,18 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    Some(sink.substitute(&subs))
+    let lowered = sink.substitute(&subs);
+    // `global_dims`/`local_dims` keep one range per axis id; a second range on
+    // the same id would survive and still needs the re-visit.
+    let gpu_ranges = all_ranges.keys().filter(|(_, axis_type)| is_gpu_axis(*axis_type)).count();
+    if gpu_ranges == all_dims.len() {
+        ctx.lowered = Some(lowered.id);
+    }
+    Some(lowered)
+}
+
+fn is_gpu_axis(axis_type: AxisType) -> bool {
+    matches!(axis_type, AxisType::Global | AxisType::Thread | AxisType::Local | AxisType::Warp | AxisType::GroupReduce)
 }
 
 /// Hardware extent of each `lidx*` axis behind the local indices.
@@ -253,7 +279,7 @@ fn hardware_local_extents(local_idxs: &[Arc<UOp>]) -> Vec<usize> {
         .iter()
         .flat_map(|idx| idx.toposort())
         .filter_map(|u| match u.op() {
-            Op::Special { end, name } if name.starts_with("lidx") => Some((name.clone(), dim_max(end))),
+            Op::Special(ops::Special { end, name }) if name.starts_with("lidx") => Some((name.clone(), dim_max(end))),
             _ => None,
         })
         .collect::<std::collections::BTreeMap<_, _>>()
@@ -302,7 +328,7 @@ fn compute_store_masks(
     let mut masks: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
     for uop in topo {
-        let Op::Store { index, .. } = uop.op() else {
+        let Op::Store(ops::Store { index, .. }) = uop.op() else {
             continue;
         };
 
@@ -311,7 +337,7 @@ fn compute_store_masks(
         // agrees across the sources of a STACK. Matching PARAM/BUFFER one level
         // deep instead missed every wrapped target — a STACK of params, or a
         // param behind an AFTER — and silently dropped the store mask.
-        let Op::Index { buffer, .. } = index.op() else { continue };
+        let Op::Index(ops::Index { buffer, .. }) = index.op() else { continue };
         if buffer.addrspace() != Some(svod_dtype::AddrSpace::Global) {
             continue;
         }
@@ -319,7 +345,7 @@ fn compute_store_masks(
         // Find local ranges NOT used in the index computation.
         // Use in_scope_ranges() to get only active (not ended) ranges,
         // rather than toposort().filter(Range) which returns ALL ranges in the graph.
-        let index_ranges: HashSet<u64> = index.in_scope_ranges().clone();
+        let index_ranges: HashSet<u64> = index.in_scope_ranges().iter().copied().collect();
 
         let mut missing_locals: Vec<Arc<UOp>> = Vec::new();
         for (axis_id, axis_type) in local_dims {
@@ -348,7 +374,7 @@ fn compute_store_masks(
 
         // Keep validity in the index expression so RANGE substitution carries it
         // to the corresponding hardware index.
-        if let (Some(mask), Op::Index { buffer, indices }) = (mask, index.op()) {
+        if let (Some(mask), Op::Index(ops::Index { buffer, indices })) = (mask, index.op()) {
             assert_eq!(indices.len(), 1, "gpudims: index must have one index source");
             let new_index = UOp::index()
                 .buffer(buffer.clone())

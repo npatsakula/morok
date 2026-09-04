@@ -38,17 +38,17 @@ Svod provides a domain-specific language for writing optimization patterns:
 ```rust
 patterns! {
     // Identity folding: x + 0 → x
-    Add[x, @zero] ~> |x| x.clone(),
+    Add[x, @zero] => x,
 
     // Constant folding: 3 + 4 → 7
-    Add(a @const(a_val), b @const(b_val))
-        => |a, a_val, b_val| eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
+    Add(a @const(a_val), _b @const(b_val))
+        => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 
     // Self-folding: x / x → 1
-    Idiv(x, x) ~> |x| UOp::one(x.dtype()),
+    Idiv(x, x) => UOp::one(x.dtype()),
 
     // Dead code elimination: if(true) { t } else { f } → t
-    Where(@true, t, _f) ~> |t| t.clone(),
+    Where(Const(ConstValue::Bool(true)), t, _f) => t,
 }
 ```
 
@@ -56,14 +56,13 @@ The macro compiles these patterns into efficient Rust code:
 
 | Syntax | Meaning | Example |
 |--------|---------|---------|
-| `(x, y)` | **Ordered.** Match in exact order. | `Sub(x, @zero) ~> x` |
-| `[x, y]` | **Commutative.** Try both orderings. | `Add[x, @zero] ~> x` |
-| `@zero` | **Zero constant.** Matches 0 or 0.0. | `Mul[_, z @ @zero] ~> z` |
-| `@one` | **One constant.** Matches 1 or 1.0. | `Mul[x, @one] ~> x` |
-| `@const(val)` | **Extract constant.** Binds the value. | `Add(@const(a), @const(b))` |
-| `x, x` | **Same operand.** Auto-generates ptr_eq check. | `Idiv(x, x) ~> UOp::one(...)` |
-| `~>` | **Infallible.** Always succeeds, returns `Arc<UOp>`. | `Add[x, @zero] ~> x` |
-| `=>` | **Fallible.** May fail, returns `Option<Arc<UOp>>`. | `=> eval(...).map(...)` |
+| `(x, y)` | **Ordered.** Match in exact order. | `Sub(x, @zero) => x` |
+| `[x, y]` | **Commutative.** Try both orderings. | `Add[x, @zero] => x` |
+| `@zero` | **Zero constant.** Matches 0 or 0.0. | `Mul[_, z @ @zero] => z` |
+| `@one` | **One constant.** Matches 1 or 1.0. | `Mul[x, @one] => x` |
+| `c @const(val)` | **Extract constant.** Binds the value. | `Add(a @const(av), _b @const(bv))` |
+| `x, x` | **Same operand.** Auto-generates ptr_eq check. | `Idiv(x, x) => UOp::one(...)` |
+| `=>` | **Rewrite.** Returns `Arc<UOp>`, `Option<Arc<UOp>>` (`None` declines) or `RewriteResult`. | `=> eval(...).map(...)` |
 | `for op in binary [...]` | **Template.** Generate patterns for multiple ops. | See below |
 | `@context Type` | **Stateful.** Access mutable context in patterns. | See below |
 
@@ -74,8 +73,8 @@ Instead of writing the same pattern for every binary operation, use a for-loop:
 ```rust
 patterns! {
     for op in binary [Add, Mul, Sub, Idiv, Fdiv, Max] {
-        op(a @const(a_val), b @const(b_val))
-            => |a, a_val, b_val| eval_binary(op, a_val, b_val)
+        op(a @const(a_val), _b @const(b_val))
+            => eval_binary(op, a_val, b_val)
                 .map(|r| UOp::const_(a.dtype(), r))
     }
 }
@@ -91,7 +90,7 @@ Some optimizations need context (e.g., which kernel we're in, what ranges are ac
 patterns! {
     @context KernelContext;
 
-    ReduceAxis { src } => |reduce, src, ctx| {
+    reduce @ ReduceAxis { src, .. } => {
         ctx.record_reduction(reduce);
         transform_reduce(reduce, src, ctx)
     }
@@ -112,26 +111,26 @@ let mega_pass = symbolic().with_context::<PcontigConfig>()
 
 ## How Pattern Matching Works
 
-The `patterns!` macro generates a `SimplifiedPatternMatcher` that dispatches patterns to the relevant bucket in **O(1)** time via HashMap lookup, then tries each pattern in the bucket sequentially.
+The `patterns!` macro compiles a block into one function that dispatches on the root's operation kind with a `match`, then tries that kind's patterns in source order.
 
 ### The OpKey Index
 
 Every UOp has an operation type (Add, Mul, Load, etc.). The macro generates an `OpKey` enum that maps operations to hashable keys:
 
 ```rust
-pub struct SimplifiedPatternMatcher<C = ()> {
-    indexed: HashMap<OpKey, Vec<PatternClosure<C>>>,  // O(1) lookup
-    wildcards: Vec<PatternClosure<C>>,                 // patterns matching any op
+match OpKey::from_op(tree.op()).index() {
+    KEY_ADD => { /* rules rooted at Add, in source order */ }
+    KEY_MUL => { /* rules rooted at Mul */ }
+    _ => {}
 }
+// wildcard rules (`x if cond`) run as sequential steps between the matches
 ```
 
 When matching a UOp:
 1. **Extract OpKey** from the UOp's operation
-2. **Lookup** in the HashMap — O(1)
+2. **Jump** to that kind's `match` arm
 3. **Try each closure** until one matches
 4. **Fall back** to wildcards if no indexed pattern matches
-
-This is 5-10x faster than scanning all patterns linearly.
 
 ### Commutative Handling
 
@@ -202,7 +201,6 @@ The engine always traverses bottom-up; the distinction is *when* patterns fire: 
 ### Safety Limits
 
 To prevent infinite loops:
-- **1000 iterations** per node maximum
 - **500,000 iterations** total maximum
 - Panics with diagnostic info if limits exceeded
 

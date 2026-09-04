@@ -35,7 +35,8 @@ fn llvm_jit_emits_reusable_object_bytes() {
     assert!(!compiled.bytes.is_empty());
     crate::clang::validate_relocatable_object(&compiled.bytes, "source_only").unwrap();
     assert_eq!(device.base_device_key(), "CPU");
-    assert!(device.compiler.cache_key().starts_with("cpu-llvm-clang:"));
+    let producer = if crate::llvm_inprocess::library().is_ok() { "cpu-llvm-inprocess:" } else { "cpu-llvm-clang:" };
+    assert!(device.compiler.cache_key().starts_with(producer), "{}", device.compiler.cache_key());
 
     let invalid =
         ProgramSpec::new("test".into(), "this is not valid LLVM IR".into(), DeviceSpec::Cpu, UOp::sink(vec![]));
@@ -202,6 +203,21 @@ fn cpu_dispatch_passes_scalars_at_their_declared_width(value: i32) {
     let buffers = [(&mut out as *mut i32).cast::<u8>()];
     unsafe { kernel.execute_with_vals(&buffers, &[value as i64]).expect("execute scalar-width fixture") };
     assert_eq!(out, value);
+}
+
+/// `SVOD_CPU_BACKEND` accepts exactly the lower- and upper-case names; other
+/// casings and garbage parse to `None` so `from_env` can warn and fall back.
+#[test_case::test_case("clang" => Some(CpuBackend::Clang); "clang")]
+#[test_case::test_case("CLANG" => Some(CpuBackend::Clang); "upper clang")]
+#[test_case::test_case("llvm" => Some(CpuBackend::Llvm); "llvm")]
+#[test_case::test_case("LLVM" => Some(CpuBackend::Llvm); "upper llvm")]
+#[test_case::test_case("Clang" => None; "mixed case clang")]
+#[test_case::test_case("Llvm" => None; "mixed case llvm")]
+#[test_case::test_case(" llvm" => None; "leading space")]
+#[test_case::test_case("" => None; "empty")]
+#[test_case::test_case("gcc" => None; "garbage")]
+fn cpu_backend_parses_only_accepted_spellings(value: &str) -> Option<CpuBackend> {
+    CpuBackend::parse(value)
 }
 
 #[test]

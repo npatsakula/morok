@@ -16,37 +16,15 @@ pub struct EnumAttrs {
 pub struct VariantAttrs {
     /// Skip pattern generation for this variant.
     pub skip: bool,
-    /// Skip matcher generation for this variant (but still generate OpKey).
-    pub skip_matcher: bool,
 }
 
 /// Parsed field information.
 #[derive(Debug)]
 pub struct FieldInfo {
-    /// Field name (for struct variants) or index (for tuple variants).
-    pub name: FieldName,
     /// Field type.
     pub ty: Type,
     /// Classification based on type.
     pub classification: FieldClass,
-}
-
-/// Field name - either named (struct) or indexed (tuple).
-#[derive(Debug, Clone)]
-pub enum FieldName {
-    Named(Ident),
-    /// Tuple field (index not tracked, only used to distinguish from Named).
-    Indexed,
-}
-
-impl FieldName {
-    /// Returns the identifier if this is a named field.
-    pub fn as_named(&self) -> Option<&Ident> {
-        match self {
-            FieldName::Named(ident) => Some(ident),
-            FieldName::Indexed => None,
-        }
-    }
 }
 
 /// Classification of a field based on its type.
@@ -68,7 +46,6 @@ pub struct VariantInfo {
     pub name: Ident,
     pub attrs: VariantAttrs,
     pub fields: Vec<FieldInfo>,
-    pub is_struct: bool,
 }
 
 /// Parse enum-level #[pattern(...)] attributes.
@@ -117,9 +94,6 @@ pub fn parse_variant_attrs(attrs: &[Attribute]) -> Result<VariantAttrs> {
                     if meta.path.is_ident("skip") {
                         result.skip = true;
                         Ok(())
-                    } else if meta.path.is_ident("skip_matcher") {
-                        result.skip_matcher = true;
-                        Ok(())
                     } else {
                         Err(meta.error("unknown pattern attribute"))
                     }
@@ -160,27 +134,7 @@ pub fn classify_field_type(ty: &Type) -> FieldClass {
 
 /// Parse fields from a variant.
 pub fn parse_fields(fields: &Fields) -> Vec<FieldInfo> {
-    match fields {
-        Fields::Named(named) => named
-            .named
-            .iter()
-            .map(|f| FieldInfo {
-                name: FieldName::Named(f.ident.clone().unwrap()),
-                ty: f.ty.clone(),
-                classification: classify_field_type(&f.ty),
-            })
-            .collect(),
-        Fields::Unnamed(unnamed) => unnamed
-            .unnamed
-            .iter()
-            .map(|f| FieldInfo {
-                name: FieldName::Indexed,
-                ty: f.ty.clone(),
-                classification: classify_field_type(&f.ty),
-            })
-            .collect(),
-        Fields::Unit => vec![],
-    }
+    fields.iter().map(|f| FieldInfo { ty: f.ty.clone(), classification: classify_field_type(&f.ty) }).collect()
 }
 
 /// Parse all variants from the enum.
@@ -189,9 +143,7 @@ pub fn parse_variants(data: &DataEnum) -> Result<Vec<VariantInfo>> {
         .iter()
         .map(|v| {
             let attrs = parse_variant_attrs(&v.attrs)?;
-            let fields = parse_fields(&v.fields);
-            let is_struct = matches!(v.fields, Fields::Named(_));
-            Ok(VariantInfo { name: v.ident.clone(), attrs, fields, is_struct })
+            Ok(VariantInfo { name: v.ident.clone(), attrs, fields: parse_fields(&v.fields) })
         })
         .collect()
 }

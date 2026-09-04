@@ -16,6 +16,7 @@ use svod_ir::{BinaryStageIdentity, Op, OptimizerWireGraph};
 use svod_schedule::optimizer::{BeamConfig, Opt};
 
 use crate::error::BeamWorker;
+use svod_ir::ops;
 
 type Result<T> = std::result::Result<T, BeamWorker>;
 
@@ -196,8 +197,8 @@ fn try_compile(
     )
     .map_err(BeamWorker::at("linearize/render"))?;
     let linear_uops = match program.op() {
-        Op::Program { linear: Some(linear), .. } => match linear.op() {
-            Op::Linear { ops } => ops.len(),
+        Op::Program(ops::Program { linear: Some(linear), .. }) => match linear.op() {
+            Op::Linear(ops::Linear { ops }) => ops.len(),
             other => return Err(BeamWorker::CompileStage { stage: "linearize/render", reason: format!("{other:?}") }),
         },
         other => return Err(BeamWorker::CompileStage { stage: "linearize/render", reason: format!("{other:?}") }),
@@ -224,14 +225,16 @@ fn try_compile(
         .map_err(BeamWorker::at("compile"))?;
     let compilation_ns = compiled_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     let identity = match compiled_program.op() {
-        Op::Program { source: Some(source), binary: Some(binary), .. } => {
+        Op::Program(ops::Program { source: Some(source), binary: Some(binary), .. }) => {
             let source_identity = match source.op() {
-                Op::Source { identity: Some(identity), .. } => identity,
+                Op::Source(ops::Source { identity: Some(identity), .. }) => identity,
                 other => return Err(BeamWorker::CompileStage { stage: "compile", reason: format!("{other:?}") }),
             };
             match binary.op() {
-                Op::ProgramBinary { identity: Some(identity), .. } if &identity.source == source_identity => {
-                    identity.clone()
+                Op::ProgramBinary(ops::ProgramBinary { identity: Some(identity), .. })
+                    if identity.source == **source_identity =>
+                {
+                    identity.as_ref().clone()
                 }
                 other => return Err(BeamWorker::CompileStage { stage: "compile", reason: format!("{other:?}") }),
             }

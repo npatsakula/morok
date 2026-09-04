@@ -4,6 +4,7 @@ use svod_ir::{AxisType, Op, ReduceOp, UOp};
 
 use crate::rangeify::{SimplifyRangesContext, pm_simplify_ranges};
 use crate::rewrite::graph_rewrite;
+use svod_ir::ops;
 
 fn buffer() -> std::sync::Arc<UOp> {
     UOp::new_buffer(DeviceSpec::Cpu, 16, DType::Float32)
@@ -28,7 +29,9 @@ fn narrowed_end(root: &std::sync::Arc<UOp>, axis: usize) -> i64 {
     root.ranges()
         .iter()
         .find_map(|range| match range.op() {
-            Op::Range { end, axis_id: svod_ir::AxisId::Renumbered(id), .. } if *id == axis => end.vmax().try_int(),
+            Op::Range(ops::Range { end, axis_id: svod_ir::AxisId::Renumbered(id), .. }) if *id == axis => {
+                end.vmax().try_int()
+            }
             _ => None,
         })
         .expect("range must remain in rewritten graph")

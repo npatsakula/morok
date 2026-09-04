@@ -12,6 +12,7 @@ use crate::rangeify::patterns::{
 };
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::{pm_fold_cast_const, symbolic_simple};
+use svod_ir::ops;
 
 fn x() -> Arc<UOp> {
     UOp::variable("x".into(), 0, 9999, DType::Int32)
@@ -186,7 +187,7 @@ fn weak_lowering_concretizes_a_weak_vconst_before_the_final_rewrite() {
     let result = graph_rewrite(crate::optimizer::final_rewrite_patterns(), lowered, &mut ());
 
     assert!(result.toposort().iter().all(|u| !u.dtype().is_weak()), "{}", result.tree());
-    let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK") };
-    assert!(matches!(sources[0].op(), Op::VConst { values } if values.len() == 4));
+    let Op::Sink(ops::Sink { sources, .. }) = result.op() else { panic!("expected SINK") };
+    assert!(matches!(sources[0].op(), Op::VConst(ops::VConst { values }) if values.len() == 4));
     assert_eq!(sources[0].dtype(), DType::Int32.vec(4).expect("vector dtype"));
 }

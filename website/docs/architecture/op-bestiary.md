@@ -509,7 +509,6 @@ Hardware tensor core operation: `D = A × B + C`. Requires specific matrix shape
 | `threads` | `usize` | Threads per warp (typically 32) |
 | `upcast_axes` | `WmmaUpcastAxes` | Per-operand vectorization (fields: `a`, `b`, `c`) |
 | `reduce_axes` | `Vec<(usize, usize)>` | Contraction axes |
-| `tile_grid` | `(usize, usize)` | Multi-FMA batching grid (default (1,1)) |
 
 **Example:**
 ```mermaid

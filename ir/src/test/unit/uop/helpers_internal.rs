@@ -1,4 +1,5 @@
 use super::*;
+use crate::ops;
 use svod_dtype::DType;
 
 #[test]
@@ -205,7 +206,7 @@ fn test_divides_vconst() {
     let result = vc.divides(3);
     assert!(result.is_some());
     if let Some(r) = result {
-        if let Op::VConst { values } = r.op() {
+        if let Op::VConst(ops::VConst { values }) = r.op() {
             assert_eq!(values, &[ConstValue::Int(2), ConstValue::Int(4)]);
         } else {
             panic!("Expected VConst result");

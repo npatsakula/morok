@@ -1,5 +1,6 @@
 use crate::{DeviceSpec, registry::DeviceSpecExt};
 use svod_dtype::DType;
+use svod_ir::ops;
 use svod_ir::{Op, UOp};
 
 fn program(
@@ -12,25 +13,28 @@ fn program(
     let info = svod_ir::ProgramInfo::from_sink(&sink, target);
     let source = match (&linear, source) {
         (Some(linear), Some(source)) => match source.op() {
-            Op::Source { code, identity: None } => crate::device::ProgramSpec::validate_program_param_abi(&sink, &info)
-                .ok()
-                .and_then(|abi| crate::device::source_stage_identity(&info, &abi, linear, code).ok())
-                .map_or_else(
-                    || Some(source.clone()),
-                    |identity| Some(UOp::source_with_identity(code.clone(), identity)),
-                ),
+            Op::Source(ops::Source { code, identity: None }) => {
+                crate::device::ProgramSpec::validate_program_param_abi(&sink, &info)
+                    .ok()
+                    .and_then(|abi| crate::device::source_stage_identity(&info, &abi, linear, code).ok())
+                    .map_or_else(
+                        || Some(source.clone()),
+                        |identity| Some(UOp::source_with_identity(code.clone(), identity)),
+                    )
+            }
             _ => Some(source),
         },
         (_, source) => source,
     };
     let binary = match (&source, binary) {
         (Some(source), Some(binary)) => match (source.op(), binary.op()) {
-            (Op::Source { identity: Some(source_identity), .. }, Op::ProgramBinary { bytes, identity: None }) => {
-                Some(UOp::binary_with_identity(
-                    bytes.clone(),
-                    crate::device::binary_stage_identity(source_identity.clone(), "device-test", bytes),
-                ))
-            }
+            (
+                Op::Source(ops::Source { identity: Some(source_identity), .. }),
+                Op::ProgramBinary(ops::ProgramBinary { bytes, identity: None }),
+            ) => Some(UOp::binary_with_identity(
+                bytes.clone(),
+                crate::device::binary_stage_identity(source_identity.as_ref().clone(), "device-test", bytes),
+            )),
             _ => Some(binary),
         },
         (_, binary) => binary,
@@ -40,10 +44,10 @@ fn program(
 
 fn slotted_var(name: &str, min: i64, max: i64, slot: usize) -> std::sync::Arc<UOp> {
     let var = UOp::variable(name.to_string(), min, max, DType::Int32);
-    let Op::Param { shape, arg } = var.op() else { panic!("variable PARAM") };
+    let Op::Param(ops::Param { shape, arg }) = var.op() else { panic!("variable PARAM") };
     let mut arg = arg.clone();
     arg.slot = slot;
-    UOp::new(Op::Param { shape: shape.clone(), arg }, DType::Int32)
+    UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg }), DType::Int32)
 }
 
 #[test]
@@ -225,10 +229,10 @@ fn program_spec_from_uop_derives_buf_count_and_io_without_metadata() {
 fn program_spec_rejects_duplicate_storage_scalar_slots_with_typed_error() {
     let global = UOp::param(0, 1, DType::Float32, None);
     let scalar = UOp::variable("n".to_string(), 1, 8, DType::Int32);
-    let Op::Param { shape, arg } = scalar.op() else { unreachable!() };
+    let Op::Param(ops::Param { shape, arg }) = scalar.op() else { unreachable!() };
     let mut arg = arg.clone();
     arg.slot = 0;
-    let scalar = UOp::new(Op::Param { shape: shape.clone(), arg }, DType::Int32);
+    let scalar = UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg }), DType::Int32);
     let sink = UOp::sink(vec![global, scalar]);
     let linear = UOp::linear(sink.toposort().into());
     let source = UOp::source("void duplicate(float* data0, int n) {}".to_string());
@@ -245,7 +249,7 @@ fn program_spec_rejects_descriptor_equivalent_var_semantic_forgery() {
 
     for mutation in ["bounds", "multiple_of"] {
         let mut info = svod_ir::ProgramInfo::from_sink(&sink, DeviceSpec::Cpu);
-        let Op::Param { shape, arg } = info.vars[0].op() else { unreachable!() };
+        let Op::Param(ops::Param { shape, arg }) = info.vars[0].op() else { unreachable!() };
         let mut forged_arg = arg.clone();
         if mutation == "bounds" {
             forged_arg.vmin_vmax = Some((
@@ -255,7 +259,7 @@ fn program_spec_rejects_descriptor_equivalent_var_semantic_forgery() {
         } else {
             forged_arg.multiple_of = Some(8);
         }
-        info.vars[0] = UOp::new(Op::Param { shape: shape.clone(), arg: forged_arg }, DType::Int32);
+        info.vars[0] = UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg: forged_arg }), DType::Int32);
         let staged = UOp::program(
             sink.clone(),
             info,
@@ -284,7 +288,7 @@ fn program_spec_accepts_semantically_identical_nonidentical_var() {
     assert!(!std::sync::Arc::ptr_eq(&sink_var, &reconstructed));
     info.vars[0] = reconstructed;
     let staged = UOp::program(sink.clone(), info, Some(UOp::linear(sink.toposort().into())), None, None);
-    let Op::Program { info, linear: Some(linear), .. } = staged.op() else { unreachable!() };
+    let Op::Program(ops::Program { info, linear: Some(linear), .. }) = staged.op() else { unreachable!() };
     let abi = crate::device::ProgramSpec::validate_program_param_abi(&sink, info).unwrap();
     let code = "void accepted(int n) {}".to_string();
     let identity = crate::device::source_stage_identity(info, &abi, linear, &code).unwrap();
@@ -359,11 +363,13 @@ fn program_spec_rejects_empty_binary_compiler_key() {
         Some(UOp::source("source".into())),
         Some(UOp::binary(vec![1, 2, 3])),
     );
-    let Op::Program { sink, info, linear, source, binary: Some(binary) } = staged.op() else { unreachable!() };
-    let Op::ProgramBinary { bytes, identity: Some(identity) } = binary.op() else { unreachable!() };
+    let Op::Program(ops::Program { sink, info, linear, source, binary: Some(binary) }) = staged.op() else {
+        unreachable!()
+    };
+    let Op::ProgramBinary(ops::ProgramBinary { bytes, identity: Some(identity) }) = binary.op() else { unreachable!() };
     let malformed = UOp::binary_with_identity(
         bytes.clone(),
-        svod_ir::BinaryStageIdentity { compiler_key: String::new(), ..identity.clone() },
+        svod_ir::BinaryStageIdentity { compiler_key: String::new(), ..identity.as_ref().clone() },
     );
     let staged = UOp::program(sink.clone(), info.clone(), linear.clone(), source.clone(), Some(malformed));
     let err = crate::device::ProgramSpec::from_uop(&staged).expect_err("empty compiler key must be rejected");
@@ -422,4 +428,34 @@ fn beam_worker_artifact_validates_source_binary_abi_and_compiler_identity() {
         )
         .is_err()
     );
+}
+
+/// Downstream stages trust the LINEAR digest minted at render time but
+/// re-derive every other identity field from the PROGRAM they are given.
+#[test]
+fn program_spec_from_uop_rechecks_every_minted_identity_field_but_the_linear_digest() {
+    let sink = UOp::sink(vec![UOp::native_const(3.0f32)]);
+    let linear = UOp::linear(sink.toposort().into());
+    let info = svod_ir::ProgramInfo::from_sink(&sink, DeviceSpec::Cpu);
+    let abi = crate::device::ProgramSpec::validate_program_param_abi(&sink, &info).unwrap();
+    let code = "void test(void) {}".to_string();
+    let minted = crate::device::source_stage_identity(&info, &abi, &linear, &code).unwrap();
+    let staged = |source| UOp::program(sink.clone(), info.clone(), Some(linear.clone()), Some(source), None);
+
+    let honest = UOp::source_with_identity(code.clone(), minted.clone());
+    assert_eq!(crate::device::minted_source_stage_identity(&info, &abi, &honest).unwrap(), minted);
+    crate::device::ProgramSpec::from_uop(&staged(honest)).expect("minted identity is accepted");
+
+    let tampered = [
+        UOp::source_with_identity(format!("{code} // edited"), minted.clone()),
+        UOp::source_with_identity(
+            code.clone(),
+            svod_ir::SourceStageIdentity { entry_name: "other".into(), ..minted.clone() },
+        ),
+        UOp::source_with_identity(code.clone(), svod_ir::SourceStageIdentity { version: minted.version + 1, ..minted }),
+    ];
+    for source in tampered {
+        let err = crate::device::ProgramSpec::from_uop(&staged(source)).expect_err("tampered SOURCE must be rejected");
+        assert!(matches!(err, crate::Error::ProgramStageMismatch { stage: "SOURCE", .. }), "{err:?}");
+    }
 }

@@ -17,7 +17,7 @@ Svod 的符号化简器使用 `schedule/src/symbolic/patterns.rs` 中定义的 1
 
 **范围分析**：每个 UOp 跟踪它在运行时可取的最小值（`vmin`）和最大值（`vmax`），在节点构造时从输入的边界急切地计算。许多模式使用这些边界在编译期证明条件（例如"x 始终非负"或"x < n 对所有值成立"）。
 
-**符号约定**：`OP[a, b]` 表示交换律模式（两种操作数顺序都会尝试）。`OP(a, b)` 表示有序。`@zero`/`@one`/`@const` 匹配常量值。当同一变量名出现两次时（例如 `Idiv(x, x)`），两个操作数必须是同一节点（`Arc::ptr_eq`——即通过 hash consing 进行结构去重）。
+**符号约定**：`OP[a, b]` 表示交换律模式（两种操作数顺序都会尝试）。`OP(a, b)` 表示有序。`@zero`/`@one`/`c @const(v)` 匹配常量值。当同一变量名出现两次时（例如 `Idiv(x, x)`），两个操作数必须是同一节点（`Arc::ptr_eq`——即通过 hash consing 进行结构去重）。
 
 **Tinygrad 参考**：`tinygrad/uop/symbolic.py`、`tinygrad/uop/divandmod.py`
 

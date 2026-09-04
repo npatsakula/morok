@@ -10,6 +10,7 @@ use svod_ir::{Op, UOp};
 
 use crate::kernels::knn::{KNN_SUPPORTED_ARCHS, build_knn_score, build_knn_topk};
 use crate::{ArchCaps, Kernel};
+use svod_ir::ops;
 
 /// Placeholder buffers for a GPU-free build: `score` (f32), `x`/`c` (bf16),
 /// `c_sq_rep` (f32), in ABI order.
@@ -41,12 +42,12 @@ fn test_knn_score_graph_shape() {
         let topo = knn_sink(32, 32, 32, caps).toposort();
 
         // The cross term emits a WMMA (looped: one symbolic node per K-iteration).
-        assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "{arch:?}: cross term emits a WMMA");
+        assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma(..))), "{arch:?}: cross term emits a WMMA");
 
         // The c_sq input is the last (4th) Param; its load reads PARAM slot 3.
         let loads_param3 = topo.iter().any(|u| {
-            let Op::Load { .. } = u.op() else { return false };
-            u.toposort().iter().any(|s| matches!(s.op(), Op::Param { arg, .. } if arg.slot == 3))
+            let Op::Load(..) = u.op() else { return false };
+            u.toposort().iter().any(|s| matches!(s.op(), Op::Param(ops::Param { arg, .. }) if arg.slot == 3))
         });
         assert!(loads_param3, "{arch:?}: a Load reads the c_sq input (Param slot 3)");
 
@@ -177,11 +178,11 @@ fn test_knn_topk_graph_shape() {
         let (corpus, query, d, k) = (32usize, 16usize, 16usize, 4usize);
         let topo = topk_sink(corpus, query, d, k, caps).toposort();
 
-        assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "{arch:?}: score WMMA");
+        assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma(..))), "{arch:?}: score WMMA");
 
         // The arg-reduce cross-lane gathers (value + index each ride a ds_bpermute):
         // many across the k insert steps × 2 reduces × reduce_tree length.
-        let customs = topo.iter().filter(|u| matches!(u.op(), Op::Custom { .. })).count();
+        let customs = topo.iter().filter(|u| matches!(u.op(), Op::Custom(..))).count();
         assert!(customs >= 4 * caps.reduce_tree().len(), "{arch:?}: arg_reduce ds_bpermute Op::Customs, got {customs}");
 
         // The evict/mask conditional rewrites are `where` (Ternary) selects.
@@ -201,8 +202,8 @@ fn test_knn_topk_graph_shape() {
         // Two outputs: a Store into the i32 idx Param (slot 0) and the f32 val (slot 1).
         let stores_to = |slot: usize| {
             topo.iter().any(|u| {
-                let Op::Store { .. } = u.op() else { return false };
-                u.toposort().iter().any(|s| matches!(s.op(), Op::Param { arg, .. } if arg.slot == slot))
+                let Op::Store(..) = u.op() else { return false };
+                u.toposort().iter().any(|s| matches!(s.op(), Op::Param(ops::Param { arg, .. }) if arg.slot == slot))
             })
         };
         assert!(stores_to(0), "{arch:?}: store into the idx output (Param 0)");
@@ -392,7 +393,7 @@ fn test_knn_graph_shape() {
     let (dists, idxs) = crate::knn(&x, &c, 5).expect("knn builds").expect("Ok(Some) on a supported device");
 
     let topo = idxs.uop().toposort();
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Call { .. })), "idxs graph carries the kernel Op::Call node");
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::Call(..))), "idxs graph carries the kernel Op::Call node");
     // The bitonic sort folds the K via Max/Min compares; the gather selects via Eq.
     assert!(
         topo.iter().any(|u| matches!(u.op(), Op::Binary(svod_ir::BinaryOp::Max, ..))),
@@ -404,7 +405,7 @@ fn test_knn_graph_shape() {
     );
     // The exact-distance tail (dists) carries the same kernel Call plus its own sub/sum.
     let dtopo = dists.uop().toposort();
-    assert!(dtopo.iter().any(|u| matches!(u.op(), Op::Call { .. })), "dists graph carries the kernel Op::Call node");
+    assert!(dtopo.iter().any(|u| matches!(u.op(), Op::Call(..))), "dists graph carries the kernel Op::Call node");
 }
 
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib knn::test_knn_amd -- --ignored --nocapture`.

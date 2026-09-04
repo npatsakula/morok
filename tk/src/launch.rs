@@ -25,6 +25,7 @@ use svod_device::Buffer;
 use svod_device::device::{Device, Program, ProgramSpec};
 use svod_dtype::{AmdArch, DType, DeviceSpec};
 use svod_ir::UOp;
+use svod_ir::ops;
 use svod_tensor::Tensor;
 
 /// Result type for the launch path.
@@ -317,14 +318,10 @@ impl CompiledLaunch {
 /// `ProgramSpec.globals`. PARAM slots select signature positions and are never
 /// used as indexes into this vector.
 pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<CompiledLaunch> {
+    // This path bypasses the tensor scheduler, so size the execution pool here.
+    svod_runtime::ensure_thread_pool(svod_schedule::thread_budget());
     let optimizer_renderer = match device.device {
-        DeviceSpec::Cpu => {
-            if std::env::var("SVOD_AMX").as_deref() == Ok("1") {
-                svod_schedule::OptimizerRenderer::apple_amx()
-            } else {
-                svod_schedule::OptimizerRenderer::cpu()
-            }
-        }
+        DeviceSpec::Cpu => svod_schedule::OptimizerRenderer::cpu(),
         DeviceSpec::Cuda { .. } => svod_schedule::OptimizerRenderer::cuda(),
         DeviceSpec::Metal { .. } => svod_schedule::OptimizerRenderer::metal(),
         DeviceSpec::Amd { .. } => device
@@ -678,7 +675,7 @@ pub fn realize_buffer(t: &Tensor) -> Result<Buffer> {
     // No backing buffer: allocate one sized to the tensor's logical shape on its
     // BUFFER UOp's device, then register it so `t.buffer()` resolves it.
     let base = t.uop().base();
-    let svod_ir::Op::Buffer { arg, .. } = base.op() else {
+    let svod_ir::Op::Buffer(ops::Buffer { arg, .. }) = base.op() else {
         return Err(RealizeSnafu.into_error(svod_tensor::error::Error::NoBuffer));
     };
     let Some(spec) = arg.device.as_ref() else {

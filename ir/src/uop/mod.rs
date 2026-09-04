@@ -13,6 +13,7 @@
 //! - [`properties`] - Standard cached properties (shape, ranges, etc.)
 //! - [`eval`] - Constant evaluation for operations
 //! - [`range_eval`] - Range analysis (vmin/vmax) for operations
+//! - [`reachability`] - Memoized gated backward-slice queries
 //! - [`comparison_analysis`] - Unified comparison analysis for optimizations
 
 pub mod cached_property;
@@ -26,6 +27,7 @@ pub mod hash_consing;
 pub mod helpers;
 pub mod properties;
 pub mod range_eval;
+pub mod reachability;
 pub mod tree;
 pub mod wire;
 
@@ -36,5 +38,6 @@ pub use canonical::{
 };
 pub use core::{IntoUOp, UOp, UOpKey};
 pub use cost::compute_ops_estimate;
-pub use hash_consing::{gc_dead_refs, live_uop_ids, set_uop_drop_hook};
+pub use hash_consing::{live_uop_ids, set_uop_drop_hook};
+pub use reachability::{Nodes, SliceMemo, SubtreeMemo, reaching, reaching_each};
 pub use wire::OptimizerWireGraph;

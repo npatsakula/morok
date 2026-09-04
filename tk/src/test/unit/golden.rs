@@ -19,6 +19,7 @@ use svod_ir::UOp;
 use crate::kernels::fa::{FaConfig, build_fa_mw_rdb};
 use crate::kernels::matmul::{M1_CFG, build_matmul_cfg};
 use crate::{ArchCaps, Kernel, kernel_fingerprint};
+use svod_ir::ops;
 
 fn matmul_sink() -> Arc<UOp> {
     let n = 512usize;
@@ -74,16 +75,16 @@ fn fa_sink() -> Arc<UOp> {
 }
 
 // Committed structural golden digests. Update ONLY for an intentional graph change.
-const MATMUL_DIGEST: u128 = 0x0261_3d2b_1ca8_9f13_0000_0000_0000_0000;
+const MATMUL_DIGEST: u128 = 0x09e3_c7ee_e534_37f2_0000_0000_0000_0000;
 const MATMUL_NODES: usize = 535;
-const FA_DIGEST: u128 = 0x3c39_d807_aa65_c6fd_0000_0000_0000_0000;
+const FA_DIGEST: u128 = 0x64ec_3383_62ce_ca94_0000_0000_0000_0000;
 const FA_NODES: usize = 897;
 // Non-causal and non-causal+key-masked build variants (pin the `causal:false` and
 // `key_lens:Some` branches GPU-free). The FA all-masked-row NaN fix is a key_lens
 // clamp at the kernel ENTRY (a tensor-graph op), so the SINK graph is unchanged.
-const FA_NONCAUSAL_DIGEST: u128 = 0x5428_d057_e5f1_eba0_0000_0000_0000_0000;
+const FA_NONCAUSAL_DIGEST: u128 = 0x4756_ff46_71a6_791a_0000_0000_0000_0000;
 const FA_NONCAUSAL_NODES: usize = 871;
-const FA_MASKED_DIGEST: u128 = 0xb58f_daa1_a06e_104c_0000_0000_0000_0000;
+const FA_MASKED_DIGEST: u128 = 0xff0a_602b_72aa_04b1_0000_0000_0000_0000;
 const FA_MASKED_NODES: usize = 895;
 
 fn check(name: &str, sink: Arc<UOp>, digest: u128, nodes: usize) {
@@ -132,10 +133,12 @@ fn local_slots_and_reg_ids(sink: &Arc<UOp>) -> (Vec<usize>, Vec<usize>) {
     let (mut locals, mut regs) = (Vec::new(), Vec::new());
     for u in sink.toposort() {
         match u.op() {
-            svod_ir::Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
+            svod_ir::Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
                 locals.push(arg.slot)
             }
-            svod_ir::Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => regs.push(arg.slot),
+            svod_ir::Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => {
+                regs.push(arg.slot)
+            }
             _ => {}
         }
     }

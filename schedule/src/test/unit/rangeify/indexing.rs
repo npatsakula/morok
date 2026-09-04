@@ -10,6 +10,7 @@ use crate::rangeify::{
     IndexingContext,
     indexing::{broadcast_ranges, data_sources},
 };
+use svod_ir::ops;
 
 fn var() -> Arc<UOp> {
     UOp::var("x", DType::Float32, 0, i64::MAX)
@@ -25,9 +26,9 @@ fn ranges_are_numbered_sequentially_and_size_one_axes_are_free() {
 
     for (i, extent) in [10i64, 20, 0, 1 << 30].into_iter().enumerate() {
         let range = ctx.new_range(&SInt::Const(extent as usize), AxisType::Loop);
-        assert!(matches!(range.op(), Op::Range { axis_id, .. } if *axis_id == AxisId::Unrenumbered(i)));
+        assert!(matches!(range.op(), Op::Range(ops::Range { axis_id, .. }) if *axis_id == AxisId::Unrenumbered(i)));
         assert!(
-            matches!(range.op(), Op::Range { end, .. } if matches!(end.op(), Op::Const(c) if c.0 == ConstValue::Int(extent)))
+            matches!(range.op(), Op::Range(ops::Range { end, .. }) if matches!(end.op(), Op::Const(c) if c.0 == ConstValue::Int(extent)))
         );
         assert_eq!(ctx.range_counter(), i + 1);
     }
@@ -38,10 +39,10 @@ fn ranges_are_numbered_sequentially_and_size_one_axes_are_free() {
 
     let n = UOp::define_var("n".to_string(), 0, i64::MAX);
     let symbolic = ctx.new_range(&SInt::Symbolic(n.clone()), AxisType::Loop);
-    assert!(matches!(symbolic.op(), Op::Range { end, .. } if Arc::ptr_eq(end, &n)));
+    assert!(matches!(symbolic.op(), Op::Range(ops::Range { end, .. }) if Arc::ptr_eq(end, &n)));
 
     let reduce = ctx.new_range(&SInt::Const(10), AxisType::Reduce);
-    assert!(matches!(reduce.op(), Op::Range { axis_type: AxisType::Reduce, .. }));
+    assert!(matches!(reduce.op(), Op::Range(ops::Range { axis_type: AxisType::Reduce, .. })));
 }
 
 #[test]
@@ -51,7 +52,7 @@ fn separate_contexts_number_their_ranges_independently() {
     first.new_range(&SInt::Const(20), AxisType::Loop);
 
     let range = second.new_range(&SInt::Const(30), AxisType::Loop);
-    assert!(matches!(range.op(), Op::Range { axis_id: AxisId::Unrenumbered(0), .. }));
+    assert!(matches!(range.op(), Op::Range(ops::Range { axis_id: AxisId::Unrenumbered(0), .. })));
 }
 
 #[test]
@@ -133,14 +134,14 @@ fn image_buffers_keep_two_index_addresses() {
     for (dtype, expected_indices) in [(image, 2), (DType::Float32, 1)] {
         let arg =
             svod_ir::ParamArg::buffer(0, dtype.clone(), svod_dtype::AddrSpace::Global, Some(svod_ir::DeviceSpec::Cpu));
-        let buffer = UOp::new(Op::Buffer { shape: shape.clone(), arg }, dtype);
+        let buffer = UOp::new(Op::Buffer(ops::Buffer { shape: shape.clone(), arg: arg.into() }), dtype);
         let indexed = crate::rangeify::transforms::transform_single_source(
             &UOp::sink(vec![]),
             &buffer,
             &ranges,
             &mut IndexingContext::new(),
         );
-        assert!(matches!(indexed.op(), Op::Index { indices, .. } if indices.len() == expected_indices));
+        assert!(matches!(indexed.op(), Op::Index(ops::Index { indices, .. }) if indices.len() == expected_indices));
     }
 }
 
@@ -154,7 +155,8 @@ fn equal_movement_inputs_reuse_the_cached_index_chain() {
     let rngs = vec![UOp::range_const(13, 0), UOp::range_const(11, 1)];
     let in_shape = [SInt::Const(11), SInt::Const(13)];
     let out_shape = svod_ir::shape::shape_to_uop(&smallvec![SInt::Const(13), SInt::Const(11)]);
-    let reshape = UOp::new(Op::Reshape { src: UOp::index_const(0), new_shape: out_shape }, DType::Float32);
+    let reshape =
+        UOp::new(Op::Reshape(ops::Reshape { src: UOp::index_const(0), new_shape: out_shape }), DType::Float32);
     let holds = || crate::rangeify::indexing::movement_cache_holds(reshape.op(), &in_shape, &rngs);
 
     assert!(!holds(), "these inputs must be new");

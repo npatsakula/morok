@@ -36,7 +36,7 @@ fn test_add_wildcard_pattern() {
     matcher.add_wildcard(|_uop, _ctx| RewriteResult::NoMatch);
 
     assert_eq!(matcher.len(), 1);
-    assert_eq!(matcher.wildcards.len(), 1);
+    assert_eq!(matcher.wildcard_count(), 1);
 }
 
 #[test]

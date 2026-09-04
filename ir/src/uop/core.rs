@@ -11,6 +11,7 @@ use bon::bon;
 use smallvec::SmallVec;
 
 use crate::op::Op;
+use crate::ops;
 use crate::pattern::{Matcher, RewriteResult};
 use crate::shape;
 use crate::types::ConstValue;
@@ -66,12 +67,15 @@ fn traversal_sources(node: &Arc<UOp>, mode: TraversalMode) -> SmallVec<[&Arc<UOp
     }
 
     match node.op() {
-        Op::Call { args, .. } | Op::Function { args, .. } => args.iter().collect(),
+        Op::Call(ops::Call { args, .. }) | Op::Function(ops::Function { args, .. }) => args.iter().collect(),
         // PROGRAM is opaque when preserving call bodies.
-        Op::Program { .. } => SmallVec::new(),
+        Op::Program(..) => SmallVec::new(),
         _ => node.op().children(),
     }
 }
+
+/// Sorted, deduplicated RANGE ids; inline for the common handful of loops.
+pub type RangeIds = SmallVec<[u64; 4]>;
 
 /// Wrapper for `Arc<UOp>` that implements Hash and Eq based on stable ID.
 ///
@@ -123,7 +127,7 @@ pub struct UOp {
     /// Cached shape - computed lazily on first access.
     /// OnceLock provides thread-safe lazy initialization.
     #[debug(skip)]
-    pub(crate) shape_cache: std::sync::OnceLock<crate::Result<Option<shape::Shape>>>,
+    pub(crate) shape_cache: std::sync::OnceLock<Result<Option<shape::Shape>, Box<crate::error::Error>>>,
     /// Cached list of RANGE operations in this UOp's graph.
     /// Computed lazily via toposort to collect all RANGE ops.
     #[debug(skip)]
@@ -136,7 +140,7 @@ pub struct UOp {
     /// ended). Ids rather than `Arc`s: a RANGE's own cache entry would
     /// otherwise be a refcount cycle (permanent leak).
     #[debug(skip)]
-    pub(crate) in_scope_ranges_cache: std::sync::OnceLock<HashSet<u64>>,
+    pub(crate) in_scope_ranges_cache: std::sync::OnceLock<RangeIds>,
     /// Cached vmin/vmax range analysis values.
     /// Computed lazily via range propagation through the computation graph.
     /// Returns (vmin, vmax) as ConstValue types.
@@ -150,10 +154,6 @@ pub struct UOp {
     /// Cached O(1) lookup used by `simplify_valid` to skip And chains inside INDEX trees.
     #[debug(skip)]
     pub(crate) has_index_in_sources_cache: std::sync::OnceLock<bool>,
-    /// Cached backward slice: IDs of all nodes reachable from this UOp (including self).
-    /// O(1) membership test via `backward_slice_ids().contains(&target.id)`.
-    #[debug(skip)]
-    pub(crate) backward_slice_cache: std::sync::OnceLock<HashSet<u64>>,
     /// Whether this node or any node in its backward slice has a weak-float dtype.
     /// Cached O(1) lookup used by the value-sensitive symbolic guard.
     #[debug(skip)]
@@ -202,18 +202,23 @@ pub struct UOp {
     pub(crate) metadata: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
-/// Hash implementation for UOp based on content (dtype + op).
-///
-/// This enables content-based hashing for cross-run caching. The hash traverses
-/// the DAG structure since Op contains `Arc<UOp>` children that also get hashed.
-/// Cache fields are intentionally skipped - they don't affect semantic identity.
+/// Hashes by the precomputed structural content hash, so a derived `Hash` on a
+/// parent `Op` is O(children) and deterministic across runs.
 impl Hash for UOp {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.dtype.hash(state);
-        self.op.hash(state);
-        // Intentionally skip: id, caches, metadata
+        state.write_u64(self.content_hash);
     }
 }
+
+/// Interned identity: structurally equal nodes are the same allocation, so
+/// comparing ids is exact and O(1).
+impl PartialEq for UOp {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for UOp {}
 
 impl UOp {
     /// Get the operation.
@@ -255,10 +260,12 @@ impl UOp {
     /// These are already contiguous by definition, so wrapping in CONTIGUOUS is a no-op.
     pub fn has_buffer_identity(&self) -> bool {
         match &self.op {
-            Op::Reshape { src, .. } | Op::Multi { src, .. } => src.has_buffer_identity(),
-            Op::Buffer { .. } | Op::Slice { .. } | Op::Param { .. } => true,
-            Op::GetTuple { src, index } => match src.op() {
-                Op::Tuple { src: elements } => elements.get(*index).is_some_and(|t| t.has_buffer_identity()),
+            Op::Reshape(ops::Reshape { src, .. }) | Op::Multi(ops::Multi { src, .. }) => src.has_buffer_identity(),
+            Op::Buffer(..) | Op::Slice(..) | Op::Param(..) => true,
+            Op::GetTuple(ops::GetTuple { src, index }) => match src.op() {
+                Op::Tuple(ops::Tuple { src: elements }) => {
+                    elements.get(*index).is_some_and(|t| t.has_buffer_identity())
+                }
                 _ => false,
             },
             _ => false,
@@ -284,7 +291,7 @@ impl UOp {
     pub fn ptrdtype(&self) -> Option<(&DType, svod_dtype::AddrSpace, Option<usize>)> {
         match (&self.dtype, self.op()) {
             (DType::Ptr { base, addrspace, size, .. }, _) => Some((base.as_ref(), *addrspace, *size)),
-            (_, Op::Param { arg, .. } | Op::Buffer { arg, .. }) => {
+            (_, Op::Param(ops::Param { arg, .. }) | Op::Buffer(ops::Buffer { arg, .. })) => {
                 Some((&arg.dtype, arg.addrspace.unwrap_or(svod_dtype::AddrSpace::Global), None))
             }
             _ => None,
@@ -304,8 +311,6 @@ impl UOp {
     }
 
     pub(crate) fn compute_addrspace(self: &Arc<Self>) -> Option<svod_dtype::AddrSpace> {
-        use Op::*;
-
         let common = |sources: SmallVec<[Arc<UOp>; 4]>| {
             let mut address_spaces = sources.iter().filter_map(|source| source.addrspace());
             let first = address_spaces.next()?;
@@ -313,24 +318,28 @@ impl UOp {
         };
 
         match self.op() {
-            Param { arg, .. } | Buffer { arg, .. } => arg.addrspace,
-            Index { buffer, .. } | MSelect { buffer, .. } => buffer.addrspace(),
-            Cast { src, .. }
-            | After { passthrough: src, .. }
-            | Reduce { src, .. }
-            | End { computation: src, .. }
-            | Reshape { src, .. }
-            | Permute { src, .. }
-            | Expand { src, .. }
-            | Pad { src, .. }
-            | Shrink { src, .. }
-            | Flip { src, .. }
-            | Multi { src, .. } => src.addrspace(),
-            Store { index, .. } => index.addrspace(),
-            MStack { buffers } => buffers.first().and_then(|buffer| buffer.addrspace()),
-            Unary(..) | Binary(..) | Ternary(..) | BitCast { .. } | Stack { .. } | Wmma { .. } | Group { .. } => {
-                common(self.op().sources())
-            }
+            Op::Param(ops::Param { arg, .. }) | Op::Buffer(ops::Buffer { arg, .. }) => arg.addrspace,
+            Op::Index(ops::Index { buffer, .. }) | Op::MSelect(ops::MSelect { buffer, .. }) => buffer.addrspace(),
+            Op::Cast(ops::Cast { src, .. })
+            | Op::After(ops::After { passthrough: src, .. })
+            | Op::Reduce(ops::Reduce { src, .. })
+            | Op::End(ops::End { computation: src, .. })
+            | Op::Reshape(ops::Reshape { src, .. })
+            | Op::Permute(ops::Permute { src, .. })
+            | Op::Expand(ops::Expand { src, .. })
+            | Op::Pad(ops::Pad { src, .. })
+            | Op::Shrink(ops::Shrink { src, .. })
+            | Op::Flip(ops::Flip { src, .. })
+            | Op::Multi(ops::Multi { src, .. }) => src.addrspace(),
+            Op::Store(ops::Store { index, .. }) => index.addrspace(),
+            Op::MStack(ops::MStack { buffers }) => buffers.first().and_then(|buffer| buffer.addrspace()),
+            Op::Unary(..)
+            | Op::Binary(..)
+            | Op::Ternary(..)
+            | Op::BitCast(..)
+            | Op::Stack(..)
+            | Op::Wmma(..)
+            | Op::Group(..) => common(self.op().sources()),
             _ => None,
         }
     }
@@ -369,7 +378,7 @@ impl UOp {
     /// ```
     pub fn unwrap_after(self: &Arc<Self>) -> Arc<Self> {
         match self.op() {
-            Op::After { passthrough, .. } => passthrough.unwrap_after(),
+            Op::After(ops::After { passthrough, .. }) => passthrough.unwrap_after(),
             _ => self.clone(),
         }
     }
@@ -387,7 +396,7 @@ impl UOp {
     /// ```
     pub fn unwrap_cast(self: &Arc<Self>) -> Arc<Self> {
         match self.op() {
-            Op::Cast { src, .. } => src.unwrap_cast(),
+            Op::Cast(ops::Cast { src, .. }) => src.unwrap_cast(),
             _ => self.clone(),
         }
     }
@@ -402,8 +411,8 @@ impl UOp {
     /// - The STORE's index is not an INDEX operation
     pub fn store_buffer(&self) -> Option<&Arc<UOp>> {
         match self.op() {
-            Op::Store { index, .. } => match index.op() {
-                Op::Index { buffer, .. } => Some(buffer),
+            Op::Store(ops::Store { index, .. }) => match index.op() {
+                Op::Index(ops::Index { buffer, .. }) => Some(buffer),
                 _ => None,
             },
             _ => None,
@@ -418,7 +427,7 @@ impl UOp {
     ///
     /// Debug-asserts that self is an INDEX operation.
     pub fn store_value(self: &Arc<Self>, value: Arc<Self>) -> Arc<Self> {
-        debug_assert!(matches!(self.op(), Op::Index { .. }), "store_value requires INDEX");
+        debug_assert!(matches!(self.op(), Op::Index(..)), "store_value requires INDEX");
         self.store(value)
     }
 
@@ -449,7 +458,7 @@ impl UOp {
         use crate::uop::properties::ShapeProperty;
         match ShapeProperty::get(self) {
             Ok(opt) => Ok(opt.as_ref()),
-            Err(e) => Err(e.clone()),
+            Err(e) => Err((**e).clone()),
         }
     }
 
@@ -511,8 +520,8 @@ impl UOp {
 
     pub(crate) fn compute_device_spec(self: &Arc<Self>) -> Option<svod_dtype::DeviceSpec> {
         match self.op() {
-            Op::Buffer { arg, .. } | Op::Param { arg, .. } => arg.device.clone(),
-            Op::Copy { device, .. } | Op::AllReduce { device, .. } => Some(device.clone()),
+            Op::Buffer(ops::Buffer { arg, .. }) | Op::Param(ops::Param { arg, .. }) => arg.device.clone(),
+            Op::Copy(ops::Copy { device, .. }) | Op::AllReduce(ops::AllReduce { device, .. }) => Some(device.clone()),
             // Children are memoised, so this is a single level, not a re-walk.
             _ => self.op().children().iter().find_map(|child| child.device_spec()),
         }
@@ -548,13 +557,13 @@ impl UOp {
     pub fn base(self: &Arc<Self>) -> Arc<Self> {
         match &self.op {
             // Movement operations - recursively get base of source
-            Op::Reshape { src, .. }
-            | Op::Permute { src, .. }
-            | Op::Expand { src, .. }
-            | Op::Pad { src, .. }
-            | Op::Shrink { src, .. }
-            | Op::Flip { src, .. }
-            | Op::Multi { src, .. } => src.base(),
+            Op::Reshape(ops::Reshape { src, .. })
+            | Op::Permute(ops::Permute { src, .. })
+            | Op::Expand(ops::Expand { src, .. })
+            | Op::Pad(ops::Pad { src, .. })
+            | Op::Shrink(ops::Shrink { src, .. })
+            | Op::Flip(ops::Flip { src, .. })
+            | Op::Multi(ops::Multi { src, .. }) => src.base(),
             // All other operations are their own base
             _ => self.clone(),
         }
@@ -578,15 +587,15 @@ impl UOp {
     /// ```
     pub fn buf_uop(self: &Arc<Self>) -> Arc<Self> {
         match self.op() {
-            Op::Buffer { .. } => self.clone(),
-            Op::MSelect { buffer, .. } => buffer.buf_uop(),
-            Op::MStack { buffers } if !buffers.is_empty() => buffers[0].buf_uop(),
-            Op::After { passthrough, .. } => passthrough.buf_uop(),
-            Op::Call { body, .. } | Op::Function { body, .. } => body.buf_uop(),
+            Op::Buffer(..) => self.clone(),
+            Op::MSelect(ops::MSelect { buffer, .. }) => buffer.buf_uop(),
+            Op::MStack(ops::MStack { buffers }) if !buffers.is_empty() => buffers[0].buf_uop(),
+            Op::After(ops::After { passthrough, .. }) => passthrough.buf_uop(),
+            Op::Call(ops::Call { body, .. }) | Op::Function(ops::Function { body, .. }) => body.buf_uop(),
             _ => {
                 // For other ops, check if base is AFTER
                 let base = self.base();
-                if matches!(base.op(), Op::After { .. }) { base.buf_uop() } else { self.clone() }
+                if matches!(base.op(), Op::After(..)) { base.buf_uop() } else { self.clone() }
             }
         }
     }
@@ -845,7 +854,7 @@ impl UOp {
     /// cached values, so the total cost across the graph is O(N).
     pub fn has_index_in_sources(self: &Arc<Self>) -> bool {
         *self.has_index_in_sources_cache.get_or_init(|| {
-            if matches!(self.op, Op::Index { .. }) {
+            if matches!(self.op, Op::Index(..)) {
                 return true;
             }
             let mut result = false;
@@ -897,7 +906,7 @@ impl UOp {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::RangesProperty;
         let cached = RangesProperty::get(self);
-        if matches!(self.op, Op::Range { .. }) {
+        if matches!(self.op, Op::Range(..)) {
             std::iter::once(self.clone()).chain(cached.iter().cloned()).collect()
         } else {
             cached.clone()
@@ -934,7 +943,7 @@ impl UOp {
     /// // After END, range is no longer in scope
     /// assert!(!end_op.in_scope_ranges().contains(&range.id));
     /// ```
-    pub fn in_scope_ranges(self: &Arc<Self>) -> &HashSet<u64> {
+    pub fn in_scope_ranges(self: &Arc<Self>) -> &[u64] {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::InScopeRangesProperty;
         InScopeRangesProperty::get(self)
@@ -1108,10 +1117,10 @@ impl UOp {
             | Op::Unique(_)
             | Op::LUnique(_)
             | Op::Noop
-            | Op::VConst { .. }
-            | Op::DefineVar { .. }
-            | Op::Source { .. }
-            | Op::ProgramBinary { .. } => {
+            | Op::VConst(..)
+            | Op::DefineVar(..)
+            | Op::Source(..)
+            | Op::ProgramBinary(..) => {
                 assert_eq!(new_srcs.len(), 0, "Nullary op should have no sources");
                 return self.clone(); // No sources to replace
             }
@@ -1135,158 +1144,166 @@ impl UOp {
             }
 
             // Type operations
-            Op::Cast { dtype, .. } => {
+            Op::Cast(ops::Cast { dtype, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::Cast { src: src(0), dtype: dtype.clone() }
+                Op::Cast(ops::Cast { src: src(0), dtype: dtype.clone() })
             }
-            Op::BitCast { dtype, .. } => {
+            Op::BitCast(ops::BitCast { dtype, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::BitCast { src: src(0), dtype: dtype.clone() }
+                Op::BitCast(ops::BitCast { src: src(0), dtype: dtype.clone() })
             }
-            Op::GetAddr { device, .. } => {
+            Op::GetAddr(ops::GetAddr { device, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::GetAddr { src: src(0), device: device.clone() }
+                Op::GetAddr(ops::GetAddr { src: src(0), device: device.clone() })
             }
 
             // Special operations
-            Op::MSelect { device_index, .. } => {
+            Op::MSelect(ops::MSelect { device_index, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::MSelect { buffer: src(0), device_index: *device_index }
+                Op::MSelect(ops::MSelect { buffer: src(0), device_index: *device_index })
             }
-            Op::Special { name, .. } => {
+            Op::Special(ops::Special { name, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::Special { end: src(0), name: name.clone() }
+                Op::Special(ops::Special { end: src(0), name: name.clone() })
             }
 
             // Buffer operations
-            Op::Buffer { arg, .. } => {
+            Op::Buffer(ops::Buffer { arg, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::Buffer { shape: src(0), arg: arg.clone() }
+                Op::Buffer(ops::Buffer { shape: src(0), arg: arg.clone() })
             }
-            Op::Param { arg, .. } => {
+            Op::Param(ops::Param { arg, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::Param { shape: src(0), arg: arg.clone() }
+                Op::Param(ops::Param { shape: src(0), arg: arg.clone() })
             }
-            Op::Slice { size, .. } => {
+            Op::Slice(ops::Slice { size, .. }) => {
                 assert_eq!(new_srcs.len(), 2);
-                Op::Slice { buffer: src(0), offset: src(1), size: *size }
+                Op::Slice(ops::Slice { buffer: src(0), offset: src(1), size: *size })
             }
-            Op::Stage { opts, .. } => {
+            Op::Stage(ops::Stage { opts, .. }) => {
                 assert!(!new_srcs.is_empty());
-                Op::Stage { compute: src(0), ranges: new_srcs[1..].iter().cloned().collect(), opts: opts.clone() }
+                Op::Stage(ops::Stage {
+                    compute: src(0),
+                    ranges: new_srcs[1..].iter().cloned().collect(),
+                    opts: opts.clone(),
+                })
             }
-            Op::Index { .. } => {
+            Op::Index(..) => {
                 assert!(!new_srcs.is_empty());
                 let buffer = src(0);
                 let indices: SmallVec<[Arc<Self>; 4]> = new_srcs[1..].iter().cloned().collect();
-                Op::Index { buffer, indices }
+                Op::Index(ops::Index { buffer, indices })
             }
-            Op::Copy { device, .. } => {
+            Op::Copy(ops::Copy { device, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::Copy { src: src(0), device: device.clone() }
+                Op::Copy(ops::Copy { src: src(0), device: device.clone() })
             }
-            Op::MStack { .. } => Op::MStack { buffers: new_srcs.iter().cloned().collect() },
+            Op::MStack(..) => Op::MStack(ops::MStack { buffers: new_srcs.iter().cloned().collect() }),
 
             // Movement operations
-            Op::Reshape { .. } => {
+            Op::Reshape(..) => {
                 assert_eq!(new_srcs.len(), 2);
-                Op::Reshape { src: src(0), new_shape: src(1) }
+                Op::Reshape(ops::Reshape { src: src(0), new_shape: src(1) })
             }
-            Op::Permute { axes, .. } => {
+            Op::Permute(ops::Permute { axes, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::Permute { src: src(0), axes: axes.clone() }
+                Op::Permute(ops::Permute { src: src(0), axes: axes.clone() })
             }
-            Op::Expand { .. } => {
+            Op::Expand(..) => {
                 assert_eq!(new_srcs.len(), 2);
-                Op::Expand { src: src(0), new_shape: src(1) }
+                Op::Expand(ops::Expand { src: src(0), new_shape: src(1) })
             }
-            Op::Pad { .. } => {
+            Op::Pad(..) => {
                 assert_eq!(new_srcs.len(), 3);
-                Op::Pad { src: src(0), begin_pads: src(1), end_pads: src(2) }
+                Op::Pad(ops::Pad { src: src(0), begin_pads: src(1), end_pads: src(2) })
             }
-            Op::Shrink { .. } => {
+            Op::Shrink(..) => {
                 assert_eq!(new_srcs.len(), 3);
-                Op::Shrink { src: src(0), offsets: src(1), sizes: src(2) }
+                Op::Shrink(ops::Shrink { src: src(0), offsets: src(1), sizes: src(2) })
             }
-            Op::Flip { axes, .. } => {
+            Op::Flip(ops::Flip { axes, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::Flip { src: src(0), axes: axes.clone() }
+                Op::Flip(ops::Flip { src: src(0), axes: axes.clone() })
             }
-            Op::Multi { axis, .. } => {
+            Op::Multi(ops::Multi { axis, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::Multi { src: src(0), axis: *axis }
+                Op::Multi(ops::Multi { src: src(0), axis: *axis })
             }
 
             // Reduction operations
-            Op::ReduceAxis { reduce_op, axes, .. } => {
+            Op::ReduceAxis(ops::ReduceAxis { reduce_op, axes, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::ReduceAxis { src: src(0), reduce_op: *reduce_op, axes: axes.clone() }
+                Op::ReduceAxis(ops::ReduceAxis { src: src(0), reduce_op: *reduce_op, axes: axes.clone() })
             }
-            Op::Reduce { reduce_op, num_axes, .. } => {
+            Op::Reduce(ops::Reduce { reduce_op, num_axes, .. }) => {
                 assert!(!new_srcs.is_empty());
-                Op::Reduce {
+                Op::Reduce(ops::Reduce {
                     src: src(0),
                     ranges: new_srcs[1..].iter().cloned().collect(),
                     reduce_op: *reduce_op,
                     num_axes: *num_axes,
-                }
+                })
             }
-            Op::AllReduce { device, reduce_op, .. } => {
+            Op::AllReduce(ops::AllReduce { device, reduce_op, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::AllReduce { src: src(0), device: device.clone(), reduce_op: *reduce_op }
+                Op::AllReduce(ops::AllReduce { src: src(0), device: device.clone(), reduce_op: *reduce_op })
             }
 
             // Control flow operations
-            Op::If { .. } => {
+            Op::If(..) => {
                 assert!(!new_srcs.is_empty());
-                Op::If { condition: src(0), body: new_srcs[1..].iter().cloned().collect() }
+                Op::If(ops::If { condition: src(0), body: new_srcs[1..].iter().cloned().collect() })
             }
-            Op::EndIf { .. } => {
+            Op::EndIf(..) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::EndIf { if_op: src(0) }
+                Op::EndIf(ops::EndIf { if_op: src(0) })
             }
-            Op::Range { axis_id, axis_type, .. } => {
+            Op::Range(ops::Range { axis_id, axis_type, .. }) => {
                 assert!(!new_srcs.is_empty());
-                Op::Range {
+                Op::Range(ops::Range {
                     end: src(0),
                     axis_id: axis_id.clone(),
                     axis_type: *axis_type,
                     deps: new_srcs[1..].iter().cloned().collect(),
-                }
+                })
             }
-            Op::End { .. } => {
+            Op::End(..) => {
                 assert!(!new_srcs.is_empty());
-                Op::End { computation: src(0), ranges: new_srcs[1..].iter().cloned().collect() }
+                Op::End(ops::End { computation: src(0), ranges: new_srcs[1..].iter().cloned().collect() })
             }
-            Op::Barrier { .. } => {
+            Op::Barrier(..) => {
                 assert!(!new_srcs.is_empty());
-                Op::Barrier { src: src(0), deps: new_srcs[1..].iter().cloned().collect() }
+                Op::Barrier(ops::Barrier { src: src(0), deps: new_srcs[1..].iter().cloned().collect() })
             }
 
-            Op::Stack { .. } => {
+            Op::Stack(..) => {
                 return Self::stack(new_srcs.iter().cloned().collect());
             }
 
             // Symbolic/Define operations
-            Op::Bind { .. } => {
+            Op::Bind(..) => {
                 assert_eq!(new_srcs.len(), 2);
-                Op::Bind { var: src(0), value: src(1) }
+                Op::Bind(ops::Bind { var: src(0), value: src(1) })
             }
 
             // Advanced operations
-            Op::Wmma { metadata, .. } => {
+            Op::Wmma(ops::Wmma { metadata, .. }) => {
                 assert_eq!(new_srcs.len(), 3);
-                Op::Wmma { a: src(0), b: src(1), c: src(2), metadata: metadata.clone() }
+                Op::Wmma(ops::Wmma { a: src(0), b: src(1), c: src(2), metadata: metadata.clone() })
             }
-            Op::Call { info, .. } => {
+            Op::Call(ops::Call { info, .. }) => {
                 assert!(!new_srcs.is_empty(), "Call requires at least body source");
-                Op::Call { body: src(0), args: new_srcs[1..].iter().cloned().collect(), info: info.clone() }
+                Op::Call(ops::Call { body: src(0), args: new_srcs[1..].iter().cloned().collect(), info: info.clone() })
             }
-            Op::Function { info, .. } => {
+            Op::Function(ops::Function { info, .. }) => {
                 assert!(!new_srcs.is_empty(), "Function requires at least body source");
-                Op::Function { body: src(0), args: new_srcs[1..].iter().cloned().collect(), info: info.clone() }
+                Op::Function(ops::Function {
+                    body: src(0),
+                    args: new_srcs[1..].iter().cloned().collect(),
+                    info: info.clone(),
+                })
             }
-            Op::Program { info, linear, source, binary, .. } => {
+            Op::Program(ops::Program { info, linear, source, binary, .. }) => {
                 assert!(!new_srcs.is_empty(), "Program requires a sink source");
                 let mut idx = 0usize;
                 let sink = src(idx);
@@ -1315,51 +1332,64 @@ impl UOp {
                 };
 
                 assert_eq!(idx, new_srcs.len(), "Program source count mismatch");
-                Op::Program { sink, info: info.clone(), linear: linear_new, source: source_new, binary: binary_new }
+                Op::Program(ops::Program {
+                    sink,
+                    info: info.clone(),
+                    linear: linear_new,
+                    source: source_new,
+                    binary: binary_new,
+                })
             }
-            Op::Linear { .. } => Op::Linear { ops: new_srcs.iter().cloned().collect() },
-            Op::Ins { arg, .. } => Op::Ins { sources: new_srcs.iter().cloned().collect(), arg: arg.clone() },
-            Op::Tuple { .. } => Op::Tuple { src: new_srcs.iter().cloned().collect() },
-            Op::GetTuple { index, .. } => {
+            Op::Linear(..) => Op::Linear(ops::Linear { ops: new_srcs.iter().cloned().collect() }),
+            Op::Ins(ops::Ins { arg, .. }) => {
+                Op::Ins(ops::Ins { sources: new_srcs.iter().cloned().collect(), arg: arg.clone() })
+            }
+            Op::Tuple(..) => Op::Tuple(ops::Tuple { src: new_srcs.iter().cloned().collect() }),
+            Op::GetTuple(ops::GetTuple { index, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::GetTuple { src: src(0), index: *index }
+                Op::GetTuple(ops::GetTuple { src: src(0), index: *index })
             }
-            Op::Detach { .. } => {
+            Op::Detach(..) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::Detach { src: src(0) }
+                Op::Detach(ops::Detach { src: src(0) })
             }
-            Op::Contiguous { opts, .. } => {
+            Op::Contiguous(ops::Contiguous { opts, .. }) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::Contiguous { src: src(0), opts: opts.clone() }
+                Op::Contiguous(ops::Contiguous { src: src(0), opts: opts.clone() })
             }
-            Op::ContiguousBackward { .. } => {
+            Op::ContiguousBackward(..) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::ContiguousBackward { src: src(0) }
+                Op::ContiguousBackward(ops::ContiguousBackward { src: src(0) })
             }
-            Op::After { .. } => {
+            Op::After(..) => {
                 assert!(!new_srcs.is_empty());
                 let passthrough = src(0);
                 // AFTER passthrough must not be control flow.
                 debug_assert!(
-                    !matches!(passthrough.op(), Op::Range { .. } | Op::End { .. }),
+                    !matches!(passthrough.op(), Op::Range(..) | Op::End(..)),
                     "reconstruct_sources: AFTER passthrough is {:?} (id={}), expected non-control-flow",
                     passthrough.op(),
                     passthrough.id
                 );
-                Op::After { passthrough, deps: new_srcs[1..].iter().cloned().collect() }
+                Op::After(ops::After { passthrough, deps: new_srcs[1..].iter().cloned().collect() })
             }
-            Op::Precast { .. } => {
+            Op::Precast(..) => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::Precast { src: src(0) }
+                Op::Precast(ops::Precast { src: src(0) })
             }
-            Op::Custom { code, .. } => Op::Custom { deps: new_srcs.iter().cloned().collect(), code: code.clone() },
-            Op::CustomFunction { kind, .. } => {
-                Op::CustomFunction { kind: kind.clone(), attrs: new_srcs.iter().cloned().collect() }
+            Op::Custom(ops::Custom { code, .. }) => {
+                Op::Custom(ops::Custom { deps: new_srcs.iter().cloned().collect(), code: code.clone() })
             }
-            Op::CustomI { code, .. } => Op::CustomI { deps: new_srcs.iter().cloned().collect(), code: code.clone() },
+            Op::CustomFunction(ops::CustomFunction { kind, .. }) => Op::CustomFunction(ops::CustomFunction {
+                kind: kind.clone(),
+                attrs: new_srcs.iter().cloned().collect(),
+            }),
+            Op::CustomI(ops::CustomI { code, .. }) => {
+                Op::CustomI(ops::CustomI { deps: new_srcs.iter().cloned().collect(), code: code.clone() })
+            }
 
             // Memory operations
-            Op::Load { alt, gate, .. } => {
+            Op::Load(ops::Load { alt, gate, .. }) => {
                 assert_eq!(alt.is_some(), gate.is_some(), "LOAD requires either index only or index, alt, and gate");
                 let expected = 1 + usize::from(alt.is_some()) + usize::from(gate.is_some());
                 assert_eq!(new_srcs.len(), expected);
@@ -1370,16 +1400,18 @@ impl UOp {
                     value
                 });
                 let new_gate = gate.as_ref().map(|_| src(next));
-                Op::Load { index: src(0), alt: new_alt, gate: new_gate }
+                Op::Load(ops::Load { index: src(0), alt: new_alt, gate: new_gate })
             }
-            Op::Store { gate, .. } => {
+            Op::Store(ops::Store { gate, .. }) => {
                 assert_eq!(new_srcs.len(), 2 + usize::from(gate.is_some()));
-                Op::Store { index: src(0), value: src(1), gate: gate.as_ref().map(|_| src(2)) }
+                Op::Store(ops::Store { index: src(0), value: src(1), gate: gate.as_ref().map(|_| src(2)) })
             }
 
             // Graph organization
-            Op::Sink { info, .. } => Op::Sink { sources: new_srcs.iter().cloned().collect(), info: info.clone() },
-            Op::Group { .. } => Op::Group { sources: new_srcs.iter().cloned().collect() },
+            Op::Sink(ops::Sink { info, .. }) => {
+                Op::Sink(ops::Sink { sources: new_srcs.iter().cloned().collect(), info: info.clone() })
+            }
+            Op::Group(..) => Op::Group(ops::Group { sources: new_srcs.iter().cloned().collect() }),
         };
 
         // ALU dtype and shape are independent: shaped STACK sources still have
@@ -1445,26 +1477,33 @@ fn visited_set(capacity: usize) -> rustc_hash::FxHashSet<*const UOp> {
     rustc_hash::FxHashSet::with_capacity_and_hasher(capacity, Default::default())
 }
 
-impl Clone for UOp {
-    fn clone(&self) -> Self {
+impl UOp {
+    /// Allocate a node with a fresh id; interning and provenance are the caller's job.
+    pub(crate) fn fresh(
+        op: Op,
+        dtype: DType,
+        tag: Option<SmallVec<[usize; 2]>>,
+        content_hash: u64,
+        src_ops: crate::op::OpMask,
+        metadata: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Self {
         Self {
-            id: self.id,
-            op: self.op.clone(),
-            dtype: self.dtype.clone(),
-            content_hash: self.content_hash,
-            src_ops: self.src_ops,
-            tag: self.tag.clone(),
+            id: crate::uop::hash_consing::next_uop_id(),
+            op,
+            dtype,
+            content_hash,
+            src_ops,
+            tag,
+            metadata,
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),
             vmin_vmax_cache: std::sync::OnceLock::new(),
             sound_vmin_vmax_cache: std::sync::OnceLock::new(),
             has_index_in_sources_cache: std::sync::OnceLock::new(),
-            backward_slice_cache: std::sync::OnceLock::new(),
             has_weak_float_cache: std::sync::OnceLock::new(),
             device_spec_cache: std::sync::OnceLock::new(),
             addrspace_cache: std::sync::OnceLock::new(),
-            metadata: self.metadata.clone(),
         }
     }
 }

@@ -38,17 +38,17 @@ Svod 提供了一种领域特定语言来编写优化模式：
 ```rust
 patterns! {
     // Identity folding: x + 0 → x
-    Add[x, @zero] ~> |x| x.clone(),
+    Add[x, @zero] => x,
 
     // Constant folding: 3 + 4 → 7
-    Add(a @const(a_val), b @const(b_val))
-        => |a, a_val, b_val| eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
+    Add(a @const(a_val), _b @const(b_val))
+        => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 
     // Self-folding: x / x → 1
-    Idiv(x, x) ~> |x| UOp::one(x.dtype()),
+    Idiv(x, x) => UOp::one(x.dtype()),
 
     // Dead code elimination: if(true) { t } else { f } → t
-    Where(@true, t, _f) ~> |t| t.clone(),
+    Where(Const(ConstValue::Bool(true)), t, _f) => t,
 }
 ```
 
@@ -56,14 +56,13 @@ patterns! {
 
 | 语法 | 含义 | 示例 |
 |--------|---------|---------|
-| `(x, y)` | **有序。** 按精确顺序匹配。 | `Sub(x, @zero) ~> x` |
-| `[x, y]` | **交换律。** 尝试两种顺序。 | `Add[x, @zero] ~> x` |
-| `@zero` | **零常量。** 匹配 0 或 0.0。 | `Mul[_, z @ @zero] ~> z` |
-| `@one` | **一常量。** 匹配 1 或 1.0。 | `Mul[x, @one] ~> x` |
-| `@const(val)` | **提取常量。** 绑定值。 | `Add(@const(a), @const(b))` |
-| `x, x` | **同一操作数。** 自动生成 ptr_eq 检查。 | `Idiv(x, x) ~> UOp::one(...)` |
-| `~>` | **不会失败。** 总是成功，返回 `Arc<UOp>`。 | `Add[x, @zero] ~> x` |
-| `=>` | **可能失败。** 返回 `Option<Arc<UOp>>`。 | `=> eval(...).map(...)` |
+| `(x, y)` | **有序。** 按精确顺序匹配。 | `Sub(x, @zero) => x` |
+| `[x, y]` | **交换律。** 尝试两种顺序。 | `Add[x, @zero] => x` |
+| `@zero` | **零常量。** 匹配 0 或 0.0。 | `Mul[_, z @ @zero] => z` |
+| `@one` | **一常量。** 匹配 1 或 1.0。 | `Mul[x, @one] => x` |
+| `c @const(val)` | **提取常量。** 绑定值。 | `Add(a @const(av), _b @const(bv))` |
+| `x, x` | **同一操作数。** 自动生成 ptr_eq 检查。 | `Idiv(x, x) => UOp::one(...)` |
+| `=>` | **重写。** 返回 `Arc<UOp>`、`Option<Arc<UOp>>`（`None` 表示放弃）或 `RewriteResult`。 | `=> eval(...).map(...)` |
 | `for op in binary [...]` | **模板。** 为多个操作生成模式。 | 见下文 |
 | `@context Type` | **有状态。** 在模式中访问可变上下文。 | 见下文 |
 
@@ -74,8 +73,8 @@ patterns! {
 ```rust
 patterns! {
     for op in binary [Add, Mul, Sub, Idiv, Fdiv, Max] {
-        op(a @const(a_val), b @const(b_val))
-            => |a, a_val, b_val| eval_binary(op, a_val, b_val)
+        op(a @const(a_val), _b @const(b_val))
+            => eval_binary(op, a_val, b_val)
                 .map(|r| UOp::const_(a.dtype(), r))
     }
 }
@@ -91,7 +90,7 @@ patterns! {
 patterns! {
     @context KernelContext;
 
-    ReduceAxis { src } => |reduce, src, ctx| {
+    reduce @ ReduceAxis { src, .. } => {
         ctx.record_reduction(reduce);
         transform_reduce(reduce, src, ctx)
     }
@@ -112,26 +111,26 @@ let mega_pass = symbolic().with_context::<PcontigConfig>()
 
 ## 模式匹配的工作原理
 
-`patterns!` 宏生成一个 `SimplifiedPatternMatcher`，通过 HashMap 查找在 **O(1)** 时间内将模式分派到相关桶，然后按顺序尝试桶中的每个模式。
+`patterns!` 宏把一个块编译成一个函数，用 `match` 按根操作的种类分派，然后按源码顺序尝试该种类的模式。
 
 ### OpKey 索引
 
 每个 UOp 都有一个操作类型（Add、Mul、Load 等）。宏生成一个 OpKey 枚举，将操作映射为可哈希的键：
 
 ```rust
-pub struct SimplifiedPatternMatcher<C = ()> {
-    indexed: HashMap<OpKey, Vec<PatternClosure<C>>>,  // O(1) lookup
-    wildcards: Vec<PatternClosure<C>>,                 // patterns matching any op
+match OpKey::from_op(tree.op()).index() {
+    KEY_ADD => { /* rules rooted at Add, in source order */ }
+    KEY_MUL => { /* rules rooted at Mul */ }
+    _ => {}
 }
+// wildcard rules (`x if cond`) run as sequential steps between the matches
 ```
 
 匹配一个 UOp 时：
 1. 从 UOp 的操作中**提取 OpKey**
-2. 在 HashMap 中**查找**——O(1)
+2. **跳转**到该种类的 `match` 分支
 3. **逐一尝试闭包**直到有一个匹配
 4. 如果没有索引模式匹配，**回退**到通配符
-
-这比线性扫描所有模式快 5-10 倍。
 
 ### 交换律处理
 
@@ -202,7 +201,6 @@ flowchart TD
 ### 安全限制
 
 为防止无限循环：
-- 每个节点最多 **1000 次迭代**
 - 总计最多 **500,000 次迭代**
 - 超限时 panic 并输出诊断信息
 

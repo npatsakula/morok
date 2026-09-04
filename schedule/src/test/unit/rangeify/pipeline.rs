@@ -9,6 +9,7 @@ use svod_ir::{AxisId, AxisType, CallInfo, ConstValue, Op, ReduceOp, SInt, UOp};
 use test_case::test_case;
 
 use crate::rangeify::{rangeify, run_rangeify, try_get_kernel_graph};
+use svod_ir::ops;
 
 struct NoRewrite;
 
@@ -23,7 +24,7 @@ struct StripDetach;
 impl svod_ir::Matcher<()> for StripDetach {
     fn rewrite(&self, uop: &Arc<UOp>, _ctx: &mut ()) -> svod_ir::RewriteResult {
         match uop.op() {
-            Op::Detach { src } => svod_ir::RewriteResult::Rewritten(src.clone()),
+            Op::Detach(ops::Detach { src }) => svod_ir::RewriteResult::Rewritten(src.clone()),
             _ => svod_ir::RewriteResult::NoMatch,
         }
     }
@@ -48,10 +49,12 @@ fn tensor_reduce_becomes_a_loop_reduce_over_ranges() {
     let (rangeified, _ctx) = run_rangeify(UOp::sink(vec![tensor_reduce.contiguous()])).expect("run_rangeify");
 
     let reductions: Vec<_> =
-        rangeified.toposort().into_iter().filter(|node| matches!(node.op(), Op::Reduce { .. })).collect();
+        rangeified.toposort().into_iter().filter(|node| matches!(node.op(), Op::Reduce(..))).collect();
     assert!(!reductions.is_empty());
     assert!(
-        reductions.iter().all(|node| matches!(node.op(), Op::Reduce { ranges, num_axes: 0, .. } if !ranges.is_empty())),
+        reductions
+            .iter()
+            .all(|node| matches!(node.op(), Op::Reduce(ops::Reduce { ranges, num_axes: 0, .. }) if !ranges.is_empty())),
         "every REDUCE must carry explicit ranges and no tensor axes"
     );
 }
@@ -66,7 +69,7 @@ fn run_rangeify_lowers_every_pad(pads: &[(usize, usize)]) {
 
     let (rangeified, _ctx) = run_rangeify(UOp::sink(vec![padded.contiguous()])).expect("run_rangeify");
     assert!(
-        !rangeified.toposort().iter().any(|node| matches!(node.op(), Op::Pad { .. } | Op::ReduceAxis { .. })),
+        !rangeified.toposort().iter().any(|node| matches!(node.op(), Op::Pad(..) | Op::ReduceAxis(..))),
         "rangeify must lower every PAD:\n{}",
         rangeified.tree()
     );
@@ -80,21 +83,21 @@ fn run_rangeify_preserves_call_and_function_bodies_by_default() {
 
     let call = reduced.call(smallvec![arg.clone()], CallInfo::default());
     let (rangeified_call, _ctx) = run_rangeify(call).expect("run_rangeify should preserve call bodies");
-    let Op::Call { body: call_body, .. } = rangeified_call.op() else {
+    let Op::Call(ops::Call { body: call_body, .. }) = rangeified_call.op() else {
         panic!("expected CALL root after run_rangeify")
     };
     assert!(
-        call_body.toposort().iter().any(|u| matches!(u.op(), Op::Reduce { num_axes: 1, .. })),
+        call_body.toposort().iter().any(|u| matches!(u.op(), Op::Reduce(ops::Reduce { num_axes: 1, .. }))),
         "run_rangeify should not rewrite CALL body by default"
     );
 
     let function = reduced.function(smallvec![arg], CallInfo::default());
     let (rangeified_function, _ctx) = run_rangeify(function).expect("run_rangeify should preserve function bodies");
-    let Op::Function { body: function_body, .. } = rangeified_function.op() else {
+    let Op::Function(ops::Function { body: function_body, .. }) = rangeified_function.op() else {
         panic!("expected FUNCTION root after run_rangeify")
     };
     assert!(
-        function_body.toposort().iter().any(|u| matches!(u.op(), Op::Reduce { num_axes: 1, .. })),
+        function_body.toposort().iter().any(|u| matches!(u.op(), Op::Reduce(ops::Reduce { num_axes: 1, .. }))),
         "run_rangeify should not rewrite FUNCTION body by default"
     );
 }
@@ -103,7 +106,7 @@ fn run_rangeify_preserves_call_and_function_bodies_by_default() {
 fn only_an_explicit_full_traversal_rewrites_inside_call_and_function_bodies() {
     let detached = UOp::native_const(1.0f32).detach();
     let arg = UOp::native_const(2.0f32);
-    let has_detach = |body: &Arc<UOp>| body.toposort().iter().any(|u| matches!(u.op(), Op::Detach { .. }));
+    let has_detach = |body: &Arc<UOp>| body.toposort().iter().any(|u| matches!(u.op(), Op::Detach(..)));
 
     for opaque in [
         detached.call(smallvec![arg.clone()], CallInfo::default()),
@@ -112,14 +115,14 @@ fn only_an_explicit_full_traversal_rewrites_inside_call_and_function_bodies() {
         let preserved =
             svod_ir::rewrite::graph_rewrite_with_bpm_preserve_calls(&NoRewrite, &StripDetach, opaque, &mut ());
         let body = match preserved.op() {
-            Op::Call { body, .. } | Op::Function { body, .. } => body,
+            Op::Call(ops::Call { body, .. }) | Op::Function(ops::Function { body, .. }) => body,
             op => panic!("expected an opaque root, got {op:?}"),
         };
         assert!(has_detach(body), "preserve-calls rewrite must leave the body alone");
 
         let full = svod_ir::rewrite::graph_rewrite_with_bpm(&NoRewrite, &StripDetach, Arc::clone(&preserved), &mut ());
         let body = match full.op() {
-            Op::Call { body, .. } | Op::Function { body, .. } => body,
+            Op::Call(ops::Call { body, .. }) | Op::Function(ops::Function { body, .. }) => body,
             op => panic!("expected an opaque root, got {op:?}"),
         };
         assert!(!has_detach(body), "an explicit full rewrite must reach into the body");
@@ -183,7 +186,7 @@ fn range_dependent_reductions_are_kept() {
     let reduce = src.reduce(vec![range].into(), ReduceOp::Add);
 
     let result = rangeify_unwrap(reduce);
-    assert!(result.toposort().iter().any(|n| matches!(n.op(), Op::Reduce { .. })), "got {}", result.tree());
+    assert!(result.toposort().iter().any(|n| matches!(n.op(), Op::Reduce(..))), "got {}", result.tree());
 }
 
 /// `split_reduceop` materialises an intermediate (a CONTIGUOUS) only once the
@@ -195,7 +198,7 @@ fn large_reductions_are_split_in_two_stages(size: usize, split: bool) {
     let reduce = buffer.try_reduce_axis(ReduceOp::Add, vec![0]).expect("reduce axis");
 
     let rangeified = rangeify_unwrap(reduce);
-    let has_contiguous = rangeified.toposort().iter().any(|node| matches!(node.op(), Op::Contiguous { .. }));
+    let has_contiguous = rangeified.toposort().iter().any(|node| matches!(node.op(), Op::Contiguous(..)));
     assert_eq!(has_contiguous, split);
     assert_eq!(rangeified.dtype(), DType::Float32);
 }

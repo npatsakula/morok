@@ -10,6 +10,7 @@ use test_case::test_case;
 
 use super::helpers::extract_kernel;
 use crate::rangeify::kernel::{split_store, try_get_kernel_graph};
+use svod_ir::ops;
 
 fn call_split_store(x: &Arc<UOp>) -> Option<Arc<UOp>> {
     split_store(&mut Vec::new(), x)
@@ -30,8 +31,8 @@ fn store_of(value: Arc<UOp>) -> Arc<UOp> {
 /// Ranges closed by the END the CALL body wraps.
 fn closed_range_count(uop: &Arc<UOp>) -> usize {
     match uop.op() {
-        Op::End { ranges, .. } => ranges.as_slice().len(),
-        Op::Sink { sources, .. } => sources.iter().map(closed_range_count).sum(),
+        Op::End(ops::End { ranges, .. }) => ranges.as_slice().len(),
+        Op::Sink(ops::Sink { sources, .. }) => sources.iter().map(closed_range_count).sum(),
         _ => 0,
     }
 }
@@ -49,15 +50,15 @@ fn a_closed_store_becomes_a_call_over_a_param(dtype: DType, value: Arc<UOp>) {
     assert!(store.in_scope_ranges().is_empty(), "the fixture must have no open ranges");
 
     let kernel = call_split_store(&store).expect("a closed STORE splits");
-    let Op::Call { body, args, .. } = kernel.op() else { panic!("expected CALL, got {}", kernel.tree()) };
+    let Op::Call(ops::Call { body, args, .. }) = kernel.op() else { panic!("expected CALL, got {}", kernel.tree()) };
     assert!(!args.is_empty(), "the CALL must bind the destination buffer");
 
-    let Op::Sink { sources, .. } = body.op() else { panic!("expected SINK body, got {}", body.tree()) };
+    let Op::Sink(ops::Sink { sources, .. }) = body.op() else { panic!("expected SINK body, got {}", body.tree()) };
     let [stored] = sources.as_slice() else { panic!("expected one STORE in the body") };
-    let Op::Store { index, value: stored_value, .. } = stored.op() else { panic!("expected STORE") };
-    let Op::Index { buffer, .. } = index.op() else { panic!("expected INDEX in the STORE") };
+    let Op::Store(ops::Store { index, value: stored_value, .. }) = stored.op() else { panic!("expected STORE") };
+    let Op::Index(ops::Index { buffer, .. }) = index.op() else { panic!("expected INDEX in the STORE") };
     assert!(
-        matches!(buffer.op(), Op::Param { arg, .. } if arg.device == Some(DeviceSpec::Cpu)),
+        matches!(buffer.op(), Op::Param(ops::Param { arg, .. }) if arg.device == Some(DeviceSpec::Cpu)),
         "the body reaches storage through a codegen PARAM, got {}",
         buffer.tree()
     );
@@ -114,7 +115,7 @@ fn an_end_over_a_store_keeps_every_closed_range(ranges: fn() -> Vec<Arc<UOp>>, e
     let end = store_of(UOp::native_const(1.0f32)).end(ranges().into());
 
     let kernel = call_split_store(&end).expect("END(STORE) splits");
-    let Op::Call { body, args, .. } = kernel.op() else { panic!("expected CALL, got {}", kernel.tree()) };
+    let Op::Call(ops::Call { body, args, .. }) = kernel.op() else { panic!("expected CALL, got {}", kernel.tree()) };
     assert!(!args.is_empty(), "the CALL must bind the destination buffer");
     assert_eq!(closed_range_count(body), expected);
 }
@@ -170,12 +171,12 @@ fn a_stored_copy_becomes_the_kernel_body(build: fn(Arc<UOp>) -> Arc<UOp>) {
     let copy = buffer(100).copy_to_device(DeviceSpec::Cuda { device_id: 0 });
 
     let kernel = call_split_store(&build(copy)).expect("a stored COPY splits");
-    let Op::Call { body, .. } = kernel.op() else { panic!("expected CALL, got {}", kernel.tree()) };
+    let Op::Call(ops::Call { body, .. }) = kernel.op() else { panic!("expected CALL, got {}", kernel.tree()) };
     let body = match body.op() {
-        Op::End { computation, .. } => computation,
+        Op::End(ops::End { computation, .. }) => computation,
         _ => body,
     };
-    assert!(matches!(body.op(), Op::Copy { .. }), "expected a COPY body, got {}", body.tree());
+    assert!(matches!(body.op(), Op::Copy(..)), "expected a COPY body, got {}", body.tree());
 }
 
 #[test]
@@ -186,8 +187,8 @@ fn a_cross_device_copy_survives_the_whole_kernel_graph() {
 
     let (graph, _ctx) = try_get_kernel_graph(root).expect("cross-device COPY must be allowed");
     let kernel = extract_kernel(&graph).expect("copy call");
-    let Op::Call { body, .. } = kernel.op() else { panic!("expected CALL") };
-    assert!(matches!(body.op(), Op::Copy { .. }), "expected a direct COPY body, got {}", body.tree());
+    let Op::Call(ops::Call { body, .. }) = kernel.op() else { panic!("expected CALL") };
+    assert!(matches!(body.op(), Op::Copy(..)), "expected a direct COPY body, got {}", body.tree());
 }
 
 /// A BIND argument may carry device-owned storage for its value; that storage is
@@ -218,7 +219,7 @@ fn only_globals_and_scalar_bindings_become_dense_call_positions() {
     let scalar = UOp::variable("N".to_string(), 1, 4, DType::Float32).bind(UOp::native_const(2.0f32));
 
     let local_stack = UOp::new(
-        Op::MStack { buffers: smallvec![local.clone(), local_peer] },
+        Op::MStack(ops::MStack { buffers: smallvec![local.clone(), local_peer] }),
         DType::Float32.ptr(Some(8), AddrSpace::Local).expect("local ptr"),
     )
     .after(smallvec![UOp::noop()]);
@@ -232,19 +233,21 @@ fn only_globals_and_scalar_bindings_become_dense_call_positions() {
         .expect("add");
     let call = call_split_store(&index_at_zero(output.clone()).store(value)).expect("STORE should split");
 
-    let Op::Call { body, args, .. } = call.op() else { panic!("expected CALL") };
+    let Op::Call(ops::Call { body, args, .. }) = call.op() else { panic!("expected CALL") };
     assert_eq!(args.as_slice().len(), 3, "two globals followed by the scalar binding");
     assert!(args.iter().any(|arg| Arc::ptr_eq(arg, &output)));
     assert!(args.iter().any(|arg| Arc::ptr_eq(arg, &input)));
 
     let last_arg = args.last().expect("scalar binding");
-    let Op::Bind { var: call_var, value: call_value } = last_arg.op() else {
+    let Op::Bind(ops::Bind { var: call_var, value: call_value }) = last_arg.op() else {
         panic!("the last CALL arg must be the scalar BIND")
     };
-    let Op::Bind { var: body_var, value: body_value } = scalar.op() else { unreachable!() };
+    let Op::Bind(ops::Bind { var: body_var, value: body_value }) = scalar.op() else { unreachable!() };
     assert!(Arc::ptr_eq(call_value, body_value));
     assert!(!Arc::ptr_eq(call_var, body_var), "CALL binding must not alias the body-local PARAM");
-    let (Op::Param { arg: call_arg, .. }, Op::Param { arg: body_arg, .. }) = (call_var.op(), body_var.op()) else {
+    let (Op::Param(ops::Param { arg: call_arg, .. }), Op::Param(ops::Param { arg: body_arg, .. })) =
+        (call_var.op(), body_var.op())
+    else {
         panic!("scalar binding must retain PARAM semantics")
     };
     assert_eq!(call_arg, body_arg, "boundary identity must not change scalar metadata");
@@ -254,7 +257,7 @@ fn only_globals_and_scalar_bindings_become_dense_call_positions() {
         .toposort()
         .into_iter()
         .filter_map(|u| match u.op() {
-            Op::Param { arg, .. } if arg.addrspace == Some(AddrSpace::Global) => Some(arg.slot),
+            Op::Param(ops::Param { arg, .. }) if arg.addrspace == Some(AddrSpace::Global) => Some(arg.slot),
             _ => None,
         })
         .collect();
@@ -268,7 +271,7 @@ fn only_globals_and_scalar_bindings_become_dense_call_positions() {
     for (addrspace, slot) in [(AddrSpace::Local, 700), (AddrSpace::Reg, 800)] {
         assert!(
             body.toposort().iter().any(
-                |u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(addrspace) && arg.slot == slot)
+                |u| matches!(u.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(addrspace) && arg.slot == slot)
             ),
             "{addrspace:?} slot {slot} must stay inside the body"
         );

@@ -6,6 +6,7 @@ use svod_ir::{AxisId, AxisType, ConstValue, Op, ReduceOp, UOp};
 
 use crate::optimizer::error::OptError;
 use crate::optimizer::{OptOps, Renderer, Scheduler};
+use svod_ir::ops;
 
 #[test]
 fn test_scheduler_new() {
@@ -42,16 +43,16 @@ fn test_scheduler_rngs_sorting() {
     assert_eq!(rngs.len(), 4);
 
     // Verify sort order: Loop(-1) < Global(0) < Local(2) < Reduce(4)
-    if let Op::Range { axis_type, .. } = rngs[0].op() {
+    if let Op::Range(ops::Range { axis_type, .. }) = rngs[0].op() {
         assert_eq!(*axis_type, AxisType::Loop);
     }
-    if let Op::Range { axis_type, .. } = rngs[1].op() {
+    if let Op::Range(ops::Range { axis_type, .. }) = rngs[1].op() {
         assert_eq!(*axis_type, AxisType::Global);
     }
-    if let Op::Range { axis_type, .. } = rngs[2].op() {
+    if let Op::Range(ops::Range { axis_type, .. }) = rngs[2].op() {
         assert_eq!(*axis_type, AxisType::Local);
     }
-    if let Op::Range { axis_type, .. } = rngs[3].op() {
+    if let Op::Range(ops::Range { axis_type, .. }) = rngs[3].op() {
         assert_eq!(*axis_type, AxisType::Reduce);
     }
 }
@@ -192,7 +193,7 @@ fn test_scheduler_axes_of() {
     // Test ranges_of
     let reduce_rngs = scheduler.ranges_of(&[AxisType::Reduce]);
     assert_eq!(reduce_rngs.len(), 1);
-    if let Op::Range { axis_type, .. } = reduce_rngs[0].op() {
+    if let Op::Range(ops::Range { axis_type, .. }) = reduce_rngs[0].op() {
         assert_eq!(*axis_type, AxisType::Reduce);
     }
 }
@@ -413,7 +414,7 @@ fn test_shift_to_basic_split() {
     let (replaced_rng, new_rng) = result.unwrap();
 
     // Verify the reduced range has size 4 (16 / 4)
-    if let Op::Range { end, axis_id, axis_type, .. } = replaced_rng.op() {
+    if let Op::Range(ops::Range { end, axis_id, axis_type, .. }) = replaced_rng.op() {
         assert_eq!(axis_id, &AxisId::Renumbered(0)); // Same axis_id
         assert_eq!(axis_type, &AxisType::Global); // Same type
         if let Op::Const(cv) = end.op()
@@ -428,7 +429,7 @@ fn test_shift_to_basic_split() {
     }
 
     // Verify the new range has size 4 and type Upcast
-    if let Op::Range { end, axis_id, axis_type, .. } = new_rng.op() {
+    if let Op::Range(ops::Range { end, axis_id, axis_type, .. }) = new_rng.op() {
         assert_eq!(axis_id, &AxisId::Renumbered(1)); // New axis_id = maxarg + 1
         assert_eq!(axis_type, &AxisType::Upcast);
         if let Op::Const(cv) = end.op()
@@ -468,7 +469,7 @@ fn test_shift_to_top_order() {
     let (replaced_rng, new_rng) = result.unwrap();
 
     // Verify both ranges exist
-    if let Op::Range { end, .. } = replaced_rng.op()
+    if let Op::Range(ops::Range { end, .. }) = replaced_rng.op()
         && let Op::Const(cv) = end.op()
         && let ConstValue::Int(sz) = cv.0
     {
@@ -477,7 +478,7 @@ fn test_shift_to_top_order() {
         panic!("Expected constant size");
     }
 
-    if let Op::Range { end, axis_type, .. } = new_rng.op() {
+    if let Op::Range(ops::Range { end, axis_type, .. }) = new_rng.op() {
         assert_eq!(axis_type, &AxisType::Local);
         if let Op::Const(cv) = end.op()
             && let ConstValue::Int(sz) = cv.0
@@ -534,8 +535,8 @@ fn test_shift_to_symbolic_exact_division() {
     assert!(result.is_ok(), "symbolic split should succeed for V*2 / 2");
 
     let (replaced_rng, _new_rng) = result.unwrap();
-    if let Op::Range { end, .. } = replaced_rng.op() {
-        assert!(end.backward_slice_ids().contains(&v.id), "reduced symbolic end should still depend on V");
+    if let Op::Range(ops::Range { end, .. }) = replaced_rng.op() {
+        assert!(end.any_in_subtree(|n| n.id == v.id), "reduced symbolic end should still depend on V");
     } else {
         panic!("Expected range after symbolic split");
     }
@@ -592,7 +593,7 @@ fn test_shift_to_substitution_in_ast() {
     let ranges_with_axis0: Vec<_> = all_nodes
         .iter()
         .filter_map(|node| {
-            if let Op::Range { end, axis_id, .. } = node.op()
+            if let Op::Range(ops::Range { end, axis_id, .. }) = node.op()
                 && *axis_id == AxisId::Renumbered(0)
                 && let Op::Const(cv) = end.op()
                 && let ConstValue::Int(sz) = cv.0
@@ -663,7 +664,7 @@ fn test_shift_to_with_custom_range() {
     let (_replaced_rng, new_rng) = result.unwrap();
 
     // Verify the returned range is our custom one
-    if let Op::Range { axis_id, .. } = new_rng.op() {
+    if let Op::Range(ops::Range { axis_id, .. }) = new_rng.op() {
         assert_eq!(axis_id, &AxisId::Renumbered(99)); // Should use our custom axis_id
     } else {
         panic!("Expected Range operation");
@@ -710,7 +711,7 @@ use crate::optimizer::{Opt, OptArg, apply_opt};
 
 /// Helper to extract axis_type from a Range UOp
 fn get_axis_type(uop: &UOp) -> AxisType {
-    if let Op::Range { axis_type, .. } = uop.op() {
+    if let Op::Range(ops::Range { axis_type, .. }) = uop.op() {
         *axis_type
     } else {
         panic!("Expected Range operation");
@@ -1072,7 +1073,7 @@ fn test_swap_basic() {
     // Get sizes of ranges before swap
     let rngs_before = scheduler.rngs();
     let get_size = |rng: &Arc<UOp>| -> i64 {
-        if let Op::Range { end, .. } = rng.op()
+        if let Op::Range(ops::Range { end, .. }) = rng.op()
             && let Op::Const(cv) = end.op()
             && let svod_ir::ConstValue::Int(sz) = cv.0
         {
@@ -1180,7 +1181,7 @@ fn test_swap_square_axes() {
         .into_iter()
         .find_map(|n| match n.op() {
             Op::Binary(svod_ir::types::BinaryOp::Mul, a, b) => [a, b].into_iter().find_map(|s| match s.op() {
-                Op::Range { axis_id, .. } => Some(axis_id.clone()),
+                Op::Range(ops::Range { axis_id, .. }) => Some(axis_id.clone()),
                 _ => None,
             }),
             _ => None,
@@ -1260,7 +1261,7 @@ fn test_convert_loop_to_global_gpu() {
     assert_eq!(ranges.len(), 2);
 
     for rng in ranges {
-        if let Op::Range { axis_type, .. } = rng.op() {
+        if let Op::Range(ops::Range { axis_type, .. }) = rng.op() {
             assert_eq!(*axis_type, AxisType::Global);
         } else {
             panic!("Expected RANGE operation");
@@ -1285,7 +1286,7 @@ fn test_convert_loop_to_global_cpu() {
     let ranges = scheduler.rngs();
     assert_eq!(ranges.len(), 1);
 
-    if let Op::Range { axis_type, .. } = ranges[0].op() {
+    if let Op::Range(ops::Range { axis_type, .. }) = ranges[0].op() {
         assert_eq!(*axis_type, AxisType::Weak);
     }
 }
@@ -1342,8 +1343,10 @@ fn test_get_optimized_ast_elementwise_kernel() {
 
 #[test]
 fn test_kernel_name_places_special_extents_before_range_extents() {
-    let special =
-        UOp::new(Op::Special { end: UOp::index_const(8), name: "gidx1".to_string() }, svod_dtype::DType::Int32);
+    let special = UOp::new(
+        Op::Special(ops::Special { end: UOp::index_const(8), name: "gidx1".to_string() }),
+        svod_dtype::DType::Int32,
+    );
     let range = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Local);
     let scheduler = Scheduler::new(UOp::sink(vec![special, range]), Renderer::cuda());
 
@@ -1473,7 +1476,7 @@ fn test_globalizable_rngs_with_sink() {
     assert_eq!(ranges.len(), 2);
 
     for rng in ranges {
-        if let Op::Range { axis_type, .. } = rng.op() {
+        if let Op::Range(ops::Range { axis_type, .. }) = rng.op() {
             assert_eq!(*axis_type, AxisType::Global, "LOOP axes in SINK should be converted to GLOBAL");
         }
     }
@@ -1638,12 +1641,12 @@ fn test_apply_threading_heuristic_symbolic_work_and_divisibility() {
     let four = UOp::index_const(4);
     let end = UOp::new(Op::Binary(BinaryOp::Mul, v, four), DType::Int32);
     let r_loop = UOp::new(
-        Op::Range {
+        Op::Range(ops::Range {
             end: end.clone(),
             axis_id: AxisId::Renumbered(0),
             axis_type: AxisType::Weak,
             deps: smallvec::smallvec![],
-        },
+        }),
         end.dtype(),
     );
 
@@ -1658,4 +1661,38 @@ fn test_apply_threading_heuristic_symbolic_work_and_divisibility() {
 
     let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
     assert!(!thread_axes.is_empty(), "Should have Thread axis after apply_threading");
+}
+
+/// Deferred naming leaves the bare shape name; `finalize_kernel_name` then
+/// draws the same suffix `get_optimized_ast(None)` would have drawn, on both
+/// the SINK's structural info and the optimizer metadata.
+#[test]
+fn test_deferred_naming_finalizes_to_the_unique_name() {
+    use crate::optimizer::{KernelInfo, KernelNaming, finalize_kernel_name};
+
+    let r_global = UOp::range_axis(UOp::index_const(4099), AxisId::Renumbered(0), AxisType::Global);
+    let sink = UOp::sink(vec![UOp::native_const(1.0f32), r_global]);
+    let scheduler = Scheduler::new(sink, Renderer::cuda());
+    let name_of = |ast: &Arc<UOp>| ast.metadata::<KernelInfo>().unwrap().name.clone();
+    let ordinal = |name: &str| match name.strip_prefix("E_4099").unwrap_or_else(|| panic!("{name}")) {
+        "" => 0,
+        suffix => suffix.strip_prefix('n').unwrap().parse::<usize>().unwrap(),
+    };
+
+    let unique = scheduler.get_optimized_ast(None);
+    let deferred = scheduler.get_optimized_ast_with_naming(KernelNaming::Deferred);
+    assert_eq!(name_of(&deferred), "E_4099");
+
+    let finalized = finalize_kernel_name(&deferred);
+    let name = name_of(&finalized);
+    assert_eq!(ordinal(&name), ordinal(&name_of(&unique)) + 1, "{name}");
+    let Op::Sink(ops::Sink { info: Some(info), .. }) = finalized.op() else { panic!("{:?}", finalized.op()) };
+    assert_eq!(info.name.as_deref(), Some(name.as_str()));
+    assert_eq!(
+        finalized.metadata::<KernelInfo>().unwrap().applied_opts,
+        unique.metadata::<KernelInfo>().unwrap().applied_opts
+    );
+
+    let unnamed = UOp::sink(vec![UOp::native_const(2.0f32)]);
+    assert!(Arc::ptr_eq(&finalize_kernel_name(&unnamed), &unnamed));
 }

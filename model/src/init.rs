@@ -1,11 +1,10 @@
-//! Lazy weight initializers shared across `resnet`, `gigaam`, and `silero_vad`
-//! `with_random_weights` constructors.
+//! Weight initializers shared by every model's `empty` / `with_random_weights`
+//! constructor.
 //!
-//! These produce *lazy* tensor graphs (no `.realize()`); the THREEFRY seed
-//! `BUFFER` reference inside the graph blocks the const-folding collapse that
-//! plain `Tensor::zeros` weights would otherwise trigger. Matches Tinygrad's
-//! `tinygrad/nn/__init__.py` convention of storing `Tensor.uniform(...)` in
-//! the constructor without realizing.
+//! Each helper ends in `contiguous()`, as Tinygrad's `rand` does, so an
+//! initialized parameter materializes into its own buffer instead of being
+//! fused into every consuming kernel: consumers then compile the same kernels
+//! for `empty()` weights as for loaded ones.
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
@@ -14,13 +13,13 @@ use svod_tensor::Tensor;
 /// Used for Conv/Linear weights, their biases, embeddings, and LSTM gates.
 pub(crate) fn fan_in_uniform(shape: &[usize], fan_in: usize, dtype: DType) -> Tensor {
     let bound = (fan_in.max(1) as f64).powf(-0.5);
-    Tensor::uniform_with_dtype(shape, -bound, bound, dtype).expect("non-empty shape with finite bounds")
+    Tensor::uniform_with_dtype(shape, -bound, bound, dtype).expect("non-empty shape with finite bounds").contiguous()
 }
 
 pub(crate) fn ones(shape: &[usize], dtype: DType) -> Tensor {
-    Tensor::ones(shape, dtype).expect("non-empty shape")
+    Tensor::ones(shape, dtype).expect("non-empty shape").contiguous()
 }
 
 pub(crate) fn zeros(shape: &[usize], dtype: DType) -> Tensor {
-    Tensor::zeros(shape, dtype).expect("non-empty shape")
+    Tensor::zeros(shape, dtype).expect("non-empty shape").contiguous()
 }

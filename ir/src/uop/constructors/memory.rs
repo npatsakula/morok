@@ -19,6 +19,7 @@ use crate::Result;
 use crate::error::IndexTypeMismatchSnafu;
 use crate::indexing::IndexSpec;
 use crate::op::Op;
+use crate::ops;
 use crate::types::{AddrSpace, BufferizeOpts};
 use crate::uop::UOp;
 
@@ -53,7 +54,7 @@ impl UOp {
 
         // STACK is a shaped value, so a constant scalar index selects a lane
         // directly rather than constructing a memory INDEX.
-        if let Op::Stack { sources } = buffer.op()
+        if let Op::Stack(ops::Stack { sources }) = buffer.op()
             && indices.len() == 1
             && let Op::Const(value) = indices[0].op()
             && let Some(index) = match value.0 {
@@ -74,7 +75,7 @@ impl UOp {
             ensure!(idx.dtype().is_int(), IndexTypeMismatchSnafu { actual: idx.dtype() });
         }
 
-        let op = Op::Index { buffer, indices };
+        let op = Op::Index(ops::Index { buffer, indices });
         let inferred = crate::dtype_from_op(&op).expect("INDEX has an inferred dtype");
         let result_dtype = dtype.unwrap_or_else(|| inferred.clone());
         // Tinygrad's INDEX carries exactly the buffer's base dtype (`uop/ops.py:574`);
@@ -106,22 +107,17 @@ impl UOp {
     /// while BUFFER/PARAM and their supported storage wrappers produce GETADDR.
     pub fn getaddr(self: &Arc<Self>, device: Option<DeviceSpec>) -> Arc<Self> {
         let mut base = self;
-        while let Op::After { passthrough, .. } = base.op() {
+        while let Op::After(ops::After { passthrough, .. }) = base.op() {
             base = passthrough;
         }
         if !matches!(
             base.op(),
-            Op::Buffer { .. }
-                | Op::Param { .. }
-                | Op::Slice { .. }
-                | Op::ProgramBinary { .. }
-                | Op::MStack { .. }
-                | Op::MSelect { .. }
+            Op::Buffer(..) | Op::Param(..) | Op::Slice(..) | Op::ProgramBinary(..) | Op::MStack(..) | Op::MSelect(..)
         ) {
             return self.clone();
         }
         let device = device.or_else(|| self.device_spec()).expect("GETADDR requires an explicit or source device");
-        Self::new(Op::GetAddr { src: self.clone(), device }, DType::UInt64)
+        Self::new(Op::GetAddr(ops::GetAddr { src: self.clone(), device }), DType::UInt64)
     }
 
     /// Multi-dimensional slicing with IndexSpec.
@@ -201,7 +197,7 @@ impl UOp {
         let dtype = dtype.unwrap_or_else(|| inferred.clone());
         assert_eq!(dtype, inferred, "LOAD dtype must match INDEX element dtype");
         assert_eq!(alt.is_some(), gate.is_some(), "LOAD requires either index only or index, alt, and gate");
-        Self::new(Op::Load { index, alt, gate }, dtype)
+        Self::new(Op::Load(ops::Load { index, alt, gate }), dtype)
     }
 
     /// Create a STORE operation.
@@ -211,12 +207,12 @@ impl UOp {
     ///
     /// For gated stores, use an INDEX with a gate (INDEX has optional gate field).
     pub fn store(self: &Arc<Self>, value: Arc<Self>) -> Arc<Self> {
-        Self::new(Op::Store { index: self.clone(), value, gate: None }, DType::Void)
+        Self::new(Op::Store(ops::Store { index: self.clone(), value, gate: None }), DType::Void)
     }
 
     /// Store a value conditionally at this address.
     pub fn store_gated(self: &Arc<Self>, value: Arc<Self>, gate: Arc<Self>) -> Arc<Self> {
-        Self::new(Op::Store { index: self.clone(), value, gate: Some(gate) }, DType::Void)
+        Self::new(Op::Store(ops::Store { index: self.clone(), value, gate: Some(gate) }), DType::Void)
     }
 
     // =========================================================================
@@ -225,7 +221,7 @@ impl UOp {
 
     /// Copy to a different device.
     pub fn copy_to_device(self: &Arc<Self>, device: DeviceSpec) -> Arc<Self> {
-        Self::new(Op::Copy { src: self.clone(), device }, self.dtype.clone())
+        Self::new(Op::Copy(ops::Copy { src: self.clone(), device }), self.dtype.clone())
     }
 
     /// Create a COPY operation with an explicit target device.
@@ -241,9 +237,9 @@ impl UOp {
     ///
     /// Marks a computation to be materialized into a buffer.
     /// The computation is evaluated over the given ranges and stored.
-    pub fn stage(compute: Arc<Self>, ranges: Vec<Arc<Self>>, opts: BufferizeOpts) -> Arc<Self> {
+    pub fn stage(compute: Arc<Self>, ranges: Vec<Arc<Self>>, opts: impl Into<Box<BufferizeOpts>>) -> Arc<Self> {
         let dtype = compute.dtype.clone();
-        Self::new(Op::Stage { compute, ranges: SmallVec::from_vec(ranges), opts }, dtype)
+        Self::new(Op::Stage(ops::Stage { compute, ranges: SmallVec::from_vec(ranges), opts: opts.into() }), dtype)
     }
 
     /// Create a STAGE operation with Global address space.

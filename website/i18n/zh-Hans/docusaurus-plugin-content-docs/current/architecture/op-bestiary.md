@@ -560,7 +560,6 @@ Wmma {
 | `threads` | `usize` | 每个 warp 的线程数（通常 32） |
 | `upcast_axes` | `WmmaUpcastAxes` | 各操作数的向量化信息（字段：`a`、`b`、`c`） |
 | `reduce_axes` | `Vec<(usize, usize)>` | 收缩轴 |
-| `tile_grid` | `(usize, usize)` | 多 FMA 批处理网格（默认 (1,1)） |
 
 **示例：**
 ```mermaid

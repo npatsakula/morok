@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use svod_dtype::{AmdArch, DType, DeviceSpec};
+use svod_ir::ops;
 use svod_ir::{ConstValue, Op, UOp};
 use svod_schedule::{
     HeuristicsConfig, OptStrategy, OptimizerConfig, OptimizerRenderer, TcOptLevel, TcSelect,
@@ -21,8 +22,8 @@ fn op_name(op: &Op) -> String {
         Op::Binary(kind, ..) => format!("{kind:?}").to_ascii_uppercase(),
         Op::Ternary(kind, ..) => format!("{kind:?}").to_ascii_uppercase(),
         Op::Unary(kind, ..) => format!("{kind:?}").to_ascii_uppercase(),
-        Op::EndIf { .. } => "ENDIF".into(),
-        Op::Wmma { .. } => "WMMA".into(),
+        Op::EndIf(..) => "ENDIF".into(),
+        Op::Wmma(..) => "WMMA".into(),
         other => other.as_ref().to_ascii_uppercase(),
     }
 }
@@ -36,9 +37,9 @@ fn node_arg(node: &Arc<UOp>) -> Value {
             ConstValue::Bool(value) => json!({"kind": "bool", "value": value}),
             ConstValue::Invalid => json!({"kind": "invalid"}),
         },
-        Op::Param { arg, .. } => json!({"slot": arg.slot}),
-        Op::Special { name, .. } => json!({"name": name}),
-        Op::Wmma { metadata, .. } => json!({
+        Op::Param(ops::Param { arg, .. }) => json!({"slot": arg.slot}),
+        Op::Special(ops::Special { name, .. }) => json!({"name": name}),
+        Op::Wmma(ops::Wmma { metadata, .. }) => json!({
             "dims": [metadata.dims.0, metadata.dims.1, metadata.dims.2],
             "input_dtype": dtype_name(&metadata.dtype_in),
             "device": metadata.device.canonical(),
@@ -99,7 +100,7 @@ fn main() {
     let program = svod_codegen::program_pipeline::program_from_sink(optimized, DeviceSpec::Amd { device_id: 0 })
         .expect("PROGRAM");
     let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("linearize");
-    let linear = linearized.toposort().into_iter().find(|node| matches!(node.op(), Op::Linear { .. })).expect("LINEAR");
+    let linear = linearized.toposort().into_iter().find(|node| matches!(node.op(), Op::Linear(..))).expect("LINEAR");
     let document = json!({
         "schema_version": 2,
         "evidence": "EVID-02",

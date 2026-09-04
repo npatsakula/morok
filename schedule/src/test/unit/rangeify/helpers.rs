@@ -4,6 +4,7 @@ use svod_ir::{BinaryOp, BufferizeOpts, ConstValue, DType, Op, UOp};
 use test_case::test_case;
 
 use crate::rangeify::indexing::{get_const_value, is_const, is_identity_value, is_zero_value};
+use svod_ir::ops;
 
 /// Count occurrences of ops matching a predicate in a UOp graph.
 ///
@@ -24,7 +25,7 @@ where
 
 /// Count CALL operations in a UOp graph.
 pub fn count_kernels(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::Call { .. }))
+    count_ops(uop, |op| matches!(op, Op::Call(..)))
 }
 
 /// Extract the first CALL from a pipeline result.
@@ -38,24 +39,24 @@ pub fn count_kernels(uop: &Arc<UOp>) -> usize {
 pub fn extract_kernel(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     match uop.op() {
         // Direct callable wrapper
-        Op::Call { .. } => Some(uop.clone()),
+        Op::Call(..) => Some(uop.clone()),
         // AFTER(passthrough, deps) - check deps for END(CALL)
-        Op::After { deps, .. } => {
+        Op::After(ops::After { deps, .. }) => {
             for dep in deps.iter() {
-                if let Op::End { computation, .. } = dep.op()
-                    && matches!(computation.op(), Op::Call { .. })
+                if let Op::End(ops::End { computation, .. }) = dep.op()
+                    && matches!(computation.op(), Op::Call(..))
                 {
                     return Some(computation.clone());
                 }
                 // Also check if dep is directly a callable wrapper
-                if matches!(dep.op(), Op::Call { .. }) {
+                if matches!(dep.op(), Op::Call(..)) {
                     return Some(dep.clone());
                 }
             }
             None
         }
         // SINK - check sources
-        Op::Sink { sources, .. } => {
+        Op::Sink(ops::Sink { sources, .. }) => {
             for src in sources.iter() {
                 if let Some(kernel) = extract_kernel(src) {
                     return Some(kernel);
@@ -64,34 +65,37 @@ pub fn extract_kernel(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
             None
         }
         // END(CALL)
-        Op::End { computation, .. } if matches!(computation.op(), Op::Call { .. }) => Some(computation.clone()),
+        Op::End(ops::End { computation, .. }) if matches!(computation.op(), Op::Call(..)) => Some(computation.clone()),
         _ => None,
     }
 }
 
 /// Count codegen PARAM operations (device: None) in a UOp graph.
 pub fn count_codegen_params(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::Param { arg, .. } if arg.device.is_none()))
+    count_ops(uop, |op| matches!(op, Op::Param(ops::Param { arg, .. }) if arg.device.is_none()))
 }
 
 /// Count DEFINE_LOCAL operations in a UOp graph.
 pub fn count_define_locals(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::Buffer { arg, .. } if arg.addrspace == Some(svod_dtype::AddrSpace::Local)))
+    count_ops(
+        uop,
+        |op| matches!(op, Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_dtype::AddrSpace::Local)),
+    )
 }
 
 /// Count STORE operations in a UOp graph.
 pub fn count_stores(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::Store { .. }))
+    count_ops(uop, |op| matches!(op, Op::Store(..)))
 }
 
 /// Count END operations in a UOp graph.
 pub fn count_ends(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::End { .. }))
+    count_ops(uop, |op| matches!(op, Op::End(..)))
 }
 
 /// Count STAGE operations in a UOp graph.
 pub fn count_bufferizes(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::Stage { .. }))
+    count_ops(uop, |op| matches!(op, Op::Stage(..)))
 }
 
 // ============================================================================

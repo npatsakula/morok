@@ -12,6 +12,7 @@ use crate::arch::FragRole;
 use crate::tile::RegTile;
 use crate::tiles::{RT_16X16, ST_16X16, TileLayout, VecLayout};
 use crate::{ArchCaps, ArgDir, Kernel, MoveIdx};
+use svod_ir::ops;
 
 const ROW: TileLayout = TileLayout::Row;
 
@@ -87,20 +88,20 @@ fn test_row_reduce_graph_shape() {
 
     let topo = out.uop().toposort();
     assert!(
-        topo.iter().any(|u| matches!(u.op(), Op::Custom { .. })),
+        topo.iter().any(|u| matches!(u.op(), Op::Custom(..))),
         "row_reduce gathers sibling lanes with a ds_bpermute Op::Custom shuffle"
     );
     assert!(
         !topo
             .iter()
-            .any(|u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
+            .any(|u| matches!(u.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
         "the wave-shuffle reduce allocates no LDS scratch"
     );
     assert!(
-        !topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })),
+        !topo.iter().any(|u| matches!(u.op(), Op::Barrier(..))),
         "the wave-shuffle reduce needs no workgroup barrier"
     );
-    assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "a reduction has no WMMA");
+    assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma(..))), "a reduction has no WMMA");
 }
 
 /// `row_arg_reduce` threads an index alongside the value: each `reduce_tree` step
@@ -125,7 +126,7 @@ fn test_row_arg_reduce_graph_shape() {
     for caps in [ArchCaps::GFX942, ArchCaps::for_arch(AmdArch::Gfx1151)] {
         let want_customs = 2 * caps.reduce_tree().len();
         let topo = build(caps);
-        let customs = topo.iter().filter(|u| matches!(u.op(), Op::Custom { .. })).count();
+        let customs = topo.iter().filter(|u| matches!(u.op(), Op::Custom(..))).count();
         assert_eq!(customs, want_customs, "{:?}: value+index each ride a ds_bpermute per tree step", caps.arch);
         assert!(topo.iter().any(|u| matches!(u.op(), Op::Ternary(..))), "{:?}: where-select pair-fold", caps.arch);
         assert!(
@@ -137,12 +138,12 @@ fn test_row_arg_reduce_graph_shape() {
         assert!(
             !topo
                 .iter()
-                .any(|u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
+                .any(|u| matches!(u.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
             "{:?}: no LDS scratch",
             caps.arch
         );
-        assert!(!topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "{:?}: no barrier", caps.arch);
-        assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "{:?}: no WMMA", caps.arch);
+        assert!(!topo.iter().any(|u| matches!(u.op(), Op::Barrier(..))), "{:?}: no barrier", caps.arch);
+        assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma(..))), "{:?}: no WMMA", caps.arch);
     }
 }
 

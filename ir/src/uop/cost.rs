@@ -4,10 +4,12 @@
 //! work. Used by the BEAM `least_compute_ops` bloat filter and by the runtime
 //! profiler's roofline (GFLOP/s) column.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
+
 use crate::op::Op;
+use crate::ops;
 use crate::uop::UOp;
 
 /// Symbolic estimate of compute ops in a kernel.
@@ -19,39 +21,51 @@ use crate::uop::UOp;
 /// filter.
 pub fn compute_ops_estimate(uop: &Arc<UOp>) -> u64 {
     let topo = uop.toposort();
+    let pos: FxHashMap<u64, usize> = topo.iter().enumerate().map(|(i, node)| (node.id, i)).collect();
 
-    // Pre-compute the size contribution of every loop-bound node — RANGE for
-    // ordinary loops, SPECIAL for hardware-provided indices.
-    let mut range_size: HashMap<u64, u64> = HashMap::new();
+    // One bit per loop-bound node — RANGE for ordinary loops, SPECIAL for
+    // hardware-provided indices — plus its iteration count.
+    let mut range_sizes: Vec<u64> = Vec::new();
+    let mut range_bit: FxHashMap<u64, usize> = FxHashMap::default();
     for node in &topo {
-        let end = match node.op() {
-            Op::Range { end, .. } => Some(end),
-            Op::Special { end, .. } => Some(end),
-            _ => None,
-        };
-        if let Some(end) = end {
-            range_size.insert(node.id, range_size_estimate(end));
+        if let Op::Range(ops::Range { end, .. }) | Op::Special(ops::Special { end, .. }) = node.op() {
+            range_bit.insert(node.id, range_sizes.len());
+            range_sizes.push(range_size_estimate(end));
         }
     }
 
-    // Each ALU/Reduce/WMMA accumulates `prod(in-scope range sizes)`. Backward
-    // slice membership tells us which RANGEs the node sits inside, mirroring
-    // tinygrad's `mult_stack` discipline structurally.
+    // Bottom-up fold over the toposort: `enclosing[node]` is the union of its
+    // children's enclosing ranges plus itself. Structurally the same
+    // information tinygrad tracks with its `mult_stack` discipline.
+    let words = range_sizes.len().div_ceil(64);
+    let mut enclosing = vec![0u64; topo.len() * words];
     let mut flops: u64 = 0;
-    for node in &topo {
-        let is_alu =
-            matches!(node.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::Reduce { .. } | Op::Wmma { .. });
-        if !is_alu {
-            continue;
-        }
-        let bws = node.backward_slice_ids();
-        let mut weight: u64 = 1;
-        for (rid, sz) in &range_size {
-            if bws.contains(rid) {
-                weight = weight.saturating_mul(*sz);
+    for (i, node) in topo.iter().enumerate() {
+        let (done, rest) = enclosing.split_at_mut(i * words);
+        let mask = &mut rest[..words];
+        node.op().map_child(|child| {
+            let j = pos[&child.id]; // children precede parents in a toposort
+            for (w, cw) in mask.iter_mut().zip(&done[j * words..(j + 1) * words]) {
+                *w |= cw;
             }
+        });
+        if let Some(&bit) = range_bit.get(&node.id) {
+            mask[bit / 64] |= 1 << (bit % 64);
         }
-        flops = flops.saturating_add(weight);
+
+        // Each ALU/Reduce/WMMA accumulates `prod(enclosing range sizes)`.
+        if matches!(node.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::Reduce(..) | Op::Wmma(..)) {
+            let mut weight: u64 = 1;
+            for (w, word) in mask.iter().enumerate() {
+                let mut bits = *word;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    weight = weight.saturating_mul(range_sizes[w * 64 + bit]);
+                    bits &= bits - 1;
+                }
+            }
+            flops = flops.saturating_add(weight);
+        }
     }
     flops
 }
@@ -71,3 +85,7 @@ fn range_size_estimate(end: &Arc<UOp>) -> u64 {
     let vmax = end.vmax().try_int().unwrap_or(vmin);
     (((vmin + vmax) / 2).max(1)) as u64
 }
+
+#[cfg(test)]
+#[path = "../test/unit/uop/cost.rs"]
+mod tests;

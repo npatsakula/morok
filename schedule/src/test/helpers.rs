@@ -278,7 +278,7 @@ pub fn assert_axes_equal(scheduler: &Scheduler, expected: &[AxisType]) {
         .rngs()
         .iter()
         .map(|r| {
-            if let Op::Range { axis_type, .. } = r.op() {
+            if let Op::Range(svod_ir::ops::Range { axis_type, .. }) = r.op() {
                 *axis_type
             } else {
                 panic!("Expected Range operation");
@@ -379,25 +379,25 @@ mod tests {
     #[test]
     fn test_create_simple_reduce() {
         let reduce = create_simple_reduce(32, ReduceOp::Add);
-        assert!(matches!(reduce.op(), Op::Sink { .. }));
+        assert!(matches!(reduce.op(), Op::Sink(..)));
     }
 
     #[test]
     fn test_create_matmul_pattern() {
         let matmul = create_matmul_pattern(16, 16, 16);
-        assert!(matches!(matmul.op(), Op::Sink { .. }));
+        assert!(matches!(matmul.op(), Op::Sink(..)));
     }
 
     #[test]
     fn test_create_double_reduce() {
         let reduce = create_double_reduce(8, 8, ReduceOp::Add);
-        assert!(matches!(reduce.op(), Op::Sink { .. }));
+        assert!(matches!(reduce.op(), Op::Sink(..)));
     }
 
     #[test]
     fn test_create_elementwise_pattern() {
         let elem = create_elementwise_pattern(&[10, 20, 30]);
-        assert!(matches!(elem.op(), Op::Sink { .. }));
+        assert!(matches!(elem.op(), Op::Sink(..)));
     }
 
     #[test]

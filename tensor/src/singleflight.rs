@@ -32,50 +32,79 @@ impl<K: Hash + Eq + Clone> Singleflight<K> {
         lookup: impl Fn() -> Option<V>,
         compute: impl FnOnce() -> Result<V, E>,
     ) -> Result<V, E> {
-        let mut compute = Some(compute);
         loop {
             if let Some(hit) = lookup() {
                 return Ok(hit);
             }
-            let (slot, winner) = {
-                let mut inflight = self.inflight.lock();
-                match inflight.entry(key.clone()) {
-                    std::collections::hash_map::Entry::Occupied(entry) => (entry.get().clone(), false),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        (entry.insert(Arc::new((Mutex::new(false), Condvar::new()))).clone(), true)
+            match self.claim(key.clone()) {
+                Ok(_ticket) => {
+                    return match lookup() {
+                        // Raced an earlier winner between our first lookup and
+                        // slot registration — take the published result.
+                        Some(hit) => Ok(hit),
+                        None => compute(),
+                    };
+                }
+                Err(slot) => {
+                    let mut done = slot.0.lock();
+                    while !*done {
+                        slot.1.wait(&mut done);
                     }
+                    // winner finished (or failed) — re-check the cache
                 }
-            };
-            if !winner {
-                let mut done = slot.0.lock();
-                while !*done {
-                    slot.1.wait(&mut done);
-                }
-                continue; // winner finished (or failed) — re-check the cache
             }
-            // Winner. The guard wakes waiters even on unwind, so a panicking
-            // computation cannot strand them.
-            let _wake = WakeOnDrop { flight: self, key: &key, slot: &slot };
-            return match lookup() {
-                // Raced an earlier winner between our first lookup and slot
-                // registration — take the published result.
-                Some(hit) => Ok(hit),
-                None => compute.take().expect("winner runs once")(),
-            };
+        }
+    }
+
+    /// Become the computing thread for `key` without waiting: `Some` when no
+    /// other thread holds it. Batch callers claim several keys up front and
+    /// must never block on a foreign key while holding tickets, or two
+    /// batches claiming in different orders would deadlock; `run` on the
+    /// foreign keys after the batch is the safe way to wait.
+    pub(crate) fn try_claim(&self, key: K) -> Option<Ticket<'_, K>> {
+        self.claim(key).ok()
+    }
+
+    /// [`try_claim`](Self::try_claim) for a cache miss: `lookup` runs again
+    /// under the ticket, so a winner that published between the caller's
+    /// lookup and the claim is not recomputed (under a second kernel name).
+    pub(crate) fn try_claim_miss<V>(&self, key: K, lookup: impl Fn() -> Option<V>) -> Option<Ticket<'_, K>> {
+        if lookup().is_some() {
+            return None;
+        }
+        let ticket = self.try_claim(key)?;
+        lookup().is_none().then_some(ticket)
+    }
+
+    fn claim(&self, key: K) -> Result<Ticket<'_, K>, Slot> {
+        let mut inflight = self.inflight.lock();
+        match inflight.entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => Err(entry.get().clone()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let slot = entry.insert(Arc::new((Mutex::new(false), Condvar::new()))).clone();
+                Ok(Ticket { flight: self, key, slot })
+            }
         }
     }
 }
 
-struct WakeOnDrop<'a, K: Hash + Eq + Clone> {
+/// The winner's hold on a key. Dropping it — including on unwind, so a
+/// panicking computation cannot strand waiters — wakes every loser, which
+/// then re-checks the cache.
+pub(crate) struct Ticket<'a, K: Hash + Eq + Clone> {
     flight: &'a Singleflight<K>,
-    key: &'a K,
-    slot: &'a Slot,
+    key: K,
+    slot: Slot,
 }
 
-impl<K: Hash + Eq + Clone> Drop for WakeOnDrop<'_, K> {
+impl<K: Hash + Eq + Clone> Drop for Ticket<'_, K> {
     fn drop(&mut self) {
-        self.flight.inflight.lock().remove(self.key);
+        self.flight.inflight.lock().remove(&self.key);
         *self.slot.0.lock() = true;
         self.slot.1.notify_all();
     }
 }
+
+#[cfg(test)]
+#[path = "test/unit/singleflight.rs"]
+mod tests;

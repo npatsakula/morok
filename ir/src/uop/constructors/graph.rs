@@ -13,6 +13,7 @@ use smallvec::SmallVec;
 use svod_dtype::DType;
 
 use crate::op::Op;
+use crate::ops;
 use crate::types::{CallInfo, CustomFunctionKind, KernelInfo};
 use crate::uop::UOp;
 use crate::{Error, Result};
@@ -23,21 +24,16 @@ use crate::{Error, Result};
 fn is_opaque_call_body(op: &Op) -> bool {
     matches!(
         op,
-        Op::Sink { .. }
-            | Op::Program { .. }
-            | Op::Linear { .. }
-            | Op::Copy { .. }
-            | Op::Slice { .. }
-            | Op::CustomFunction { .. }
+        Op::Sink(..) | Op::Program(..) | Op::Linear(..) | Op::Copy(..) | Op::Slice(..) | Op::CustomFunction(..)
     )
 }
 
 impl UOp {
     fn placeholder_like_anchor(src: &Arc<Self>) -> Arc<Self> {
         match src.op() {
-            Op::Multi { src: shard, .. } => Self::placeholder_like_anchor(shard),
-            Op::MSelect { buffer, .. } => Self::placeholder_like_anchor(buffer),
-            Op::MStack { buffers } if !buffers.is_empty() => Self::placeholder_like_anchor(&buffers[0]),
+            Op::Multi(ops::Multi { src: shard, .. }) => Self::placeholder_like_anchor(shard),
+            Op::MSelect(ops::MSelect { buffer, .. }) => Self::placeholder_like_anchor(buffer),
+            Op::MStack(ops::MStack { buffers }) if !buffers.is_empty() => Self::placeholder_like_anchor(&buffers[0]),
             _ => src.clone(),
         }
     }
@@ -50,7 +46,7 @@ impl UOp {
     ///
     /// Sink marks outputs that must be evaluated. All sources are dependencies.
     pub fn sink(sources: Vec<Arc<Self>>) -> Arc<Self> {
-        Self::new(Op::Sink { sources: SmallVec::from_vec(sources), info: None }, DType::Void)
+        Self::new(Op::Sink(ops::Sink { sources: SmallVec::from_vec(sources), info: None }), DType::Void)
     }
 
     /// Create a sink carrying a structural [`KernelInfo`] marker.
@@ -58,8 +54,8 @@ impl UOp {
     /// The marker participates in hash consing — marked and unmarked sinks
     /// with otherwise identical sources are distinct UOps. Used to mark a
     /// SINK as a fully-formed kernel AST that downstream gates skip over.
-    pub fn sink_with_info(sources: Vec<Arc<Self>>, info: KernelInfo) -> Arc<Self> {
-        Self::new(Op::Sink { sources: SmallVec::from_vec(sources), info: Some(info) }, DType::Void)
+    pub fn sink_with_info(sources: Vec<Arc<Self>>, info: impl Into<Box<KernelInfo>>) -> Arc<Self> {
+        Self::new(Op::Sink(ops::Sink { sources: SmallVec::from_vec(sources), info: Some(info.into()) }), DType::Void)
     }
 
     /// Create a group operation (merging/organizing related ops).
@@ -68,7 +64,7 @@ impl UOp {
     /// It passes through the first source while ensuring all sources are dependencies.
     pub fn group(sources: Vec<Arc<Self>>) -> Arc<Self> {
         let dtype = if sources.is_empty() { DType::Void } else { sources[0].dtype.clone() };
-        Self::new(Op::Group { sources: SmallVec::from_vec(sources) }, dtype)
+        Self::new(Op::Group(ops::Group { sources: SmallVec::from_vec(sources) }), dtype)
     }
 
     // =========================================================================
@@ -85,14 +81,14 @@ impl UOp {
     pub fn after(self: &Arc<Self>, deps: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
         #[cfg(debug_assertions)]
         debug_assert!(
-            !matches!(self.op(), Op::Range { .. } | Op::End { .. }),
+            !matches!(self.op(), Op::Range(..) | Op::End(..)),
             "AFTER passthrough must be data-producing node, got {:?} (id={})",
             self.op(),
             self.id
         );
 
         let dtype = self.dtype();
-        Self::new(Op::After { passthrough: self.clone(), deps }, dtype)
+        Self::new(Op::After(ops::After { passthrough: self.clone(), deps }), dtype)
     }
 
     // =========================================================================
@@ -102,7 +98,7 @@ impl UOp {
     /// Detach from gradient flow / force materialization.
     pub fn detach(self: &Arc<Self>) -> Arc<Self> {
         let dtype = self.dtype();
-        Self::new(Op::Detach { src: self.clone() }, dtype)
+        Self::new(Op::Detach(ops::Detach { src: self.clone() }), dtype)
     }
 
     /// Ensure contiguous memory layout.
@@ -113,32 +109,29 @@ impl UOp {
     ///
     /// Based on Tinygrad's `UOp.contiguous()` (ops.py:463-466).
     pub fn contiguous(self: &Arc<Self>) -> Arc<Self> {
-        if matches!(self.op(), Op::Contiguous { .. }) {
+        if matches!(self.op(), Op::Contiguous(..)) {
             return self.clone();
         }
         if self.has_buffer_identity() {
             return self.clone();
         }
         let dtype = self.dtype();
-        Self::new(Op::Contiguous { src: self.clone(), opts: smallvec::SmallVec::new() }, dtype)
+        Self::new(Op::Contiguous(ops::Contiguous { src: self.clone(), opts: Vec::new() }), dtype)
     }
 
     /// Ensure contiguous memory layout with optimization hints.
     ///
     /// The hints are extracted during rangeify and passed to the optimizer.
     /// Based on Tinygrad's CONTIGUOUS.arg which carries Opt tuples.
-    pub fn contiguous_with_opts(
-        self: &Arc<Self>,
-        opts: smallvec::SmallVec<[crate::types::ContiguousHint; 4]>,
-    ) -> Arc<Self> {
+    pub fn contiguous_with_opts(self: &Arc<Self>, opts: impl Into<Vec<crate::types::ContiguousHint>>) -> Arc<Self> {
         let dtype = self.dtype();
-        Self::new(Op::Contiguous { src: self.clone(), opts }, dtype)
+        Self::new(Op::Contiguous(ops::Contiguous { src: self.clone(), opts: opts.into() }), dtype)
     }
 
     /// Contiguous backward pass.
     pub fn contiguous_backward(self: &Arc<Self>) -> Arc<Self> {
         let dtype = self.dtype();
-        Self::new(Op::ContiguousBackward { src: self.clone() }, dtype)
+        Self::new(Op::ContiguousBackward(ops::ContiguousBackward { src: self.clone() }), dtype)
     }
 
     // =========================================================================
@@ -151,7 +144,7 @@ impl UOp {
     /// in codegen (prevents invalid cast fusion).
     pub fn precast(self: &Arc<Self>) -> Arc<Self> {
         let dtype = self.dtype();
-        Self::new(Op::Precast { src: self.clone() }, dtype)
+        Self::new(Op::Precast(ops::Precast { src: self.clone() }), dtype)
     }
 
     // =========================================================================
@@ -166,7 +159,7 @@ impl UOp {
     /// This op is rendered by backend codegen as inline/source-template code.
     /// For typed runtime helpers (encdec/graph style), use `custom_function`.
     pub fn custom(deps: SmallVec<[Arc<Self>; 4]>, code: String, dtype: DType) -> Arc<Self> {
-        Self::new(Op::Custom { deps, code }, dtype)
+        Self::new(Op::Custom(ops::Custom { deps, code }), dtype)
     }
 
     /// Create an explicit runtime custom-function operation.
@@ -175,7 +168,7 @@ impl UOp {
     /// semantic runtime behavior (for example `EncDec`), while CALL provides the
     /// runtime buffer arguments.
     pub fn custom_function(kind: CustomFunctionKind, attrs: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
-        Self::new(Op::CustomFunction { kind, attrs }, DType::Void)
+        Self::new(Op::CustomFunction(ops::CustomFunction { kind, attrs }), DType::Void)
     }
 
     /// Inject custom code as an inline expression.
@@ -183,7 +176,7 @@ impl UOp {
     /// Unlike `custom` (statement), this is substituted directly into expressions.
     /// `deps` provide values to reference; result has specified `dtype`.
     pub fn customi(deps: SmallVec<[Arc<Self>; 4]>, code: String, dtype: DType) -> Arc<Self> {
-        Self::new(Op::CustomI { deps, code }, dtype)
+        Self::new(Op::CustomI(ops::CustomI { deps, code }), dtype)
     }
 
     /// Create a PARAM placeholder shaped like `src` for custom kernel building.
@@ -216,7 +209,7 @@ impl UOp {
         F: FnOnce(Vec<Arc<Self>>) -> Arc<Self>,
     {
         let contig_srcs: Vec<Arc<Self>> =
-            srcs.into_iter().map(|x| if matches!(x.op(), Op::After { .. }) { x } else { x.contiguous() }).collect();
+            srcs.into_iter().map(|x| if matches!(x.op(), Op::After(..)) { x } else { x.contiguous() }).collect();
 
         let placeholders: Vec<Arc<Self>> = contig_srcs
             .iter()
@@ -225,7 +218,7 @@ impl UOp {
             .collect::<Result<_>>()?;
 
         let mut body = fxn(placeholders);
-        if let Op::Sink { sources, info: None } = body.op() {
+        if let Op::Sink(ops::Sink { sources, info: None }) = body.op() {
             body = Self::sink_with_info(sources.to_vec(), KernelInfo::default());
         }
         let args = SmallVec::from_vec(contig_srcs.clone());

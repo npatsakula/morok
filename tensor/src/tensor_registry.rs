@@ -35,13 +35,15 @@
 //!
 //! TensorEntry also caches the buffer for direct access via tensor.buffer().
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use papaya::HashMap as PapayaMap;
 use parking_lot::RwLock;
 use svod_device::Buffer;
+use svod_ir::ops;
+use svod_ir::uop::SubtreeMemo;
 use svod_ir::{Op, UOp, UOpKey};
 
 /// Atomic counter for unique tensor IDs.
@@ -326,7 +328,14 @@ fn apply_map_to_tensors_inner(
     let map = tensors();
     let guard = map.guard();
 
-    // Phase 1: Find affected tensors (read-only scan, skip dead weak refs)
+    // Phase 1: Find affected tensors (read-only scan, skip dead weak refs).
+    //
+    // One memo shared across every live tensor: tensor graphs overlap heavily,
+    // so a per-tensor walk would re-answer "does this subtree touch a replaced
+    // node" for the same shared nodes on every realize (the dominant
+    // multi-model prepare cost).
+    let replaced: HashSet<u64> = becomes_map.keys().map(|key| key.0.id).collect();
+    let mut touches_replaced = SubtreeMemo::new(|node: &Arc<UOp>| replaced.contains(&node.id));
     let affected: Vec<Arc<TensorEntry>> = map
         .iter(&guard)
         .filter_map(|(_, weak)| {
@@ -340,12 +349,7 @@ fn apply_map_to_tensors_inner(
                 {
                     return None;
                 }
-                // Cached backward-slice membership: O(|map|) per tensor once
-                // the slice cache is warm, instead of a fresh toposort of
-                // every live tensor's graph on every realize (the dominant
-                // multi-model prepare cost).
-                let slice = uop.backward_slice_ids();
-                becomes_map.keys().any(|key| slice.contains(&key.0.id))
+                touches_replaced.contains(&uop)
             }; // uop lock dropped here
             if is_affected { Some(entry) } else { None }
         })
@@ -371,7 +375,7 @@ fn apply_map_to_tensors_inner(
     // result. Re-applying is idempotent: realize maps are `old → replacement`
     // where the replacement no longer contains the old key, so an
     // already-rewritten value comes back unchanged and is left alone.
-    if let Op::Sink { sources: new_sources, .. } = new_sink.op() {
+    if let Op::Sink(ops::Sink { sources: new_sources, .. }) = new_sink.op() {
         for (entry, (old, new)) in affected.iter().zip(sources.iter().zip(new_sources.iter())) {
             if Arc::ptr_eq(old, new) {
                 continue;

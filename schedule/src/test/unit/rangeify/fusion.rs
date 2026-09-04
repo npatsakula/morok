@@ -11,6 +11,7 @@ use test_case::test_case;
 use crate::rangeify::{rangeify_with_map, try_get_kernel_graph};
 
 use super::helpers::count_kernels;
+use svod_ir::ops;
 
 fn buffer(size: usize) -> Arc<UOp> {
     UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, DType::Float32)
@@ -18,7 +19,7 @@ fn buffer(size: usize) -> Arc<UOp> {
 
 fn reshape_2d(src: Arc<UOp>, rows: i64, cols: i64) -> Arc<UOp> {
     let new_shape = UOp::stack(smallvec![UOp::index_const(rows), UOp::index_const(cols)]);
-    UOp::new(Op::Reshape { src, new_shape }, DType::Float32)
+    UOp::new(Op::Reshape(ops::Reshape { src, new_shape }), DType::Float32)
 }
 
 fn binop() -> Arc<UOp> {
@@ -36,7 +37,7 @@ fn binop_then_reshape() -> Arc<UOp> {
 
 fn binop_then_permute() -> Arc<UOp> {
     let reshaped = reshape_2d(buffer(100).try_add(&buffer(100)).expect("add"), 10, 10);
-    UOp::sink(vec![UOp::new(Op::Permute { src: reshaped, axes: vec![1, 0] }, DType::Float32)])
+    UOp::sink(vec![UOp::new(Op::Permute(ops::Permute { src: reshaped, axes: vec![1, 0] }), DType::Float32)])
 }
 
 fn reduce() -> Arc<UOp> {
@@ -82,7 +83,7 @@ fn empty_sink() -> Arc<UOp> {
 #[test_case(super::empty_sink, 0 ; "empty sink launches nothing")]
 fn kernel_count(build: fn() -> Arc<UOp>, expected: usize) {
     let built = build();
-    let Op::Sink { sources, .. } = built.op() else { panic!("builders return SINKs") };
+    let Op::Sink(ops::Sink { sources, .. }) = built.op() else { panic!("builders return SINKs") };
     let root = UOp::sink(sources.iter().map(|source| source.contiguous()).collect());
     let rangeified = rangeify_with_map(root).expect("rangeify");
     let (kernels, _) = try_get_kernel_graph(rangeified.sink).expect("kernel graph");
