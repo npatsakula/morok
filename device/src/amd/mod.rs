@@ -27,6 +27,11 @@
 //!   single-threaded. **Pending hardware gates**: multi-XCC AQL with XCC0
 //!   `PRED_EXEC` predication, two-GPU peer/sentinel validation, and
 //!   near-capacity ring stress.
+//! - **Open on gfx1151**: the merged tensor doctest binary under
+//!   `SVOD_DEVICE=AMD:0` faults (`NotPresent` at offset 0 of a live
+//!   `QueueGart` descriptor page) in a handful of random doctests per run,
+//!   and passes with `--test-threads=1`. The unit suites do not show it.
+//!   Reproduced on `7f7f1f5f` (2026-09-04); not yet root-caused.
 //! - **Structural debt**: linked plans publish SDMA work on a plan-local
 //!   timeline, so `AmdCopyQueue` must retain foreign finalizers; the wider
 //!   fix is one per-device timeline signal as in Tinygrad's `HCQCompiled`.
