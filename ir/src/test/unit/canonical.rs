@@ -39,6 +39,27 @@ fn canonical_json_is_stable_generic_json_free_of_runtime_ids() {
     assert_eq!(parsed["nodes"][2]["op"], "SUB");
 }
 
+/// The binary encoding carries the JSON oracle's content: equal graphs encode
+/// identically across interning generations, a semantic change (another
+/// constant) changes the bytes, and the layout is fixed-width little-endian
+/// bincode so digests over it are machine-independent.
+#[test]
+fn canonical_binary_encoding_is_stable_and_content_sensitive() {
+    let encode = |value: i64| {
+        let lhs = UOp::const_(DType::Int32, ConstValue::Int(value));
+        let rhs = UOp::const_(DType::Int32, ConstValue::Int(2));
+        let sub = UOp::new(Op::Binary(BinaryOp::Sub, lhs, rhs), DType::Int32);
+        let mut bytes = Vec::new();
+        CanonicalGraph::from_root("tensor", &sub).unwrap().encode_into(&mut bytes).unwrap();
+        bytes
+    };
+    let first = encode(7);
+    assert_eq!(first, encode(7));
+    assert_ne!(first, encode(8));
+    // schema_version as u32, then the u64 length-prefixed stage.
+    assert_eq!(first[..16], [6, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, b't', b'e', b'n', b's']);
+}
+
 #[test]
 fn canonical_verbose_mode_is_explicit_and_not_in_default_oracle() {
     let root = UOp::native_const(7i32).rtag(Some(smallvec::smallvec![9]));

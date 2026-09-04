@@ -382,14 +382,15 @@ fn sha256(bytes: &[u8]) -> StageDigest {
 }
 
 fn linear_sha256(linear: &Arc<UOp>) -> Result<StageDigest> {
-    let graph = svod_ir::CanonicalGraph::from_root("source-stage-linear-v1", linear).map_err(|error| {
+    let graph = svod_ir::CanonicalGraph::from_root("source-stage-linear-v2", linear).map_err(|error| {
         Error::ProgramStageMismatch { stage: "SOURCE", reason: format!("cannot encode LINEAR identity: {error}") }
     })?;
-    let encoded = graph.to_pretty_json().map_err(|error| Error::ProgramStageMismatch {
+    let mut hasher = Sha256::new();
+    graph.encode_into(&mut hasher).map_err(|error| Error::ProgramStageMismatch {
         stage: "SOURCE",
         reason: format!("cannot serialize LINEAR identity: {error}"),
     })?;
-    Ok(sha256(encoded.as_bytes()))
+    Ok(StageDigest(hasher.finalize().into()))
 }
 
 fn source_stage_identity_from_parts(

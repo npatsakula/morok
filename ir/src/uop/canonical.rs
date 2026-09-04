@@ -4,7 +4,7 @@
 //! nodes, and expose runtime IDs and caches. This module instead emits a
 //! dependency-first node table with graph-local source IDs.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -261,7 +261,7 @@ impl CanonicalGraph {
         let stage = stage.into();
         let topo = canonical_toposort(roots)?;
 
-        let ids: HashMap<u64, usize> = topo.iter().enumerate().map(|(id, node)| (node.id, id)).collect();
+        let ids: FxHashMap<u64, usize> = topo.iter().enumerate().map(|(id, node)| (node.id, id)).collect();
         let nodes = topo
             .iter()
             .enumerate()
@@ -294,6 +294,13 @@ impl CanonicalGraph {
     pub fn to_pretty_json(&self) -> serde_json::Result<String> {
         serde_json::to_string_pretty(self)
     }
+
+    /// Stream the same fields as [`Self::to_pretty_json`] into `writer` as
+    /// fixed-width little-endian bincode. Identity digests hash this directly
+    /// instead of materializing text.
+    pub fn encode_into(&self, writer: impl std::io::Write) -> bincode::Result<()> {
+        bincode::serialize_into(writer, self)
+    }
 }
 
 fn canonical_dependencies(node: &Arc<UOp>) -> crate::Result<Vec<Arc<UOp>>> {
@@ -324,8 +331,8 @@ fn canonical_sources(op: &Op) -> Vec<Arc<UOp>> {
 }
 
 fn canonical_toposort(roots: &[Arc<UOp>]) -> crate::Result<Vec<Arc<UOp>>> {
-    let mut visited = HashSet::new();
-    let mut active = HashSet::new();
+    let mut visited = FxHashSet::default();
+    let mut active = FxHashSet::default();
     let mut result = Vec::new();
     let mut stack: Vec<_> = roots.iter().rev().cloned().map(|root| (root, false)).collect();
 
@@ -401,7 +408,7 @@ fn capture_canonical_stage(stage: &str, root: &Arc<UOp>) {
 fn canonical_node(
     id: usize,
     node: &Arc<UOp>,
-    ids: &HashMap<u64, usize>,
+    ids: &FxHashMap<u64, usize>,
     verbose: bool,
 ) -> crate::Result<CanonicalNode> {
     let shape = node
@@ -507,7 +514,7 @@ fn address_space_name(address_space: AddrSpace) -> String {
     .to_string()
 }
 
-fn canonical_program_value(value: &Arc<UOp>, ids: &HashMap<u64, usize>) -> crate::Result<CanonicalProgramValue> {
+fn canonical_program_value(value: &Arc<UOp>, ids: &FxHashMap<u64, usize>) -> crate::Result<CanonicalProgramValue> {
     Ok(match value.op() {
         Op::Const(value) => match canonical_const(value.0) {
             CanonicalConst::Int { value } => CanonicalProgramValue::Int { value },
@@ -570,7 +577,7 @@ pub const TAG_SCHEDULE_CACHE_PARAM: usize = usize::MAX - 4;
 /// Tag separating a CALL-source binding PARAM from its body-local counterpart.
 pub const TAG_CALL_BIND_PARAM: usize = usize::MAX - 5;
 
-fn canonical_arg(node: &Arc<UOp>, ids: &HashMap<u64, usize>, verbose: bool) -> crate::Result<CanonicalArg> {
+fn canonical_arg(node: &Arc<UOp>, ids: &FxHashMap<u64, usize>, verbose: bool) -> crate::Result<CanonicalArg> {
     Ok(match node.op() {
         Op::Const(constant) => CanonicalArg::Const { value: canonical_const(constant.0) },
         Op::Unique(_) | Op::LUnique(_) => {

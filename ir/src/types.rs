@@ -13,8 +13,9 @@ use svod_dtype::DeviceSpec;
 use svod_dtype::cast::commit_float;
 use svod_dtype::{DType, ScalarDType};
 
-/// Schema version for semantic SOURCE stage identities.
-pub const SOURCE_STAGE_IDENTITY_VERSION: u32 = 1;
+/// Schema version for semantic SOURCE stage identities. v2 hashes the LINEAR
+/// canonical graph as bincode instead of pretty JSON.
+pub const SOURCE_STAGE_IDENTITY_VERSION: u32 = 2;
 
 /// Schema version for semantic BINARY stage identities.
 pub const BINARY_STAGE_IDENTITY_VERSION: u32 = 1;

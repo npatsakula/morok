@@ -9,9 +9,10 @@ use svod_ir::ops;
 
 /// WMMA `(upcast, reduce, hidden)` axis lists, `None` when the sort key carries no WMMA.
 type WmmaAxes = Option<(Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<(usize, usize)>)>;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::UOp;
 use svod_ir::op::Op;
@@ -131,7 +132,7 @@ fn op_value(op: &Op) -> u16 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ConstKey {
     Invalid,
     Bool(bool),
@@ -180,7 +181,7 @@ impl PartialOrd for ConstKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct DTypeKey(i16, usize, String, Option<char>, Vec<usize>);
 
 fn dtype_key(dtype: &DType) -> DTypeKey {
@@ -239,7 +240,7 @@ fn const_key(value: ConstValue) -> ConstKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct ParamKey {
     slot: i128,
     dtype: DTypeKey,
@@ -469,7 +470,7 @@ impl PartialTuplizeRef {
 fn partial_tuplize_ref_cmp(
     left: PartialTuplizeRef,
     right: PartialTuplizeRef,
-    cache: &mut HashMap<(u64, u64), Option<Ordering>>,
+    cache: &mut FxHashMap<(u64, u64), Option<Ordering>>,
 ) -> Option<Ordering> {
     let pair = left.node_id().zip(right.node_id());
     if let Some(pair) = pair
@@ -517,7 +518,7 @@ fn partial_tuplize_ref_cmp(
 fn partial_tuplize_cmp(
     left: &Arc<UOp>,
     right: &Arc<UOp>,
-    cache: &mut HashMap<(u64, u64), Option<Ordering>>,
+    cache: &mut FxHashMap<(u64, u64), Option<Ordering>>,
 ) -> Option<Ordering> {
     partial_tuplize_ref_cmp(PartialTuplizeRef::Node(left.clone()), PartialTuplizeRef::Node(right.clone()), cache)
 }
@@ -536,8 +537,8 @@ thread_local! {
     /// Keyed by UOp id pairs, which is sound because ids are monotonic and
     /// never reused (`ir/src/uop/hash_consing.rs:46-52`), so a verdict for a
     /// pair stays true for the life of the process.
-    static TUPLIZE_CMP_MEMO: std::cell::RefCell<HashMap<(u64, u64), Option<Ordering>>> =
-        std::cell::RefCell::new(HashMap::new());
+    static TUPLIZE_CMP_MEMO: std::cell::RefCell<FxHashMap<(u64, u64), Option<Ordering>>> =
+        std::cell::RefCell::new(FxHashMap::default());
 }
 
 /// Compare pinned Tinygrad `(op, arg, dtype, *src.tuplize)` keys without
@@ -551,7 +552,7 @@ pub(crate) fn tinygrad_tuplize_cmp(left: &Arc<UOp>, right: &Arc<UOp>) -> Option<
     })
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum ArgKey {
     None,
     Const(ConstKey),
@@ -696,132 +697,195 @@ fn arg_key(op: &Op) -> ArgKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TuplizeKey {
+/// `(op, arg, dtype)` head of one tuplize key.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct TuplizeHead {
     op: u16,
     arg: ArgKey,
     dtype: DTypeKey,
-    src: Vec<Arc<TuplizeKey>>,
 }
 
-impl Ord for TuplizeKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.op
-            .cmp(&other.op)
-            .then_with(|| self.arg.cmp(&other.arg))
-            .then_with(|| self.dtype.cmp(&other.dtype))
-            .then_with(|| self.src.cmp(&other.src))
-    }
+/// Tuplize keys of one toposorted graph, flattened into index tables.
+///
+/// Entry `i < nodes.len()` is the key of toposort node `i`; the entries after
+/// that are the CONST lanes pinned Tinygrad's `STACK(CONST...)` gives a VCONST.
+/// Heads are interned and ranked once, so a key's head compares as one integer
+/// and only source walks remain per comparison.
+struct TuplizeKeys {
+    /// Distinct heads in ascending order; `head` indexes this table.
+    #[cfg(test)]
+    heads: Vec<TuplizeHead>,
+    head: Vec<u32>,
+    /// CSR layout: the sources of entry `i` are `src[src_start[i]..src_start[i + 1]]`.
+    src_start: Vec<u32>,
+    src: Vec<u32>,
 }
 
-impl PartialOrd for TuplizeKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// One suspended `compare_tuplize` call: `next` is how many of this pair's
-/// source pairs have already come back Equal.
+/// One suspended comparison: `next` is how many of this pair's source pairs
+/// have already come back Equal.
+#[derive(Clone, Copy)]
 struct TuplizeFrame {
-    left: Arc<TuplizeKey>,
-    right: Arc<TuplizeKey>,
+    left: u32,
+    right: u32,
     next: usize,
 }
 
-impl TuplizeFrame {
-    fn pair(&self) -> (usize, usize) {
-        (Arc::as_ptr(&self.left) as usize, Arc::as_ptr(&self.right) as usize)
-    }
+fn key_pair(left: u32, right: u32) -> u64 {
+    (u64::from(left) << 32) | u64::from(right)
 }
 
-/// Lexicographic comparison of two tuplize keys.
-///
-/// Iterative rather than recursive: the key mirrors the UOp graph, so a deep
-/// chain (long CAST/PRECAST ladders, unrolled reductions) recursed once per
-/// level and overflowed the 8 MiB main stack around 20-30k deep. The memo is
-/// unchanged; the 128-element key truncation this replaced is *not* reinstated,
-/// because truncating makes the order non-total.
-fn compare_tuplize(
-    left: &Arc<TuplizeKey>,
-    right: &Arc<TuplizeKey>,
-    cache: &mut HashMap<(usize, usize), Ordering>,
-) -> Ordering {
-    let mut stack = vec![TuplizeFrame { left: left.clone(), right: right.clone(), next: 0 }];
-    // Verdict of the frame just popped, still to be consumed by its parent.
-    let mut settled: Option<Ordering> = None;
+impl TuplizeKeys {
+    fn sources(&self, key: u32) -> &[u32] {
+        &self.src[self.src_start[key as usize] as usize..self.src_start[key as usize + 1] as usize]
+    }
 
-    loop {
-        let frame = stack.last_mut().expect("the root frame is popped only by returning");
-        let mut decided = match settled.take() {
-            // A source pair came back: Equal moves on to the next one, anything
-            // else settles this frame.
-            Some(Ordering::Equal) => {
-                frame.next += 1;
-                None
-            }
-            Some(order) => Some(order),
-            None => cache.get(&frame.pair()).copied().or_else(|| {
-                let shallow = frame
-                    .left
-                    .op
-                    .cmp(&frame.right.op)
-                    .then_with(|| frame.left.arg.cmp(&frame.right.arg))
-                    .then_with(|| frame.left.dtype.cmp(&frame.right.dtype));
-                (shallow != Ordering::Equal).then_some(shallow)
-            }),
-        };
+    #[cfg(test)]
+    fn head_of(&self, key: u32) -> &TuplizeHead {
+        &self.heads[self.head[key as usize] as usize]
+    }
 
-        if decided.is_none() {
-            decided = match (frame.left.src.get(frame.next), frame.right.src.get(frame.next)) {
-                (Some(a), Some(b)) => {
-                    let (a, b) = (a.clone(), b.clone());
-                    stack.push(TuplizeFrame { left: a, right: b, next: 0 });
-                    None
+    /// Verdict available without walking sources: identity, head order, or a memoized pair.
+    fn shallow_cmp(&self, left: u32, right: u32, memo: &FxHashMap<u64, Ordering>) -> Option<Ordering> {
+        if left == right {
+            return Some(Ordering::Equal);
+        }
+        match self.head[left as usize].cmp(&self.head[right as usize]) {
+            Ordering::Equal => memo.get(&key_pair(left, right)).copied(),
+            order => Some(order),
+        }
+    }
+
+    /// Lexicographic `(head, *src)` comparison of two keys.
+    ///
+    /// Iterative rather than recursive: the key mirrors the UOp graph, so a deep
+    /// chain (long CAST/PRECAST ladders, unrolled reductions) recursed once per
+    /// level and overflowed the 8 MiB main stack around 20-30k deep. `memo`
+    /// keeps every pair settled by a source walk; `stack` is scratch reused
+    /// across calls. Keys are never truncated: truncating makes the order
+    /// non-total.
+    fn cmp(
+        &self,
+        left: u32,
+        right: u32,
+        memo: &mut FxHashMap<u64, Ordering>,
+        stack: &mut Vec<TuplizeFrame>,
+    ) -> Ordering {
+        stack.clear();
+        stack.push(TuplizeFrame { left, right, next: 0 });
+        // Verdict of the frame just popped, still to be consumed by its parent.
+        let mut settled: Option<Ordering> = None;
+
+        loop {
+            let frame = stack.last_mut().expect("the root frame is popped only by returning");
+            let (mut decided, walked) = match settled.take() {
+                // A source pair came back: Equal moves on to the next one, anything
+                // else settles this frame.
+                Some(Ordering::Equal) => {
+                    frame.next += 1;
+                    (None, true)
                 }
-                _ => Some(frame.left.src.len().cmp(&frame.right.src.len())),
+                Some(order) => (Some(order), true),
+                None => (self.shallow_cmp(frame.left, frame.right, memo), false),
             };
-        }
+            let TuplizeFrame { left, right, next } = *frame;
 
-        let Some(order) = decided else { continue };
-        let pair = stack.pop().expect("the frame was borrowed from the stack").pair();
-        cache.insert(pair, order);
-        cache.insert((pair.1, pair.0), order.reverse());
-        if stack.is_empty() {
-            return order;
+            if decided.is_none() {
+                let (left_src, right_src) = (self.sources(left), self.sources(right));
+                decided = match (left_src.get(next), right_src.get(next)) {
+                    (Some(&a), Some(&b)) => {
+                        stack.push(TuplizeFrame { left: a, right: b, next: 0 });
+                        None
+                    }
+                    _ => Some(left_src.len().cmp(&right_src.len())),
+                };
+            }
+
+            let Some(order) = decided else { continue };
+            stack.pop();
+            if walked {
+                memo.insert(key_pair(left, right), order);
+                memo.insert(key_pair(right, left), order.reverse());
+            }
+            if stack.is_empty() {
+                return order;
+            }
+            settled = Some(order);
         }
-        settled = Some(order);
     }
 }
 
-fn compute_tuplize(nodes: &[Arc<UOp>]) -> HashMap<u64, Arc<TuplizeKey>> {
-    let mut keys: HashMap<u64, Arc<TuplizeKey>> = HashMap::with_capacity(nodes.len());
+/// Toposort position of every node by UOp id.
+fn node_index(nodes: &[Arc<UOp>]) -> FxHashMap<u64, u32> {
+    nodes.iter().enumerate().map(|(position, node)| (node.id, position as u32)).collect()
+}
+
+fn compute_tuplize(nodes: &[Arc<UOp>], index: &FxHashMap<u64, u32>) -> TuplizeKeys {
+    let mut interned: FxHashMap<TuplizeHead, u32> = FxHashMap::default();
+    let mut intern = |head: TuplizeHead| {
+        let next = interned.len() as u32;
+        *interned.entry(head).or_insert(next)
+    };
+
+    let mut head = Vec::with_capacity(nodes.len());
+    let mut src_start = Vec::with_capacity(nodes.len() + 1);
+    let mut src = Vec::with_capacity(nodes.len() * 2);
+    let mut lanes = Vec::new();
+    src_start.push(0);
     for node in nodes {
-        let (arg, dtype, src) = match node.op() {
+        match node.op() {
             // Svod's compact VCONST is pinned Tinygrad's STACK(CONST...).
             Op::VConst(ops::VConst { values }) => {
-                let dtype = DType::Scalar(node.dtype().base());
-                let src = values
-                    .iter()
-                    .map(|value| {
-                        Arc::new(TuplizeKey {
-                            op: 61,
-                            arg: ArgKey::Const(const_key(*value)),
-                            dtype: dtype_key(&dtype),
-                            src: vec![],
-                        })
-                    })
-                    .collect();
-                (ArgKey::None, dtype_key(&dtype), src)
+                let dtype = dtype_key(&DType::Scalar(node.dtype().base()));
+                head.push(intern(TuplizeHead { op: 16, arg: ArgKey::None, dtype: dtype.clone() }));
+                for value in values {
+                    src.push((nodes.len() + lanes.len()) as u32);
+                    lanes.push(intern(TuplizeHead {
+                        op: 61,
+                        arg: ArgKey::Const(const_key(*value)),
+                        dtype: dtype.clone(),
+                    }));
+                }
             }
-            _ => (
-                arg_key(node.op()),
-                dtype_key(&node.dtype()),
-                node.op().sources().iter().map(|child| keys[&child.id].clone()).collect(),
-            ),
-        };
-        keys.insert(node.id, Arc::new(TuplizeKey { op: op_value(node.op()), arg, dtype, src }));
+            op => {
+                head.push(intern(TuplizeHead { op: op_value(op), arg: arg_key(op), dtype: dtype_key(&node.dtype()) }));
+                src.extend(op.sources().iter().map(|child| index[&child.id]));
+            }
+        }
+        src_start.push(src.len() as u32);
     }
-    keys
+    src_start.resize(nodes.len() + lanes.len() + 1, src.len() as u32);
+    head.append(&mut lanes);
+
+    let mut heads: Vec<(TuplizeHead, u32)> = interned.into_iter().collect();
+    heads.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let mut rank = vec![0u32; heads.len()];
+    for (position, (_, id)) in heads.iter().enumerate() {
+        rank[*id as usize] = position as u32;
+    }
+    for slot in &mut head {
+        *slot = rank[*slot as usize];
+    }
+    TuplizeKeys {
+        #[cfg(test)]
+        heads: heads.into_iter().map(|(head, _)| head).collect(),
+        head,
+        src_start,
+        src,
+    }
+}
+
+/// Dense position of every node in ascending tuplize order; equal keys keep
+/// their toposort order, as a stable sort on the keys would.
+fn tuplize_ranks(nodes: &[Arc<UOp>], index: &FxHashMap<u64, u32>) -> Vec<u32> {
+    let keys = compute_tuplize(nodes, index);
+    let (mut memo, mut stack) = (FxHashMap::default(), Vec::new());
+    let mut order: Vec<u32> = (0..nodes.len() as u32).collect();
+    order.sort_by(|&left, &right| keys.cmp(left, right, &mut memo, &mut stack));
+    let mut rank = vec![0; nodes.len()];
+    for (position, &node) in order.iter().enumerate() {
+        rank[node as usize] = position as u32;
+    }
+    rank
 }
 
 /// Compute run_count: `prod(int(r.vmax)+1 for r in u.ranges)`.
@@ -884,64 +948,54 @@ pub fn linearize(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
     if lst.is_empty() {
         return vec![sink];
     }
+    let index = node_index(&lst);
 
-    // Compute out_degree and priorities.
-    let mut out_degree: HashMap<u64, usize> = HashMap::new();
-    let mut priorities: HashMap<u64, (u64, i32, Option<i64>)> = HashMap::new();
-
+    let mut out_degree = vec![0u32; lst.len()];
     for u in &lst {
         for s in u.op().sources() {
-            *out_degree.entry(s.id).or_default() += 1;
+            out_degree[index[&s.id] as usize] += 1;
         }
     }
-    for u in &lst {
-        let rc = run_count(u);
-        let (p, extra) = priority(u);
-        priorities.insert(u.id, (rc, p, extra));
-    }
-
-    // Compute tuplize keys (bottom-up).
-    let tuplize = compute_tuplize(&lst);
 
     // Sort all nodes by (run_count, priority, extra, tuplize) — the "ideal order".
     // Assign sequential nkey based on sorted position.
-    let mut sorted: Vec<u64> = lst.iter().map(|u| u.id).collect();
-    let mut comparison_cache = HashMap::new();
-    sorted.sort_by(|&a, &b| {
-        let pa = &priorities[&a];
-        let pb = &priorities[&b];
-        pa.cmp(pb).then_with(|| {
-            if TUPLE_ORDER {
-                compare_tuplize(&tuplize[&a], &tuplize[&b], &mut comparison_cache)
-            } else {
-                Ordering::Equal
-            }
+    let ranks = if TUPLE_ORDER { tuplize_ranks(&lst, &index) } else { vec![0; lst.len()] };
+    let sort_keys: Vec<_> = lst
+        .iter()
+        .zip(&ranks)
+        .map(|(u, &rank)| {
+            let (p, extra) = priority(u);
+            (run_count(u), p, extra, rank)
         })
-    });
-
-    let nkey: HashMap<u64, usize> = sorted.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+        .collect();
+    let mut sorted: Vec<u32> = (0..lst.len() as u32).collect();
+    sorted.sort_by_key(|&node| sort_keys[node as usize]);
+    let mut nkey = vec![0usize; lst.len()];
+    for (position, &node) in sorted.iter().enumerate() {
+        nkey[node as usize] = position;
+    }
 
     // Heap toposort: pop highest nkey first (max-heap), reverse at end.
-    let id_map: HashMap<u64, Arc<UOp>> = lst.iter().map(|u| (u.id, u.clone())).collect();
-
-    let mut heap: BinaryHeap<(usize, u64)> = BinaryHeap::new();
-    heap.push((nkey[&sink.id], sink.id));
+    let root = index[&sink.id];
+    let mut heap = BinaryHeap::new();
+    heap.push((nkey[root as usize], root));
 
     let mut newlst: Vec<Arc<UOp>> = Vec::with_capacity(lst.len());
-    let mut visited: HashSet<u64> = HashSet::new();
+    let mut visited = vec![false; lst.len()];
 
-    while let Some((_, uid)) = heap.pop() {
-        if !visited.insert(uid) {
+    while let Some((_, node)) = heap.pop() {
+        if std::mem::replace(&mut visited[node as usize], true) {
             continue;
         }
-        let u = &id_map[&uid];
+        let u = &lst[node as usize];
         newlst.push(u.clone());
 
         for v in u.op().sources() {
-            let deg = out_degree.entry(v.id).or_default();
+            let source = index[&v.id];
+            let deg = &mut out_degree[source as usize];
             *deg = deg.saturating_sub(1);
-            if *deg == 0 && !visited.contains(&v.id) {
-                heap.push((nkey[&v.id], v.id));
+            if *deg == 0 && !visited[source as usize] {
+                heap.push((nkey[source as usize], source));
             }
         }
     }

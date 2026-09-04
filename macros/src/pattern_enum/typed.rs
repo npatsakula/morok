@@ -5,7 +5,7 @@
 //! (`Index { buffer, indices }` becomes `Index(ops::Index)`), the structs live in
 //! a sibling `ops` module, and `Op` gains `From<ops::X>` plus `as_x()` accessors.
 //! Tuple and unit variants are left untouched. The pattern-matching
-//! infrastructure (`OpKey`, `pattern_metadata`) is derived from the original
+//! infrastructure (`OpKey`, `alu`) is derived from the original
 //! field layout, so the DSL keeps seeing named children.
 
 use proc_macro2::TokenStream;
