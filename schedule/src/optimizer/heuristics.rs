@@ -960,9 +960,6 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
     if scheduler.renderer().tensor_cores.is_empty() {
         return false;
     }
-    if !has_matmul_pattern(scheduler) {
-        return false;
-    }
 
     // Guard: require exactly one reduce axis unless TC_OPT >= 1.
     let reduce_count = scheduler.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).len();

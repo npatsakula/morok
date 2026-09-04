@@ -454,7 +454,18 @@ use svod_schedule::{OptimizerRenderer, optimize_kernel_with_config};
 
 /// The single kernel AST the scheduler produces for `a·b` accumulating in `out`.
 fn matmul_kernel_ast(a_shape: &[usize], b_shape: &[usize], in_dtype: DType, out: DType) -> Arc<UOp> {
-    let a = Tensor::empty(a_shape, in_dtype.clone());
+    fused_matmul_kernel_ast(a_shape, b_shape, in_dtype, out, |a| a)
+}
+
+/// Like [`matmul_kernel_ast`], with `producer` applied to `a` before the matmul.
+fn fused_matmul_kernel_ast(
+    a_shape: &[usize],
+    b_shape: &[usize],
+    in_dtype: DType,
+    out: DType,
+    producer: impl Fn(Tensor) -> Tensor,
+) -> Arc<UOp> {
+    let a = producer(Tensor::empty(a_shape, in_dtype.clone()));
     let b = Tensor::empty(b_shape, in_dtype);
     let c = a.matmul_with().other(&b).dtype(out).call().expect("tensor matmul");
     let rangeified = svod_schedule::rangeify_with_map(UOp::sink(vec![c.uop().contiguous()])).expect("rangeify matmul");
@@ -578,6 +589,20 @@ fn native_amd_tensor_core_compile_only(
     if let Some(format_selectors) = format_selectors {
         assert!(rendered.code.contains(format_selectors), "wrong scaled format selectors");
     }
+}
+
+/// A fused elementwise producer (`relu(a) @ b`) keeps the WMMA legal; the
+/// hand-coded path must select it as tinygrad does.
+#[test]
+fn test_matmul_fused_producer_gfx1151_uses_wmma_compile_only() {
+    let ast = fused_matmul_kernel_ast(&[16, 16], &[16, 16], DType::Float16, DType::Float32, |a| a.relu().unwrap());
+    let optimizer = amd_optimizer(AmdArch::Gfx1151, None);
+    let heuristics = HeuristicsConfig::builder().matvec_enabled(false).build();
+    let config = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).heuristics(heuristics).build();
+    let optimized = optimize_kernel_with_config(ast, &optimizer, &config).expect("heuristic optimization");
+    let nodes = optimized.toposort();
+    let Op::Wmma(ops::Wmma { metadata, .. }) = find_wmma(&nodes).op() else { unreachable!() };
+    assert_eq!((metadata.dtype_in.clone(), metadata.dtype_out.clone()), (DType::Float16, DType::Float32));
 }
 
 fn eval_lane(u: &Arc<UOp>, lane: i64) -> i64 {

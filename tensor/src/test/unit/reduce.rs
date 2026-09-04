@@ -308,6 +308,19 @@ fn test_argmax_all_equal() {
 // ============================================================================
 
 crate::codegen_tests! {
+    /// `min` ignores NaN exactly like `max` instead of keeping whatever
+    /// element follows the NaN.
+    fn test_min_and_max_ignore_nan_alike(config) {
+        let x = Tensor::from_slice([3.0f32, f32::NAN, 5.0, 4.0]);
+        let mut min = x.min(0).unwrap();
+        min.realize_with(&config).unwrap();
+        let mut max = x.max(0).unwrap();
+        max.realize_with(&config).unwrap();
+        assert_eq!((min.as_vec::<f32>().unwrap(), max.as_vec::<f32>().unwrap()), (vec![3.0], vec![5.0]));
+    }
+}
+
+crate::codegen_tests! {
     // ========== Sum Tests (from Tinygrad test_ops.py:1344-1380) ==========
 
     fn test_sum_1d_value(config) {

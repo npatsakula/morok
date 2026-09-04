@@ -349,7 +349,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             let bv = ctx.get(b).to_string();
             let cv = ctx.get(c).to_string();
             let expr = if a.dtype().is_float() {
-                format!("{}({av}, {bv}, {cv})", c_math_fn("__builtin_fma", &a.dtype()))
+                narrow_float(format!("{}({av}, {bv}, {cv})", c_math_fn("__builtin_fma", &a.dtype())), &a.dtype())
             } else {
                 format!("(({av} * {bv}) + {cv})")
             };
@@ -588,6 +588,16 @@ fn narrow_int(expr: String, dtype: &DType) -> String {
     if narrow && dtype.vcount() == 1 { format!("(({}){expr})", c_dtype(dtype)) } else { expr }
 }
 
+/// The `f`-suffixed builtins compute at f32; round a half or bfloat16 result
+/// back to its own width so the C backend matches the native-width backends.
+fn narrow_float(expr: String, dtype: &DType) -> String {
+    if matches!(dtype.base(), ScalarDType::Float16 | ScalarDType::BFloat16) && dtype.vcount() == 1 {
+        format!("(({}){expr})", c_dtype(dtype))
+    } else {
+        expr
+    }
+}
+
 /// Render a binary operation as a C expression.
 fn render_binary(op: BinaryOp, l: &str, r: &str, dtype: &DType) -> String {
     match op {
@@ -599,14 +609,14 @@ fn render_binary(op: BinaryOp, l: &str, r: &str, dtype: &DType) -> String {
         BinaryOp::CDiv => narrow_int(format!("({l} / {r})"), dtype),
         BinaryOp::CMod => {
             if dtype.is_float() {
-                format!("{}({l}, {r})", c_math_fn("__builtin_fmod", dtype))
+                narrow_float(format!("{}({l}, {r})", c_math_fn("__builtin_fmod", dtype)), dtype)
             } else {
                 narrow_int(format!("({l} % {r})"), dtype)
             }
         }
         BinaryOp::Max => {
             if dtype.is_float() {
-                format!("{}({l}, {r})", c_math_fn("__builtin_fmax", dtype))
+                narrow_float(format!("{}({l}, {r})", c_math_fn("__builtin_fmax", dtype)), dtype)
             } else {
                 narrow_int(format!("({l} > {r} ? {l} : {r})"), dtype)
             }
@@ -624,7 +634,7 @@ fn render_binary(op: BinaryOp, l: &str, r: &str, dtype: &DType) -> String {
         BinaryOp::Shr => narrow_int(format!("({l} >> {r})"), dtype),
         BinaryOp::Pow => {
             if dtype.is_float() {
-                format!("{}({l}, {r})", c_math_fn("__builtin_pow", dtype))
+                narrow_float(format!("{}({l}, {r})", c_math_fn("__builtin_pow", dtype)), dtype)
             } else {
                 // Integer pow via cast to double
                 format!("(({})__builtin_pow((double){l}, (double){r}))", c_dtype(&DType::Scalar(dtype.base())))
@@ -647,32 +657,32 @@ fn render_unary(op: UnaryOp, s: &str, dtype: &DType) -> String {
         }
         UnaryOp::Abs => {
             if dtype.is_float() {
-                format!("{}({s})", c_math_fn("__builtin_fabs", dtype))
+                narrow_float(format!("{}({s})", c_math_fn("__builtin_fabs", dtype)), dtype)
             } else {
                 narrow_int(format!("({s} < 0 ? -{s} : {s})"), dtype)
             }
         }
-        UnaryOp::Sqrt => format!("{}({s})", c_math_fn("__builtin_sqrt", dtype)),
+        UnaryOp::Sqrt => narrow_float(format!("{}({s})", c_math_fn("__builtin_sqrt", dtype)), dtype),
         UnaryOp::Rsqrt => {
             let one = if matches!(dtype.base(), ScalarDType::Float64) { "1.0" } else { "1.0f" };
-            format!("({one} / {}({s}))", c_math_fn("__builtin_sqrt", dtype))
+            narrow_float(format!("({one} / {}({s}))", c_math_fn("__builtin_sqrt", dtype)), dtype)
         }
         UnaryOp::Reciprocal => {
             let one = if matches!(dtype.base(), ScalarDType::Float64) { "1.0" } else { "1.0f" };
             format!("({one} / {s})")
         }
-        UnaryOp::Exp => format!("{}({s})", c_math_fn("__builtin_exp", dtype)),
-        UnaryOp::Exp2 => format!("{}({s})", c_math_fn("__builtin_exp2", dtype)),
-        UnaryOp::Log => format!("{}({s})", c_math_fn("__builtin_log", dtype)),
-        UnaryOp::Log2 => format!("{}({s})", c_math_fn("__builtin_log2", dtype)),
-        UnaryOp::Sin => format!("{}({s})", c_math_fn("__builtin_sin", dtype)),
-        UnaryOp::Cos => format!("{}({s})", c_math_fn("__builtin_cos", dtype)),
-        UnaryOp::Tan => format!("{}({s})", c_math_fn("__builtin_tan", dtype)),
-        UnaryOp::Floor => format!("{}({s})", c_math_fn("__builtin_floor", dtype)),
-        UnaryOp::Ceil => format!("{}({s})", c_math_fn("__builtin_ceil", dtype)),
-        UnaryOp::Trunc => format!("{}({s})", c_math_fn("__builtin_trunc", dtype)),
-        UnaryOp::Round => format!("{}({s})", c_math_fn("__builtin_rint", dtype)),
-        UnaryOp::Erf => format!("{}({s})", c_math_fn("__builtin_erf", dtype)),
+        UnaryOp::Exp => narrow_float(format!("{}({s})", c_math_fn("__builtin_exp", dtype)), dtype),
+        UnaryOp::Exp2 => narrow_float(format!("{}({s})", c_math_fn("__builtin_exp2", dtype)), dtype),
+        UnaryOp::Log => narrow_float(format!("{}({s})", c_math_fn("__builtin_log", dtype)), dtype),
+        UnaryOp::Log2 => narrow_float(format!("{}({s})", c_math_fn("__builtin_log2", dtype)), dtype),
+        UnaryOp::Sin => narrow_float(format!("{}({s})", c_math_fn("__builtin_sin", dtype)), dtype),
+        UnaryOp::Cos => narrow_float(format!("{}({s})", c_math_fn("__builtin_cos", dtype)), dtype),
+        UnaryOp::Tan => narrow_float(format!("{}({s})", c_math_fn("__builtin_tan", dtype)), dtype),
+        UnaryOp::Floor => narrow_float(format!("{}({s})", c_math_fn("__builtin_floor", dtype)), dtype),
+        UnaryOp::Ceil => narrow_float(format!("{}({s})", c_math_fn("__builtin_ceil", dtype)), dtype),
+        UnaryOp::Trunc => narrow_float(format!("{}({s})", c_math_fn("__builtin_trunc", dtype)), dtype),
+        UnaryOp::Round => narrow_float(format!("{}({s})", c_math_fn("__builtin_rint", dtype)), dtype),
+        UnaryOp::Erf => narrow_float(format!("{}({s})", c_math_fn("__builtin_erf", dtype)), dtype),
         UnaryOp::Sign => {
             if dtype.is_float() {
                 let zero = if matches!(dtype.base(), ScalarDType::Float64) { "0.0" } else { "0.0f" };
