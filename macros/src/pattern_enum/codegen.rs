@@ -71,9 +71,15 @@ fn generate_op_key(variants: &[AnalyzedVariant], enum_name: &Ident) -> TokenStre
         let name = &v.name;
         let ty = v.filter_enum_type.as_ref().expect("grouped variant has a filter enum");
         let base = format_ident!("OP_KEY_BASE_{}", name.to_string().to_uppercase());
-        base_defs.push(quote! { const #base: usize = #count; });
+        let end = format_ident!("OP_KEY_END_{}", name.to_string().to_uppercase());
+        base_defs.push(quote! {
+            /// First dense key index of this grouped variant.
+            pub const #base: usize = #count;
+            /// One past the last dense key index of this grouped variant.
+            pub const #end: usize = #base + <#ty as ::strum::VariantArray>::VARIANTS.len();
+        });
         index_arms.push(quote! { OpKey::#name(sub) => #base + *sub as usize });
-        count = quote! { #base + <#ty as ::strum::VariantArray>::VARIANTS.len() };
+        count = quote! { #end };
     }
 
     quote! {
@@ -108,9 +114,10 @@ fn generate_op_key(variants: &[AnalyzedVariant], enum_name: &Ident) -> TokenStre
 }
 
 /// Generate the `alu` module: every grouped kind's variants as values (`alu::Add`), one
-/// type alias per grouped variant (`alu::Binary`), and the `AluOp` trait that keys and
-/// destructures an op by kind. Pattern code names an ALU op through this module, so a
-/// typo is a resolution error at the author's span and the arity is a tuple type.
+/// type alias per grouped variant (`alu::Binary`), a `const fn op_key` on each kind
+/// type, and the `AluOp` trait that destructures an op by kind. Pattern code names an
+/// ALU op through this module, so a typo is a resolution error at the author's span,
+/// the arity is a tuple type, and `alu::Add.op_key().index()` is a constant.
 fn generate_alu(variants: &[AnalyzedVariant], enum_name: &Ident) -> TokenStream {
     let grouped: Vec<_> = variants.iter().filter(|v| v.kind == VariantKind::Grouped).collect();
     let reexports = grouped.iter().map(|v| {
@@ -125,14 +132,17 @@ fn generate_alu(variants: &[AnalyzedVariant], enum_name: &Ident) -> TokenStream 
         let child_tys = v.children.iter().map(|f| &f.ty);
         let vars: Vec<Ident> = (0..v.children.len()).map(|i| format_ident!("child{i}")).collect();
         quote! {
+            impl #ty {
+                /// The dispatch key of ops of this kind.
+                #[inline]
+                pub const fn op_key(self) -> pattern_derived::OpKey {
+                    pattern_derived::OpKey::#name(self)
+                }
+            }
+
             impl AluOp for #ty {
                 type Children<'a> = (#(&'a #child_tys,)*);
                 const ALL: &'static [Self] = <Self as ::strum::VariantArray>::VARIANTS;
-
-                #[inline]
-                fn key(self) -> pattern_derived::OpKey {
-                    pattern_derived::OpKey::#name(self)
-                }
 
                 #[inline]
                 fn destructure(self, op: &#enum_name) -> Option<Self::Children<'_>> {
@@ -159,8 +169,6 @@ fn generate_alu(variants: &[AnalyzedVariant], enum_name: &Ident) -> TokenStream 
                 type Children<'a>;
                 /// Every kind, in declaration order.
                 const ALL: &'static [Self];
-                /// The dispatch key of ops of this kind.
-                fn key(self) -> pattern_derived::OpKey;
                 /// The children of `op` when it is of this kind.
                 fn destructure(self, op: &#enum_name) -> Option<Self::Children<'_>>;
             }

@@ -638,12 +638,24 @@ impl OpMask {
     /// Mask with no op kinds set — never rejects.
     pub const EMPTY: Self = Self([0; OP_MASK_WORDS]);
 
+    /// Every op kind.
+    pub const ALL: Self = Self::of_range(0, pattern_derived::OP_KEY_COUNT);
+
     /// Mask holding exactly `key`.
     #[inline]
     pub const fn of_key(key: &pattern_derived::OpKey) -> Self {
-        let index = key.index();
+        Self::of_range(key.index(), key.index() + 1)
+    }
+
+    /// Mask holding the dense key indices `start..end` — a grouped variant's whole kind
+    /// via its `OP_KEY_BASE_*`/`OP_KEY_END_*` bounds.
+    pub const fn of_range(start: usize, end: usize) -> Self {
         let mut words = [0; OP_MASK_WORDS];
-        words[index / 64] = 1 << (index % 64);
+        let mut index = start;
+        while index < end {
+            words[index / 64] |= 1 << (index % 64);
+            index += 1;
+        }
         Self(words)
     }
 
@@ -655,12 +667,21 @@ impl OpMask {
 
     /// Union of two masks.
     #[inline]
-    pub fn union(self, other: Self) -> Self {
+    pub const fn union(self, other: Self) -> Self {
         let mut words = self.0;
-        for (word, other) in words.iter_mut().zip(other.0) {
-            *word |= other;
+        let mut word = 0;
+        while word < OP_MASK_WORDS {
+            words[word] |= other.0[word];
+            word += 1;
         }
         Self(words)
+    }
+
+    /// Whether `key` is in the mask.
+    #[inline]
+    pub const fn has(&self, key: &pattern_derived::OpKey) -> bool {
+        let index = key.index();
+        self.0[index / 64] & (1 << (index % 64)) != 0
     }
 
     /// Whether every kind in `self` is also in `other` (Tinygrad: `issubset`).
@@ -673,6 +694,11 @@ impl OpMask {
     #[inline]
     pub fn is_empty(self) -> bool {
         self.0.iter().all(|word| *word == 0)
+    }
+
+    /// Number of kinds set.
+    pub fn count(self) -> usize {
+        self.0.iter().map(|word| word.count_ones() as usize).sum()
     }
 }
 

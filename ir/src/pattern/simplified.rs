@@ -1,23 +1,20 @@
-//! Pattern matcher with O(1) `OpKey` dispatch.
+//! Pattern matcher: a chain of compiled blocks.
 //!
 //! # Architecture
 //!
-//! A matcher is a sequence of segments, each a table of buckets indexed by
-//! [`OpKey::index`]. Wildcard rules are copied into every bucket when added, so a
-//! bucket already holds its candidates in source order and dispatch is one array index.
-//! Composition (`+`) appends segments; a guard (`guarded`) or a context lift
-//! (`with_context`) is a property of a segment, checked once per `rewrite` call rather
-//! than wrapped around every closure.
-//!
-//! The `patterns!` macro generates the closures; each carries the early-reject mask of
-//! op kinds its fixed-position sources demand of the root's direct children
-//! (Tinygrad's `UPat.early_reject`, uop/ops.py:1390).
+//! The `patterns!` macro compiles a whole block into one function that dispatches on
+//! the root op kind with a `match` over constant keys and tests each rule's constant
+//! early-reject mask inline (Tinygrad's `UPat.early_reject`, uop/ops.py:1390). A
+//! matcher is a sequence of such segments; each carries the mask of root kinds it can
+//! match at all, so a `rewrite` skips a segment with one bit test. Composition (`+`)
+//! appends segments; a guard (`guarded`) or a context lift (`with_context`) is a
+//! property of a segment, checked once per `rewrite` call.
 //!
 //! ```ignore
 //! let matcher = patterns! {
-//!     Add(x, @zero) => x,              // bucket Binary(Add)
-//!     Mul(x, @one) => x,               // bucket Binary(Mul)
-//!     x if is_const(x) => fold(x),     // wildcard: every bucket
+//!     Add(x, @zero) => x,              // `match` arm Binary(Add)
+//!     Mul(x, @one) => x,               // `match` arm Binary(Mul)
+//!     x if is_const(x) => fold(x),     // wildcard: sequential step
 //! };
 //! ```
 
@@ -25,129 +22,88 @@ use std::sync::Arc;
 
 use crate::UOp;
 use crate::op::OpMask;
-use crate::op::pattern_derived::{OP_KEY_COUNT, OpKey};
+use crate::op::pattern_derived::OpKey;
 
 use super::RewriteResult;
 
-/// Closure type for pattern matching + rewriting.
+/// Closure type of a hand-written rule: root node and context.
 pub type PatternClosure<C> = Arc<dyn Fn(&Arc<UOp>, &mut C) -> RewriteResult + Send + Sync>;
+
+/// A compiled block: root node, the mask of its direct children's kinds, and context.
+///
+/// The children mask is handed in rather than read from the node so early rejects can
+/// be switched off for equivalence checks ([`SimplifiedPatternMatcher::without_early_reject`]).
+pub type BlockFn<C> = Arc<dyn Fn(&Arc<UOp>, OpMask, &mut C) -> RewriteResult + Send + Sync>;
 
 type Guard = Arc<dyn Fn(&Arc<UOp>) -> bool + Send + Sync>;
 
-/// One compiled pattern: its early-reject mask and its closure.
-struct PatternEntry<C> {
-    early_reject: OpMask,
-    closure: PatternClosure<C>,
+/// Dispatch metadata of one rule: the root kinds it can match, and what it demands of
+/// the root's direct children.
+pub type RuleMeta = (OpMask, OpMask);
+
+enum Body<C> {
+    Typed(BlockFn<C>),
+    Unit(BlockFn<()>),
 }
 
-impl<C> Clone for PatternEntry<C> {
-    fn clone(&self) -> Self {
-        Self { early_reject: self.early_reject, closure: Arc::clone(&self.closure) }
-    }
-}
-
-/// Buckets indexed by `OpKey::index()`, each holding its candidates in source order.
-type Buckets<C> = Vec<Vec<PatternEntry<C>>>;
-
-fn empty_buckets<C>() -> Buckets<C> {
-    (0..OP_KEY_COUNT).map(|_| Vec::new()).collect()
-}
-
-/// Entries of a segment, either taking the matcher's context or lifted from `()`.
-enum Entries<C> {
-    Typed(Buckets<C>),
-    Unit(Buckets<()>),
-}
-
-impl<C> Clone for Entries<C> {
+impl<C> Clone for Body<C> {
     fn clone(&self) -> Self {
         match self {
-            Self::Typed(buckets) => Self::Typed(buckets.clone()),
-            Self::Unit(buckets) => Self::Unit(buckets.clone()),
+            Self::Typed(block) => Self::Typed(Arc::clone(block)),
+            Self::Unit(block) => Self::Unit(Arc::clone(block)),
         }
     }
 }
 
 struct Segment<C> {
+    /// Root kinds any rule of the block can match.
+    root: OpMask,
     guard: Option<Guard>,
-    entries: Entries<C>,
+    early_reject: bool,
+    rules: Vec<RuleMeta>,
+    body: Body<C>,
 }
 
 impl<C> Clone for Segment<C> {
     fn clone(&self) -> Self {
-        Self { guard: self.guard.clone(), entries: self.entries.clone() }
+        Self {
+            root: self.root,
+            guard: self.guard.clone(),
+            early_reject: self.early_reject,
+            rules: self.rules.clone(),
+            body: self.body.clone(),
+        }
     }
 }
 
-impl<C> Segment<C> {
-    fn map_masks(&self, f: impl Fn(OpMask) -> OpMask) -> Self {
-        fn map<C>(buckets: &Buckets<C>, f: &impl Fn(OpMask) -> OpMask) -> Buckets<C> {
-            buckets
-                .iter()
-                .map(|bucket| {
-                    bucket
-                        .iter()
-                        .map(|entry| PatternEntry {
-                            early_reject: f(entry.early_reject),
-                            closure: Arc::clone(&entry.closure),
-                        })
-                        .collect()
-                })
-                .collect()
-        }
-        let entries = match &self.entries {
-            Entries::Typed(buckets) => Entries::Typed(map(buckets, &f)),
-            Entries::Unit(buckets) => Entries::Unit(map(buckets, &f)),
-        };
-        Self { guard: self.guard.clone(), entries }
-    }
-
-    fn masks(&self, key: OpKey) -> Vec<OpMask> {
-        match &self.entries {
-            Entries::Typed(buckets) => buckets[key.index()].iter().map(|entry| entry.early_reject).collect(),
-            Entries::Unit(buckets) => buckets[key.index()].iter().map(|entry| entry.early_reject).collect(),
-        }
-    }
-
-    fn bucket_len(&self, index: usize) -> usize {
-        match &self.entries {
-            Entries::Typed(buckets) => buckets[index].len(),
-            Entries::Unit(buckets) => buckets[index].len(),
-        }
-    }
-
-    fn is_open(&self) -> bool {
-        self.guard.is_none() && matches!(self.entries, Entries::Typed(_))
-    }
-}
-
-/// Pattern matcher: rules bucketed by root `OpKey`, tried in source order.
+/// Pattern matcher: compiled blocks tried in order, each skipped by a root-kind bit test.
 ///
-/// `C` is the context type passed to every closure; `()` for stateless matching.
+/// `C` is the context type passed to every rule; `()` for stateless matching.
 pub struct SimplifiedPatternMatcher<C = ()> {
     segments: Vec<Segment<C>>,
-    len: usize,
-    wildcards: usize,
 }
 
 impl<C> SimplifiedPatternMatcher<C> {
     /// Create a new empty pattern matcher.
     pub fn new() -> Self {
-        Self { segments: Vec::new(), len: 0, wildcards: 0 }
+        Self { segments: Vec::new() }
     }
 
-    /// The trailing unguarded, context-typed segment, opened if needed.
-    fn open_buckets(&mut self) -> &mut Buckets<C> {
-        if !self.segments.last().is_some_and(Segment::is_open) {
-            self.segments.push(Segment { guard: None, entries: Entries::Typed(empty_buckets()) });
-        }
-        match &mut self.segments.last_mut().expect("segment just opened").entries {
-            Entries::Typed(buckets) => buckets,
-            Entries::Unit(_) => unreachable!("open segment is context-typed"),
-        }
+    /// Append a compiled block; `rules` describes each of its rules in source order.
+    pub fn add_block<F>(&mut self, rules: &[RuleMeta], block: F)
+    where
+        F: Fn(&Arc<UOp>, OpMask, &mut C) -> RewriteResult + Send + Sync + 'static,
+    {
+        self.segments.push(Segment {
+            root: rules.iter().fold(OpMask::EMPTY, |acc, (root, _)| acc.union(*root)),
+            guard: None,
+            early_reject: true,
+            rules: rules.to_vec(),
+            body: Body::Typed(Arc::new(block)),
+        });
     }
 
-    /// Add pattern for specific OpKey(s); an empty `keys` registers a wildcard.
+    /// Add a hand-written rule for specific OpKey(s); an empty `keys` registers a wildcard.
     pub fn add<F>(&mut self, keys: &[OpKey], closure: F)
     where
         F: Fn(&Arc<UOp>, &mut C) -> RewriteResult + Send + Sync + 'static,
@@ -155,33 +111,23 @@ impl<C> SimplifiedPatternMatcher<C> {
         self.add_rejecting(keys, &[], closure);
     }
 
-    /// Add a pattern that can only match when the root's direct children include every
-    /// op kind in `early_reject`; the closure is skipped otherwise.
+    /// Add a hand-written rule that can only match when the root's direct children
+    /// include every op kind in `early_reject`; the closure is skipped otherwise.
     ///
-    /// `early_reject` must be a *necessary* condition for the closure to match, i.e. the
-    /// union of the op kinds demanded by the pattern's fixed-position sources. Sources
-    /// that accept several kinds — or any kind — contribute nothing, exactly as in
-    /// Tinygrad's `UPat.early_reject` (uop/ops.py:1390).
+    /// `early_reject` must be a *necessary* condition for the closure to match, exactly
+    /// as in Tinygrad's `UPat.early_reject` (uop/ops.py:1390).
     pub fn add_rejecting<F>(&mut self, keys: &[OpKey], early_reject: &[OpKey], closure: F)
     where
         F: Fn(&Arc<UOp>, &mut C) -> RewriteResult + Send + Sync + 'static,
     {
-        let entry = PatternEntry { early_reject: early_reject.iter().copied().collect(), closure: Arc::new(closure) };
-        self.len += 1;
-        if keys.is_empty() {
-            self.wildcards += 1;
-            for bucket in self.open_buckets() {
-                bucket.push(entry.clone());
-            }
-        } else {
-            let buckets = self.open_buckets();
-            for key in keys {
-                buckets[key.index()].push(entry.clone());
-            }
-        }
+        let root = if keys.is_empty() { OpMask::ALL } else { keys.iter().copied().collect() };
+        let reject: OpMask = early_reject.iter().copied().collect();
+        self.add_block(&[(root, reject)], move |uop, src_ops, ctx| {
+            if reject.is_subset_of(src_ops) { closure(uop, ctx) } else { RewriteResult::NoMatch }
+        });
     }
 
-    /// Add wildcard pattern (tried for every op, in source order).
+    /// Add a hand-written wildcard rule (tried for every op, in source order).
     pub fn add_wildcard<F>(&mut self, closure: F)
     where
         F: Fn(&Arc<UOp>, &mut C) -> RewriteResult + Send + Sync + 'static,
@@ -210,48 +156,61 @@ impl<C> SimplifiedPatternMatcher<C> {
                         Arc::new(move |uop: &Arc<UOp>| inner(uop) && outer(uop)) as Guard
                     }
                 };
-                Segment { guard: Some(guard), entries: segment.entries.clone() }
+                Segment { guard: Some(guard), ..segment.clone() }
             })
             .collect();
-        Self { segments, len: self.len, wildcards: self.wildcards }
+        Self { segments }
     }
 
-    /// Copy of this matcher with every early reject cleared, so all entries are dispatched.
+    /// Copy of this matcher with every early reject switched off, so all rules are tried.
     ///
     /// Equivalence hook: rewriting with this must produce exactly the same graph as
-    /// rewriting with `self`, since an early reject only skips entries that cannot match.
+    /// rewriting with `self`, since an early reject only skips rules that cannot match.
     pub fn without_early_reject(&self) -> Self {
-        let segments = self.segments.iter().map(|segment| segment.map_masks(|_| OpMask::EMPTY)).collect();
-        Self { segments, len: self.len, wildcards: self.wildcards }
+        let segments = self
+            .segments
+            .iter()
+            .map(|segment| Segment {
+                early_reject: false,
+                rules: segment.rules.iter().map(|(root, _)| (*root, OpMask::EMPTY)).collect(),
+                ..segment.clone()
+            })
+            .collect();
+        Self { segments }
     }
 
-    /// Number of registered patterns.
+    fn rules(&self) -> impl Iterator<Item = &RuleMeta> {
+        self.segments.iter().flat_map(|segment| &segment.rules)
+    }
+
+    /// Number of registered rules.
     pub fn len(&self) -> usize {
-        self.len
+        self.rules().count()
     }
 
-    /// Check if no patterns are registered.
+    /// Check if no rules are registered.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.segments.is_empty()
     }
 
-    /// Number of wildcard patterns (tried for every op).
+    /// Number of wildcard rules (tried for every op).
     pub fn wildcard_count(&self) -> usize {
-        self.wildcards
+        self.rules().filter(|(root, _)| *root == OpMask::ALL).count()
     }
 
-    /// Number of `OpKey`s that have at least one non-wildcard candidate.
+    /// Number of `OpKey`s some non-wildcard rule is keyed under.
     pub fn indexed_count(&self) -> usize {
-        (0..OP_KEY_COUNT)
-            .filter(|&index| self.segments.iter().any(|segment| segment.bucket_len(index) > self.wildcards))
+        self.rules()
+            .filter(|(root, _)| *root != OpMask::ALL)
+            .fold(OpMask::EMPTY, |acc, (root, _)| acc.union(*root))
             .count()
     }
 
-    /// Early-reject masks of the candidates for `key`, in dispatch order.
+    /// Early-reject masks of the rules that can match `key`, in dispatch order.
     ///
-    /// Diagnostic view of what each compiled pattern demands of a node's direct children.
+    /// Diagnostic view of what each compiled rule demands of a node's direct children.
     pub fn early_rejects(&self, key: &OpKey) -> Vec<OpMask> {
-        self.segments.iter().flat_map(|segment| segment.masks(*key)).collect()
+        self.rules().filter(|(root, _)| root.has(key)).map(|(_, reject)| *reject).collect()
     }
 
     /// Attempt to rewrite a UOp using registered patterns.
@@ -263,14 +222,14 @@ impl<C> SimplifiedPatternMatcher<C> {
     /// RUST_LOG=svod_ir::pattern=trace cargo run
     /// ```
     pub fn rewrite(&self, uop: &Arc<UOp>, ctx: &mut C) -> RewriteResult {
-        let index = OpKey::from_op(uop.op()).index();
+        let key = OpKey::from_op(uop.op());
         let src_ops = uop.src_ops();
         // Consecutive segments often share one guard (`value_sensitive` in symbolic);
         // remember the last verdict so it is evaluated once per distinct guard.
         let mut last_guard: Option<(*const (), bool)> = None;
 
         for segment in &self.segments {
-            if segment.bucket_len(index) == 0 {
+            if !segment.root.has(&key) {
                 continue;
             }
             if let Some(guard) = &segment.guard {
@@ -284,12 +243,13 @@ impl<C> SimplifiedPatternMatcher<C> {
                     continue;
                 }
             }
-            let result = match &segment.entries {
-                Entries::Typed(buckets) => try_entries(&buckets[index], src_ops, uop, ctx),
-                Entries::Unit(buckets) => try_entries(&buckets[index], src_ops, uop, &mut ()),
+            let src_ops = if segment.early_reject { src_ops } else { OpMask::ALL };
+            let result = match &segment.body {
+                Body::Typed(block) => block(uop, src_ops, ctx),
+                Body::Unit(block) => block(uop, src_ops, &mut ()),
             };
             if !matches!(result, RewriteResult::NoMatch) {
-                tracing::trace!(op_key = ?OpKey::from_op(uop.op()), "pattern matched");
+                tracing::trace!(op_key = ?key, "pattern matched");
                 return result;
             }
         }
@@ -297,20 +257,9 @@ impl<C> SimplifiedPatternMatcher<C> {
     }
 }
 
-/// First candidate whose early reject passes and whose closure rewrites.
-fn try_entries<C>(entries: &[PatternEntry<C>], src_ops: OpMask, uop: &Arc<UOp>, ctx: &mut C) -> RewriteResult {
-    for entry in entries.iter().filter(|entry| entry.early_reject.is_subset_of(src_ops)) {
-        let result = (entry.closure)(uop, ctx);
-        if !matches!(result, RewriteResult::NoMatch) {
-            return result;
-        }
-    }
-    RewriteResult::NoMatch
-}
-
 impl<C> Clone for SimplifiedPatternMatcher<C> {
     fn clone(&self) -> Self {
-        Self { segments: self.segments.clone(), len: self.len, wildcards: self.wildcards }
+        Self { segments: self.segments.clone() }
     }
 }
 
@@ -323,9 +272,9 @@ impl<C> Default for SimplifiedPatternMatcher<C> {
 impl SimplifiedPatternMatcher<()> {
     /// Lift a context-free matcher into any context type.
     ///
-    /// `()` patterns ignore the context, so they can run under any `D`; the segments are
-    /// re-tagged rather than each closure re-wrapped. This enables combining
-    /// context-free matchers with context-dependent ones via `+`:
+    /// `()` rules ignore the context, so they can run under any `D`; the segments are
+    /// re-tagged rather than wrapped. This enables combining context-free matchers with
+    /// context-dependent ones via `+`:
     ///
     /// ```ignore
     /// let mega = symbolic().with_context::<SomeCtx>()
@@ -336,13 +285,19 @@ impl SimplifiedPatternMatcher<()> {
             .segments
             .iter()
             .map(|segment| {
-                let buckets = match &segment.entries {
-                    Entries::Typed(buckets) | Entries::Unit(buckets) => buckets.clone(),
+                let block = match &segment.body {
+                    Body::Typed(block) | Body::Unit(block) => Arc::clone(block),
                 };
-                Segment { guard: segment.guard.clone(), entries: Entries::Unit(buckets) }
+                Segment {
+                    root: segment.root,
+                    guard: segment.guard.clone(),
+                    early_reject: segment.early_reject,
+                    rules: segment.rules.clone(),
+                    body: Body::Unit(block),
+                }
             })
             .collect();
-        SimplifiedPatternMatcher { segments, len: self.len, wildcards: self.wildcards }
+        SimplifiedPatternMatcher { segments }
     }
 }
 
@@ -355,30 +310,9 @@ impl<C> super::Matcher<C> for SimplifiedPatternMatcher<C> {
 impl<C> std::ops::Add for SimplifiedPatternMatcher<C> {
     type Output = Self;
 
-    /// Combine two matchers. Patterns from `rhs` are appended.
+    /// Combine two matchers. Rules from `rhs` come after every rule of `self`.
     fn add(mut self, rhs: Self) -> Self::Output {
-        let mut incoming = rhs.segments.into_iter().peekable();
-        // Two adjacent unguarded segments of one kind fold into a single table, so a
-        // long `+` chain stays short.
-        if let (Some(last), Some(first)) = (self.segments.last_mut(), incoming.peek())
-            && last.guard.is_none()
-            && first.guard.is_none()
-        {
-            match (&mut last.entries, &first.entries) {
-                (Entries::Typed(mine), Entries::Typed(_)) => {
-                    let Some(Segment { entries: Entries::Typed(theirs), .. }) = incoming.next() else { unreachable!() };
-                    mine.iter_mut().zip(theirs).for_each(|(bucket, more)| bucket.extend(more));
-                }
-                (Entries::Unit(mine), Entries::Unit(_)) => {
-                    let Some(Segment { entries: Entries::Unit(theirs), .. }) = incoming.next() else { unreachable!() };
-                    mine.iter_mut().zip(theirs).for_each(|(bucket, more)| bucket.extend(more));
-                }
-                _ => {}
-            }
-        }
-        self.segments.extend(incoming);
-        self.len += rhs.len;
-        self.wildcards += rhs.wildcards;
+        self.segments.extend(rhs.segments);
         self
     }
 }
