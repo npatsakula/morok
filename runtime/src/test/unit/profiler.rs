@@ -1,17 +1,24 @@
 //! Unit tests for the profiler data model, table rendering (GPU-free), lane
 //! metrics, and [`RunProfile::merge`] accumulation semantics.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use svod_device::PmcCounter;
+use svod_device::device::Program;
 use svod_device::hcq::{
     DeviceQueue, QueueKind, QueueMergeLimits, SemanticLinkedPlan, TopologyOperation, TopologyOperationKind,
     TopologyResource, schedule_device_lanes,
 };
 use svod_dtype::DeviceSpec;
+use svod_ir::UOp;
+use svod_ir::origin::{self, Origin, OriginFrame, OriginId, SourceLocation};
+use test_case::test_case;
 
+use crate::kernel_cache::CachedKernel;
 use crate::profiler::{
-    OperationTiming, PmcSelection, ProfileOptions, RunProfile, StageProfile, analyze_execution_lanes, parse_pmc,
+    KernelProfile, OperationTiming, OriginView, PmcSelection, ProfileExport, ProfileOptions, RunProfile, StageProfile,
+    UNATTRIBUTED, aggregate_origins, analyze_execution_lanes, has_origins, parse_pmc,
 };
 
 #[test]
@@ -31,6 +38,7 @@ fn pmc_selection_is_parsed_and_resolved() {
     assert_eq!(ProfileOptions::default().counters, PmcSelection::None);
     assert_eq!(ProfileOptions::default().iters, 1);
     assert!(ProfileOptions::default().static_analysis);
+    assert_eq!(ProfileOptions::default().origin_depth, None, "rollups default to the leaf scope");
 
     assert_eq!(parse_pmc(""), PmcSelection::None);
     assert_eq!(parse_pmc("0"), PmcSelection::None);
@@ -152,4 +160,365 @@ fn alternating_copy_compute_metrics_preserve_serial_hazards() {
     assert_eq!(metrics.wait, Duration::from_millis(5));
     assert_eq!(metrics.overlap, Duration::ZERO);
     assert!(metrics.lanes.iter().all(|lane| lane.overlap == Duration::ZERO));
+}
+
+// ── origin rollups ─────────────────────────────────────────────────────────
+
+/// Nothing dispatches here: a `KernelProfile` only needs a named program to key
+/// the entry-point breakdown by.
+#[derive(Debug)]
+struct NamedProgram(&'static str);
+
+impl Program for NamedProgram {
+    unsafe fn execute(
+        &self,
+        _buffers: &[*mut u8],
+        _vals: &[i64],
+        _global_size: Option<[usize; 3]>,
+        _local_size: Option<[usize; 3]>,
+        _wait: bool,
+    ) -> svod_device::Result<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        self.0
+    }
+}
+
+fn cached_kernel(name: &'static str) -> Arc<CachedKernel> {
+    let unit = || [UOp::index_const(1), UOp::index_const(1), UOp::index_const(1)];
+    Arc::new(CachedKernel {
+        program: Box::new(NamedProgram(name)),
+        device: "CPU".into(),
+        code: String::new(),
+        entry_point: name.into(),
+        var_names: Vec::new(),
+        globals: vec![0],
+        outs: vec![0],
+        ins: Vec::new(),
+        global_size: unit(),
+        local_size: Some(unit()),
+    })
+}
+
+/// A dispatch of `name` taking `micros` of wall (no GPU stamps, so
+/// `gpu_or_wall` is exactly that), charged to `origin` and fused from `origins`.
+fn dispatch(name: &'static str, micros: u64, origin: Option<OriginId>, origins: &[OriginId]) -> KernelProfile {
+    KernelProfile {
+        kernel: cached_kernel(name),
+        device: DeviceSpec::Cpu,
+        origin,
+        origins: origins.iter().copied().collect(),
+        num_buffers: 1,
+        wall: Duration::from_micros(micros),
+        gpu_start_ns: None,
+        gpu_end_ns: None,
+        static_info: None,
+        counters: None,
+    }
+}
+
+/// Intern is independent of capture, so scopes can be built directly here
+/// without reshaping any graph.
+fn module(parent: Option<OriginId>, name: &str) -> OriginId {
+    origin::intern(Origin { parent, frame: OriginFrame::Module { name: name.into() } })
+}
+
+fn call(parent: Option<OriginId>, op: &'static str) -> OriginId {
+    origin::intern(Origin {
+        parent,
+        frame: OriginFrame::Call { op, at: SourceLocation::new("tensor/src/arithmetic.rs", 31, 9) },
+    })
+}
+
+/// `encoder.layers.0.{ffn1,attn}` and `ctc_head`, the leaves being call frames
+/// under the deepest module — the shape the tensor entry points mint.
+struct Scopes {
+    encoder: OriginId,
+    ffn1: OriginId,
+    ffn1_call: OriginId,
+    attn_call: OriginId,
+    ctc_head: OriginId,
+}
+
+fn scopes() -> Scopes {
+    let encoder = module(None, "encoder");
+    let layer = module(Some(encoder), "layers.0");
+    let ffn1 = module(Some(layer), "ffn1");
+    let attn = module(Some(layer), "attn");
+    Scopes {
+        encoder,
+        ffn1,
+        ffn1_call: call(Some(ffn1), "mul"),
+        attn_call: call(Some(attn), "matmul"),
+        ctc_head: module(None, "ctc_head"),
+    }
+}
+
+/// Two encoder leaves plus one head kernel: 100 + 200 + 300 µs.
+fn stage_kernels() -> Vec<KernelProfile> {
+    let s = scopes();
+    vec![
+        dispatch("ffn1_gemm", 100, Some(s.ffn1_call), &[s.ffn1_call, s.ffn1]),
+        dispatch("attn_gemm", 200, Some(s.attn_call), &[s.attn_call]),
+        dispatch("head_gemm", 300, Some(s.ctc_head), &[s.ctc_head]),
+    ]
+}
+
+/// Exclusive rows partition the dispatches at every depth, so they always sum
+/// to the profiled total and count every dispatch exactly once.
+#[test_case(Some(1); "root frames only")]
+#[test_case(Some(2); "two frames")]
+#[test_case(Some(3); "three frames")]
+#[test_case(None; "leaf")]
+fn exclusive_rollup_sums_to_the_total(depth: Option<usize>) {
+    let kernels = stage_kernels();
+    let rows = aggregate_origins(&kernels, OriginView::Exclusive, depth);
+    assert_eq!(rows.iter().map(|r| r.total).sum::<Duration>(), Duration::from_micros(600), "{depth:?}");
+    assert_eq!(rows.iter().map(|r| r.count).sum::<usize>(), kernels.len(), "{depth:?}");
+    assert!(rows.windows(2).all(|w| (w[0].total, &w[1].path) >= (w[1].total, &w[0].path)), "sorted desc by total");
+    // The secondary entry-point breakdown of a row accounts for the whole row.
+    for row in &rows {
+        assert_eq!(row.kernels.iter().map(|k| k.total).sum::<Duration>(), row.total, "{}", row.path);
+    }
+}
+
+/// A depth cut merges the leaves under their common ancestor; the leaf view
+/// keeps them apart.
+#[test]
+fn exclusive_rollup_keys_are_cut_to_the_depth() {
+    let kernels = stage_kernels();
+    let paths = |depth| {
+        aggregate_origins(&kernels, OriginView::Exclusive, depth)
+            .into_iter()
+            .map(|r| (r.path, r.total))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+
+    assert_eq!(
+        paths(Some(1)),
+        [("ctc_head".to_owned(), Duration::from_micros(300)), ("encoder".to_owned(), Duration::from_micros(300))]
+            .into_iter()
+            .collect(),
+        "both encoder leaves merge into the root row"
+    );
+    assert_eq!(
+        paths(None),
+        [
+            ("ctc_head".to_owned(), Duration::from_micros(300)),
+            ("encoder.layers.0.attn".to_owned(), Duration::from_micros(200)),
+            ("encoder.layers.0.ffn1".to_owned(), Duration::from_micros(100)),
+        ]
+        .into_iter()
+        .collect(),
+    );
+}
+
+/// Inclusive rows charge a dispatch to every ancestor, so a parent's total
+/// contains its children's and the rows deliberately over-sum.
+#[test]
+fn inclusive_rollup_rolls_children_into_parents() {
+    let kernels = stage_kernels();
+    let rows: std::collections::BTreeMap<String, (usize, Duration)> =
+        aggregate_origins(&kernels, OriginView::Inclusive, None)
+            .into_iter()
+            .map(|r| (r.path, (r.count, r.total)))
+            .collect();
+
+    assert_eq!(rows["encoder"], (2, Duration::from_micros(300)), "parent holds both leaves");
+    assert_eq!(rows["encoder.layers.0"], (2, Duration::from_micros(300)));
+    assert_eq!(rows["encoder.layers.0.ffn1"], (1, Duration::from_micros(100)));
+    assert_eq!(rows["encoder.layers.0.attn"], (1, Duration::from_micros(200)));
+    assert_eq!(rows["ctc_head"], (1, Duration::from_micros(300)));
+    assert!(
+        rows.values().map(|(_, total)| *total).sum::<Duration>() > Duration::from_micros(600),
+        "inclusive rows overlap and do not sum to the total"
+    );
+}
+
+/// The union, not the primary, drives the inclusive view: a kernel that fused a
+/// scope it is not charged to still shows up under it.
+#[test]
+fn inclusive_rollup_follows_the_fused_set() {
+    let s = scopes();
+    let kernels = vec![dispatch("fused", 100, Some(s.ctc_head), &[s.ctc_head, s.encoder])];
+
+    let exclusive = aggregate_origins(&kernels, OriginView::Exclusive, None);
+    assert_eq!(exclusive.len(), 1);
+    assert_eq!(exclusive[0].path, "ctc_head", "charged once, to the primary");
+
+    let inclusive: Vec<String> =
+        aggregate_origins(&kernels, OriginView::Inclusive, None).into_iter().map(|r| r.path).collect();
+    assert_eq!(inclusive, ["ctc_head", "encoder"], "equal totals, ordered by path");
+}
+
+/// Capture off (or a scope installer that misses some code) leaves dispatches
+/// unattributed rather than dropping their time from the rollup.
+#[test_case(OriginView::Exclusive; "exclusive")]
+#[test_case(OriginView::Inclusive; "inclusive")]
+fn dispatches_without_a_scope_land_in_one_unattributed_row(view: OriginView) {
+    let s = scopes();
+    let kernels = vec![dispatch("bare", 100, None, &[]), dispatch("scoped", 50, Some(s.ctc_head), &[s.ctc_head])];
+    let rows = aggregate_origins(&kernels, view, None);
+
+    let bare = rows.iter().find(|r| r.path == UNATTRIBUTED).expect("unattributed row");
+    assert_eq!((bare.count, bare.total), (1, Duration::from_micros(100)));
+    assert_eq!(bare.kernels.len(), 1);
+    assert_eq!(bare.kernels[0].name, "bare");
+    assert_eq!(rows.iter().map(|r| r.total).sum::<Duration>(), Duration::from_micros(150));
+}
+
+/// Call frames are the flat `file:line` layer under a module path, never a
+/// rollup level: they neither appear in a key nor consume a depth frame.
+#[test]
+fn call_frames_never_appear_in_rollup_keys() {
+    let s = scopes();
+    // A call frame in the middle of the chain, not only at the leaf.
+    let under_call = module(Some(s.ffn1_call), "linear2");
+    let kernels = vec![dispatch("k", 100, Some(under_call), &[under_call])];
+
+    for depth in [Some(1), Some(2), Some(3), Some(4), Some(9), None] {
+        for view in [OriginView::Exclusive, OriginView::Inclusive] {
+            for row in aggregate_origins(&kernels, view, depth) {
+                assert!(!row.path.contains('@'), "{view:?} {depth:?}: {}", row.path);
+                assert!(!row.path.contains("arithmetic.rs"), "{view:?} {depth:?}: {}", row.path);
+            }
+        }
+    }
+    let leaf = aggregate_origins(&kernels, OriginView::Exclusive, None);
+    assert_eq!(leaf[0].path, "encoder.layers.0.ffn1.linear2", "four module frames, the call dropped");
+}
+
+/// A depth past the leaf is the leaf: rollups can ask for a fixed depth without
+/// special-casing shallow paths.
+#[test]
+fn truncation_past_the_leaf_is_stable() {
+    let kernels = stage_kernels();
+    let leaf = aggregate_origins(&kernels, OriginView::Exclusive, None);
+    for depth in [4, 5, 64] {
+        let rows = aggregate_origins(&kernels, OriginView::Exclusive, Some(depth));
+        let (a, b): (Vec<_>, Vec<_>) =
+            (rows.iter().map(|r| (&r.path, r.total)).collect(), leaf.iter().map(|r| (&r.path, r.total)).collect());
+        assert_eq!(a, b, "depth {depth} past the deepest path");
+    }
+    // Depth zero keeps no frame at all, mirroring `origin::truncate(id, 0)`.
+    let none = aggregate_origins(&kernels, OriginView::Exclusive, Some(0));
+    assert_eq!(none.len(), 1);
+    assert_eq!(none[0].path, UNATTRIBUTED);
+    assert_eq!(none[0].total, Duration::from_micros(600), "and still accounts for every dispatch");
+}
+
+// ── rendering ──────────────────────────────────────────────────────────────
+
+fn stage_without_origins() -> StageProfile {
+    StageProfile::gpu(
+        "encoder",
+        Duration::from_millis(7),
+        vec![dispatch("gemm", 300, None, &[]), dispatch("gemm", 100, None, &[]), dispatch("cast", 50, None, &[])],
+    )
+}
+
+/// The name-keyed table is exactly what it was before origins existed: no
+/// origin section, and every number unchanged. The fixture is the whole
+/// rendering, so a stray column or row would fail here.
+#[test]
+fn render_without_origins_is_byte_identical() {
+    let mut profile = RunProfile::default();
+    profile.push(stage_without_origins());
+
+    assert_eq!(
+        profile.render_table(),
+        // `mean µs` is padded to its byte length, not its display width — the
+        // column has looked like this since before origins, and must not move.
+        "encoder: 3 dispatches, GPU 0.450 ms\n\
+         name  cnt  total ms   mean µs     %  \n\
+         gemm    2     0.400     200.0  88.9  \n\
+         cast    1     0.050      50.0  11.1  \n"
+    );
+    assert_eq!(profile.render_table(), profile.render_table_at(Some(2)), "depth is moot without origins");
+    assert_eq!(profile.to_string(), profile.render_report(None), "Display is the leaf-depth report");
+    assert!(!profile.to_string().contains("origin"), "no origin section: {}", profile);
+    assert_eq!(
+        profile.to_string(),
+        "encoder: wall 7.0 ms, profiled exec GPU 0.450 ms\n\
+         3 dispatches (0 GPU-stamped), total 0.450 ms\n\
+         \x20 total ms  count    mean \u{b5}s      %  name\n\
+         \x20    0.400      2      200.0   88.9  gemm\n\
+         \x20    0.050      1       50.0   11.1  cast\n\n",
+        "the histogram report, down to the trailing blank line the old `writeln!` left"
+    );
+    assert!(!has_origins(&profile.stages[0].kernels));
+}
+
+/// With origins present both renderers grow one section, in both views, and the
+/// small-table detail lists the entry points under each exclusive row.
+#[test]
+fn render_with_origins_adds_both_views_and_kernel_detail() {
+    let mut profile = RunProfile::default();
+    profile.push(StageProfile::gpu("encoder", Duration::from_millis(7), stage_kernels()));
+    let table = profile.render_table_at(Some(2));
+
+    assert!(table.starts_with("encoder: 3 dispatches, GPU 0.600 ms\n"), "{table}");
+    assert!(table.contains("origin rollup (depth 2, exclusive; rows sum to the total)"), "{table}");
+    assert!(table.contains("origin rollup (depth 2, inclusive; parents contain children, rows overlap)"), "{table}");
+    assert!(table.contains("origin path"), "{table}");
+    assert!(table.contains("encoder.layers.0"), "{table}");
+    assert!(table.contains("· ffn1_gemm"), "exclusive rows list their kernels: {table}");
+
+    // The report path (GigaAM's `Display`) carries the same section.
+    let report = profile.render_report(Some(1));
+    assert!(report.contains("origin rollup (depth 1"), "{report}");
+    assert!(report.contains("profiled exec GPU"), "the histogram is still there: {report}");
+}
+
+// ── JSON export ────────────────────────────────────────────────────────────
+
+/// The export round-trips through `serde_json::Value`, resolves every id it
+/// mentions through the embedded arena, and carries both rollups.
+#[test]
+fn json_export_round_trips_and_embeds_the_origin_arena() {
+    let mut profile = RunProfile::default();
+    profile.push(StageProfile::host("mel", Duration::from_millis(2)));
+    let mut stage = StageProfile::gpu("encoder", Duration::from_millis(7), stage_kernels());
+    stage.meta.insert("rtf".into(), "0.02".into());
+    profile.push(stage);
+
+    let json: serde_json::Value = serde_json::from_str(&profile.to_json(Some(2))).expect("valid JSON");
+    assert_eq!(json["origin_depth"], serde_json::json!(2));
+    assert_eq!(json["stages"][0]["name"], "mel");
+    assert_eq!(json["stages"][0]["dispatches"], 0);
+    assert_eq!(json["stages"][1]["meta"]["rtf"], "0.02");
+    assert_eq!(json["stages"][1]["dispatches"], 3);
+
+    let kernels = json["stages"][1]["kernels"].as_array().expect("kernel rows");
+    assert_eq!(kernels.len(), 3, "one row per (entry point, primary origin)");
+    assert_eq!(kernels[0]["name"], "head_gemm", "sorted by total time");
+    assert_eq!(kernels[0]["count"], 1);
+    assert!((kernels[0]["total_ms"].as_f64().unwrap() - 0.3).abs() < 1e-9);
+    assert_eq!(kernels[0]["origin"], "ctc_head");
+    // The full path keeps the call frame the rollup key drops.
+    let ffn1 = kernels.iter().find(|k| k["name"] == "ffn1_gemm").expect("ffn1 row");
+    assert!(
+        ffn1["origin"].as_str().unwrap().starts_with("encoder.layers.0.ffn1 @ mul tensor/src/arithmetic.rs:31"),
+        "{ffn1}"
+    );
+    assert_eq!(ffn1["origins"].as_array().unwrap().len(), 2);
+
+    let exclusive = json["stages"][1]["origins_exclusive"].as_array().expect("exclusive rows");
+    assert!(exclusive.iter().all(|r| r["path"] != serde_json::Value::Null));
+    assert!((exclusive.iter().map(|r| r["percent"].as_f64().unwrap()).sum::<f64>() - 100.0).abs() < 1e-6);
+    let inclusive = json["stages"][1]["origins_inclusive"].as_array().expect("inclusive rows");
+    assert!(inclusive.len() >= exclusive.len(), "ancestors add rows");
+
+    // The arena resolves every id minted so far, so paths are reconstructible
+    // offline from the ids a consumer finds elsewhere.
+    let arena = json["origins"].as_array().expect("arena snapshot");
+    assert!(!arena.is_empty());
+    let s = scopes();
+    assert_eq!(arena.len(), origin::snapshot().len());
+    assert!(arena.len() >= s.encoder.get() as usize);
+    let export: ProfileExport = serde_json::from_value(json).expect("round-trips back into the export type");
+    assert_eq!(export.origin_depth, Some(2));
+    assert_eq!(export.origins, origin::snapshot()[..export.origins.len()], "arena entries are the interned origins");
 }

@@ -42,7 +42,7 @@ pub fn requirements_met(archs: &'static [svod_dtype::AmdArch]) -> bool {
 /// hand-rolled loop.
 pub fn plan_gpu_ns(plan: &ExecutionPlan, iters: u64) -> u64 {
     use svod_runtime::PmcSelection;
-    let opts = ProfileOptions { iters: 1, static_analysis: false, counters: PmcSelection::None };
+    let opts = ProfileOptions { iters: 1, static_analysis: false, counters: PmcSelection::None, ..Default::default() };
     let mut total = 0u64;
     for _ in 0..iters {
         let report = plan.profile(&opts).expect("plan.profile");
