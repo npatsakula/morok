@@ -4,6 +4,7 @@
 //! (reduces, matmul, etc.) and assertion utilities for validating scheduler state.
 
 use std::sync::Arc;
+use svod_dtype::{DType, DeviceSpec};
 use svod_ir::{AxisId, AxisType, Op, ReduceOp, UOp};
 
 use crate::optimizer::Scheduler;
@@ -133,6 +134,29 @@ pub fn create_matmul_pattern(m: i64, n: i64, k: i64) -> Arc<UOp> {
     let reduce = add_expr.reduce(smallvec![k_range], ReduceOp::Add);
 
     // Create sink with all ranges
+    UOp::sink(vec![reduce, m_range, n_range])
+}
+
+/// Buffer-backed row-major `C[m,n] = sum_k A[m,k] * B[k,n]` with `A`/`B` stored
+/// as `stored`; with `wide`, both loads are cast to it before the product.
+pub fn create_typed_matmul_pattern(m: i64, n: i64, k: i64, stored: DType, wide: Option<DType>) -> Arc<UOp> {
+    use smallvec::smallvec;
+
+    let m_range = UOp::range_axis(UOp::index_const(m), AxisId::Renumbered(0), AxisType::Global);
+    let n_range = UOp::range_axis(UOp::index_const(n), AxisId::Renumbered(1), AxisType::Global);
+    let k_range = UOp::range_axis(UOp::index_const(k), AxisId::Renumbered(2), AxisType::Reduce);
+    let load = |numel: i64, row: &Arc<UOp>, stride: i64, col: &Arc<UOp>| {
+        let buffer = UOp::new_buffer(DeviceSpec::Cpu, numel as usize, stored.clone());
+        let index = row.try_mul(&UOp::index_const(stride)).and_then(|x| x.try_add(col)).expect("index should build");
+        let value = UOp::index().buffer(buffer).indices(vec![index]).call().expect("load should build");
+        match &wide {
+            Some(wide) => value.cast(wide.clone()),
+            None => value,
+        }
+    };
+    let a = load(m * k, &m_range, k, &k_range);
+    let b = load(k * n, &k_range, n, &n_range);
+    let reduce = a.try_mul(&b).expect("mul should succeed").reduce(smallvec![k_range], ReduceOp::Add);
     UOp::sink(vec![reduce, m_range, n_range])
 }
 

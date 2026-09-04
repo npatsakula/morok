@@ -395,6 +395,36 @@ fn test_matmul_int8_widens_operands_for_int32_accumulator() {
     assert_eq!(c.as_vec::<i32>().unwrap(), vec![318]);
 }
 
+crate::codegen_tests! {
+    /// A tensor-core-shaped int8 GEMM (every axis a multiple of 16) with
+    /// products that overflow int8 and int16: every backend must match the
+    /// int32 reference, and an RDNA3 GPU must get there through the integer WMMA.
+    fn test_matmul_int8_tensor_core_shapes_match_reference(config) {
+        let a_nd = Array2::from_shape_fn((16, 16), |(m, k)| ((m * 16 + k) * 37 + 11) as i32 % 256 - 128);
+        let b_nd = Array2::from_shape_fn((16, 16), |(k, n)| ((k * 16 + n) * 91 + 5) as i32 % 256 - 128);
+        let a = Tensor::from_ndarray(&a_nd.mapv(|v| v as i8));
+        let b = Tensor::from_ndarray(&b_nd.mapv(|v| v as i8));
+        let build = || a.matmul_with().other(&b).dtype(DType::Int32).call().unwrap();
+
+        let plan = build().prepare_with(&config).unwrap();
+        let rdna3 = match a.device() {
+            DeviceSpec::Amd { device_id } => svod_device::registry::resolve_amd_arch_from_topology(device_id)
+                .is_ok_and(|arch| !arch.is_cdna() && !arch.is_rdna4()),
+            _ => false,
+        };
+        if rdna3 {
+            assert!(
+                plan.kernels().any(|kernel| kernel.code.contains("llvm.amdgcn.wmma.i32.16x16x16.iu8")),
+                "rdna3 must lower the widened int8 GEMM through the integer WMMA"
+            );
+        }
+
+        let mut c = build();
+        c.realize_with(&config).unwrap();
+        assert_eq!(c.as_vec::<i32>().unwrap(), a_nd.dot(&b_nd).iter().copied().collect::<Vec<i32>>());
+    }
+}
+
 // =========================================================================
 // AMD tensor-core lowering. Compile-only: every test below stops at LLVM text
 // (plus an ELF check when an amdgpu target is installed) and never opens a GPU.
@@ -497,32 +527,40 @@ fn test_matmul_fp8_gfx1201_decomposes_to_f16_wmma_compile_only() {
     }
 }
 
-/// Positive control for native OCP FP8: gfx950 keeps E4M3/E5M2 operands and
-/// selects its scaled K=128 MFMA.
-#[test]
-fn test_matmul_ocp_fp8_gfx950_native_mfma_compile_only() {
-    for dtype in [DType::FP8E4M3, DType::FP8E5M2] {
-        let ast = matmul_kernel_ast(&[16, 128], &[128, 16], dtype.clone(), DType::Float32);
-        let optimizer = amd_optimizer(AmdArch::Gfx950, None);
-        let tc_index = optimizer
-            .tensor_cores
-            .iter()
-            .position(|tc| tc.dtype_in == dtype && tc.dtype_out == DType::Float32 && tc.dims == (16, 16, 128))
-            .expect("gfx950 scaled FP8 tensor core");
-        let optimized = optimize_kernel_with_config(ast, &optimizer, &pinned_tc_config(tc_index, TcOptLevel::Strict))
-            .expect("gfx950 native FP8 TC optimization");
+/// Native AMD tensor-core selection, compile-only: the pinned tensor core is
+/// chosen, its WMMA metadata matches, and the rendered text names the intrinsic.
+/// `int8 · int8 → int32` widens the operands before the product, so the matcher
+/// must look through those casts; gfx950 keeps OCP FP8 operands for its scaled
+/// K=128 MFMA and selects the format per dtype.
+#[test_case(AmdArch::Gfx1151, DType::Int8, DType::Int32, (16, 16, 16), "llvm.amdgcn.wmma.i32.16x16x16.iu8", None; "gfx1151 int8 wmma")]
+#[test_case(AmdArch::Gfx950, DType::FP8E4M3, DType::Float32, (16, 16, 128), "llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4", Some("i32 0, i32 0"); "gfx950 e4m3 scaled mfma")]
+#[test_case(AmdArch::Gfx950, DType::FP8E5M2, DType::Float32, (16, 16, 128), "llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4", Some("i32 1, i32 1"); "gfx950 e5m2 scaled mfma")]
+fn native_amd_tensor_core_compile_only(
+    arch: AmdArch,
+    in_dtype: DType,
+    out_dtype: DType,
+    dims: (usize, usize, usize),
+    intrinsic: &str,
+    format_selectors: Option<&str>,
+) {
+    let ast = matmul_kernel_ast(&[16, dims.2], &[dims.2, 16], in_dtype.clone(), out_dtype.clone());
+    let optimizer = amd_optimizer(arch, None);
+    let tc_index = optimizer
+        .tensor_cores
+        .iter()
+        .position(|tc| tc.dtype_in == in_dtype && tc.dtype_out == out_dtype && tc.dims == dims)
+        .expect("native tensor core");
+    let optimized = optimize_kernel_with_config(ast, &optimizer, &pinned_tc_config(tc_index, TcOptLevel::Strict))
+        .expect("native TC optimization");
 
-        let nodes = optimized.toposort();
-        let Op::Wmma(ops::Wmma { metadata, .. }) = find_wmma(&nodes).op() else { unreachable!() };
-        assert_eq!(
-            (metadata.dims, metadata.dtype_in.clone(), metadata.dtype_out.clone()),
-            ((16, 16, 128), dtype.clone(), DType::Float32)
-        );
+    let nodes = optimized.toposort();
+    let Op::Wmma(ops::Wmma { metadata, .. }) = find_wmma(&nodes).op() else { unreachable!() };
+    assert_eq!((metadata.dims, metadata.dtype_in.clone(), metadata.dtype_out.clone()), (dims, in_dtype, out_dtype));
 
-        let (_, rendered) = render_amd(optimized, AmdArch::Gfx950, "matmul_fp8_gfx950");
-        assert!(rendered.code.contains("llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4"));
-        let format = if dtype == DType::FP8E5M2 { "i32 1, i32 1" } else { "i32 0, i32 0" };
-        assert!(rendered.code.contains(format), "wrong scaled format selectors for {dtype:?}");
+    let (_, rendered) = render_amd(optimized, arch, "native_tc");
+    assert!(rendered.code.contains(intrinsic), "must select {intrinsic}");
+    if let Some(format_selectors) = format_selectors {
+        assert!(rendered.code.contains(format_selectors), "wrong scaled format selectors");
     }
 }
 

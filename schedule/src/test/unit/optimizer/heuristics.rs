@@ -9,6 +9,7 @@ use crate::optimizer::heuristics::{
     apply_default_upcast, apply_heuristic_upcasts, apply_image_upcasts, apply_matvec_fast_path, try_tensor_cores,
 };
 use crate::optimizer::{Opt, OptOps, Renderer, Scheduler};
+use crate::test::helpers::create_typed_matmul_pattern;
 use svod_ir::ops;
 
 fn create_matvec_like_pattern(rows: i64, cols: i64) -> Arc<UOp> {
@@ -45,6 +46,23 @@ fn create_tc_retry_pattern() -> Arc<UOp> {
     let mul = a_val.try_mul(&b_val).expect("mul should succeed");
     let red = mul.reduce(vec![k_range].into(), ReduceOp::Add);
     UOp::sink(vec![red, m_range, n_good_range, n_bad_range])
+}
+
+/// A widening integer cast on the operands is exact under the int8→int32 WMMA,
+/// so it must not hide the tensor core; float casts keep the generic path.
+#[test_case(DType::Int8, DType::Int32, true; "int8 operands widened to int32 use the integer wmma")]
+#[test_case(DType::Float16, DType::Float32, false; "float16 operands widened to float32 stay scalar")]
+fn try_tensor_cores_sees_through_widening_integer_casts(stored: DType, wide: DType, uses_tc: bool) {
+    let sink = create_typed_matmul_pattern(16, 16, 16, stored.clone(), Some(wide));
+    let mut scheduler = Scheduler::new(sink, Renderer::amd_rdna3());
+
+    assert_eq!(try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().build()), uses_tc);
+
+    let wmma = scheduler.ast().toposort().into_iter().find_map(|u| match u.op() {
+        Op::Wmma(ops::Wmma { metadata, .. }) => Some(metadata.dtype_in.clone()),
+        _ => None,
+    });
+    assert_eq!(wmma, uses_tc.then_some(stored));
 }
 
 /// The matvec fast path applies GROUP + LOCAL + UPCAST in one shot, unless

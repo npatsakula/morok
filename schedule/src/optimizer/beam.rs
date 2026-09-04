@@ -942,6 +942,14 @@ fn cached_opt_suffix<'a>(scheduler: &Scheduler, cached: &'a [Opt]) -> Option<&'a
     cached.starts_with(&scheduler.applied_opts).then(|| &cached[scheduler.applied_opts.len()..])
 }
 
+/// Replay a cached opt sequence on top of the opts `scheduler` already carries.
+fn replay_cached(scheduler: &Scheduler, cached_opts: &[Opt]) -> Result<Scheduler, OptError> {
+    tracing::info!(opts = ?cached_opts, "Beam cache HIT - replaying opts");
+    let suffix = cached_opt_suffix(scheduler, cached_opts)
+        .ok_or(OptError::ValidationFailed { op: "BEAM cache", reason: "cached opts do not extend base opts" })?;
+    replay_opts(scheduler.clone(), suffix)
+}
+
 /// Get cached beam search result.
 fn cache_get(key: &CacheKey) -> Option<Vec<Opt>> {
     let db = CACHE_DB.as_ref()?;
@@ -995,10 +1003,7 @@ where
         // Replay cached optimizations. If replay fails (stale entry from code changes),
         // or the replayed scheduler exceeds the current limits (looser cap at search
         // time, tighter cap now), invalidate and fall through to fresh search.
-        tracing::info!(opts_count = cached_opts.len(), "Beam cache HIT - replaying opts");
-        let replayed = cached_opt_suffix(&scheduler, &cached_opts)
-            .ok_or(OptError::ValidationFailed { op: "BEAM cache", reason: "cached opts do not extend base opts" })
-            .and_then(|suffix| replay_opts(scheduler.clone(), suffix));
+        let replayed = replay_cached(&scheduler, &cached_opts);
         match replayed {
             Ok(replayed) if validate_limits(&replayed, config) => {
                 if let Some(metrics) = compile_and_time(&replayed, None)
@@ -1059,9 +1064,7 @@ where
     if !config.disable_cache
         && let Some(cached_opts) = cache_get(&key)
     {
-        let replayed = cached_opt_suffix(&scheduler, &cached_opts)
-            .ok_or(OptError::ValidationFailed { op: "BEAM cache", reason: "cached opts do not extend base opts" })
-            .and_then(|suffix| replay_opts(scheduler.clone(), suffix));
+        let replayed = replay_cached(&scheduler, &cached_opts);
         match replayed {
             Ok(replayed) if validate_limits(&replayed, config) => {
                 let mut compiled_count = 0;
@@ -1132,9 +1135,7 @@ where
     if !config.disable_cache
         && let Some(cached_opts) = cache_get(&key)
     {
-        let replayed = cached_opt_suffix(&scheduler, &cached_opts)
-            .ok_or(OptError::ValidationFailed { op: "BEAM cache", reason: "cached opts do not extend base opts" })
-            .and_then(|suffix| replay_opts(scheduler.clone(), suffix));
+        let replayed = replay_cached(&scheduler, &cached_opts);
         match replayed {
             Ok(replayed) if validate_limits(&replayed, config) => {
                 let mut timing = Duration::MAX;

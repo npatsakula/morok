@@ -20,7 +20,8 @@ use crate::optimizer::{
 // PATTERN MATCHING
 // ============================================================================
 
-/// Information about a detected matmul pattern.
+/// Information about a detected matmul pattern. `in0`/`in1` are the tensor-core
+/// operands: the MUL inputs with an exact integer widening peeled ([`tc_operand`]).
 #[derive(Debug, Clone)]
 pub struct MatmulPattern {
     pub reduce_op: Arc<UOp>,
@@ -48,14 +49,13 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
     }
 
     // Extract MUL operation (possibly under CAST)
-    let mul =
-        if let Op::Cast(svod_ir::ops::Cast { src: cast_src, .. }) = src.op() { cast_src.clone() } else { src.clone() };
+    let mul = src.unwrap_cast();
 
     let Op::Binary(BinaryOp::Mul, a, b) = mul.op() else {
         return Ok(None);
     };
 
-    let (in0, in1) = (a.clone(), b.clone());
+    let (in0, in1) = (tc_operand(a), tc_operand(b));
     let in0_all_ranges = get_ranges(&in0);
     let in1_all_ranges = get_ranges(&in1);
 
@@ -95,6 +95,22 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
     }
 
     Ok(Some(MatmulPattern { reduce_op, in0, in1, in0_ranges, in1_ranges, red_ranges, axis_choices }))
+}
+
+/// The tensor-core operand behind a MUL input. A value-preserving integer
+/// widening (`int8 → int32`) is exact under a tensor core, which multiplies at
+/// full width before accumulating, so the narrow source is matched instead.
+pub(crate) fn tc_operand(operand: &Arc<UOp>) -> Arc<UOp> {
+    match operand.op() {
+        Op::Cast(svod_ir::ops::Cast { src, .. })
+            if src.dtype().is_int()
+                && operand.dtype().is_int()
+                && svod_dtype::DType::can_safe_cast(src.dtype(), operand.dtype()) =>
+        {
+            src.clone()
+        }
+        _ => operand.clone(),
+    }
 }
 
 fn get_ranges(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
@@ -414,10 +430,7 @@ fn apply_axis_choice_impl(
             Op::Reduce(svod_ir::ops::Reduce { src, ranges, .. }) => (src.clone(), ranges.clone()),
             _ => unreachable!(),
         };
-        let mul = match reduce_src.op() {
-            Op::Cast(svod_ir::ops::Cast { src, .. }) => src.clone(),
-            _ => reduce_src.clone(),
-        };
+        let mul = reduce_src.unwrap_cast();
         if !matches!(mul.op(), Op::Binary(BinaryOp::Mul, ..)) {
             return ValidationFailedSnafu { op: "TC", reason: "expected MUL inside REDUCE" }.fail();
         }
@@ -444,12 +457,9 @@ fn apply_axis_choice_impl(
             Op::Reduce(svod_ir::ops::Reduce { src, .. }) => src.clone(),
             _ => unreachable!(),
         };
-        let ret_mul = match ret_src.op() {
-            Op::Cast(svod_ir::ops::Cast { src, .. }) => src.clone(),
-            _ => ret_src.clone(),
-        };
+        let ret_mul = ret_src.unwrap_cast();
         let (ret_a, ret_b) = match ret_mul.op() {
-            Op::Binary(BinaryOp::Mul, a, b) => (a.clone(), b.clone()),
+            Op::Binary(BinaryOp::Mul, a, b) => (tc_operand(a), tc_operand(b)),
             _ => unreachable!(),
         };
 
