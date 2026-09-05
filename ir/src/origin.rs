@@ -282,20 +282,27 @@ pub fn current() -> Option<OriginId> {
 }
 
 /// RAII guard over this thread's capture state: every constructor saves the state
-/// and `Drop` restores it, including while a panic unwinds through it. The guard
-/// is `!Send`: it restores the state of the thread it was opened on, so it must
-/// not be dropped anywhere else. Carry a scope to a worker with [`install`].
+/// and `Drop` restores it, including while a panic unwinds through it.
+///
+/// Scopes must nest. The guard is `!Send`, so a future holding one across an
+/// `.await` cannot move to another thread, and a debug build panics when a guard
+/// is dropped while a later one is still active — the signature of two tasks
+/// interleaving scopes on one thread. Open scopes around synchronous graph
+/// construction and drop them before awaiting; carry a scope to a worker with
+/// [`install`].
 #[must_use = "an origin scope only applies while its guard is alive"]
 pub struct OriginScope {
     previous: State,
+    installed: State,
     _thread_bound: std::marker::PhantomData<*const ()>,
 }
 
 impl OriginScope {
     fn replace(next: impl FnOnce(State) -> State) -> Self {
         let previous = STATE.with(Cell::get);
-        STATE.with(|state| state.set(next(previous)));
-        Self { previous, _thread_bound: std::marker::PhantomData }
+        let installed = next(previous);
+        STATE.with(|state| state.set(installed));
+        Self { previous, installed, _thread_bound: std::marker::PhantomData }
     }
 
     /// Push a frame under the current scope. While capture is off the frame is
@@ -355,6 +362,16 @@ impl OriginScope {
 
 impl Drop for OriginScope {
     fn drop(&mut self) {
+        // Skipped while unwinding: the guard that triggered the panic has already
+        // left the state inconsistent for the guards above it.
+        if !std::thread::panicking() {
+            let now = STATE.with(Cell::get);
+            debug_assert!(
+                now.current == self.installed.current && now.enabled == self.installed.enabled,
+                "origin scopes must nest: this scope was dropped while a scope opened after it is still active \
+                 (a guard held across an await while another task ran on this thread?)"
+            );
+        }
         STATE.with(|state| state.set(self.previous));
     }
 }

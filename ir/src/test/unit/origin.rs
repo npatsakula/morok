@@ -156,6 +156,17 @@ fn constructors_are_no_ops_while_capture_is_off(kind: &str) {
     assert_eq!(captured, None, "{kind} scope must not capture while disabled");
 }
 
+/// Two guards dropped out of order are two tasks interleaving on one thread.
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "origin scopes must nest"))]
+fn interleaved_scopes_are_rejected() {
+    let _capture = crate::origin::capture_for_thread(true);
+    let outer = OriginScope::module("interleave-outer");
+    let inner = OriginScope::module("interleave-inner");
+    drop(outer);
+    drop(inner);
+}
+
 // =========================================================================
 // Rendering
 // =========================================================================
