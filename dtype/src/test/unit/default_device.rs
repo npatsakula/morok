@@ -74,3 +74,9 @@ fn spawn_with_default_device_propagates_callers_device() {
     let handle = with_default_device(DeviceSpec::Amd { device_id: 3 }, || spawn_with_default_device(default_device));
     assert_eq!(handle.join().unwrap(), DeviceSpec::Amd { device_id: 3 });
 }
+
+#[test]
+fn platform_default_is_metal_only_on_macos() {
+    let expected = if cfg!(target_os = "macos") { DeviceSpec::Metal { device_id: 0 } } else { DeviceSpec::Cpu };
+    assert_eq!(platform_default(), expected);
+}
