@@ -29,4 +29,4 @@ test-case = "3.3.1"
 svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.6", features = [
   "testing",
 ] }
-svod-runtime = { path = "../runtime" }
+svod-runtime = { path = "../runtime", version = "=0.1.0-alpha.6" }
