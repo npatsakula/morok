@@ -1,5 +1,6 @@
 //! A compute pipeline loaded from a metallib (or MSL source in fallback mode)
-//! and dispatched one command buffer per launch.
+//! and dispatched one command buffer per launch; see [`super::graph`] for the
+//! batched replay path.
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -11,11 +12,12 @@ use super::objc::{
     AutoreleasePool, Id, MTL_PIPELINE_OPTION_NONE, MTLSize, NSUInteger, ObjcBool, ObjcId, ns_error_message, ns_string,
 };
 use crate::device::{AbiParamDescriptor, Program};
+use crate::sync::DispatchTimestamps;
 use crate::{Error, Result};
 
 /// `[[buffer(n)]]` indices are positional in MSL, so the ABI slot is the bind
 /// index; Metal exposes 31 of them.
-const MAX_BUFFER_BINDINGS: usize = 31;
+pub(crate) const MAX_BUFFER_BINDINGS: usize = 31;
 
 /// One resolved kernel argument, ready to bind.
 enum Arg {
@@ -157,31 +159,27 @@ impl MetalProgram {
     pub fn max_total_threads_per_threadgroup(&self) -> usize {
         self.max_total_threads
     }
-}
 
-impl Program for MetalProgram {
-    unsafe fn execute(
+    pub(crate) fn pipeline(&self) -> Id {
+        self.pipeline.as_raw()
+    }
+
+    pub(crate) fn buf_count(&self) -> usize {
+        self.buf_count
+    }
+
+    pub(crate) fn var_count(&self) -> usize {
+        self.var_count
+    }
+
+    /// `(threadgroups, threads per group)` for a launch. `global_size` is
+    /// already the threadgroup count and `local_size` the threads per group;
+    /// direct-id kernels run one thread per group.
+    pub(crate) fn launch_sizes(
         &self,
-        buffers: &[*mut u8],
-        vals: &[i64],
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
-        wait: bool,
-    ) -> Result<()> {
-        if buffers.len() != self.buf_count || vals.len() != self.var_count {
-            return Err(Error::ProgramAbiMismatch {
-                reason: format!(
-                    "kernel {} expects {} buffers and {} scalars, got {} and {}",
-                    self.name,
-                    self.buf_count,
-                    self.var_count,
-                    buffers.len(),
-                    vals.len()
-                ),
-            });
-        }
-        // `global_size` is already the threadgroup count and `local_size` the
-        // threads per group; direct-id kernels run one thread per group.
+    ) -> Result<(MTLSize, MTLSize)> {
         let groups = global_size.unwrap_or([1, 1, 1]);
         let threads = local_size.unwrap_or([1, 1, 1]);
         let thread_count = threads.iter().try_fold(1usize, |acc, dim| acc.checked_mul(*dim)).unwrap_or(usize::MAX);
@@ -194,6 +192,30 @@ impl Program for MetalProgram {
                 ),
             });
         }
+        Ok((MTLSize::from(groups), MTLSize::from(threads)))
+    }
+
+    /// Encode one dispatch into its own command buffer and commit it.
+    fn submit(
+        &self,
+        buffers: &[*mut u8],
+        vals: &[i64],
+        global_size: Option<[usize; 3]>,
+        local_size: Option<[usize; 3]>,
+    ) -> Result<ObjcId> {
+        if buffers.len() != self.buf_count || vals.len() != self.var_count {
+            return Err(Error::ProgramAbiMismatch {
+                reason: format!(
+                    "kernel {} expects {} buffers and {} scalars, got {} and {}",
+                    self.name,
+                    self.buf_count,
+                    self.var_count,
+                    buffers.len(),
+                    vals.len()
+                ),
+            });
+        }
+        let (groups, threads) = self.launch_sizes(global_size, local_size)?;
 
         // Resolve every argument before any Metal object exists: a command
         // encoder released without `endEncoding` is a fatal Metal assertion,
@@ -217,13 +239,7 @@ impl Program for MetalProgram {
         let objc = self.dev.objc();
         let _pool = AutoreleasePool::push(objc);
         let sels = &objc.sels;
-        // SAFETY: `commandBuffer` / `computeCommandEncoder` return autoreleased objects.
-        let command_buffer =
-            unsafe { ObjcId::retain(objc, objc.send0::<Id>(self.dev.queue(), sels.command_buffer)) }
-                .ok_or_else(|| Error::Runtime { message: "Metal command queue returned no command buffer".into() })?;
-        let encoder =
-            unsafe { ObjcId::retain(objc, objc.send0::<Id>(command_buffer.as_raw(), sels.compute_command_encoder)) }
-                .ok_or_else(|| Error::Runtime { message: "Metal command buffer returned no compute encoder".into() })?;
+        let (command_buffer, encoder) = self.dev.begin_compute()?;
         let enc = encoder.as_raw();
 
         // SAFETY: each selector is sent with its documented argument types.
@@ -250,30 +266,49 @@ impl Program for MetalProgram {
                     ),
                 }
             }
-            objc.send2::<MTLSize, MTLSize, ()>(
-                enc,
-                sels.dispatch_threadgroups,
-                MTLSize::from(groups),
-                MTLSize::from(threads),
-            );
+            objc.send2::<MTLSize, MTLSize, ()>(enc, sels.dispatch_threadgroups, groups, threads);
             objc.send0::<()>(enc, sels.end_encoding);
             objc.send1::<Id, ()>(command_buffer.as_raw(), sels.set_label, self.label.as_raw());
             objc.send0::<()>(command_buffer.as_raw(), sels.commit);
         }
+        Ok(command_buffer)
+    }
 
+    fn wait(&self, command_buffer: &ObjcId) -> Result<()> {
+        self.dev.wait_command_buffer(command_buffer.as_raw(), &format!("Metal kernel '{}'", self.name))
+    }
+}
+
+impl Program for MetalProgram {
+    unsafe fn execute(
+        &self,
+        buffers: &[*mut u8],
+        vals: &[i64],
+        global_size: Option<[usize; 3]>,
+        local_size: Option<[usize; 3]>,
+        wait: bool,
+    ) -> Result<()> {
+        let command_buffer = self.submit(buffers, vals, global_size, local_size)?;
         if wait {
-            // SAFETY: blocking wait, then an autoreleased NSError or nil.
-            let message = unsafe {
-                objc.send0::<()>(command_buffer.as_raw(), sels.wait_until_completed);
-                ns_error_message(objc, objc.send0::<Id>(command_buffer.as_raw(), sels.error))
-            };
-            if let Some(message) = message {
-                return Err(Error::Runtime { message: format!("Metal kernel '{}' failed: {message}", self.name) });
-            }
+            self.wait(&command_buffer)
         } else {
             self.dev.push_in_flight(command_buffer);
+            Ok(())
         }
-        Ok(())
+    }
+
+    unsafe fn execute_timed(
+        &self,
+        buffers: &[*mut u8],
+        vals: &[i64],
+        global_size: Option<[usize; 3]>,
+        local_size: Option<[usize; 3]>,
+    ) -> Result<Option<std::time::Duration>> {
+        let command_buffer = self.submit(buffers, vals, global_size, local_size)?;
+        self.wait(&command_buffer)?;
+        let _pool = AutoreleasePool::push(self.dev.objc());
+        let timestamps = MetalDispatchTimestamps::read(&self.dev, command_buffer.as_raw());
+        Ok(timestamps.timestamps_ns().map(|(start, end)| std::time::Duration::from_nanos(end - start)))
     }
 
     fn name(&self) -> &str {
@@ -282,5 +317,28 @@ impl Program for MetalProgram {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+/// A completed command buffer's `GPUStartTime`/`GPUEndTime`, converted from
+/// seconds on the GPU clock.
+#[derive(Debug, Clone, Copy)]
+pub struct MetalDispatchTimestamps {
+    start_ns: u64,
+    end_ns: u64,
+}
+
+impl MetalDispatchTimestamps {
+    /// Read the stamps of a command buffer that has completed.
+    pub(crate) fn read(dev: &MetalDevice, command_buffer: Id) -> Self {
+        let (start, end) = dev.gpu_times(command_buffer);
+        Self { start_ns: (start * 1e9) as u64, end_ns: (end * 1e9) as u64 }
+    }
+}
+
+impl DispatchTimestamps for MetalDispatchTimestamps {
+    fn timestamps_ns(&self) -> Option<(u64, u64)> {
+        // Zero stamps mean the driver did not record them (e.g. an empty encoder).
+        (self.end_ns >= self.start_ns && self.start_ns > 0).then_some((self.start_ns, self.end_ns))
     }
 }

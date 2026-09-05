@@ -2,6 +2,7 @@
 //! through the runtime glue, and compiler identity stability. Hardware tests
 //! self-skip on hosts without a Metal device.
 
+use svod_device::Allocator;
 use svod_device::device::{AbiParamDescriptor, AbiParamKind, ProgramSpec};
 use svod_device::metal::{MetalDevice, has_devices};
 use svod_device::registry::DeviceRegistry;
@@ -111,4 +112,39 @@ fn metal_spec_round_trips_through_registry_parse() {
     use svod_device::registry::DeviceSpecExt;
     assert_eq!(DeviceSpec::parse("METAL:1").unwrap(), DeviceSpec::Metal { device_id: 1 });
     assert_eq!(DeviceSpec::Metal { device_id: 0 }.base_type(), "METAL");
+}
+
+/// The device carries a graph factory, and a static chain of loaded kernels
+/// is captured by it (the execution plan's replay path).
+#[test]
+fn device_installs_indirect_command_buffer_graphs() {
+    if skip() {
+        return;
+    }
+    let device = create_metal_device(&DeviceRegistry::default(), 0).unwrap();
+    let factory = device.graph.clone().expect("Metal devices graph static plans");
+    let compiled = device.compiler.compile(&vadd_spec()).unwrap();
+    let dev = MetalDevice::open(0).unwrap();
+    let program = create_metal_program(&dev, &compiled).unwrap();
+    let alloc = svod_device::metal::MetalAllocator::new(0).unwrap();
+    let spec = svod_device::BufferSpec::default();
+    let buffers: Vec<_> = (0..3).map(|_| alloc._alloc(256, &spec, true).unwrap()).collect();
+    let pointers: Vec<*mut u8> = buffers
+        .iter()
+        .map(|buffer| match buffer {
+            svod_device::allocator::RawBuffer::Metal { contents, .. } => contents.as_ptr(),
+            _ => unreachable!(),
+        })
+        .collect();
+    let kernel = svod_device::device::GraphKernel {
+        program: program.as_ref(),
+        buffers: pointers,
+        vals: vec![],
+        global_size: Some([2, 1, 1]),
+        local_size: Some([32, 1, 1]),
+        deps: vec![],
+    };
+    let graph = factory(&[kernel]).unwrap().expect("static Metal chain is graphable");
+    graph.replay(&[], &[]).unwrap();
+    dev.synchronize().unwrap();
 }

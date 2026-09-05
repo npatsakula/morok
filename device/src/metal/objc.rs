@@ -42,7 +42,21 @@ impl From<[usize; 3]> for MTLSize {
     }
 }
 
+/// `NSRange`, passed by value (two words in registers; never returned).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NSRange {
+    pub location: NSUInteger,
+    pub length: NSUInteger,
+}
+
 pub(crate) const MTL_RESOURCE_STORAGE_MODE_SHARED: NSUInteger = 0;
+/// `MTLResourceCPUCacheModeDefaultCache`, the only option an indirect command buffer needs.
+pub(crate) const MTL_RESOURCE_OPTIONS_DEFAULT: NSUInteger = 0;
+/// `MTLIndirectCommandTypeConcurrentDispatch`.
+pub(crate) const MTL_INDIRECT_COMMAND_TYPE_CONCURRENT_DISPATCH: NSUInteger = 1 << 5;
+/// `MTLResourceUsageRead | MTLResourceUsageWrite`.
+pub(crate) const MTL_RESOURCE_USAGE_READ_WRITE: NSUInteger = 1 | 2;
 pub(crate) const MTL_PIPELINE_OPTION_NONE: NSUInteger = 0;
 pub(crate) const MTL_COMMAND_BUFFER_STATUS_COMPLETED: NSUInteger = 4;
 pub(crate) const MTL_MATH_MODE_SAFE: NSInteger = 0;
@@ -142,6 +156,20 @@ selectors! {
     static_threadgroup_memory_length = "staticThreadgroupMemoryLength";
     set_fast_math_enabled = "setFastMathEnabled:";
     set_math_mode = "setMathMode:";
+    gpu_start_time = "GPUStartTime";
+    gpu_end_time = "GPUEndTime";
+    // Indirect command buffers (graph replay).
+    set_command_types = "setCommandTypes:";
+    set_inherit_buffers = "setInheritBuffers:";
+    set_inherit_pipeline_state = "setInheritPipelineState:";
+    set_max_kernel_buffer_bind_count = "setMaxKernelBufferBindCount:";
+    new_indirect_command_buffer = "newIndirectCommandBufferWithDescriptor:maxCommandCount:options:";
+    indirect_compute_command_at_index = "indirectComputeCommandAtIndex:";
+    set_kernel_buffer_offset_at_index = "setKernelBuffer:offset:atIndex:";
+    concurrent_dispatch_threadgroups = "concurrentDispatchThreadgroups:threadsPerThreadgroup:";
+    set_barrier = "setBarrier";
+    use_resources_count_usage = "useResources:count:usage:";
+    execute_commands_in_buffer_with_range = "executeCommandsInBuffer:withRange:";
 }
 
 /// The Objective-C classes the backend instantiates.
@@ -149,6 +177,7 @@ pub(crate) struct Classes {
     pub(crate) ns_string: Class,
     pub(crate) compute_pipeline_descriptor: Class,
     pub(crate) compile_options: Class,
+    pub(crate) indirect_command_buffer_descriptor: Class,
 }
 
 /// The loaded runtime: libobjc, libSystem, CoreGraphics and Metal.
@@ -206,6 +235,7 @@ impl Objc {
                 ns_string: class(c"NSString")?,
                 compute_pipeline_descriptor: class(c"MTLComputePipelineDescriptor")?,
                 compile_options: class(c"MTLCompileOptions")?,
+                indirect_command_buffer_descriptor: class(c"MTLIndirectCommandBufferDescriptor")?,
             },
             _libraries: vec![objc, system, core_graphics, metal],
         })
@@ -325,7 +355,10 @@ pub(crate) fn mtl_compiler() -> Option<&'static MtlCompilerApi> {
         .as_ref()
 }
 
-/// An owned (+1) Objective-C object reference; `Drop` releases it.
+/// An owned (+1) Objective-C object reference; `Drop` releases it. Transparent
+/// over `id`, so a `[ObjcId]` doubles as the C array selectors like
+/// `useResources:count:usage:` expect.
+#[repr(transparent)]
 pub struct ObjcId(Id);
 
 impl ObjcId {

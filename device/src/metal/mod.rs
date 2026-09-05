@@ -9,16 +9,19 @@
 //! `MTLBuffer`s whose host mapping doubles as the kernel argument handle
 //! (resolved back to `(buffer, offset)` through a pointer registry); one
 //! command buffer per dispatch, tracked in an in-flight list that is drained
-//! before any host access. Kernels are compiled to metallibs by the private
+//! before any host access; all-static plans replay as one indirect command
+//! buffer ([`graph`]). Kernels are compiled to metallibs by the private
 //! `MTLCodeGenService` (falling back to `newLibraryWithSource:`).
 
 pub mod allocator;
 pub mod compile;
 pub mod device;
+pub mod graph;
 #[doc(hidden)]
 pub mod objc;
 pub mod program;
 
 pub use allocator::MetalAllocator;
 pub use device::{MetalDevice, has_devices};
-pub use program::MetalProgram;
+pub use graph::MetalGraph;
+pub use program::{MetalDispatchTimestamps, MetalProgram};

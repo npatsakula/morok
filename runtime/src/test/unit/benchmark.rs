@@ -79,3 +79,43 @@ fn test_benchmark_early_stop_aborts_over_cutoff() {
     assert_eq!(result.runs.len(), 1);
     assert!(result.min > cutoff * 3);
 }
+
+/// A backend with GPU stamps reports the device time, not the (longer) wall
+/// time around the synchronous dispatch.
+struct StampedKernel;
+
+impl Program for StampedKernel {
+    unsafe fn execute(
+        &self,
+        _buffers: &[*mut u8],
+        _vals: &[i64],
+        _global_size: Option<[usize; 3]>,
+        _local_size: Option<[usize; 3]>,
+        _wait: bool,
+    ) -> svod_device::Result<()> {
+        std::thread::sleep(Duration::from_millis(5));
+        Ok(())
+    }
+
+    unsafe fn execute_timed(
+        &self,
+        buffers: &[*mut u8],
+        vals: &[i64],
+        global_size: Option<[usize; 3]>,
+        local_size: Option<[usize; 3]>,
+    ) -> svod_device::Result<Option<Duration>> {
+        unsafe { self.execute(buffers, vals, global_size, local_size, true)? };
+        Ok(Some(Duration::from_micros(7)))
+    }
+
+    fn name(&self) -> &str {
+        "stamped"
+    }
+}
+
+#[test]
+fn benchmark_prefers_gpu_stamped_durations() {
+    let result =
+        unsafe { benchmark_kernel(&StampedKernel, &[], &[], None, None, &BenchmarkConfig::default()) }.unwrap();
+    assert!(result.runs.iter().all(|run| *run == Duration::from_micros(7)), "{:?}", result.runs);
+}

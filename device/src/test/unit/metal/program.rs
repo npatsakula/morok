@@ -19,24 +19,24 @@ pub(crate) fn vadd_abi() -> Vec<AbiParamDescriptor> {
     vec![storage(0), storage(1), storage(2)]
 }
 
-fn f32_bytes(values: &[f32]) -> &[u8] {
+pub(crate) fn f32_bytes(values: &[f32]) -> &[u8] {
     // SAFETY: f32 has no padding; the slice is re-viewed byte-wise.
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
 }
 
-fn upload(alloc: &MetalAllocator, values: &[f32]) -> RawBuffer {
+pub(crate) fn upload(alloc: &MetalAllocator, values: &[f32]) -> RawBuffer {
     let buffer = alloc._alloc(values.len() * 4, &BufferSpec::default(), false).unwrap();
     alloc._copyin(&buffer, 0, f32_bytes(values)).unwrap();
     buffer
 }
 
-fn download(alloc: &MetalAllocator, buffer: &RawBuffer, len: usize) -> Vec<f32> {
+pub(crate) fn download(alloc: &MetalAllocator, buffer: &RawBuffer, len: usize) -> Vec<f32> {
     let mut bytes = vec![0u8; len * 4];
     alloc._copyout(&mut bytes, buffer, 0).unwrap();
     bytes.as_chunks::<4>().0.iter().map(|chunk| f32::from_le_bytes(*chunk)).collect()
 }
 
-fn host_ptr(buffer: &RawBuffer) -> *mut u8 {
+pub(crate) fn host_ptr(buffer: &RawBuffer) -> *mut u8 {
     let RawBuffer::Metal { contents, .. } = buffer else { unreachable!() };
     contents.as_ptr()
 }
@@ -199,4 +199,27 @@ fn unregistered_pointer_is_reported() {
     }
     .expect_err("host memory is not a Metal buffer");
     assert!(format!("{error}").contains("no registered MTLBuffer"), "{error}");
+}
+
+#[test]
+fn timed_execution_reports_gpu_duration() {
+    let Some(alloc) = metal_alloc_or_skip() else { return };
+    let bytes = compile_for_test(&alloc.dev, VADD_MSL).unwrap();
+    let program = MetalProgram::load(alloc.dev.clone(), &bytes, "vadd", &vadd_abi()).unwrap();
+    const N: usize = 1 << 20;
+    let (out, a, b) = (upload(&alloc, &vec![0.0; N]), upload(&alloc, &vec![1.0; N]), upload(&alloc, &vec![2.0; N]));
+    let wall = Instant::now();
+    let gpu = unsafe {
+        program.execute_timed(
+            &[host_ptr(&out), host_ptr(&a), host_ptr(&b)],
+            &[],
+            Some([N / 32, 1, 1]),
+            Some([32, 1, 1]),
+        )
+    }
+    .unwrap()
+    .expect("Metal stamps every command buffer");
+    let wall = wall.elapsed();
+    assert!(gpu.as_nanos() > 0 && gpu <= wall, "gpu {gpu:?} wall {wall:?}");
+    assert_eq!(download(&alloc, &out, N)[N - 1], 3.0);
 }

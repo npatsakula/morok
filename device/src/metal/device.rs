@@ -198,6 +198,63 @@ impl MetalDevice {
         Ok((buffer.as_raw(), offset as NSUInteger))
     }
 
+    /// [`Self::resolve`] plus an owning reference, for holders that outlive the
+    /// `RawBuffer` (an indirect command buffer keeps its bindings across frees).
+    pub(crate) fn resolve_retained(&self, pointer: *mut u8) -> Result<(ObjcId, NSUInteger)> {
+        let registry = self.registry.lock();
+        let (buffer, offset) = registry.resolve(pointer as usize)?;
+        Ok((buffer.clone(), offset as NSUInteger))
+    }
+
+    /// A fresh command buffer on the queue and a compute encoder on it, both
+    /// retained. The caller must `endEncoding` before releasing the encoder.
+    pub(crate) fn begin_compute(&self) -> Result<(ObjcId, ObjcId)> {
+        let sels = &self.objc.sels;
+        // SAFETY: `commandBuffer` / `computeCommandEncoder` return autoreleased objects.
+        let command_buffer =
+            unsafe { ObjcId::retain(self.objc, self.objc.send0::<Id>(self.queue(), sels.command_buffer)) }
+                .ok_or_else(|| Error::Runtime { message: "Metal command queue returned no command buffer".into() })?;
+        let encoder = unsafe {
+            ObjcId::retain(self.objc, self.objc.send0::<Id>(command_buffer.as_raw(), sels.compute_command_encoder))
+        }
+        .ok_or_else(|| Error::Runtime { message: "Metal command buffer returned no compute encoder".into() })?;
+        Ok((command_buffer, encoder))
+    }
+
+    /// [`Self::resolve_retained`] for a flattened list of host addresses.
+    pub(crate) fn resolve_all(&self, addresses: &[u64]) -> Result<Vec<(ObjcId, NSUInteger)>> {
+        let registry = self.registry.lock();
+        addresses
+            .iter()
+            .map(|address| {
+                let (buffer, offset) = registry.resolve(*address as usize)?;
+                Ok((buffer.clone(), offset as NSUInteger))
+            })
+            .collect()
+    }
+
+    /// Block until a committed command buffer retires; its `NSError`, if any,
+    /// becomes `Error::Runtime` prefixed with `what`.
+    pub(crate) fn wait_command_buffer(&self, command_buffer: Id, what: &str) -> Result<()> {
+        // SAFETY: blocking wait, then an autoreleased NSError (or nil).
+        let message = unsafe {
+            self.objc.send0::<()>(command_buffer, self.objc.sels.wait_until_completed);
+            ns_error_message(self.objc, self.objc.send0::<Id>(command_buffer, self.objc.sels.error))
+        };
+        message.map_or(Ok(()), |message| Err(Error::Runtime { message: format!("{what} failed: {message}") }))
+    }
+
+    /// `(GPUStartTime, GPUEndTime)` in seconds of a completed command buffer.
+    pub(crate) fn gpu_times(&self, command_buffer: Id) -> (f64, f64) {
+        // SAFETY: two `CFTimeInterval` (double) accessors.
+        unsafe {
+            (
+                self.objc.send0::<f64>(command_buffer, self.objc.sels.gpu_start_time),
+                self.objc.send0::<f64>(command_buffer, self.objc.sels.gpu_end_time),
+            )
+        }
+    }
+
     /// Track a committed command buffer, dropping the ones already completed.
     pub(crate) fn push_in_flight(&self, command_buffer: ObjcId) {
         let mut in_flight = self.in_flight.lock();
@@ -222,20 +279,13 @@ impl MetalDevice {
         let _pool = AutoreleasePool::push(self.objc);
         let mut first_error = None;
         for command_buffer in in_flight.drain(..) {
-            // SAFETY: plain void selector, then an autoreleased NSError (or nil).
-            let message = unsafe {
-                self.objc.send0::<()>(command_buffer.as_raw(), self.objc.sels.wait_until_completed);
-                ns_error_message(self.objc, self.objc.send0::<Id>(command_buffer.as_raw(), self.objc.sels.error))
+            // SAFETY: `label` returns an autoreleased NSString or nil.
+            let label = unsafe {
+                ns_string_to_string(self.objc, self.objc.send0::<Id>(command_buffer.as_raw(), self.objc.sels.label))
             };
-            if let Some(message) = message
-                && first_error.is_none()
-            {
-                // SAFETY: `label` returns an autoreleased NSString or nil.
-                let label = unsafe {
-                    ns_string_to_string(self.objc, self.objc.send0::<Id>(command_buffer.as_raw(), self.objc.sels.label))
-                };
-                first_error =
-                    Some(Error::Runtime { message: format!("Metal command buffer '{label}' failed: {message}") });
+            let result = self.wait_command_buffer(command_buffer.as_raw(), &format!("Metal command buffer '{label}'"));
+            if first_error.is_none() {
+                first_error = result.err();
             }
         }
         first_error.map_or(Ok(()), Err)

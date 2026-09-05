@@ -5,6 +5,7 @@
 
 mod allocator;
 mod compile;
+mod graph;
 mod objc;
 mod program;
 mod registry;

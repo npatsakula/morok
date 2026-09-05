@@ -13,12 +13,14 @@ use std::sync::Arc;
 
 use svod_codegen::c::CRenderer;
 use svod_device::Result;
-use svod_device::device::{CompiledSpec, Compiler, Device, Program, ProgramSpec, Renderer, RuntimeFactory};
+use svod_device::device::{
+    CompiledSpec, Compiler, Device, GraphFactory, Program, ProgramSpec, Renderer, RuntimeFactory,
+};
 use svod_device::metal::compile::{
     codegen_service_available, compile_msl, compile_msl_public, macos_product_version, metal_std_flag,
     validate_metallib,
 };
-use svod_device::metal::{MetalDevice, MetalProgram};
+use svod_device::metal::{MetalDevice, MetalGraph, MetalProgram};
 use svod_device::registry::DeviceRegistry;
 use svod_dtype::DeviceSpec;
 use svod_ir::UOp;
@@ -26,15 +28,18 @@ use svod_ir::UOp;
 use crate::object_cache::{CompilerIdentity, OBJECT_CACHE_SCHEMA, ObjectCache, ObjectCacheKey};
 
 /// Create a `METAL:N` device end-to-end (allocator + renderer + compiler +
-/// runtime). Per-call dispatch only: no graph factory yet.
+/// runtime + indirect-command-buffer graph replay).
 pub fn create_metal_device(registry: &DeviceRegistry, device_id: usize) -> Result<Device> {
     let spec = DeviceSpec::Metal { device_id };
     let allocator = registry.get(&spec)?;
     let (renderer, compiler) = create_metal_codegen(device_id)?;
     let dev = MetalDevice::open(device_id)?;
-    let runtime: RuntimeFactory =
-        Arc::new(move |compiled: &CompiledSpec| -> Result<Box<dyn Program>> { create_metal_program(&dev, compiled) });
-    Ok(Device::new(spec, allocator, renderer, compiler, runtime))
+    let runtime_dev = Arc::clone(&dev);
+    let runtime: RuntimeFactory = Arc::new(move |compiled: &CompiledSpec| -> Result<Box<dyn Program>> {
+        create_metal_program(&runtime_dev, compiled)
+    });
+    let graph: GraphFactory = Arc::new(move |kernels| MetalGraph::capture(Arc::clone(&dev), kernels));
+    Ok(Device::new(spec, allocator, renderer, compiler, runtime).with_graph(graph))
 }
 
 /// Load a compiled kernel (metallib bytes, or MSL source in fallback mode).

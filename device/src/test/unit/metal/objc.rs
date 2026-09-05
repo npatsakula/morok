@@ -1,6 +1,6 @@
 use std::mem::{offset_of, size_of};
 
-use crate::metal::objc::{BlockDescriptor, BlockLiteral, MTLSize, ObjcBool, objc};
+use crate::metal::objc::{BlockDescriptor, BlockLiteral, MTLSize, NSRange, ObjcBool, objc};
 
 /// clang's Block-ABI-Apple layout, which `MTLCodeGenServiceBuildRequest`
 /// dereferences to reach `invoke` (tinygrad's `&fn - 0x10` hack pins offset 16).
@@ -26,6 +26,13 @@ fn mtl_size_is_three_nsuintegers() {
     assert_eq!(offset_of!(MTLSize, height), 8);
     assert_eq!(offset_of!(MTLSize, depth), 16);
     assert_eq!(MTLSize::from([2, 3, 4]), MTLSize { width: 2, height: 3, depth: 4 });
+}
+
+#[test]
+fn ns_range_is_two_nsuintegers() {
+    assert_eq!(size_of::<NSRange>(), 16);
+    assert_eq!(offset_of!(NSRange, location), 0);
+    assert_eq!(offset_of!(NSRange, length), 8);
 }
 
 #[test]
