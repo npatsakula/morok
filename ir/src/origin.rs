@@ -282,17 +282,20 @@ pub fn current() -> Option<OriginId> {
 }
 
 /// RAII guard over this thread's capture state: every constructor saves the state
-/// and `Drop` restores it, including while a panic unwinds through it.
+/// and `Drop` restores it, including while a panic unwinds through it. The guard
+/// is `!Send`: it restores the state of the thread it was opened on, so it must
+/// not be dropped anywhere else. Carry a scope to a worker with [`install`].
 #[must_use = "an origin scope only applies while its guard is alive"]
 pub struct OriginScope {
     previous: State,
+    _thread_bound: std::marker::PhantomData<*const ()>,
 }
 
 impl OriginScope {
     fn replace(next: impl FnOnce(State) -> State) -> Self {
         let previous = STATE.with(Cell::get);
         STATE.with(|state| state.set(next(previous)));
-        Self { previous }
+        Self { previous, _thread_bound: std::marker::PhantomData }
     }
 
     /// Push a frame under the current scope. While capture is off the frame is
