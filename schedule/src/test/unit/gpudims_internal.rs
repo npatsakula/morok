@@ -192,3 +192,14 @@ fn symbolic_identity_dims_return_bare_specials() {
         .collect();
     assert_eq!(names, vec!["gidx1", "gidx0"], "reverse=true names the innermost axis gidx0");
 }
+
+/// MSL exposes three grid axes (`gid.xyz`), so a fourth global axis must be
+/// grouped into them instead of surfacing as `gidx3` (which the Metal renderer
+/// rejects); locals go through the same three-axis cap.
+#[test]
+fn metal_groups_global_axes_into_the_three_grid_dimensions() {
+    let extents = global_special_extents(&Renderer::metal(), &[8, 16, 32, 64], &[4]);
+    assert_eq!(extents.len(), 3, "{extents:?}");
+    assert_eq!(extents.iter().product::<usize>(), 8 * 16 * 32 * 64);
+    assert_eq!(global_special_extents(&Renderer::metal(), &[2, 3], &[]), vec![2, 3]);
+}

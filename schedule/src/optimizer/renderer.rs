@@ -364,7 +364,9 @@ impl Renderer {
             has_shared: true,
             has_threads: false,
             shared_max: 32768, // 32KB for Metal
-            global_max: None,
+            // Three grid axes: extra global axes are grouped into them (tinygrad's
+            // `Renderer.global_max = (0x8FFFFFFF,) * 3` default, which Metal inherits).
+            global_max: Some(vec![0x8FFF_FFFF; 3]),
             global_prod_max: None,
             local_max: Some(1024),
             upcast_max: 4,        // float4 for Metal
