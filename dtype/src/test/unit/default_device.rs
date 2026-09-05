@@ -14,6 +14,9 @@ fn parse_simple_variants() {
     assert_eq!(parse_simple("amd:2"), Some(DeviceSpec::Amd { device_id: 2 }));
     assert_eq!(parse_simple("HIP"), Some(DeviceSpec::Amd { device_id: 0 }));
     assert_eq!(parse_simple("HIP:1"), Some(DeviceSpec::Amd { device_id: 1 }));
+    assert_eq!(parse_simple("METAL"), Some(DeviceSpec::Metal { device_id: 0 }));
+    assert_eq!(parse_simple("metal:1"), Some(DeviceSpec::Metal { device_id: 1 }));
+    assert_eq!(parse_simple("METAL:x"), None);
     assert_eq!(parse_simple("cuda"), None);
     assert_eq!(parse_simple(""), None);
     assert_eq!(parse_simple("AMD:notanum"), None);

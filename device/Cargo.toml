@@ -29,6 +29,7 @@ proptest-derive = { version = "0.7", optional = true }
 proptest = { version = "1.9", optional = true }
 memmap2 = "0.9"
 object = { version = "0.38", default-features = false, features = ["elf", "read"] }
+libloading = "0.8"
 
 # AMD GPU provider — always compiled on Unix (Linux + macOS); the KFD path is
 # selected at runtime (the device registry registers the AMD factory only when
@@ -53,4 +54,3 @@ proptest = ["dep:proptest", "dep:proptest-derive", "svod-dtype/proptest"]
 # Devices
 cuda = ["dep:cudarc"]
 webgpu = []
-metal = []

@@ -10,7 +10,8 @@ use std::sync::Arc;
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::{BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
 
-use super::types::{c_cast, c_dtype, c_math_fn};
+use super::dialect::{CDialect, addr_qualifier};
+use super::types::{MathFn, c_cast, c_dtype, math_fn, pointer_type, vector_literal};
 use crate::common::{access_dtype, format_custom_template_strict, shaped_dtype};
 use svod_ir::ops;
 
@@ -34,11 +35,14 @@ pub struct CContext {
     /// violation. The render loop drains this after each call and propagates as
     /// a typed [`crate::Error`].
     pending_error: Option<crate::Error>,
+    /// Which C-family language is being emitted.
+    pub dialect: CDialect,
 }
 
 impl CContext {
-    pub fn new(ref_counts: HashMap<u64, usize>, scope_escaping: HashSet<u64>) -> Self {
+    pub fn new(ref_counts: HashMap<u64, usize>, scope_escaping: HashSet<u64>, dialect: CDialect) -> Self {
         Self {
+            dialect,
             names: HashMap::new(),
             ref_counts,
             counter: 0,
@@ -151,12 +155,14 @@ impl CContext {
             return expr;
         }
         let declared = if is_address_value(uop) {
-            match uop.dtype() {
-                dtype @ DType::Ptr { .. } => c_dtype(&dtype),
-                dtype => format!("{}*", c_dtype(&dtype)),
-            }
+            let dtype = uop.dtype();
+            let elem = match &dtype {
+                DType::Ptr { base, .. } => base.as_ref(),
+                other => other,
+            };
+            pointer_type(elem, uop.addrspace(), self.dialect)
         } else {
-            c_dtype(&shaped_dtype(uop))
+            c_dtype(&shaped_dtype(uop), self.dialect)
         };
         let name = self.next_name("bidx");
         let indent = self.indent();
@@ -166,7 +172,7 @@ impl CContext {
         name
     }
 
-    fn emit_expr_dtype(
+    pub(super) fn emit_expr_dtype(
         &mut self,
         uop: &Arc<UOp>,
         expr: String,
@@ -180,18 +186,32 @@ impl CContext {
             expr
         } else {
             let name = self.next_name(prefix);
-            let dtype = c_dtype(dtype);
-            let indent = self.indent();
-            if self.scope_escaping.contains(&uop.id) {
-                // Hoist: declare at function scope, assign at current depth
-                self.hoisted_declarations.push(format!("  {dtype} {name};"));
-                kernel.push(format!("{indent}{name} = {expr};"));
-            } else {
-                kernel.push(format!("{indent}{dtype} {name} = {expr};"));
-            }
-            self.register(uop.id, name.clone());
-            name
+            self.emit_named(uop, expr, name, dtype, kernel)
         }
+    }
+
+    /// Declare `name` with `dtype` at the current depth (hoisted to function
+    /// scope when the value escapes). The name is fixed by the caller — SPECIAL
+    /// axes keep their IR name.
+    pub(super) fn emit_named(
+        &mut self,
+        uop: &Arc<UOp>,
+        expr: String,
+        name: String,
+        dtype: &DType,
+        kernel: &mut Vec<String>,
+    ) -> String {
+        let dtype = c_dtype(dtype, self.dialect);
+        let indent = self.indent();
+        if self.scope_escaping.contains(&uop.id) {
+            // Hoist: declare at function scope, assign at current depth
+            self.hoisted_declarations.push(format!("  {dtype} {name};"));
+            kernel.push(format!("{indent}{name} = {expr};"));
+        } else {
+            kernel.push(format!("{indent}{dtype} {name} = {expr};"));
+        }
+        self.register(uop.id, name.clone());
+        name
     }
 }
 
@@ -200,6 +220,19 @@ impl CContext {
 /// Returns `Some(())` if code was emitted, `None` for meta-ops.
 pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) -> Option<()> {
     match uop.op() {
+        Op::Special(ops::Special { name, .. }) if ctx.dialect.is_metal() => {
+            super::metal::render_special(uop, name, ctx, kernel)
+        }
+        Op::Barrier(..) if ctx.dialect.is_metal() => {
+            let indent = ctx.indent();
+            kernel.push(format!("{indent}threadgroup_barrier(mem_flags::mem_threadgroup);"));
+            ctx.register(uop.id, String::new());
+            Some(())
+        }
+        Op::Wmma(ops::Wmma { a, b, c, metadata }) if ctx.dialect.is_metal() => {
+            super::metal::render_wmma(uop, a, b, c, metadata, ctx, kernel)
+        }
+
         // Meta-ops: no code emitted
         Op::Const(_)
         | Op::VConst(..)
@@ -217,7 +250,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             let alloc_size = uop.buffer_size().unwrap_or(1);
             let name = ctx.next_name("reg");
             let indent = ctx.indent();
-            kernel.push(format!("{indent}{} {name}[{alloc_size}];", c_dtype(&base_dtype)));
+            kernel.push(format!("{indent}{} {name}[{alloc_size}];", c_dtype(&base_dtype, ctx.dialect)));
             ctx.register(uop.id, name);
             Some(())
         }
@@ -279,7 +312,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             }
             let idx = ctx.get(index).to_string();
             let load_dtype = shaped_dtype(uop);
-            let deref_expr = render_access(index, &load_dtype, &idx);
+            let deref_expr = render_access(index, &load_dtype, &idx, ctx.dialect);
             let expr = match (alt, gate) {
                 (None, None) => deref_expr,
                 (Some(alt), Some(gate)) => {
@@ -313,21 +346,21 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             let val = ctx.get(value).to_string();
             let indent = ctx.indent();
             let val_dtype = access_dtype(index, value);
-            kernel.push(format!("{indent}{} = {val};", render_access(index, &val_dtype, &idx)));
+            kernel.push(format!("{indent}{} = {val};", render_access(index, &val_dtype, &idx, ctx.dialect)));
             Some(())
         }
 
         Op::Binary(op, lhs, rhs) => {
             let l = ctx.get(lhs).to_string();
             let r = ctx.get(rhs).to_string();
-            let expr = render_binary(*op, &l, &r, &lhs.dtype());
+            let expr = render_binary(*op, &l, &r, &lhs.dtype(), ctx.dialect);
             ctx.emit_expr(uop, expr, "alu", kernel);
             Some(())
         }
 
         Op::Unary(op, src) => {
             let s = ctx.get(src).to_string();
-            let expr = render_unary(*op, &s, &src.dtype());
+            let expr = render_unary(*op, &s, &src.dtype(), ctx.dialect);
             ctx.emit_expr(uop, expr, "alu", kernel);
             Some(())
         }
@@ -349,7 +382,14 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             let bv = ctx.get(b).to_string();
             let cv = ctx.get(c).to_string();
             let expr = if a.dtype().is_float() {
-                narrow_float(format!("{}({av}, {bv}, {cv})", c_math_fn("__builtin_fma", &a.dtype())), &a.dtype())
+                let dtype = a.dtype();
+                let d = ctx.dialect;
+                let args = [av, bv, cv].map(|arg| bf16_arg(&arg, &dtype, d));
+                narrow_float(
+                    format!("{}({}, {}, {})", math_fn(MathFn::Fma, &dtype, d), args[0], args[1], args[2]),
+                    &dtype,
+                    d,
+                )
             } else {
                 format!("(({av} * {bv}) + {cv})")
             };
@@ -360,9 +400,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         Op::Cast(ops::Cast { src, dtype }) => {
             let s = ctx.get(src).to_string();
             if is_address_value(src) {
-                let target = c_dtype(dtype);
-                let pointer_type = if matches!(dtype, DType::Ptr { .. }) { target } else { format!("{target}*") };
-                let expr = format!("(({pointer_type})({s}))");
+                let elem = match dtype {
+                    DType::Ptr { base, .. } => base.as_ref(),
+                    other => other,
+                };
+                let expr = format!("(({})({s}))", pointer_type(elem, uop.addrspace(), ctx.dialect));
                 ctx.emit_address(uop, expr, kernel);
                 return Some(());
             }
@@ -371,9 +413,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             // Vector casts use __builtin_convertvector for element-wise conversion
             // (a plain C cast would reinterpret bits, not convert values)
             let expr = if rendered_dtype.vcount() > 1 && !matches!(rendered_dtype, DType::Ptr { .. }) {
-                format!("__builtin_convertvector({s}, {})", c_dtype(&rendered_dtype))
+                format!("__builtin_convertvector({s}, {})", c_dtype(&rendered_dtype, ctx.dialect))
             } else {
-                c_cast(&s, &src.dtype(), dtype)
+                c_cast(&s, &src.dtype(), dtype, ctx.dialect)
             };
             let allow_inline = rendered_dtype.vcount() == 1;
             ctx.emit_expr_dtype(uop, expr, "cast", kernel, &rendered_dtype, allow_inline);
@@ -382,13 +424,16 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
 
         Op::BitCast(ops::BitCast { src, dtype: _ }) => {
             let s = ctx.get(src).to_string();
-            let from_type = c_dtype(&shaped_dtype(src));
+            let from_type = c_dtype(&shaped_dtype(src), ctx.dialect);
             let rendered_dtype = shaped_dtype(uop);
-            let to_type = c_dtype(&rendered_dtype);
+            let to_type = c_dtype(&rendered_dtype, ctx.dialect);
             if from_type == to_type {
                 ctx.register(uop.id, s);
             } else {
-                let expr = format!("__builtin_bit_cast({to_type}, ({from_type})({s}))");
+                let expr = match ctx.dialect {
+                    CDialect::Clang => format!("__builtin_bit_cast({to_type}, ({from_type})({s}))"),
+                    CDialect::Metal => format!("as_type<{to_type}>(({from_type})({s}))"),
+                };
                 ctx.emit_expr(uop, expr, "cast", kernel);
             }
             Some(())
@@ -403,7 +448,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         Op::Range(ops::Range { end, axis_id, .. }) => {
             let end_val = ctx.get(end).to_string();
             let id = axis_id.name();
-            let range_dtype = c_dtype(&uop.dtype());
+            let range_dtype = c_dtype(&uop.dtype(), ctx.dialect);
             let var_name = format!("ridx{id}");
             let indent = ctx.indent();
             kernel.push(format!("{indent}for ({range_dtype} {var_name} = 0; {var_name} < {end_val}; {var_name}++) {{"));
@@ -445,7 +490,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 let acc_name = ctx.get(uop).to_string();
                 let indent = ctx.indent();
 
-                let acc_expr = render_reduce_accumulate(*reduce_op, &acc_name, &src_val, dtype);
+                let acc_expr = render_reduce_accumulate(*reduce_op, &acc_name, &src_val, dtype, ctx.dialect);
                 kernel.push(format!("{indent}{acc_expr}"));
 
                 // Register pending for End to emit the final value
@@ -465,8 +510,8 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 ctx.emit_expr(uop, vals[0].clone(), "vec", kernel);
             } else {
                 let packed_dtype = uop.dtype().scalar_dtype().vec(sources.len()).expect("STACK source dtype is scalar");
-                let out_dtype = c_dtype(&packed_dtype);
-                let expr = format!("({out_dtype}){{{}}}", vals.join(", "));
+                let out_dtype = c_dtype(&packed_dtype, ctx.dialect);
+                let expr = vector_literal(&out_dtype, &vals.join(", "), ctx.dialect);
                 ctx.emit_expr_dtype(uop, expr, "vec", kernel, &packed_dtype, true);
             }
             Some(())
@@ -503,7 +548,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 ctx.register(uop.id, String::new());
             } else {
                 let name = ctx.next_name("custom");
-                let dtype = c_dtype(&uop.dtype());
+                let dtype = c_dtype(&uop.dtype(), ctx.dialect);
                 if ctx.scope_escaping.contains(&uop.id) {
                     ctx.hoisted_declarations.push(format!("  {dtype} {name};"));
                     kernel.push(format!("{indent}{name} = {rendered};"));
@@ -565,7 +610,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
 }
 
 /// Direct equivalent of Tinygrad CStyleLanguage.render_access.
-fn render_access(index: &Arc<UOp>, access_dtype: &DType, address: &str) -> String {
+fn render_access(index: &Arc<UOp>, access_dtype: &DType, address: &str, d: CDialect) -> String {
     let source_dtype = match index.op() {
         Op::Index(ops::Index { buffer, .. }) => buffer.dtype(),
         Op::Shrink(ops::Shrink { src, .. }) => src.dtype(),
@@ -573,7 +618,7 @@ fn render_access(index: &Arc<UOp>, access_dtype: &DType, address: &str) -> Strin
         _ => index.dtype(),
     };
     if access_dtype.vcount() > 1 || *access_dtype != source_dtype {
-        format!("*(({}*)({address}))", c_dtype(access_dtype))
+        format!("*(({}{}*)({address}))", addr_qualifier(d, index.addrspace()), c_dtype(access_dtype, d))
     } else {
         format!("*({address})")
     }
@@ -582,43 +627,56 @@ fn render_access(index: &Arc<UOp>, access_dtype: &DType, address: &str) -> Strin
 /// C evaluates scalar arithmetic on types narrower than `int` at `int` width,
 /// and an inlined expression never rounds back down. Cast such results to the
 /// IR dtype so `int8` wraps like every other backend.
-fn narrow_int(expr: String, dtype: &DType) -> String {
+fn narrow_int(expr: String, dtype: &DType, d: CDialect) -> String {
     let narrow =
         matches!(dtype.base(), ScalarDType::Int8 | ScalarDType::UInt8 | ScalarDType::Int16 | ScalarDType::UInt16);
-    if narrow && dtype.vcount() == 1 { format!("(({}){expr})", c_dtype(dtype)) } else { expr }
+    if narrow && dtype.vcount() == 1 { format!("(({}){expr})", c_dtype(dtype, d)) } else { expr }
 }
 
 /// The `f`-suffixed builtins compute at f32; round a half or bfloat16 result
 /// back to its own width so the C backend matches the native-width backends.
-fn narrow_float(expr: String, dtype: &DType) -> String {
+fn narrow_float(expr: String, dtype: &DType, d: CDialect) -> String {
     if matches!(dtype.base(), ScalarDType::Float16 | ScalarDType::BFloat16) && dtype.vcount() == 1 {
-        format!("(({}){expr})", c_dtype(dtype))
+        format!("(({}){expr})", c_dtype(dtype, d))
     } else {
         expr
     }
 }
 
+/// MSL has no `bfloat` overloads of the math functions; promote the operand
+/// (`narrow_float` rounds the result back). Identity for clang, whose
+/// `__builtin_*f` promote implicitly.
+fn bf16_arg(s: &str, dtype: &DType, d: CDialect) -> String {
+    if d.is_metal() && dtype.base() == ScalarDType::BFloat16 { format!("(float){s}") } else { s.to_string() }
+}
+
+/// `fn(args...)` through the dialect's math function, with bf16 promotion.
+fn math_call(f: MathFn, args: &[&str], dtype: &DType, d: CDialect) -> String {
+    let args: Vec<String> = args.iter().map(|arg| bf16_arg(arg, dtype, d)).collect();
+    narrow_float(format!("{}({})", math_fn(f, dtype, d), args.join(", ")), dtype, d)
+}
+
 /// Render a binary operation as a C expression.
-fn render_binary(op: BinaryOp, l: &str, r: &str, dtype: &DType) -> String {
+fn render_binary(op: BinaryOp, l: &str, r: &str, dtype: &DType, d: CDialect) -> String {
     match op {
         BinaryOp::FloorDiv | BinaryOp::FloorMod => unreachable!("floor div/mod must be decomposed before C rendering"),
-        BinaryOp::Add => narrow_int(format!("({l} + {r})"), dtype),
-        BinaryOp::Sub => narrow_int(format!("({l} - {r})"), dtype),
-        BinaryOp::Mul => narrow_int(format!("({l} * {r})"), dtype),
+        BinaryOp::Add => narrow_int(format!("({l} + {r})"), dtype, d),
+        BinaryOp::Sub => narrow_int(format!("({l} - {r})"), dtype, d),
+        BinaryOp::Mul => narrow_int(format!("({l} * {r})"), dtype, d),
         BinaryOp::Fdiv => format!("({l} / {r})"),
-        BinaryOp::CDiv => narrow_int(format!("({l} / {r})"), dtype),
+        BinaryOp::CDiv => narrow_int(format!("({l} / {r})"), dtype, d),
         BinaryOp::CMod => {
             if dtype.is_float() {
-                narrow_float(format!("{}({l}, {r})", c_math_fn("__builtin_fmod", dtype)), dtype)
+                math_call(MathFn::Fmod, &[l, r], dtype, d)
             } else {
-                narrow_int(format!("({l} % {r})"), dtype)
+                narrow_int(format!("({l} % {r})"), dtype, d)
             }
         }
         BinaryOp::Max => {
             if dtype.is_float() {
-                narrow_float(format!("{}({l}, {r})", c_math_fn("__builtin_fmax", dtype)), dtype)
+                math_call(MathFn::Fmax, &[l, r], dtype, d)
             } else {
-                narrow_int(format!("({l} > {r} ? {l} : {r})"), dtype)
+                narrow_int(format!("({l} > {r} ? {l} : {r})"), dtype, d)
             }
         }
         BinaryOp::Lt => format!("({l} < {r})"),
@@ -627,62 +685,63 @@ fn render_binary(op: BinaryOp, l: &str, r: &str, dtype: &DType) -> String {
         BinaryOp::Ge => format!("({l} >= {r})"),
         BinaryOp::Eq => format!("({l} == {r})"),
         BinaryOp::Ne => format!("({l} != {r})"),
-        BinaryOp::And => narrow_int(format!("({l} & {r})"), dtype),
-        BinaryOp::Or => narrow_int(format!("({l} | {r})"), dtype),
-        BinaryOp::Xor => narrow_int(format!("({l} ^ {r})"), dtype),
-        BinaryOp::Shl => narrow_int(format!("({l} << {r})"), dtype),
-        BinaryOp::Shr => narrow_int(format!("({l} >> {r})"), dtype),
+        BinaryOp::And => narrow_int(format!("({l} & {r})"), dtype, d),
+        BinaryOp::Or => narrow_int(format!("({l} | {r})"), dtype, d),
+        BinaryOp::Xor => narrow_int(format!("({l} ^ {r})"), dtype, d),
+        BinaryOp::Shl => narrow_int(format!("({l} << {r})"), dtype, d),
+        BinaryOp::Shr => narrow_int(format!("({l} >> {r})"), dtype, d),
         BinaryOp::Pow => {
             if dtype.is_float() {
-                narrow_float(format!("{}({l}, {r})", c_math_fn("__builtin_pow", dtype)), dtype)
+                math_call(MathFn::Pow, &[l, r], dtype, d)
             } else {
-                // Integer pow via cast to double
-                format!("(({})__builtin_pow((double){l}, (double){r}))", c_dtype(&DType::Scalar(dtype.base())))
+                // Integer pow through the widest float the dialect has.
+                let (wide, pow) = match d {
+                    CDialect::Clang => ("double", "__builtin_pow"),
+                    CDialect::Metal => ("float", "pow"),
+                };
+                format!("(({}){pow}(({wide}){l}, ({wide}){r}))", c_dtype(&DType::Scalar(dtype.base()), d))
             }
         }
-        BinaryOp::Threefry => narrow_int(format!("({l} ^ {r})"), dtype),
+        BinaryOp::Threefry => narrow_int(format!("({l} ^ {r})"), dtype, d),
     }
 }
 
 /// Render a unary operation as a C expression.
-fn render_unary(op: UnaryOp, s: &str, dtype: &DType) -> String {
+fn render_unary(op: UnaryOp, s: &str, dtype: &DType, d: CDialect) -> String {
+    let one = if matches!(dtype.base(), ScalarDType::Float64) { "1.0" } else { "1.0f" };
     match op {
-        UnaryOp::Neg => narrow_int(format!("(-{s})"), dtype),
+        UnaryOp::Neg => narrow_int(format!("(-{s})"), dtype, d),
         UnaryOp::Not => {
             if dtype.is_bool() {
                 format!("(!{s})")
             } else {
-                narrow_int(format!("(~{s})"), dtype)
+                narrow_int(format!("(~{s})"), dtype, d)
             }
         }
         UnaryOp::Abs => {
             if dtype.is_float() {
-                narrow_float(format!("{}({s})", c_math_fn("__builtin_fabs", dtype)), dtype)
+                math_call(MathFn::Fabs, &[s], dtype, d)
             } else {
-                narrow_int(format!("({s} < 0 ? -{s} : {s})"), dtype)
+                narrow_int(format!("({s} < 0 ? -{s} : {s})"), dtype, d)
             }
         }
-        UnaryOp::Sqrt => narrow_float(format!("{}({s})", c_math_fn("__builtin_sqrt", dtype)), dtype),
+        UnaryOp::Sqrt => math_call(MathFn::Sqrt, &[s], dtype, d),
         UnaryOp::Rsqrt => {
-            let one = if matches!(dtype.base(), ScalarDType::Float64) { "1.0" } else { "1.0f" };
-            narrow_float(format!("({one} / {}({s}))", c_math_fn("__builtin_sqrt", dtype)), dtype)
+            narrow_float(format!("({one} / {}({}))", math_fn(MathFn::Sqrt, dtype, d), bf16_arg(s, dtype, d)), dtype, d)
         }
-        UnaryOp::Reciprocal => {
-            let one = if matches!(dtype.base(), ScalarDType::Float64) { "1.0" } else { "1.0f" };
-            format!("({one} / {s})")
-        }
-        UnaryOp::Exp => narrow_float(format!("{}({s})", c_math_fn("__builtin_exp", dtype)), dtype),
-        UnaryOp::Exp2 => narrow_float(format!("{}({s})", c_math_fn("__builtin_exp2", dtype)), dtype),
-        UnaryOp::Log => narrow_float(format!("{}({s})", c_math_fn("__builtin_log", dtype)), dtype),
-        UnaryOp::Log2 => narrow_float(format!("{}({s})", c_math_fn("__builtin_log2", dtype)), dtype),
-        UnaryOp::Sin => narrow_float(format!("{}({s})", c_math_fn("__builtin_sin", dtype)), dtype),
-        UnaryOp::Cos => narrow_float(format!("{}({s})", c_math_fn("__builtin_cos", dtype)), dtype),
-        UnaryOp::Tan => narrow_float(format!("{}({s})", c_math_fn("__builtin_tan", dtype)), dtype),
-        UnaryOp::Floor => narrow_float(format!("{}({s})", c_math_fn("__builtin_floor", dtype)), dtype),
-        UnaryOp::Ceil => narrow_float(format!("{}({s})", c_math_fn("__builtin_ceil", dtype)), dtype),
-        UnaryOp::Trunc => narrow_float(format!("{}({s})", c_math_fn("__builtin_trunc", dtype)), dtype),
-        UnaryOp::Round => narrow_float(format!("{}({s})", c_math_fn("__builtin_rint", dtype)), dtype),
-        UnaryOp::Erf => narrow_float(format!("{}({s})", c_math_fn("__builtin_erf", dtype)), dtype),
+        UnaryOp::Reciprocal => format!("({one} / {s})"),
+        UnaryOp::Exp => math_call(MathFn::Exp, &[s], dtype, d),
+        UnaryOp::Exp2 => math_call(MathFn::Exp2, &[s], dtype, d),
+        UnaryOp::Log => math_call(MathFn::Log, &[s], dtype, d),
+        UnaryOp::Log2 => math_call(MathFn::Log2, &[s], dtype, d),
+        UnaryOp::Sin => math_call(MathFn::Sin, &[s], dtype, d),
+        UnaryOp::Cos => math_call(MathFn::Cos, &[s], dtype, d),
+        UnaryOp::Tan => math_call(MathFn::Tan, &[s], dtype, d),
+        UnaryOp::Floor => math_call(MathFn::Floor, &[s], dtype, d),
+        UnaryOp::Ceil => math_call(MathFn::Ceil, &[s], dtype, d),
+        UnaryOp::Trunc => math_call(MathFn::Trunc, &[s], dtype, d),
+        UnaryOp::Round => math_call(MathFn::Rint, &[s], dtype, d),
+        UnaryOp::Erf => math_call(MathFn::Erf, &[s], dtype, d),
         UnaryOp::Sign => {
             if dtype.is_float() {
                 let zero = if matches!(dtype.base(), ScalarDType::Float64) { "0.0" } else { "0.0f" };
@@ -696,20 +755,23 @@ fn render_unary(op: UnaryOp, s: &str, dtype: &DType) -> String {
 }
 
 /// Render a reduce accumulation statement.
-fn render_reduce_accumulate(op: ReduceOp, acc: &str, val: &str, dtype: &DType) -> String {
+fn render_reduce_accumulate(op: ReduceOp, acc: &str, val: &str, dtype: &DType, d: CDialect) -> String {
+    let float_fn = |f: MathFn| {
+        format!("{acc} = {}({}, {});", math_fn(f, dtype, d), bf16_arg(acc, dtype, d), bf16_arg(val, dtype, d))
+    };
     match op {
         ReduceOp::Add => format!("{acc} += {val};"),
         ReduceOp::Mul => format!("{acc} *= {val};"),
         ReduceOp::Max => {
             if dtype.is_float() {
-                format!("{acc} = {}({acc}, {val});", c_math_fn("__builtin_fmax", dtype))
+                float_fn(MathFn::Fmax)
             } else {
                 format!("{acc} = ({acc} > {val} ? {acc} : {val});")
             }
         }
         ReduceOp::Min => {
             if dtype.is_float() {
-                format!("{acc} = {}({acc}, {val});", c_math_fn("__builtin_fmin", dtype))
+                float_fn(MathFn::Fmin)
             } else {
                 format!("{acc} = ({acc} < {val} ? {acc} : {val});")
             }

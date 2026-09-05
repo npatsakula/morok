@@ -92,7 +92,24 @@ impl DeviceFactoryRegistry {
             );
         }
 
-        // Future: Register CUDA, Metal, WebGPU factories when implemented
+        // Metal factory. Same contract as AMD: always compiled, registered only
+        // when the Apple frameworks load and a default GPU exists, so Linux
+        // (dlopen fails) cleanly has no "METAL" device type.
+        if svod_device::metal::has_devices() {
+            registry.register_factory(
+                "METAL",
+                Arc::new(|spec, alloc_reg| {
+                    let svod_ir::DeviceSpec::Metal { device_id } = spec else {
+                        return Err(svod_device::Error::DeviceUnavailable {
+                            reason: format!("Metal factory called with non-Metal spec: {spec:?}"),
+                        });
+                    };
+                    crate::devices::metal::create_metal_device(alloc_reg, *device_id)
+                }),
+            );
+        }
+
+        // Future: Register CUDA and WebGPU factories when implemented
         // registry.register_factory("CUDA", Arc::new(|spec, reg| create_cuda_device(spec, reg)));
 
         registry

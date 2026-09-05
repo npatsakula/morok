@@ -35,7 +35,9 @@ pub mod buffer;
 pub mod device;
 pub mod error;
 pub mod hcq;
+pub mod inprocess;
 pub mod isa;
+pub mod metal;
 pub mod profile;
 pub mod registry;
 pub mod sync;
@@ -46,6 +48,7 @@ pub use device::{
     Program,
 };
 pub use error::{Error, Result};
+pub use inprocess::claim_inprocess_llvm;
 pub use profile::{CounterSet, KernelResources, PmcCounter};
 pub use sync::{CompletionToken, CpuTimelineSignal, DispatchTimestamps, TimelineSignal};
 

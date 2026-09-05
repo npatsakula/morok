@@ -3434,6 +3434,7 @@ dependencies = [
  "cudarc",
  "enum_delegate",
  "libc",
+ "libloading",
  "memmap2",
  "ndarray",
  "nix",

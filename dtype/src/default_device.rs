@@ -10,9 +10,9 @@
 //!   3. `SVOD_DEVICE` env var (parsed once at first access).
 //!   4. `DeviceSpec::Cpu` (final fallback).
 //!
-//! Note: parsing is intentionally restricted to "CPU" and "AMD[:N]". Devices
-//! that need richer specs (CUDA, Metal, WebGPU) can opt in by extending
-//! `parse_simple` here.
+//! Note: parsing is intentionally restricted to "CPU", "AMD[:N]" and
+//! "METAL[:N]". Devices that need richer specs (CUDA, WebGPU) can opt in by
+//! extending `parse_simple` here.
 
 use std::cell::RefCell;
 
@@ -92,15 +92,15 @@ where
 ///     comes from KFD topology when the registry/device-factory opens the
 ///     allocator. The default-device value is only used as a *spec hint*;
 ///     downstream consumers re-resolve through the registry.
+///   - `METAL` / `METAL:N`
 fn parse_simple(s: &str) -> Option<DeviceSpec> {
     let upper = s.to_uppercase();
     let parts: Vec<&str> = upper.split(':').collect();
+    let device_id = || -> Option<usize> { if parts.len() > 1 { parts[1].parse().ok() } else { Some(0) } };
     match parts[0] {
         "CPU" => Some(DeviceSpec::Cpu),
-        "AMD" | "HIP" => {
-            let device_id: usize = if parts.len() > 1 { parts[1].parse().ok()? } else { 0 };
-            Some(DeviceSpec::Amd { device_id })
-        }
+        "AMD" | "HIP" => Some(DeviceSpec::Amd { device_id: device_id()? }),
+        "METAL" => Some(DeviceSpec::Metal { device_id: device_id()? }),
         _ => None,
     }
 }

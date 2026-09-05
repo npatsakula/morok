@@ -152,7 +152,18 @@ pub(crate) fn library() -> Result<&'static LlvmLibrary> {
         return Err(Error::LlvmError { reason: "in-process compilation disabled by SVOD_LLVM_INPROCESS=0".into() });
     }
     LIBRARY
-        .get_or_init(|| LlvmLibrary::discover(std::env::var_os("SVOD_LLVM_LIB")).map_err(|error| error.to_string()))
+        .get_or_init(|| {
+            // The Metal private compiler loads a second libLLVM RTLD_GLOBAL that
+            // crashes LLVM's verifier; only one in-process LLVM may load per
+            // process. If Metal already claimed the slot, fall back to clang.
+            if !svod_device::claim_inprocess_llvm("cpu-llvm") {
+                return Err(
+                    "in-process LLVM unavailable: the Metal compiler holds this process's in-process LLVM slot"
+                        .to_string(),
+                );
+            }
+            LlvmLibrary::discover(std::env::var_os("SVOD_LLVM_LIB")).map_err(|error| error.to_string())
+        })
         .as_ref()
         .map_err(|reason| Error::LlvmError { reason: reason.clone() })
 }

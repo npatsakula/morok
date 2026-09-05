@@ -1,16 +1,27 @@
-//! C source code generation backend.
-//!
-//! Generates C source code from linearized UOp IR, suitable for compilation
-//! with `clang -shared -O2` and loading via `dlopen`.
+//! C-family source code generation backend: clang C for the CPU and Metal
+//! Shading Language for Apple GPUs, selected by [`CDialect`].
 //!
 //! # Kernel Signature
 //!
-//! Emits a single function with typed `restrict` pointer params and const variable params:
+//! Clang emits a single function with typed `restrict` pointer params and
+//! const variable params:
 //!
 //! ```c
 //! void kernel(float* restrict data0, const int N) { /* body */ }
 //! ```
+//!
+//! Metal emits a compute kernel whose buffer bindings are positional (argument
+//! index = declaration order = PARAM slot) and whose launch ids are the two
+//! trailing attributed parameters:
+//!
+//! ```c
+//! kernel void kernel(device float* data0, constant int& N,
+//!                    uint3 gid [[threadgroup_position_in_grid]],
+//!                    uint3 lid [[thread_position_in_threadgroup]]) { /* body */ }
+//! ```
 
+pub mod dialect;
+pub mod metal;
 pub mod ops;
 pub mod types;
 
@@ -23,27 +34,42 @@ use svod_ir::{Op, prelude::*};
 use crate::common::{collect_abi_params, is_output_buffer, validate_custom_template_strict};
 use crate::{BufferArg, Error, RenderedKernel, Result};
 
+pub use self::dialect::CDialect;
 use self::ops::{CContext, count_references, render_uop};
-use self::types::{c_const, c_dtype, c_reduce_identity, c_vconst, collect_vector_typedefs};
+use self::types::{
+    c_const, c_dtype, c_reduce_identity, c_vconst, collect_vector_typedefs, reject_unsupported_metal_dtypes,
+};
 
-/// C source code renderer for CPU execution via clang.
-pub struct CRenderer;
-
-impl CRenderer {
-    pub fn new() -> Self {
-        Self
-    }
+/// C-family source renderer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CRenderer {
+    dialect: CDialect,
 }
 
-impl Default for CRenderer {
-    fn default() -> Self {
-        Self::new()
+impl CRenderer {
+    /// Clang C for CPU execution.
+    pub fn new() -> Self {
+        Self::with_dialect(CDialect::Clang)
+    }
+
+    /// Metal Shading Language for Apple GPUs.
+    pub fn metal() -> Self {
+        Self::with_dialect(CDialect::Metal)
+    }
+
+    pub fn with_dialect(dialect: CDialect) -> Self {
+        Self { dialect }
+    }
+
+    pub fn dialect(&self) -> CDialect {
+        self.dialect
     }
 }
 
 impl crate::Renderer for CRenderer {
     fn render(&self, uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
         let kernel_name = name.unwrap_or("kernel");
+        let d = self.dialect;
 
         let nodes: Vec<Arc<UOp>> = match uop.op() {
             Op::Linear(svod_ir::ops::Linear { ops }) => ops.iter().cloned().collect(),
@@ -51,7 +77,13 @@ impl crate::Renderer for CRenderer {
                 return Err(Error::InvalidGraph { reason: format!("C renderer expects LINEAR input, got {other:?}") });
             }
         };
-        crate::common::reject_unsupported_fnuz(&nodes, "C")?;
+        match d {
+            CDialect::Clang => crate::common::reject_unsupported_fnuz(&nodes, "C")?,
+            CDialect::Metal => {
+                crate::common::reject_unsupported_fnuz(&nodes, "Metal")?;
+                reject_unsupported_metal_dtypes(&nodes)?;
+            }
+        }
 
         for (i, node) in nodes.iter().enumerate() {
             tracing::trace!(position = i, op = node.op().as_ref(), id = node.id, "c linearized node");
@@ -99,22 +131,34 @@ impl crate::Renderer for CRenderer {
         // Count references for SSA inlining decisions
         let ref_counts = count_references(&nodes);
         let scope_escaping = find_scope_escaping_vars(&nodes, &ref_counts);
-        let mut ctx = CContext::new(ref_counts, scope_escaping);
+        let mut ctx = CContext::new(ref_counts, scope_escaping, d);
 
-        // === Build C source ===
+        // === Build source ===
         let mut code_lines: Vec<String> = Vec::new();
 
-        // Includes
-        code_lines.push("#include <stdbool.h>".to_string());
-        code_lines.push("".to_string());
+        match d {
+            CDialect::Clang => {
+                code_lines.push("#include <stdbool.h>".to_string());
+                code_lines.push("".to_string());
 
-        // Vector typedefs
-        let typedefs = collect_vector_typedefs(&nodes);
-        for td in &typedefs {
-            code_lines.push(td.clone());
-        }
-        if !typedefs.is_empty() {
-            code_lines.push("".to_string());
+                // Vector typedefs (MSL vectors are native)
+                let typedefs = collect_vector_typedefs(&nodes);
+                for td in &typedefs {
+                    code_lines.push(td.clone());
+                }
+                if !typedefs.is_empty() {
+                    code_lines.push("".to_string());
+                }
+            }
+            CDialect::Metal => {
+                code_lines.push("#include <metal_stdlib>".to_string());
+                code_lines.push("using namespace metal;".to_string());
+                code_lines.push("".to_string());
+                for helper in metal::wmma_helper_prefix(&nodes) {
+                    code_lines.push(helper);
+                    code_lines.push("".to_string());
+                }
+            }
         }
 
         // Build typed function params
@@ -128,29 +172,48 @@ impl crate::Renderer for CRenderer {
             if arg.addrspace.is_some() {
                 let dtype = param.dtype();
                 let elem_type = match &dtype {
-                    DType::Ptr { base, .. } => c_dtype(base),
-                    _ => c_dtype(&dtype),
+                    DType::Ptr { base, .. } => c_dtype(base, d),
+                    _ => c_dtype(&dtype, d),
                 };
                 let volatile = if arg.volatile { "volatile " } else { "" };
-                params.push(format!("{volatile}{elem_type}* restrict {source_name}"));
+                params.push(match d {
+                    CDialect::Clang => format!("{volatile}{elem_type}* restrict {source_name}"),
+                    CDialect::Metal => format!("{volatile}device {elem_type}* {source_name}"),
+                });
             } else {
-                params.push(format!("const {} {source_name}", c_dtype(&param.dtype())));
+                let scalar_type = c_dtype(&param.dtype(), d);
+                params.push(match d {
+                    CDialect::Clang => format!("const {scalar_type} {source_name}"),
+                    CDialect::Metal => format!("constant {scalar_type}& {source_name}"),
+                });
             }
             ctx.register(param.id, source_name);
         }
 
         // Function signature
-        code_lines.push(format!("void {kernel_name}({}) {{", params.join(", ")));
+        match d {
+            CDialect::Clang => code_lines.push(format!("void {kernel_name}({}) {{", params.join(", "))),
+            CDialect::Metal => {
+                // Launch ids are not ABI params: appended after the PARAM list so
+                // positional buffer indices stay equal to slots.
+                params.push("uint3 gid [[threadgroup_position_in_grid]]".to_string());
+                params.push("uint3 lid [[thread_position_in_threadgroup]]".to_string());
+                code_lines.push(format!("kernel void {kernel_name}({}) {{", params.join(", ")));
+            }
+        }
 
-        // Local memory allocations (stack arrays on CPU)
+        // Local memory allocations: stack arrays on CPU, threadgroup memory on Metal
         for node in &nodes {
             if let Op::Buffer(svod_ir::ops::Buffer { arg, .. }) = node.op()
                 && arg.addrspace == Some(svod_ir::AddrSpace::Local)
             {
-                let base = c_dtype(&arg.dtype);
+                let base = c_dtype(&arg.dtype, d);
                 let size = node.buffer_size().unwrap_or(1);
                 let name = format!("local{}", arg.slot);
-                code_lines.push(format!("  {base} {name}[{size}];"));
+                code_lines.push(match d {
+                    CDialect::Clang => format!("  {base} {name}[{size}];"),
+                    CDialect::Metal => format!("  threadgroup __attribute__((aligned(16))) {base} {name}[{size}];"),
+                });
                 ctx.register(node.id, name);
             }
         }
@@ -164,8 +227,8 @@ impl crate::Renderer for CRenderer {
                     continue;
                 }
                 let dtype = &node.dtype();
-                let c_type = c_dtype(dtype);
-                let identity = c_reduce_identity(*reduce_op, dtype);
+                let c_type = c_dtype(dtype, d);
+                let identity = c_reduce_identity(*reduce_op, dtype, d);
                 let acc_name = format!("acc{}", node.id);
                 code_lines.push(format!("  {c_type} {acc_name} = {identity};"));
                 // Pre-register so the ops.rs render_uop finds it
@@ -177,11 +240,11 @@ impl crate::Renderer for CRenderer {
         for node in &nodes {
             match node.op() {
                 Op::Const(cv) => {
-                    let val = c_const(&cv.0, &node.dtype());
+                    let val = c_const(&cv.0, &node.dtype(), d);
                     ctx.register(node.id, val);
                 }
                 Op::VConst(svod_ir::ops::VConst { values }) => {
-                    let val = c_vconst(values, &node.dtype());
+                    let val = c_vconst(values, &node.dtype(), d);
                     ctx.register(node.id, val);
                 }
                 _ => {}
@@ -239,12 +302,15 @@ impl crate::Renderer for CRenderer {
     }
 
     fn backend_name(&self) -> &str {
-        "clang"
+        match self.dialect {
+            CDialect::Clang => "clang",
+            CDialect::Metal => "metal",
+        }
     }
 
     fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
-        // C uses __builtin_ math functions (sqrt, exp, sin, etc.) — no decomposition needed.
-        // Threefry is handled by XOR in render.
+        // Both dialects call the platform math functions directly; the
+        // device-level wrapper supplies the transcendental decompositions.
         None
     }
 }
@@ -302,8 +368,12 @@ fn find_scope_escaping_vars(nodes: &[Arc<UOp>], ref_counts: &HashMap<u64, usize>
         .collect()
 }
 
-/// Public render function for the C backend.
+/// Render clang C.
 pub fn render(uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
-    let renderer = CRenderer::new();
-    crate::Renderer::render(&renderer, uop, name)
+    crate::Renderer::render(&CRenderer::new(), uop, name)
+}
+
+/// Render Metal Shading Language.
+pub fn render_metal(uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
+    crate::Renderer::render(&CRenderer::metal(), uop, name)
 }

@@ -53,16 +53,6 @@ impl DeviceSpecExt for DeviceSpec {
                 };
                 Ok(DeviceSpec::Cuda { device_id })
             }
-            #[cfg(feature = "metal")]
-            "METAL" => {
-                let device_id = if parts.len() > 1 {
-                    parts[1].parse().map_err(|_| crate::error::Error::InvalidDevice { device: s.to_string() })?
-                } else {
-                    0
-                };
-                Ok(DeviceSpec::Metal { device_id })
-            }
-            #[cfg(not(feature = "metal"))]
             "METAL" => {
                 let device_id = if parts.len() > 1 {
                     parts[1].parse().map_err(|_| crate::error::Error::InvalidDevice { device: s.to_string() })?
@@ -145,11 +135,7 @@ impl DeviceRegistry {
                 });
             }
             DeviceSpec::Amd { device_id, .. } => Box::new(crate::amd::AmdAllocator::new(*device_id)?),
-            DeviceSpec::Metal { .. } => {
-                return Err(crate::error::Error::DeviceUnavailable {
-                    reason: "Metal allocator is not yet implemented".into(),
-                });
-            }
+            DeviceSpec::Metal { device_id } => Box::new(crate::metal::MetalAllocator::new(*device_id)?),
             DeviceSpec::WebGpu => {
                 return Err(crate::error::Error::DeviceUnavailable {
                     reason: "WebGPU allocator is not yet implemented".into(),

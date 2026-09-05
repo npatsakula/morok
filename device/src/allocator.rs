@@ -118,6 +118,18 @@ pub enum RawBuffer {
         handle: u64,
         device: std::sync::Arc<crate::amd::AmdDevice>,
     },
+    /// Metal buffer with `MTLResourceStorageModeShared` storage.
+    ///
+    /// `contents` is the host mapping of the same unified-memory allocation:
+    /// what the CPU memcpys through and, plus the view offset, what
+    /// `Buffer::as_raw_ptr` hands to `Program::execute`, which resolves it back
+    /// to `(MTLBuffer, offset)` through the device's pointer registry.
+    Metal {
+        buffer: crate::metal::objc::ObjcId,
+        contents: std::ptr::NonNull<u8>,
+        size: usize,
+        device: std::sync::Arc<crate::metal::MetalDevice>,
+    },
 }
 
 // SAFETY: RawBuffer access is synchronized by the scheduler at a higher level.
@@ -197,6 +209,9 @@ impl std::fmt::Debug for RawBuffer {
                 .field("size", size)
                 .field("cpu_accessible", &host_ptr.is_some())
                 .finish_non_exhaustive(),
+            RawBuffer::Metal { contents, size, .. } => {
+                f.debug_struct("Metal").field("contents", contents).field("size", size).finish_non_exhaustive()
+            }
         }
     }
 }
@@ -213,6 +228,7 @@ impl RawBuffer {
             #[cfg(feature = "cuda")]
             RawBuffer::CudaUnified { data, .. } => unsafe { (&*data.get()).len() },
             RawBuffer::AmdDevice { size, .. } => *size,
+            RawBuffer::Metal { size, .. } => *size,
         }
     }
 
@@ -226,6 +242,7 @@ impl RawBuffer {
             #[cfg(feature = "cuda")]
             RawBuffer::CudaUnified { .. } => true,
             RawBuffer::AmdDevice { host_ptr, .. } => host_ptr.is_some(),
+            RawBuffer::Metal { .. } => true,
         }
     }
 }
@@ -683,6 +700,13 @@ impl LruAllocator {
                 Ok(true)
             }
             RawBuffer::AmdDevice { host_ptr: None, .. } => Ok(false),
+            RawBuffer::Metal { contents, size, device, .. } => {
+                // A recycled buffer may still be read by in-flight kernels; the
+                // host memset is not ordered on the GPU timeline.
+                device.synchronize()?;
+                unsafe { std::ptr::write_bytes(contents.as_ptr(), 0, *size) };
+                Ok(true)
+            }
             #[cfg(feature = "cuda")]
             RawBuffer::CudaDevice { data, device } => {
                 let cuda_data = unsafe { &mut *data.get() };

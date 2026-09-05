@@ -194,6 +194,13 @@ impl Renderer {
         ret
     }
 
+    /// MSL has no `double`.
+    fn metal_dtypes() -> std::collections::HashSet<ScalarDType> {
+        let mut dtypes = Self::common_dtypes();
+        dtypes.remove(&ScalarDType::Float64);
+        dtypes
+    }
+
     fn webgpu_dtypes() -> std::collections::HashSet<ScalarDType> {
         use ScalarDType::*;
         Self::dtype_set(&[Bool, Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32])
@@ -354,7 +361,7 @@ impl Renderer {
             extra_matcher: None,
             decomposition_matcher: None,
             renderer_ops: None,
-            supported_dtypes: Self::common_dtypes(),
+            supported_dtypes: Self::metal_dtypes(),
             decomposition_profile: "none",
             extra_profile: "none",
         }
