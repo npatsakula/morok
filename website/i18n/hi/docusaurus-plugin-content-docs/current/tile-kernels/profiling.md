@@ -112,7 +112,7 @@ pub struct ProfileOptions {
     pub iters: u32,             // replays; the per-kernel minimum device time is kept
     pub static_analysis: bool,  // Tier 2/3 (flops/bytes/resources) — cheap, on by default
     pub counters: PmcSelection, // Tier 4 hardware counters
-    pub origin_depth: Option<usize>, // origin rollup की depth; None पूरा path रखता है
+    pub origin_depth: Option<usize>, // origin rollup depth; None keeps the full path
 }
 ```
 
@@ -126,7 +126,7 @@ let opts = ProfileOptions {
     iters: 50,
     static_analysis: true,
     counters: PmcSelection::Default, // add Tier 4
-    origin_depth: Some(3), // origin paths को तीन frames तक rollup करें
+    origin_depth: Some(3), // roll the origin rows up to three frames
 };
 ```
 
@@ -139,8 +139,8 @@ let opts = ProfileOptions {
 |---------|--------|
 | `SVOD_PROFILE_ITERS` | min-merge के लिए replay count (कम से कम 1 तक clamp किया गया) |
 | `SVOD_PMC` | Tier-4 selection: empty या `0` → off; `1` → default counter set; वरना एक comma-separated token list (`sqbusy`, `waves`, `valu`) |
-| `SVOD_ORIGIN` | `1` हर op के बनने का scope दर्ज करता है (module path, call site, ONNX node), नीचे देखें |
-| `SVOD_ORIGIN_DEPTH` | origin rollups कितने path segments रखें (`origin_depth`); unset या `0` = पूरा path |
+| `SVOD_ORIGIN` | `1` हर op का scope दर्ज करता है — module path, call site, ONNX node; नीचे देखें |
+| `SVOD_ORIGIN_DEPTH` | origin rollups path के कितने segments रखें (`origin_depth`); unset या `0` = पूरा path |
 
 ```bash
 # Profile with 20 replays and the default hardware counters.
@@ -158,31 +158,32 @@ SVOD_DEVICE=AMD:0 SVOD_PMC=valu,sqbusy ...
 जाता है। एक कर्नेल की intrinsic cost का robust estimator minimum ही है — यह scheduling jitter, contention,
 और clock-ramp outliers को reject कर देता है जो किसी mean को फुला देते हैं।
 
-## कर्नेल को model code से जोड़ना
+## कर्नेल को model code से जोड़ना {#attributing-kernels-to-model-code}
 
-`r_128_3_32_4_2_2_2_4_4_192_2` जैसा कर्नेल नाम उसकी shape बताता है, यह नहीं कि वह किस layer
-का काम करता है। `SVOD_ORIGIN=1` के साथ हर tensor op वह scope दर्ज करता है जिसके अंदर वह बना —
+`r_128_3_32_4_2_2_2_4_4_192_2` जैसा कर्नेल नाम उसकी shape बताता है, यह नहीं कि वह किस layer का
+काम करता है। `SVOD_ORIGIN=1` के साथ हर tensor op वह scope दर्ज करता है जिसके अंदर वह बना —
 `encoder.layers.3.ffn1` जैसा module path, public op की call site, या ONNX node index — और
-scheduler उनका union हर dispatch पर ले जाता है। सोलह एक जैसी layers अब भी एक ही program
-compile करती हैं; वह सोलह बार, सोलह अलग attributions के साथ dispatch होता है।
+scheduler उस union को हर dispatch तक पहुँचाता है। सोलह एक जैसी layers अब भी एक ही program compile
+करती हैं; वह program सोलह बार dispatch होता है, हर बार अलग attribution के साथ।
 
-Models अपने state-dict paths के साथ scopes खोलते हैं (`OriginScope::module`), ONNX importer हर
-node के लिए एक खोलता है, और stage नाम (`vad`, `encoder`, `ctc_head`) root पर labels हैं।
-हाथ से लिखे `tk` कर्नेल भी बाकी की तरह attribute होते हैं: कर्नेल बनाते समय जो scope सक्रिय है,
-वही उसका origin बन जाता है।
+Models अपने state-dict paths के हिसाब से scopes खोलते हैं (`OriginScope::module`), ONNX importer
+हर node के लिए एक खोलता है, और stage नाम (`vad`, `encoder`, `ctc_head`) root पर labels हैं।
+हाथ से लिखे `tk` कर्नेल भी बाक़ी सबकी तरह ही attribute होते हैं: कर्नेल बनाते समय जो scope सक्रिय
+होता है, वही उसका origin बन जाता है।
 
 जब किसी run में origins हों, `render_table()` दो rollups जोड़ता है:
 
-- **exclusive** हर dispatch को एक बार, उसके primary origin (जिस scope ने stored value बनाई) पर
-  चार्ज करता है, इसलिए rows कुल का बँटवारा हैं;
-- **inclusive** हर dispatch को उसमें fuse हुए हर origin के हर ancestor पर चार्ज करता है, इसलिए
-  parent row अपने children को समेटती है और rows overlap करती हैं।
+- **exclusive** हर dispatch को एक ही बार, उसके primary origin के खाते में डालता है — यानी उस
+  scope के, जिसने stored value बनाई — इसलिए rows मिलकर पूरा कुल बनाती हैं;
+- **inclusive** हर dispatch को उसमें fuse हुए हर origin के हर ancestor के खाते में डालता है,
+  इसलिए parent row अपने children को समेट लेती है और rows overlap करती हैं।
 
-दोनों `origin_depth` segments तक काटे जाते हैं; call frames (`@ add tensor/src/arithmetic.rs:31`)
-कर्नेल rows में detail की तरह रहते हैं और कभी rollup key नहीं बनते। किसी भी scope के बाहर बने
-कर्नेल `<unattributed>` row में जाते हैं। यह depth `RunProfile` पर ही चलती है, इसलिए
-`render_table()`, `Display` और `to_json()` उसी depth पर काटते हैं जिससे profile बना था
-(`SVOD_ORIGIN_DEPTH` समेत); `render_table_at(d)` / `to_json_at(d)` उसे override करते हैं।
+दोनों rollups `origin_depth` segments पर काट दिए जाते हैं; call frames
+(`@ add tensor/src/arithmetic.rs:31`) कर्नेल rows में detail की तरह रहते हैं और कभी rollup key
+नहीं बनते। किसी भी scope के बाहर बने कर्नेल `<unattributed>` row में जा गिरते हैं। यह depth
+`RunProfile` के साथ ही चलती है, इसलिए `render_table()`, `Display` और `to_json()` उसी depth पर
+काटते हैं जिस पर profile बना था (`SVOD_ORIGIN_DEPTH` समेत); `render_table_at(d)` /
+`to_json_at(d)` उसे override कर देते हैं।
 
 ```
 origin rollup (depth 3, exclusive; rows sum to the total):
@@ -191,16 +192,16 @@ origin rollup (depth 3, exclusive; rows sum to the total):
      8.231      3     2743.7    1.9  ctc_head.GigaAmCtcJit.layers.6
 ```
 
-`RunProfile::to_json()` कर्नेल rows — हर एक अपने rendered path के साथ raw `origin_id` /
-`origin_ids` भी रखती है — दोनों rollups, और सिर्फ़ वे arena entries export करता है जहाँ तक वे ids
-पहुँचती हैं, `{ id, parent, frame }` के रूप में; इससे paths offline resolve हो जाते हैं और पूरी
-process arena फ़ाइल में नहीं जाती; `gigaam_infer --profile-json out.json --origin-depth 3` ऐसी
-फ़ाइल लिखता है।
+`RunProfile::to_json()` तीन चीज़ें export करता है: कर्नेल rows — हर row अपने rendered path के साथ
+raw `origin_id` / `origin_ids` भी रखती है — दोनों rollups, और arena की सिर्फ़ वही entries जहाँ तक
+वे ids पहुँचती हैं, `{ id, parent, frame }` के रूप में। इससे paths offline resolve हो जाते हैं
+और पूरी process arena फ़ाइल में embed नहीं होती;
+`gigaam_infer --profile-json out.json --origin-depth 3` ऐसी ही एक फ़ाइल लिखता है।
 
-Capture चालू करने से node identity बदलती है: अलग scopes में बने दो एक जैसे subgraphs अब kernel
-cut से पहले merge नहीं होते। कर्नेल programs पर असर नहीं पड़ता, लेकिन जो helper हर call site पर
-वही expression दोबारा बनाता है, उसे `OriginScope::suspend()` के अंदर चलना चाहिए या अपने inputs
-पहले से materialised लेने चाहिए।
+Capture चालू करने से node identity बदल जाती है: अलग-अलग scopes में बने दो एक जैसे subgraphs अब
+kernel cut से पहले merge नहीं होते। कर्नेल programs पर इसका असर नहीं पड़ता, लेकिन जो helper हर
+call site पर वही expression दोबारा बनाता है, उसे `OriginScope::suspend()` के अंदर चलाएँ, या उसके
+inputs पहले से materialise करके दें।
 
 ---
 

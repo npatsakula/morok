@@ -300,12 +300,11 @@ Call {
 |------|------|------|
 | `name` | `Option<String>` | 可读的 callable 名称 |
 | `grad_tag` | `Option<String>` | 为梯度回调的身份保留 |
-| `origin` | `Option<OriginId>` | 被存储值根节点的 origin —— 该内核记在谁的账上 |
-| `origins` | `OriginSet` | 剥离之前体内可达的每一个 origin |
+| `origin` | `Option<OriginId>` | 所存储值根节点的来源——该内核记在谁的账上 |
+| `origins` | `OriginSet` | 剥除之前体内可达的全部来源 |
 | `precompile` / `precompile_backward` | `bool` | 预编译提示 |
 
-内核的 CALL 正是携带性能分析汇总所读取的归属信息之处；参见
-[内核的性能分析与基准测试](../tile-kernels/profiling.md)。
+一次 dispatch 的归属信息就落在内核 CALL 上，profiler 的汇总正是从这里读取；参见[剖析与基准测试内核](../tile-kernels/profiling.md)。
 
 ### FUNCTION — 可重用的体
 

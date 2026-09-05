@@ -108,12 +108,8 @@ let b = UOp::binary(Add, x.clone(), y.clone());
 assert!(Arc::ptr_eq(&a, &b));  // Same pointer!
 ```
 
-:::note origin 是节点身份的一部分
-在 `SVOD_ORIGIN=1` 下，节点还会携带它被构建时所处的 `OriginScope`，该 origin 会并入它的
-content hash。此时在不同作用域下构建的两个相同子图是*不同*的节点，并且一直不共享，直到
-内核切分剥离 origin 为止。字面量是例外，与 `BUFFER`/`PARAM`/`UNIQUE` 一样：同一个常量由两个
-作用域各自独立构建，因此在它上面带 origin 只会拆开一个切分随后又会合并的节点。相关取舍参见
-[内核的性能分析与基准测试](../tile-kernels/profiling.md)中的“把内核归属到模型代码”一节。
+:::note 来源是节点身份的一部分
+开启 `SVOD_ORIGIN=1` 后，节点还会带上构建时所处的 `OriginScope`，并把它折进自己的内容哈希。于是在不同作用域下构建的两个相同子图成了*不同*的节点，在内核切分剥除来源之前一直不共享。字面量是例外，`BUFFER`/`PARAM`/`UNIQUE` 也一样：同一个常量本就由两个作用域各自独立构建，给它带上来源只会拆出一个切分之后又要合并回去的节点。相关取舍参见[剖析与基准测试内核](../tile-kernels/profiling.md#attributing-kernels-to-model-code)。
 :::
 
 这通过全局缓存实现。构造 UOp 时先检查是否已有相同的：
