@@ -360,7 +360,7 @@ fn identity_ops_never_carry_an_origin() {
     let shape = UOp::new(Op::Stack(ops::Stack { sources: smallvec::smallvec![UOp::index_const(4)] }), DType::Index);
     let arg = ParamArg::buffer(0, DType::Float32, crate::AddrSpace::Global, Some(svod_dtype::DeviceSpec::Cpu));
     let buffer = UOp::new(Op::Buffer(ops::Buffer { shape: shape.clone(), arg: arg.clone().into() }), DType::Float32);
-    let param = UOp::new(Op::Param(ops::Param { shape, arg: arg.into() }), DType::Float32);
+    let param = UOp::new(Op::Param(ops::Param { shape: shape.clone(), arg: arg.into() }), DType::Float32);
     let unique = UOp::new(Op::Unique(7), DType::Void);
     let lunique = UOp::new(Op::LUnique(7), DType::Void);
 
@@ -372,6 +372,31 @@ fn identity_ops_never_carry_an_origin() {
     // identically, so an origin on it would only split a node the kernel cut
     // re-merges (see `origin_opaque`).
     assert_eq!(UOp::const_(DType::Int32, ConstValue::Int(17)).origin(), None);
+    // Shape algebra and bindings are structure, not work: a variable built in two
+    // scopes must stay one variable, and so must the shapes that name it.
+    assert_eq!(shape.origin(), None);
+    let var = UOp::variable("identity.t".into(), 1, 8, DType::WeakInt);
+    assert_eq!(var.origin(), None);
+    assert_eq!(var.bind(UOp::index_const(4)).origin(), None);
+    let scaled = var.try_mul(&UOp::index_const(3)).expect("symbolic product");
+    assert!(matches!(scaled.op(), Op::Binary(..)), "a symbolic product is a real node, not a folded literal");
+    assert_eq!(scaled.origin(), None);
+}
+
+#[test]
+fn a_variable_built_in_two_scopes_is_one_variable() {
+    let _capture = crate::origin::capture_for_thread(true);
+    let build = || UOp::variable("shared.t".into(), 1, 8, DType::WeakInt);
+    let left = {
+        let _scope = OriginScope::module("variable.left");
+        build()
+    };
+    let right = {
+        let _scope = OriginScope::module("variable.right");
+        build()
+    };
+    assert!(Arc::ptr_eq(&left, &right));
+    assert!(Arc::ptr_eq(&left.bind(UOp::index_const(4)), &right.bind(UOp::index_const(4))));
 }
 
 #[test]

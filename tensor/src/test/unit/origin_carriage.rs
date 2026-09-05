@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use svod_ir::origin::{self, Origin, OriginFrame, OriginId};
+use svod_ir::origin::{self, Origin, OriginFrame, OriginId, OriginScope};
 use svod_runtime::execution_plan::ExecutionPlan;
 
 use crate::Tensor;
@@ -300,6 +300,24 @@ fn inlined_function_bodies_keep_their_origins() {
         "the body keeps its origins for the cut:\n{}",
         body.tree()
     );
+}
+
+/// Symbolic dimensions are shape algebra, not work: two modules naming the same
+/// variable share one node and one binding whatever scope they run under.
+#[test]
+fn symbolic_dimensions_are_shared_across_scopes() {
+    let _capture = origin::capture_for_thread(true);
+    let define = |scope: &str| {
+        let _scope = OriginScope::module(scope);
+        let t = crate::Variable::new("carriage.t", 1, 16);
+        let bound = t.bind(8).expect("bind");
+        (t.uop().clone(), bound.uop().clone())
+    };
+    let (left_var, left_bound) = define("symbolic.left");
+    let (right_var, right_bound) = define("symbolic.right");
+    assert!(Arc::ptr_eq(&left_var, &right_var), "one variable, not one per scope");
+    assert!(Arc::ptr_eq(&left_bound, &right_bound), "one binding, not one per scope");
+    assert_eq!(left_bound.origin(), None);
 }
 
 /// A caller-supplied attribution wins; the harvested set still describes the body.

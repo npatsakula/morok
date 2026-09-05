@@ -78,8 +78,26 @@ fn content_hash(op: &Op, dtype: &DType, origin: Option<OriginId>) -> u64 {
 /// beyond code quality: the kernel cut re-merges the split literals with
 /// `without_origins`, so a rewrite the pre-cut passes could not see fires after the
 /// CALL ABI is fixed and drops a PARAM the CALL still binds.
-fn origin_opaque(op: &Op) -> bool {
-    matches!(op, Op::Buffer(..) | Op::Param(..) | Op::Unique(..) | Op::LUnique(..) | Op::Const(..))
+///
+/// Structural nodes join them: shape stacks (a child of every BUFFER and PARAM,
+/// so a variable built in two scopes would otherwise become two variables),
+/// variable bindings, vector constants, and index-typed arithmetic, which is
+/// shape algebra rather than work a kernel performs.
+fn origin_opaque(op: &Op, dtype: &DType) -> bool {
+    matches!(
+        op,
+        Op::Buffer(..)
+            | Op::Param(..)
+            | Op::Unique(..)
+            | Op::LUnique(..)
+            | Op::Const(..)
+            | Op::VConst(..)
+            | Op::Stack(..)
+            | Op::Bind(..)
+            | Op::DefineVar(..)
+            | Op::Noop
+    ) || *dtype == DType::Index
+        || *dtype == DType::WeakInt
 }
 
 /// Table hash: the content hash mixed with the tag, which participates in
@@ -248,7 +266,7 @@ impl UOp {
             }
         }
 
-        let origin = origin.filter(|_| !origin_opaque(&op));
+        let origin = origin.filter(|_| !origin_opaque(&op, &dtype));
         let content_hash = content_hash(&op, &dtype, origin);
         let hash = intern_hash(content_hash, &tag);
         let guard = uops().guard();
