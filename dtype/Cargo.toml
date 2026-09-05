@@ -23,3 +23,6 @@ once_cell = "1.21.4"
 default = ["proptest", "serde"]
 proptest = ["dep:proptest", "dep:proptest-derive"]
 serde = ["dep:serde"]
+
+[dev-dependencies]
+test-case = "3.3.1"

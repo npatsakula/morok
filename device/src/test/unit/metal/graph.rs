@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use svod_dtype::MetalFamily;
 use test_case::test_case;
 
 use super::program::{download, host_ptr, upload, vadd_abi};
@@ -9,13 +10,13 @@ use crate::device::{AbiParamDescriptor, AbiParamKind, Graph, GraphKernel, Progra
 use crate::metal::graph::needs_icb_fix;
 use crate::metal::{MetalAllocator, MetalGraph, MetalProgram};
 
-#[test_case("Apple9", false; "m3 and later")]
-#[test_case("Apple12", false; "future generation")]
-#[test_case("Apple8", true; "m2")]
-#[test_case("Apple7", true; "m1")]
-#[test_case("Mac2", true; "intel or amd")]
-#[test_case("Unknown", true; "unknown family")]
-fn icb_fix_is_applied_before_apple9(family: &str, expected: bool) {
+#[test_case(MetalFamily::Apple(9), false; "m3 and later")]
+#[test_case(MetalFamily::Apple(12), false; "future generation")]
+#[test_case(MetalFamily::Apple(8), true; "m2")]
+#[test_case(MetalFamily::Apple(7), true; "m1")]
+#[test_case(MetalFamily::Mac2, true; "intel or amd")]
+#[test_case(MetalFamily::Unknown, true; "unknown family")]
+fn icb_fix_is_applied_before_apple9(family: MetalFamily, expected: bool) {
     assert_eq!(needs_icb_fix(family), expected);
 }
 

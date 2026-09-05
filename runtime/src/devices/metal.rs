@@ -22,7 +22,7 @@ use svod_device::metal::compile::{
 };
 use svod_device::metal::{MetalDevice, MetalGraph, MetalProgram};
 use svod_device::registry::DeviceRegistry;
-use svod_dtype::DeviceSpec;
+use svod_dtype::{DeviceSpec, GpuArch, MetalFamily};
 use svod_ir::UOp;
 
 use crate::object_cache::{CompilerIdentity, OBJECT_CACHE_SCHEMA, ObjectCache, ObjectCacheKey};
@@ -91,7 +91,7 @@ pub fn create_metal_codegen(device_id: usize) -> Result<(Arc<dyn Renderer>, Arc<
         object_format: "metallib-or-msl-v1".into(),
     };
     let cache_key = identity.cache_key();
-    let renderer = Arc::new(MetalRendererWrapper { device: spec });
+    let renderer = Arc::new(MetalRendererWrapper { device: spec, family: dev.family() });
     let compiler = Arc::new(MetalCompiler { dev, cache, params, identity, cache_key });
     Ok((renderer, compiler))
 }
@@ -111,6 +111,7 @@ fn metal_modules_cache_dir(cache: Option<&ObjectCache>) -> PathBuf {
 
 struct MetalRendererWrapper {
     device: DeviceSpec,
+    family: MetalFamily,
 }
 
 impl Renderer for MetalRendererWrapper {
@@ -128,6 +129,10 @@ impl Renderer for MetalRendererWrapper {
 
     fn device(&self) -> &DeviceSpec {
         &self.device
+    }
+
+    fn gpu_arch(&self) -> Option<GpuArch> {
+        Some(GpuArch::Metal(self.family))
     }
 
     fn supported_ops(&self) -> svod_ir::RendererOps {

@@ -60,19 +60,9 @@ pub(crate) const MTL_RESOURCE_USAGE_READ_WRITE: NSUInteger = 1 | 2;
 pub(crate) const MTL_PIPELINE_OPTION_NONE: NSUInteger = 0;
 pub(crate) const MTL_COMMAND_BUFFER_STATUS_COMPLETED: NSUInteger = 4;
 pub(crate) const MTL_MATH_MODE_SAFE: NSInteger = 0;
-/// `MTLGPUFamilyApple1..Apple9`, highest first.
-pub(crate) const MTL_GPU_FAMILY_APPLE: [(NSInteger, &str); 9] = [
-    (1009, "Apple9"),
-    (1008, "Apple8"),
-    (1007, "Apple7"),
-    (1006, "Apple6"),
-    (1005, "Apple5"),
-    (1004, "Apple4"),
-    (1003, "Apple3"),
-    (1002, "Apple2"),
-    (1001, "Apple1"),
-];
-pub(crate) const MTL_GPU_FAMILY_MAC2: (NSInteger, &str) = (2002, "Mac2");
+/// `MTLGPUFamilyAppleN == 1000 + N`; `MTLGPUFamilyMac2`.
+pub(crate) const MTL_GPU_FAMILY_APPLE_BASE: NSInteger = 1000;
+pub(crate) const MTL_GPU_FAMILY_MAC2: NSInteger = 2002;
 
 const LIBOBJC: &str = "/usr/lib/libobjc.A.dylib";
 const LIBSYSTEM: &str = "/usr/lib/libSystem.B.dylib";

@@ -7,13 +7,18 @@ use std::sync::{Arc, LazyLock, OnceLock};
 
 use parking_lot::Mutex;
 
+use svod_dtype::MetalFamily;
+
 use super::objc::{
-    AutoreleasePool, Id, MTL_COMMAND_BUFFER_STATUS_COMPLETED, MTL_GPU_FAMILY_APPLE, MTL_GPU_FAMILY_MAC2, NSInteger,
-    NSUInteger, Objc, ObjcBool, ObjcId, ns_error_message, ns_string_to_string, objc,
+    AutoreleasePool, Id, MTL_COMMAND_BUFFER_STATUS_COMPLETED, MTL_GPU_FAMILY_APPLE_BASE, MTL_GPU_FAMILY_MAC2,
+    NSInteger, NSUInteger, Objc, ObjcBool, ObjcId, ns_error_message, ns_string_to_string, objc,
 };
 use crate::{Error, Result};
 
 const COMMAND_QUEUE_DEPTH: NSUInteger = 1024;
+/// Newest Apple GPU generation probed with `supportsFamily:`; unknown values
+/// simply answer NO, so this only needs to stay ahead of shipping hardware.
+const NEWEST_APPLE_GENERATION: u8 = 12;
 
 static DEVICE_CACHE: LazyLock<Mutex<HashMap<usize, Arc<MetalDevice>>>> = LazyLock::new(Default::default);
 static HAS_DEVICES: OnceLock<bool> = OnceLock::new();
@@ -78,7 +83,7 @@ pub struct MetalDevice {
     mtl: ObjcId,
     queue: ObjcId,
     name: String,
-    family: String,
+    family: MetalFamily,
     /// Committed, possibly unfinished command buffers; drained by [`Self::synchronize`].
     in_flight: Mutex<Vec<ObjcId>>,
     /// `contents` base → (MTLBuffer, allocated length).
@@ -133,13 +138,12 @@ impl MetalDevice {
             // SAFETY: `supportsFamily:` takes NSInteger and returns BOOL.
             unsafe { objc.send1::<NSInteger, ObjcBool>(mtl.as_raw(), sels.supports_family, family) != 0 }
         };
-        let family = MTL_GPU_FAMILY_APPLE
-            .iter()
-            .chain(std::iter::once(&MTL_GPU_FAMILY_MAC2))
-            .find(|(family, _)| supports(*family))
-            .map_or("Unknown", |(_, label)| label)
-            .to_string();
-        tracing::info!(device_id, name, family, "opened Metal device");
+        let family = (1..=NEWEST_APPLE_GENERATION)
+            .rev()
+            .find(|generation| supports(MTL_GPU_FAMILY_APPLE_BASE + NSInteger::from(*generation)))
+            .map(MetalFamily::Apple)
+            .unwrap_or(if supports(MTL_GPU_FAMILY_MAC2) { MetalFamily::Mac2 } else { MetalFamily::Unknown });
+        tracing::info!(device_id, name, %family, "opened Metal device");
         Ok(Self {
             objc,
             device_id,
@@ -156,9 +160,9 @@ impl MetalDevice {
         self.device_id
     }
 
-    /// `MTLGPUFamily` label such as `Apple9` or `Mac2`.
-    pub fn family(&self) -> &str {
-        &self.family
+    /// The highest `MTLGPUFamily` the GPU supports.
+    pub fn family(&self) -> MetalFamily {
+        self.family
     }
 
     pub fn name(&self) -> &str {

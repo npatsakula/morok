@@ -128,3 +128,20 @@ fn test_local_max_axes_match_renderer_capabilities() {
     assert_eq!(Renderer::cpu().local_max_axes(), None);
     assert_eq!(Renderer::metal().local_max_axes(), None);
 }
+
+/// Tensor cores follow the Apple GPU family: none below Apple7 or on Intel-Mac
+/// GPUs, and the family is part of the profile's identity.
+#[test]
+fn test_metal_profile_follows_gpu_family() {
+    use svod_dtype::MetalFamily;
+    let m4 = Renderer::for_metal_family(MetalFamily::Apple(9));
+    assert_eq!(m4.tensor_cores.len(), Renderer::metal().tensor_cores.len());
+    let m1 = Renderer::for_metal_family(MetalFamily::Apple(7));
+    assert_eq!(m1.tensor_cores.len(), 5);
+    for family in [MetalFamily::Apple(6), MetalFamily::Mac2, MetalFamily::Unknown] {
+        assert!(Renderer::for_metal_family(family).tensor_cores.is_empty(), "{family}");
+    }
+    assert_ne!(m4.cache_fingerprint(), m1.cache_fingerprint());
+    assert_ne!(m4.cache_fingerprint(), Renderer::metal().cache_fingerprint());
+    assert_eq!(Renderer::for_metal_family(MetalFamily::Apple(9)).cache_fingerprint(), m4.cache_fingerprint());
+}

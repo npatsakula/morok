@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use svod_dtype::MetalFamily;
 
 use super::device::MetalDevice;
 use super::objc::{
@@ -28,11 +29,8 @@ const MAX_ICB_OFFSET: NSUInteger = u32::MAX as NSUInteger;
 /// Before Apple9 (M3) the driver faults unless every pipeline the indirect
 /// command buffer references was also used by the encoder itself; an empty
 /// dispatch per pipeline is the known workaround (tinygrad's `FIX_METAL_ICB`).
-pub(crate) fn needs_icb_fix(family: &str) -> bool {
-    family
-        .strip_prefix("Apple")
-        .and_then(|generation| generation.parse::<u32>().ok())
-        .is_none_or(|generation| generation < 9)
+pub(crate) fn needs_icb_fix(family: MetalFamily) -> bool {
+    !matches!(family, MetalFamily::Apple(generation) if generation >= 9)
 }
 
 struct CapturedKernel {

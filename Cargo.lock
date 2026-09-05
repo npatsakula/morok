@@ -3465,6 +3465,7 @@ dependencies = [
  "proptest-derive",
  "serde",
  "strum 0.27.2",
+ "test-case",
 ]
 
 [[package]]

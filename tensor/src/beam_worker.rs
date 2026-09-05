@@ -146,7 +146,11 @@ fn worker_codegen(init: &WorkerInit) -> Result<WorkerCodegen> {
                 },
             )?
         }
-        DeviceSpec::Metal { .. } => svod_schedule::OptimizerRenderer::metal(),
+        DeviceSpec::Metal { .. } => init
+            .gpu_arch
+            .and_then(GpuArch::metal)
+            .map(svod_schedule::OptimizerRenderer::for_metal_family)
+            .unwrap_or_else(svod_schedule::OptimizerRenderer::metal),
         _ => {
             return Err(BeamWorker::HelperUnavailable {
                 reason: format!("{:?} has no BEAM optimizer profile", init.device),
