@@ -100,3 +100,31 @@ fn vector_f64_becomes_vector_f32() {
     assert!(!has_dtype(&demoted, ScalarDType::Float64), "{}", demoted.tree());
     assert!(demoted.toposort().iter().any(|node| node.dtype() == DType::Float32.vec(2).unwrap()), "{}", demoted.tree());
 }
+
+/// A gated load from f64 storage keeps its `alt` in f64: the load's dtype is
+/// pinned by its address and a demoted `alt` would make the node ill-formed.
+#[test]
+fn gated_external_load_keeps_its_alt_dtype() {
+    let input = UOp::param(1, 4, DType::Float64, None);
+    let zero = UOp::const_(DType::Float64, ConstValue::Float(0.0));
+    let gate = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let load = UOp::new(
+        Op::Load(svod_ir::ops::Load { index: element(input, 0), alt: Some(zero.clone()), gate: Some(gate) }),
+        DType::Float64,
+    );
+    // The same constant also feeds internal math, which still runs in f32.
+    let internal = zero.try_add(&UOp::const_(DType::Float64, ConstValue::Float(1.0))).unwrap();
+    let value = load.try_add(&internal).unwrap().cast(DType::Float32);
+    let sink = UOp::sink(vec![element(UOp::param(0, 4, DType::Float32, None), 0).store(value)]);
+
+    let demoted = demote_unsupported_floats(sink, &Renderer::metal());
+    let nodes = demoted.toposort();
+    let load = nodes.iter().find(|node| matches!(node.op(), Op::Load(..))).expect("load survives");
+    let Op::Load(svod_ir::ops::Load { alt: Some(alt), .. }) = load.op() else { unreachable!() };
+    assert_eq!((load.dtype(), alt.dtype()), (DType::Float64, DType::Float64), "{}", demoted.tree());
+    let add = nodes
+        .iter()
+        .find(|node| matches!(node.op(), Op::Binary(svod_ir::BinaryOp::Add, ..)) && node.dtype() == DType::Float32)
+        .expect("internal add runs in f32");
+    assert!(add.op().sources().iter().all(|source| source.dtype() == DType::Float32), "{}", demoted.tree());
+}

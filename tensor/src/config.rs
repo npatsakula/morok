@@ -145,6 +145,21 @@ impl PrepareConfig {
     }
 }
 
+/// Whether a device family can hold buffers of `dtype`, per its optimizer
+/// profile (Metal and WebGPU have no `double`). Family-level: arch-specific
+/// refinements (AMD fp8 variants) need the opened device's renderer.
+pub fn device_supports_storage_dtype(spec: &DeviceSpec, dtype: svod_dtype::ScalarDType) -> bool {
+    use svod_schedule::OptimizerRenderer;
+    let profile = match spec {
+        DeviceSpec::Cpu | DeviceSpec::Disk { .. } => OptimizerRenderer::cpu(),
+        DeviceSpec::Cuda { .. } => OptimizerRenderer::cuda(),
+        DeviceSpec::Amd { .. } => OptimizerRenderer::amd_rdna3(),
+        DeviceSpec::Metal { .. } => OptimizerRenderer::metal(),
+        DeviceSpec::WebGpu => OptimizerRenderer::webgpu(),
+    };
+    profile.supports_storage_dtype(dtype)
+}
+
 /// Detect a supported AMD GPU on this host. Returns the gfx-family arch of
 /// device 0 when (a) `/dev/kfd` exists, (b) KFD topology has a GPU node, and
 /// (c) the gfx target maps to one of `AmdArch`'s supported families

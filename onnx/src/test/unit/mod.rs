@@ -10,5 +10,6 @@ mod origin;
 #[allow(clippy::field_reassign_with_default)]
 mod proto;
 mod reduce;
+mod resize;
 mod shape;
 mod slice;

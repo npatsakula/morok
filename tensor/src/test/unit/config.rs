@@ -28,3 +28,15 @@ fn resolve_device_separates_backends() {
     assert!(!Arc::ptr_eq(&clang, &llvm));
     assert_ne!(clang.compiler.cache_key(), llvm.compiler.cache_key());
 }
+
+#[test]
+fn storage_dtype_support_follows_the_device_family() {
+    use svod_dtype::{DeviceSpec, ScalarDType};
+    for spec in [DeviceSpec::Cpu, DeviceSpec::Amd { device_id: 0 }, DeviceSpec::Cuda { device_id: 0 }] {
+        assert!(device_supports_storage_dtype(&spec, ScalarDType::Float64), "{spec:?}");
+    }
+    for spec in [DeviceSpec::Metal { device_id: 0 }, DeviceSpec::WebGpu] {
+        assert!(!device_supports_storage_dtype(&spec, ScalarDType::Float64), "{spec:?}");
+        assert!(device_supports_storage_dtype(&spec, ScalarDType::Float32), "{spec:?}");
+    }
+}

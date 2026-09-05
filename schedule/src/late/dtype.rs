@@ -9,11 +9,12 @@
 //! belongs to the host, and the renderer reports it as unsupported, exactly as
 //! tinygrad's Metal renderer does.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use svod_dtype::{AddrSpace, DType, ScalarDType};
 use svod_ir::pattern::{Matcher, RewriteResult};
-use svod_ir::{Op, UOp, ops};
+use svod_ir::{Op, UOp, UOpKey, ops};
 
 use crate::graph_rewrite;
 use crate::optimizer::Renderer;
@@ -23,17 +24,37 @@ pub fn demote_unsupported_floats(sink: Arc<UOp>, renderer: &Renderer) -> Arc<UOp
     if renderer.supports_alu_dtype(ScalarDType::Float64) {
         return sink;
     }
-    graph_rewrite(&DemoteFloat { from: ScalarDType::Float64, to: ScalarDType::Float32 }, sink, &mut ())
+    graph_rewrite(&DemoteFloat::for_sink(ScalarDType::Float64, ScalarDType::Float32, &sink), sink, &mut ())
 }
 
 /// Rewrites values of scalar dtype `from` to compute in `to`. Applied with
 /// [`graph_rewrite`], so every node sees already-demoted children.
 pub struct DemoteFloat {
-    pub from: ScalarDType,
-    pub to: ScalarDType,
+    from: ScalarDType,
+    to: ScalarDType,
+    /// `alt` values of gated loads from external storage: a load's dtype is
+    /// fixed by its address, and the rewrite engine rebuilds the load from its
+    /// children before this matcher sees it, so those children must not move.
+    keep: HashSet<UOpKey>,
 }
 
 impl DemoteFloat {
+    pub fn for_sink(from: ScalarDType, to: ScalarDType, sink: &Arc<UOp>) -> Self {
+        let keep = sink
+            .toposort()
+            .into_iter()
+            .filter_map(|node| match node.op() {
+                Op::Load(ops::Load { index, alt: Some(alt), .. })
+                    if index.addrspace() == Some(AddrSpace::Global) && alt.dtype().base() == from =>
+                {
+                    Some(UOpKey(alt.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        Self { from, to, keep }
+    }
+
     fn target(&self, dtype: &DType) -> Option<DType> {
         match dtype {
             DType::Scalar(scalar) if *scalar == self.from => Some(DType::Scalar(self.to)),
@@ -44,9 +65,9 @@ impl DemoteFloat {
 
     fn demote(&self, node: &Arc<UOp>) -> Option<Arc<UOp>> {
         let target = self.target(&node.dtype())?;
-        // External storage keeps its layout: PARAMs, their addresses, and
-        // loads through them stay in the wide dtype.
-        if node.addrspace() == Some(AddrSpace::Global) {
+        // External storage keeps its layout: PARAMs, their addresses, loads
+        // through them and those loads' `alt` values stay in the wide dtype.
+        if node.addrspace() == Some(AddrSpace::Global) || self.keep.contains(&UOpKey(node.clone())) {
             return None;
         }
         match node.op() {

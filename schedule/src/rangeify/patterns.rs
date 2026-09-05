@@ -98,9 +98,12 @@ fn copy_needs_contiguous(src: &Arc<UOp>) -> bool {
     }
 }
 
-/// Check if operation is elementwise (Binary or Ternary).
+/// Whether an op is elementwise, i.e. tinygrad's `GroupOp.Elementwise`
+/// (`uop/__init__.py:112`): ALU plus the two casts. A source that is elementwise
+/// can be split off into its own kernel without changing what it computes, which
+/// is what buffer-limit enforcement relies on.
 pub fn is_elementwise(uop: &Arc<UOp>) -> bool {
-    matches!(uop.op(), Op::Binary(..) | Op::Ternary(..))
+    matches!(uop.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast(..) | Op::BitCast(..))
 }
 
 // ============================================================================
@@ -1158,7 +1161,14 @@ fn check_buffer_limit(
     None
 }
 
-/// Collect all accessed buffers from sources.
+/// Distinct kernel arguments the sources would read.
+///
+/// Mirrors tinygrad's `_limit_bufs` visitor (`schedule/rangeify.py:176`): STAGE,
+/// AFTER, PARAM, MSELECT and MSTACK each cost exactly one argument and stop the
+/// walk. Morok additionally sees pre-normalization BUFFER nodes, and skips
+/// LOCAL/REG storage, which is compiler-managed and never consumes an argument
+/// slot. Only GLOBAL STAGEs are realize boundaries here; a LOCAL/REG one is
+/// materialised inside the kernel, so its own reads are what cost arguments.
 fn collect_accessed_buffers(sources: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
     let mut all_buffers = Vec::new();
     let mut visited = HashSet::new();
@@ -1169,12 +1179,25 @@ fn collect_accessed_buffers(sources: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
             return;
         }
         match uop.op() {
+            // AFTER is a buffer identity: it costs its own buffer, once, and the
+            // producers it orders against are not read by this kernel.
+            Op::After(..) => {
+                buffers.push(uop.buf_uop());
+                return;
+            }
             Op::Stage(ops::Stage { opts, .. }) if opts.addrspace == AddrSpace::Global => {
                 buffers.push(Arc::clone(uop));
                 return; // Stop at GLOBAL stage
             }
-            Op::Buffer(..) | Op::MStack(..) | Op::MSelect(..) => {
+            Op::MStack(..) | Op::MSelect(..) => {
                 buffers.push(Arc::clone(uop));
+                return;
+            }
+            Op::Buffer(..) | Op::Param(..) => {
+                if !matches!(storage_addrspace(uop), Some(AddrSpace::Local | AddrSpace::Reg)) {
+                    buffers.push(Arc::clone(uop));
+                }
+                return;
             }
             _ => {}
         }
@@ -1194,8 +1217,16 @@ fn collect_accessed_buffers(sources: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
 }
 
 /// Force bufferization of a computation to GLOBAL memory.
+///
+/// The new STAGE's axes are the ranges still *open* at `src` — tinygrad's
+/// `s.ranges` (`uop/ops.py:483`), which drops whatever a nested STAGE, REDUCE or
+/// END already closed. `UOp::ranges()` is the wider "every RANGE in the cone",
+/// so it must be filtered through `in_scope_ranges()`: an already-closed range
+/// is not an axis of this value, and rewriting it would rebuild every producer
+/// that binds it — the copies compound through a chain of bufferized kernels.
 fn force_bufferize(src: &Arc<UOp>, ctx: &mut IndexingContext) -> Arc<UOp> {
-    let original_ranges = src.ranges().clone();
+    let scope = src.in_scope_ranges();
+    let original_ranges: Vec<_> = src.ranges().into_iter().filter(|range| scope.contains(&range.id)).collect();
     if original_ranges.is_empty() {
         return Arc::clone(src);
     }
