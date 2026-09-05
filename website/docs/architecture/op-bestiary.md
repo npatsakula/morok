@@ -290,7 +290,7 @@ arguments, and a `Program` carries the body through the strict
 Call {
     body: Arc<UOp>,                     // FUNCTION (or its body)
     args: SmallVec<[Arc<UOp>; 4]>,      // concrete argument values
-    info: CallInfo,                     // metadata (name, grad_tag, ...)
+    info: CallInfo,                     // annotations (name, origin, ...)
 }
 ```
 
@@ -303,8 +303,12 @@ operations in `args` (range_start_index = 1; `body=0`, `args=1+`).
 |-------|------|---------|
 | `name` | `Option<String>` | Human-readable callable name |
 | `grad_tag` | `Option<String>` | Reserved for gradient-callback identity |
-| `metadata` | `Vec<String>` | Stable, hashable annotations |
+| `origin` | `Option<OriginId>` | Origin of the stored value's root — what the kernel is charged to |
+| `origins` | `OriginSet` | Every origin reachable in the body before it was stripped |
 | `precompile` / `precompile_backward` | `bool` | Eager-compile hints |
+
+The kernel CALL is where a dispatch keeps the attribution the profiler rollups read; see
+[Profiling and benchmarking kernels](../tile-kernels/profiling.md).
 
 ### FUNCTION — Reusable Body
 

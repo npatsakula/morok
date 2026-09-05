@@ -16,7 +16,7 @@ use crate::{
     CustomFunctionKind, InsArg, KernelInfo, Op, ParamArg, ReduceOp, TernaryOp, UOp, UnaryOp, WmmaMetadata,
 };
 
-pub const OPTIMIZER_WIRE_SCHEMA_VERSION: u32 = 2;
+pub const OPTIMIZER_WIRE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptimizerWireGraph {
@@ -29,6 +29,9 @@ pub struct OptimizerWireGraph {
 pub struct OptimizerWireNode {
     pub dtype: DType,
     pub tag: Option<SmallVec<[usize; 2]>>,
+    /// Raw [`crate::origin::OriginId`]. Ids are process-local, so a decoded graph
+    /// reproduces the encoder's content hashes but resolves paths only in-process.
+    pub origin: Option<u32>,
     pub content_hash: u64,
     pub op: OptimizerWireOp,
     pub src: Vec<usize>,
@@ -144,6 +147,7 @@ impl OptimizerWireGraph {
                 Ok(OptimizerWireNode {
                     dtype: node.dtype(),
                     tag: node.tag().clone(),
+                    origin: node.origin().map(crate::origin::OriginId::get),
                     content_hash: node.content_hash,
                     op: OptimizerWireOp::from_op(node.op())?,
                     src: node.op().children().iter().map(|child| ids[&child.id]).collect(),
@@ -173,7 +177,8 @@ impl OptimizerWireGraph {
                 }
                 src.push(decoded[source].clone());
             }
-            let rebuilt = UOp::new_tagged(node.op.to_op(src)?, node.dtype.clone(), node.tag.clone());
+            let origin = node.origin.and_then(crate::origin::OriginId::from_raw);
+            let rebuilt = UOp::new_with_origin(node.op.to_op(src)?, node.dtype.clone(), node.tag.clone(), origin);
             if rebuilt.content_hash != node.content_hash {
                 return Err(wire_error(format!(
                     "node {index} content hash changed during reconstruction: encoded={}, decoded={}",

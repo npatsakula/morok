@@ -104,7 +104,7 @@ fn resolve_single_function(function: &Arc<UOp>) -> svod_ir::Result<Option<Arc<UO
     // substitutions are single-pass so actual argument graphs are not treated
     // as part of the callable implementation.
     let subs = svod_ir::shape::function_param_substitutions(body, args)?;
-    let resolved = body.substitute_walk_preserve_calls(&subs).rtag(function.tag().clone());
+    let resolved = body.substitute_walk_preserve_calls(&subs).rtag(function.tag().clone()).rorigin(function.origin());
     Ok(Some(resolved))
 }
 
@@ -234,6 +234,11 @@ pub struct RangeifyResult {
 /// **Stage 6**: apply_opts - Post-range optimization (happens in optimizer)
 #[tracing::instrument(skip_all)]
 pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
+    // Scheduling is not part of any caller's scope: a graph realized inside one must
+    // not stamp that scope onto the compiler artifacts this pipeline mints. Node
+    // attribution already sits on the graph and is carried forward explicitly.
+    let _detached = svod_ir::origin::OriginScope::suspend();
+
     // Resolve the exact hardware-independent multi subset before tags capture
     // tensor identity and before range assignment can materialize its sources.
     let t_stage = std::time::Instant::now();
@@ -780,7 +785,9 @@ pub(crate) fn transform_single_source(
 
         // tag=s.tag if GLOBAL, else None.
         let buf_tag = if addrspace == AddrSpace::Global { src.tag().clone() } else { None };
-        let bufferized = UOp::stage(Arc::clone(src), closed_ranges.clone(), opts);
+        // The tag is the tensor-output identity and only GLOBAL stages keep it; the
+        // origin is attribution and always belongs to the computation being staged.
+        let bufferized = UOp::stage(Arc::clone(src), closed_ranges.clone(), opts).rorigin(src.origin());
         let bufferized = if let Some(t) = buf_tag { bufferized.with_tag(t) } else { bufferized };
 
         let index_ranges: Vec<_> = input_ranges
@@ -939,6 +946,11 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut RangeifyBufferConte
         _ => return None,
     };
 
+    // The STAGE is the last node that knows which computation this buffer serves;
+    // the BUFFER itself is origin-opaque, so the STORE/END/AFTER chain carries the
+    // attribution forward to the kernel cut (copy- and alias-only kernels included).
+    let origin = bufferize_op.origin().or_else(|| compute.origin());
+
     // Calculate size and base dtype upfront.
     let size = calculate_size_from_ranges(ranges);
     let base_dtype = match bufferize_op.dtype() {
@@ -984,10 +996,10 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut RangeifyBufferConte
                 }
             }
             let combined = sort_ranges_by_axis_id(&combined);
-            ended_stores.push(store_target.store_value(value.clone()).end(combined));
+            ended_stores.push(store_target.store_value(value.clone()).end(combined).rorigin(origin));
         }
 
-        let result = if ended_stores.is_empty() { buf } else { buf.after(ended_stores) };
+        let result = if ended_stores.is_empty() { buf } else { buf.after(ended_stores).rorigin(origin) };
         ctx.map_buffer(bufferize_op.clone(), result.clone());
         return Some(result);
     }
@@ -1046,16 +1058,16 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut RangeifyBufferConte
     // 3. For scalar stores (e.g., REDUCE results), no END wrapping (ranges is empty)
     // 4. REDUCE's loop is handled by pm_reduce which creates its own END internally
     // NOTE: STORE takes (index, value) - buffer is accessed via index.buffer
-    let store = store_target.store_value(compute.clone());
+    let store = store_target.store_value(compute.clone()).rorigin(origin);
 
     // Determine END ranges: use only actual RANGE ops from STAGE.
     // CONST(0) entries are excluded because `.ranges` only collects RANGE UOps.
     // END should only wrap with actual iteration ranges, not collapsed singletons.
     let end_ranges: SmallVec<[Arc<UOp>; 4]> = sorted_ranges.clone();
 
-    let do_store = if !end_ranges.is_empty() { store.end(end_ranges) } else { store };
+    let do_store = if !end_ranges.is_empty() { store.end(end_ranges).rorigin(origin) } else { store };
 
-    let result = buffer.after(SmallVec::from_elem(do_store, 1));
+    let result = buffer.after(SmallVec::from_elem(do_store, 1)).rorigin(origin);
     ctx.map_buffer(bufferize_op.clone(), result.clone());
 
     Some(result)
@@ -1664,7 +1676,7 @@ fn strip_reshape_on_callable_sources(callable: &Arc<UOp>) -> Option<Arc<UOp>> {
     if !changed {
         return None;
     }
-    Some(body.call(rewritten, info.clone()).rtag(callable.tag().clone()))
+    Some(body.call(rewritten, info.clone()).rtag(callable.tag().clone()).rorigin(callable.origin()))
 }
 
 /// Create pattern matcher for adding buffers (STAGE → STORE conversion).

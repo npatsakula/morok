@@ -24,7 +24,9 @@ impl Linear {
     /// Create a linear layer with deterministic initialization using `sin()`.
     ///
     /// Weight shape: `[out_features, in_features]`, bias: zeros.
+    #[track_caller]
     pub fn with_dims(in_features: usize, out_features: usize, dtype: DType) -> Self {
+        origin_call!("Linear::with_dims");
         let weight_data: Vec<f32> = (0..in_features * out_features).map(|i| ((i as f32) * 0.1).sin() * 0.1).collect();
         let weight = Tensor::from_slice(&weight_data)
             .try_reshape([out_features as isize, in_features as isize])

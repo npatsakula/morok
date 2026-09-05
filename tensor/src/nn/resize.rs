@@ -65,6 +65,7 @@ impl Tensor {
     // Tinygrad onnx.py:789-890
     #[builder]
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn resize(
         &self,
         scales: Option<&[f64]>,
@@ -80,6 +81,7 @@ impl Tensor {
         roi: Option<&[f64]>,
         #[builder(default = 0.0)] extrapolation_value: f64,
     ) -> Result<Tensor> {
+        origin_call!("resize");
         let ndim = self.ndim()?;
         let _shape = self.shape()?;
 

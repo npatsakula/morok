@@ -113,10 +113,11 @@ pub struct ProfileOptions {
     pub iters: u32,             // replays; the per-kernel minimum device time is kept
     pub static_analysis: bool,  // Tier 2/3 (flops/bytes/resources) — cheap, on by default
     pub counters: PmcSelection, // Tier 4 hardware counters
+    pub origin_depth: Option<usize>, // origin rollup depth; None keeps the full path
 }
 ```
 
-`ProfileOptions::default()` is `{ iters: 1, static_analysis: true, counters: PmcSelection::None }`
+`ProfileOptions::default()` is `{ iters: 1, static_analysis: true, counters: PmcSelection::None, origin_depth: None }`
 — Tiers 1–3, single pass. Construct it directly for explicit control:
 
 ```rust
@@ -126,6 +127,7 @@ let opts = ProfileOptions {
     iters: 50,
     static_analysis: true,
     counters: PmcSelection::Default, // add Tier 4
+    origin_depth: Some(3), // roll the origin rows up to three frames
 };
 ```
 
@@ -138,6 +140,8 @@ let opts = ProfileOptions {
 |---------|--------|
 | `SVOD_PROFILE_ITERS` | replay count for the min-merge (clamped to at least 1) |
 | `SVOD_PMC` | Tier-4 selection: empty or `0` → off; `1` → the default counter set; otherwise a comma-separated token list (`sqbusy`, `waves`, `valu`) |
+| `SVOD_ORIGIN` | `1` records the scope every op is built under (module path, call site, ONNX node), see below |
+| `SVOD_ORIGIN_DEPTH` | path segments the origin rollups keep (`origin_depth`); unset — or `0` — keeps the full path |
 
 ```bash
 # Profile with 20 replays and the default hardware counters.
@@ -154,6 +158,49 @@ pass produces a `RunProfile`, and passes are merged by `RunProfile::merge_min`: 
 faster (minimum device-time) sample wins, carrying *that* sample's counters and static analysis.
 Minimum is the robust estimator of a kernel's intrinsic cost — it rejects the scheduling jitter,
 contention, and clock-ramp outliers that inflate a mean.
+
+## Attributing kernels to model code
+
+A kernel name like `r_128_3_32_4_2_2_2_4_4_192_2` says what shape the kernel has, not which
+layer it serves. With `SVOD_ORIGIN=1` every tensor op records the scope it was built under —
+a module path such as `encoder.layers.3.ffn1`, the call site of the public op, or the ONNX
+node index — and the scheduler carries the union onto each dispatch. Sixteen identical layers
+still compile one program; they dispatch it sixteen times with sixteen attributions.
+
+Models open scopes along their state-dict paths (`OriginScope::module`), the ONNX importer
+opens one per node, and stage names (`vad`, `encoder`, `ctc_head`) are labels at the root.
+Hand-written `tk` kernels are attributed like any other: the scope active when the kernel is
+built becomes its origin.
+
+When a run carries origins, `render_table()` appends two rollups:
+
+- **exclusive** charges each dispatch once, to its primary origin (the scope that produced
+  the stored value), so rows partition the total;
+- **inclusive** charges each dispatch to every ancestor of every origin fused into it, so a
+  parent row contains its children and rows overlap.
+
+Both are cut to `origin_depth` segments; call frames (`@ add tensor/src/arithmetic.rs:31`)
+stay as detail on the kernel rows and never form rollup keys. Kernels built outside any
+scope land on a `<unattributed>` row. The depth travels on the `RunProfile`, so
+`render_table()`, `Display` and `to_json()` cut at the depth the profile was produced with
+(`SVOD_ORIGIN_DEPTH` included); `render_table_at(d)` / `to_json_at(d)` override it.
+
+```
+origin rollup (depth 3, exclusive; rows sum to the total):
+  total ms  count    mean µs      %  origin path
+    23.045      2    11522.6    5.3  ctc_head.GigaAmCtcJit.subsampling
+     8.231      3     2743.7    1.9  ctc_head.GigaAmCtcJit.layers.6
+```
+
+`RunProfile::to_json()` exports the kernel rows — each carrying the raw `origin_id` /
+`origin_ids` beside its rendered path — both rollups, and only the arena entries those ids
+reach, as `{ id, parent, frame }`, so paths resolve offline without embedding the whole
+process arena; `gigaam_infer --profile-json out.json --origin-depth 3` writes one.
+
+Turning capture on changes node identity: two identical subgraphs built under different
+scopes no longer merge before the kernel cut. Kernel programs are unaffected, but a helper
+that rebuilds the same expression per call site should run under `OriginScope::suspend()`
+or hand its inputs over already materialised.
 
 ---
 

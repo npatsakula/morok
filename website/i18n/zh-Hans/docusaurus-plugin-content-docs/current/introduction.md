@@ -14,7 +14,7 @@ Svod 是一个基于 Rust 的 ML 编译器，灵感来自 [Tinygrad](https://git
 |---------|-------------|
 | **声明式优化** | `patterns!` DSL 实现图重写，通过 Z3 验证正确性 |
 | **惰性求值** | Tensor 构建计算图，仅在 `realize()` 时编译执行 |
-| **溯源追踪** | `#[track_caller]` 将每个 UOp 追溯到源码位置 |
+| **来源追踪** | 作用域把每个内核归属到模块路径、调用点或 ONNX 节点 |
 | **80+ IR 操作** | 算术、内存、控制流、WMMA tensor core |
 | **20+ 优化** | 常量折叠、tensor core、向量化、循环展开 |
 
@@ -26,7 +26,7 @@ Svod 是一个基于 Rust 的 ML 编译器，灵感来自 [Tinygrad](https://git
 |-------|-------------|
 | [dtype](https://github.com/npatsakula/svod/tree/main/dtype/) | 类型系统：标量、向量、指针、图像 |
 | [macros](https://github.com/npatsakula/svod/tree/main/macros/) | 过程宏（`patterns!` DSL） |
-| [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp 图 IR：80+ 操作、符号整数、溯源 |
+| [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp 图 IR：80+ 操作、符号整数、内核来源 |
 | [device](https://github.com/npatsakula/svod/tree/main/device/) | 缓冲区管理：惰性分配、零拷贝视图、LRU 缓存 |
 | [schedule](https://github.com/npatsakula/svod/tree/main/schedule/) | 优化引擎：20+ 趟、RANGEIFY、Z3 验证 |
 | [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | 代码生成：Clang（默认）、LLVM JIT |

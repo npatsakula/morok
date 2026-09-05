@@ -16,6 +16,8 @@ pub mod indexing;
 pub mod math;
 pub mod matmul;
 pub mod nn;
+pub mod origin;
+pub mod origin_carriage;
 pub mod rand;
 pub mod rangeify_kernel_count;
 pub mod readme_examples;

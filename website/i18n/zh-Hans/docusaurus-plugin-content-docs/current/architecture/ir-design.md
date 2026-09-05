@@ -108,6 +108,10 @@ let b = UOp::binary(Add, x.clone(), y.clone());
 assert!(Arc::ptr_eq(&a, &b));  // Same pointer!
 ```
 
+:::note 来源是节点身份的一部分
+开启 `SVOD_ORIGIN=1` 后，节点还会带上构建时所处的 `OriginScope`，并把它折进自己的内容哈希。于是在不同作用域下构建的两个相同子图成了*不同*的节点，在内核切分剥除来源之前一直不共享。字面量是例外，`BUFFER`/`PARAM`/`UNIQUE` 也一样：同一个常量本就由两个作用域各自独立构建，给它带上来源只会拆出一个切分之后又要合并回去的节点。相关取舍参见[剖析与基准测试内核](../tile-kernels/profiling.md#attributing-kernels-to-model-code)。
+:::
+
 这通过全局缓存实现。构造 UOp 时先检查是否已有相同的：
 
 ```rust

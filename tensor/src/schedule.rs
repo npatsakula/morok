@@ -768,6 +768,44 @@ pub struct ScheduleItem {
     pub instance_dependencies: Vec<usize>,
 }
 
+/// Kernel attribution, read back from the CALL that `split_store` stamped.
+///
+/// The CALL is the per-dispatch node — the body it wraps is shared by every
+/// structurally identical kernel — so the origins live there and are recovered
+/// here rather than copied into every schedule type.
+fn call_origins(kernel: &Arc<UOp>) -> Option<&svod_ir::CallInfo> {
+    match kernel.op() {
+        Op::Call(ops::Call { info, .. }) => Some(info),
+        _ => None,
+    }
+}
+
+static NO_ORIGINS: std::sync::LazyLock<svod_ir::OriginSet> = std::sync::LazyLock::new(svod_ir::OriginSet::new);
+
+impl ScheduleItem {
+    /// Origin this kernel is charged to.
+    pub fn origin(&self) -> Option<svod_ir::OriginId> {
+        call_origins(&self.kernel).and_then(|info| info.origin)
+    }
+
+    /// Every origin folded into this kernel.
+    pub fn origins(&self) -> &svod_ir::OriginSet {
+        call_origins(&self.kernel).map_or(&NO_ORIGINS, |info| &info.origins)
+    }
+}
+
+impl PreScheduleItem {
+    /// Origin this kernel is charged to.
+    pub fn origin(&self) -> Option<svod_ir::OriginId> {
+        call_origins(&self.kernel).and_then(|info| info.origin)
+    }
+
+    /// Every origin folded into this kernel.
+    pub fn origins(&self) -> &svod_ir::OriginSet {
+        call_origins(&self.kernel).map_or(&NO_ORIGINS, |info| &info.origins)
+    }
+}
+
 /// Full execution schedule (list of callables in dependency order).
 pub type Schedule = Vec<ScheduleItem>;
 

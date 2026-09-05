@@ -251,6 +251,7 @@ impl Tensor {
     /// numpy-style read indexing. Build `spec` with [`s!`].
     #[track_caller]
     pub fn getitem(&self, spec: impl Into<IndexSpec>) -> Result<Tensor> {
+        origin_call!("getitem");
         self.index_impl(spec.into().0, None)
     }
 
@@ -258,6 +259,7 @@ impl Tensor {
     /// with the `spec` region overwritten by `value` (broadcast). Nothing mutates.
     #[track_caller]
     pub fn set(&self, spec: impl Into<IndexSpec>, value: &Tensor) -> Result<Tensor> {
+        origin_call!("set");
         self.index_impl(spec.into().0, Some(value))
     }
 

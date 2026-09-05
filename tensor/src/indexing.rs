@@ -23,6 +23,7 @@ impl Tensor {
     /// Gather values along an axis specified by `dim`, using `index` for element selection.
     #[track_caller]
     pub fn gather(&self, dim: isize, index: &Tensor) -> Result<Self> {
+        origin_call!("gather");
         let self_shape = self.shape()?;
         let index_shape = index.shape()?;
         let ndim = self_shape.len();
@@ -90,6 +91,7 @@ impl Tensor {
     /// returns shape `[A, K, C]`.
     #[track_caller]
     pub fn index_select(&self, dim: isize, index: &Tensor) -> Result<Self> {
+        origin_call!("index_select");
         let self_shape = self.shape()?;
         let ndim = self_shape.len();
         let dim = Self::normalize_axis(dim, ndim)?;
@@ -111,7 +113,9 @@ impl Tensor {
 
     /// One-hot encoding: self == arange(num_classes) broadcast along dim.
     /// Returns a boolean tensor with True at the class positions.
+    #[track_caller]
     pub fn one_hot_along_dim(&self, num_classes: usize, dim: isize) -> Result<Tensor> {
+        origin_call!("one_hot_along_dim");
         let ndim = self.ndim()?;
         let norm_dim = Self::normalize_axis(dim, ndim)?;
         let offset = ndim - norm_dim - 1;
@@ -122,7 +126,9 @@ impl Tensor {
     }
 
     /// Normalize negative indices: `indices[i] = indices[i] < 0 ? indices[i] + dim_size : indices[i]`
+    #[track_caller]
     pub fn normalize_negative_indices(&self, dim_size: i64) -> Result<Tensor> {
+        origin_call!("normalize_negative_indices");
         let zero = Tensor::const_(ConstValue::Int(0), self.uop().dtype());
         let dim_t = Tensor::const_(ConstValue::Int(dim_size), self.uop().dtype());
         let neg_mask = self.try_lt(&zero)?;
@@ -204,6 +210,7 @@ impl Tensor {
     /// the last value wins (matching PyTorch/Tinygrad semantics).
     #[track_caller]
     pub fn scatter(&self, dim: isize, index: &Tensor, src: &Tensor) -> Result<Tensor> {
+        origin_call!("scatter");
         let (src_p, mask_p) = self._pre_scatter(dim, index, src)?;
         masked_setitem(self, &src_p, &mask_p, &[-1])
     }
@@ -218,6 +225,7 @@ impl Tensor {
         reduce: ScatterReduction,
         include_self: bool,
     ) -> Result<Tensor> {
+        origin_call!("scatter_reduce");
         let (src_p, mask_p) = self._pre_scatter(dim, index, src)?;
         let dtype = src_p.uop().dtype();
         let inv_mask = |a: &Tensor, b: &Tensor| -> Result<Tensor> {
@@ -266,6 +274,7 @@ impl Tensor {
     /// Requires `realize()` internally (data-dependent output size).
     #[track_caller]
     pub fn masked_select(&self, mask: &Tensor) -> Result<Tensor> {
+        origin_call!("masked_select");
         if mask.uop().dtype() != DType::Bool {
             return TypeMismatchSnafu { expected: DType::Bool, actual: mask.uop().dtype() }.fail();
         }
@@ -298,6 +307,7 @@ impl Tensor {
     /// The condition is a 1D boolean/integer tensor; nonzero values select.
     #[track_caller]
     pub fn compress(&self, condition: &[bool], axis: Option<isize>) -> Result<Tensor> {
+        origin_call!("compress");
         let x = if axis.is_none() { self.flatten()? } else { self.clone() };
         let axis = axis.unwrap_or(0);
         let indices: Vec<i64> = condition.iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i as i64).collect();
@@ -312,6 +322,7 @@ impl Tensor {
     /// Bitonic sort along a dimension. Returns (sorted_values, indices).
     #[track_caller]
     pub fn sort(&self, dim: isize, descending: bool) -> Result<(Tensor, Tensor)> {
+        origin_call!("sort");
         let shape = self.shape()?;
         let ndim = shape.len();
         let dim = Self::normalize_axis(dim, ndim)?;
@@ -452,6 +463,7 @@ impl Tensor {
     /// Top-k elements along a dimension. Returns (values, indices).
     #[track_caller]
     pub fn topk(&self, k: usize, dim: isize, largest: bool) -> Result<(Tensor, Tensor)> {
+        origin_call!("topk");
         let shape = self.shape()?;
         let ndim = shape.len();
         let norm_dim = Self::normalize_axis(dim, ndim)?;
@@ -471,6 +483,7 @@ impl Tensor {
     /// Indices of non-zero elements. Returns [num_nonzero, ndim] tensor.
     #[track_caller]
     pub fn nonzero(&self) -> Result<Tensor> {
+        origin_call!("nonzero");
         let shape = self.shape()?;
         let ndim = shape.len();
         let dims = svod_ir::shape::to_vec_usize(&shape).context(UOpSnafu)?;
@@ -514,6 +527,7 @@ impl Tensor {
     /// batch element `i` along `batch_axis`, leaving the rest unchanged.
     #[track_caller]
     pub fn reverse_sequence(&self, sequence_lens: &Tensor, time_axis: usize, batch_axis: usize) -> Result<Self> {
+        origin_call!("reverse_sequence");
         let dims = svod_ir::shape::to_vec_usize(&self.shape()?).context(UOpSnafu)?;
         let ndim = dims.len();
         let time_len = dims[time_axis];
@@ -563,7 +577,9 @@ impl Tensor {
     // =========================================================================
 
     /// Gather values using N-dimensional indices.
+    #[track_caller]
     pub fn gather_nd(&self, indices: &Tensor, batch_dims: usize) -> Result<Tensor> {
+        origin_call!("gather_nd");
         let x_shape = self.shape()?;
         let x_dims = svod_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
         let idx_shape = indices.shape()?;
@@ -658,7 +674,9 @@ impl Tensor {
     }
 
     /// Scatter updates into a tensor using N-dimensional indices.
+    #[track_caller]
     pub fn scatter_nd(&self, indices: &Tensor, updates: &Tensor, reduction: &str) -> Result<Tensor> {
+        origin_call!("scatter_nd");
         let x_shape = self.shape()?;
         let x_dims = svod_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
         let idx_shape = indices.shape()?;
@@ -713,6 +731,7 @@ impl Tensor {
     }
 
     /// Batch-aware tensor scatter with write index offsets.
+    #[track_caller]
     pub fn tensor_scatter(
         &self,
         update: &Tensor,
@@ -720,6 +739,7 @@ impl Tensor {
         mode: &str,
         axis: isize,
     ) -> Result<Tensor> {
+        origin_call!("tensor_scatter");
         let data_shape = self.shape()?;
         let ndim = data_shape.len();
         let axis = Self::normalize_axis(axis, ndim)?;

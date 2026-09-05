@@ -14,7 +14,7 @@ ML-компилятор на Rust, вдохновлённый [Tinygrad](https:/
 |-------------|----------|
 | **Декларативные оптимизации** | DSL `patterns!` для перезаписи графов с Z3-верифицированной корректностью |
 | **Ленивые вычисления** | Тензоры строят граф вычислений, компиляция происходит только при `realize()` |
-| **Трассировка происхождения** | `#[track_caller]` привязывает каждый UOp к месту в исходном коде |
+| **Отслеживание происхождения** | скоупы привязывают каждое ядро к пути модуля, месту вызова или узлу ONNX |
 | **80+ IR-операций** | Арифметика, память, control flow, WMMA tensor cores |
 | **20+ оптимизаций** | Свёртка констант, tensor cores, векторизация, развёртка циклов |
 
@@ -26,7 +26,7 @@ ML-компилятор на Rust, вдохновлённый [Tinygrad](https:/
 |-------|----------|
 | [dtype](https://github.com/npatsakula/svod/tree/main/dtype/) | Система типов: скаляры, векторы, указатели, изображения |
 | [macros](https://github.com/npatsakula/svod/tree/main/macros/) | Процедурные макросы (DSL `patterns!`) |
-| [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp-граф IR: 80+ операций, символьные целые, трассировка происхождения |
+| [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp-граф IR: 80+ операций, символьные целые, происхождение ядер |
 | [device](https://github.com/npatsakula/svod/tree/main/device/) | Управление буферами: ленивое выделение, zero-copy view, LRU-кэширование |
 | [schedule](https://github.com/npatsakula/svod/tree/main/schedule/) | Движок оптимизаций: 20+ проходов, RANGEIFY, Z3-верификация |
 | [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | Кодогенерация: Clang (по умолчанию), LLVM JIT |

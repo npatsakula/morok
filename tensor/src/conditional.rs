@@ -32,7 +32,9 @@ impl Tensor {
     /// let result = x.where_(condition, &zeros)?;
     /// // result = [0.0, 0.0, 3.0, 4.0]
     /// ```
+    #[track_caller]
     pub fn where_(&self, condition: &Tensor, other: &Tensor) -> Result<Self> {
+        origin_call!("where");
         use svod_ir::shape::{align_shapes_left, broadcast_shapes};
 
         let cond_shape = condition.shape()?;
@@ -66,7 +68,9 @@ impl Tensor {
     /// let result = a.maximum(&b)?;
     /// // result = [2.0, 5.0, 4.0]
     /// ```
+    #[track_caller]
     pub fn maximum(&self, other: &Tensor) -> Result<Self> {
+        origin_call!("maximum");
         let (lhs, rhs) = self.broadcast_for_binop(other)?;
         let result = lhs.uop().try_max(&rhs.uop()).context(UOpSnafu)?;
         Ok(Self::new(result))
@@ -87,7 +91,9 @@ impl Tensor {
     /// let result = a.minimum(&b)?;
     /// // result = [1.0, 3.0, 3.0]
     /// ```
+    #[track_caller]
     pub fn minimum(&self, other: &Tensor) -> Result<Self> {
+        origin_call!("minimum");
         // Minimum is not a primitive, we implement it as: -max(-a, -b)
         // Or equivalently: where(a < b, a, b)
         let condition = self.try_lt(other)?;
@@ -117,7 +123,9 @@ impl Tensor {
     /// // result = [-1.0, 0.0, 1.0, 2.0, 2.0]
     /// ```
     #[builder]
+    #[track_caller]
     pub fn clamp(&self, min: Option<&Tensor>, max: Option<&Tensor>) -> Result<Self> {
+        origin_call!("clamp");
         let mut result = self.clone();
 
         if let Some(min_val) = min {
@@ -143,7 +151,9 @@ impl Tensor {
     /// let result = x.clip().min(&min).max(&max).call()?;
     /// ```
     #[builder]
+    #[track_caller]
     pub fn clip(&self, min: Option<&Tensor>, max: Option<&Tensor>) -> Result<Self> {
+        origin_call!("clip");
         self.clamp().maybe_min(min).maybe_max(max).call()
     }
 
@@ -163,7 +173,9 @@ impl Tensor {
     /// let fill = Tensor::from_slice(&[-1.0f32, -2.0, -3.0, -4.0]);
     /// let r2 = x.masked_fill(&mask, &fill)?;             // [-1.0, 2.0, -3.0, 4.0]
     /// ```
+    #[track_caller]
     pub fn masked_fill<'a>(&self, mask: &Tensor, value: impl Into<MaskedFillValue<'a>>) -> Result<Self> {
+        origin_call!("masked_fill");
         let fill_tensor: std::borrow::Cow<'_, Tensor> = match value.into() {
             MaskedFillValue::Scalar(cv) => std::borrow::Cow::Owned(Tensor::full(&[1], cv, self.uop().dtype())?),
             MaskedFillValue::Tensor(t) => std::borrow::Cow::Borrowed(t),

@@ -25,7 +25,9 @@ impl Tensor {
     /// let vals = y.as_vec::<u8>().unwrap();
     /// assert_eq!(vals, vec![255, 0, 128]);
     /// ```
+    #[track_caller]
     pub fn clamp_cast(&self, dtype: DType) -> Result<Self> {
+        origin_call!("clamp_cast");
         let min = Tensor::const_(dtype.min_value(), self.uop().dtype());
         let max = Tensor::const_(dtype.max_value(), self.uop().dtype());
         self.clamp().min(&min).max(&max).call()?.cast(dtype)
@@ -38,12 +40,14 @@ impl Tensor {
     /// per-output-channel integer weight, accumulated in the dtype's normal sum
     /// type, and rescaled in FP32 before the optional bias and output cast.
     #[builder]
+    #[track_caller]
     pub fn dynamic_quantized_linear(
         &self,
         weight: &Tensor,
         weight_scale: &Tensor,
         bias: Option<&Tensor>,
     ) -> Result<Tensor> {
+        origin_call!("dynamic_quantized_linear");
         const OP: &str = "dynamic_quantized_linear";
         let output_dtype = self.uop().dtype();
         let quantized_dtype = weight.uop().dtype();
@@ -149,6 +153,7 @@ impl Tensor {
     /// assert_eq!(shape, vec![1, 1, 3, 3]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn qlinear_conv(
         &self,
         x_scale: &Tensor,
@@ -166,6 +171,7 @@ impl Tensor {
         strides: Option<&[i64]>,
         dilations: Option<&[i64]>,
     ) -> Result<Tensor> {
+        origin_call!("qlinear_conv");
         let adj_x = self.cast(DType::Int32)?.try_sub(&x_zero_point.cast(DType::Int32)?)?;
         let w_i32 = weight.cast(DType::Int32)?;
         let w_zp = reshape_per_channel(&w_zero_point.cast(DType::Int32)?, w_i32.ndim()?)?;
@@ -205,6 +211,7 @@ impl Tensor {
     /// assert_eq!(shape, vec![1, 1, 3, 3]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn conv_integer(
         &self,
         weight: &Tensor,
@@ -218,6 +225,7 @@ impl Tensor {
         strides: Option<&[i64]>,
         dilations: Option<&[i64]>,
     ) -> Result<Tensor> {
+        origin_call!("conv_integer");
         let adj_x = if let Some(zp) = x_zero_point {
             self.cast(DType::Int32)?.try_sub(&zp.cast(DType::Int32)?)?
         } else {
@@ -276,6 +284,7 @@ impl Tensor {
     /// assert_eq!(shape, vec![2, 4]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn qlinear_matmul(
         &self,
         a_scale: &Tensor,
@@ -286,6 +295,7 @@ impl Tensor {
         y_scale: &Tensor,
         y_zero_point: &Tensor,
     ) -> Result<Tensor> {
+        origin_call!("qlinear_matmul");
         let adj_a = self.cast(DType::Int32)?.try_sub(&a_zero_point.cast(DType::Int32)?)?;
         let adj_b = b.cast(DType::Int32)?.try_sub(&b_zero_point.cast(DType::Int32)?)?;
         let out = adj_a.matmul(&adj_b)?;

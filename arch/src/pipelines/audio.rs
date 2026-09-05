@@ -24,6 +24,7 @@
 use std::time::Instant;
 
 use snafu::{ResultExt, Snafu};
+use svod_ir::origin::OriginScope;
 
 pub use svod_runtime::RunProfile;
 use svod_runtime::StageProfile;
@@ -260,7 +261,13 @@ impl<V: Vad> Splitter for VadSplitter<V> {
     }
 
     fn split(&mut self, waveform: &[f32]) -> Result<Vec<AudioChunk>, Self::Error> {
-        let probs = self.vad.probs(waveform).context(ProbsSnafu)?;
+        // The stage name the profiler groups by is also the root of every
+        // origin path the VAD graph mints, so its kernels roll up under the
+        // same label the pipeline records the split wall under.
+        let probs = {
+            let _origin = OriginScope::label(self.profile_label());
+            self.vad.probs(waveform).context(ProbsSnafu)?
+        };
         // The chunker clamps chunk ends to the real audio (the final VAD window
         // is zero-padded, so the prob grid overshoots the waveform). The length
         // is only known here, so set it per call over the baked sentinel.

@@ -34,7 +34,7 @@ jit_wrapper! {
             // same dtype regardless of the encoder's compute dtype.
             let out = out.cast(svod_dtype::DType::Float32).context(TensorSnafu)?;
             let head = model.head.expect_ctc("GigaAmCtcJit")?;
-            head.forward(&out)
+            crate::state::scoped("head", || head.forward(&out))
         }
     }
 }

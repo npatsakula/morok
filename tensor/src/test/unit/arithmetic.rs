@@ -259,56 +259,6 @@ fn test_ge_comparison() {
 }
 
 #[test]
-fn test_provenance_tracking() {
-    use svod_dtype::DType;
-    use svod_ir::{ConstValue, UOp, provenance::PROVENANCE_TRACKER};
-
-    // Capture is off by default (SVOD_TRACK_PROVENANCE); enable it for this thread.
-    let was_tracking = svod_ir::provenance::set_tracking(true);
-    PROVENANCE_TRACKER.with(|t| t.borrow_mut().clear());
-
-    // Test at UOp level first to verify #[track_caller] works
-    let uop_a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let uop_b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let uop_c = uop_a.try_add(&uop_b).unwrap(); // Line 248: Track this
-
-    PROVENANCE_TRACKER.with(|tracker| {
-        let t = tracker.borrow();
-
-        eprintln!("\n=== UOp Level Provenance ===");
-        let events = t.get_events(uop_c.id);
-        assert!(events.is_some(), "Expected provenance for UOp");
-
-        for (i, event) in events.unwrap().iter().enumerate() {
-            eprintln!("  [{}] {}", i, event);
-        }
-    });
-
-    // Now test at Tensor level
-    PROVENANCE_TRACKER.with(|t| t.borrow_mut().clear());
-
-    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c = &a + &b; // Line 266: Track this
-
-    PROVENANCE_TRACKER.with(|tracker| {
-        let t = tracker.borrow();
-
-        eprintln!("\n=== Tensor Level Provenance ===");
-        let events = t.get_events(c.uop().id);
-        assert!(events.is_some(), "Expected provenance for Tensor");
-
-        for (i, event) in events.unwrap().iter().enumerate() {
-            eprintln!("  [{}] {}", i, event);
-        }
-
-        // Just verify provenance exists - the exact location may vary due to inlining
-        assert!(!events.unwrap().is_empty(), "Expected at least one provenance event");
-    });
-    svod_ir::provenance::set_tracking(was_tracking);
-}
-
-#[test]
 fn test_neg_basic() {
     // neg() now produces MUL(x, -1) matching Tinygrad's approach
     let a = Tensor::from_slice([1.0f32, -2.0, 3.0]);

@@ -2,10 +2,13 @@ use ndarray::Array4;
 use snafu::ResultExt;
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::SInt;
+use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 
 use crate::init::{fan_in_uniform, ones, zeros};
-use crate::state::{self, HasStateDict, StateDict, TensorSnafu as StateTensorSnafu, get_tensor, prefixed};
+use crate::state::{
+    self, HasStateDict, StateDict, TensorSnafu as StateTensorSnafu, get_tensor, prefixed, scoped, scoped_index,
+};
 use crate::{load_state_field, state_field};
 
 use super::error::{StateSnafu, TensorSnafu, TkSnafu};
@@ -139,7 +142,7 @@ impl FeedForward {
         // The two-linear FFN lowers to GEMM1+silu → h → GEMM2 (two reduces force `h`
         // to realize between them), which the generic optimizer fuses + (with BEAM)
         // tunes as well as a hand kernel — so the FFN stays plain graph ops.
-        let y = self.norm.apply(x)?;
+        let y = scoped("norm", || self.norm.apply(x))?;
         let y = linear(&y, &self.linear1_weight, &self.linear1_bias, self.linear1_quantization.as_ref())?;
         let y = y.silu().context(TensorSnafu)?;
         linear(&y, &self.linear2_weight, &self.linear2_bias, self.linear2_quantization.as_ref())
@@ -235,7 +238,7 @@ impl MultiHeadSelfAttention {
         let d_k = d_model / self.n_heads;
         let h = self.n_heads;
 
-        let y = self.norm.apply(x)?;
+        let y = scoped("norm", || self.norm.apply(x))?;
 
         // RoPE expects [T, B, H, d_k] (PyTorch ordering). Rotate once, then
         // materialise back as [B, T, d_model] so the Q/K projections share
@@ -245,9 +248,13 @@ impl MultiHeadSelfAttention {
             .context(TensorSnafu)?
             .try_reshape([t.clone(), b.clone(), SInt::Const(h), SInt::Const(d_k)])
             .context(TensorSnafu)?;
+        // The table is shared by every layer, so its cast is built outside the
+        // layer's origin scope and hash-conses across layers.
         let rope_dtype = y_heads.uop().dtype();
-        let cos = cos.cast(rope_dtype.clone()).context(TensorSnafu)?;
-        let sin = sin.cast(rope_dtype).context(TensorSnafu)?;
+        let (cos, sin) = {
+            let _shared = OriginScope::suspend();
+            (cos.cast(rope_dtype.clone()).context(TensorSnafu)?, sin.cast(rope_dtype).context(TensorSnafu)?)
+        };
         let qk_input = y_heads
             .apply_rotary_emb(&cos, &sin, false)
             .context(TensorSnafu)?
@@ -300,6 +307,9 @@ fn sdpa_attention(q: &Tensor, k: &Tensor, v: &Tensor, key_lens: Option<&Tensor>)
             let dim = |i: usize| qs[i].as_const().expect("concrete dim");
             let (b, n) = (dim(0), dim(1));
             // [B, 1, 1, N] bool key mask: true (masked) where arange(N) ≥ key_lens[b].
+            // A property of `key_lens`, shared by every layer: built outside the
+            // layer's origin scope so the layers share one mask.
+            let _shared = OriginScope::suspend();
             let range = Tensor::arange(n as i64, None, None)
                 .context(TensorSnafu)?
                 .try_reshape([1usize, 1, 1, n])
@@ -423,7 +433,7 @@ impl ConvModule {
 
     pub fn forward(&self, x: &Tensor, pad_mask: Option<&Tensor>) -> Result<Tensor> {
         let activation_dtype = x.uop().dtype();
-        let y = self.norm.apply(x)?;
+        let y = scoped("norm", || self.norm.apply(x))?;
 
         let y = y.try_transpose(-1, -2).context(TensorSnafu)?;
 
@@ -451,7 +461,7 @@ impl ConvModule {
         let y = match &self.conv_norm {
             ConvNorm::LayerNorm(ln) => {
                 let y = y.try_transpose(-1, -2).context(TensorSnafu)?;
-                let y = ln.apply(&y)?;
+                let y = scoped("conv_norm", || ln.apply(&y))?;
                 y.try_transpose(-1, -2).context(TensorSnafu)?
             }
             ConvNorm::BatchNorm { scale, bias, mean, invstd } => {
@@ -740,19 +750,23 @@ impl ConformerLayer {
         let half = Tensor::from_const(0.5f64).cast(x.uop().dtype()).context(TensorSnafu)?;
 
         // FFN1 half-step
-        let x = x.try_add(&self.ffn1.forward(x)?.try_mul(&half).context(TensorSnafu)?).context(TensorSnafu)?;
+        let ffn1 = scoped("ffn1", || self.ffn1.forward(x))?;
+        let x = x.try_add(&ffn1.try_mul(&half).context(TensorSnafu)?).context(TensorSnafu)?;
 
         // MHSA
-        let x = x.try_add(&self.mhsa.forward(&x, cos, sin, key_lens)?).context(TensorSnafu)?;
+        let mhsa = scoped("mhsa", || self.mhsa.forward(&x, cos, sin, key_lens))?;
+        let x = x.try_add(&mhsa).context(TensorSnafu)?;
 
         // Convolution
-        let x = x.try_add(&self.conv.forward(&x, pad_mask)?).context(TensorSnafu)?;
+        let conv = scoped("conv", || self.conv.forward(&x, pad_mask))?;
+        let x = x.try_add(&conv).context(TensorSnafu)?;
 
         // FFN2 half-step
-        let x = x.try_add(&self.ffn2.forward(&x)?.try_mul(&half).context(TensorSnafu)?).context(TensorSnafu)?;
+        let ffn2 = scoped("ffn2", || self.ffn2.forward(&x))?;
+        let x = x.try_add(&ffn2.try_mul(&half).context(TensorSnafu)?).context(TensorSnafu)?;
 
         // Final layer norm
-        self.final_norm.apply(&x)
+        scoped("final_norm", || self.final_norm.apply(&x))
     }
 }
 
@@ -842,7 +856,7 @@ impl Encoder {
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
         let x = mel.try_transpose(-1, -2).context(TensorSnafu)?;
         let x = x.cast(self.input_dtype()).context(TensorSnafu)?;
-        let x = self.subsampling.forward(&x)?;
+        let x = scoped("subsampling", || self.subsampling.forward(&x))?;
 
         let shape = x.shape().context(TensorSnafu)?;
         let seq_len = shape[1].clone();
@@ -852,8 +866,8 @@ impl Encoder {
         // this mel (no bucketing / no padding), so every key position is valid:
         // `key_lens = None` lets attention see the whole sequence.
         let mut x = x;
-        for layer in &self.layers {
-            x = layer.forward(&x, &cos, &sin, None, None)?;
+        for (index, layer) in self.layers.iter().enumerate() {
+            x = scoped_index("layers", index, || layer.forward(&x, &cos, &sin, None, None))?;
         }
 
         x.try_transpose(-1, -2).context(TensorSnafu)
@@ -886,7 +900,7 @@ impl Encoder {
 
         let x = mel.try_transpose(-1, -2).context(TensorSnafu)?;
         let x = x.cast(self.input_dtype()).context(TensorSnafu)?;
-        let x = self.subsampling.forward(&x)?;
+        let x = scoped("subsampling", || self.subsampling.forward(&x))?;
 
         let shape = x.shape().context(TensorSnafu)?;
         let t_sub = shape[1].clone();
@@ -910,8 +924,8 @@ impl Encoder {
         let (cos, sin) = self.slice_rope(t_sub)?;
 
         let mut x = x;
-        for layer in &self.layers {
-            x = layer.forward(&x, &cos, &sin, Some(&key_lens), Some(&pad_mask))?;
+        for (index, layer) in self.layers.iter().enumerate() {
+            x = scoped_index("layers", index, || layer.forward(&x, &cos, &sin, Some(&key_lens), Some(&pad_mask)))?;
         }
 
         x.try_transpose(-1, -2).context(TensorSnafu)

@@ -109,6 +109,15 @@ let b = UOp::binary(Add, x.clone(), y.clone());
 assert!(Arc::ptr_eq(&a, &b));  // Same pointer!
 ```
 
+:::note Origin is part of node identity
+With `SVOD_ORIGIN=1` each node also carries the `OriginScope` it was built under, folded
+into its content hash. Two identical subgraphs built under different scopes are then
+*different* nodes and stay unshared until the kernel cut strips origins. Literals are the
+exception, alongside `BUFFER`/`PARAM`/`UNIQUE`: two scopes build the same constant
+independently, so an origin there would only split a node the cut merges back. See the
+trade-off in [Profiling and benchmarking kernels](../tile-kernels/profiling.md#attributing-kernels-to-model-code).
+:::
+
 This works through a global lock-free cache (using the `papaya` crate with `Weak` references to avoid memory leaks). When constructing a UOp, we first check if an identical one exists:
 
 ```rust

@@ -32,7 +32,9 @@ impl Tensor {
     /// // Each row is independently normalized to mean~0, std~1
     /// assert!((vals[0] + vals[1] + vals[2]).abs() < 1e-5);
     /// ```
+    #[track_caller]
     pub fn layernorm(&self, axis: isize, eps: f64) -> Result<Tensor> {
+        origin_call!("layernorm");
         let (normed, _, _) = self.layernorm_with_stats(axis, eps)?;
         Ok(normed)
     }
@@ -53,7 +55,9 @@ impl Tensor {
     /// let mean_val = mean.as_vec::<f32>().unwrap();
     /// assert!((mean_val[0] - 2.0).abs() < 1e-5);
     /// ```
+    #[track_caller]
     pub fn layernorm_with_stats(&self, axis: isize, eps: f64) -> Result<(Tensor, Tensor, Tensor)> {
+        origin_call!("layernorm_with_stats");
         let ndim = self.ndim()?;
         let norm_axis = Tensor::normalize_axis(axis, ndim)?;
         let axes: Vec<isize> = (norm_axis..ndim).map(|a| a as isize).collect();
@@ -92,7 +96,9 @@ impl Tensor {
     /// // Output ≈ [0.46, 0.93, 1.39]
     /// assert!((vals[0] - 1.0 / (14.0f32 / 3.0).sqrt()).abs() < 1e-4);
     /// ```
+    #[track_caller]
     pub fn rms_norm(&self, axis: isize, eps: f64) -> Result<Tensor> {
+        origin_call!("rms_norm");
         let ndim = self.ndim()?;
         let norm_axis = Tensor::normalize_axis(axis, ndim)?;
         let axes: Vec<isize> = (norm_axis..ndim).map(|a| a as isize).collect();
@@ -150,7 +156,9 @@ impl Tensor {
     /// // L1 norm of [3,4] = 7, so output ≈ [3/7, 4/7]
     /// assert!((vals[0] - 3.0 / 7.0).abs() < 1e-5);
     /// ```
+    #[track_caller]
     pub fn lp_normalize(&self, axis: isize, p: i64) -> Result<Tensor> {
+        origin_call!("lp_normalize");
         let norm = match p {
             1 => self.try_abs()?.sum_with().axes(AxisSpec::Single(axis)).keepdim(true).call()?,
             _ => self.square()?.sum_with().axes(AxisSpec::Single(axis)).keepdim(true).call()?.try_sqrt()?,
@@ -179,7 +187,9 @@ impl Tensor {
     /// assert!(vals[0] < 0.0);
     /// assert!(vals[5] > 0.0);
     /// ```
+    #[track_caller]
     pub fn mean_variance_normalize(&self, axes: &[isize], eps: f64) -> Result<Tensor> {
+        origin_call!("mean_variance_normalize");
         let axes_spec = AxisSpec::Multiple(axes.to_vec());
         // Normalize in f32 like `layernorm_with_stats`: a float16 `eps` is
         // subnormal, so a constant slice divides 0 by a flushed 0 and gives NaN.
@@ -230,6 +240,7 @@ impl Tensor {
     /// assert_eq!(shape, [1, 4, 2, 2]);
     /// ```
     #[builder]
+    #[track_caller]
     pub fn group_norm(
         &self,
         scale: &Tensor,
@@ -237,6 +248,7 @@ impl Tensor {
         num_groups: usize,
         #[builder(default = 1e-5)] eps: f64,
     ) -> Result<Tensor> {
+        origin_call!("group_norm");
         let x_shape = self.shape()?;
         let ndim = x_shape.len();
         snafu::ensure!(ndim >= 2, NdimMinimumSnafu { op: "group_norm", min: 2_usize, actual: ndim });

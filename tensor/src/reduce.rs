@@ -150,6 +150,7 @@ impl Tensor {
     /// Use `sum_with().promote(false)` to preserve input dtype.
     #[track_caller]
     pub fn sum(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
+        origin_call!("sum");
         reduce_internal(self, ReduceOp::Add, axes.into(), false, None, true)
     }
 
@@ -179,6 +180,7 @@ impl Tensor {
         dtype: Option<DType>,
         promote: Option<bool>,
     ) -> Result<Self> {
+        origin_call!("sum");
         if dtype.is_some() && promote == Some(true) {
             return Err(Error::ConflictingReductionOptions);
         }
@@ -191,6 +193,7 @@ impl Tensor {
     /// Preserves input dtype. Use `prod_with().promote(true)` or `.dtype(...)` for different accumulation.
     #[track_caller]
     pub fn prod(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
+        origin_call!("prod");
         reduce_internal(self, ReduceOp::Mul, axes.into(), false, None, false)
     }
 
@@ -208,13 +211,16 @@ impl Tensor {
         dtype: Option<DType>,
         #[builder(default = false)] promote: bool,
     ) -> Result<Self> {
+        origin_call!("prod");
         reduce_internal(self, ReduceOp::Mul, axes.into(), keepdim, dtype, promote)
     }
 
     /// Maximum of tensor elements over given axes.
     ///
     /// Always preserves input dtype.
+    #[track_caller]
     pub fn max(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
+        origin_call!("max");
         reduce_internal(self, ReduceOp::Max, axes.into(), false, None, false)
     }
 
@@ -222,6 +228,7 @@ impl Tensor {
     #[builder]
     #[track_caller]
     pub fn max_with(&self, axes: impl Into<AxisSpec>, #[builder(default = false)] keepdim: bool) -> Result<Self> {
+        origin_call!("max");
         reduce_internal(self, ReduceOp::Max, axes.into(), keepdim, None, false)
     }
 
@@ -230,6 +237,7 @@ impl Tensor {
     /// Always preserves input dtype.
     #[track_caller]
     pub fn min(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
+        origin_call!("min");
         reduce_internal(self, ReduceOp::Min, axes.into(), false, None, false)
     }
 
@@ -237,6 +245,7 @@ impl Tensor {
     #[builder]
     #[track_caller]
     pub fn min_with(&self, axes: impl Into<AxisSpec>, #[builder(default = false)] keepdim: bool) -> Result<Self> {
+        origin_call!("min");
         reduce_internal(self, ReduceOp::Min, axes.into(), keepdim, None, false)
     }
 
@@ -246,6 +255,7 @@ impl Tensor {
     /// For float inputs, preserves input dtype.
     #[track_caller]
     pub fn mean(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
+        origin_call!("mean");
         mean_impl(self, axes.into(), false)
     }
 
@@ -253,6 +263,7 @@ impl Tensor {
     #[builder]
     #[track_caller]
     pub fn mean_with(&self, axes: impl Into<AxisSpec>, #[builder(default = false)] keepdim: bool) -> Result<Self> {
+        origin_call!("mean");
         mean_impl(self, axes, keepdim)
     }
 
@@ -269,6 +280,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn var(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
+        origin_call!("var");
         var_impl(self, axes.into(), false, 1)
     }
 
@@ -285,6 +297,7 @@ impl Tensor {
         #[builder(default = false)] keepdim: bool,
         #[builder(default = 1)] correction: i64,
     ) -> Result<Self> {
+        origin_call!("var");
         var_impl(self, axes.into(), keepdim, correction)
     }
 
@@ -301,6 +314,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn std(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
+        origin_call!("std");
         std_impl(self, axes.into(), false, 1)
     }
 
@@ -317,6 +331,7 @@ impl Tensor {
         #[builder(default = false)] keepdim: bool,
         #[builder(default = 1)] correction: i64,
     ) -> Result<Self> {
+        origin_call!("std");
         std_impl(self, axes.into(), keepdim, correction)
     }
 
@@ -332,6 +347,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn var_mean(&self, axes: impl Into<AxisSpec>) -> Result<(Self, Self)> {
+        origin_call!("var_mean");
         var_mean_impl(self, axes.into(), false, 1)
     }
 
@@ -346,6 +362,7 @@ impl Tensor {
         #[builder(default = false)] keepdim: bool,
         #[builder(default = 1)] correction: i64,
     ) -> Result<(Self, Self)> {
+        origin_call!("var_mean");
         var_mean_impl(self, axes.into(), keepdim, correction)
     }
 
@@ -361,6 +378,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn std_mean(&self, axes: impl Into<AxisSpec>) -> Result<(Self, Self)> {
+        origin_call!("std_mean");
         std_mean_impl(self, axes.into(), false, 1)
     }
 
@@ -375,6 +393,7 @@ impl Tensor {
         #[builder(default = false)] keepdim: bool,
         #[builder(default = 1)] correction: i64,
     ) -> Result<(Self, Self)> {
+        origin_call!("std_mean");
         std_mean_impl(self, axes.into(), keepdim, correction)
     }
 
@@ -420,6 +439,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn argmax(&self, axis: impl Into<Option<isize>>) -> Result<Self> {
+        origin_call!("argmax");
         argmax_impl(self, axis.into(), false)
     }
 
@@ -431,6 +451,7 @@ impl Tensor {
         axis: impl Into<Option<isize>>,
         #[builder(default = false)] keepdim: bool,
     ) -> Result<Self> {
+        origin_call!("argmax");
         argmax_impl(self, axis.into(), keepdim)
     }
 
@@ -440,6 +461,7 @@ impl Tensor {
     /// maximum value along `axis` and 0.0 elsewhere, cast to the input dtype.
     #[track_caller]
     pub fn hardmax(&self, axis: isize) -> Result<Self> {
+        origin_call!("hardmax");
         let shape = self.shape()?;
         let ndim = shape.len();
         let norm_axis = Self::normalize_axis(axis, ndim)?;
@@ -461,6 +483,7 @@ impl Tensor {
     /// For ties, returns the index of the first occurrence.
     #[track_caller]
     pub fn argmin(&self, axis: impl Into<Option<isize>>) -> Result<Self> {
+        origin_call!("argmin");
         argmin_impl(self, axis.into(), false)
     }
 
@@ -472,6 +495,7 @@ impl Tensor {
         axis: impl Into<Option<isize>>,
         #[builder(default = false)] keepdim: bool,
     ) -> Result<Self> {
+        origin_call!("argmin");
         argmin_impl(self, axis.into(), keepdim)
     }
 
@@ -489,6 +513,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn any(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
+        origin_call!("any");
         any_impl(self, axes.into(), false)
     }
 
@@ -496,6 +521,7 @@ impl Tensor {
     #[builder]
     #[track_caller]
     pub fn any_with(&self, axes: impl Into<AxisSpec>, #[builder(default = false)] keepdim: bool) -> Result<Self> {
+        origin_call!("any");
         any_impl(self, axes.into(), keepdim)
     }
 
@@ -513,6 +539,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn all(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
+        origin_call!("all");
         all_impl(self, axes.into(), false)
     }
 
@@ -520,6 +547,7 @@ impl Tensor {
     #[builder]
     #[track_caller]
     pub fn all_with(&self, axes: impl Into<AxisSpec>, #[builder(default = false)] keepdim: bool) -> Result<Self> {
+        origin_call!("all");
         all_impl(self, axes.into(), keepdim)
     }
 }

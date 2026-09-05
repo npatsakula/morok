@@ -3,6 +3,7 @@ use std::path::Path;
 
 use snafu::{ResultExt, Snafu};
 use svod_dtype::DType;
+use svod_ir::origin::{self, OriginScope};
 use svod_tensor::Tensor;
 
 pub type StateDict = HashMap<String, Tensor>;
@@ -136,6 +137,34 @@ pub fn cast_all(sd: &StateDict, dtype: DType) -> StateDict {
 /// Helper: format a prefixed key.
 pub fn prefixed(prefix: &str, name: &str) -> String {
     if prefix.is_empty() { name.to_string() } else { format!("{prefix}.{name}") }
+}
+
+/// Build a child module's graph under its own origin scope, named by the same
+/// segment [`prefixed`] uses for its weights. A module is named by its parent —
+/// the only place that knows which slot it fills (`ffn1` vs `ffn2`) — so a
+/// rendered origin path is a state-dict key prefix by construction, for a model
+/// loaded from a checkpoint and for one built with random weights alike.
+///
+/// Costs one atomic load while capture is off: the segment is only interned
+/// inside [`OriginScope`].
+#[inline]
+pub fn scoped<T>(name: &str, f: impl FnOnce() -> T) -> T {
+    let _origin = OriginScope::module(name);
+    f()
+}
+
+/// [`scoped`] for one element of a repeated module (`layers.3`, `blocks.11`).
+/// The segment is only formatted while capture is on.
+#[inline]
+pub fn scoped_index<T>(name: &str, index: usize, f: impl FnOnce() -> T) -> T {
+    if origin::enabled() { scoped(&format!("{name}.{index}"), f) } else { f() }
+}
+
+/// [`scoped_index`] as a guard, for a loop body that cannot be a closure.
+/// A no-op scope while capture is off, so the segment is never formatted.
+#[inline]
+pub fn scope_index(name: &str, index: usize) -> OriginScope {
+    if origin::enabled() { OriginScope::module(format!("{name}.{index}")) } else { origin::install(origin::current()) }
 }
 
 /// Insert each named field of `$self` into the state dict under

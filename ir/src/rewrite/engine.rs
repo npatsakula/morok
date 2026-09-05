@@ -215,12 +215,9 @@ where
         }
     }
 
-    /// Record a result in the replace map, with provenance tracking.
+    /// Record a result in the replace map.
     #[inline]
     fn record_replace(&mut self, original_id: u64, result: Arc<UOp>) {
-        if result.id != original_id {
-            crate::provenance::record_transformed(result.id, original_id, crate::provenance::PassName::RewritePattern);
-        }
         self.replace.insert(original_id, result);
     }
 

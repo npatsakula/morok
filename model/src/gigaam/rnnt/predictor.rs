@@ -8,7 +8,7 @@ use svod_tensor::Tensor;
 use svod_tensor::nn::LSTMCell;
 
 use crate::init::fan_in_uniform;
-use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
+use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed, scoped, scoped_index};
 
 use crate::gigaam::Result;
 use crate::gigaam::error::TensorSnafu;
@@ -69,7 +69,7 @@ impl RnntPredictor {
 
         // Embed lookup: prev_token [B, 1] -> emb [B, 1, P].
         // Squeeze the seq-len axis to feed the LSTM cell shape [B, P].
-        let emb = self.embed.embedding(prev_token).context(TensorSnafu)?;
+        let emb = scoped("embed", || self.embed.embedding(prev_token).context(TensorSnafu))?;
         let mut layer_in = emb.try_squeeze(Some(1)).context(TensorSnafu)?; // [B, P]
 
         let mut new_hs: Vec<Tensor> = Vec::with_capacity(self.layers.len());
@@ -87,7 +87,7 @@ impl RnntPredictor {
                 .context(TensorSnafu)?
                 .try_squeeze(Some(0))
                 .context(TensorSnafu)?;
-            let (new_h, new_c) = cell.step(&layer_in, &h_i, &c_i).context(TensorSnafu)?;
+            let (new_h, new_c) = scoped_index("lstm", i, || cell.step(&layer_in, &h_i, &c_i).context(TensorSnafu))?;
             new_hs.push(new_h.clone());
             new_cs.push(new_c.clone());
             layer_in = new_h;

@@ -639,6 +639,9 @@ fn schedule_result_from_sink_with_cache(
     mut var_vals: HashMap<String, i64>,
     config: &PrepareConfig,
 ) -> Result<crate::schedule::ScheduleResult> {
+    // Everything below builds compiler artifacts, never model graph: detach from any
+    // scope the caller is realizing inside so kernel bodies stay origin-free.
+    let _detached = svod_ir::origin::OriginScope::suspend();
     svod_ir::dump_canonical_stage("tensor", &sink);
     if config.disable_schedule_cache || schedule_cache_disabled_by_env() {
         return schedule_result_from_sink_uncached(sink, var_vals, config);
@@ -688,6 +691,7 @@ fn schedule_result_from_sink_uncached(
     mut var_vals: HashMap<String, i64>,
     config: &PrepareConfig,
 ) -> Result<crate::schedule::ScheduleResult> {
+    let _detached = svod_ir::origin::OriginScope::suspend();
     let normalization = normalize_for_schedule_cache(&sink)?;
     merge_var_vals_checked(&mut var_vals, &normalization.var_vals, "uncached schedule normalization")?;
     let rangeify_result = svod_schedule::rangeify_with_map(normalization.normalized.clone()).context(RangeifySnafu)?;
@@ -1080,6 +1084,10 @@ fn optimized_kernel_key(
     renderer_fingerprint: u64,
     optimizer_fingerprint: u64,
 ) -> OptKey {
+    debug_assert!(
+        ast.toposort().iter().all(|node| node.origin().is_none()),
+        "kernel bodies are origin-stripped at the cut so identical kernels share one cache entry"
+    );
     (
         crate::schedule_cache::content_hash(ast),
         device.clone(),
@@ -1213,6 +1221,10 @@ impl KernelSite {
             svod_codegen::program_pipeline::program_from_sink_with_renderer(optimized, self.device.renderer.as_ref())
                 .context(RenderKernelSnafu)?;
         let codegen = self.codegen();
+        debug_assert!(
+            program.toposort().iter().all(|node| node.origin().is_none()),
+            "rendered programs inherit the stripped body, so the compiled-program cache stays shared"
+        );
         let result = svod_runtime::kernel_cache::get_or_compile_kernel(
             crate::schedule_cache::content_hash(&program),
             codegen,
@@ -1241,8 +1253,12 @@ impl KernelSite {
         Ok(result)
     }
 
-    /// The whole miss pipeline for one kernel, inline.
+    /// The whole miss pipeline for one kernel, inline. Detached for the same
+    /// reason `compile_missing_kernels` detaches its workers: optimizing and
+    /// rendering mint UOps, and this path runs under whatever scope the caller
+    /// is realizing inside.
     fn build(&self, config: &PrepareConfig) -> Result<Arc<CachedKernel>> {
+        let _detached = svod_ir::origin::OriginScope::suspend();
         let optimized = self.optimize(config)?;
         self.compile(finalize_kernel_name(&optimized))
     }
@@ -1284,7 +1300,13 @@ fn compile_missing_kernels(
     let threads =
         if matches!(config.optimizer.strategy, svod_schedule::OptStrategy::Beam { .. }) { 1 } else { config.threads };
 
-    let optimized = map_on_threads(threads, jobs.iter().collect(), |(site, _)| site.optimize(config));
+    // Optimizing and rendering mint UOps; on every thread they must stay detached, or
+    // the optimized AST and the rendered program inherit a scope and fork the caches
+    // keyed on them (`OPT_CACHE`, the compiled-program cache, the on-disk beam cache).
+    let optimized = map_on_threads(threads, jobs.iter().collect(), |(site, _)| {
+        let _detached = svod_ir::origin::OriginScope::suspend();
+        site.optimize(config)
+    });
     let mut failed = None;
     let named: Vec<_> = jobs
         .into_iter()
@@ -1299,6 +1321,7 @@ fn compile_missing_kernels(
         .collect();
 
     let compiled = map_on_threads(threads, named, |((site, ticket), ast)| {
+        let _detached = svod_ir::origin::OriginScope::suspend();
         let compiled = site.compile(ast);
         drop(ticket);
         compiled.map(|kernel| (site.key.clone(), kernel))
@@ -1353,6 +1376,9 @@ fn prepare_execution_plan(
     schedule_result: &crate::schedule::ScheduleResult,
     config: &PrepareConfig,
 ) -> Result<ExecutionPlan> {
+    // Optimizing, rendering and compiling are compiler work, not model graph: detach
+    // so nothing they mint adopts the scope the caller is realizing inside.
+    let _detached = svod_ir::origin::OriginScope::suspend();
     // Every prepare and, through the plan it returns, every execution passes
     // here: size the shared pool before either can use it.
     svod_runtime::ensure_thread_pool(config.threads);
@@ -1501,6 +1527,8 @@ fn prepare_execution_plan(
                     id: item.kernel.id,
                     buffer_indices,
                     dependencies: item.dependencies.clone(),
+                    origin: item.origin(),
+                    origins: item.origins().clone(),
                 }),
                 item.instance_dependencies.clone(),
             );
@@ -1523,6 +1551,8 @@ fn prepare_execution_plan(
                     fixedvars: item.fixedvars.clone(),
                     dependencies: item.dependencies.clone(),
                     runtime_vars,
+                    origin: item.origin(),
+                    origins: item.origins().clone(),
                 }),
                 item.instance_dependencies.clone(),
             );
@@ -1575,6 +1605,8 @@ fn prepare_execution_plan(
             buffer_ptrs: Vec::new(), // Computed in build()
             buffer_ids: Vec::new(),  // Computed in build()
             runtime_vars,
+            origin: item.origin(),
+            origins: item.origins().clone(),
         };
 
         builder.add_op_with_instance_dependencies(

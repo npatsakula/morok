@@ -2,7 +2,7 @@
 
 use svod_tensor::Tensor;
 
-use crate::state::{self, HasStateDict, StateDict, prefixed};
+use crate::state::{self, HasStateDict, StateDict, prefixed, scoped};
 
 use super::config::ModelDimensions;
 use super::decoder::TextDecoder;
@@ -24,12 +24,12 @@ impl Whisper {
 
     /// Encode mel spectrogram → audio features `[B, n_audio_ctx, D]`.
     pub fn encode(&self, mel: &Tensor) -> Result<Tensor> {
-        self.encoder.forward(mel)
+        scoped("encoder", || self.encoder.forward(mel))
     }
 
     /// Decode tokens given audio features → logits `[B, L, n_vocab]`.
     pub fn decode(&self, tokens: &Tensor, audio_features: &Tensor, offset: usize) -> Result<Tensor> {
-        self.decoder.forward(tokens, audio_features, offset)
+        scoped("decoder", || self.decoder.forward(tokens, audio_features, offset))
     }
 
     /// Teacher-forced alignment using retained packed cross-attention K/V.
@@ -40,17 +40,17 @@ impl Whisper {
         cross_v: &Tensor,
         alignment_heads: &[(usize, usize)],
     ) -> Result<Tensor> {
-        self.decoder.forward_alignment(tokens, cross_k, cross_v, alignment_heads)
+        scoped("decoder", || self.decoder.forward_alignment(tokens, cross_k, cross_v, alignment_heads))
     }
 
     /// Project encoder features into packed cross-attention K/V once per window.
     pub fn project_cross_kv(&self, audio_features: &Tensor) -> Result<(Tensor, Tensor)> {
-        self.decoder.project_cross_kv(audio_features)
+        scoped("decoder", || self.decoder.project_cross_kv(audio_features))
     }
 
     /// Decode logits using packed cross-attention K/V.
     pub fn decode_with_cross_kv(&self, tokens: &Tensor, cross_k: &Tensor, cross_v: &Tensor) -> Result<Tensor> {
-        self.decoder.forward_with_cross_kv(tokens, cross_k, cross_v, 0)
+        scoped("decoder", || self.decoder.forward_with_cross_kv(tokens, cross_k, cross_v, 0))
     }
 
     /// Prefill: initial tokens → logits + packed K/V caches.
@@ -61,7 +61,7 @@ impl Whisper {
         cross_v: &Tensor,
         offset: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        self.decoder.forward_prefill(tokens, cross_k, cross_v, offset)
+        scoped("decoder", || self.decoder.forward_prefill(tokens, cross_k, cross_v, offset))
     }
 
     /// Single-token step with KV cache → (logits, new_self_k, new_self_v).
@@ -76,7 +76,9 @@ impl Whisper {
         cross_v: &Tensor,
         self_key_lens: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        self.decoder.forward_step(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_key_lens)
+        scoped("decoder", || {
+            self.decoder.forward_step(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_key_lens)
+        })
     }
 
     /// Full forward: encode + decode.

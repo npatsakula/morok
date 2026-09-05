@@ -109,6 +109,16 @@ let b = UOp::binary(Add, x.clone(), y.clone());
 assert!(Arc::ptr_eq(&a, &b));  // Same pointer!
 ```
 
+:::note Origin नोड की आइडेंटिटी का हिस्सा है
+`SVOD_ORIGIN=1` के साथ हर नोड वह `OriginScope` भी साथ रखता है जिसके अंदर वह बना था, और यह origin
+उसके content hash में घुल जाता है। तब अलग-अलग scopes में बने दो एक जैसे सबग्राफ़ *अलग* नोड होते
+हैं और तब तक शेयर नहीं होते जब तक kernel cut origins हटा नहीं देता। लिटरल इसका अपवाद हैं, और
+इनके साथ `BUFFER`/`PARAM`/`UNIQUE` भी: एक ही कॉन्स्टेंट दो scopes अपने-अपने तौर पर बनाते हैं,
+इसलिए वहाँ origin रखने से वही नोड बँट जाता जिसे cut बाद में फिर से जोड़ देता है। इस ट्रेड-ऑफ़ के लिए
+[Profiling और Benchmarking](../tile-kernels/profiling.md#attributing-kernels-to-model-code) में “कर्नेल को model code से जोड़ना”
+सेक्शन देखें।
+:::
+
 यह एक ग्लोबल lock-free cache (papaya crate इस्तेमाल करके, मेमोरी लीक से बचने के लिए `Weak` रेफ़रेंस के साथ) से काम करता है। UOp बनाते समय, पहले चेक करते हैं कि आइडेंटिकल पहले से मौजूद है या नहीं:
 
 ```rust

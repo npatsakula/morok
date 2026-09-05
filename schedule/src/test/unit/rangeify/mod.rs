@@ -17,6 +17,7 @@ pub mod kernel_count;
 pub mod late_decompositions;
 pub mod load_collapse;
 pub mod movement_patterns;
+pub mod origin;
 pub mod patterns;
 pub mod pipeline;
 pub mod pipeline_integration;

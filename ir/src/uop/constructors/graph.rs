@@ -208,8 +208,13 @@ impl UOp {
     where
         F: FnOnce(Vec<Arc<Self>>) -> Arc<Self>,
     {
-        let contig_srcs: Vec<Arc<Self>> =
-            srcs.into_iter().map(|x| if matches!(x.op(), Op::After(..)) { x } else { x.contiguous() }).collect();
+        // Materialising an input is the producer's work, not the caller's: the copy
+        // takes the source's origin so every scope that hands over the same node
+        // shares one materialisation instead of minting one per call site.
+        let contig_srcs: Vec<Arc<Self>> = srcs
+            .into_iter()
+            .map(|x| if matches!(x.op(), Op::After(..)) { x } else { x.contiguous().rorigin(x.origin()) })
+            .collect();
 
         let placeholders: Vec<Arc<Self>> = contig_srcs
             .iter()
@@ -222,7 +227,26 @@ impl UOp {
             body = Self::sink_with_info(sources.to_vec(), KernelInfo::default());
         }
         let args = SmallVec::from_vec(contig_srcs.clone());
-        let callable = if is_opaque_call_body(body.op()) { body.call(args, info) } else { body.function(args, info) };
+        let callable = if is_opaque_call_body(body.op()) {
+            // Same contract as the scheduler's kernel cut: the body keys every cache
+            // downstream, so a hand-lowered kernel built once per module must still
+            // hash-cons to one body and attribution moves onto the callable. An
+            // opaque body never reaches `split_store`, so this is its only chance.
+            // A FUNCTION body is inlined by rangeify and cut like any other graph,
+            // so its nodes keep their origins for the cut to harvest.
+            let mut info = info;
+            if crate::origin::any_interned() {
+                let (primary, origins) = body.kernel_attribution();
+                if !origins.is_empty() {
+                    info.origin = info.origin.or(primary);
+                    info.origins.extend(&origins);
+                    body = body.without_origins();
+                }
+            }
+            body.call(args, info)
+        } else {
+            body.function(args, info)
+        };
 
         Ok(contig_srcs.into_iter().map(|s| s.after(SmallVec::from_vec(vec![callable.clone()]))).collect())
     }

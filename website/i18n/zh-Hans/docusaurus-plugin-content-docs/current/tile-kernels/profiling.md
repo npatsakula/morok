@@ -88,10 +88,11 @@ pub struct ProfileOptions {
     pub iters: u32,             // replays; the per-kernel minimum device time is kept
     pub static_analysis: bool,  // Tier 2/3 (flops/bytes/resources) — cheap, on by default
     pub counters: PmcSelection, // Tier 4 hardware counters
+    pub origin_depth: Option<usize>, // origin rollup depth; None keeps the full path
 }
 ```
 
-`ProfileOptions::default()` 即 `{ iters: 1, static_analysis: true, counters: PmcSelection::None }`——第 1–3 层，单趟。想要显式控制就直接构造它：
+`ProfileOptions::default()` 即 `{ iters: 1, static_analysis: true, counters: PmcSelection::None, origin_depth: None }`——第 1–3 层，单趟。想要显式控制就直接构造它：
 
 ```rust
 use svod_runtime::{ProfileOptions, PmcSelection};
@@ -100,6 +101,7 @@ let opts = ProfileOptions {
     iters: 50,
     static_analysis: true,
     counters: PmcSelection::Default, // add Tier 4
+    origin_depth: Some(3), // roll the origin rows up to three frames
 };
 ```
 
@@ -111,6 +113,8 @@ let opts = ProfileOptions {
 |---------|--------|
 | `SVOD_PROFILE_ITERS` | 用于取最小合并的重放次数（钳制为至少 1） |
 | `SVOD_PMC` | 第 4 层的选择：空或 `0` → 关闭；`1` → 默认计数器组；否则为一份逗号分隔的 token 列表（`sqbusy`、`waves`、`valu`） |
+| `SVOD_ORIGIN` | 取 `1` 时记录每个操作构建时所处的作用域（模块路径、调用点、ONNX 节点），见下文 |
+| `SVOD_ORIGIN_DEPTH` | 来源汇总保留的路径段数（`origin_depth`）；未设置或为 `0` 时保留完整路径 |
 
 ```bash
 # Profile with 20 replays and the default hardware counters.
@@ -123,6 +127,30 @@ SVOD_DEVICE=AMD:0 SVOD_PMC=valu,sqbusy ...
 ### 累积取最小
 
 当 `iters > 1` 时（或跨 criterion 的多次调用），profiler **不会**取平均。每一趟都产出一个 `RunProfile`，各趟由 `RunProfile::merge_min` 合并：对每个内核，更快（设备时间最小）的那个样本胜出，并带上*那个*样本的计数器和静态分析。最小值是内核内在开销的稳健估计量——它把调度抖动、争用以及时钟爬升这些会抬高均值的离群点都剔除掉。
+
+## 把内核归属到模型代码 {#attributing-kernels-to-model-code}
+
+`r_128_3_32_4_2_2_2_4_4_192_2` 这样的内核名只说明内核的形状，不说明它服务于哪一层。开启 `SVOD_ORIGIN=1` 后，每个张量操作都会记下自己构建时所处的作用域——`encoder.layers.3.ffn1` 这样的模块路径、公开操作的调用点，或是 ONNX 节点索引——调度器再把这些来源的并集带到每次 dispatch 上。十六个完全相同的层仍然只编译出一个程序，只是 dispatch 十六次，各自带上一份归属。
+
+模型沿着 state-dict 路径打开作用域（`OriginScope::module`），ONNX 导入器为每个节点打开一个，阶段名（`vad`、`encoder`、`ctc_head`）则是根部的标签。手写的 `tk` 内核适用同一条规则：构建它时处于活动状态的作用域就是它的来源。
+
+一次运行带有来源时，`render_table()` 会附加两份汇总：
+
+- **exclusive** 把每次 dispatch 只计一次，记到它的主要来源（产生所存储值的那个作用域）上，因此各行加起来正好是总量；
+- **inclusive** 把每次 dispatch 记到融合进它的每个来源的所有祖先上，因此父行包含子行，各行互相重叠。
+
+两者都截断到 `origin_depth` 段；调用帧（`@ add tensor/src/arithmetic.rs:31`）只作为细节留在内核行里，绝不构成汇总键。在任何作用域之外构建的内核落到 `<unattributed>` 行。深度记录在 `RunProfile` 上，因此 `render_table()`、`Display` 和 `to_json()` 都按该 profile 产出时的深度截断（`SVOD_ORIGIN_DEPTH` 也算在内）；要另选深度就用 `render_table_at(d)` / `to_json_at(d)`。
+
+```
+origin rollup (depth 3, exclusive; rows sum to the total):
+  total ms  count    mean µs      %  origin path
+    23.045      2    11522.6    5.3  ctc_head.GigaAmCtcJit.subsampling
+     8.231      3     2743.7    1.9  ctc_head.GigaAmCtcJit.layers.6
+```
+
+`RunProfile::to_json()` 导出三部分：内核行（每行在渲染好的路径旁还带上原始的 `origin_id` / `origin_ids`）、两份汇总，以及这些 id 能触及的那些 arena 条目，形如 `{ id, parent, frame }`——这样既能离线还原路径，又不必把整个进程级 arena 塞进文件。`gigaam_infer --profile-json out.json --origin-depth 3` 就会写出这样一个文件。
+
+开启捕获会改变节点身份：不同作用域下构建的两个相同子图，在内核切分之前不再合并。内核程序不受影响，但那种在每个调用点重建同一表达式的辅助函数应放在 `OriginScope::suspend()` 下运行，或者直接给它传入已经物化好的输入。
 
 ---
 

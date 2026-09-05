@@ -1,6 +1,21 @@
+use std::panic::Location;
+
 use snafu::ResultExt;
+use svod_ir::origin::OriginScope;
 
 use super::*;
+
+/// The op name behind a `try_*` entry point, resolved at compile time so a call
+/// frame reads `add` rather than `try_add`.
+const fn op_name(name: &'static str) -> &'static str {
+    match name.as_bytes() {
+        [b't', b'r', b'y', b'_', rest @ ..] => match std::str::from_utf8(rest) {
+            Ok(rest) => rest,
+            Err(_) => name,
+        },
+        _ => name,
+    }
+}
 
 /// Unified macro for implementing Tensor operations.
 ///
@@ -18,6 +33,8 @@ macro_rules! impl_tensor_ops {
         $(
             #[track_caller]
             pub fn $bin_method(&self, other: &Tensor) -> Result<Tensor> {
+                let _origin = OriginScope::outer_call(op_name(stringify!($bin_method)), Location::caller());
+
                 // Broadcast tensors to common shape
                 let (lhs, rhs) = self.broadcast_for_binop(other)?;
 
@@ -30,6 +47,7 @@ macro_rules! impl_tensor_ops {
         $(
             #[track_caller]
             pub fn $inf_method(&self) -> Result<Tensor> {
+                let _origin = OriginScope::outer_call(op_name(stringify!($inf_method)), Location::caller());
                 Ok(Self::new(self.uop().$inf_uop()))
             }
         )*
@@ -38,6 +56,7 @@ macro_rules! impl_tensor_ops {
         $(
             #[track_caller]
             pub fn $fall_method(&self) -> Result<Tensor> {
+                let _origin = OriginScope::outer_call(op_name(stringify!($fall_method)), Location::caller());
                 self.uop().$fall_uop().map(Self::new).context(UOpSnafu)
             }
         )*
@@ -94,7 +113,9 @@ impl Tensor {
     /// let nums = Tensor::from_slice(&[0.0f32, 1.0, 2.0]);
     /// let result = nums.logical_not()?;  // [true, false, false]
     /// ```
+    #[track_caller]
     pub fn logical_not(&self) -> Result<Tensor> {
+        origin_call!("logical_not");
         use svod_dtype::DType;
 
         // Cast to bool (non-zero becomes true)
@@ -130,7 +151,10 @@ impl Tensor {
     /// # Errors
     ///
     /// Returns error if called on non-integer dtype.
+    #[track_caller]
     pub fn bitwise_not(&self) -> Result<Tensor> {
+        origin_call!("bitwise_not");
+
         // Verify dtype is integer
         let dtype = self.uop().dtype();
         if !dtype.is_int() {

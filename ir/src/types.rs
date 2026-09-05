@@ -520,14 +520,19 @@ pub struct ContiguousHint {
 
 /// Metadata payload carried by CALL operations.
 ///
-/// `grad_tag` is a placeholder for future gradient callback identity;
-/// `metadata` carries stable, cache-key-safe call annotations.
+/// `grad_tag` is a placeholder for future gradient callback identity; the origin
+/// fields are the kernel's attribution, harvested at the kernel cut from the nodes
+/// that were folded into the body. They live here rather than on the body SINK
+/// because the CALL is per dispatch while the body keys every kernel cache.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct CallInfo {
     pub grad_tag: Option<String>,
-    pub metadata: Vec<String>,
+    /// Origin of the stored value's root — what the kernel is charged to.
+    pub origin: Option<crate::origin::OriginId>,
+    /// Every origin reachable in the body before it was stripped.
+    pub origins: crate::origin::OriginSet,
     pub name: Option<String>,
     pub precompile: bool,
     pub precompile_backward: bool,

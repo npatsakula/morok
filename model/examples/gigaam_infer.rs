@@ -16,6 +16,8 @@
 //!   cargo run -p svod-model --release --example gigaam_infer -- audio.wav --encoder-dtype int8
 //!   cargo run -p svod-model --release --example gigaam_infer -- audio.wav --encoder-dtype fp8
 //!   cargo run -p svod-model --release --example gigaam_infer -- audio.wav --rnnt --profile
+//!   SVOD_ORIGIN=1 cargo run -p svod-model --release --example gigaam_infer -- \
+//!     audio.wav --profile --origin-depth 3 --profile-json profile.json
 //!
 //! Env knobs (all optional):
 //!   SVOD_VAD_THRESHOLD=f       FireRedVAD speech threshold (default 0.4).
@@ -61,6 +63,18 @@ struct Args {
     /// Collect and print the typed per-stage GPU profile.
     #[arg(long)]
     profile: bool,
+
+    /// Write the full profile (stages, kernel rows, origin rollups and the
+    /// origin arena) as JSON. Implies --profile collection; set SVOD_ORIGIN=1
+    /// for the rollups to carry scopes.
+    #[arg(long, value_name = "PATH")]
+    profile_json: Option<PathBuf>,
+
+    /// Roll origin paths up to this many outermost frames (default:
+    /// `SVOD_ORIGIN_DEPTH`, else the full module path). Call frames are never a
+    /// rollup level.
+    #[arg(long, value_name = "N")]
+    origin_depth: Option<usize>,
 
     /// SDPA scores buffer budget (MiB).
     #[arg(long, default_value_t = 256)]
@@ -156,8 +170,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t_transcribe = Instant::now();
     // VAD split → arch pipeline machinery (decode windows → crop → stitch),
     // with the VAD stage folded into the profile.
-    let result =
-        asr.transcribe(&waveform, RunOptions { words: args.timestamps, profile: args.profile, ..Default::default() })?;
+    let profile = args.profile || args.profile_json.is_some();
+    let result = asr.transcribe(&waveform, RunOptions { words: args.timestamps, profile, ..Default::default() })?;
     let dt_transcribe = t_transcribe.elapsed();
 
     if args.timestamps {
@@ -175,7 +189,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if let Some(profile) = &result.profile {
-        println!("\n--- Profile ---\n{profile}");
+        // `--origin-depth` wins; otherwise the depth the profile was produced at,
+        // falling back to `SVOD_ORIGIN_DEPTH` for profiles assembled stage by
+        // stage rather than through `ExecutionPlan::profile`.
+        let depth = args
+            .origin_depth
+            .or(profile.origin_depth)
+            .or_else(|| svod_runtime::ProfileOptions::from_env().origin_depth);
+        if args.profile {
+            println!("\n--- Profile ---\n{}", profile.render_report_at(depth));
+        }
+        if let Some(path) = &args.profile_json {
+            std::fs::write(path, profile.to_json_at(depth))?;
+            println!("Profile JSON: {}", path.display());
+        }
     }
 
     println!("\n--- Transcript ---\n{}", result.text);

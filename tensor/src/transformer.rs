@@ -20,7 +20,9 @@ impl Tensor {
     /// — no flatten-to-`[-1]` — so a symbolic dim on `indices` (e.g. a JIT
     /// batch bound to a `Variable`) passes through. Only the vocab axis
     /// (weight dim 0) must be concrete.
+    #[track_caller]
     pub fn embedding(&self, indices: &Tensor) -> Result<Tensor> {
+        origin_call!("embedding");
         let weight_shape = self.shape()?;
         let vocab_size =
             weight_shape[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "embedding" })?;
@@ -57,7 +59,9 @@ impl Tensor {
     /// `cos`, `sin`: broadcastable to `self`'s shape `[..., rot_dim/2]`.
     /// If interleaved: pairs are (even, odd) indices.
     /// If not interleaved: pairs are (first_half, second_half).
+    #[track_caller]
     pub fn apply_rotary_emb(&self, cos: &Tensor, sin: &Tensor, interleaved: bool) -> Result<Tensor> {
+        origin_call!("apply_rotary_emb");
         let shape = self.shape()?;
         let last_dim = shape
             .last()
@@ -116,6 +120,7 @@ impl Tensor {
     /// intersected with any causal mask and the boolean `attn_mask` (when the
     /// latter encodes padding).
     #[builder]
+    #[track_caller]
     pub fn scaled_dot_product_attention(
         &self,
         key: &Tensor,
@@ -126,6 +131,7 @@ impl Tensor {
         window: Option<(usize, usize)>,
         softcap: Option<f64>,
     ) -> Result<Tensor> {
+        origin_call!("scaled_dot_product_attention");
         let q_dtype = self.uop().dtype();
         ensure!(
             q_dtype.is_float(),

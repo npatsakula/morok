@@ -28,7 +28,9 @@ impl Tensor {
     /// Uniform `[low, high)` random tensor, float32, on the default (CPU) device.
     ///
     /// Convenience wrapper around [`Tensor::uniform_with_dtype`] with f32 output.
+    #[track_caller]
     pub fn uniform(shape: &[usize], low: f64, high: f64) -> Result<Tensor> {
+        origin_call!("uniform");
         Self::uniform_with_dtype(shape, low, high, DType::Float32)
     }
 
@@ -38,7 +40,9 @@ impl Tensor {
     /// to the target dtype**, then adds `low`. Casting before the offset
     /// keeps the addition honest in low-precision targets (f16/bf16) where
     /// `low` might otherwise be lost to rounding if applied at f32.
+    #[track_caller]
     pub fn uniform_with_dtype(shape: &[usize], low: f64, high: f64, dtype: DType) -> Result<Tensor> {
+        origin_call!("uniform");
         if low >= high {
             return Err(Error::ParamRange {
                 op: "Tensor::uniform",
@@ -59,7 +63,9 @@ impl Tensor {
     /// Each output element draws from two `[0, 1)` uniforms via one combined
     /// `rand([2, *shape])` call, so the RNG counter advances exactly once per
     /// `randn` invocation regardless of `shape`.
+    #[track_caller]
     pub fn randn(shape: &[usize]) -> Result<Tensor> {
+        origin_call!("randn");
         // src = rand([2, *shape])  →  one counter advance for two halves.
         let mut combined_shape: Vec<usize> = Vec::with_capacity(shape.len() + 1);
         combined_shape.push(2);
@@ -87,7 +93,9 @@ impl Tensor {
     }
 
     /// Normal `N(mean, std)` random tensor. Requires `std >= 0`.
+    #[track_caller]
     pub fn normal(shape: &[usize], mean: f64, std: f64) -> Result<Tensor> {
+        origin_call!("normal");
         if std < 0.0 {
             return Err(Error::ParamRange {
                 op: "Tensor::normal",
@@ -108,7 +116,9 @@ impl Tensor {
     /// Casting after the add would truncate-toward-zero asymmetrically for
     /// negative `low` (e.g. `low=-3, rand≈0.005` would yield `-2` instead of
     /// the correct `-3`).
+    #[track_caller]
     pub fn randint(shape: &[usize], low: i64, high: i64) -> Result<Tensor> {
+        origin_call!("randint");
         if low >= high {
             return Err(Error::ParamRange {
                 op: "Tensor::randint",
@@ -125,7 +135,9 @@ impl Tensor {
     }
 
     /// `uniform(-1, 1) · prod(shape)^(-½)`. Same dtype contract as `uniform`.
+    #[track_caller]
     pub fn scaled_uniform(shape: &[usize]) -> Result<Tensor> {
+        origin_call!("scaled_uniform");
         let numel: usize = shape.iter().copied().product::<usize>().max(1);
         let scale = (numel as f64).powf(-0.5);
         let u = Tensor::uniform(shape, -1.0, 1.0)?;
@@ -134,13 +146,17 @@ impl Tensor {
     }
 
     /// Glorot/Xavier uniform initializer, float32 output.
+    #[track_caller]
     pub fn glorot_uniform(shape: &[usize]) -> Result<Tensor> {
+        origin_call!("glorot_uniform");
         Self::glorot_uniform_with_dtype(shape, DType::Float32)
     }
 
     /// Glorot/Xavier uniform initializer with explicit dtype.
     /// `bound = √(6 / (shape[0] + prod(shape[1..]))); uniform(-bound, bound)`.
+    #[track_caller]
     pub fn glorot_uniform_with_dtype(shape: &[usize], dtype: DType) -> Result<Tensor> {
+        origin_call!("glorot_uniform");
         if shape.is_empty() {
             return Err(Error::ParamRange {
                 op: "Tensor::glorot_uniform",
@@ -156,7 +172,9 @@ impl Tensor {
     }
 
     /// Kaiming/He uniform initializer for ReLU-family activations, float32 output.
+    #[track_caller]
     pub fn kaiming_uniform(shape: &[usize], a: f64) -> Result<Tensor> {
+        origin_call!("kaiming_uniform");
         Self::kaiming_uniform_with_dtype(shape, a, DType::Float32)
     }
 
@@ -167,7 +185,9 @@ impl Tensor {
     /// `a` is the negative slope of the activation:
     /// - `0.0` — plain ReLU (PyTorch default).
     /// - `0.01` — leaky-ReLU with default slope.
+    #[track_caller]
     pub fn kaiming_uniform_with_dtype(shape: &[usize], a: f64, dtype: DType) -> Result<Tensor> {
+        origin_call!("kaiming_uniform");
         if shape.is_empty() {
             return Err(Error::ParamRange {
                 op: "Tensor::kaiming_uniform",
@@ -182,7 +202,9 @@ impl Tensor {
 
     /// Kaiming/He normal initializer for ReLU-family activations.
     /// `std = √(2 / ((1 + a²) · prod(shape[1..]))); randn · std`.
+    #[track_caller]
     pub fn kaiming_normal(shape: &[usize], a: f64) -> Result<Tensor> {
+        origin_call!("kaiming_normal");
         if shape.is_empty() {
             return Err(Error::ParamRange {
                 op: "Tensor::kaiming_normal",

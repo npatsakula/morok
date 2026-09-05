@@ -9,6 +9,7 @@
 //! - [`op`] - Operation enum defining all IR operations
 //! - [`uop`] - UOp (micro-operation) struct and implementation
 //! - [`uop::constructors`] - UOp constructor methods by semantic category
+//! - [`origin`] - Hierarchical origin tracking for IR nodes
 //! - [`indexing`] - Multi-dimensional indexing support
 //! - [`error`] - Error types and result handling
 //! - [`shape`] - Shape inference utilities
@@ -22,16 +23,14 @@ pub mod decompositions;
 pub mod dtype_rule;
 pub mod error;
 pub mod indexing;
-pub mod kernel_info;
 pub mod op;
 pub mod opt;
+pub mod origin;
 pub mod prelude;
 pub mod shape;
 pub mod sint;
 pub mod types;
 pub mod uop;
-
-pub mod provenance;
 
 #[macro_use]
 pub mod pattern;
@@ -46,6 +45,7 @@ pub use error::{Error, IndexTypeMismatchSnafu, Result};
 pub use indexing::IndexSpec;
 pub use op::{Op, ops};
 pub use opt::{Opt, OptArg, OptOps};
+pub use origin::{Origin, OriginFrame, OriginId, OriginScope, OriginSet, SourceLocation};
 pub use sint::{IntoShrinkRange, SInt, ShrinkRange, sint_max, sint_min, sint_prod};
 pub use types::{
     AddrSpace, AxisId, AxisType, BINARY_STAGE_IDENTITY_VERSION, BinaryOp, BinaryStageIdentity, BufferizeOpts, CallInfo,

@@ -11,6 +11,7 @@ fn cfg() -> PrepareConfig {
 /// after normalization (the key property that enables kernel caching).
 #[test]
 fn test_same_shape_same_hash() {
+    let _structural = svod_ir::origin::capture_for_thread(false);
     svod_schedule::testing::setup_test_tracing();
     let cfg = cfg();
 
@@ -69,6 +70,7 @@ fn test_repeated_realize_correct() {
 
 #[test]
 fn test_prepare_with_reuses_same_schedule_cache_entry() {
+    let _structural = svod_ir::origin::capture_for_thread(false);
     crate::test::helpers::test_setup();
     let cfg = cfg();
 
@@ -142,6 +144,7 @@ fn test_resolve_codegen_skips_disk_buffers() {
 
 #[test]
 fn test_prepare_batch_with_reuses_same_schedule_cache_entry() {
+    let _structural = svod_ir::origin::capture_for_thread(false);
     crate::test::helpers::test_setup();
     let cfg = cfg();
 
@@ -197,6 +200,7 @@ fn test_repeated_matmul_correct() {
 /// Verify that different bind values normalize to same schedule cache key.
 #[test]
 fn test_different_bind_values_same_hash() {
+    let _structural = svod_ir::origin::capture_for_thread(false);
     svod_schedule::testing::setup_test_tracing();
     let cfg = cfg();
 
@@ -219,6 +223,7 @@ fn test_different_bind_values_same_hash() {
 
 #[test]
 fn test_prepare_with_bind_reuses_same_schedule_cache_entry() {
+    let _structural = svod_ir::origin::capture_for_thread(false);
     crate::test::helpers::test_setup();
     let cfg = cfg();
 
@@ -252,6 +257,7 @@ fn test_prepare_with_bind_reuses_same_schedule_cache_entry() {
 
 #[test]
 fn test_rebind_realize_with_cache_hit_keeps_bound_values() {
+    let _structural = svod_ir::origin::capture_for_thread(false);
     crate::test::helpers::test_setup();
     let cfg = cfg();
     let n = Variable::new("N", 1, 16);

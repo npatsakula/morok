@@ -12,6 +12,7 @@ use smallvec::SmallVec;
 
 use crate::op::Op;
 use crate::ops;
+use crate::origin::OriginId;
 use crate::pattern::{Matcher, RewriteResult};
 use crate::shape;
 use crate::types::ConstValue;
@@ -190,6 +191,12 @@ pub struct UOp {
     /// - `Some([i])` — single index (assigned by add_tags)
     /// - `Some([i, j, ...])` — merged indices (from buffer folding)
     pub tag: Option<SmallVec<[usize; 2]>>,
+    /// Scope this node was built under (see [`crate::origin`]).
+    ///
+    /// Unlike `tag` it participates in `content_hash`, so a cache keyed on the
+    /// content hash can never serve one scope's plan to another. `None` while
+    /// capture is off, which makes hashes identical to an origin-free build.
+    pub(crate) origin: Option<OriginId>,
     /// Optional metadata attached to this UOp.
     ///
     /// Metadata is NOT part of hash consing - attaching metadata creates a new UOp
@@ -246,12 +253,53 @@ impl UOp {
         if self.tag == tag {
             return self.clone();
         }
-        Self::new_tagged(self.op.clone(), self.dtype.clone(), tag)
+        Self::new_with_origin(self.op.clone(), self.dtype.clone(), tag, self.origin)
     }
 
     /// Create a new UOp with the given tag set.
     pub fn with_tag(self: &Arc<Self>, tag: SmallVec<[usize; 2]>) -> Arc<Self> {
         self.rtag(Some(tag))
+    }
+
+    /// Get the origin scope this node was built under.
+    #[inline]
+    pub fn origin(&self) -> Option<OriginId> {
+        self.origin
+    }
+
+    /// Re-intern this node under `origin`. Returns self unchanged when equal.
+    pub fn rorigin(self: &Arc<Self>, origin: Option<OriginId>) -> Arc<Self> {
+        if self.origin == origin {
+            return self.clone();
+        }
+        Self::new_with_origin(self.op.clone(), self.dtype.clone(), self.tag.clone(), origin)
+    }
+
+    /// What a kernel rooted here is charged to, in one pass: the nearest attributed
+    /// node walking root-first (the toposort is children-first, so it is consumed in
+    /// reverse), and every origin the body carries.
+    pub fn kernel_attribution(self: &Arc<Self>) -> (Option<OriginId>, crate::origin::OriginSet) {
+        let body = self.toposort();
+        (body.iter().rev().find_map(|node| node.origin()), body.iter().filter_map(|node| node.origin()).collect())
+    }
+
+    /// Rebuild this tree with every origin cleared.
+    ///
+    /// A kernel body keys the optimizer, BEAM, the compiled-program and the object
+    /// cache, so attribution rides the callable instead: two dispatches of the same
+    /// computation from different scopes must still share one compiled program.
+    /// Nodes whose sources are unchanged and that carry no origin are returned
+    /// as-is, so an already origin-free tree hash-conses back to itself.
+    pub fn without_origins(self: &Arc<Self>) -> Arc<Self> {
+        let mut rebuilt: HashMap<u64, Arc<Self>> = HashMap::new();
+        for node in self.toposort() {
+            let children = node.op().children();
+            let sources: Vec<Arc<Self>> = children.iter().map(|child| rebuilt[&child.id].clone()).collect();
+            let moved = children.iter().zip(&sources).any(|(old, new)| !Arc::ptr_eq(old, new));
+            let stripped = if moved { node.with_sources(sources) } else { node.clone() };
+            rebuilt.insert(node.id, stripped.rorigin(None));
+        }
+        rebuilt.remove(&self.id).expect("toposort ends at the root")
     }
 
     /// Check if this UOp has a concrete buffer identity in the graph.
@@ -362,7 +410,7 @@ impl UOp {
         if self.dtype == dtype {
             return self.clone();
         }
-        Self::new(self.op.clone(), dtype)
+        Self::new_with_origin(self.op.clone(), dtype, None, self.origin)
     }
 
     /// Walk through AFTER nodes to get the passthrough value.
@@ -1426,7 +1474,7 @@ impl UOp {
         } else {
             crate::dtype_from_op(&new_op).unwrap_or_else(|| self.dtype.clone())
         };
-        Self::new_tagged(new_op, dtype, self.tag.clone())
+        Self::new_with_origin(new_op, dtype, self.tag.clone(), self.origin)
     }
 }
 
@@ -1478,11 +1526,12 @@ fn visited_set(capacity: usize) -> rustc_hash::FxHashSet<*const UOp> {
 }
 
 impl UOp {
-    /// Allocate a node with a fresh id; interning and provenance are the caller's job.
+    /// Allocate a node with a fresh id; interning is the caller's job.
     pub(crate) fn fresh(
         op: Op,
         dtype: DType,
         tag: Option<SmallVec<[usize; 2]>>,
+        origin: Option<OriginId>,
         content_hash: u64,
         src_ops: crate::op::OpMask,
         metadata: Option<Arc<dyn std::any::Any + Send + Sync>>,
@@ -1494,6 +1543,7 @@ impl UOp {
             content_hash,
             src_ops,
             tag,
+            origin,
             metadata,
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),

@@ -442,10 +442,10 @@ fn test_call_constructor_and_with_sources() {
 
     let info = CallInfo {
         grad_tag: Some("grad_add".to_string()),
-        metadata: vec!["tag0".to_string()],
         name: Some("call_add".to_string()),
         precompile: true,
         precompile_backward: false,
+        ..Default::default()
     };
     let call = body.call(smallvec![a.clone(), b.clone()], info.clone());
 
@@ -483,10 +483,10 @@ fn test_function_constructor_with_sources_shape_and_hash() {
 
     let info = CallInfo {
         grad_tag: Some("grad_fn".to_string()),
-        metadata: vec!["m0".to_string()],
         name: Some("fn_add".to_string()),
         precompile: true,
         precompile_backward: true,
+        ..Default::default()
     };
     let function = body.function(smallvec![a.clone(), b.clone()], info.clone());
 

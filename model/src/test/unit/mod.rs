@@ -10,6 +10,7 @@ mod jit;
 mod jit_recurrent;
 mod mel;
 mod modernbert;
+mod origin;
 mod qwen3;
 mod remap;
 mod resnet;

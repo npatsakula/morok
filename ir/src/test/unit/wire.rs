@@ -69,11 +69,7 @@ fn optimizer_wire_roundtrips_reduce_symbolic_wmma_multi_and_calls() {
         Op::Function(ops::Function {
             body: UOp::new(Op::Tuple(ops::Tuple { src: smallvec![wmma.clone(), reduce] }), DType::Void),
             args: smallvec![param.clone()],
-            info: Box::new(CallInfo {
-                name: Some("inner".into()),
-                metadata: vec!["exact".into()],
-                ..Default::default()
-            }),
+            info: Box::new(CallInfo { name: Some("inner".into()), ..Default::default() }),
         }),
         DType::Void,
     );

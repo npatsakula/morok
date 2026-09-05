@@ -14,7 +14,7 @@ Svod एक Rust-आधारित ML कम्पाइलर है जो [T
 |---------|-------|
 | **डिक्लेरेटिव ऑप्टिमाइज़ेशन** | Z3-सत्यापित शुद्धता के साथ ग्राफ़ रीराइट्स के लिए `patterns!` DSL |
 | **Lazy इवैल्यूएशन** | Tensor कम्प्यूटेशन ग्राफ़ बनाते हैं, कम्पाइल केवल `realize()` पर होता है |
-| **प्रोवेनेंस ट्रैकिंग** | `#[track_caller]` हर UOp को सोर्स लोकेशन तक ट्रेस करता है |
+| **Origin ट्रैकिंग** | scopes हर कर्नेल को उसके module path, call site या ONNX node से जोड़ते हैं |
 | **80+ IR ऑपरेशन** | अरिथमेटिक, मेमोरी, कंट्रोल फ़्लो, WMMA tensor cores |
 | **20+ ऑप्टिमाइज़ेशन** | कॉन्स्टेंट फ़ोल्डिंग, tensor cores, वेक्टराइज़ेशन, लूप अनरोलिंग |
 
@@ -26,7 +26,7 @@ Svod एक Rust-आधारित ML कम्पाइलर है जो [T
 |-------|-------|
 | [dtype](https://github.com/npatsakula/svod/tree/main/dtype/) | टाइप सिस्टम: scalars, vectors, pointers, images |
 | [macros](https://github.com/npatsakula/svod/tree/main/macros/) | प्रोसीज़रल मैक्रोज़ (`patterns!` DSL) |
-| [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp ग्राफ़ IR: 80+ ops, symbolic integers, प्रोवेनेंस |
+| [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp ग्राफ़ IR: 80+ ops, symbolic integers, origins |
 | [device](https://github.com/npatsakula/svod/tree/main/device/) | बफ़र मैनेजमेंट: lazy alloc, zero-copy views, LRU कैशिंग |
 | [schedule](https://github.com/npatsakula/svod/tree/main/schedule/) | ऑप्टिमाइज़ेशन इंजन: 20+ पासेज़, RANGEIFY, Z3 वेरिफ़िकेशन |
 | [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | कोड जनरेशन: Clang (डिफ़ॉल्ट), LLVM JIT |

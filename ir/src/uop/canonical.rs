@@ -14,7 +14,7 @@ use crate::ops;
 use crate::{AxisId, BinaryOp, ConstValue, Op, SInt, TernaryOp, UOp};
 
 /// Version of the canonical graph schema.
-pub const CANONICAL_SCHEMA_VERSION: u32 = 6;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 7;
 
 /// Canonical graph representation used by cross-implementation parity tests.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -35,6 +35,9 @@ pub struct CanonicalVerboseNode {
     pub runtime_id: u64,
     pub tag: String,
     pub backend_dtype: String,
+    /// Rendered origin path, absent when the node carries no origin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_xxh64: Option<String>,
 }
@@ -277,6 +280,7 @@ impl CanonicalGraph {
                     runtime_id: node.id,
                     tag: format!("{:?}", node.tag()),
                     backend_dtype: format!("{:?}", node.dtype()),
+                    origin: node.origin().map(crate::origin::path),
                     content_xxh64: match node.op() {
                         Op::ProgramBinary(ops::ProgramBinary { bytes, .. }) => {
                             Some(format!("0x{:016x}", xxhash_rust::xxh64::xxh64(bytes, 0)))
@@ -667,7 +671,10 @@ fn canonical_arg(node: &Arc<UOp>, ids: &FxHashMap<u64, usize>, verbose: bool) ->
             }
             CanonicalArg::Call {
                 grad_tag: None,
-                metadata: info.metadata.clone(),
+                // Svod has no equivalent of Tinygrad's call `aux` strings, and origins
+                // are deliberately absent from the parity form (per-node origins are
+                // rendered in the verbose form instead).
+                metadata: Vec::new(),
                 name: info.name.clone(),
                 precompile: info.precompile,
                 precompile_backward: info.precompile_backward,

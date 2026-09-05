@@ -25,6 +25,7 @@ use smallvec::SmallVec;
 
 use crate::op::Op;
 use crate::ops;
+use crate::origin::{self, OriginId};
 use crate::uop::core::UOp;
 use svod_dtype::DType;
 
@@ -50,13 +51,53 @@ pub(crate) fn next_uop_id() -> u64 {
     UOP_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Structural hash of `(dtype, op)`: children contribute their own content hash,
-/// so the value is deterministic across runs and independent of interning order.
-fn content_hash(op: &Op, dtype: &DType) -> u64 {
+/// Structural hash of `(dtype, op, origin)`: children contribute their own content
+/// hash, so the value is deterministic across runs and independent of interning
+/// order. The origin is mixed in only when present, so an origin-free graph hashes
+/// exactly as it did before origins existed.
+fn content_hash(op: &Op, dtype: &DType, origin: Option<OriginId>) -> u64 {
     let mut h = xxhash_rust::xxh64::Xxh64::new(0);
     dtype.hash(&mut h);
     op.hash(&mut h);
+    if let Some(origin) = origin {
+        h.write_u32(origin.get());
+    }
     h.finish()
+}
+
+/// Ops an origin must never split.
+///
+/// BUFFER/PARAM/UNIQUE/LUNIQUE are identities rather than structures: buffer ids key
+/// the realize/tensor tables and PARAM positions key kernel dedup.
+///
+/// CONST is the one *value* here. A literal is the only node two scopes build
+/// independently yet identically — every other node is distinguished by its
+/// operands, which already carry the scope that produced them. Splitting a literal
+/// buys no attribution (a constant costs nothing to execute) and defeats every
+/// structural-equality rewrite, `WHERE(_, t, t) -> t` among them. That matters
+/// beyond code quality: the kernel cut re-merges the split literals with
+/// `without_origins`, so a rewrite the pre-cut passes could not see fires after the
+/// CALL ABI is fixed and drops a PARAM the CALL still binds.
+///
+/// Structural nodes join them: shape stacks (a child of every BUFFER and PARAM,
+/// so a variable built in two scopes would otherwise become two variables),
+/// variable bindings, vector constants, and index-typed arithmetic, which is
+/// shape algebra rather than work a kernel performs.
+fn origin_opaque(op: &Op, dtype: &DType) -> bool {
+    matches!(
+        op,
+        Op::Buffer(..)
+            | Op::Param(..)
+            | Op::Unique(..)
+            | Op::LUnique(..)
+            | Op::Const(..)
+            | Op::VConst(..)
+            | Op::Stack(..)
+            | Op::Bind(..)
+            | Op::DefineVar(..)
+            | Op::Noop
+    ) || *dtype == DType::Index
+        || *dtype == DType::WeakInt
 }
 
 /// Table hash: the content hash mixed with the tag, which participates in
@@ -127,7 +168,7 @@ impl PartialEq for InternKey {
 impl Eq for InternKey {}
 
 fn same_structure(a: &UOp, b: &UOp) -> bool {
-    a.dtype == b.dtype && a.tag == b.tag && a.op == b.op
+    a.dtype == b.dtype && a.tag == b.tag && a.origin() == b.origin() && a.op == b.op
 }
 
 /// Lookup probe for a candidate that has not been allocated yet.
@@ -136,6 +177,7 @@ struct Probe<'a> {
     op: &'a Op,
     dtype: &'a DType,
     tag: &'a Tag,
+    origin: Option<OriginId>,
 }
 
 impl Hash for Probe<'_> {
@@ -147,7 +189,9 @@ impl Hash for Probe<'_> {
 
 impl Equivalent<InternKey> for Probe<'_> {
     fn equivalent(&self, key: &InternKey) -> bool {
-        key.node.upgrade().is_some_and(|node| node.dtype == *self.dtype && node.tag == *self.tag && node.op == *self.op)
+        key.node.upgrade().is_some_and(|node| {
+            node.dtype == *self.dtype && node.tag == *self.tag && node.origin() == self.origin && node.op == *self.op
+        })
     }
 }
 
@@ -197,15 +241,20 @@ impl UOp {
     /// This function is thread-safe. Creating the same UOp from different threads
     /// will return the same `Arc<UOp>`, so `Arc::ptr_eq` works across threads.
     #[inline]
-    #[track_caller]
     pub fn new(op: Op, dtype: DType) -> Arc<Self> {
         Self::new_tagged(op, dtype, None)
     }
 
     /// Create a UOp with an explicit tag (Tinygrad: `UOp(op, dtype, src, arg, tag)`).
     /// Tag participates in hash consing — same structure + different tag = different UOp.
-    #[track_caller]
+    #[inline]
     pub fn new_tagged(op: Op, dtype: DType, tag: Tag) -> Arc<Self> {
+        Self::new_with_origin(op, dtype, tag, origin::current())
+    }
+
+    /// Create a UOp under an explicit origin instead of the ambient scope. Rewrites
+    /// use this to carry a node's origin across a rebuild.
+    pub fn new_with_origin(op: Op, dtype: DType, tag: Tag, origin: Option<OriginId>) -> Arc<Self> {
         use papaya::{Compute, Operation};
 
         if let Op::Load(ops::Load { index, alt, gate }) = &op {
@@ -217,16 +266,14 @@ impl UOp {
             }
         }
 
-        let caller_location = std::panic::Location::caller();
-        let content_hash = content_hash(&op, &dtype);
+        let origin = origin.filter(|_| !origin_opaque(&op, &dtype));
+        let content_hash = content_hash(&op, &dtype, origin);
         let hash = intern_hash(content_hash, &tag);
         let guard = uops().guard();
 
-        // Fast path: a live structurally equal node already exists.
-        // No provenance capture here: an interning hit returns a node that already
-        // has its `Created` event, and this branch is the majority of the ~1M
-        // `UOp::new` calls in one resnet50 schedule.
-        if let Some((key, _)) = uops().get_key_value(&Probe { hash, op: &op, dtype: &dtype, tag: &tag }, &guard)
+        // Fast path: a live structurally equal node already exists. This branch is
+        // the majority of the ~1M `UOp::new` calls in one resnet50 schedule.
+        if let Some((key, _)) = uops().get_key_value(&Probe { hash, op: &op, dtype: &dtype, tag: &tag, origin }, &guard)
             && let Some(arc) = key.node.upgrade()
         {
             return arc;
@@ -235,7 +282,7 @@ impl UOp {
         let mut src_ops = crate::op::OpMask::EMPTY;
         op.map_child(|child| src_ops = src_ops.union(crate::op::OpMask::of_op(child.op())));
 
-        let new_arc = Arc::new(Self::fresh(op, dtype, tag, content_hash, src_ops, None));
+        let new_arc = Arc::new(Self::fresh(op, dtype, tag, origin, content_hash, src_ops, None));
         let result = uops().compute(
             InternKey { hash, node: Arc::downgrade(&new_arc) },
             |entry| match entry.and_then(|(existing, _)| existing.node.upgrade()) {
@@ -245,14 +292,10 @@ impl UOp {
             &guard,
         );
 
-        let final_arc = match result {
+        match result {
             Compute::Aborted(existing) => existing,
             _ => new_arc,
-        };
-
-        crate::provenance::record_created(final_arc.id, caller_location);
-
-        final_arc
+        }
     }
 
     /// Attach metadata to this UOp, creating a new instance.
@@ -287,6 +330,7 @@ impl UOp {
             self.op.clone(),
             self.dtype.clone(),
             self.tag.clone(),
+            self.origin,
             self.content_hash,
             self.src_ops,
             Some(metadata),

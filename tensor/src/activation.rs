@@ -24,7 +24,9 @@ impl Tensor {
     /// let y = x.relu()?;
     /// // y = [0.0, 0.0, 0.0, 1.0, 2.0]
     /// ```
+    #[track_caller]
     pub fn relu(&self) -> Result<Self> {
+        origin_call!("relu");
         let zero = self.zero()?;
         let condition = self.try_gt(&zero)?;
         self.where_(&condition, &zero)
@@ -40,7 +42,9 @@ impl Tensor {
     /// let y = x.sigmoid()?;
     /// // y ≈ [0.119, 0.268, 0.5, 0.731, 0.880]
     /// ```
+    #[track_caller]
     pub fn sigmoid(&self) -> Result<Self> {
+        origin_call!("sigmoid");
         // sigmoid(x) = 1 / (1 + exp(-x)) = 1 / (1 + 2^(-x/ln2))
         // Using exp2 matches Tinygrad's implementation for better hardware mapping.
         let scale = self.broadcast_scalar(ConstValue::Float(-1.0 / std::f64::consts::LN_2))?;
@@ -62,7 +66,9 @@ impl Tensor {
     /// let y = x.tanh()?;
     /// // y ≈ [-0.964, -0.762, 0.0, 0.762, 0.964]
     /// ```
+    #[track_caller]
     pub fn tanh(&self) -> Result<Self> {
+        origin_call!("tanh");
         // Check if tanh is a UOp primitive
         // tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
         // Or: tanh(x) = 2*sigmoid(2x) - 1
@@ -88,7 +94,9 @@ impl Tensor {
     /// let probs = logits.softmax(-1)?;
     /// // sum(probs) = 1.0, probs[i] > 0 for all i
     /// ```
+    #[track_caller]
     pub fn softmax(&self, axis: impl Into<AxisSpec>) -> Result<Self> {
+        origin_call!("softmax");
         let axis = axis.into();
 
         // softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))
@@ -116,7 +124,9 @@ impl Tensor {
     /// let log_probs = logits.log_softmax(-1)?;
     /// // More numerically stable than logits.softmax(-1)?.try_log()
     /// ```
+    #[track_caller]
     pub fn log_softmax(&self, axis: impl Into<AxisSpec>) -> Result<Self> {
+        origin_call!("log_softmax");
         let axis = axis.into();
 
         // log_softmax(x) = x - max(x) - log(sum(exp(x - max(x))))
@@ -141,7 +151,9 @@ impl Tensor {
     /// let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
     /// let lse = x.logsumexp(-1)?;
     /// ```
+    #[track_caller]
     pub fn logsumexp(&self, axis: impl Into<AxisSpec>) -> Result<Self> {
+        origin_call!("logsumexp");
         let axis = axis.into();
 
         // logsumexp(x) = max(x) + log(sum(exp(x - max(x))))
@@ -168,7 +180,9 @@ impl Tensor {
     /// let x = Tensor::from_slice(&[-2.0f32, -1.0, 0.0, 1.0, 2.0]);
     /// let y = x.gelu()?;
     /// ```
+    #[track_caller]
     pub fn gelu(&self) -> Result<Self> {
+        origin_call!("gelu");
         // gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
         // sqrt(2/π) ≈ 0.7978845608
 
@@ -204,7 +218,9 @@ impl Tensor {
     }
 
     /// Exact GELU: `0.5 * x * (1 + erf(x / sqrt(2)))`.
+    #[track_caller]
     pub fn gelu_exact(&self) -> Result<Self> {
+        origin_call!("gelu_exact");
         let dtype = self.uop().dtype();
         let half = Tensor::const_(0.5f64, dtype.clone());
         let one = Tensor::const_(1.0f64, dtype.clone());
@@ -219,7 +235,9 @@ impl Tensor {
     /// # Arguments
     /// * `alpha` - Slope (default 0.2 in ONNX)
     /// * `beta` - Offset (default 0.5 in ONNX)
+    #[track_caller]
     pub fn hard_sigmoid(&self, alpha: f64, beta: f64) -> Result<Self> {
+        origin_call!("hard_sigmoid");
         let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
         let beta_t = self.broadcast_scalar(ConstValue::Float(beta))?;
         let zero = self.broadcast_scalar(ConstValue::Float(0.0))?;
@@ -235,7 +253,9 @@ impl Tensor {
     ///
     /// # Arguments
     /// * `alpha` - Negative slope (default 0.01 in ONNX)
+    #[track_caller]
     pub fn leaky_relu(&self, alpha: f64) -> Result<Self> {
+        origin_call!("leaky_relu");
         let zero = self.zero()?;
         let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
         let condition = self.try_gt(&zero)?;
@@ -246,7 +266,9 @@ impl Tensor {
     /// PReLU: `x if x > 0, slope * x otherwise`.
     ///
     /// Like LeakyReLU but with a learned per-channel slope.
+    #[track_caller]
     pub fn prelu(&self, slope: &Tensor) -> Result<Self> {
+        origin_call!("prelu");
         let zero = self.zero()?;
         let condition = self.try_gt(&zero)?;
         let neg_branch = self.try_mul(slope)?;
@@ -257,7 +279,9 @@ impl Tensor {
     ///
     /// # Arguments
     /// * `alpha` - Threshold (default 1.0 in ONNX)
+    #[track_caller]
     pub fn thresholded_relu(&self, alpha: f64) -> Result<Self> {
+        origin_call!("thresholded_relu");
         let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
         let zero = self.zero()?;
         let condition = self.try_gt(&alpha_t)?;
@@ -268,7 +292,9 @@ impl Tensor {
     ///
     /// # Arguments
     /// * `alpha` - Scale for negative part (default 1.0 in ONNX)
+    #[track_caller]
     pub fn elu(&self, alpha: f64) -> Result<Self> {
+        origin_call!("elu");
         let zero = self.zero()?;
         let one = self.one()?;
         let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
@@ -285,7 +311,9 @@ impl Tensor {
     /// # Arguments
     /// * `alpha` - Default 1.6732632...
     /// * `gamma` - Default 1.0507010...
+    #[track_caller]
     pub fn selu(&self, alpha: f64, gamma: f64) -> Result<Self> {
+        origin_call!("selu");
         let zero = self.zero()?;
         let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
         let gamma_t = self.broadcast_scalar(ConstValue::Float(gamma))?;
@@ -307,20 +335,26 @@ impl Tensor {
     /// let x = Tensor::from_slice(&[-2.0f32, -1.0, 0.0, 1.0, 2.0]);
     /// let y = x.swish()?;
     /// ```
+    #[track_caller]
     pub fn swish(&self) -> Result<Self> {
+        origin_call!("swish");
         // swish(x) = x * sigmoid(x)
         let sig = self.sigmoid()?;
         self.try_mul(&sig)
     }
 
     /// Alias for `swish` (matches PyTorch naming).
+    #[track_caller]
     pub fn silu(&self) -> Result<Self> {
+        origin_call!("silu");
         self.swish()
     }
 
     /// Gated Linear Unit: splits `self` along `dim` into two halves,
     /// returns `first_half * sigmoid(second_half)`.
+    #[track_caller]
     pub fn glu(&self, dim: isize) -> Result<Self> {
+        origin_call!("glu");
         let shape = self.shape()?;
         let ndim = shape.len();
         let axis = if dim < 0 { (ndim as isize + dim) as usize } else { dim as usize };
@@ -336,7 +370,9 @@ impl Tensor {
     }
 
     /// Softplus: `log(1 + exp(beta*x)) / beta`, numerically stable via logaddexp.
+    #[track_caller]
     pub fn softplus(&self, beta: f64) -> Result<Self> {
+        origin_call!("softplus");
         let beta_t = self.broadcast_scalar(ConstValue::Float(beta))?;
         let scaled = self.try_mul(&beta_t)?;
         let zero = self.zero()?;
@@ -348,12 +384,16 @@ impl Tensor {
     }
 
     /// Mish: `x * tanh(softplus(x))`.
+    #[track_caller]
     pub fn mish(&self) -> Result<Self> {
+        origin_call!("mish");
         self.try_mul(&self.softplus(1.0)?.tanh()?)
     }
 
     /// ReLU6: `relu(x) - relu(x-6)` = `clamp(x, 0, 6)`.
+    #[track_caller]
     pub fn relu6(&self) -> Result<Self> {
+        origin_call!("relu6");
         let six = self.broadcast_scalar(ConstValue::Int(6))?;
         let relu_x = self.relu()?;
         let relu_x6 = self.try_sub(&six)?.relu()?;
@@ -361,7 +401,9 @@ impl Tensor {
     }
 
     /// HardSwish: `x * relu6(x+3) / 6`.
+    #[track_caller]
     pub fn hardswish(&self) -> Result<Self> {
+        origin_call!("hardswish");
         let three = self.broadcast_scalar(ConstValue::Int(3))?;
         let six = self.broadcast_scalar(ConstValue::Int(6))?;
         let r6 = self.try_add(&three)?.relu6()?;
@@ -369,14 +411,18 @@ impl Tensor {
     }
 
     /// Softsign: `x / (1 + |x|)`.
+    #[track_caller]
     pub fn softsign(&self) -> Result<Self> {
+        origin_call!("softsign");
         let one = self.one()?;
         let denom = one.try_add(&self.try_abs()?)?;
         self.try_div(&denom)
     }
 
     /// CELU: `max(0, x) + min(0, alpha*(exp(x/alpha)-1))`.
+    #[track_caller]
     pub fn celu(&self, alpha: f64) -> Result<Self> {
+        origin_call!("celu");
         let zero = self.zero()?;
         let one = self.one()?;
         let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
@@ -410,6 +456,7 @@ impl Tensor {
     /// let normalized = x.batchnorm().mean(&mean).invstd(&invstd).call()?;
     /// ```
     #[builder]
+    #[track_caller]
     pub fn batchnorm(
         &self,
         scale: Option<&Tensor>,
@@ -418,6 +465,7 @@ impl Tensor {
         invstd: &Tensor,
         #[builder(default = AxisSpec::Single(1))] axis: AxisSpec,
     ) -> Result<Self> {
+        origin_call!("batchnorm");
         let shape = self.shape()?;
 
         // Build broadcast shape: keep axis dimensions, others become 1

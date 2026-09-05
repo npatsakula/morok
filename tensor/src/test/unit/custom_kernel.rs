@@ -42,8 +42,7 @@ fn test_tensor_custom_kernel_builds_after_call_outputs() {
 #[test]
 fn test_tensor_custom_kernel_with_call_info() {
     let a = Tensor::empty(&[4], DType::Float32);
-    let info =
-        CallInfo { grad_tag: Some("grad_tag".to_string()), metadata: vec!["meta".to_string()], ..CallInfo::default() };
+    let info = CallInfo { grad_tag: Some("grad_tag".to_string()), ..CallInfo::default() };
 
     let outputs = a
         .custom_kernel_with(&[], info.clone(), |placeholders| UOp::sink(vec![placeholders[0].clone()]))
