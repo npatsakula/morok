@@ -35,12 +35,13 @@ fn role_tiles_resolve_arch_fragment() {
     }
 }
 
-/// On an arch without fragment layouts (CUDA) the role tiles refuse loudly instead
-/// of silently building a wave64/RDNA layout the hardware does not have.
+/// On an arch without fragment layouts (pre-Ampere CUDA: no f16/bf16 `m16n8k16`)
+/// the role tiles refuse loudly instead of silently building a layout the hardware
+/// does not have.
 #[test]
-#[should_panic(expected = "sm_86: tk defines no Accumulator fragment layout")]
+#[should_panic(expected = "sm_75: tk defines no Accumulator fragment layout")]
 fn role_tiles_panic_without_fragment_layouts() {
-    let caps = ArchCaps::for_arch(GpuArch::Cuda(CudaArch::from_compute_capability(8, 6)));
+    let caps = ArchCaps::for_arch(GpuArch::Cuda(CudaArch::from_compute_capability(7, 5)));
     let ker = Kernel::new("scaf", [1, 1, 1], 32, vec![], caps);
     let _ = ker.acc((16, 16), TileLayout::Col);
 }

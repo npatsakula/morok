@@ -290,8 +290,9 @@ impl<'k> RT<'k> {
     }
 }
 
-/// A register vector: logical shape `[outer_dim, inner_dim]` (`[tiles, 1]` for
-/// the ortho layout).
+/// A register vector: logical shape `[outer_dim, inner_dim]` — `[tiles, slots]`
+/// for the ortho layout, `slots` the fragment map's per-lane kept values
+/// ([`crate::layout::LaneMap::slots`]: 1 on AMD, 2 on `mma.sync`).
 #[derive(Clone)]
 pub struct RV<'k> {
     buf: Arc<UOp>,
@@ -403,14 +404,15 @@ impl Kernel {
 
     /// Allocate a register vector [`RV`] tile (tinygrad `ker.rv`). `length` is
     /// the logical vector length, floored to a multiple of `base.base.rows`
-    /// (the per-fragment row count) to give the fragment-tile count.
+    /// (the per-fragment row count) to give the fragment-tile count; the inner
+    /// width is the fragment map's slot count.
     ///
     /// # Panics
     /// Panics (divide-by-zero) if `base.base.rows == 0`.
     pub fn rv(&self, length: usize, dtype: DType, layout: VecLayout, base: RTBaseShape) -> RV<'_> {
         let tiles = length / base.base.rows;
         let (outer, inner) = match layout {
-            VecLayout::Ortho => (tiles, 1usize),
+            VecLayout::Ortho => (tiles, base.map.slots()),
         };
         let shape = vec![outer, inner];
         let buf = self.alloc_reg(outer * inner, dtype.clone());

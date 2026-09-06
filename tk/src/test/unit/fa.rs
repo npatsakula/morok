@@ -484,25 +484,33 @@ fn test_fa_graph_amd() {
     }
 }
 
+/// The f32 causal SDPA reference for the graph check below, in `[B,N,H,D]`.
+#[allow(clippy::result_large_err)] // one-shot check helper, like the macro body
+fn fa_causal_reference(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor, svod_tensor::error::Error> {
+    let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("permute");
+    let (qp, kp, vp) = (perm(q), perm(k), perm(v));
+    let r = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(true).call().expect("sdpa");
+    r.try_permute(&[0, 2, 1, 3])
+}
+
 // Generic custom-kernel **check** via the `tensor`-layer macro — the graph-native
-// `flash_attention` vs causal SDPA on gfx942. Demonstrates the reusable
+// `flash_attention` vs causal SDPA on gfx942/gfx1151. Demonstrates the reusable
 // definition(`Tensor::graph_kernel`)/check(`custom_kernel_check!`) facility: tk just
 // supplies the kernel `run` + the `reference` op; the boilerplate (build inputs, run
-// both, cast f32, compare within tol) is generated.
+// both, cast f32, compare within tol) is generated. On a device the FA kernel
+// declines (`Ok(None)`: CUDA until the FA port), `run` self-skips onto the reference.
 // `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_graph_check_amd -- --ignored --nocapture`.
 svod_tensor::custom_kernel_check! {
     test_fa_graph_check_amd,
     inputs (q, k, v): shape [1, 128, 2, 64], dtype svod_dtype::DType::BFloat16,
-    run: |q, k, v| crate::kernels::fa::flash_attention(q, k, v).map(|o| o.expect("FA kernel applies to this shape")),
-    reference: |q, k, v| {
-        use svod_tensor::Tensor;
-        let perm = |t: &Tensor| {
-            t.cast(svod_dtype::DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("permute")
-        };
-        let (qp, kp, vp) = (perm(q), perm(k), perm(v));
-        let r = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(true).call().expect("sdpa");
-        r.try_permute(&[0, 2, 1, 3])
+    run: |q, k, v| match crate::kernels::fa::flash_attention(q, k, v).expect("FA build") {
+        Some(o) => Ok(o),
+        None => {
+            eprintln!("skip test_fa_graph_check_amd: the FA kernel does not apply on this device");
+            fa_causal_reference(q, k, v)
+        }
     },
+    reference: fa_causal_reference,
     tol: 2e-2,
 }
 

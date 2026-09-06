@@ -9,7 +9,7 @@ use std::sync::Arc;
 use smallvec::{SmallVec, smallvec};
 use svod_ir::{AxisType, ConstValue, Op, UOp};
 
-use super::{Group, MoveIdx, iadd, idiv, idx_mul, imod, imul, lane_rc, wave_offset};
+use super::{Group, MoveIdx, iadd, idiv, idx_mul, imod, imul, wave_offset};
 use crate::index::{Idx, cidx, flat_index, flat_offset, index_off, index_off_gated, load_at, load_off, load_off_gated};
 use crate::tile::{GL, RT, ST};
 use crate::tiles::TileLayout;
@@ -448,9 +448,6 @@ impl<'k> Group<'k> {
     pub(super) fn load_local_to_reg(&self, rt: RT<'k>, st: &ST, dst_idxs: &[Idx], idxs: &[Idx]) -> RT<'k> {
         let laneid = self.ker.laneid();
         let ept = rt.base.base.elements_per_thread() as i64;
-        let base_rows = rt.base.base.rows as i64;
-        let base_cols = rt.base.base.cols as i64;
-        let stride = rt.base.stride as i64;
         let n = rt.shape().len();
         let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
         // SI-1 off-by-one guard: the wave's RT sub-tile must fit inside the ST.
@@ -461,16 +458,7 @@ impl<'k> Group<'k> {
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
         let inner = self.ker.raw_range(ept, AxisType::Loop);
 
-        let (row, col) = lane_rc(
-            rt.layout != st.layout,
-            rt.base.interleave,
-            rt.base.interleave_t,
-            &laneid,
-            base_rows,
-            base_cols,
-            stride,
-            &inner,
-        );
+        let (row, col) = rt.lane_rc(rt.layout != st.layout, &laneid, &inner);
         let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
 
         // Wave sub-tile fragment offset (SI-1): the caller passes the wave's
@@ -542,7 +530,6 @@ impl<'k> Group<'k> {
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
         let base_rows = rt.base.base.rows as i64;
         let base_cols = rt.base.base.cols as i64;
-        let stride = rt.base.stride as i64;
         let ept = rt.base.base.elements_per_thread() as i64;
         let n = rt.shape().len();
         let s3 = rt.shape()[n - 3] as i64;
@@ -571,16 +558,7 @@ impl<'k> Group<'k> {
 
         let base_row = imul(&height, base_rows);
         let base_col = imul(&width, base_cols);
-        let (row, col) = lane_rc(
-            rt.layout == TileLayout::Col,
-            rt.base.interleave,
-            rt.base.interleave_t,
-            &laneid,
-            base_rows,
-            base_cols,
-            stride,
-            &inner,
-        );
+        let (row, col) = rt.lane_rc(rt.layout == TileLayout::Col, &laneid, &inner);
         let srow = iadd(&base_row, &row);
         let scol = iadd(&base_col, &col);
         let off = iadd(&src_i_base, &iadd(&imul(&srow, row_stride), &scol));
@@ -609,25 +587,13 @@ impl<'k> Group<'k> {
     pub(super) fn store_reg_to_local(&self, st: ST, rt: &RT<'k>, idxs: &[Idx], src_idxs: &[Idx]) -> ST {
         let laneid = self.ker.laneid();
         let ept = rt.base.base.elements_per_thread() as i64;
-        let base_rows = rt.base.base.rows as i64;
-        let base_cols = rt.base.base.cols as i64;
-        let stride = rt.base.stride as i64;
         let n = rt.shape().len();
         let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
         let height = self.ker.raw_range(rt_h, AxisType::Loop);
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
         let inner = self.ker.raw_range(ept, AxisType::Loop);
 
-        let (row, col) = lane_rc(
-            rt.layout != st.layout,
-            rt.base.interleave,
-            rt.base.interleave_t,
-            &laneid,
-            base_rows,
-            base_cols,
-            stride,
-            &inner,
-        );
+        let (row, col) = rt.lane_rc(rt.layout != st.layout, &laneid, &inner);
         let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
 
         let mut sidx: Vec<Idx> = src_idxs.to_vec();
@@ -658,7 +624,6 @@ impl<'k> Group<'k> {
         let row_stride: i64 = dst.shape()[axis + 1..].iter().product::<usize>() as i64;
         let base_rows = rt.base.base.rows as i64;
         let base_cols = rt.base.base.cols as i64;
-        let stride = rt.base.stride as i64;
         let ept = rt.base.base.elements_per_thread() as i64;
         let n = rt.shape().len();
         let s3 = rt.shape()[n - 3] as i64;
@@ -687,16 +652,7 @@ impl<'k> Group<'k> {
 
         let base_row = imul(&height, base_rows);
         let base_col = imul(&width, base_cols);
-        let (row, col) = lane_rc(
-            rt.layout == TileLayout::Col,
-            rt.base.interleave,
-            rt.base.interleave_t,
-            &laneid,
-            base_rows,
-            base_cols,
-            stride,
-            &inner,
-        );
+        let (row, col) = rt.lane_rc(rt.layout == TileLayout::Col, &laneid, &inner);
         let srow = iadd(&base_row, &row);
         let scol = iadd(&base_col, &col);
         let off = iadd(&dst_i_base, &iadd(&imul(&srow, row_stride), &scol));

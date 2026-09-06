@@ -117,16 +117,16 @@ impl<'k> StoreInto<'k, GL> for RT<'k> {
 
 // ── Index (i64-typed) arithmetic helpers ───────────────────────────────────
 
-pub(super) fn idiv(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
+pub(crate) fn idiv(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
     a.try_div(&cidx(k)).expect("idiv")
 }
-pub(super) fn imod(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
+pub(crate) fn imod(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
     a.try_mod(&cidx(k)).expect("imod")
 }
-pub(super) fn imul(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
+pub(crate) fn imul(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
     if k == 1 { a.clone() } else { a.try_mul(&cidx(k)).expect("imul") }
 }
-pub(super) fn iadd(a: &Arc<UOp>, b: &Arc<UOp>) -> Arc<UOp> {
+pub(crate) fn iadd(a: &Arc<UOp>, b: &Arc<UOp>) -> Arc<UOp> {
     a.try_add(b).expect("iadd")
 }
 pub(super) fn ixor(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
@@ -211,44 +211,6 @@ pub(super) fn wave_offset(block: Option<&Idx>, frags: i64, local: &Arc<UOp>) -> 
     match block {
         None => Idx::from(local),
         Some(b) => Idx::Uop(iadd(&imul(&b.to_uop(), frags), local)),
-    }
-}
-
-/// The per-lane (row, col) within a base fragment. `transpose` selects the
-/// "fragment is laid out column-major in registers" branch (group.py: either
-/// `rt.layout != st.layout` for the LDS hops, or `rt.layout == COL` for the
-/// global hops); `inner` is the upcast element index.
-#[allow(clippy::too_many_arguments)]
-fn lane_rc(
-    transpose: bool,
-    interleave: bool,
-    interleave_t: bool,
-    laneid: &Arc<UOp>,
-    rows: i64,
-    cols: i64,
-    stride: i64,
-    inner: &Arc<UOp>,
-) -> (Arc<UOp>, Arc<UOp>) {
-    if interleave_t {
-        // The transpose of the RDNA accumulator interleave: `row = lane%16,
-        // col = 2·j + lane/16`. Stores an even/odd-interleaved accumulator to memory
-        // along the transposed (N-major) axis — the FA output tile `O[q,d]` from the
-        // `[d,q]` PV accumulator. Checked before `interleave` (and ignores
-        // `transpose`) so it never perturbs the matmul accumulator store.
-        return (imod(laneid, cols), iadd(&imul(inner, 2), &idiv(laneid, cols)));
-    }
-    if interleave {
-        // RDNA wave32 WMMA f32 accumulator: even/odd row interleave across the two
-        // wave-halves — `m = 2·j + lane/16, n = lane%16` (j = `inner`; the ×2 is the
-        // wave32 subgroup count `wave_size/16`). The lane-half is the +1 unit and
-        // the register the ×2 — the opposite weighting from the stride branches, so
-        // it can't be expressed as a stride (tinygrad `ops_python` RDNA3 `c_map`).
-        return (iadd(&imul(inner, 2), &idiv(laneid, cols)), imod(laneid, cols));
-    }
-    if transpose {
-        (iadd(&imul(&idiv(laneid, cols), stride), inner), imod(laneid, cols))
-    } else {
-        (imod(laneid, rows), iadd(&imul(&idiv(laneid, rows), stride), inner))
     }
 }
 
@@ -396,6 +358,17 @@ impl<'k> Group<'k> {
         self.ker.push_store(ended.clone(), t.uop().clone());
         let after = t.uop().after(smallvec![ended]);
         t.rewrap(after)
+    }
+}
+
+impl<'k> RT<'k> {
+    /// This lane's `(row, col)` of register `inner` within a base fragment, per the
+    /// tile's [`LaneMap`](crate::layout::LaneMap). `transpose` selects the
+    /// "fragment is laid out column-major in registers" reading (group.py: either
+    /// `rt.layout != st.layout` for the LDS hops, or `rt.layout == COL` for the
+    /// global hops).
+    pub(crate) fn lane_rc(&self, transpose: bool, laneid: &Arc<UOp>, inner: &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) {
+        self.base.map.rc(transpose, laneid, self.base.base.rows as i64, self.base.base.cols as i64, inner)
     }
 }
 

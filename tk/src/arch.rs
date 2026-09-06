@@ -9,35 +9,34 @@
 //!
 //! Two layers of support, resolved per arch:
 //!
-//! - **Control path** — [`ArchCaps::wave_size`] (warp/lane math, launch block)
-//!   and [`ArchCaps::reduce_tree`] (the `wave_size/16 − 1` sibling-fold formula
-//!   yields `[16, 32, 48]` for wave64 and `[16]` for wave32). Defined for every
-//!   arch; the shuffle-only kernels (single-query attention) need nothing else.
+//! - **Control path** — [`ArchCaps::wave_size`] (warp/lane math, launch block).
+//!   Defined for every arch; the shuffle-only kernels (single-query attention)
+//!   need nothing else.
 //! - **Matrix-core fragment layouts** — [`ArchCaps::frag`] / [`ArchCaps::shared_default`]
 //!   / [`ArchCaps::shared_swizzled`], the single arch→fragment table kernels stay
-//!   arch-blind through (no `is_cdna()` shape branches). Defined for AMD: CDNA's
-//!   MFMA accumulator and input fragments share the wave64 [`crate::tiles::RT_16X16`]
-//!   layout; RDNA (gfx11 WMMA, wave32) carries `ept=(16,16,8)`, inputs replicated
-//!   across the two wave-halves, and an even/odd-interleaved `<8×float>` accumulator
-//!   (the `RT_16X16_W32_*` shapes). **Unresolved (`None`) on CUDA**: `mma.sync
-//!   m16n8k16` fragments are rectangular with their own lane→(row,col) maps, which
-//!   the current square 16×16 [`crate::tiles::BaseShape`] / `lane_rc` cannot express
-//!   — so an MMA kernel on CUDA fails loudly at fragment resolution instead of
-//!   rendering a wrong layout.
+//!   arch-blind through (no `is_cdna()` shape branches). CDNA's MFMA accumulator
+//!   and input fragments share the wave64 [`crate::tiles::RT_16X16`] layout; RDNA
+//!   (gfx11 WMMA, wave32) carries `ept=(16,16,8)`, inputs replicated across the two
+//!   wave-halves, and an even/odd-interleaved `<8×float>` accumulator (the
+//!   `RT_16X16_W32_*` shapes); CUDA sm_80+ (`mma.sync m16n8k16`, warp32) holds a
+//!   16×16 tile as two m16n8 halves ([`crate::layout::LaneMap::MmaSync`], 8/lane
+//!   for inputs and accumulator alike — [`crate::tiles::RT_16X16_MMA`]). Unresolved
+//!   (`None`) on Metal and pre-Ampere CUDA, so an MMA kernel fails loudly at
+//!   fragment resolution instead of rendering a wrong layout.
 //!
 //! gfx942 is the validated/calibrated target — the register-tile fragment-layout
 //! tables ([`crate::tiles`] strides and `group::mma`'s per-lane upcast counts) and
 //! the [`crate::WARP_THREADS`] layout-table constant are pinned to it.
 //! [`ArchCaps::frag_row_stride`] is the one remaining CDNA-only datum (the legacy
 //! direct-launch FA mask — the production rolled-db kernel derives its mask from
-//! the accumulator's own `lane_rc` instead).
+//! the accumulator's own lane map instead).
 
 use smallvec::SmallVec;
 use svod_dtype::{AmdArch, CudaArch, GpuArch};
 
 use crate::tiles::{
-    RT_16X16, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, RTBaseShape, ST_16X16, ST_16X16_SWIZZLED,
-    ST_16X16_SWIZZLED_W32, STBaseShape,
+    RT_16X16, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, RTBaseShape, ST_16X16, ST_16X16_MMA,
+    ST_16X16_SWIZZLED, ST_16X16_SWIZZLED_W32, STBaseShape,
 };
 
 /// Logical role of a 16×16 matrix-core fragment, independent of arch packing.
@@ -108,19 +107,20 @@ impl ArchCaps {
     }
 
     /// Whether tk defines matrix-core fragment layouts for this arch (so
-    /// [`Self::frag`] and the shared-tile strips resolve). AMD only until the
-    /// rectangular `mma.sync` fragments land.
+    /// [`Self::frag`] and the shared-tile strips resolve): AMD, and CUDA from
+    /// Ampere (the f16/bf16 `m16n8k16` floor).
     pub fn has_matrix_core_layouts(&self) -> bool {
-        self.amd().is_some()
+        self.amd().is_some() || self.cuda().is_some_and(CudaArch::has_bf16_mma)
     }
 
-    /// Cross-lane reduce-tree offsets: a lane folds the partials of the
+    /// The AMD sibling-gather reduce-tree offsets: a lane folds the partials of the
     /// `wave_size / 16` sibling row-groups, each one WMMA-column span (16 lanes)
-    /// apart → wave64 `[16, 32, 48]`, wave32 `[16]`. This is correct for **both** the
-    /// CDNA MFMA layout *and* the RDNA even/odd accumulator: at wave32 a softmax row
+    /// apart → wave64 `[16, 32, 48]`, wave32 `[16]`. Correct for **both** the CDNA
+    /// MFMA layout *and* the RDNA even/odd accumulator: at wave32 a softmax row
     /// (16 KV) is split across a lane's 8 in-register elements (the even/odd half)
-    /// and its sibling lane `L+16` (the other half), so the single `[16]` fold plus
-    /// the in-register reduce covers the whole row (HW-validated reduce structure).
+    /// and its sibling lane `L+16` (the other half). The reductions themselves read
+    /// the tree off the fragment's [`crate::layout::LaneMap::tree`] (the quad
+    /// butterfly on CUDA); this is the AMD form for the graph-shape tests.
     pub fn reduce_tree(&self) -> SmallVec<[i64; 3]> {
         (1..self.wave_size as i64 / 16).map(|i| i * 16).collect()
     }
@@ -139,40 +139,64 @@ impl ArchCaps {
     /// single arch→fragment table the kernels resolve through. CDNA's MFMA
     /// accumulator and input fragments share a layout, so every role resolves to
     /// [`RT_16X16`]; RDNA (gfx11 WMMA) splits into the even/odd-interleaved
-    /// accumulator, the replicated input, and the transposed accumulator. `None`
-    /// where tk has no fragment table (CUDA `mma.sync`, Metal) — see the module docs.
+    /// accumulator, the replicated input, and the transposed accumulator; CUDA
+    /// sm_80+ resolves every role to the two-half [`RT_16X16_MMA`] (an accumulator
+    /// IS the A-operand register order, and the transposed store is the `Col`
+    /// reading of the same map). `None` where tk has no fragment table (Metal,
+    /// pre-Ampere CUDA) — see the module docs.
     pub fn frag(&self, role: FragRole) -> Option<RTBaseShape> {
-        let amd = self.amd()?;
-        Some(if amd.is_cdna() {
-            RT_16X16
-        } else {
-            match role {
+        if !self.has_matrix_core_layouts() {
+            return None;
+        }
+        Some(match self.amd() {
+            None => RT_16X16_MMA,
+            Some(amd) if amd.is_cdna() => RT_16X16,
+            Some(_) => match role {
                 FragRole::Accumulator => RT_16X16_W32_ACC,
                 FragRole::Operand => RT_16X16_W32_IN,
                 FragRole::AccumulatorT => RT_16X16_W32_ACC_T,
-            }
+            },
         })
     }
 
-    /// The canonical LDS strip fragment: plain on CDNA. On RDNA the only ept-8 strip
-    /// defined is swizzled, so it coincides with [`Self::shared_swizzled`]. Used by
-    /// kernels whose LDS access does not itself need the XOR swizzle (flash-attention).
-    /// `None` where [`Self::frag`] is.
+    /// The canonical LDS strip fragment: plain on CDNA. On RDNA and CUDA the only
+    /// ept-8 strip defined is swizzled, so it coincides with [`Self::shared_swizzled`].
+    /// Used by kernels whose LDS access does not itself need the XOR swizzle
+    /// (flash-attention). `None` where [`Self::frag`] is.
     pub fn shared_default(&self) -> Option<STBaseShape> {
-        self.amd().map(|amd| if amd.is_cdna() { ST_16X16 } else { ST_16X16_SWIZZLED_W32 })
+        self.shared_strip(false)
     }
 
     /// The XOR-swizzled LDS strip fragment, for kernels that swizzle to avoid LDS
     /// bank conflicts (the matmul A/B strips). `None` where [`Self::frag`] is.
     pub fn shared_swizzled(&self) -> Option<STBaseShape> {
-        self.amd().map(|amd| if amd.is_cdna() { ST_16X16_SWIZZLED } else { ST_16X16_SWIZZLED_W32 })
+        self.shared_strip(true)
+    }
+
+    fn shared_strip(&self, swizzled: bool) -> Option<STBaseShape> {
+        if !self.has_matrix_core_layouts() {
+            return None;
+        }
+        Some(match self.amd() {
+            None => ST_16X16_MMA,
+            Some(amd) if amd.is_cdna() => {
+                if swizzled {
+                    ST_16X16_SWIZZLED
+                } else {
+                    ST_16X16
+                }
+            }
+            Some(_) => ST_16X16_SWIZZLED_W32,
+        })
     }
 
     /// Whether an MMA accumulator fragment can be reused directly as a WMMA input via
-    /// a register copy. True on CDNA (MFMA acc == input fragment); false on RDNA (the
-    /// even/odd `<8×f32>` accumulator and the replicated `<16×in>` input differ), where
-    /// the acc→input handoff must round-trip through LDS instead.
+    /// a register copy. True on CDNA (MFMA acc == input fragment) and CUDA (the
+    /// two-half 16×16 f32 accumulator holds the m16n8 C fragments in exactly the A
+    /// fragment's register order — ThunderKittens `mma_AB(o, att_bf, v)`); false on
+    /// RDNA (the even/odd `<8×f32>` accumulator and the replicated `<16×in>` input
+    /// differ), where the acc→input handoff must round-trip through LDS instead.
     pub fn acc_reusable_as_input(&self) -> bool {
-        self.is_cdna()
+        self.is_cdna() || self.cuda().is_some()
     }
 }

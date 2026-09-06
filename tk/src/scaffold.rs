@@ -20,7 +20,7 @@ use svod_ir::UOp;
 use crate::arch::FragRole;
 use crate::kernel::Kernel;
 use crate::tile::{GL, RT, RV, ST};
-use crate::tiles::{RT_16X16, RTBaseShape, STBaseShape, TileLayout, VecLayout};
+use crate::tiles::{RTBaseShape, STBaseShape, TileLayout, VecLayout};
 
 /// A global-buffer binding spec for [`Kernel::bind_abi`] (logical shape + element
 /// dtype). The concrete buffer's dtype governs; `dtype` carries the author's intent.
@@ -68,15 +68,15 @@ impl Kernel {
     /// kernel that requires a matrix-core layout.
     ///
     /// # Panics
-    /// Panics when tk defines no matrix-core fragment layouts for the arch (CUDA,
-    /// Metal) — an authoring error: such kernels must gate on an [`crate::ArchSet`]
-    /// that excludes those arches.
+    /// Panics when tk defines no matrix-core fragment layouts for the arch (Metal,
+    /// pre-Ampere CUDA) — an authoring error: such kernels must gate on an
+    /// [`crate::ArchSet`] that excludes those arches.
     pub fn frag(&self, role: FragRole) -> RTBaseShape {
         self.caps.frag(role).unwrap_or_else(|| self.no_layout(&format!("{role:?} fragment")))
     }
     fn no_layout<T>(&self, what: &str) -> T {
         panic!(
-            "{}: tk defines no {what} layout for this arch (matrix-core kernels are AMD-only)",
+            "{}: tk defines no {what} layout for this arch (matrix-core kernels need AMD or CUDA sm_80+)",
             self.caps.arch.target_name()
         )
     }
@@ -103,10 +103,13 @@ impl Kernel {
     pub fn operand(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> RT<'_> {
         self.rt(dims, dt, layout, self.frag(FragRole::Operand))
     }
-    /// An f32 ortho register-vector — the softmax/reduce accumulator vectors. Uses
-    /// [`RT_16X16`] on both arches (the vectors are not arch-fragment-resolved today).
+    /// An f32 ortho register-vector — the softmax/reduce accumulator vectors, sized
+    /// by the accumulator fragment's per-lane slots ([`FragRole::Accumulator`]).
+    ///
+    /// # Panics
+    /// Panics when the arch has no fragment layouts (see [`Kernel::frag`]).
     pub fn acc_vec(&self, length: usize) -> RV<'_> {
-        self.rv(length, DType::Float32, VecLayout::Ortho, RT_16X16)
+        self.rv(length, DType::Float32, VecLayout::Ortho, self.frag(FragRole::Accumulator))
     }
     /// A shared (LDS) tile with the arch's canonical strip ([`crate::ArchCaps::shared_default`]).
     ///

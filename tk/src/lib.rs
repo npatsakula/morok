@@ -30,9 +30,9 @@
 //! # Supported targets
 //! - **gfx942** (CDNA3) — wave64, MFMA.
 //! - **gfx1151** (RDNA3.5) — wave32, WMMA.
-//! - **CUDA sm_80+** — warp32; shuffle-only kernels ([`single_query_attention`])
-//!   today. The matrix-core kernels wait on the rectangular `mma.sync` fragment
-//!   layouts ([`ArchCaps::frag`](arch::ArchCaps::frag) is `None` on CUDA).
+//! - **CUDA sm_80+** — warp32, `mma.sync.m16n8k16` (a 16×16 tile as two m16n8
+//!   halves, [`layout::LaneMap::MmaSync`]); [`matmul`] and the shuffle-only
+//!   [`single_query_attention`] today, flash-attention pending.
 //!
 //! Each kernel declares the arches it is built for as an [`ArchSet`]. Inputs are
 //! bf16/f16, accumulation is f32, the WMMA/MFMA K-edge is 16; the per-arch
@@ -51,6 +51,7 @@ pub mod index;
 pub mod kernel;
 pub mod kernels;
 pub mod launch;
+pub mod layout;
 pub mod loop_scope;
 pub mod math;
 pub mod ops;
@@ -86,13 +87,14 @@ pub use group::{ArgDir, Group, LoadInto, MoveIdx, StoreInto, SwapDir};
 pub use index::IntoIdxs;
 pub use kernel::Kernel;
 pub use launch::{graph_launch, graph_launch_multi, launch_custom}; // wrap a hand kernel as a lazy Tensor graph node / kernel entry
+pub use layout::{LaneMap, ReduceTree};
 pub use loop_scope::Loop;
 pub use scaffold::GlSpec;
 pub use swizzle::Swizzle;
 pub use tile::{AfterDep, AfterDeps, GL, RT, RV, RegTile, ST};
 pub use tiles::{
-    BaseShape, RT_16X16, RT_16X32, RT_32X16, RT_32X32, RTBaseShape, ST_16X16, ST_16X16_SWIZZLED, ST_16X32, ST_32X16,
-    ST_32X32, STBaseShape, TileLayout, VecLayout,
+    BaseShape, RT_16X16, RT_16X16_MMA, RT_16X32, RT_32X16, RT_32X32, RTBaseShape, ST_16X16, ST_16X16_MMA,
+    ST_16X16_SWIZZLED, ST_16X32, ST_32X16, ST_32X32, STBaseShape, TileLayout, VecLayout,
 };
 
 // ── Debug your kernel (direct dispatch against concrete buffers) ─────────────

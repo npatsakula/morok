@@ -5,7 +5,8 @@
 //! gfx1151 (RDNA3.5, wave32) gets the correct control-path caps and is built for
 //! by both matmul and FA (in `MATMUL_/FA_SUPPORTED_ARCHS`); its RDNA WMMA fragment
 //! layout is carried by the `RT_16X16_W32_*` tile shapes selected in the kernels.
-//! CUDA gets the warp32 control path only — its fragment table is `None`.
+//! CUDA sm_80+ resolves every role to the two-half `mma.sync` fragment
+//! (`RT_16X16_MMA`); pre-Ampere CUDA has no fragment table.
 
 use svod_dtype::{AmdArch, CudaArch, DType, GpuArch};
 use svod_schedule::optimizer::Renderer;
@@ -14,7 +15,8 @@ use test_case::test_case;
 use crate::ArchCaps;
 use crate::arch::FragRole::{Accumulator, AccumulatorT, Operand};
 use crate::tiles::{
-    RT_16X16, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, ST_16X16, ST_16X16_SWIZZLED, ST_16X16_SWIZZLED_W32,
+    RT_16X16, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, ST_16X16, ST_16X16_MMA,
+    ST_16X16_SWIZZLED, ST_16X16_SWIZZLED_W32,
 };
 
 const SM_86: GpuArch = GpuArch::Cuda(CudaArch::from_compute_capability(8, 6));
@@ -50,24 +52,38 @@ fn gfx1151_caps_are_wave32() {
     assert_eq!(c.cuda(), None);
 }
 
-/// CUDA (sm_86) gets the warp32 control path — the same lane math as gfx1151 —
-/// but no matrix-core fragment table: every fragment resolver is `None` (the
-/// rectangular `mma.sync` fragments are not the square 16×16 `BaseShape`), the
-/// accumulator is never reusable as an input, and the arch accessors classify it.
+/// CUDA sm_86 gets the warp32 control path — the same lane math as gfx1151 — and
+/// the `mma.sync` fragment table: every role is the two-half [`RT_16X16_MMA`] (an
+/// accumulator IS an A operand, so it is reusable as an input), both LDS strips are
+/// the swizzled [`ST_16X16_MMA`], and the arch accessors classify it.
 #[test]
-fn cuda_caps_are_warp32_without_fragment_layouts() {
+fn cuda_sm86_caps_resolve_mma_sync_fragments() {
     let c = ArchCaps::for_arch(SM_86);
     assert_eq!(c.wave_size, 32);
-    assert_eq!(c.reduce_tree().as_slice(), &[16]);
     assert_eq!(c.amd(), None);
     assert_eq!(c.cuda(), Some(CudaArch::from_compute_capability(8, 6)));
+    assert!(c.has_matrix_core_layouts());
+    for role in [Accumulator, Operand, AccumulatorT] {
+        assert_eq!(c.frag(role), Some(RT_16X16_MMA), "{role:?}");
+    }
+    assert_eq!(c.shared_default(), Some(ST_16X16_MMA));
+    assert_eq!(c.shared_swizzled(), Some(ST_16X16_MMA));
+    assert!(c.acc_reusable_as_input(), "the two-half f32 accumulator is the A-fragment register order");
+}
+
+/// Pre-Ampere CUDA (sm_75: f16 `m16n8k8` only, no K=16 f16/bf16 core) and Metal
+/// have no fragment table: every resolver is `None`, so an MMA kernel fails loudly.
+#[test_case(GpuArch::Cuda(CudaArch::from_compute_capability(7, 5)); "sm_75")]
+#[test_case(GpuArch::Metal(svod_dtype::MetalFamily::Apple(9)); "metal")]
+fn caps_without_fragment_layouts(arch: GpuArch) {
+    let c = ArchCaps::for_arch(arch);
+    assert_eq!(c.wave_size, 32);
     assert!(!c.has_matrix_core_layouts());
     for role in [Accumulator, Operand, AccumulatorT] {
         assert_eq!(c.frag(role), None, "{role:?}");
     }
     assert_eq!(c.shared_default(), None);
     assert_eq!(c.shared_swizzled(), None);
-    assert!(!c.acc_reusable_as_input());
 }
 
 /// The WMMA descriptor is sourced from the shared `TensorCore` table *by the
@@ -75,19 +91,21 @@ fn cuda_caps_are_warp32_without_fragment_layouts() {
 /// so it tracks the GPU in use — not a hand-built descriptor. Confirm the
 /// 16×16×16 f16 core resolves with the arch's wave thread count on both the
 /// validated CDNA3 path (64) and the deferred RDNA3.5 path (32), and that CUDA
-/// exposes no square 16×16×16 core (its `mma.sync` is `m16n8k16`) — the reason
-/// `Kernel::mma_*` refuses CUDA until the rectangular fragments land.
+/// exposes the rectangular `m16n8k16` `(8,16,16)` core with `(8,4,4)` elements per
+/// lane (the shape `group::mma` plans two halves over) instead of a square one.
 #[test]
 fn wmma_descriptor_resolves_per_detected_arch() {
-    let core_threads = |ren: Renderer| {
+    let core = |ren: Renderer, dims| {
         ren.tensor_cores
             .into_iter()
-            .find(|tc| tc.dtype_in == DType::Float16 && tc.dims == (16, 16, 16))
-            .map(|tc| tc.threads)
+            .find(|tc| tc.dtype_in == DType::Float16 && tc.dtype_out == DType::Float32 && tc.dims == dims)
+            .map(|tc| (tc.threads, tc.elements_per_thread))
     };
-    assert_eq!(core_threads(Renderer::for_amd_arch(AmdArch::Gfx942)), Some(64), "gfx942 f16 WMMA = wave64 MFMA core");
-    assert_eq!(core_threads(Renderer::for_amd_arch(AmdArch::Gfx1151)), Some(32), "gfx1151 f16 WMMA = wave32 RDNA core");
-    assert_eq!(core_threads(Renderer::for_cuda_arch(CudaArch::from_compute_capability(8, 6))), None, "sm_86: m16n8k16");
+    assert_eq!(core(Renderer::for_amd_arch(AmdArch::Gfx942), (16, 16, 16)), Some((64, (4, 4, 4))), "gfx942 MFMA");
+    assert_eq!(core(Renderer::for_amd_arch(AmdArch::Gfx1151), (16, 16, 16)), Some((32, (16, 16, 8))), "gfx1151 WMMA");
+    let sm86 = CudaArch::from_compute_capability(8, 6);
+    assert_eq!(core(Renderer::for_cuda_arch(sm86), (16, 16, 16)), None, "sm_86 has no square core");
+    assert_eq!(core(Renderer::for_cuda_arch(sm86), (8, 16, 16)), Some((32, (8, 4, 4))), "sm_86 m16n8k16");
 }
 
 /// Behavior-preserving guard for the fragment-role resolver (Gap 2): the logical
