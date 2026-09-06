@@ -388,3 +388,109 @@ fn nvptx_renders_for_older_capabilities() {
     );
     assert_ptx_compiles(&old.code, SM75);
 }
+
+/// One warp-uniform value shuffled to each lane: `idx`/`up`/`down`/`bfly`
+/// share the intrinsic shape and differ only in the mode and the clamp word.
+#[test_case::test_case(ShflMode::Idx, "idx", 31; "idx")]
+#[test_case::test_case(ShflMode::Up, "up", 0; "up clamps at lane 0")]
+#[test_case::test_case(ShflMode::Down, "down", 31; "down")]
+#[test_case::test_case(ShflMode::Bfly, "bfly", 31; "bfly")]
+fn nvptx_shfl_modes(mode: ShflMode, suffix: &str, clamp: i32) {
+    let l = UOp::special(UOp::native_const(32i32), "lidx0".to_string());
+    let value = UOp::load().index(indexed(0, DType::Int32, l.clone())).call();
+    let out = indexed(1, DType::Int32, l).store(shfl(mode, &value, &UOp::native_const(3i32)));
+    let rendered = render_nvptx_linearized(&UOp::sink(vec![out]), SM86, "nvptx_shfl_mode");
+
+    let call = format!("call i32 @llvm.nvvm.shfl.sync.{suffix}.i32(i32 -1, i32 %");
+    assert!(rendered.code.contains(&call), "missing {call}:\n{}", rendered.code);
+    assert!(rendered.code.contains(&format!(", i32 3, i32 {clamp})")), "{}", rendered.code);
+    assert!(!rendered.code.contains("bitcast"), "i32 needs no reinterpretation:\n{}", rendered.code);
+    let decl = format!("declare i32 @llvm.nvvm.shfl.sync.{suffix}.i32(i32, i32, i32, i32)");
+    assert_eq!(rendered.code.matches(&decl).count(), 1, "{}", rendered.code);
+    if let Some(ptx) = assert_ptx_compiles(&rendered.code, SM86) {
+        let needle = format!("shfl.sync.{suffix}.b32");
+        assert!(ptx.contains(&needle), "missing {needle}:\n{ptx}");
+    }
+}
+
+/// 16-bit scalars widen into the shuffled word and truncate back (signed
+/// ones sign-extend, which the truncation makes irrelevant); floats
+/// reinterpret through their integer bit pattern on both sides.
+#[test_case::test_case(DType::Float16, "zext", 2; "f16")]
+#[test_case::test_case(DType::BFloat16, "zext", 2; "bf16")]
+#[test_case::test_case(DType::Int16, "sext", 0; "i16")]
+#[test_case::test_case(DType::UInt16, "zext", 0; "u16")]
+fn nvptx_shfl_widens_16bit_values(dtype: DType, widen: &str, bitcasts: usize) {
+    let l = UOp::special(UOp::native_const(32i32), "lidx0".to_string());
+    let value = UOp::load().index(indexed(0, dtype.clone(), l.clone())).call();
+    let out = indexed(1, dtype.clone(), l.clone()).store(shfl_idx(&value, &l));
+    let rendered = render_nvptx_linearized(&UOp::sink(vec![out]), SM86, "nvptx_shfl_16");
+
+    for needle in [
+        &format!("{widen} i16 %"),
+        "to i32",
+        "call i32 @llvm.nvvm.shfl.sync.idx.i32(i32 -1, i32 %",
+        "trunc i32 %",
+        "to i16",
+    ] {
+        assert!(rendered.code.contains(needle), "missing {needle}:\n{}", rendered.code);
+    }
+    assert_eq!(rendered.code.matches("bitcast ").count(), bitcasts, "{}", rendered.code);
+    if let Some(ptx) = assert_ptx_compiles(&rendered.code, SM86) {
+        assert!(ptx.contains("shfl.sync.idx.b32"), "{ptx}");
+    }
+}
+
+/// A packed pair (`<2 x half>`, the mma.sync fragment word) is one register.
+#[test]
+fn nvptx_shfl_moves_a_packed_half_pair_as_one_word() {
+    let pair = load(0, DType::Float32).bitcast(DType::Float16.vec(2).unwrap());
+    let shuffled = shfl_down(&pair, &UOp::native_const(1i32));
+    let out = indexed(1, DType::Float16, UOp::native_const(0i32)).store(shuffled);
+    let rendered = render_raw(UOp::sink(vec![out]), SM86, "nvptx_shfl_pair").expect("render");
+    for needle in [
+        "bitcast <2 x half> %",
+        "to i32",
+        "call i32 @llvm.nvvm.shfl.sync.down.i32(i32 -1, i32 %",
+        "bitcast i32 %",
+        "to <2 x half>",
+    ] {
+        assert!(rendered.code.contains(needle), "missing {needle}:\n{}", rendered.code);
+    }
+    assert!(!rendered.code.contains("zext"), "{}", rendered.code);
+    assert_ptx_compiles(&rendered.code, SM86);
+}
+
+/// A `STACK` of lanes is shaped, not packed: its casts are elementwise.
+#[test]
+#[should_panic(expected = "split a shaped")]
+fn nvptx_shfl_rejects_shaped_values() {
+    let lanes: smallvec::SmallVec<[Arc<UOp>; 4]> =
+        (0..2).map(|lane| UOp::load().index(indexed(0, DType::Float16, UOp::native_const(lane))).call()).collect();
+    shfl_idx(&UOp::stack(lanes), &UOp::native_const(0i32));
+}
+
+#[test]
+#[should_panic(expected = "one 32-bit register")]
+fn nvptx_shfl_rejects_wide_values() {
+    shfl_idx(&load(0, DType::Float64), &UOp::native_const(0i32));
+}
+
+/// The nvvm builders are NVPTX-only: rendering them for the CPU or an AMD
+/// target fails with a typed error before clang could turn the intrinsic
+/// into an extern call.
+#[test_case::test_case(LlvmTextRenderer::new(), "cpu"; "cpu")]
+#[test_case::test_case(LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx942), "gfx942"; "amd")]
+fn nvvm_builders_are_rejected_on_other_targets(renderer: LlvmTextRenderer, target: &str) {
+    let value = load(0, DType::Float32);
+    let out = indexed(1, DType::Float32, UOp::native_const(0i32)).store(shfl_idx(&value, &UOp::native_const(0i32)));
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(UOp::sink(vec![out])).into());
+    let err = renderer.render(&linear, Some("foreign")).expect_err("nvvm intrinsics have no lowering here");
+    match &err {
+        crate::Error::ForeignIntrinsic { intrinsic, target: reported } => {
+            assert_eq!(intrinsic, "llvm.nvvm.shfl.sync.idx.i32");
+            assert_eq!(reported, target);
+        }
+        other => panic!("expected ForeignIntrinsic, got {other}"),
+    }
+}

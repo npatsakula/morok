@@ -18,3 +18,23 @@ mod scaffold;
 mod shuffle;
 mod sq_attention;
 mod swizzle;
+
+/// The env-selected device's caps when tk defines its matrix-core fragment layouts
+/// (AMD today), else `None` — the skip gate for fragment-layout HW tests, so a
+/// CUDA device (control path only) skips instead of panicking at `Kernel::frag`.
+pub(crate) fn fragment_device() -> Option<crate::ArchCaps> {
+    let dev = svod_tensor::Tensor::rand(&[16, 16]).expect("probe tensor").device();
+    crate::target::resolve_arch(&dev).map(crate::ArchCaps::for_arch).filter(crate::ArchCaps::has_matrix_core_layouts)
+}
+
+/// Whether the env-selected device is AMD CDNA (gfx942, wave64).
+pub(crate) fn is_cdna_device() -> bool {
+    fragment_device().and_then(|caps| caps.amd()).is_some_and(svod_dtype::AmdArch::is_cdna)
+}
+
+/// Whether the env-selected device is in `archs` with its LLVM backend present —
+/// the self-skip gate for the `#[ignore]`d HW tests of a kernel.
+pub(crate) fn device_supported(archs: crate::ArchSet) -> bool {
+    let spec = svod_tensor::Tensor::empty(&[1], svod_dtype::DType::Float32).device();
+    crate::target::check_target(&spec, archs).is_ok()
+}

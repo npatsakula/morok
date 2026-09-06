@@ -114,7 +114,7 @@ fn test_row_arg_reduce_graph_shape() {
     let build = |caps: ArchCaps| {
         let ker = Kernel::new("argred", [1, 1, 1], caps.wave_size as i64, vec![], caps);
         let warp = ker.warp();
-        let frag = ker.caps.frag(FragRole::Accumulator);
+        let frag = ker.frag(FragRole::Accumulator);
         let src = warp.zero(ker.rt((16, 16), DType::Float32, ROW, frag));
         let val = warp.clear_rv(ker.rv(16, DType::Float32, VecLayout::Ortho, frag), f64::INFINITY);
         let idx = warp.clear_rv(ker.rv(16, DType::Int32, VecLayout::Ortho, frag), -1.0);
@@ -123,7 +123,7 @@ fn test_row_arg_reduce_graph_shape() {
         let (_, idx) = warp.row_arg_reduce(val, idx, &src, ArgDir::Min);
         idx.uop().toposort()
     };
-    for caps in [ArchCaps::GFX942, ArchCaps::for_arch(AmdArch::Gfx1151)] {
+    for caps in [ArchCaps::GFX942, ArchCaps::for_amd(AmdArch::Gfx1151)] {
         let want_customs = 2 * caps.reduce_tree().len();
         let topo = build(caps);
         let customs = topo.iter().filter(|u| matches!(u.op(), Op::Custom(..))).count();
@@ -157,8 +157,7 @@ fn test_row_arg_reduce_graph_shape() {
 /// geometry is wave64-specific (a 64-thread block is 2 waves on wave32, racing the
 /// shared output). A wave32 softmax would need an arch-derived block.
 fn is_cdna_device() -> bool {
-    let dev = svod_tensor::Tensor::rand(&[16, 16]).expect("probe tensor").device();
-    crate::target::resolve_arch(&dev).is_some_and(|a| a.is_cdna())
+    super::is_cdna_device()
 }
 
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib reductions::test_softmax_amd -- --ignored --nocapture`.
@@ -251,12 +250,11 @@ fn test_softmax_unroll_amd() {
 fn test_row_argmin_amd() {
     use svod_tensor::Tensor;
 
-    let dev = Tensor::rand(&[16, 16]).expect("probe").device();
-    let Some(arch) = crate::target::resolve_arch(&dev) else {
-        eprintln!("skip test_row_argmin_amd: no AMD device");
+    let Some(caps) = super::fragment_device() else {
+        eprintln!("skip test_row_argmin_amd: no device with tk fragment layouts");
         return;
     };
-    let w = arch.wave_size() as i64;
+    let w = caps.wave_size as i64;
 
     // Symmetric matrix: +1.0 except −1.0 at the involution pairs (2k, 2k+1) and a
     // tie pair (0, 6). Symmetry ⇒ per-row argmin == per-column argmin, so the
@@ -289,7 +287,7 @@ fn test_row_argmin_amd() {
 
     crate::run_kernel("argmin", [1, 1, 1], w, &mut [&mut vout, &mut iout], &[&a], |ker| {
         let warp = ker.warp();
-        let frag = ker.caps.frag(FragRole::Accumulator);
+        let frag = ker.frag(FragRole::Accumulator);
         let vo = ker.gl(&[1, 1, 16, 16], DType::Float32);
         let io = ker.gl(&[1, 1, 16, 16], DType::Int32);
         let ain = ker.gl(&[1, 1, 16, 16], DType::Float32);
@@ -314,5 +312,5 @@ fn test_row_argmin_amd() {
         assert_eq!(gi[k * 16 + k], expect[k], "row/col {k}: argmin index (diagonal)");
         assert!((gv[k * 16 + k] + 1.0).abs() < 1e-6, "row/col {k}: argmin value −1.0, got {}", gv[k * 16 + k]);
     }
-    println!("row_argmin: 16/16 correct on {arch:?} (tie at index 0 → 1)");
+    println!("row_argmin: 16/16 correct on {:?} (tie at index 0 → 1)", caps.arch);
 }

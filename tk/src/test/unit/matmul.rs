@@ -140,7 +140,7 @@ fn test_matmul_rdna_renders_wmma() {
         SMALL_CFG.grid_dims(n),
         SMALL_CFG.threads(32),
         dummy_buffers(n),
-        crate::ArchCaps::for_arch(svod_dtype::AmdArch::Gfx1151),
+        crate::ArchCaps::for_amd(svod_dtype::AmdArch::Gfx1151),
     );
     build_matmul_cfg(&ker, n, SMALL_CFG);
     let sink = ker.finish(SMALL_CFG.n_accum);
@@ -227,6 +227,10 @@ fn test_st_db_base_offset_infra() {
 #[test]
 #[ignore]
 fn test_simple_matmul_amd() {
+    if !super::device_supported(crate::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
+        eprintln!("skip test_simple_matmul_amd: unsupported device/toolchain");
+        return;
+    }
     for n in [256usize, 512, 1024, 2048] {
         run_matmul_check(n);
     }
@@ -249,6 +253,10 @@ fn run_matmul_check(n: usize) {
 #[test]
 #[ignore]
 fn test_matmul_l2swizzle_amd() {
+    if !super::device_supported(crate::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
+        eprintln!("skip test_matmul_l2swizzle_amd: unsupported device/toolchain");
+        return;
+    }
     let cfg = MatmulCfg { vec_load: false, ..M1_CFG };
     for n in [2048usize, 4096] {
         let (a, b) = matmul_inputs(n);
@@ -291,6 +299,10 @@ fn max_abs_err(got: &[f32], expected: &[f32]) -> f32 {
 #[test]
 #[ignore]
 fn test_matmul_rdna_computes_ab() {
+    if !super::device_supported(crate::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
+        eprintln!("skip test_matmul_rdna_computes_ab: unsupported device/toolchain");
+        return;
+    }
     use svod_tensor::Tensor;
     let n = 64usize;
     let (a, b) = matmul_inputs(n);
@@ -331,6 +343,10 @@ fn test_matmul_rdna_computes_ab() {
 #[test]
 #[ignore]
 fn test_matmul_rdna_grid() {
+    if !super::device_supported(crate::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
+        eprintln!("skip test_matmul_rdna_grid: unsupported device/toolchain");
+        return;
+    }
     use svod_tensor::Tensor;
     let n = 64usize;
     let mut a_data = vec![0f32; n * n];
@@ -367,7 +383,7 @@ where
     use svod_tensor::Tensor;
     // Launch block must match the device wave size (gfx942 wave64, gfx11 wave32),
     // matching the `matmul()` entry's `cfg.threads(caps.wave_size)`.
-    let ws = crate::target::resolve_arch(&a.device()).map(|ar| ar.wave_size() as usize).unwrap_or(64);
+    let ws = crate::target::resolve_arch(&a.device()).map(|ar| crate::ArchCaps::for_arch(ar).wave_size).unwrap_or(64);
     let mut c = Tensor::empty(&[n, n], DType::Float32);
     crate::run_kernel(name, cfg.grid_dims(n), cfg.threads(ws), &mut [&mut c], &[a, b], |ker| {
         build(ker);
@@ -387,6 +403,10 @@ where
 #[test]
 #[ignore]
 fn test_matmul_graph_amd() {
+    if !super::device_supported(crate::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
+        eprintln!("skip test_matmul_graph_amd: unsupported device/toolchain");
+        return;
+    }
     for n in [256usize, 512, 1024] {
         let (a, b) = matmul_inputs(n);
         let expected = matmul_reference(&a, &b);
@@ -412,6 +432,10 @@ fn test_matmul_graph_amd() {
 #[test]
 #[ignore]
 fn test_matmul_adaptive_amd() {
+    if !super::device_supported(crate::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
+        eprintln!("skip test_matmul_adaptive_amd: unsupported device/toolchain");
+        return;
+    }
     for n in [256usize, 512, 768, 1024, 2048] {
         let (a, b) = matmul_inputs(n);
         let cfg = cfg_for_n(n);

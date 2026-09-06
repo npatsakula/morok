@@ -11,7 +11,7 @@ use smallvec::smallvec;
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::{BinaryOp, Op, UnaryOp, prelude::*};
 
-use crate::common::shaped_dtype;
+use crate::common::{shaped_dtype, value_width};
 use crate::llvm::common::gpu::{AXIS_LETTERS, parse_special_axis, render_define_local};
 use crate::llvm::common::{LlvmTarget, RenderContext, ldt};
 use crate::llvm::cpu;
@@ -146,22 +146,95 @@ fn render_barrier(kernel: &mut Vec<String>) -> Option<()> {
 
 // ── Warp-level builders (typed CUSTOM nodes) ──────────────────────────────
 
-/// `shfl.sync.bfly.b32` across the full warp: lane `L` receives `value` from
-/// lane `L ^ lane_mask` (the butterfly step of a warp reduction). 32-bit
-/// values only; f32 rides through i32 like tk's `ds_bpermute` shuffle. The
-/// `declare` travels in the CUSTOM body and is hoisted to the module prefix.
-pub fn shfl_bfly(value: &Arc<UOp>, lane_mask: &Arc<UOp>) -> Arc<UOp> {
-    assert_eq!(value.dtype().bytes(), 4, "shfl_bfly moves one 32-bit register, got {:?}", value.dtype());
-    let is_f32 = value.dtype() == DType::Float32;
-    let word = if is_f32 { value.bitcast(DType::Int32) } else { value.clone() };
+/// The lane-selection mode of a `shfl.sync.*.b32` warp shuffle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShflMode {
+    /// Lane `L` reads from lane `lane`.
+    Idx,
+    /// Lane `L` reads from lane `L - lane` (lanes below 0 keep their own value).
+    Up,
+    /// Lane `L` reads from lane `L + lane` (lanes past 31 keep their own value).
+    Down,
+    /// Lane `L` reads from lane `L ^ lane` (the butterfly step of a reduction).
+    Bfly,
+}
+
+impl ShflMode {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Idx => "idx",
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Bfly => "bfly",
+        }
+    }
+
+    /// The `c` operand: `((32 - width) << 8) | clamp` for the full-warp width,
+    /// where `up` clamps against lane 0 and the others against lane 31 (the
+    /// values `__shfl_*_sync` pass for `width = 32`).
+    fn clamp(self) -> i32 {
+        match self {
+            Self::Up => 0,
+            Self::Idx | Self::Down | Self::Bfly => 31,
+        }
+    }
+}
+
+/// One `shfl.sync.{mode}.b32` over the full warp mask: lane `L` receives
+/// `value` from the lane [`ShflMode`] selects with `lane`. The instruction
+/// moves one 32-bit register, so a 4-byte value (`i32`, `f32`, a `<2 x half>`
+/// fragment word) rides through `i32` by bitcast and a 16-bit scalar widens
+/// into the low half and truncates back. A shaped value (a `STACK` of lanes)
+/// is refused: its `bitcast`/`cast` are elementwise, so the caller splits it.
+/// The `declare` travels in the CUSTOM body and is hoisted to the module
+/// prefix.
+pub fn shfl(mode: ShflMode, value: &Arc<UOp>, lane: &Arc<UOp>) -> Arc<UOp> {
+    let dtype = value.dtype();
+    assert_eq!(value_width(value), dtype.vcount(), "shfl moves one register: split a shaped {dtype:?} value per lane");
+    // The integer type carrying the value's bits; 16-bit ones widen from it.
+    let bits = match dtype.bytes() {
+        4 => DType::Int32,
+        2 if dtype.is_float() => DType::UInt16,
+        2 => dtype.clone(),
+        bytes => panic!("shfl moves one 32-bit register; {dtype:?} is {bytes} bytes"),
+    };
+    let suffix = mode.suffix();
     let shuffled = UOp::custom(
-        smallvec![word, lane_mask.cast(DType::Int32)],
-        "declare i32 @llvm.nvvm.shfl.sync.bfly.i32(i32, i32, i32, i32)\n\
-         call i32 @llvm.nvvm.shfl.sync.bfly.i32(i32 -1, i32 {0}, i32 {1}, i32 31)"
-            .to_string(),
+        smallvec![rebits(value, bits.clone()).cast(DType::Int32), lane.cast(DType::Int32)],
+        format!(
+            "declare i32 @llvm.nvvm.shfl.sync.{suffix}.i32(i32, i32, i32, i32)\n\
+             call i32 @llvm.nvvm.shfl.sync.{suffix}.i32(i32 -1, i32 {{0}}, i32 {{1}}, i32 {})",
+            mode.clamp()
+        ),
         DType::Int32,
     );
-    if is_f32 { shuffled.bitcast(DType::Float32) } else { shuffled }
+    rebits(&shuffled.cast(bits), dtype)
+}
+
+/// `value` reinterpreted as `dtype`, skipping the no-op bitcast.
+fn rebits(value: &Arc<UOp>, dtype: DType) -> Arc<UOp> {
+    if value.dtype() == dtype { value.clone() } else { value.bitcast(dtype) }
+}
+
+/// `shfl.sync.idx.b32`: every lane reads `value` from lane `src_lane`
+/// (a broadcast when `src_lane` is warp-uniform).
+pub fn shfl_idx(value: &Arc<UOp>, src_lane: &Arc<UOp>) -> Arc<UOp> {
+    shfl(ShflMode::Idx, value, src_lane)
+}
+
+/// `shfl.sync.up.b32`: lane `L` reads `value` from lane `L - delta`.
+pub fn shfl_up(value: &Arc<UOp>, delta: &Arc<UOp>) -> Arc<UOp> {
+    shfl(ShflMode::Up, value, delta)
+}
+
+/// `shfl.sync.down.b32`: lane `L` reads `value` from lane `L + delta`.
+pub fn shfl_down(value: &Arc<UOp>, delta: &Arc<UOp>) -> Arc<UOp> {
+    shfl(ShflMode::Down, value, delta)
+}
+
+/// `shfl.sync.bfly.b32`: lane `L` reads `value` from lane `L ^ lane_mask`.
+pub fn shfl_bfly(value: &Arc<UOp>, lane_mask: &Arc<UOp>) -> Arc<UOp> {
+    shfl(ShflMode::Bfly, value, lane_mask)
 }
 
 /// `%globaltimer`: the nanosecond GPU clock, for in-kernel stamp probes.

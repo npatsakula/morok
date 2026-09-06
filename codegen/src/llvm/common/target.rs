@@ -45,6 +45,16 @@ impl LlvmTarget {
     }
 }
 
+impl std::fmt::Display for LlvmTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cpu => f.write_str("cpu"),
+            Self::Amd(arch) => write!(f, "{arch}"),
+            Self::Nvptx(arch) => write!(f, "{arch}"),
+        }
+    }
+}
+
 /// Numeric address space encoded in LLVM IR pointer types for this target.
 ///
 /// CPU: addrspace(0) is the generic flat space; LLVM's IR-level distinction

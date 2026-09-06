@@ -151,6 +151,9 @@ impl Renderer for LlvmTextRenderer {
                 ctx.register(node.id, String::new());
                 continue;
             }
+            if let Some(intrinsic) = foreign_intrinsic(node, self.target) {
+                return Err(Error::ForeignIntrinsic { intrinsic, target: self.target.to_string() });
+            }
             let first_line = kernel.len();
             match self.target {
                 LlvmTarget::Cpu => {
@@ -286,6 +289,24 @@ attributes #0 = {{ {attrs} }}
     fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
         None
     }
+}
+
+/// The first `@llvm.nvvm.*` / `@llvm.amdgcn.*` reference in a CUSTOM body
+/// that `target` cannot lower. The typed builders (`nvptx::{ops,smem}`, tk's
+/// gfx9 `asm`) are target-specific; on the wrong target clang emits the name
+/// as an extern call that only the device assembler rejects.
+fn foreign_intrinsic(node: &Arc<UOp>, target: LlvmTarget) -> Option<String> {
+    let code = match node.op() {
+        Op::Custom(ops::Custom { code, .. }) | Op::CustomI(ops::CustomI { code, .. }) => code,
+        _ => return None,
+    };
+    code.match_indices("@llvm.")
+        .map(|(at, _)| code[at + 1..].split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or_default())
+        .find(|name| {
+            (name.starts_with("llvm.nvvm.") && !target.is_nvptx())
+                || (name.starts_with("llvm.amdgcn.") && !target.is_amd())
+        })
+        .map(str::to_string)
 }
 
 fn mangle_type(llvm_type: &str) -> String {

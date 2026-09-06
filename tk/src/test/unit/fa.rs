@@ -204,7 +204,7 @@ fn test_fa_graph_path_renders_clean_gfx1151() {
         [h as i64, (n / q_blk / 8) as i64, b as i64],
         8 * 32, // NUM_WARPS * wave32
         dummy_fa_buffers(b, n, h, h_kv, d),
-        crate::ArchCaps::for_arch(svod_dtype::AmdArch::Gfx1151),
+        crate::ArchCaps::for_amd(svod_dtype::AmdArch::Gfx1151),
     );
     build_fa_mw_rdb(
         &ker,
@@ -269,7 +269,7 @@ fn test_fa_mw_rdb_renders_wave32() {
         [h as i64, (n / 16 / 8) as i64, b as i64],
         8 * 32, // NUM_WARPS * wave32
         dummy_fa_buffers(b, n, h, h_kv, d),
-        crate::ArchCaps::for_arch(svod_dtype::AmdArch::Gfx1151),
+        crate::ArchCaps::for_amd(svod_dtype::AmdArch::Gfx1151),
     );
     build_fa_mw_rdb(
         &ker,
@@ -354,8 +354,7 @@ fn test_fa_mw_rdb_unroll_amd() {
 /// wave-width-aware `flash_attention_with` graph entry, exercised by the
 /// `*_noncausal_*`/`*_graph_check_*` tests).
 fn is_cdna_device() -> bool {
-    let dev = svod_tensor::Tensor::rand(&[16, 16]).expect("probe tensor").device();
-    crate::target::resolve_arch(&dev).is_some_and(|a| a.is_cdna())
+    super::is_cdna_device()
 }
 
 fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
@@ -516,6 +515,10 @@ svod_tensor::custom_kernel_check! {
 #[test]
 #[ignore]
 fn test_fa_noncausal_f16_amd() {
+    if !super::device_supported(crate::kernels::fa::FA_SUPPORTED_ARCHS) {
+        eprintln!("skip test_fa_noncausal_f16_amd: unsupported device/toolchain");
+        return;
+    }
     use crate::kernels::fa::{FaOpts, flash_attention_with};
     use svod_tensor::Tensor;
 
@@ -558,6 +561,10 @@ fn test_fa_noncausal_f16_amd() {
 #[test]
 #[ignore]
 fn test_fa_noncausal_f16_masked_amd() {
+    if !super::device_supported(crate::kernels::fa::FA_SUPPORTED_ARCHS) {
+        eprintln!("skip test_fa_noncausal_f16_masked_amd: unsupported device/toolchain");
+        return;
+    }
     use crate::kernels::fa::{FaOpts, flash_attention_with};
     use svod_tensor::Tensor;
 
@@ -617,6 +624,10 @@ fn test_fa_noncausal_f16_masked_amd() {
 #[test]
 #[ignore]
 fn test_fa_key_lens_zero_is_finite_amd() {
+    if !super::device_supported(crate::kernels::fa::FA_SUPPORTED_ARCHS) {
+        eprintln!("skip test_fa_key_lens_zero_is_finite_amd: unsupported device/toolchain");
+        return;
+    }
     use crate::kernels::fa::{FaOpts, flash_attention_with};
     use svod_tensor::Tensor;
 

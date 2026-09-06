@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
-use svod_dtype::{AmdArch, DType};
+use svod_dtype::{DType, GpuArch};
 use svod_ir::{AxisId, AxisType, RendererDevice, UOp, WmmaMetadata, WmmaUpcastAxes};
 use svod_schedule::optimizer::{Renderer, TensorCore};
 
@@ -45,21 +45,28 @@ fn wmma_from_tc(tc: &TensorCore, device: RendererDevice) -> WmmaMetadata {
 }
 
 /// The K=16 WMMA descriptor for input dtype `dtype_in` on `arch`, looked up from
-/// the shared per-arch tensor-core table (`Renderer::for_amd_arch`) rather than
-/// re-encoded here — so bf16/f16 on CDNA's MFMA cores and the RDNA wave32 cores
-/// come from one source. Both accumulate in f32. `arch` is threaded from
-/// [`crate::ArchCaps::arch`] (gfx942 in practice; the table already carries the
-/// RDNA cores for when a wave32 arch is enabled).
-fn wmma_desc(arch: AmdArch, dtype_in: &DType) -> WmmaMetadata {
-    let ren = Renderer::for_amd_arch(arch);
+/// the shared per-arch tensor-core table (`Renderer::for_{amd,cuda}_arch`) rather
+/// than re-encoded here — so bf16/f16 on CDNA's MFMA cores and the RDNA wave32
+/// cores come from one source. Both accumulate in f32. `arch` is threaded from
+/// [`crate::ArchCaps::arch`]. CUDA's `mma.sync` cores are `m16n8k16` (dims
+/// `(8,16,16)`), so no 16×16×16 entry exists there and the lookup fails loudly
+/// until tk carries rectangular fragments.
+fn wmma_desc(arch: GpuArch, dtype_in: &DType) -> WmmaMetadata {
+    let ren = match arch {
+        GpuArch::Amd(amd) => Renderer::for_amd_arch(amd),
+        GpuArch::Cuda(cuda) => Renderer::for_cuda_arch(cuda),
+        GpuArch::Metal(family) => Renderer::for_metal_family(family),
+    };
     let tc =
         ren.tensor_cores.iter().find(|tc| &tc.dtype_in == dtype_in && tc.dims == (16, 16, 16)).unwrap_or_else(|| {
             // Precondition violation by the kernel author, not end-user input: the
             // matrix-core operand dtype must be bf16/f16 (the only 16×16×16 WMMA
-            // inputs). The USE-face kernels pre-cast; an AUTHOR calling `mma_*`
-            // with an unsupported RT dtype lands here.
+            // inputs) on an arch with a square 16×16×16 core. The USE-face kernels
+            // pre-cast and gate by `ArchSet`; an AUTHOR calling `mma_*` with an
+            // unsupported RT dtype or on CUDA lands here.
             unimplemented!(
-                "mma: operand dtype {dtype_in:?} has no 16×16×16 WMMA on {arch:?} — operands must be bf16 or f16"
+                "mma: operand dtype {dtype_in:?} has no 16×16×16 WMMA on {arch:?} — operands must be bf16 or f16 on \
+                 an AMD matrix-core arch"
             )
         });
     wmma_from_tc(tc, ren.device)

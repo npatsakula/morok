@@ -16,7 +16,8 @@
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
-use svod_dtype::DType;
+use svod_codegen::llvm::nvptx::ops::{shfl_bfly, shfl_idx};
+use svod_dtype::{DType, GpuArch};
 use svod_ir::{AxisType, UOp};
 
 use crate::index::{Idx, cidx, flat_offset};
@@ -335,24 +336,43 @@ impl<'k> Group<'k> {
         }
     }
 
-    /// Read this lane's `value` from lane `src_lane` within the wave (gfx9
-    /// wave64) via `llvm.amdgcn.ds.bpermute` — an in-register cross-lane gather
-    /// with no LDS and no barrier. The intrinsic is i32-typed (lane `L` receives
-    /// `data` from lane `byte_addr(L) >> 2`), so f32 is bitcast through i32 and
-    /// the byte address is `src_lane * 4`. Emitted via the typed `Op::Custom`
+    /// Read this lane's `value` from lane `src_lane` within the wave — an
+    /// in-register cross-lane gather with no LDS and no barrier, lowered per arch:
+    /// `llvm.amdgcn.ds.bpermute` on AMD (i32-typed; lane `L` receives `data` from
+    /// lane `byte_addr(L) >> 2`, so f32 is bitcast through i32 and the byte address
+    /// is `src_lane * 4`), `shfl.sync.idx` on CUDA. Both ride the typed `Op::Custom`
     /// path (the `declare` is auto-hoisted+deduped to the module prefix).
+    ///
+    /// # Panics
+    /// Panics on an arch without a shuffle lowering (Metal).
     pub(super) fn shuffle_lane(&self, value: &Arc<UOp>, src_lane: &Arc<UOp>) -> Arc<UOp> {
-        let is_f32 = value.dtype() == DType::Float32;
-        let data_i = if is_f32 { value.bitcast(DType::Int32) } else { value.clone() };
-        let addr = imul(src_lane, 4).cast(DType::Int32);
-        let sh = UOp::custom(
-            smallvec![addr, data_i],
-            "declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)\n\
-             call i32 @llvm.amdgcn.ds.bpermute(i32 {0}, i32 {1})"
-                .to_string(),
-            DType::Int32,
-        );
-        if is_f32 { sh.bitcast(DType::Float32) } else { sh }
+        match self.ker.caps.arch {
+            GpuArch::Amd(_) => {
+                let is_f32 = value.dtype() == DType::Float32;
+                let data_i = if is_f32 { value.bitcast(DType::Int32) } else { value.clone() };
+                let addr = imul(src_lane, 4).cast(DType::Int32);
+                let sh = UOp::custom(
+                    smallvec![addr, data_i],
+                    "declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)\n\
+                     call i32 @llvm.amdgcn.ds.bpermute(i32 {0}, i32 {1})"
+                        .to_string(),
+                    DType::Int32,
+                );
+                if is_f32 { sh.bitcast(DType::Float32) } else { sh }
+            }
+            GpuArch::Cuda(_) => shfl_idx(value, src_lane),
+            GpuArch::Metal(_) => unimplemented!("tk cross-lane shuffle has no Metal lowering"),
+        }
+    }
+
+    /// Butterfly gather: this lane's `value` from lane `laneid ^ mask` — the
+    /// `shfl.sync.bfly` immediate form on CUDA, the same `ds_bpermute` as
+    /// [`Self::shuffle_lane`] with a computed partner on AMD.
+    pub(super) fn shuffle_xor_lane(&self, value: &Arc<UOp>, mask: i64) -> Arc<UOp> {
+        match self.ker.caps.arch {
+            GpuArch::Cuda(_) => shfl_bfly(value, &cidx(mask)),
+            _ => self.shuffle_lane(value, &ixor(&self.laneid(), mask)),
+        }
     }
 
     // ── store bookkeeping helpers ───────────────────────────────────────────

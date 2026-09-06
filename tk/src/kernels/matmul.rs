@@ -134,9 +134,9 @@ pub fn cfg_for_n(n: usize) -> MatmulCfg {
 /// [`GFX1151_CFG`]; gfx942 (CDNA wave64) keeps the size-adaptive [`cfg_for_n`].
 /// Arch-specific peak tuning lives here (the generic optimizer stays generic);
 /// this is the tk peer of HK shipping separate gfx942/gfx950/gfx1250 kernels.
-pub fn cfg_for_arch(arch: svod_dtype::AmdArch, n: usize) -> MatmulCfg {
+pub fn cfg_for_arch(arch: svod_dtype::GpuArch, n: usize) -> MatmulCfg {
     match arch {
-        svod_dtype::AmdArch::Gfx1151 if n.is_multiple_of(GFX1151_CFG.block) => GFX1151_CFG,
+        svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx1151) if n.is_multiple_of(GFX1151_CFG.block) => GFX1151_CFG,
         _ => cfg_for_n(n),
     }
 }
@@ -165,7 +165,8 @@ fn block_coords(ker: &Kernel, m: usize, n: usize, cfg: &MatmulCfg) -> (Arc<UOp>,
 /// gfx1151 (RDNA3.5 WMMA, wave32 — the `_W32_*` fragment shapes). The launcher
 /// gates against this; see [`crate::target::check_target`].
 /// Validated on gfx942 (CDNA3) and gfx1151 (RDNA3.5).
-pub const MATMUL_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151];
+pub const MATMUL_SUPPORTED_ARCHS: crate::ArchSet =
+    crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151]);
 
 /// **Graph-native** `n×n` matrix multiply — returns a lazy output [`Tensor`] (a
 /// `custom_kernel` / `Op::Call` node), the matmul peer of [`crate::flash_attention`].

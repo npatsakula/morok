@@ -62,10 +62,11 @@ fn iconst(v: i64) -> Arc<UOp> {
 /// → [`build_fa_mw_rdb`]) is enabled for gfx942 (CDNA MFMA, wave64) and gfx1151
 /// (RDNA3.5 WMMA, wave32). The launcher gates against this list; generic launch
 /// infrastructure stays architecture-agnostic.
-pub const FA_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151];
+pub const FA_SUPPORTED_ARCHS: crate::ArchSet =
+    crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151]);
 
 /// Whether `device` can run the production graph flash-attention kernel.
-/// Uses the same architecture and AMD toolchain gate as [`crate::launch_custom`].
+/// Uses the same architecture and toolchain gate as [`crate::launch_custom`].
 pub fn flash_attention_supported(device: &svod_dtype::DeviceSpec) -> bool {
     crate::target::resolve_supported_arch(device, FA_SUPPORTED_ARCHS).is_ok()
 }
@@ -73,7 +74,7 @@ pub fn flash_attention_supported(device: &svod_dtype::DeviceSpec) -> bool {
 /// The **direct-launch** FA wrappers ([`flash_attention_forward`], `_mw`, `_mw_db`,
 /// `_mw_rdb`) hardcode the wave64 block size and the CDNA fragment tiles, so they
 /// stay gfx942-only.
-const FA_DIRECT_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942];
+const FA_DIRECT_SUPPORTED_ARCHS: crate::ArchSet = crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942]);
 
 /// Validate a direct-launch wrapper's device against [`FA_DIRECT_SUPPORTED_ARCHS`].
 fn fa_check_target(t: &Tensor) -> crate::LaunchResult<()> {

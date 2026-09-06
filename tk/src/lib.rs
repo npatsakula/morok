@@ -1,4 +1,4 @@
-//! `svod-tk` — a ThunderKittens-style tile DSL for AMD GPUs. It serves two
+//! `svod-tk` — a ThunderKittens-style tile DSL for GPUs. It serves two
 //! audiences, and the public API below is grouped to match.
 //!
 //! **1. Use the built-in kernels** through the [`Tensor`](svod_tensor::Tensor)
@@ -30,13 +30,17 @@
 //! # Supported targets
 //! - **gfx942** (CDNA3) — wave64, MFMA.
 //! - **gfx1151** (RDNA3.5) — wave32, WMMA.
+//! - **CUDA sm_80+** — warp32; shuffle-only kernels ([`single_query_attention`])
+//!   today. The matrix-core kernels wait on the rectangular `mma.sync` fragment
+//!   layouts ([`ArchCaps::frag`](arch::ArchCaps::frag) is `None` on CUDA).
 //!
-//! Inputs are bf16/f16, accumulation is f32, the WMMA/MFMA K-edge is 16; the
-//! per-arch fragment shapes resolve through [`ArchCaps`]. The layout-table
-//! calibration is pinned to gfx942 wave64 ([`WARP_THREADS`]); the live lane count
-//! flows through [`ArchCaps::wave_size`](arch::ArchCaps::wave_size). On a target
-//! outside the two above [`flash_attention`] transparently falls back to the
-//! tensor scheduler.
+//! Each kernel declares the arches it is built for as an [`ArchSet`]. Inputs are
+//! bf16/f16, accumulation is f32, the WMMA/MFMA K-edge is 16; the per-arch
+//! fragment shapes resolve through [`ArchCaps`]. The layout-table calibration is
+//! pinned to gfx942 wave64 ([`WARP_THREADS`]); the live lane count flows through
+//! [`ArchCaps::wave_size`](arch::ArchCaps::wave_size). On a target outside a
+//! kernel's set its launcher declines (`Ok(None)`) so the caller falls back to
+//! the tensor scheduler.
 
 pub mod arch;
 pub mod asm;
@@ -63,7 +67,7 @@ pub mod tiles;
 /// [`ArchCaps::wave_size`](arch::ArchCaps::wave_size); this constant is only the
 /// layout-table calibration, pinned to the canonical arch by the assert below.
 pub const WARP_THREADS: usize = 64;
-const _: () = assert!(WARP_THREADS == svod_dtype::AmdArch::Gfx942.wave_size() as usize);
+const _: () = assert!(WARP_THREADS == ArchCaps::GFX942.wave_size);
 
 // ── Use the built-in kernels (Tensor in → Tensor out) ───────────────────────
 pub use kernels::fa::{
@@ -74,6 +78,7 @@ pub use kernels::knn::knn;
 pub use kernels::matmul::matmul;
 pub use kernels::sq_attention::{SqAttentionOpts, single_query_attention, single_query_attention_packed};
 pub use launch::{Error as LaunchError, Result as LaunchResult};
+pub use target::ArchSet;
 
 // ── Author your own kernel (the tile DSL) ───────────────────────────────────
 pub use arch::ArchCaps;
