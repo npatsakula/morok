@@ -148,12 +148,31 @@ pub(crate) fn tensor_to_bool_scalar(t: &Tensor) -> Result<bool> {
 
 /// Extract a scalar f64 from a tensor (e.g. constant_value for Pad).
 pub(crate) fn tensor_to_f64_scalar(t: &Tensor) -> Result<f64> {
-    let mut casted =
-        t.cast(DType::Float64).map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_scalar: {e}") })?;
-    casted.realize().map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_scalar: {e}") })?;
-    let vals =
-        casted.as_vec::<f64>().map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_scalar: {e}") })?;
-    vals.into_iter().next().ok_or_else(|| Error::IrConstruction { details: "empty scalar tensor".into() })
+    host_f64_values(t, "tensor_to_f64_scalar")?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::IrConstruction { details: "empty scalar tensor".into() })
+}
+
+/// Read a tensor's values as f64 on the host. The device computes in the
+/// tensor's own dtype family (f32 for floats, i64 for integers) and the widening
+/// happens here, so no f64 kernel is required of devices without `double`.
+fn host_f64_values(t: &Tensor, what: &str) -> Result<Vec<f64>> {
+    let failed = |e: svod_tensor::error::Error| Error::IrConstruction { details: format!("{what}: {e}") };
+    let dtype = t.uop().dtype();
+    if dtype.base() == svod_dtype::ScalarDType::Float64 {
+        let mut realized = t.clone();
+        realized.realize().map_err(failed)?;
+        return realized.as_vec::<f64>().map_err(failed);
+    }
+    let via = if dtype.is_float() { DType::Float32 } else { DType::Int64 };
+    let mut casted = t.cast(via.clone()).map_err(failed)?;
+    casted.realize().map_err(failed)?;
+    if via == DType::Float32 {
+        Ok(casted.as_vec::<f32>().map_err(failed)?.into_iter().map(f64::from).collect())
+    } else {
+        Ok(casted.as_vec::<i64>().map_err(failed)?.into_iter().map(|v| v as f64).collect())
+    }
 }
 
 /// Extract concrete i64 values from a tensor (shape/indices/pads inputs).
@@ -166,8 +185,5 @@ pub(crate) fn tensor_to_i64_vec(t: &Tensor) -> Result<Vec<i64>> {
 
 /// Extract concrete f64 values from a tensor.
 pub(crate) fn tensor_to_f64_vec(t: &Tensor) -> Result<Vec<f64>> {
-    let mut casted =
-        t.cast(DType::Float64).map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_vec: {e}") })?;
-    casted.realize().map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_vec: {e}") })?;
-    casted.as_vec::<f64>().map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_vec: {e}") })
+    host_f64_values(t, "tensor_to_f64_vec")
 }

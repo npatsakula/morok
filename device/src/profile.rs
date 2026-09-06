@@ -53,23 +53,25 @@ pub struct CounterSet {
     pub values: BTreeMap<PmcCounter, u64>,
 }
 
-/// Per-kernel static GPU resource usage, decoded from the compiled program's
-/// kernel descriptor. Pure static — no runtime cost.
+/// Per-kernel static GPU resource usage, decoded from the compiled program
+/// (AMD: the kernel descriptor; Metal: the pipeline state). Pure static — no
+/// runtime cost. Fields a backend cannot see are `None`.
 #[derive(Debug, Clone, Copy)]
 pub struct KernelResources {
-    /// Vector GPRs allocated per lane.
-    pub vgprs: u32,
-    /// Scalar GPRs allocated.
-    pub sgprs: u32,
-    /// LDS (group segment) bytes per workgroup.
+    /// Vector GPRs allocated per lane (AMD).
+    pub vgprs: Option<u32>,
+    /// Scalar GPRs allocated (AMD).
+    pub sgprs: Option<u32>,
+    /// LDS / threadgroup memory bytes per workgroup.
     pub lds_bytes: u32,
-    /// Scratch (private segment) bytes per lane.
-    pub scratch_bytes: u32,
-    /// Wave width (32 or 64).
+    /// Scratch (private segment) bytes per lane (AMD).
+    pub scratch_bytes: Option<u32>,
+    /// Wave / SIMD-group width (32 or 64).
     pub wave_size: u32,
-    /// VGPR-limited occupancy as a fraction of the SIMD's max resident waves
-    /// (0.0–1.0), for architectures with known register-file geometry. `None`
-    /// when the geometry is unknown — the first-order limiter only (LDS and
-    /// workgroup limits are not modeled).
+    /// Register-limited occupancy (0.0–1.0), the first-order limiter only (LDS
+    /// and workgroup limits are not modeled). AMD: resident waves per SIMD
+    /// versus the register-file maximum, `None` for unknown geometry. Metal:
+    /// the pipeline's `maxTotalThreadsPerThreadgroup` over the device's 1024,
+    /// which the compiler lowers as register demand grows.
     pub occupancy: Option<f32>,
 }

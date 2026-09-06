@@ -14,6 +14,9 @@ fn parse_simple_variants() {
     assert_eq!(parse_simple("amd:2"), Some(DeviceSpec::Amd { device_id: 2 }));
     assert_eq!(parse_simple("HIP"), Some(DeviceSpec::Amd { device_id: 0 }));
     assert_eq!(parse_simple("HIP:1"), Some(DeviceSpec::Amd { device_id: 1 }));
+    assert_eq!(parse_simple("METAL"), Some(DeviceSpec::Metal { device_id: 0 }));
+    assert_eq!(parse_simple("metal:1"), Some(DeviceSpec::Metal { device_id: 1 }));
+    assert_eq!(parse_simple("METAL:x"), None);
     assert_eq!(parse_simple("cuda"), None);
     assert_eq!(parse_simple(""), None);
     assert_eq!(parse_simple("AMD:notanum"), None);
@@ -70,4 +73,10 @@ fn nested_with_default_device_restores_each_layer() {
 fn spawn_with_default_device_propagates_callers_device() {
     let handle = with_default_device(DeviceSpec::Amd { device_id: 3 }, || spawn_with_default_device(default_device));
     assert_eq!(handle.join().unwrap(), DeviceSpec::Amd { device_id: 3 });
+}
+
+#[test]
+fn platform_default_is_metal_only_on_macos() {
+    let expected = if cfg!(target_os = "macos") { DeviceSpec::Metal { device_id: 0 } } else { DeviceSpec::Cpu };
+    assert_eq!(platform_default(), expected);
 }

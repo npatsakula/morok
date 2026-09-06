@@ -44,7 +44,6 @@ serde = ["svod-ir/serde"]
 tracing-verbose = []
 # Devices
 cuda = ["svod-device/cuda"]
-metal = ["svod-device/metal"]
 webgpu = ["svod-device/webgpu"]
 
 [dev-dependencies]

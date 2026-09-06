@@ -136,6 +136,28 @@ impl PrepareConfig {
         svod_device::registry::resolve_amd_arch_from_topology(device_id).ok()?;
         Some(Self::from_env())
     }
+
+    /// Metal variant for the `codegen_tests!` macro. The test runs only when the
+    /// active default is a Metal device and an Apple GPU is present.
+    pub fn for_metal_if_available() -> Option<Self> {
+        let DeviceSpec::Metal { .. } = svod_dtype::default_device::default_device() else { return None };
+        svod_device::metal::has_devices().then(Self::from_env)
+    }
+}
+
+/// Whether a device family can hold buffers of `dtype`, per its optimizer
+/// profile (Metal and WebGPU have no `double`). Family-level: arch-specific
+/// refinements (AMD fp8 variants) need the opened device's renderer.
+pub fn device_supports_storage_dtype(spec: &DeviceSpec, dtype: svod_dtype::ScalarDType) -> bool {
+    use svod_schedule::OptimizerRenderer;
+    let profile = match spec {
+        DeviceSpec::Cpu | DeviceSpec::Disk { .. } => OptimizerRenderer::cpu(),
+        DeviceSpec::Cuda { .. } => OptimizerRenderer::cuda(),
+        DeviceSpec::Amd { .. } => OptimizerRenderer::amd_rdna3(),
+        DeviceSpec::Metal { .. } => OptimizerRenderer::metal(),
+        DeviceSpec::WebGpu => OptimizerRenderer::webgpu(),
+    };
+    profile.supports_storage_dtype(dtype)
 }
 
 /// Detect a supported AMD GPU on this host. Returns the gfx-family arch of
@@ -253,6 +275,22 @@ macro_rules! codegen_tests {
                 };
                 $body
             }
+
+            /// Metal variant — runs only under `SVOD_DEVICE=METAL:N` on a host
+            /// with an Apple GPU; skips otherwise.
+            #[test]
+            $(#[$meta])*
+            fn metal() {
+                ::svod_schedule::testing::setup_test_tracing();
+                let $config = match $crate::PrepareConfig::for_metal_if_available() {
+                    Some(cfg) => cfg,
+                    None => {
+                        eprintln!("metal codegen_tests variant: skipped (no Metal device)");
+                        return;
+                    }
+                };
+                $body
+            }
         }
         $crate::codegen_tests!($($rest)*);
     };
@@ -322,6 +360,26 @@ macro_rules! codegen_tests {
                     Ok(())
                 }).unwrap();
             }
+
+            #[test]
+            #[allow(unused_parens)]
+            $(#[$meta])*
+            fn metal() {
+                ::svod_schedule::testing::setup_test_tracing();
+                let metal_cfg = match $crate::PrepareConfig::for_metal_if_available() {
+                    Some(cfg) => cfg,
+                    None => {
+                        eprintln!("metal codegen_tests variant: skipped (no Metal device)");
+                        return;
+                    }
+                };
+                let mut runner = $runner;
+                runner.run(&($($strategy),+), |($($param),+)| {
+                    let $config = metal_cfg.clone();
+                    $body
+                    Ok(())
+                }).unwrap();
+            }
         }
     };
 
@@ -364,6 +422,24 @@ macro_rules! codegen_tests {
                         Some(cfg) => cfg,
                         None => {
                             eprintln!("amd codegen_tests variant: skipped (no supported AMD GPU)");
+                            return;
+                        }
+                    };
+                    $body
+                }
+            }
+            mod metal {
+                #[allow(unused_imports)]
+                use super::super::*;
+                use ::test_case::test_case;
+
+                $(#[$meta])*
+                fn $name($($param: $ty),+) {
+                    ::svod_schedule::testing::setup_test_tracing();
+                    let $config = match $crate::PrepareConfig::for_metal_if_available() {
+                        Some(cfg) => cfg,
+                        None => {
+                            eprintln!("metal codegen_tests variant: skipped (no Metal device)");
                             return;
                         }
                     };

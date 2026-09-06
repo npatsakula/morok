@@ -5,7 +5,7 @@
 //! and provides tensor core configurations for hardware-accelerated matrix multiplication.
 
 use smallvec::SmallVec;
-use svod_dtype::{AmdArch, DType, ScalarDType};
+use svod_dtype::{AmdArch, DType, MetalFamily, ScalarDType};
 use svod_ir::{RendererDevice, RendererOps, TypedPatternMatcher};
 
 /// Tensor core optimization operation.
@@ -194,6 +194,13 @@ impl Renderer {
         ret
     }
 
+    /// MSL has no `double`.
+    fn metal_dtypes() -> std::collections::HashSet<ScalarDType> {
+        let mut dtypes = Self::common_dtypes();
+        dtypes.remove(&ScalarDType::Float64);
+        dtypes
+    }
+
     fn webgpu_dtypes() -> std::collections::HashSet<ScalarDType> {
         use ScalarDType::*;
         Self::dtype_set(&[Bool, Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32])
@@ -335,7 +342,20 @@ impl Renderer {
         }
     }
 
-    /// Create a Metal GPU renderer configuration (Apple M1/M2/M3).
+    /// The Metal profile for a concrete GPU family: `simdgroup_matrix` tensor
+    /// cores exist from Apple7 (M1) on, so Intel-Mac GPUs (`Mac2`) and older
+    /// Apple GPUs run without them.
+    pub fn for_metal_family(family: MetalFamily) -> Self {
+        let mut renderer = Self::metal();
+        if !family.has_simdgroup_matrix() {
+            renderer.tensor_cores.clear();
+        }
+        renderer.target = Some(family.to_string());
+        renderer
+    }
+
+    /// Create a Metal GPU renderer configuration (family-agnostic: assumes an
+    /// Apple7+ GPU; see [`Self::for_metal_family`]).
     pub fn metal() -> Self {
         Self {
             device: RendererDevice::Metal,
@@ -344,7 +364,9 @@ impl Renderer {
             has_shared: true,
             has_threads: false,
             shared_max: 32768, // 32KB for Metal
-            global_max: None,
+            // Three grid axes: extra global axes are grouped into them (tinygrad's
+            // `Renderer.global_max = (0x8FFFFFFF,) * 3` default, which Metal inherits).
+            global_max: Some(vec![0x8FFF_FFFF; 3]),
             global_prod_max: None,
             local_max: Some(1024),
             upcast_max: 4,        // float4 for Metal
@@ -354,7 +376,7 @@ impl Renderer {
             extra_matcher: None,
             decomposition_matcher: None,
             renderer_ops: None,
-            supported_dtypes: Self::common_dtypes(),
+            supported_dtypes: Self::metal_dtypes(),
             decomposition_profile: "none",
             extra_profile: "none",
         }
@@ -544,7 +566,7 @@ impl Renderer {
         self.renderer_ops = Some(renderer.supported_ops());
         self.decomposition_matcher = renderer.decompositor();
         self.extra_matcher = renderer.extra_matcher();
-        self.target = renderer.gpu_arch().and_then(|arch| arch.amd()).map(|arch| arch.mcpu().to_string());
+        self.target = renderer.gpu_arch().map(svod_dtype::GpuArch::target_name);
         self.decomposition_profile = if self.decomposition_matcher.is_some() {
             match self.device {
                 RendererDevice::AmdRdna3

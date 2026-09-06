@@ -72,6 +72,23 @@ pub trait Program: Send + Sync {
     /// Get the kernel name (for debugging/profiling).
     fn name(&self) -> &str;
 
+    /// Run synchronously and report the dispatch's duration on the GPU clock
+    /// when the backend stamps it; `None` leaves timing to the caller's wall
+    /// clock (the default, which just executes with `wait=true`).
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Program::execute`].
+    unsafe fn execute_timed(
+        &self,
+        buffers: &[*mut u8],
+        vals: &[i64],
+        global_size: Option<[usize; 3]>,
+        local_size: Option<[usize; 3]>,
+    ) -> Result<Option<std::time::Duration>> {
+        unsafe { self.execute(buffers, vals, global_size, local_size, true) }.map(|()| None)
+    }
+
     /// Downcast hook so a backend graph factory can recover its concrete
     /// program type (to read backend-specific fields) when pre-building dispatch
     /// packets. Default returns nothing graphable.

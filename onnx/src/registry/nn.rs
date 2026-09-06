@@ -1,8 +1,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{
-    AspectRatioPolicy, AutoPad, CoordinateTransformMode, DepthToSpaceMode, GridSampleMode, GridSamplePaddingMode,
-    NearestMode, Reduction, ResizeMode, flat_pads_to_pairs,
+    AutoPad, DepthToSpaceMode, GridSampleMode, GridSamplePaddingMode, Reduction, flat_pads_to_pairs,
 };
 use svod_tensor::reduce::AxisSpec;
 
@@ -314,57 +313,6 @@ pub(crate) fn op_instance_norm(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> 
     let epsilon = attrs.float("epsilon", 1e-5) as f64;
     let num_channels = x.shape()?[1].as_const().unwrap();
     Ok(x.group_norm().scale(scale).bias(bias).num_groups(num_channels).eps(epsilon).call()?)
-}
-
-pub(crate) fn op_resize(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
-    let antialias = attrs.int("antialias", 0) != 0;
-    let x = inp(inputs, 0);
-    let roi: Option<Vec<f64>> = inputs
-        .get(1)
-        .and_then(|o| o.as_ref())
-        .filter(|t| t.numel().unwrap_or(0) > 0)
-        .map(tensor_to_f64_vec)
-        .transpose()?;
-    let scales: Option<Vec<f64>> = inputs
-        .get(2)
-        .and_then(|o| o.as_ref())
-        .filter(|t| t.numel().unwrap_or(0) > 0)
-        .map(tensor_to_f64_vec)
-        .transpose()?;
-    let sizes: Option<Vec<usize>> = inputs
-        .get(3)
-        .and_then(|o| o.as_ref())
-        .filter(|t| t.numel().unwrap_or(0) > 0)
-        .map(|t| tensor_to_i64_vec(t).map(|v| v.iter().map(|&x| x as usize).collect()))
-        .transpose()?;
-    let mode: ResizeMode = parse_enum(attrs, "mode", "nearest")?;
-    let coord_mode: CoordinateTransformMode = parse_enum(attrs, "coordinate_transformation_mode", "half_pixel")?;
-    let nearest_mode: NearestMode = parse_enum(attrs, "nearest_mode", "round_prefer_floor")?;
-    let cubic_coeff = attrs.float("cubic_coeff_a", -0.75) as f64;
-    let exclude_outside = attrs.int("exclude_outside", 0) != 0;
-    let extrapolation_value = attrs.float("extrapolation_value", 0.0) as f64;
-    let policy: AspectRatioPolicy = parse_enum(attrs, "keep_aspect_ratio_policy", "stretch")?;
-    let axes_attr = attrs.ints("axes");
-    let axes: Option<Vec<usize>> = if axes_attr.is_empty() {
-        None
-    } else {
-        let ndim = x.ndim()?;
-        Some(axes_attr.iter().map(|&a| if a < 0 { (ndim as i64 + a) as usize } else { a as usize }).collect())
-    };
-    Ok(x.resize()
-        .maybe_scales(scales.as_deref())
-        .maybe_sizes(sizes.as_deref())
-        .mode(mode)
-        .coordinate_transformation_mode(coord_mode)
-        .nearest_mode(nearest_mode)
-        .cubic_coeff_a(cubic_coeff)
-        .exclude_outside(exclude_outside)
-        .antialias(antialias)
-        .extrapolation_value(extrapolation_value)
-        .keep_aspect_ratio_policy(policy)
-        .maybe_axes(axes.as_deref())
-        .maybe_roi(roi.as_deref())
-        .call()?)
 }
 
 // =========================================================================

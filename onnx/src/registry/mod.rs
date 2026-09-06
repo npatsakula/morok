@@ -10,6 +10,7 @@ pub(crate) use attr::*;
 mod constant;
 mod indexing;
 mod nn;
+mod resize;
 mod shape;
 mod transformer;
 
@@ -599,7 +600,7 @@ impl OpRegistry {
             "LayerNormalization" => nn::op_layer_norm(inputs, &mut attrs)?,
             "GroupNormalization" => vec![nn::op_group_norm(inputs, &mut attrs)?],
             "InstanceNormalization" => vec![nn::op_instance_norm(inputs, &mut attrs)?],
-            "Resize" => vec![nn::op_resize(inputs, &mut attrs)?],
+            "Resize" => vec![resize::op_resize(inputs, &mut attrs)?],
             "DepthToSpace" => vec![nn::op_depth_to_space(inputs, &mut attrs)?],
             "SpaceToDepth" => vec![nn::op_space_to_depth(inputs, &mut attrs)?],
             "LpNormalization" => vec![nn::op_lp_norm(inputs, &mut attrs)?],
@@ -719,7 +720,7 @@ impl OpRegistry {
                 // Upsample (deprecated) has inputs [X, scales]; Resize has [X, roi, scales, sizes].
                 // Remap by inserting None for roi so op_resize reads scales from index 2.
                 let remapped = vec![inputs.first().cloned().flatten(), None, inputs.get(1).cloned().flatten()];
-                vec![nn::op_resize(&remapped, &mut attrs)?]
+                vec![resize::op_resize(&remapped, &mut attrs)?]
             }
 
             // === Identity / Constant ===

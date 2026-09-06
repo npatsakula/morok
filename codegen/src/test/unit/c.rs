@@ -4,6 +4,7 @@ use smallvec::SmallVec;
 use svod_dtype::{AddrSpace, DType, DeviceSpec};
 use svod_ir::{AxisId, AxisType, ConstValue, Op, ParamArg, ReduceOp, UOp};
 
+use crate::c::CDialect;
 use crate::c::render;
 use crate::c::types::c_const;
 use svod_ir::ops;
@@ -274,11 +275,11 @@ fn test_render_rejects_fnuz_without_fallback() {
 fn c_constants_consume_committed_values_and_fp8_bits() {
     let f32_value = UOp::const_(DType::Float32, ConstValue::Float(-3.2));
     let Op::Const(f32_value) = f32_value.op() else { unreachable!() };
-    assert_eq!(c_const(&f32_value.0, &DType::Float32), "-3.2e0f");
+    assert_eq!(c_const(&f32_value.0, &DType::Float32, CDialect::Clang), "-3.2e0f");
 
     let fp8 = UOp::const_(DType::FP8E4M3, ConstValue::Float(1.1875));
     let Op::Const(fp8) = fp8.op() else { unreachable!() };
-    assert_eq!(c_const(&fp8.0, &DType::FP8E4M3), "58");
+    assert_eq!(c_const(&fp8.0, &DType::FP8E4M3, CDialect::Clang), "58");
 }
 
 fn empty_loop_sink() -> std::sync::Arc<UOp> {

@@ -553,6 +553,10 @@ fn apply_post_optimization_configured_with_capture(
     print_stage("19e-move_gates_from_index", &gates_moved);
     svod_ir::dump_canonical_stage("gated", &gates_moved);
 
+    // Renderers without a wide float (Metal, WebGPU) compute internal f64 in
+    // f32; external f64 storage is left for the renderer to reject.
+    let gates_moved = crate::late::demote_unsupported_floats(gates_moved, &renderer_ctx);
+
     // Tinygrad's final rewrite repeats decomposition rules, then performs
     // renderer rewrites/split ENDs and removes any remaining Invalid markers.
     let t_stage = std::time::Instant::now();

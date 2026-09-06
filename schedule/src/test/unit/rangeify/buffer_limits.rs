@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use svod_device::DeviceSpec;
 use svod_dtype::DType;
-use svod_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, SInt, UOp, UOpKey};
+use svod_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, ReduceOp, SInt, UOp, UOpKey};
 use test_case::test_case;
 
 use crate::rangeify::indexing::IndexingContext;
@@ -155,12 +155,15 @@ fn a_device_range_is_carried_through_without_renumbering() {
 // ===== helpers the pattern is built on =====
 
 /// Only elementwise nodes are candidates for materialisation — a leaf has
-/// nothing to materialise into.
+/// nothing to materialise into. The set is tinygrad's `GroupOp.Elementwise`:
+/// unary, binary and ternary ALU plus CAST and BITCAST.
 #[test]
-fn only_binary_and_ternary_nodes_are_elementwise() {
+fn alu_and_cast_nodes_are_elementwise() {
     let (a, b) = (UOp::native_const(1.0f32), UOp::native_const(2.0f32));
     assert!(is_elementwise(&a.try_add(&b).expect("add")));
-    assert!(is_elementwise(&UOp::try_where(UOp::native_const(true), a.clone(), b).expect("where")));
+    assert!(is_elementwise(&UOp::try_where(UOp::native_const(true), a.clone(), b.clone()).expect("where")));
+    assert!(is_elementwise(&a.try_sqrt().expect("sqrt")));
+    assert!(is_elementwise(&a.cast(DType::Float64)));
     assert!(!is_elementwise(&a));
     assert!(!is_elementwise(&test_buffer(100, 1)));
 }
@@ -173,4 +176,117 @@ fn the_device_comes_from_a_buffer_or_a_copy_target() {
         Some(DeviceSpec::Cpu)
     );
     assert_eq!(extract_device_from_graph(&UOp::native_const(1.0f32)), None);
+}
+
+// ===== what counts as a kernel argument =====
+
+fn test_param(slot: usize) -> Arc<UOp> {
+    UOp::param(slot, 40, DType::Float32, Some(DeviceSpec::Cpu))
+}
+
+fn read_from(buffer: Arc<UOp>, range: &Arc<UOp>) -> Arc<UOp> {
+    UOp::index().buffer(buffer).indices(vec![range.clone()]).call().expect("index")
+}
+
+/// `(((s0 + s1) + s2) + ...)` over `count` distinct storages built by `storage`.
+fn chain_over(count: usize, range: &Arc<UOp>, storage: impl Fn(usize) -> Arc<UOp>) -> Arc<UOp> {
+    (1..count)
+        .fold(read_from(storage(0), range), |acc, slot| acc.try_add(&read_from(storage(slot), range)).expect("add"))
+}
+
+/// Model weights reach rangeify as PARAMs, not BUFFERs. Leaving them out of the
+/// count let an inception concat fuse 32 inputs into one kernel, which Metal
+/// then refused to bind (`no 'buffer' resource location available for 'data31'`).
+#[test_case(30, false ; "one below the limit")]
+#[test_case(31, true ; "at the limit")]
+#[test_case(35, true ; "well over the limit")]
+fn a_param_costs_an_argument_slot_like_a_buffer(inputs: usize, materializes: bool) {
+    let mut ctx = IndexingContext::new();
+    let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
+    let computation = chain_over(inputs, &range, test_param);
+
+    let result = graph_rewrite(&buffer_limit_patterns(31), computation.clone(), &mut ctx);
+
+    assert_eq!(count_stages(&result) > count_stages(&computation), materializes);
+    if !materializes {
+        assert!(Arc::ptr_eq(&result, &computation));
+    }
+}
+
+/// LOCAL storage is compiler-managed: it lives inside the kernel and never binds
+/// an argument, so no amount of it can trip the limit.
+#[test]
+fn local_storage_does_not_consume_an_argument_slot() {
+    let mut ctx = IndexingContext::new();
+    let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
+    let computation = chain_over(40, &range, |slot| UOp::buffer(slot, 40, DType::Float32, AddrSpace::Local, None));
+
+    let result = graph_rewrite(&buffer_limit_patterns(31), computation.clone(), &mut ctx);
+
+    assert!(Arc::ptr_eq(&result, &computation));
+}
+
+/// AFTER is a buffer identity: the kernels it orders against write the buffer,
+/// they are not read by this one. Walking into its dependencies counted a whole
+/// producer cone against a kernel that binds a single argument.
+#[test]
+fn an_after_costs_one_argument_not_its_producer_cone() {
+    let mut ctx = IndexingContext::new();
+    let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
+
+    let deps: smallvec::SmallVec<[Arc<UOp>; 4]> = (2..42).map(|slot| read(slot, &range)).collect();
+    let ordered = read_from(test_buffer(40, 0).after(deps), &range);
+
+    let fused = ordered.try_add(&read(1, &range)).expect("add");
+    let root = fused.try_add(&ordered).expect("add");
+
+    let result = graph_rewrite(&buffer_limit_patterns(31), root.clone(), &mut ctx);
+
+    assert!(Arc::ptr_eq(&result, &root));
+}
+
+/// `GroupOp.Elementwise` is ALU plus the casts (tinygrad `uop/__init__.py:112`),
+/// so a CAST operand is a materialisation candidate like any binary one.
+#[test]
+fn a_cast_operand_is_materialized() {
+    let mut ctx = IndexingContext::new();
+    let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
+
+    let wide = add_chain(30, &range).cast(DType::Float64);
+    let root = wide.try_add(&read(30, &range).cast(DType::Float64)).expect("add");
+
+    let result = graph_rewrite(&buffer_limit_patterns(31), root.clone(), &mut ctx);
+
+    assert!(count_stages(&result) > count_stages(&root));
+}
+
+/// The new STAGE's axes are the ranges still open at the operand. A REDUCE
+/// closes its own, and putting one on the STAGE made the range substitution
+/// rebuild every producer that binds it — copies that compound through a chain
+/// of bufferized kernels until the graph explodes.
+#[test]
+fn a_closed_reduce_range_is_not_an_axis_of_the_new_stage() {
+    let mut ctx = IndexingContext::new();
+    let outer = ctx.new_range(&SInt::Const(10), AxisType::Loop);
+    let inner = ctx.new_range(&SInt::Const(4), AxisType::Reduce);
+
+    let reduced = add_chain(30, &inner).reduce(smallvec::smallvec![inner.clone()], ReduceOp::Add);
+    let over_limit = reduced.try_add(&read(30, &outer)).expect("add");
+    let root = over_limit.try_add(&read(31, &outer)).expect("add");
+
+    let result = graph_rewrite(&buffer_limit_patterns(31), root.clone(), &mut ctx);
+
+    let stage_ranges = result
+        .toposort()
+        .into_iter()
+        .find_map(|u| match u.op() {
+            Op::Stage(ops::Stage { ranges, .. }) => Some(ranges.clone()),
+            _ => None,
+        })
+        .expect("buffer limit should materialize the reduced operand");
+
+    assert_eq!(stage_ranges.len(), 1, "only the open outer range is an axis, got {stage_ranges:?}");
+    assert!(stage_ranges.iter().all(|r| !Arc::ptr_eq(r, &inner)));
+    // The REDUCE keeps the axis it closes: it was never substituted.
+    assert!(result.toposort().iter().any(|u| Arc::ptr_eq(u, &inner)));
 }

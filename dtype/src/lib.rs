@@ -2,6 +2,7 @@ pub mod amd_arch;
 pub mod cast;
 pub mod default_device;
 pub mod ext;
+pub mod metal_family;
 
 #[cfg(any(test, feature = "proptest"))]
 pub mod test;
@@ -9,6 +10,7 @@ pub mod test;
 use std::path::PathBuf;
 
 pub use amd_arch::AmdArch;
+pub use metal_family::MetalFamily;
 
 /// GPU hardware architecture a renderer/compiler targets — a backend-neutral
 /// wrapper so generic code (e.g. the scheduler's optimizer-profile selection)
@@ -19,6 +21,8 @@ pub use amd_arch::AmdArch;
 pub enum GpuArch {
     /// AMD GCN/CDNA/RDNA architecture.
     Amd(AmdArch),
+    /// Apple GPU family behind a Metal device.
+    Metal(MetalFamily),
 }
 
 impl GpuArch {
@@ -26,6 +30,24 @@ impl GpuArch {
     pub fn amd(self) -> Option<AmdArch> {
         match self {
             GpuArch::Amd(arch) => Some(arch),
+            GpuArch::Metal(_) => None,
+        }
+    }
+
+    /// The Metal family when this is a Metal target, else `None`.
+    pub fn metal(self) -> Option<MetalFamily> {
+        match self {
+            GpuArch::Metal(family) => Some(family),
+            GpuArch::Amd(_) => None,
+        }
+    }
+
+    /// The exact target within its backend family (`gfx1151`, `Apple9`), as
+    /// the optimizer profile records it.
+    pub fn target_name(self) -> String {
+        match self {
+            GpuArch::Amd(arch) => arch.mcpu().to_string(),
+            GpuArch::Metal(family) => family.to_string(),
         }
     }
 }

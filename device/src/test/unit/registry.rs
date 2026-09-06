@@ -19,7 +19,6 @@ fn test_max_buffers_cuda() {
     assert_eq!(spec.max_buffers(), None, "CUDA should have no buffer limit");
 }
 
-#[cfg(feature = "metal")]
 #[test]
 fn test_max_buffers_metal() {
     let spec = DeviceSpec::Metal { device_id: 0 };

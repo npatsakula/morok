@@ -1771,7 +1771,12 @@ pub(crate) fn get_optimizer_renderer(device: &Device) -> svod_schedule::Optimize
     let renderer = match device.device {
         DeviceSpec::Cpu => svod_schedule::OptimizerRenderer::cpu(),
         DeviceSpec::Cuda { .. } => svod_schedule::OptimizerRenderer::cuda(),
-        DeviceSpec::Metal { .. } => svod_schedule::OptimizerRenderer::metal(),
+        DeviceSpec::Metal { .. } => device
+            .renderer
+            .gpu_arch()
+            .and_then(svod_dtype::GpuArch::metal)
+            .map(svod_schedule::OptimizerRenderer::for_metal_family)
+            .unwrap_or_else(svod_schedule::OptimizerRenderer::metal),
         // AMD picks the profile (wave size, LDS, WMMA/MFMA tensor cores) from
         // the opened device's arch, exposed via the renderer. Falls back to
         // RDNA3 if the renderer can't report arch.

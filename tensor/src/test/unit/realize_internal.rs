@@ -812,8 +812,11 @@ fn test_memory_growth_realize_pattern() {
 #[test]
 fn buffers_expire_automatically_with_their_graphs() {
     crate::test::helpers::test_setup();
-    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
+    // Distinctive literals: the output entry is keyed on a hash-consed UOp id,
+    // so a concurrent test computing the same values would share the id (and its
+    // live buffer) and defeat the lifetime assertion below.
+    let a = Tensor::from_slice([13.5f32, 26.25, 39.125]);
+    let b = Tensor::from_slice([48.0625f32, 60.03125, 72.015625]);
     let mut c = &a + &b;
     c.realize().expect("realize");
     let out_id = c.uop().base().id;

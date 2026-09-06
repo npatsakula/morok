@@ -119,6 +119,9 @@ fn worker_codegen(init: &WorkerInit) -> Result<WorkerCodegen> {
                 })?;
                 svod_runtime::create_amd_codegen(device_id, arch).map_err(BeamWorker::at("AMD codegen"))?
             }
+            DeviceSpec::Metal { device_id } => {
+                svod_runtime::create_metal_codegen(device_id).map_err(BeamWorker::at("Metal codegen"))?
+            }
             _ => {
                 return Err(BeamWorker::HelperUnavailable {
                     reason: format!("{:?} has no device-disabled BEAM codegen factory", init.device),
@@ -143,6 +146,11 @@ fn worker_codegen(init: &WorkerInit) -> Result<WorkerCodegen> {
                 },
             )?
         }
+        DeviceSpec::Metal { .. } => init
+            .gpu_arch
+            .and_then(GpuArch::metal)
+            .map(svod_schedule::OptimizerRenderer::for_metal_family)
+            .unwrap_or_else(svod_schedule::OptimizerRenderer::metal),
         _ => {
             return Err(BeamWorker::HelperUnavailable {
                 reason: format!("{:?} has no BEAM optimizer profile", init.device),

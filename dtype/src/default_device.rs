@@ -8,11 +8,11 @@
 //!   1. `with_default_device(spec, fn)` scope (thread-local).
 //!   2. `set_default_device(spec)` thread-local override.
 //!   3. `SVOD_DEVICE` env var (parsed once at first access).
-//!   4. `DeviceSpec::Cpu` (final fallback).
+//!   4. [`platform_default`]: `METAL:0` on macOS, `CPU` elsewhere.
 //!
-//! Note: parsing is intentionally restricted to "CPU" and "AMD[:N]". Devices
-//! that need richer specs (CUDA, Metal, WebGPU) can opt in by extending
-//! `parse_simple` here.
+//! Note: parsing is intentionally restricted to "CPU", "AMD[:N]" and
+//! "METAL[:N]". Devices that need richer specs (CUDA, WebGPU) can opt in by
+//! extending `parse_simple` here.
 
 use std::cell::RefCell;
 
@@ -31,7 +31,7 @@ pub fn set_default_device(spec: DeviceSpec) {
     THREAD_DEFAULT.with(|t| *t.borrow_mut() = Some(spec));
 }
 
-/// Clear the thread-local override; subsequent calls fall back to env / Cpu.
+/// Clear the thread-local override; subsequent calls fall back to env / platform default.
 pub fn clear_default_device() {
     THREAD_DEFAULT.with(|t| *t.borrow_mut() = None);
 }
@@ -43,9 +43,16 @@ pub fn default_device() -> DeviceSpec {
     }
     PROCESS_DEFAULT
         .get_or_init(|| {
-            std::env::var("SVOD_DEVICE").ok().and_then(|s| parse_simple(s.trim())).unwrap_or(DeviceSpec::Cpu)
+            std::env::var("SVOD_DEVICE").ok().and_then(|s| parse_simple(s.trim())).unwrap_or_else(platform_default)
         })
         .clone()
+}
+
+/// The device used when nothing selects one: the Apple GPU on macOS (every
+/// Mac has a Metal device; tinygrad defaults the same way), the CPU elsewhere.
+/// `SVOD_DEVICE=CPU` opts out.
+pub fn platform_default() -> DeviceSpec {
+    if cfg!(target_os = "macos") { DeviceSpec::Metal { device_id: 0 } } else { DeviceSpec::Cpu }
 }
 
 /// Scoped override: runs `f` with `spec` as the default device, restoring
@@ -92,15 +99,15 @@ where
 ///     comes from KFD topology when the registry/device-factory opens the
 ///     allocator. The default-device value is only used as a *spec hint*;
 ///     downstream consumers re-resolve through the registry.
+///   - `METAL` / `METAL:N`
 fn parse_simple(s: &str) -> Option<DeviceSpec> {
     let upper = s.to_uppercase();
     let parts: Vec<&str> = upper.split(':').collect();
+    let device_id = || -> Option<usize> { if parts.len() > 1 { parts[1].parse().ok() } else { Some(0) } };
     match parts[0] {
         "CPU" => Some(DeviceSpec::Cpu),
-        "AMD" | "HIP" => {
-            let device_id: usize = if parts.len() > 1 { parts[1].parse().ok()? } else { 0 };
-            Some(DeviceSpec::Amd { device_id })
-        }
+        "AMD" | "HIP" => Some(DeviceSpec::Amd { device_id: device_id()? }),
+        "METAL" => Some(DeviceSpec::Metal { device_id: device_id()? }),
         _ => None,
     }
 }

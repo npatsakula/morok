@@ -97,11 +97,11 @@ pub unsafe fn benchmark_kernel(
         if config.clear_l2 && i > 0 {
             invalidate_l2();
         }
+        // GPU-stamped duration when the backend has one (Metal command-buffer
+        // times); otherwise the wall clock around the synchronous dispatch.
         let start = Instant::now();
-        unsafe {
-            kernel.execute(buffers, vals, global_size, local_size, /*wait=*/ true)?
-        };
-        runs.push(start.elapsed());
+        let gpu = unsafe { kernel.execute_timed(buffers, vals, global_size, local_size)? };
+        runs.push(gpu.unwrap_or_else(|| start.elapsed()));
 
         // Min-of-runs early stop: abort only when the best run so far still
         // exceeds the threshold. A single jitter outlier in an otherwise

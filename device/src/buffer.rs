@@ -385,6 +385,10 @@ impl Buffer {
                 Ok(bytes)
             }
             RawBuffer::Mmap { data, .. } => Ok(&data[self.offset..self.offset + self.size]),
+            RawBuffer::Metal { contents, device, .. } => {
+                let base = metal_host_ptr(device, *contents, self.offset)?;
+                Ok(unsafe { std::slice::from_raw_parts(base, self.size) })
+            }
             RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
@@ -441,6 +445,10 @@ impl Buffer {
             }
             // Mmap is read-only — no mutable access
             RawBuffer::Mmap { .. } => NotCpuAccessibleSnafu.fail(),
+            RawBuffer::Metal { contents, device, .. } => {
+                let base = metal_host_ptr(device, *contents, self.offset)?;
+                Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
+            }
             RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
@@ -480,6 +488,12 @@ impl Buffer {
                 let bytes = &data[self.offset..self.offset + self.size];
                 let count = bytes.len() / T::DTYPE.bytes();
                 let typed = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) };
+                ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
+            }
+            RawBuffer::Metal { contents, device, .. } => {
+                let bytes_ptr = metal_host_ptr(device, *contents, self.offset)? as *const T;
+                let count = self.size / T::DTYPE.bytes();
+                let typed = unsafe { std::slice::from_raw_parts(bytes_ptr, count) };
                 ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
             RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
@@ -533,6 +547,12 @@ impl Buffer {
                 let typed = unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut T, count) };
                 ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
+            RawBuffer::Metal { contents, device, .. } => {
+                let bytes_ptr = metal_host_ptr(device, *contents, self.offset)? as *mut T;
+                let count = self.size / T::DTYPE.bytes();
+                let typed = unsafe { std::slice::from_raw_parts_mut(bytes_ptr, count) };
+                ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
+            }
             RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
@@ -560,6 +580,11 @@ impl Buffer {
                 let bytes = unsafe { &(&(*data.get()))[self.offset..self.offset + self.size] };
                 let count = bytes.len() / T::DTYPE.bytes();
                 Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) })
+            }
+            RawBuffer::Metal { contents, device, .. } => {
+                let bytes_ptr = metal_host_ptr(device, *contents, self.offset)? as *const T;
+                let count = self.size / T::DTYPE.bytes();
+                Ok(unsafe { std::slice::from_raw_parts(bytes_ptr, count) })
             }
             RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
@@ -793,6 +818,13 @@ impl Buffer {
                 // Read-only mmap: writing through this pointer is UB.
                 unsafe { data.as_ptr().add(self.offset) as *mut u8 }
             }
+            RawBuffer::Metal { contents, .. } => {
+                // Host pointer into the shared MTLBuffer; `MetalProgram::execute`
+                // resolves it back to (MTLBuffer, offset) through the device's
+                // pointer registry. Not drained here: this is the dispatch path
+                // and GPU-side ordering is the queue's job.
+                unsafe { contents.as_ptr().add(self.offset) }
+            }
             RawBuffer::AmdDevice { gpu_addr, .. } => {
                 // GPU virtual address — what AMD kernels see in their kernarg
                 // buffer for buffer parameters. The CPU never dereferences
@@ -833,6 +865,7 @@ impl Buffer {
             }
             RawBuffer::Mmap { data, .. } => data.as_ptr() as usize,
             RawBuffer::AmdDevice { gpu_addr, .. } => *gpu_addr as usize,
+            RawBuffer::Metal { contents, .. } => contents.as_ptr() as usize,
             #[cfg(feature = "cuda")]
             RawBuffer::CudaDevice { data, .. } => {
                 // For CUDA device memory, we use the CudaSlice's internal pointer
@@ -847,4 +880,19 @@ impl Buffer {
             }
         }
     }
+}
+
+/// Drain the Metal device before raw host access: shared-storage reads and
+/// writes are not ordered against committed command buffers. Metal has no
+/// per-storage producer table (the AMD `wait_storage` equivalent), so the drain
+/// is device-wide; the in-flight list is pruned of completed buffers on every
+/// dispatch, so it stays cheap.
+fn metal_host_ptr(
+    device: &Arc<crate::metal::MetalDevice>,
+    contents: std::ptr::NonNull<u8>,
+    offset: usize,
+) -> Result<*mut u8> {
+    device.synchronize()?;
+    // SAFETY: the view offset is bounded by the allocation (`Buffer::view`).
+    Ok(unsafe { contents.as_ptr().add(offset) })
 }

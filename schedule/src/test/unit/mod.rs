@@ -3,6 +3,7 @@ pub mod devectorize;
 pub mod expand;
 pub mod gpudims;
 pub mod late_coalesce;
+pub mod late_dtype;
 pub mod multi;
 pub mod optimizer;
 pub mod phi_dominance;

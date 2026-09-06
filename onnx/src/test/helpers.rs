@@ -5,7 +5,7 @@ use prost::Message;
 
 pub(crate) use crate::parser::onnx::{
     AttributeProto, GraphProto, ModelProto, NodeProto, StringStringEntryProto, TensorProto, ValueInfoProto,
-    tensor_proto,
+    tensor_proto, type_proto,
 };
 pub(crate) use crate::registry::*;
 pub(crate) use svod_dtype::{DType, ScalarDType};
@@ -290,6 +290,44 @@ fn sorted_dirs(parent: &Path, prefix: &str) -> Vec<PathBuf> {
     entries
 }
 
+/// Whether the model touches ONNX `DOUBLE` anywhere: graph I/O, initializers,
+/// constant payloads, `Cast`/`EyeLike`-style dtype attributes, type attributes,
+/// and subgraphs.
+fn graph_uses_double(graph: &GraphProto) -> bool {
+    const DOUBLE: i32 = tensor_proto::DataType::Double as i32;
+    let value_is_double = |info: &ValueInfoProto| {
+        matches!(
+            info.r#type.as_ref().and_then(|ty| ty.value.as_ref()),
+            Some(type_proto::Value::TensorType(tensor)) if tensor.elem_type == DOUBLE
+        )
+    };
+    graph.input.iter().chain(&graph.output).chain(&graph.value_info).any(value_is_double)
+        || graph.initializer.iter().any(|init| init.data_type == DOUBLE)
+        || graph.node.iter().flat_map(|node| &node.attribute).any(|attr| {
+            attr.t.as_ref().is_some_and(|tensor| tensor.data_type == DOUBLE)
+                || ((attr.name == "to" || attr.name == "dtype") && attr.i == i64::from(DOUBLE))
+                || matches!(
+                    attr.tp.as_ref().and_then(|ty| ty.value.as_ref()),
+                    Some(type_proto::Value::TensorType(tensor)) if tensor.elem_type == DOUBLE
+                )
+                || attr.g.as_ref().is_some_and(graph_uses_double)
+        })
+}
+
+/// `DOUBLE` models cannot run on a device without f64 storage (Metal, WebGPU);
+/// they skip there, as tinygrad's ONNX suite does, instead of failing.
+fn skipped_without_f64(test_name: &str, model: &ModelProto) -> bool {
+    let device = svod_tensor::default_device();
+    if svod_tensor::device_supports_storage_dtype(&device, ScalarDType::Float64) {
+        return false;
+    }
+    let uses_double = model.graph.as_ref().is_some_and(graph_uses_double);
+    if uses_double {
+        eprintln!("{test_name}: skipped, {device:?} has no Float64 storage");
+    }
+    uses_double
+}
+
 pub(crate) fn run_onnx_node_test(test_dir: &str, config: &PrepareConfig) {
     let test_dir = Path::new(test_dir);
     let test_name = test_dir.file_name().unwrap().to_string_lossy();
@@ -299,6 +337,9 @@ pub(crate) fn run_onnx_node_test(test_dir: &str, config: &PrepareConfig) {
         .unwrap_or_else(|e| panic!("{test_name}: failed to read model.onnx: {e}"));
     let model = ModelProto::decode(model_bytes.as_slice())
         .unwrap_or_else(|e| panic!("{test_name}: failed to decode model: {e}"));
+    if skipped_without_f64(&test_name, &model) {
+        return;
+    }
 
     // 2. Extract input/output names from raw proto (before prepare filters out initializers)
     let proto_graph = model.graph.as_ref().unwrap_or_else(|| panic!("{test_name}: model has no graph"));

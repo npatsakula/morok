@@ -91,7 +91,7 @@ pub mod transformer;
 pub mod variable;
 
 // Re-export for public API
-pub use config::PrepareConfig;
+pub use config::{PrepareConfig, device_supports_storage_dtype};
 pub use index::{Idx, IndexSpec};
 pub use memory_planner::PlannerMode;
 pub use svod_dtype::default_device::{clear_default_device, default_device, set_default_device, with_default_device};
