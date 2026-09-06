@@ -1,0 +1,55 @@
+---
+sidebar_label: Limitations & Roadmap
+---
+
+# Limitations and Roadmap
+
+What the backend does not do yet, with the concrete reason in the source, and
+what is planned. Nothing here fails silently: each gap is either a clean error
+or a documented fallback.
+
+---
+
+## Not implemented
+
+| Gap | Today | Where |
+|---|---|---|
+| **fp8 conversions** | A cast to or from `FP8E4M3` / `FP8E5M2` fails at render (`NVPTX fp8 cast ...`); the sm_89 `cvt.*.e4m3x2` intrinsics are not emitted. The fp8 `mma.sync` rows exist in `resolve_mma` but cannot be fed. | `codegen/src/llvm/nvptx/ops.rs` |
+| **Scoped synchronization** | Host reads and writes drain the whole context (`cuCtxSynchronize` in `_copyin` / `_copyout`) instead of waiting only on the buffer's producers. Plans and graphs do hand out event-based `CompletionToken`s. | `device/src/cuda/allocator.rs` |
+| **Peer-to-peer copies** | `cuMemcpyPeerAsync` / `cuDeviceCanAccessPeer` are not bound. A `CUDA:0 → CUDA:1` copy takes `SyncStrategy::PeerToPeer` in the executor, which falls back to `Buffer::copy_from`; two allocators are two devices, so the bytes bounce through a host `Vec`. | `runtime/src/executor.rs`, `device/src/buffer.rs` |
+| **Hardware counters (Tier 4)** | No CUPTI; `pmc_available()` is `false`, `SVOD_PMC` degrades with a note. | [Profiling](./profiling.md) |
+| **Tile kernels (`tk`)** | AMD-only: `resolve_arch` yields no `AmdArch` for a CUDA spec, so a `tk` launch reports `UnsupportedArch`. | `tk/src/target.rs` |
+| **Dynamic shared memory** | Launches pass `shared_mem_bytes = 0`; only static `.shared` is used and `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` is never called, so a kernel needing more than the default per-block limit fails at JIT. The device factory refuses a device whose limit is below the profile's `shared_max` (48 KiB) up front. | `device/src/cuda/program.rs`, `runtime/src/devices/cuda.rs` |
+| **Hopper / Blackwell matrix paths** | Only `mma.sync` (`m16n8kK`) is lowered; no `wgmma`, no `tcgen05`. | `codegen/src/llvm/nvptx/wmma.rs` |
+| **Pre-assembled objects** | The object cache stores PTX text; every fresh load pays the driver JIT (cached by the driver in `~/.nv/ComputeCache`). A `ptxas` pre-assembly (`object_format: cubin`) is not wired. | `runtime/src/devices/cuda.rs` |
+| **Userspace NV driver** | Tinygrad's `ops_nv` (direct GPU-FIFO submission) needs a generated ABI per driver branch; Svod stays on the stable `libcuda.so.1` API. `NV` is accepted as an alias of `CUDA` in `SVOD_DEVICE` and reserved for that future backend. | `nvidia_backend_plan.md` |
+
+Numerical notes rather than gaps: f64 `Exp2` / `Log2` and all transcendentals
+take the polynomial path ([Codegen](./codegen.md)); `lg2.approx.f32` is
+available to the renderer but not used by ordinary graphs.
+
+---
+
+## Requirements that are not negotiable today
+
+- The PTX ISA version follows the host clang (clang 22 emits 8.8), so the
+  driver must be at least CUDA 12.8 / R570. The flags do not pin an older ISA.
+- `clang` must carry the NVPTX target; there is no NVRTC fallback.
+
+---
+
+## Roadmap
+
+In the order the plan (`nvidia_backend_plan.md`, phase 5) lists them:
+
+1. **Scoped sync**: a producer table per buffer so host access waits on
+   events instead of `cuCtxSynchronize`.
+2. **Real P2P**: bind `cuDeviceCanAccessPeer` / `cuCtxEnablePeerAccess` /
+   `cuMemcpyPeerAsync` and route `SyncStrategy::PeerToPeer` through them.
+3. **CUPTI counters**: widen `PmcCounter` beyond the AMD SQ set and add a
+   Tier 4 provider.
+4. **fp8**: lower the sm_89 `cvt` intrinsics so the fp8 `mma.sync` rows become
+   reachable.
+5. **`ptxas` pre-assembly** when the toolkit is present, cached as a cubin.
+6. **Dynamic shared memory** via `cuFuncSetAttribute`, and `tk` over
+   `GpuArch` so tile kernels run on CUDA.
