@@ -8,10 +8,10 @@ fn decodes_vgpr_sgpr_segments_wave32() {
     // gfx1151). GRANULATED_WAVEFRONT_SGPR_COUNT = 1 → (1+1)*16 = 32 SGPRs.
     let rsrc1 = 24u32 | (1 << 6);
     let r = decode_resources(rsrc1, 4608, 0, 32, 11);
-    assert_eq!(r.vgprs, 200);
-    assert_eq!(r.sgprs, 32);
+    assert_eq!(r.vgprs, Some(200));
+    assert_eq!(r.sgprs, Some(32));
     assert_eq!(r.lds_bytes, 4608);
-    assert_eq!(r.scratch_bytes, 0);
+    assert_eq!(r.scratch_bytes, Some(0));
     assert_eq!(r.wave_size, 32);
 }
 
@@ -33,5 +33,5 @@ fn occupancy_unknown_arch_is_none() {
     // CDNA (gfx9) geometry not modeled → occupancy None, but counts still decode.
     let r = decode_resources(24, 0, 0, 64, 9);
     assert!(r.occupancy.is_none());
-    assert_eq!(r.vgprs, (24 + 1) * 4); // wave64 block = 4
+    assert_eq!(r.vgprs, Some((24 + 1) * 4)); // wave64 block = 4
 }

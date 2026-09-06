@@ -32,7 +32,14 @@ pub fn decode_resources(
     // allocates a fixed pool, so this is reported but never an occupancy limiter.
     let sgprs = (((rsrc1 >> RSRC1_SGPR_SHIFT) & RSRC1_SGPR_MASK) + 1) * 16;
     let occupancy = vgpr_limited_occupancy(vgprs, wave_size, target_major);
-    KernelResources { vgprs, sgprs, lds_bytes, scratch_bytes, wave_size, occupancy }
+    KernelResources {
+        vgprs: Some(vgprs),
+        sgprs: Some(sgprs),
+        lds_bytes,
+        scratch_bytes: Some(scratch_bytes),
+        wave_size,
+        occupancy,
+    }
 }
 
 /// VGPR-limited occupancy as a fraction of the SIMD's max resident waves, for

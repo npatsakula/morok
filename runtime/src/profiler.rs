@@ -969,12 +969,13 @@ fn render_stage_table(s: &StageProfile, origin_depth: Option<usize>) -> String {
         if any_res {
             match r.resources {
                 Some(res) => {
+                    let opt = |value: Option<u32>| value.map_or_else(|| "-".to_string(), |v| v.to_string());
                     let occ = res.occupancy.map(|o| format!("{:.0}", o * 100.0)).unwrap_or_else(|| "-".into());
                     cells.extend([
-                        res.vgprs.to_string(),
-                        res.sgprs.to_string(),
+                        opt(res.vgprs),
+                        opt(res.sgprs),
                         res.lds_bytes.to_string(),
-                        res.scratch_bytes.to_string(),
+                        opt(res.scratch_bytes),
                         occ,
                     ]);
                 }

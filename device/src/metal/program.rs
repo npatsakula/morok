@@ -12,12 +12,16 @@ use super::objc::{
     AutoreleasePool, Id, MTL_PIPELINE_OPTION_NONE, MTLSize, NSUInteger, ObjcBool, ObjcId, ns_error_message, ns_string,
 };
 use crate::device::{AbiParamDescriptor, Program};
+use crate::profile::KernelResources;
 use crate::sync::DispatchTimestamps;
 use crate::{Error, Result};
 
 /// `[[buffer(n)]]` indices are positional in MSL, so the ABI slot is the bind
 /// index; Metal exposes 31 of them.
 pub(crate) const MAX_BUFFER_BINDINGS: usize = 31;
+/// `maxThreadsPerThreadgroup` of every Apple and Mac2 GPU; a pipeline reports
+/// less only when its register demand forces it.
+const DEVICE_MAX_THREADS_PER_THREADGROUP: usize = 1024;
 
 /// One resolved kernel argument, ready to bind.
 enum Arg {
@@ -317,6 +321,19 @@ impl Program for MetalProgram {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// The pipeline's static limits; Metal exposes no register counts, so the
+    /// threadgroup cap stands in for register-limited occupancy.
+    fn resource_usage(&self) -> Option<KernelResources> {
+        Some(KernelResources {
+            vgprs: None,
+            sgprs: None,
+            lds_bytes: self.static_threadgroup_memory as u32,
+            scratch_bytes: None,
+            wave_size: self.thread_execution_width as u32,
+            occupancy: Some(self.max_total_threads as f32 / DEVICE_MAX_THREADS_PER_THREADGROUP as f32),
+        })
     }
 }
 

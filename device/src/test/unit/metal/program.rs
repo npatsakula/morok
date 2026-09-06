@@ -223,3 +223,24 @@ fn timed_execution_reports_gpu_duration() {
     assert!(gpu.as_nanos() > 0 && gpu <= wall, "gpu {gpu:?} wall {wall:?}");
     assert_eq!(download(&alloc, &out, N)[N - 1], 3.0);
 }
+
+/// Static limits come from the pipeline state: SIMD width, threadgroup memory
+/// and the register-driven threadgroup cap; register counts are unknown.
+#[test]
+fn resource_usage_reports_pipeline_limits() {
+    let Some(dev) = metal_device_or_skip() else { return };
+    let bytes = compile_for_test(&dev, VADD_MSL).unwrap();
+    let vadd = MetalProgram::load(dev.clone(), &bytes, "vadd", &vadd_abi()).unwrap();
+    let resources = vadd.resource_usage().expect("Metal reports static limits");
+    assert_eq!((resources.vgprs, resources.sgprs, resources.scratch_bytes), (None, None, None));
+    assert_eq!((resources.wave_size, resources.lds_bytes), (32, 0));
+    assert_eq!(resources.occupancy, Some(1.0));
+
+    const LOCAL_MSL: &str = "#include <metal_stdlib>\nusing namespace metal;\n\
+kernel void scratch(device float* out, uint3 gid [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]]) {\n\
+  threadgroup float tile[1024];\n  tile[lid.x] = float(lid.x);\n  threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+  out[gid.x * 32 + lid.x] = tile[31 - lid.x];\n}\n";
+    let bytes = compile_for_test(&dev, LOCAL_MSL).unwrap();
+    let scratch = MetalProgram::load(dev, &bytes, "scratch", &vadd_abi()[..1]).unwrap();
+    assert_eq!(scratch.resource_usage().unwrap().lds_bytes, 1024 * 4);
+}
