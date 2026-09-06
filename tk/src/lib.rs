@@ -31,8 +31,8 @@
 //! - **gfx942** (CDNA3) — wave64, MFMA.
 //! - **gfx1151** (RDNA3.5) — wave32, WMMA.
 //! - **CUDA sm_80+** — warp32, `mma.sync.m16n8k16` (a 16×16 tile as two m16n8
-//!   halves, [`layout::LaneMap::MmaSync`]); [`matmul`] and the shuffle-only
-//!   [`single_query_attention`] today, flash-attention pending.
+//!   halves, [`layout::LaneMap::MmaSync`]); [`matmul`], [`flash_attention`] and the
+//!   shuffle-only [`single_query_attention`].
 //!
 //! Each kernel declares the arches it is built for as an [`ArchSet`]. Inputs are
 //! bf16/f16, accumulation is f32, the WMMA/MFMA K-edge is 16; the per-arch

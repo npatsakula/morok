@@ -30,10 +30,10 @@ use crate::tiles::TileLayout;
 const BLK: usize = 16;
 
 /// Multi-wave warps per workgroup (the multi-wave occupancy lift, 8 waves/block):
-/// 8 wave64 warps = `8 * 64 = 512` threads per block. Each warp owns a distinct
-/// Q-tile; all 8
-/// share one K/V LDS slot, filled collaboratively across the 512 threads.
-const NUM_WARPS: usize = 8;
+/// `8 * wave_size` threads per block (512 at wave64, 256 at warp32). Each warp owns
+/// a distinct Q-tile; all 8 share one K/V LDS slot, filled collaboratively across
+/// the block.
+pub(crate) const NUM_WARPS: usize = 8;
 
 /// Default per-warp Q-tile height for the production double-buffered path
 /// ([`flash_attention_forward_mw_db`]). The default `{16,16}` Q/KV tile (the WMMA
@@ -59,11 +59,12 @@ fn iconst(v: i64) -> Arc<UOp> {
 }
 
 /// The GPU arch(es) the **production graph** flash-attention ([`flash_attention_with`]
-/// → [`build_fa_mw_rdb`]) is enabled for gfx942 (CDNA MFMA, wave64) and gfx1151
-/// (RDNA3.5 WMMA, wave32). The launcher gates against this list; generic launch
-/// infrastructure stays architecture-agnostic.
+/// → [`build_fa_mw_rdb`]) is enabled for: gfx942 (CDNA MFMA, wave64), gfx1151
+/// (RDNA3.5 WMMA, wave32) and CUDA sm_80+ (`mma.sync`, warp32). The launcher gates
+/// against this list; generic launch infrastructure stays architecture-agnostic.
 pub const FA_SUPPORTED_ARCHS: crate::ArchSet =
-    crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151]);
+    crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151])
+        .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
 
 /// Whether `device` can run the production graph flash-attention kernel.
 /// Uses the same architecture and toolchain gate as [`crate::launch_custom`].
@@ -486,24 +487,70 @@ pub(crate) fn build_fa_mw_rdb(
     let _ = warp.store(o, o_reg_t, MoveIdx::block((batch.clone(), q_blk.clone(), head.clone(), 0), 1));
 }
 
-/// Per-warp tile for [`build_fa_mw_rdb`]: the bigger `{32,32}` (which amortizes the
-/// softmax over more MFMA) once its grid `b·h·n/(32·NUM_WARPS)` covers the ~304-CU
-/// machine and `N` divides `32·NUM_WARPS`; otherwise the baseline `{16,16}` (the
-/// bigger tile halves the grid, so it loses at low occupancy). The 304 crossover is
-/// a first cut from the gfx942 bench.
-fn adaptive_fa_tile(b: usize, n: usize, h: usize) -> (usize, usize) {
-    const NUM_CU: usize = 304;
-    const BIG: usize = 32;
-    if n.is_multiple_of(BIG * NUM_WARPS) && b * h * (n / (BIG * NUM_WARPS)) >= NUM_CU {
-        (BIG, BIG)
-    } else {
-        (Q_BLK, KV_BLK)
+/// Per-arch policy of [`flash_attention_with`]: the per-warp tile crossover and
+/// the loop-body form. The bigger `big` tile (which amortizes the softmax over
+/// more matrix-core work) is chosen once the launch grid `b·h·n/(q_blk·NUM_WARPS)`
+/// covers the machine's `compute_units` and `N` divides its block; otherwise the
+/// baseline `small` tile (the bigger tile shrinks the grid, so it loses at low
+/// occupancy). The CU counts are the arch's flagship part (MI300X 304, Strix
+/// Halo 40); `big == small` disables the crossover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FaPolicy {
+    pub compute_units: usize,
+    pub big: (usize, usize),
+    /// The largest head dim the `big` tile fits in registers at (CUDA: `{32,32}`
+    /// at d=128 is 255 registers plus 848 bytes of local memory).
+    pub big_max_d: usize,
+    pub small: (usize, usize),
+    /// Emit the flat (fully-unrolled) body. Every register index is then a
+    /// constant, which the NVPTX backend needs to keep the accumulators in
+    /// registers (a rolled elementwise loop it declines to unroll pins `o_reg`
+    /// to local memory); the AMD path keeps the rolled iglp baseline.
+    pub unroll: bool,
+}
+
+impl FaPolicy {
+    /// gfx942 keeps the bench-calibrated 304-CU `{32,32}` crossover and gfx1151
+    /// the baseline tile. CUDA (measured on sm_86, 28 SMs, d=64): `{32,32}` wins at
+    /// every grid that covers the SMs (GigaAM b=8/h=16/n=1536: 5.4 ms vs 8.5 ms at
+    /// `{16,16}`; whisper b=1/h=6: 0.40 vs 0.50 ms), `{16,64}` spills, and the flat
+    /// body halves the small-tile time (the rolled `{16,32}` pins `o_reg` to local
+    /// memory) — so both CUDA tiles are flat.
+    pub fn for_arch(arch: svod_dtype::GpuArch) -> Self {
+        let small = (Q_BLK, KV_BLK);
+        match arch {
+            svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx942) => {
+                Self { compute_units: 304, big: (32, 32), big_max_d: usize::MAX, small, unroll: false }
+            }
+            svod_dtype::GpuArch::Amd(_) => {
+                Self { compute_units: 40, big: small, big_max_d: usize::MAX, small, unroll: false }
+            }
+            svod_dtype::GpuArch::Cuda(_) | svod_dtype::GpuArch::Metal(_) => {
+                Self { compute_units: 28, big: (32, 32), big_max_d: 64, small, unroll: true }
+            }
+        }
+    }
+
+    /// The `(q_blk, kv_blk)` for a `[b, n, h, d]` attention.
+    pub fn tile(&self, b: usize, n: usize, h: usize, d: usize) -> (usize, usize) {
+        let big_n = self.big.0 * NUM_WARPS;
+        if d <= self.big_max_d && n.is_multiple_of(big_n) && b * h * (n / big_n) >= self.compute_units {
+            self.big
+        } else {
+            self.small
+        }
+    }
+
+    /// The builder config for a `[b, n, h, d]` attention.
+    pub fn config(&self, b: usize, n: usize, h: usize, d: usize, causal: bool) -> FaConfig {
+        let (q_blk, kv_blk) = self.tile(b, n, h, d);
+        FaConfig { q_blk, kv_blk, unroll: self.unroll, causal }
     }
 }
 
 /// Run the rolled double-buffered multi-wave flash-attention forward into `o`
 /// ([`build_fa_mw_rdb`]). One rolled KV loop over a parity-indexed 2× LDS double
-/// buffer (one [`FaScratch`]); the per-warp tile is [`adaptive_fa_tile`]. `o` is an
+/// buffer (one [`FaScratch`]); the per-warp tile is [`FaPolicy::tile`]. `o` is an
 /// **output parameter**: the result is written in place into the supplied tensor.
 ///
 /// ```text
@@ -524,22 +571,12 @@ pub fn flash_attention_forward_mw_rdb(o: &mut Tensor, q: &Tensor, k: &Tensor, v:
     let kd = crate::launch::concrete_dims(k, "flash-attention", "k", 4)?;
     let (b, n, h, d) = (qd[0], qd[1], qd[2], qd[3]);
     let h_kv = kd[2];
-    let (q_blk, kv_blk) = adaptive_fa_tile(b, n, h);
-    let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
+    let cfg = FaPolicy::for_arch(svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx942)).config(b, n, h, d, true);
+    let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
 
     let in_dtype = q.uop().dtype();
     crate::run_kernel("fa_mw_rdb", grid, (NUM_WARPS * 64) as i64, &mut [o], &[q, k, v], |ker| {
-        build_fa_mw_rdb(
-            ker,
-            b,
-            n,
-            h,
-            h_kv,
-            d,
-            FaConfig { q_blk, kv_blk, ..Default::default() },
-            in_dtype.clone(),
-            false,
-        );
+        build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, in_dtype.clone(), false);
         ker.finish(1)
     })
 }
@@ -580,7 +617,7 @@ impl Default for FaOpts<'_> {
 ///   [`crate::graph_launch`], honoring `opts.causal` and the optional
 ///   `opts.key_lens` **key-only** mask (a 5th `[B]` `i32` global after `o,q,k,v`).
 /// - `Ok(None)` — *doesn't apply here:* the device isn't a supported arch
-///   ([`FA_SUPPORTED_ARCHS`] — gfx942/gfx1151 with the AMD toolchain), **or** the
+///   ([`FA_SUPPORTED_ARCHS`] — gfx942/gfx1151/CUDA sm_80+ with its LLVM backend), **or** the
 ///   runtime sequence length doesn't tile (`N % (q_blk·NUM_WARPS) != 0`). The caller
 ///   substitutes its own attention (e.g. [`Tensor::scaled_dot_product_attention`]).
 /// - `Err` — *malformed request* on a supported device: a FIXED property is wrong —
@@ -605,7 +642,6 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
     let kd = crate::launch::concrete_dims(k, "flash-attention", "k", 4)?;
     let (b, n, h, d) = (qd[0], qd[1], qd[2], qd[3]);
     let h_kv = kd[2];
-    let (q_blk, kv_blk) = adaptive_fa_tile(b, n, h);
     let dtype = q.uop().dtype();
     let dtype_ok = dtype == DType::BFloat16 || dtype == DType::Float16;
     let err_dtype = dtype.clone();
@@ -643,11 +679,12 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
         },
         // Runtime tiling (`None`) — `N` is the (audio) sequence length and may
         // legitimately not tile, so the caller falls back per-clip instead of padding.
-        move |_| n % (q_blk * NUM_WARPS) == 0,
+        move |arch| n % (FaPolicy::for_arch(arch).tile(b, n, h, d).0 * NUM_WARPS) == 0,
         // Build for the resolved arch — caps track the real wave width.
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
-            let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
+            let cfg = FaPolicy::for_arch(arch).config(b, n, h, d, opts.causal);
+            let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
             let out = Tensor::empty(&[b, n, h, d], dtype.clone());
             let masked = opts.key_lens.is_some();
             let build_dtype = dtype.clone();
@@ -677,17 +714,7 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
             }
             let block = (NUM_WARPS * caps.wave_size) as i64;
             crate::graph_launch("flash_attention", grid, block, out, &ins, caps, move |ker| {
-                build_fa_mw_rdb(
-                    ker,
-                    b,
-                    n,
-                    h,
-                    h_kv,
-                    d,
-                    FaConfig { q_blk, kv_blk, causal: opts.causal, ..Default::default() },
-                    build_dtype.clone(),
-                    masked,
-                );
+                build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, build_dtype.clone(), masked);
                 ker.finish(1)
             })
         },
