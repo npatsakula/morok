@@ -32,8 +32,9 @@ available to the renderer but not used by ordinary graphs.
 
 ## Requirements that are not negotiable today
 
-- The PTX ISA version follows the host clang (clang 22 emits 8.8), so the
-  driver must be at least CUDA 12.8 / R570. The flags do not pin an older ISA.
+- The driver must be at least CUDA 12.0 / R525: the CUDA-graph entry points
+  are bound by their 12.0 versioned names. The PTX ISA is pinned to 7.8 by
+  `--cuda-feature=+ptx78`, so a newer clang does not raise that floor.
 - `clang` must carry the NVPTX target; there is no NVRTC fallback.
 
 ---

@@ -52,8 +52,8 @@ CUDA JIT of kernel "r_64_32" failed: CUDA_ERROR_INVALID_PTX (218): a PTX JIT com
 ptxas application ptx input, line 27; error   : ...
 ```
 
-`CUDA_ERROR_UNSUPPORTED_PTX_VERSION` का अर्थ है कि driver उस PTX ISA से पुराना है जो clang
-ने emit की (clang 22: 8.8, CUDA 12.8 / R570), देखें [आवश्यकताएँ](./overview.md)। Info log
+`CUDA_ERROR_UNSUPPORTED_PTX_VERSION` का अर्थ है कि driver module की PTX ISA से पुराना है
+(7.8 पर pin, CUDA 11.8 / R520), देखें [आवश्यकताएँ](./overview.md)। Info log
 (warnings, register spills) `svod_device` के अंतर्गत `debug` level पर log होता है।
 
 दो errors Svod के अपने validator से आती हैं, driver के कुछ भी देखने से पहले:

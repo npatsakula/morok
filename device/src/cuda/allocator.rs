@@ -1,11 +1,15 @@
 //! Device-local allocations by default; host-visible buffers are managed
-//! memory (device-resident, migrated on host touch), `host` buffers are
-//! pinned host memory mapped into the device. Host ↔ device copies wait the
-//! storage's in-flight producers and readers on the host, then run as one
-//! synchronous `cuMemcpy` up to the bounce size and stage through the
-//! device's pinned bounce buffer on the copy stream above it. Device-to-
-//! device copies and memsets are asynchronous on the copy lane, ordered
-//! after the producers by event and published as the new producer.
+//! memory (device-resident, migrated on host touch) where host access to it
+//! is coherent, else pinned host memory mapped into the device, which is
+//! also what `host` buffers get. Host ↔ device copies wait the storage's
+//! in-flight producers and readers on the host; up to the bounce size a
+//! copy-in is one `cuMemcpyHtoDAsync` on the copy lane published as the
+//! storage's producer (the driver returns once a pageable source is staged,
+//! the DMA retires in stream order), a copy-out one synchronous
+//! `cuMemcpyDtoH`; above it both stage through the device's pinned bounce
+//! buffer on the copy stream. Device-to-device copies and memsets are
+//! asynchronous on the copy lane, ordered after the producers by event and
+//! published as the new producer.
 
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -50,6 +54,17 @@ impl CudaAllocator {
         }
     }
 
+    /// `host` → pinned; `cpu_access` → managed when host access to it is
+    /// coherent with running kernels, else pinned (WDDM, pre-Pascal);
+    /// otherwise device memory.
+    pub(crate) fn memory_kind(options: &BufferSpec, managed: bool) -> CudaMemory {
+        match (options.host, options.cpu_access, managed) {
+            (true, ..) | (false, true, false) => CudaMemory::Pinned,
+            (false, true, true) => CudaMemory::Managed,
+            (false, false, _) => CudaMemory::Device,
+        }
+    }
+
     fn alloc_failed(&self, size: usize, error: Error) -> Error {
         let usage =
             self.dev.memory_info().map(|(free, total)| format!(" (free {free} / total {total})")).unwrap_or_default();
@@ -79,18 +94,11 @@ impl std::fmt::Debug for CudaAllocator {
 }
 
 impl Allocator for CudaAllocator {
-    /// `host` → pinned; `cpu_access` → managed (when the device supports
-    /// coherent managed access, else plain device memory); otherwise device.
+    /// See [`Self::memory_kind`].
     fn _alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> Result<RawBuffer> {
         let api = self.dev.enter()?;
         let alloc_len = size.max(1);
-        let memory = if options.host {
-            CudaMemory::Pinned
-        } else if options.cpu_access && self.dev.limits().managed_memory {
-            CudaMemory::Managed
-        } else {
-            CudaMemory::Device
-        };
+        let memory = Self::memory_kind(options, self.dev.limits().managed_memory);
         let mut device_ptr: CUdeviceptr = 0;
         let mut host_ptr = None;
         // SAFETY: out-pointers to live slots; flags per `cuda.h`.
@@ -121,8 +129,9 @@ impl Allocator for CudaAllocator {
         }
         self.dev.register_storage(device_ptr);
         let buffer = RawBuffer::Cuda { device_ptr, host_ptr, size, memory, device: Arc::clone(&self.dev) };
-        if zero {
-            self.dev.zero(device_ptr, alloc_len)?;
+        if zero && let Err(error) = self.dev.zero(device_ptr, alloc_len) {
+            self._free(buffer, options);
+            return Err(error);
         }
         Ok(buffer)
     }
@@ -157,8 +166,9 @@ impl Allocator for CudaAllocator {
     /// Host access is not ordered against the lanes, so the storage's
     /// in-flight producers and readers are waited first (a host overwrite is
     /// a WAR hazard against readers). Pinned memory is then a plain `memcpy`;
-    /// device and managed memory take one synchronous `cuMemcpyHtoD` up to
-    /// the bounce size and chunked pinned staging above it.
+    /// device and managed memory take one copy-lane `cuMemcpyHtoDAsync` up
+    /// to the bounce size, published as the storage's producer so later
+    /// launches on any lane wait its DMA, and chunked pinned staging above it.
     fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> Result<()> {
         let (device_ptr, host_ptr, _, memory) = self.cuda_buffer(dest);
         self.dev.wait_storage(device_ptr)?;
@@ -172,12 +182,19 @@ impl Allocator for CudaAllocator {
         }
         let api = self.dev.api();
         let dst = device_ptr + dest_off as u64;
-        if src.len() <= STAGING_BYTES {
-            // SAFETY: the destination range is bounded by the caller; the copy
-            // retires before the call returns, so `src` is free afterwards.
-            return self.dev.check(unsafe { (api.memcpy_htod)(dst, src.as_ptr().cast(), src.len()) }, "cuMemcpyHtoD");
-        }
         let stream = self.dev.copy_stream();
+        if src.len() <= STAGING_BYTES {
+            return self.dev.with_copy_lane(|dev| {
+                // SAFETY: the destination range is bounded by the caller; the
+                // driver returns once the pageable `src` is staged, so it is
+                // free afterwards while the DMA retires in stream order.
+                dev.check(
+                    unsafe { (api.memcpy_htod_async)(dst, src.as_ptr().cast(), src.len(), stream) },
+                    "cuMemcpyHtoDAsync",
+                )?;
+                dev.record_copy(&[device_ptr])
+            });
+        }
         self.staged(src.len(), |staging, done, chunk| {
             // SAFETY: `chunk` fits the bounce buffer; the destination range is
             // bounded by the caller; the copy is waited for before reuse.

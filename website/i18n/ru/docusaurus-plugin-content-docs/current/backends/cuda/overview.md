@@ -19,14 +19,14 @@ JIT-компилируются в SASS драйвером при загрузк�
 | Требование | Зачем |
 |---|---|
 | Драйвер NVIDIA, предоставляющий `libcuda.so.1` | Каждый вызов драйвера разрешается из неё во время выполнения через `libloading` |
-| Драйвер **CUDA 12.8 (R570) или новее** | clang 22 выдаёт **PTX ISA 8.8** (`.version 8.8`); более старый драйвер отклонит модуль на `cuModuleLoadDataEx` |
+| Драйвер **CUDA 12.0 (R525) или новее** | Точки входа CUDA-графов привязаны по версионированным именам (`cuGraphAddKernelNode_v2`, `cuGraphExecKernelNodeSetParams_v2`), появившимся в 12.0; PTX ISA зафиксирована на **7.8** (`--cuda-feature=+ptx78`), которую любой такой драйвер JIT-компилирует |
 | `clang`, собранный с таргетом **NVPTX** | `clang -x ir --target=nvptx64-nvidia-cuda` превращает отрендеренный IR в PTX |
 
 Проверить их на хосте:
 
 ```bash
 ldconfig -p | grep libcuda.so.1          # библиотека драйвера
-nvidia-smi | grep 'CUDA Version'         # уровень CUDA у драйвера (>= 12.8)
+nvidia-smi | grep 'CUDA Version'         # уровень CUDA у драйвера (>= 12.0)
 clang --print-targets | grep nvptx64     # бэкенд NVPTX
 ```
 

@@ -74,7 +74,7 @@ A `RawBuffer::Cuda` carries a device pointer, an optional host pointer, and its
 | `BufferSpec` | Kind | Driver call |
 |---|---|---|
 | default | `Device` | `cuMemAlloc` — device memory, no host mapping |
-| `cpu_access` (and the device reports concurrent managed access) | `Managed` | `cuMemAllocManaged`, one address valid on both sides |
+| `cpu_access` | `Managed` when the device reports concurrent managed access, else `Pinned` (WDDM, pre-Pascal) | `cuMemAllocManaged`, one address valid on both sides |
 | `host` | `Pinned` | `cuMemHostAlloc(PORTABLE \| DEVICEMAP)`, kernels read it over the bus |
 
 `supports_device_local()` is `true`, so intermediates stay on the device.

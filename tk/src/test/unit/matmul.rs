@@ -731,3 +731,26 @@ fn test_matmul_bench_cuda() {
         );
     }
 }
+
+/// `mma_AB` reads B as a `[k,n]` (`Col`) tile; a `Row` tile would be
+/// multiplied transposed, so the plan refuses it at build time. GPU-free.
+#[test]
+#[should_panic(expected = "operand B must be a Col tile")]
+fn mma_ab_rejects_a_row_b_tile() {
+    let ker = Kernel::new("mma_orient", [1, 1, 1], 64, vec![], crate::ArchCaps::GFX942);
+    let warp = ker.warp();
+    let a = ker.operand((16, 16), DType::BFloat16, TileLayout::Row);
+    let b = ker.operand((16, 16), DType::BFloat16, TileLayout::Row);
+    let _ = warp.mma_ab(warp.zero(ker.acc((16, 16), TileLayout::Col)), &a, &b);
+}
+
+/// Symmetrically, `mma_AtB` reads A as a `[k,m]` (`Col`) tile.
+#[test]
+#[should_panic(expected = "operand A must be a Col tile")]
+fn mma_atb_rejects_a_row_a_tile() {
+    let ker = Kernel::new("mma_orient", [1, 1, 1], 32, vec![], crate::ArchCaps::for_arch(SM_86));
+    let warp = ker.warp();
+    let a = ker.operand((16, 16), DType::BFloat16, TileLayout::Row);
+    let b = ker.operand((16, 16), DType::BFloat16, TileLayout::Col);
+    let _ = warp.mma_atb(warp.zero(ker.acc((16, 16), TileLayout::Col)), &a, &b);
+}

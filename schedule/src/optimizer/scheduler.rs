@@ -59,14 +59,12 @@ pub enum KernelNaming {
 /// Give a kernel finished under [`KernelNaming::Deferred`] its unique name, on
 /// both channels the optimizer writes it to: the SINK's structural
 /// `KernelInfo.name` and the attached optimizer metadata. Kernels without
-/// optimizer metadata were never named and stay as they are.
+/// optimizer metadata were never named and stay as they are. A hand-authored
+/// name goes through the same counter, so two different kernels launched
+/// under one name stay distinguishable in profiles and IR dumps.
 pub fn finalize_kernel_name(ast: &Arc<UOp>) -> Arc<UOp> {
     use crate::optimizer::KernelInfo;
     let Some(info) = ast.metadata::<KernelInfo>() else { return ast.clone() };
-    // A hand-authored kernel (`opts_to_apply` set) keeps the name its author gave it.
-    if matches!(ast.op(), Op::Sink(ops::Sink { info: Some(structural), .. }) if structural.opts_to_apply.is_some()) {
-        return ast.clone();
-    }
     let name = unique_kernel_name(&info.name);
     let renamed = match ast.op() {
         Op::Sink(ops::Sink { sources, info }) => {

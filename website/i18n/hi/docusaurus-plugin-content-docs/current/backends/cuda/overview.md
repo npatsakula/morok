@@ -19,14 +19,14 @@ memory, programs, graphs), `runtime/src/cuda/` और `runtime/src/devices/cuda.
 | Requirement | क्यों |
 |---|---|
 | एक NVIDIA driver जो `libcuda.so.1` उजागर करता हो | हर driver call उसी से runtime पर `libloading` के साथ resolve होती है |
-| Driver **CUDA 12.8 (R570) या नया** | clang 22 **PTX ISA 8.8** (`.version 8.8`) emit करता है; एक पुराना driver `cuModuleLoadDataEx` पर module reject कर देता है |
+| Driver **CUDA 12.0 (R525) या नया** | CUDA graph के entry points अपने versioned नामों (`cuGraphAddKernelNode_v2`, `cuGraphExecKernelNodeSetParams_v2`) से bind होते हैं, जो 12.0 से हैं; PTX ISA **7.8** पर pin है (`--cuda-feature=+ptx78`), जिसे ऐसा कोई भी driver JIT कर लेता है |
 | **NVPTX** target के साथ बना `clang` | `clang -x ir --target=nvptx64-nvidia-cuda` rendered IR को PTX में बदल देता है |
 
 किसी host पर इनकी जाँच करें:
 
 ```bash
 ldconfig -p | grep libcuda.so.1          # the driver library
-nvidia-smi | grep 'CUDA Version'         # the driver's CUDA level (>= 12.8)
+nvidia-smi | grep 'CUDA Version'         # the driver's CUDA level (>= 12.0)
 clang --print-targets | grep nvptx64     # the NVPTX backend
 ```
 

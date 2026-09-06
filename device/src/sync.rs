@@ -58,6 +58,12 @@ pub trait DispatchTimestamps: Send + Sync {
 pub trait CompletionToken: Send + Sync + Any {
     fn wait(&self, timeout_ms: u64) -> Result<()>;
     fn retired(&self) -> bool;
+
+    /// The owner has recorded this token on every storage it covers. Until
+    /// then a backend that tracks unpublished submissions per lane keeps
+    /// the token's lane flagged, so a scoped wait racing the publication
+    /// still drains it. No-op by default.
+    fn published(&self) {}
 }
 
 /// Monotonic timeline signal for synchronization.

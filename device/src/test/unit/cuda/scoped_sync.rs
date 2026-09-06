@@ -81,6 +81,7 @@ fn publish(dev: &CudaDevice, ctx: &CudaPlanCtx, storages: &[&RawBuffer]) -> Arc<
     for storage in storages {
         dev.record_producer(base(storage), &token);
     }
+    token.published();
     token
 }
 
@@ -198,7 +199,7 @@ fn graph_replay_then_host_read() {
     graph.replay(&[], &[]).unwrap();
     let token = graph.completion_token().expect("replays record completion");
     chain.alloc.dev.record_producer(base(&chain.out), &token);
-    assert_eq!(chain.alloc.dev.producer_count(base(&chain.out)), Some(1));
+    assert_eq!(chain.alloc.dev.producer_count(base(&chain.out)), Some(2), "the copy-in's token and the replay's");
     assert_eq!(download(&chain.alloc, &chain.out, chain.alloc_len()), chain.expected());
     assert!(token.retired());
 }
@@ -314,7 +315,7 @@ fn producers_are_kept_per_lane() {
         .unwrap();
         publish(slow.dev(), ctx, &[&out]);
     }
-    assert_eq!(slow.dev().producer_count(base(&out)), Some(2), "one token per lane");
+    assert_eq!(slow.dev().producer_count(base(&out)), Some(3), "one token per lane, the upload's copy lane included");
     slow.dev().wait_storage(base(&out)).unwrap();
     assert_eq!(slow.dev().producer_count(base(&out)), Some(0));
 }
@@ -343,4 +344,56 @@ fn poisoned_device_fails_scoped_waits() {
     alloc._free(other, &spec);
     assert!(!shared.dev.is_poisoned());
     let _ = shared;
+}
+
+/// A token minted but not yet recorded on its storages still covers the
+/// lane: a host read of a storage with no recorded producer drains the lane
+/// instead of returning early. Once the token is published, only later
+/// submissions keep the lane unpublished.
+#[test]
+fn unrecorded_token_keeps_the_lane_covered() {
+    let Some(slow) = Slow::new() else { return };
+    let (input, out) = (upload(&slow.alloc, &values(3.0)), upload(&slow.alloc, &vec![0.0; N]));
+    let ctx = slow.ctx();
+    slow.dispatch(&ctx, &out, &input, LONG_MS);
+    let token = ctx.completion_token().expect("CUDA contexts hand out tokens");
+    assert_eq!(download(&slow.alloc, &out, N), doubled(&values(3.0)), "read raced the unpublished launch");
+    slow.dev().record_producer(base(&out), &token);
+    token.published();
+    let later = upload(&slow.alloc, &vec![0.0; N]);
+    slow.dispatch(&ctx, &later, &input, LONG_MS);
+    assert_eq!(download(&slow.alloc, &later, N), doubled(&values(3.0)), "read raced a launch after publication");
+}
+
+/// The same for a graph: its token covers the replay until the executor
+/// records it, and a profiled replay is fully retired when it returns.
+#[test]
+fn unrecorded_graph_token_keeps_the_lane_covered() {
+    let Some(chain) = Chain::new() else { return };
+    let graph = chain.capture();
+    graph.replay(&[], &[]).unwrap();
+    let token = graph.completion_token().expect("replays record completion");
+    assert_eq!(download(&chain.alloc, &chain.out, chain.alloc_len()), chain.expected());
+    chain.alloc.dev.record_producer(base(&chain.out), &token);
+    token.published();
+    chain.alloc._copyin(&chain.out, 0, &vec![0u8; chain.alloc_len() * 4]).unwrap();
+    graph.replay_profiled(&[], &[]).unwrap();
+    assert_eq!(download(&chain.alloc, &chain.out, chain.alloc_len()), chain.expected());
+}
+
+/// A copy-in below the bounce size is published as the storage's producer,
+/// so a later launch on any lane is ordered after its DMA on the GPU.
+#[test]
+fn small_copyin_is_published_as_the_producer() {
+    let Some(slow) = Slow::new() else { return };
+    let spec = BufferSpec { cpu_access: false, ..BufferSpec::default() };
+    let input = slow.alloc._alloc(N * 4, &spec, false).unwrap();
+    slow.alloc._copyin(&input, 0, super::f32_bytes(&values(7.0))).unwrap();
+    assert_eq!(slow.dev().producer_count(base(&input)), Some(1));
+    let out = upload(&slow.alloc, &vec![0.0; N]);
+    let ctx = slow.ctx();
+    slow.dispatch(&ctx, &out, &input, 0);
+    publish(slow.dev(), &ctx, &[&out, &input]);
+    assert_eq!(download(&slow.alloc, &out, N), doubled(&values(7.0)));
+    slow.alloc._free(input, &spec);
 }

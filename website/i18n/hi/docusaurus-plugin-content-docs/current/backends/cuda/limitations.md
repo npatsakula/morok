@@ -31,8 +31,9 @@ path लेते हैं ([Codegen](./codegen.md)); `lg2.approx.f32` renderer
 
 ## वे आवश्यकताएँ जिन पर आज कोई समझौता नहीं
 
-- PTX ISA version host clang का अनुसरण करता है (clang 22 8.8 emit करता है), इसलिए driver
-  कम से कम CUDA 12.8 / R570 होना चाहिए। Flags किसी पुरानी ISA को pin नहीं करते।
+- Driver कम से कम CUDA 12.0 / R525 होना चाहिए: CUDA graph के entry points अपने 12.0
+  versioned नामों से bind हैं। PTX ISA `--cuda-feature=+ptx78` से 7.8 पर pin है, इसलिए
+  नया clang यह floor नहीं बढ़ाता।
 - `clang` में NVPTX target होना चाहिए; कोई NVRTC fallback नहीं है।
 
 ---

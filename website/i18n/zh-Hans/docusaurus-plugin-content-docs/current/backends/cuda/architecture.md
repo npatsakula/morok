@@ -70,7 +70,7 @@ CUDA cuLaunchKernel failed: CUDA_ERROR_INVALID_VALUE (1): invalid argument
 | `BufferSpec` | 种类 | 驱动调用 |
 |---|---|---|
 | 默认 | `Device` | `cuMemAlloc`——设备内存，没有宿主映射 |
-| `cpu_access`（且设备报告支持并发的托管访问） | `Managed` | `cuMemAllocManaged`，一个地址在两侧都有效 |
+| `cpu_access` | 若设备报告支持并发的托管访问则为 `Managed`，否则为 `Pinned`（WDDM、Pascal 之前） | `cuMemAllocManaged`，一个地址在两侧都有效 |
 | `host` | `Pinned` | `cuMemHostAlloc(PORTABLE \| DEVICEMAP)`，内核经由总线读取它 |
 
 `supports_device_local()` 为 `true`，因此中间结果留在设备上。

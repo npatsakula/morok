@@ -52,8 +52,8 @@ CUDA JIT of kernel "r_64_32" failed: CUDA_ERROR_INVALID_PTX (218): a PTX JIT com
 ptxas application ptx input, line 27; error   : ...
 ```
 
-`CUDA_ERROR_UNSUPPORTED_PTX_VERSION` 意味着驱动比 clang 发出的 PTX ISA 更老
-（clang 22：8.8，CUDA 12.8 / R570），见[要求](./overview.md)。信息日志
+`CUDA_ERROR_UNSUPPORTED_PTX_VERSION` 意味着驱动比模块中的 PTX ISA 更老
+（锁定在 7.8，CUDA 11.8 / R520），见[要求](./overview.md)。信息日志
 （警告、寄存器溢出）以 `debug` 级别记录在 `svod_device` 之下。
 
 有两个错误来自 Svod 自己的校验器，在驱动看到任何东西之前：

@@ -54,8 +54,8 @@ CUDA JIT of kernel "r_64_32" failed: CUDA_ERROR_INVALID_PTX (218): a PTX JIT com
 ptxas application ptx input, line 27; error   : ...
 ```
 
-`CUDA_ERROR_UNSUPPORTED_PTX_VERSION` означает, что драйвер старше, чем PTX ISA,
-которую выдал clang (clang 22: 8.8, CUDA 12.8 / R570), см.
+`CUDA_ERROR_UNSUPPORTED_PTX_VERSION` означает, что драйвер старше, чем PTX ISA
+модуля (зафиксирована на 7.8, CUDA 11.8 / R520), см.
 [требования](./overview.md). Информационный лог (предупреждения, спиллы
 регистров) логируется на уровне `debug` под `svod_device`.
 

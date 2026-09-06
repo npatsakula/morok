@@ -155,6 +155,7 @@ one matters: a misspelt `llvm.nvvm.*` name is not a compile error, LLVM
 silently emits it as an external call, and it would otherwise only surface as
 a `cuModuleLoadDataEx` failure.
 
-The PTX ISA version is whatever the clang release emits (clang 22:
-`.version 8.8`, which needs a CUDA 12.8 / R570 driver); the flags do not pin
-it.
+The PTX ISA version is pinned to 7.8 (`--cuda-feature=+ptx78`) rather than
+whatever the clang release would emit (clang 22: `.version 8.8`, which needs
+a CUDA 12.8 / R570 driver); every `mma.sync` shape the renderer selects exists
+in 7.8.

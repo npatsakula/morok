@@ -174,8 +174,8 @@ impl CudaGraph {
     }
 
     /// Launch on this graph's lane, ordered after published copies, and
-    /// return the token covering it; the lane stays flagged unpublished
-    /// until the token is handed out or waited.
+    /// return the token covering it; the launch stays unpublished until the
+    /// token is recorded on its storages or waited.
     fn launch(&self, exec: &Exec) -> Result<CudaCompletionToken> {
         let api = self.dev.enter()?;
         let lane = self.stream.lane();
@@ -370,9 +370,7 @@ impl Graph for CudaGraph {
     }
 
     fn completion_token(&self) -> Option<Arc<dyn CompletionToken>> {
-        let token = self.state.lock().last.clone()?;
-        self.stream.lane().take_unpublished();
-        Some(Arc::new(token))
+        Some(Arc::new(self.state.lock().last.clone()?))
     }
 
     fn replay_profiled(&self, buffers: &[u64], vals: &[i64]) -> Result<Option<Vec<Arc<dyn DispatchTimestamps>>>> {
@@ -387,8 +385,9 @@ impl Graph for CudaGraph {
         let events = exec.rearm_stamps()?;
         let done = self.launch(exec)?;
         state.last = Some(done.clone());
-        self.stream.lane().take_unpublished();
+        // Waited here, so nothing is left for the executor to publish.
         done.wait(0)?;
+        done.published();
         Ok(Some(
             events
                 .into_iter()

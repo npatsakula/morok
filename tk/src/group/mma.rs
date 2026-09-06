@@ -117,7 +117,15 @@ impl MmaPlan {
     /// `mma_AB_base`. A `Col` accumulator holds `Cᵀ` in that register order, so it
     /// is computed as `Cᵀ += Bᵀ·Aᵀ`: the B tile supplies the A fragment, the A tile
     /// the two B fragments (`swap`), and the halves split M instead of N.
-    fn resolve(arch: GpuArch, c: &RT<'_>, a: &RT<'_>, b: &RT<'_>) -> Self {
+    fn resolve(arch: GpuArch, c: &RT<'_>, a: &RT<'_>, b: &RT<'_>, a_t: bool, b_t: bool) -> Self {
+        // The fragment registers are read as `[m,k]`/`[k,n]` (`Row`/`Col`) or
+        // their transposes; a tile declared the other way round is silently
+        // multiplied transposed.
+        let expect = |name, layout: TileLayout, wanted: TileLayout| {
+            assert_eq!(layout, wanted, "mma: operand {name} must be a {wanted:?} tile for this variant");
+        };
+        expect("A", a.layout, if a_t { TileLayout::Col } else { TileLayout::Row });
+        expect("B", b.layout, if b_t { TileLayout::Row } else { TileLayout::Col });
         let meta = wmma_desc(arch, a.elem(), c.elem());
         let steps = if arch.cuda().is_some() {
             for (name, t) in [("A", a), ("B", b), ("C", c)] {
@@ -244,7 +252,7 @@ impl<'k> Group<'k> {
         if self.ker.unrolled() {
             return self.mma_u(c, a, b, a_t, b_t);
         }
-        let plan = MmaPlan::resolve(self.ker.caps.arch, &c, a, b);
+        let plan = MmaPlan::resolve(self.ker.caps.arch, &c, a, b, a_t, b_t);
 
         let h_end = c.shape()[c.shape().len() - 3] as i64;
         let w_end = c.shape()[c.shape().len() - 2] as i64;
@@ -280,7 +288,7 @@ impl<'k> Group<'k> {
     /// KV loop's `END` scopes them all (cf. the matmul accumulator chain,
     /// `kernels/matmul.rs:201`). Bit-identical accumulation order to [`Self::mma`].
     fn mma_u(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool) -> RT<'k> {
-        let plan = MmaPlan::resolve(self.ker.caps.arch, &c, a, b);
+        let plan = MmaPlan::resolve(self.ker.caps.arch, &c, a, b, a_t, b_t);
 
         let h_end = c.shape()[c.shape().len() - 3] as i64;
         let w_end = c.shape()[c.shape().len() - 2] as i64;

@@ -75,7 +75,7 @@ CUDA cuLaunchKernel failed: CUDA_ERROR_INVALID_VALUE (1): invalid argument
 | `BufferSpec` | Вид | Вызов драйвера |
 |---|---|---|
 | по умолчанию | `Device` | `cuMemAlloc` — память устройства, без отображения на хост |
-| `cpu_access` (и устройство сообщает о поддержке конкурентного managed-доступа) | `Managed` | `cuMemAllocManaged`, один адрес валиден с обеих сторон |
+| `cpu_access` | `Managed`, если устройство сообщает о конкурентном managed-доступе, иначе `Pinned` (WDDM, до Pascal) | `cuMemAllocManaged`, один адрес валиден с обеих сторон |
 | `host` | `Pinned` | `cuMemHostAlloc(PORTABLE \| DEVICEMAP)`, ядра читают её по шине |
 
 `supports_device_local()` возвращает `true`, поэтому промежуточные данные

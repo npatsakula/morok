@@ -84,7 +84,6 @@ fn symbol_table_is_unique_and_versioned() {
         "cuMemcpyDtoDAsync",
         "cuStreamDestroy",
         "cuEventDestroy",
-        "cuEventElapsedTime",
         "cuGraphInstantiate",
         "cuGraphAddKernelNode",
         "cuGraphExecKernelNodeSetParams",
@@ -98,7 +97,7 @@ fn symbol_table_is_unique_and_versioned() {
 #[test_case("mem_alloc", "cuMemAlloc_v2")]
 #[test_case("mem_free", "cuMemFree_v2")]
 #[test_case("memcpy_htod_async", "cuMemcpyHtoDAsync_v2")]
-#[test_case("event_elapsed_time", "cuEventElapsedTime_v2")]
+#[test_case("event_elapsed_time", "cuEventElapsedTime")]
 #[test_case("graph_instantiate_with_flags", "cuGraphInstantiateWithFlags")]
 #[test_case("graph_add_kernel_node", "cuGraphAddKernelNode_v2")]
 #[test_case("graph_exec_kernel_node_set_params", "cuGraphExecKernelNodeSetParams_v2")]

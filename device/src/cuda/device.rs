@@ -16,8 +16,11 @@
 //!   readers too). Published by the executor after every plan execute and by
 //!   the allocator after every copy-lane operation. A storage absent from the
 //!   table has unknown producers and falls back to a context drain.
-//! - `lanes`: every live lane and whether it holds submissions no token has
-//!   been published for yet; such lanes are waited by every scoped wait.
+//! - `lanes`: every live lane and how many submissions it holds that no
+//!   token has been published for yet; such lanes are waited by every
+//!   scoped wait. A token counts as published only once its owner recorded
+//!   it on every storage ([`CompletionToken::published`]), so the window
+//!   between minting and recording is covered.
 //! - `copy_tail`: the newest copy-lane event; every launch on any lane waits
 //!   it on the GPU, so an asynchronous copy or memset is ordered before all
 //!   later kernels without a host wait.
@@ -91,11 +94,15 @@ pub struct CudaLimits {
 /// alive across a wait even while its owner is being dropped.
 pub struct Lane {
     api: &'static Api,
+    /// The owning device's context, made current before the stream is destroyed.
+    context: CUcontext,
     raw: CUstream,
     id: u64,
-    /// Submissions were made since the last completion token was published
-    /// (or the lane was synchronized): every scoped wait drains such a lane.
-    unpublished: AtomicBool,
+    /// Submissions so far; a token minted after the `n`th covers `n`.
+    submitted: AtomicU64,
+    /// Submissions covered by a published token or a drain. Every scoped
+    /// wait drains a lane whose count trails `submitted`.
+    published: AtomicU64,
     /// `CudaDevice::copy_seq` value this lane last waited on.
     copies_seen: AtomicU64,
 }
@@ -105,15 +112,17 @@ unsafe impl Send for Lane {}
 unsafe impl Sync for Lane {}
 
 impl Lane {
-    fn create(api: &'static Api) -> Result<Arc<Self>> {
+    fn create(api: &'static Api, context: CUcontext) -> Result<Arc<Self>> {
         let mut raw = CUstream::NULL;
         // SAFETY: out-pointer to a live handle slot.
         unsafe { (api.stream_create)(&mut raw, CU_STREAM_NON_BLOCKING) }.check("cuStreamCreate")?;
         Ok(Arc::new(Self {
             api,
+            context,
             raw,
             id: NEXT_LANE.fetch_add(1, Ordering::Relaxed),
-            unpublished: AtomicBool::new(false),
+            submitted: AtomicU64::new(0),
+            published: AtomicU64::new(0),
             copies_seen: AtomicU64::new(0),
         }))
     }
@@ -122,25 +131,48 @@ impl Lane {
         self.raw
     }
 
-    /// Flag a submission no token covers yet; called before the launch so a
-    /// concurrent scoped wait can never miss it.
+    /// Count a submission no token covers yet; called before the launch so
+    /// a concurrent scoped wait can never miss it.
     pub(crate) fn mark_unpublished(&self) {
-        self.unpublished.store(true, Ordering::Release);
+        self.submitted.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Clear the flag, returning whether it was set. Cleared *before* the
-    /// corresponding wait or publication: a submission racing the clear
-    /// either precedes the wait or re-sets the flag afterwards.
+    /// The submissions made so far: what a token minted now covers.
+    pub(crate) fn seq(&self) -> u64 {
+        self.submitted.load(Ordering::Acquire)
+    }
+
+    /// A token covering the first `seq` submissions was recorded on its
+    /// storages; later submissions stay unpublished.
+    pub(crate) fn publish(&self, seq: u64) {
+        self.published.fetch_max(seq, Ordering::AcqRel);
+    }
+
+    pub(crate) fn has_unpublished(&self) -> bool {
+        self.seq() != self.published.load(Ordering::Acquire)
+    }
+
+    /// Count every submission so far as published, returning whether any
+    /// was not. Done *before* the corresponding drain: a submission racing
+    /// it either precedes the drain or stays unpublished.
     pub(crate) fn take_unpublished(&self) -> bool {
-        self.unpublished.swap(false, Ordering::AcqRel)
+        let seq = self.seq();
+        self.published.fetch_max(seq, Ordering::AcqRel) < seq
     }
 }
 
 impl Drop for Lane {
     fn drop(&mut self) {
-        // SAFETY: the stream this lane created; the driver defers destruction
-        // until its work retires.
-        unsafe { (self.api.stream_destroy)(self.raw) };
+        // SAFETY: the stream this lane created, destroyed in its context;
+        // the driver defers destruction until its work retires.
+        let result = unsafe {
+            (self.api.ctx_set_current)(self.context)
+                .check("cuCtxSetCurrent")
+                .and_then(|()| (self.api.stream_destroy)(self.raw).check("cuStreamDestroy"))
+        };
+        if let Err(error) = result {
+            tracing::warn!(?error, lane = self.id, "CUDA stream leaked");
+        }
     }
 }
 
@@ -255,8 +287,8 @@ impl CudaDevice {
                 && attribute(attribute::CONCURRENT_MANAGED_ACCESS)? == 1,
         };
 
-        let copy = Lane::create(api)?;
-        let dispatch = Lane::create(api)?;
+        let copy = Lane::create(api, raw)?;
+        let dispatch = Lane::create(api, raw)?;
         let mut base_event = CUevent::NULL;
         // SAFETY: out-pointer to a live handle slot; the event is then
         // recorded on the legacy default stream and waited for, so it is
@@ -329,7 +361,7 @@ impl CudaDevice {
     /// A fresh non-blocking lane, registered for scoped waits.
     pub(crate) fn new_lane(&self) -> Result<Arc<Lane>> {
         self.enter()?;
-        let lane = Lane::create(self.api)?;
+        let lane = Lane::create(self.api, self.context.raw)?;
         let mut lanes = self.lanes.lock();
         lanes.retain(|weak| weak.strong_count() > 0);
         lanes.push(Arc::downgrade(&lane));
@@ -557,7 +589,7 @@ impl CudaDevice {
             }
         }
         for lane in self.live_lanes() {
-            if lane.unpublished.load(Ordering::Acquire) {
+            if lane.has_unpublished() {
                 let tail = CudaEvent::new(Arc::clone(self), false)?;
                 tail.record(lane.raw)?;
                 events.push(Arc::new(tail));
@@ -674,11 +706,12 @@ impl CudaStream {
         Ok(Arc::new(event))
     }
 
-    /// A completion token for everything submitted so far. The lane stays
-    /// flagged unpublished until the owner hands the token out
-    /// (`Lane::take_unpublished`), since only then is it recorded on storages.
+    /// A completion token for everything submitted so far. The submissions
+    /// stay unpublished until the owner recorded the token on its storages
+    /// and called [`CompletionToken::published`].
     pub fn token(&self) -> Result<CudaCompletionToken> {
-        Ok(CudaCompletionToken::new(self.record(false)?, self.lane.id))
+        let seq = self.lane.seq();
+        Ok(CudaCompletionToken::new(self.record(false)?, self.lane.id).covering(&self.lane, seq))
     }
 }
 
@@ -773,9 +806,16 @@ impl CudaEvent {
 impl Drop for CudaEvent {
     fn drop(&mut self) {
         let api = self.dev.api();
-        // SAFETY: an event this value created; the driver defers destruction
-        // until it completes.
-        unsafe { (api.event_destroy)(self.raw) };
+        // SAFETY: an event this value created, destroyed in its context; the
+        // driver defers destruction until it completes.
+        let result = unsafe {
+            (api.ctx_set_current)(self.dev.context.raw)
+                .check("cuCtxSetCurrent")
+                .and_then(|()| (api.event_destroy)(self.raw).check("cuEventDestroy"))
+        };
+        if let Err(error) = result {
+            tracing::warn!(?error, "CUDA event leaked");
+        }
     }
 }
 

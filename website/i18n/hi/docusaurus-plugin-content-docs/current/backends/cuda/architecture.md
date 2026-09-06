@@ -72,7 +72,7 @@ kind रखता है, जिसे `BufferSpec` से चुना जा�
 | `BufferSpec` | Kind | Driver call |
 |---|---|---|
 | default | `Device` | `cuMemAlloc` — device memory, कोई host mapping नहीं |
-| `cpu_access` (और device concurrent managed access report करता हो) | `Managed` | `cuMemAllocManaged`, एक ही address दोनों ओर valid |
+| `cpu_access` | `Managed` यदि device concurrent managed access report करता हो, अन्यथा `Pinned` (WDDM, pre-Pascal) | `cuMemAllocManaged`, एक ही address दोनों ओर valid |
 | `host` | `Pinned` | `cuMemHostAlloc(PORTABLE \| DEVICEMAP)`, kernels इसे bus के ऊपर से पढ़ते हैं |
 
 `supports_device_local()` `true` है, इसलिए intermediates device पर ही रहते हैं।

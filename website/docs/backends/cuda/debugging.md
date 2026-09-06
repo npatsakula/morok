@@ -54,7 +54,7 @@ ptxas application ptx input, line 27; error   : ...
 ```
 
 `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` means the driver is older than the PTX
-ISA clang emitted (clang 22: 8.8, CUDA 12.8 / R570), see the
+ISA of the module (pinned to 7.8, CUDA 11.8 / R520), see the
 [requirements](./overview.md). The info log (warnings, register spills) is
 logged at `debug` level under `svod_device`.
 

@@ -6,8 +6,8 @@ use test_case::test_case;
 use super::cuda_alloc_or_skip;
 use crate::Buffer;
 use crate::allocator::{Allocator, BufferSpec, RawBuffer};
-use crate::cuda::CudaMemory;
 use crate::cuda::device::STAGING_BYTES;
+use crate::cuda::{CudaAllocator, CudaMemory};
 
 fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 7 % 251) as u8).collect()
@@ -84,6 +84,15 @@ fn large_copies_stage_in_chunks() {
     alloc._copyout(&mut back, &buffer, 0).unwrap();
     assert!(back == data);
     alloc._free(buffer, &device_local());
+}
+
+#[test_case(BufferSpec { cpu_access: false, ..BufferSpec::default() }, true, CudaMemory::Device; "device local")]
+#[test_case(BufferSpec { cpu_access: false, ..BufferSpec::default() }, false, CudaMemory::Device; "device local without managed")]
+#[test_case(BufferSpec::default(), true, CudaMemory::Managed; "cpu access with coherent managed memory")]
+#[test_case(BufferSpec::default(), false, CudaMemory::Pinned; "cpu access without it is pinned")]
+#[test_case(BufferSpec { host: true, ..BufferSpec::default() }, true, CudaMemory::Pinned; "host memory is pinned")]
+fn memory_kind_honours_cpu_access_without_managed_memory(spec: BufferSpec, managed: bool, expected: CudaMemory) {
+    assert_eq!(CudaAllocator::memory_kind(&spec, managed), expected);
 }
 
 #[test_case(BufferSpec { cpu_access: false, ..BufferSpec::default() }, CudaMemory::Device, false; "device local")]

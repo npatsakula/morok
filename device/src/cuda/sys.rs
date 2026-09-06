@@ -224,7 +224,6 @@ cuda_api! {
     memcpy_htod_async = "cuMemcpyHtoDAsync_v2": fn(CUdeviceptr, *const c_void, usize, CUstream);
     memcpy_dtoh_async = "cuMemcpyDtoHAsync_v2": fn(*mut c_void, CUdeviceptr, usize, CUstream);
     memcpy_dtod_async = "cuMemcpyDtoDAsync_v2": fn(CUdeviceptr, CUdeviceptr, usize, CUstream);
-    memcpy_htod = "cuMemcpyHtoD_v2": fn(CUdeviceptr, *const c_void, usize);
     memcpy_dtoh = "cuMemcpyDtoH_v2": fn(*mut c_void, CUdeviceptr, usize);
     memset_d8_async = "cuMemsetD8Async": fn(CUdeviceptr, u8, usize, CUstream);
     module_load_data_ex = "cuModuleLoadDataEx": fn(*mut CUmodule, *const c_void, u32, *mut c_int, *mut *mut c_void);
@@ -245,7 +244,9 @@ cuda_api! {
     event_record = "cuEventRecord": fn(CUevent, CUstream);
     event_synchronize = "cuEventSynchronize": fn(CUevent);
     event_query = "cuEventQuery": fn(CUevent);
-    event_elapsed_time = "cuEventElapsedTime_v2": fn(*mut f32, CUevent, CUevent);
+    // `_v2` (CUDA 12.8) shares the prototype and would alone raise the
+    // driver floor from the 12.0 graph entry points to R570.
+    event_elapsed_time = "cuEventElapsedTime": fn(*mut f32, CUevent, CUevent);
     graph_create = "cuGraphCreate": fn(*mut CUgraph, u32);
     graph_destroy = "cuGraphDestroy": fn(CUgraph);
     graph_add_kernel_node =

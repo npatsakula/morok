@@ -1,9 +1,9 @@
 //! Event-based synchronization: the per-plan stream context, dispatch
 //! timestamps from event pairs, and completion tokens.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use super::device::{CudaDevice, CudaEvent, CudaStream};
+use super::device::{CudaDevice, CudaEvent, CudaStream, Lane};
 use super::program::CudaProgram;
 use crate::device::{PlanContext, Program};
 use crate::sync::{CompletionToken, DispatchTimestamps};
@@ -46,9 +46,7 @@ impl PlanContext for CudaPlanCtx {
     }
 
     fn completion_token(&self) -> Option<Arc<dyn CompletionToken>> {
-        let token = self.stream.token().ok()?;
-        self.stream.lane().take_unpublished();
-        Some(Arc::new(token))
+        Some(Arc::new(self.stream.token().ok()?))
     }
 
     fn synchronize(&self) -> Result<()> {
@@ -93,16 +91,24 @@ impl DispatchTimestamps for CudaDispatchTimestamps {
 
 /// One event recorded on one lane: retired once the lane reached the record.
 /// The lane id lets the device's producer table keep only the newest token
-/// per lane and order copies after the event on the GPU.
+/// per lane and order copies after the event on the GPU. A token minted by
+/// a [`CudaStream`] also covers the lane's submissions up to that point and
+/// publishes them once recorded on their storages.
 #[derive(Clone)]
 pub struct CudaCompletionToken {
     event: Arc<CudaEvent>,
     lane: u64,
+    covers: Option<(Weak<Lane>, u64)>,
 }
 
 impl CudaCompletionToken {
     pub fn new(event: Arc<CudaEvent>, lane: u64) -> Self {
-        Self { event, lane }
+        Self { event, lane, covers: None }
+    }
+
+    pub(crate) fn covering(mut self, lane: &Arc<Lane>, seq: u64) -> Self {
+        self.covers = Some((Arc::downgrade(lane), seq));
+        self
     }
 
     pub(crate) fn event(&self) -> &Arc<CudaEvent> {
@@ -121,5 +127,13 @@ impl CompletionToken for CudaCompletionToken {
 
     fn retired(&self) -> bool {
         self.event.completed().unwrap_or(true)
+    }
+
+    fn published(&self) {
+        if let Some((lane, seq)) = &self.covers
+            && let Some(lane) = lane.upgrade()
+        {
+            lane.publish(*seq);
+        }
     }
 }
