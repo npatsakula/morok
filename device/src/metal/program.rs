@@ -351,6 +351,11 @@ impl MetalDispatchTimestamps {
         let (start, end) = dev.gpu_times(command_buffer);
         Self { start_ns: (start * 1e9) as u64, end_ns: (end * 1e9) as u64 }
     }
+
+    /// Stamps already converted to nanoseconds (Metal 4 counter heap).
+    pub(crate) fn from_ns(start_ns: u64, end_ns: u64) -> Self {
+        Self { start_ns, end_ns }
+    }
 }
 
 impl DispatchTimestamps for MetalDispatchTimestamps {

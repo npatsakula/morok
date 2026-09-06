@@ -57,6 +57,14 @@ pub(crate) const MTL_RESOURCE_OPTIONS_DEFAULT: NSUInteger = 0;
 pub(crate) const MTL_INDIRECT_COMMAND_TYPE_CONCURRENT_DISPATCH: NSUInteger = 1 << 5;
 /// `MTLResourceUsageRead | MTLResourceUsageWrite`.
 pub(crate) const MTL_RESOURCE_USAGE_READ_WRITE: NSUInteger = 1 | 2;
+/// `MTL4CounterHeapTypeTimestamp`.
+pub(crate) const MTL4_COUNTER_HEAP_TYPE_TIMESTAMP: NSInteger = 1;
+/// `MTL4TimestampGranularityPrecise`.
+pub(crate) const MTL4_TIMESTAMP_GRANULARITY_PRECISE: NSInteger = 1;
+/// `MTLStageDispatch`.
+pub(crate) const MTL_STAGE_DISPATCH: NSUInteger = 1 << 27;
+/// `MTL4VisibilityOptionDevice`.
+pub(crate) const MTL4_VISIBILITY_OPTION_DEVICE: NSUInteger = 1;
 pub(crate) const MTL_PIPELINE_OPTION_NONE: NSUInteger = 0;
 pub(crate) const MTL_COMMAND_BUFFER_STATUS_COMPLETED: NSUInteger = 4;
 pub(crate) const MTL_MATH_MODE_SAFE: NSInteger = 0;
@@ -160,6 +168,32 @@ selectors! {
     set_barrier = "setBarrier";
     use_resources_count_usage = "useResources:count:usage:";
     execute_commands_in_buffer_with_range = "executeCommandsInBuffer:withRange:";
+    // Metal 4 (macOS 26): per-dispatch timestamps through a counter heap.
+    responds_to_selector = "respondsToSelector:";
+    new_mtl4_command_queue = "newMTL4CommandQueue";
+    new_command_allocator = "newCommandAllocator";
+    new_command_buffer = "newCommandBuffer";
+    reset = "reset";
+    begin_command_buffer_with_allocator = "beginCommandBufferWithAllocator:";
+    end_command_buffer = "endCommandBuffer";
+    use_residency_set = "useResidencySet:";
+    commit_count = "commit:count:";
+    signal_event_value = "signalEvent:value:";
+    new_shared_event = "newSharedEvent";
+    wait_until_signaled_value_timeout = "waitUntilSignaledValue:timeoutMS:";
+    new_counter_heap_with_descriptor_error = "newCounterHeapWithDescriptor:error:";
+    set_type = "setType:";
+    set_count = "setCount:";
+    resolve_counter_range = "resolveCounterRange:";
+    query_timestamp_frequency = "queryTimestampFrequency";
+    size_of_counter_heap_entry = "sizeOfCounterHeapEntry:";
+    write_timestamp_into_heap_at_index = "writeTimestampWithGranularity:intoHeap:atIndex:";
+    barrier_after_stages = "barrierAfterStages:beforeQueueStages:visibilityOptions:";
+    new_residency_set_with_descriptor_error = "newResidencySetWithDescriptor:error:";
+    set_initial_capacity = "setInitialCapacity:";
+    add_allocation = "addAllocation:";
+    bytes = "bytes";
+    length = "length";
 }
 
 /// The Objective-C classes the backend instantiates.
@@ -173,6 +207,7 @@ pub(crate) struct Classes {
 /// The loaded runtime: libobjc, libSystem, CoreGraphics and Metal.
 pub(crate) struct Objc {
     objc_msg_send: unsafe extern "C" fn(),
+    get_class: unsafe extern "C" fn(*const c_char) -> Class,
     retain: unsafe extern "C" fn(Id) -> Id,
     release: unsafe extern "C" fn(Id),
     pool_push: unsafe extern "C" fn() -> *mut c_void,
@@ -212,6 +247,7 @@ impl Objc {
         };
         Ok(Self {
             objc_msg_send: sym(&objc, LIBOBJC, c"objc_msgSend")?,
+            get_class,
             retain: sym(&objc, LIBOBJC, c"objc_retain")?,
             release: sym(&objc, LIBOBJC, c"objc_release")?,
             pool_push: sym(&objc, LIBOBJC, c"objc_autoreleasePoolPush")?,
@@ -274,6 +310,24 @@ impl Objc {
         // SAFETY: as `send0`.
         let f: unsafe extern "C" fn(Id, Sel, A, B, C, D) -> R = unsafe { std::mem::transmute(self.objc_msg_send) };
         unsafe { f(receiver, sel, a, b, c, d) }
+    }
+
+    /// A class that may be absent on older systems (`None` then).
+    pub(crate) fn optional_class(&self, name: &CStr) -> Option<Class> {
+        // SAFETY: NUL-terminated class name.
+        let class = unsafe { (self.get_class)(name.as_ptr()) };
+        (!class.is_null()).then_some(class)
+    }
+
+    /// [`Self::optional_class`] as a `DeviceUnavailable` error when missing.
+    pub(crate) fn classes_optional_new(&self, name: &CStr) -> Result<Class> {
+        self.optional_class(name).ok_or_else(|| unavailable(format!("Objective-C class {name:?} not found")))
+    }
+
+    /// `-[NSObject respondsToSelector:]`, for selectors newer than the running OS may be.
+    pub(crate) fn responds_to(&self, receiver: Id, sel: Sel) -> bool {
+        // SAFETY: takes a SEL, returns BOOL.
+        unsafe { self.send1::<Sel, ObjcBool>(receiver, self.sels.responds_to_selector, sel) != 0 }
     }
 
     /// `[Class new]`, adopted.
@@ -463,6 +517,23 @@ pub(crate) unsafe fn ns_string_to_string(objc: &Objc, string: Id) -> String {
     }
     // SAFETY: `UTF8String` returns a NUL-terminated buffer owned by the string.
     unsafe { CStr::from_ptr(chars) }.to_string_lossy().into_owned()
+}
+
+/// `-[NSData bytes]` copied out; empty for nil.
+///
+/// # Safety
+///
+/// `data` must be nil or a live `NSData`.
+pub(crate) unsafe fn ns_data_to_vec(objc: &Objc, data: Id) -> Vec<u8> {
+    if data.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: `length` bytes are readable at `bytes` while the data object lives.
+    unsafe {
+        let length = objc.send0::<NSUInteger>(data, objc.sels.length) as usize;
+        let bytes = objc.send0::<*const u8>(data, objc.sels.bytes);
+        if bytes.is_null() { Vec::new() } else { std::slice::from_raw_parts(bytes, length).to_vec() }
+    }
 }
 
 /// `-[NSError localizedDescription]`; `None` for nil.

@@ -5,9 +5,10 @@
 
 mod allocator;
 mod compile;
-mod graph;
+pub(super) mod graph;
+mod mtl4;
 mod objc;
-mod program;
+pub(super) mod program;
 mod registry;
 
 use std::sync::Arc;

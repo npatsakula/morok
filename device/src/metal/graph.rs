@@ -339,8 +339,9 @@ impl Graph for MetalGraph {
         Ok(())
     }
 
-    /// The same chain, one command buffer per kernel on the same in-order
-    /// queue, so each kernel gets its own GPU start/end stamps.
+    /// Per-kernel GPU stamps. With Metal 4 the indirect commands run one at a
+    /// time inside a single submission with precise timestamps between them;
+    /// otherwise each kernel gets its own command buffer on the legacy queue.
     fn replay_profiled(&self, buffers: &[u64], vals: &[i64]) -> Result<Option<Vec<Arc<dyn DispatchTimestamps>>>> {
         let mut state = self.state.lock();
         let objc = self.dev.objc();
@@ -348,6 +349,28 @@ impl Graph for MetalGraph {
         let sels = &objc.sels;
         self.retire_last(&mut state)?;
         self.rebind(&mut state, buffers, vals)?;
+
+        if let Some(profiler) = self.dev.mtl4() {
+            // The Metal 4 queue is not ordered against the legacy one: drain
+            // everything that may still be writing this graph's inputs.
+            self.dev.synchronize()?;
+            let stamps = profiler.time_indirect_commands(
+                &self.dev,
+                self.icb.as_raw(),
+                self.kernels.len(),
+                &state.resources,
+                &self.pipelines,
+                self.needs_icb_fix,
+            )?;
+            return Ok(Some(
+                stamps
+                    .into_iter()
+                    .map(|(start, end)| {
+                        Arc::new(MetalDispatchTimestamps::from_ns(start, end)) as Arc<dyn DispatchTimestamps>
+                    })
+                    .collect(),
+            ));
+        }
 
         let mut command_buffers = Vec::with_capacity(self.kernels.len());
         let mut slot = 0;

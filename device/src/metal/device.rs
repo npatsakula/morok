@@ -88,6 +88,8 @@ pub struct MetalDevice {
     in_flight: Mutex<Vec<ObjcId>>,
     /// `contents` base → (MTLBuffer, allocated length).
     registry: Mutex<PointerRegistry<ObjcId>>,
+    /// Metal 4 timestamp queue, opened on first profiled replay; `None` below macOS 26.
+    mtl4: OnceLock<Option<super::mtl4::Mtl4Profiler>>,
 }
 
 impl std::fmt::Debug for MetalDevice {
@@ -153,6 +155,7 @@ impl MetalDevice {
             family,
             in_flight: Mutex::new(Vec::new()),
             registry: Mutex::new(PointerRegistry::default()),
+            mtl4: OnceLock::new(),
         })
     }
 
@@ -172,6 +175,11 @@ impl MetalDevice {
     /// Paravirtualized GPUs (CI VMs) break indirect command buffers.
     pub fn supports_graph(&self) -> bool {
         !self.name.to_lowercase().contains("virtual")
+    }
+
+    /// Per-dispatch GPU timestamps, when the OS offers Metal 4.
+    pub fn mtl4(&self) -> Option<&super::mtl4::Mtl4Profiler> {
+        self.mtl4.get_or_init(|| super::mtl4::Mtl4Profiler::open(self)).as_ref()
     }
 
     pub(crate) fn objc(&self) -> &'static Objc {

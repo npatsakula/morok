@@ -20,20 +20,20 @@ fn icb_fix_is_applied_before_apple9(family: MetalFamily, expected: bool) {
     assert_eq!(needs_icb_fix(family), expected);
 }
 
-const N: usize = 4096;
+pub(super) const N: usize = 4096;
 
-struct Chain {
-    alloc: MetalAllocator,
+pub(super) struct Chain {
+    pub(super) alloc: MetalAllocator,
     program: MetalProgram,
     a: RawBuffer,
     b: RawBuffer,
     mid1: RawBuffer,
     mid2: RawBuffer,
-    out: RawBuffer,
+    pub(super) out: RawBuffer,
 }
 
 impl Chain {
-    fn new() -> Option<Self> {
+    pub(super) fn new() -> Option<Self> {
         let alloc = metal_alloc_or_skip()?;
         let bytes = compile_for_test(&alloc.dev, VADD_MSL).unwrap();
         let program = MetalProgram::load(alloc.dev.clone(), &bytes, "vadd", &vadd_abi()).unwrap();
@@ -53,7 +53,7 @@ impl Chain {
 
     /// `mid1 = a + b; mid2 = mid1 + b; out = mid2 + mid1` — every kernel reads
     /// the previous one's output, so the chain is only correct in order.
-    fn kernels(&self) -> Vec<GraphKernel<'_>> {
+    pub(super) fn kernels(&self) -> Vec<GraphKernel<'_>> {
         let launch = |buffers: Vec<*mut u8>| GraphKernel {
             program: &self.program as &dyn Program,
             buffers,
@@ -74,11 +74,11 @@ impl Chain {
     }
 
     /// `out[i] = (a + b) + b + (a + b) = 2a + 3b`.
-    fn expected(&self) -> Vec<f32> {
+    pub(super) fn expected(&self) -> Vec<f32> {
         (0..N).map(|i| (2 * i + 3 * 2 * i) as f32).collect()
     }
 
-    fn capture(&self) -> Box<dyn Graph> {
+    pub(super) fn capture(&self) -> Box<dyn Graph> {
         MetalGraph::capture(self.alloc.dev.clone(), &self.kernels()).unwrap().expect("static chain is graphable")
     }
 }

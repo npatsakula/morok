@@ -17,6 +17,7 @@ pub mod allocator;
 pub mod compile;
 pub mod device;
 pub mod graph;
+pub mod mtl4;
 #[doc(hidden)]
 pub mod objc;
 pub mod program;
@@ -24,4 +25,5 @@ pub mod program;
 pub use allocator::MetalAllocator;
 pub use device::{MetalDevice, has_devices};
 pub use graph::MetalGraph;
+pub use mtl4::Mtl4Profiler;
 pub use program::{MetalDispatchTimestamps, MetalProgram};
