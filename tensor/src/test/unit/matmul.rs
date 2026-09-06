@@ -1185,6 +1185,46 @@ fn test_matmul_validated_square(size: usize, tol: f32) {
 #[test_case(1024, 64, 128, 1.0; "1024x64 @ 64x128 tall-skinny")]
 #[test_case(64, 512, 64, 1.5; "64x512 @ 512x64 wide")]
 #[test_case(256, 1024, 256, 2.5; "256x1024 @ 1024x256 large-K")]
+#[test_case(2, 384, 51865, 0.05; "2x384 @ 384x51865 whisper logits")]
+#[test_case(1, 512, 10007, 0.05; "1x512 @ 512x10007 prime vocabulary")]
+#[test_case(2, 64, 10007, 0.01; "2x64 @ 64x10007 prime vocabulary")]
 fn test_matmul_validated_non_square(m: usize, k: usize, n: usize, tol: f32) {
     run_validated_matmul(m, k, n, tol);
+}
+
+/// Whisper's decoder logits `[rows, 384] x [384, 51865]`: the vocabulary axis
+/// (5·11·23·41) has no standard block divisor, so the heuristic pads it to a
+/// multiple of 32 and masks the tail. The launch must fill at least a warp per
+/// block and the padded lanes must not leak into the result.
+#[test_case(2, DType::Float32, 1e-3; "two rows f32")]
+#[test_case(2, DType::Float16, 0.1; "two rows f16")]
+#[test_case(1, DType::Float32, 1e-3; "one row f32 matvec")]
+#[test_case(1, DType::Float16, 0.1; "one row f16 matvec")]
+fn test_matmul_cuda_padded_vocabulary_axis(rows: usize, dtype: DType, tol: f32) {
+    let Some(config) = PrepareConfig::for_cuda_if_available() else {
+        eprintln!("skipped: default device is not a CUDA GPU");
+        return;
+    };
+    let (k, n) = (384, 51865);
+    // Zero-mean multiples of 1/32: exact in f16, so the f32 reference sees the same inputs.
+    let a_nd = Array2::from_shape_fn((rows, k), |(m, i)| (((m * 17 + i) % 23) as f32 - 11.0) / 32.0);
+    let b_nd = Array2::from_shape_fn((k, n), |(i, j)| (((i * 13 + j) % 29) as f32 - 14.0) / 32.0);
+    let mut a = Tensor::from_ndarray(&a_nd).cast(dtype.clone()).unwrap();
+    let mut b = Tensor::from_ndarray(&b_nd).cast(dtype).unwrap();
+    a.realize().unwrap();
+    b.realize().unwrap();
+
+    let build = || a.matmul(&b).unwrap();
+    let plan = build().prepare_with(&config).unwrap();
+    let reduce_kernels: Vec<_> = plan.kernels().filter(|kernel| kernel.entry_point.starts_with("r_")).collect();
+    assert_eq!(reduce_kernels.len(), 1, "one matmul kernel expected");
+    let local = reduce_kernels[0].local_size.as_ref().expect("the matmul launches with a block size");
+    let threads: i64 = local.iter().map(|dim| dim.vmax().try_int().expect("constant block dim")).product();
+    assert!(threads >= 32, "{}: {threads} threads per block", reduce_kernels[0].entry_point);
+
+    let mut c = build();
+    c.realize_with(&config).unwrap();
+    let mut c = c.cast(DType::Float32).unwrap();
+    c.realize().unwrap();
+    assert_matmul_close(&c.as_vec::<f32>().unwrap(), &a_nd.dot(&b_nd), tol);
 }
