@@ -171,4 +171,44 @@ impl LaneMap {
             _ => ReduceTree::Gather((1..wave_size as i64 / 16).map(|i| i * 16).collect()),
         }
     }
+
+    /// The `ldmatrix.x4` load of a 16×16 16-bit fragment held under this map
+    /// (`transpose` as in [`Self::rc`]), if one exists: the four 8×8 matrices the
+    /// warp fetches (lane `L` addressing row `L % 16`, columns `8·(L / 16)..` — TL,
+    /// BL, TR, BR) each land as one 32-bit register pair of adjacent elements, so
+    /// the map must give lane `L` register pair `p` = elements `(L/4, 2(L%4) + e)`
+    /// of one matrix (or its transpose under `.trans`). Proved by evaluating the
+    /// closed form over every lane and register — the plan is derived, never
+    /// hand-permuted: [`Self::MmaSync`] reads `[0, 1, 2, 3]` plain and `[0, 2, 1,
+    /// 3]` transposed (ThunderKittens `ldsm4t(tmp[0], tmp[2], tmp[1], tmp[3])`).
+    pub fn ldmatrix_x4(&self, transpose: bool) -> Option<LdmatrixX4> {
+        [false, true].into_iter().find_map(|trans| {
+            let mut words = [0usize; 4];
+            for (p, word) in words.iter_mut().enumerate() {
+                let (r, c) = self.rc(transpose, &0i64, 16, 16, &(2 * p as i64));
+                let (rb, cb) = (r / 8, c / 8);
+                *word = (rb + 2 * cb) as usize;
+                for lane in 0..32i64 {
+                    let (g, t) = (lane / 4, lane % 4);
+                    for e in 0..2i64 {
+                        let want =
+                            if trans { (8 * rb + 2 * t + e, 8 * cb + g) } else { (8 * rb + g, 8 * cb + 2 * t + e) };
+                        if self.rc(transpose, &lane, 16, 16, &(2 * p as i64 + e)) != want {
+                            return None;
+                        }
+                    }
+                }
+            }
+            Some(LdmatrixX4 { trans, words })
+        })
+    }
+}
+
+/// How one `ldmatrix.sync.aligned.m8n8.x4[.trans]` fills a 16×16 fragment: register
+/// pair `p` (elements `2p, 2p+1`) is the fetched matrix `words[p]` (see
+/// [`LaneMap::ldmatrix_x4`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LdmatrixX4 {
+    pub trans: bool,
+    pub words: [usize; 4],
 }

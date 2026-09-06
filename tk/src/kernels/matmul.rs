@@ -48,7 +48,7 @@ pub struct MatmulCfg {
     /// `block_idx`. Grid becomes `[grid² , 1, 1]`.
     pub l2_swizzle: bool,
     /// Fill the GLOBAL→LDS strips with 128-bit (`vec8` bf16) coalesced loads
-    /// instead of the scalar/`vec4`-folded path.
+    /// instead of the scalar/`vec4`-folded path (16-byte `cp.async` copies on CUDA).
     pub vec_load: bool,
     /// K-reduction step (LDS strip depth) for the single-buffered K-loop. Must be a
     /// multiple of 16 (the WMMA K-edge) and divide N. Lowering it cuts the live

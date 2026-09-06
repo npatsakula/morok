@@ -127,3 +127,34 @@ fn test_base_shape_arithmetic() {
     assert_eq!(RT_16X16_MMA.elements_per_thread(), 8);
     assert_eq!(RT_16X16_MMA.map, LaneMap::MmaSync);
 }
+
+/// The `ldmatrix` row / `cp.async` copy unit is an aligned 16-byte chunk: the
+/// chunk-granular XOR of [`Swizzle::Sw16x16Mma`] (and the identity) keeps every
+/// chunk one contiguous, aligned run; the HipKittens XOR variants permute at 8-byte
+/// granularity and break it.
+#[test]
+fn test_keeps_16b_chunks() {
+    let cidx = |v: usize| UOp::index_const(v as i64);
+    for sw in
+        [Swizzle::Identity, Swizzle::Sw16x16Mma, Swizzle::Sw16x16, Swizzle::Sw32x32, Swizzle::Sw16x32, Swizzle::Sw32x16]
+    {
+        let (rows, cols) = match sw {
+            Swizzle::Sw32x32 => (32, 32),
+            Swizzle::Sw16x32 => (16, 32),
+            Swizzle::Sw32x16 => (32, 16),
+            _ => (16, 16),
+        };
+        let contiguous = (0..rows).all(|r| {
+            (0..cols).step_by(8).all(|c0| {
+                let (r0, s0) = sw.swizzle_rc(cidx(r), cidx(c0), cols, ScalarDType::BFloat16);
+                let (r0, s0) = (eval_const(&r0), eval_const(&s0));
+                s0 % 8 == 0
+                    && (1..8).all(|k| {
+                        let (rk, sk) = sw.swizzle_rc(cidx(r), cidx(c0 + k), cols, ScalarDType::BFloat16);
+                        eval_const(&rk) == r0 && eval_const(&sk) == s0 + k as i64
+                    })
+            })
+        });
+        assert_eq!(sw.keeps_16b_chunks(), contiguous, "{sw:?}");
+    }
+}

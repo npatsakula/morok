@@ -773,6 +773,8 @@ fn render_fa_sm86(name: &str, (b, n, h, h_kv, d): (usize, usize, usize, usize, u
 #[test_case::test_case(32, 32, true, true, 64; "32x32 flat causal")]
 #[test_case::test_case(32, 32, true, false, 128; "32x32 flat d=128")]
 #[test_case::test_case(16, 32, true, false, 128; "16x32 flat d=128")]
+#[test_case::test_case(16, 64, true, false, 64; "16x64 flat")]
+#[test_case::test_case(16, 64, true, true, 128; "16x64 flat causal d=128")]
 fn test_fa_sm86_renders_mma_sync(q_blk: usize, kv_blk: usize, unroll: bool, causal: bool, d: usize) {
     let body = if unroll { "flat" } else { "rolled" };
     let name = format!("fa_sm86_{q_blk}x{kv_blk}_{body}{}_d{d}", if causal { "_causal" } else { "" });
@@ -787,10 +789,46 @@ fn test_fa_sm86_renders_mma_sync(q_blk: usize, kv_blk: usize, unroll: bool, caus
     }
     assert!(code.contains("addrspace(3)"), "the K/V double buffers are NVPTX shared arrays");
     assert!(code.contains("shfl.sync.bfly"), "the softmax reduce completes in the quad butterfly");
+    // The K/V gathers are one `ldmatrix.x4` per 16×16 fragment — plain for K (a
+    // `Row` tile read `Row`), `.trans` for V (read `Col`) — and no scalar shared
+    // load remains.
+    let calls = |needle: &str| code.lines().filter(|l| l.contains(needle) && !l.contains("declare")).count();
+    let frags = (kv_blk / 16) * (d / 16);
+    assert_eq!(calls("call { i32, i32, i32, i32 } @llvm.nvvm.ldmatrix.sync.aligned.m8n8.x4.b16("), frags, "K");
+    assert_eq!(calls("call { i32, i32, i32, i32 } @llvm.nvvm.ldmatrix.sync.aligned.m8n8.x4.trans.b16("), frags, "V");
+    // The K/V stream is `cp.async`: one 16-byte copy per lane per pass of each tile
+    // in the prologue and in the loop, one commit per tile, one `wait_group 0` at the
+    // loop top and one `wait_all` drain after it; no `st.shared` commit remains.
+    let passes = (kv_blk * d * 2).div_ceil(256 * 16);
+    assert_eq!(calls("@llvm.nvvm.cp.async.cg.shared.global.16("), 4 * passes, "K+V copies, prologue + loop");
+    assert_eq!(calls("@llvm.nvvm.cp.async.commit.group()"), 4);
+    assert_eq!(calls("@llvm.nvvm.cp.async.wait.group(i32 0)"), 1);
+    assert_eq!(calls("@llvm.nvvm.cp.async.wait.all()"), 1);
+    // In the PTX: no scalar shared load survives (the gathers are `ldmatrix`), the
+    // K/V commit is `cp.async` (no `st.shared`), and the loop carries one barrier.
+    if let Some(ptx) = ptx_of(&code) {
+        let count = |needle: &str| ptx.matches(needle).count();
+        assert_eq!(count("ld.shared.b16"), 0, "scalar LDS gather in the PTX:\n{ptx}");
+        assert_eq!(count("st.shared"), 0, "register-staged LDS commit in the PTX:\n{ptx}");
+        assert_eq!(count("ldmatrix.sync.aligned.m8n8.x4.shared.b16"), frags);
+        assert_eq!(count("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16"), frags);
+        assert_eq!(count("cp.async.cg.shared.global"), 4 * passes);
+        assert_eq!((count("cp.async.wait_group"), count("cp.async.wait_all"), count("bar.sync")), (1, 1, 1));
+    }
     assert!(
         !code.contains("amdgcn") && !code.contains("mfma") && !code.contains("wmma."),
         "no AMD intrinsics on NVPTX"
     );
+}
+
+/// The sm_86 PTX of rendered NVPTX IR, or `None` without an NVPTX-enabled clang
+/// (the render assertions still run; only the PTX-level ones skip).
+pub(super) fn ptx_of(code: &str) -> Option<String> {
+    if !svod_runtime::cuda::has_nvptx_target() {
+        return None;
+    }
+    let sm86 = svod_dtype::CudaArch::from_compute_capability(8, 6);
+    Some(String::from_utf8(svod_runtime::cuda::compile_ir_to_ptx(code, sm86).expect("clang accepts the IR")).unwrap())
 }
 
 const GFX942: svod_dtype::GpuArch = svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx942);
@@ -799,15 +837,17 @@ const SM_86: svod_dtype::GpuArch = svod_dtype::GpuArch::Cuda(svod_dtype::CudaArc
 
 /// The per-arch tile policy: gfx942's `{32,32}` needs `b·h·n/256 >= 304` blocks
 /// (else the `{16,32}` baseline), gfx1151 always takes the baseline, and CUDA
-/// takes `{32,32}` (flat) once the grid covers its 28 SMs and `N` tiles by 256.
+/// takes the taller `{16,64}` KV block (flat) once the grid covers its 28 SMs, at
+/// d ≤ 64 (the d=128 double buffers would exceed the static LDS).
 #[test_case::test_case(GFX942, (1, 1536, 16, 64), (16, 32), false; "gfx942 small grid")]
 #[test_case::test_case(GFX942, (8, 2048, 32, 128), (32, 32), false; "gfx942 machine-covering grid")]
 #[test_case::test_case(GFX942, (64, 1152, 16, 64), (16, 32), false; "gfx942 N not a 256-multiple")]
 #[test_case::test_case(GFX1151, (64, 2048, 32, 64), (16, 32), false; "gfx1151 baseline only")]
-#[test_case::test_case(SM_86, (1, 1536, 6, 64), (32, 32), true; "sm_86 whisper-tiny b=1")]
-#[test_case::test_case(SM_86, (8, 1536, 16, 64), (32, 32), true; "sm_86 gigaam")]
+#[test_case::test_case(SM_86, (1, 1536, 6, 64), (16, 64), true; "sm_86 whisper-tiny b=1")]
+#[test_case::test_case(SM_86, (8, 1536, 16, 64), (16, 64), true; "sm_86 gigaam")]
+#[test_case::test_case(SM_86, (1, 1024, 16, 64), (16, 64), true; "sm_86 gigaam b=1")]
 #[test_case::test_case(SM_86, (1, 256, 2, 64), (16, 32), true; "sm_86 tiny grid")]
-#[test_case::test_case(SM_86, (8, 1152, 16, 64), (16, 32), true; "sm_86 N not a 256-multiple")]
+#[test_case::test_case(SM_86, (8, 1152, 16, 64), (16, 64), true; "sm_86 N a 128-multiple only")]
 #[test_case::test_case(SM_86, (8, 1536, 16, 128), (16, 32), true; "sm_86 d=128 keeps the small tile")]
 fn fa_policy_tile(
     arch: svod_dtype::GpuArch,
@@ -906,4 +946,27 @@ fn test_fa_cuda(b: usize, n: usize, h: usize, h_kv: usize, d: usize, dtype: DTyp
     );
     println!("fa[cuda] b={b} n={n} h={h}/{h_kv} d={d} {dtype:?} causal={causal} lens={valid:?}: {}", report.message);
     assert!(report.ok, "{}", report.message);
+}
+
+/// Every RANGE a kernel body opens must be closed on every path to its SINK: the
+/// tensor scheduler's kernel split (`split_store`) treats a RANGE still in scope
+/// at a CALL as an interior loop and refuses to cut the *consumer* kernel, which
+/// then fails the kernel-graph spec. `After.ended_ranges()` only propagates through
+/// `END`/`After` deps — an ordering statement (a `cp.async` wait, a barrier) as an
+/// `After` dep hides the loop `END` from a carried accumulator's post-loop read, so
+/// the CUDA stream threads its drain through the output GLOBAL instead. Pins both
+/// K/V streams, flat and rolled.
+#[test_case::test_case(SM_86, true; "sm_86 flat")]
+#[test_case::test_case(SM_86, false; "sm_86 rolled")]
+#[test_case::test_case(GFX942, false; "gfx942 rolled")]
+fn fa_sink_leaves_no_range_in_scope(arch: svod_dtype::GpuArch, unroll: bool) {
+    use crate::kernels::fa::NUM_WARPS;
+    let (b, n, h, h_kv, d) = (1usize, 128usize, 2usize, 2usize, 64usize);
+    let cfg = FaConfig { q_blk: 16, kv_blk: 32, unroll, causal: true };
+    let caps = crate::ArchCaps::for_arch(arch);
+    let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
+    let ker = Kernel::new("fa", grid, (NUM_WARPS * caps.wave_size) as i64, dummy_fa_buffers(b, n, h, h_kv, d), caps);
+    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, cfg, DType::BFloat16, false);
+    let sink = ker.finish(1);
+    assert!(sink.in_scope_ranges().is_empty(), "RANGE {:?} still open at the SINK", sink.in_scope_ranges());
 }

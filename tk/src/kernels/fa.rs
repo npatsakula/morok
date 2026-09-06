@@ -6,6 +6,11 @@
 //! `QKᵀ` with [`mma_atb`](crate::Group::mma_atb), applying the causal mask, the
 //! running-max online softmax (the LDS cross-lane [`row_reduce`]s), and the `A·V`
 //! accumulation, before normalizing and writing the transposed output tile back.
+//!
+//! The K/V stream is arch-selected inside [`build_fa_mw_rdb`]: register-staged
+//! (`global_load` early, `ds_write` late) on AMD, `cp.async` into the other LDS half
+//! with the copy in flight under the current block's compute on CUDA sm_80+, where
+//! the LDS→register gathers are `ldmatrix.x4` (see [`crate::Group::load`]).
 
 use std::sync::Arc;
 
@@ -23,6 +28,7 @@ use crate::loop_scope::Loop;
 use crate::scaffold::GlSpec;
 use crate::tile::{RT, RV, RegTile, ST};
 use crate::tiles::TileLayout;
+use svod_codegen::llvm::nvptx::smem::{cp_async_wait, cp_async_wait_all};
 
 /// The WMMA tile edge (gfx942 K=16). The QKᵀ / A·V WMMAs always operate on
 /// 16×16 fragments; Q/KV per-warp *tiles* are grids of `BLK`-edged fragments
@@ -185,8 +191,9 @@ fn score_mask<'k>(
 /// freshly-zeroed `att`, and apply the causal mask. Returns the masked raw scores
 /// `att` and the gathered `v_reg` (carried to [`fa_softmax_pv`]). Splitting QK off
 /// the softmax/PV lets the cross-tile pipeline emit `qk(cur)` out of phase with
-/// `softmax_pv(prev)`. `war_barrier`/`extra_war` gate the LDS→REG read behind a
-/// cross-wave WAR barrier (with the double-buffer prefetch commits folded in).
+/// `softmax_pv(prev)`. `fence` (the register-staged stream) gates the LDS→REG read
+/// behind a cross-wave WAR barrier with the double-buffer prefetch commits folded
+/// in; the `cp.async` stream fences at the loop top instead and passes `None`.
 #[allow(clippy::too_many_arguments)]
 fn fa_qk<'k>(
     ctx: &FaCtx<'_, 'k>,
@@ -197,18 +204,20 @@ fn fa_qk<'k>(
     k_smem: ST,
     v_smem: ST,
     slice_idx: &Arc<UOp>,
-    war_barrier: bool,
-    extra_war: &[Arc<UOp>],
+    fence: Option<&[Arc<UOp>]>,
 ) -> (RT<'k>, RT<'k>) {
     let warp = ctx.warp;
     // Per-warp LDS→REG gather: every warp reads the shared K/V block.
     let k_reg = warp.load(k_reg, k_smem, MoveIdx::default());
     let v_reg = warp.load(v_reg, v_smem, MoveIdx::default());
     // Cross-wave WAR sync: all 8 warps must finish reading this buffer before the
-    // next fill overwrites it. `extra_war` folds in the rolled double-buffer's
+    // next fill overwrites it. The extra deps fold in the rolled double-buffer's
     // prefetch commits, so this single in-loop barrier (consumed by the gathers)
     // also gates the cross-iteration RAW/WAR.
-    let (k_reg, v_reg) = if war_barrier { warp.war_fence2(k_reg, v_reg, extra_war) } else { (k_reg, v_reg) };
+    let (k_reg, v_reg) = match fence {
+        Some(extra) => warp.war_fence2(k_reg, v_reg, extra),
+        None => (k_reg, v_reg),
+    };
 
     // QKᵀ into a freshly-zeroed att tile (re-zeroed each trip via the loop scope).
     let att = warp.zero(ctx.lp.reinit(att));
@@ -421,12 +430,23 @@ pub(crate) fn build_fa_mw_rdb(
         iconst(total_kv_blocks)
     };
 
-    // Prologue: stage KV block 0 → VGPR, commit → buf[0], barrier.
+    // The K/V stream: `cp.async` (sm_80+ — the copy lands in LDS with no register
+    // staging and stays in flight under the previous block's compute) or the
+    // register-staged prefetch (AMD).
+    let async_stream = g.cp_async_fill_applies(&k_smem, &k) && g.cp_async_fill_applies(&v_smem, &v);
+
+    // Prologue: block 0 → buf[0]. Register-staged: stage → VGPR, commit, barrier;
+    // cp.async: issue + commit only (the loop top retires and fences it).
     let p_kidx = [Idx::from(&batch), Idx::Const(0), Idx::from(&head_kv), Idx::Const(0)];
-    let s0_k = g.stage_global_to_reg(&k_smem, &k, &p_kidx, 1);
-    let s0_v = g.stage_global_to_reg(&v_smem, &v, &p_kidx, 1);
-    let k_smem = g.commit_reg_to_local(k_smem, &s0_k, true);
-    let v_smem = g.commit_reg_to_local(v_smem, &s0_v, true);
+    let (k_smem, v_smem) = if async_stream {
+        let c_k = g.cp_async_fill(&k_smem, &k, &p_kidx, 1);
+        let c_v = g.cp_async_fill(&v_smem, &v, &p_kidx, 1);
+        (k_smem.after(c_k), v_smem.after(c_v))
+    } else {
+        let s0_k = g.stage_global_to_reg(&k_smem, &k, &p_kidx, 1);
+        let s0_v = g.stage_global_to_reg(&v_smem, &v, &p_kidx, 1);
+        (g.commit_reg_to_local(k_smem, &s0_k, true), g.commit_reg_to_local(v_smem, &s0_v, true))
+    };
 
     // Rolled KV loop. `kv_bound` (the dynamic per-q-block causal trip count) is the
     // Range end. The prefetch-block index is `(kv+1) % total_kv_blocks` (a FloorMod): the
@@ -456,31 +476,56 @@ pub(crate) fn build_fa_mw_rdb(
     let mark = crate::sched::pipeline(crate::sched::SchedKind::Attention, kv_idx.clone());
     let k_l = k.rewrap(k.uop().after(smallvec![mark.clone()]));
     let v_l = v.rewrap(v.uop().after(smallvec![mark]));
-    let s_k = g.stage_global_to_reg(&k_smem, &k_l, &pf_kidx, 1);
-    let s_v = g.stage_global_to_reg(&v_smem, &v_l, &pf_kidx, 1);
 
-    // Commit the staged registers into the *other* half (no per-commit barrier — the
-    // single in-loop WAR barrier below covers both RAW and WAR). Emitted before the
-    // slice so the slice's `o_reg` A·V store stays the last terminal store on the stack.
-    let commit_k = g.commit_reg_to_local(k_nxt, &s_k, false);
-    let commit_v = g.commit_reg_to_local(v_nxt, &s_v, false);
+    // Per-iteration ordering of the two streams (one workgroup barrier each):
+    //
+    // cp.async — `wait_group 0` + barrier at the loop TOP retire block `kv` (issued
+    // last iteration, or by the prologue) and prove every warp finished gathering
+    // buf[nxt] last iteration (WAR); then block `kv+1` is issued into buf[nxt] and
+    // stays in flight under this block's gather + compute (the gathers order after
+    // the commit so the copy issues first). The final trip's wrapped prefetch is
+    // drained after the loop.
+    //
+    // register-staged — stage block `kv+1` → VGPR, `ds_write` it into buf[nxt] (no
+    // per-commit barrier; emitted before the slice so the slice's `o_reg` A·V store
+    // stays the last terminal store on the stack), gather buf[cur], then the WAR
+    // barrier consumed by the gathers folds in the commits, gating both the
+    // cross-iteration RAW and WAR. The barrier-wrapped END (`endrange_barrier_to`)
+    // is NOT used: it reorders the causal-mask WHERE past its consumer, leaving the
+    // renderer without its SSA value — plain `endrange` keeps the render order.
+    let (k_cur, v_cur, fence) = if async_stream {
+        let landed = cp_async_wait(0, smallvec![kv_idx.clone()]).barrier(smallvec![]);
+        let c_k = g.cp_async_fill(&k_nxt.after(&landed), &k_l, &pf_kidx, 1);
+        let c_v = g.cp_async_fill(&v_nxt.after(&landed), &v_l, &pf_kidx, 1);
+        let issued: smallvec::SmallVec<[Arc<UOp>; 4]> = smallvec![landed, c_k, c_v];
+        (k_cur.after(issued.clone()), v_cur.after(issued), None)
+    } else {
+        let s_k = g.stage_global_to_reg(&k_smem, &k_l, &pf_kidx, 1);
+        let s_v = g.stage_global_to_reg(&v_smem, &v_l, &pf_kidx, 1);
+        let commit_k = g.commit_reg_to_local(k_nxt, &s_k, false);
+        let commit_v = g.commit_reg_to_local(v_nxt, &s_v, false);
+        (k_cur, v_cur, Some([commit_k.uop().clone(), commit_v.uop().clone()]))
+    };
 
-    // Gather buf[cur] (counter-dependent ⇒ loop-scoped; reads the block committed
-    // last iteration, or the prologue for block 0) and run QKᵀ → causal mask →
-    // online softmax → A·V. The WAR barrier (consumed by the gathers, an in-loop
-    // anchor) folds in the prefetch commits via `extra_war`, so one barrier gates
-    // the cross-iteration RAW/WAR. The barrier-wrapped END (`endrange_barrier_to`)
-    // is NOT used here: it reorders the causal-mask WHERE past its consumer, leaving
-    // the renderer without its SSA value — plain `endrange` keeps the render order.
-    let extra_war = [commit_k.uop().clone(), commit_v.uop().clone()];
+    // Gather buf[cur] (counter-dependent ⇒ loop-scoped; reads the block landed last
+    // iteration, or the prologue for block 0) and run QKᵀ → causal mask → online
+    // softmax → A·V.
     let ctx = FaCtx { warp: &warp, lp: &lp, q_reg_t: &q_reg_t, q_blk: &q_blk, warpid: &warpid, causal, valid_len };
     // The two pipeline stages: gather + QKᵀ + mask, then online-softmax + A·V.
     let FaScratch { k_reg, k_reg_t, v_reg, att, att_mma, max_vec_last, att_smem } = sc;
-    let (att, v_reg) = fa_qk(&ctx, k_reg, k_reg_t, v_reg, att, k_cur, v_cur, &kv_idx, true, &extra_war);
+    let (att, v_reg) = fa_qk(&ctx, k_reg, k_reg_t, v_reg, att, k_cur, v_cur, &kv_idx, fence.as_ref().map(|f| &f[..]));
     let FaAcc { norm_vec, o_reg, .. } = fa_softmax_pv(&ctx, acc, att_mma, att_smem, max_vec_last, att, &v_reg);
 
     let o_reg = lp.close_carry(o_reg);
     let norm_vec = norm_vec.after(&o_reg);
+    // No copy may be outstanding at exit: drain the last trip's wrapped prefetch
+    // before the output store (threaded through the GLOBAL tile, so the carried
+    // accumulators keep their plain post-loop `After([END])` reads).
+    let o = if async_stream {
+        o.rewrap(o.uop().after(smallvec![cp_async_wait_all(smallvec![o_reg.uop().clone()])]))
+    } else {
+        o
+    };
 
     let o_reg = o_reg / &norm_vec;
     let o_reg_t = warp.transpose(o_reg_t, &o_reg);
@@ -498,8 +543,8 @@ pub(crate) fn build_fa_mw_rdb(
 pub struct FaPolicy {
     pub compute_units: usize,
     pub big: (usize, usize),
-    /// The largest head dim the `big` tile fits in registers at (CUDA: `{32,32}`
-    /// at d=128 is 255 registers plus 848 bytes of local memory).
+    /// The largest head dim the `big` tile fits at (CUDA: `{16,64}` at d=128 needs
+    /// 64 KiB of K/V double buffers, past the 48 KiB static LDS).
     pub big_max_d: usize,
     pub small: (usize, usize),
     /// Emit the flat (fully-unrolled) body. Every register index is then a
@@ -511,11 +556,14 @@ pub struct FaPolicy {
 
 impl FaPolicy {
     /// gfx942 keeps the bench-calibrated 304-CU `{32,32}` crossover and gfx1151
-    /// the baseline tile. CUDA (measured on sm_86, 28 SMs, d=64): `{32,32}` wins at
-    /// every grid that covers the SMs (GigaAM b=8/h=16/n=1536: 5.4 ms vs 8.5 ms at
-    /// `{16,16}`; whisper b=1/h=6: 0.40 vs 0.50 ms), `{16,64}` spills, and the flat
-    /// body halves the small-tile time (the rolled `{16,32}` pins `o_reg` to local
-    /// memory) — so both CUDA tiles are flat.
+    /// the baseline tile. CUDA (measured on sm_86, 28 SMs, with the `ldmatrix` +
+    /// `cp.async` K/V stream): the taller KV super-block `{16,64}` (117 registers,
+    /// 32 KiB LDS at d=64 — two blocks per SM) is fastest on every grid that covers
+    /// the SMs (GigaAM b=8/h=16/n=1536: 3.20 ms vs 3.26 at `{16,32}` and 3.55 at
+    /// `{32,32}`; whisper b=1/h=6: 192 vs 198 / 272 µs), while at d=128 its double
+    /// buffers would need 64 KiB, so d=128 keeps `{16,32}` (158 registers, no
+    /// spill). Both CUDA tiles are flat: the rolled body pins the register tiles to
+    /// local memory (3-15× slower).
     pub fn for_arch(arch: svod_dtype::GpuArch) -> Self {
         let small = (Q_BLK, KV_BLK);
         match arch {
@@ -526,7 +574,7 @@ impl FaPolicy {
                 Self { compute_units: 40, big: small, big_max_d: usize::MAX, small, unroll: false }
             }
             svod_dtype::GpuArch::Cuda(_) | svod_dtype::GpuArch::Metal(_) => {
-                Self { compute_units: 28, big: (32, 32), big_max_d: 64, small, unroll: true }
+                Self { compute_units: 28, big: (Q_BLK, 2 * KV_BLK), big_max_d: 64, small, unroll: true }
             }
         }
     }

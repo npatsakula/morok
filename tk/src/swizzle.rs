@@ -80,6 +80,15 @@ impl Swizzle {
         }
     }
 
+    /// Whether every aligned 16-byte column chunk of a row stays one contiguous,
+    /// 16-byte-aligned run under the swizzle — the `ldmatrix` row / `cp.async`
+    /// copy unit. The HipKittens XOR variants permute at 8-byte granularity
+    /// (`st.cuh:96` `<< 3`), so only the identity and the chunk-granular
+    /// [`Swizzle::Sw16x16Mma`] qualify.
+    pub fn keeps_16b_chunks(&self) -> bool {
+        matches!(self, Swizzle::Identity | Swizzle::Sw16x16Mma)
+    }
+
     /// Map `(row, col)` within a base tile of `cols` columns to swizzled
     /// `(row, col)`. `scalar` is the element type (the XOR variants depend on
     /// `itemsize`). The mapping is a bijection on `[0,rows)×[0,cols)`, so a write

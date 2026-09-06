@@ -13,6 +13,7 @@ mod loop_scope;
 mod masked;
 mod math;
 mod matmul;
+mod movement;
 mod proptests;
 mod reductions;
 mod scaffold;

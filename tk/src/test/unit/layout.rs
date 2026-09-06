@@ -15,7 +15,7 @@ use test_case::test_case;
 use crate::ArchCaps;
 use crate::arch::FragRole;
 use crate::index::Idx;
-use crate::layout::{LaneMap, ReduceTree};
+use crate::layout::{LaneMap, LdmatrixX4, ReduceTree};
 use crate::tiles::{RT_16X16, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, RTBaseShape};
 
 const SM_86: GpuArch = GpuArch::Cuda(CudaArch::from_compute_capability(8, 6));
@@ -248,4 +248,38 @@ fn rv_slots_follow_the_accumulator_map(arch: GpuArch, slots: usize) {
     let ker = crate::Kernel::new("rv", [1, 1, 1], caps.wave_size as i64, vec![], caps);
     assert_eq!(caps.frag(FragRole::Accumulator).unwrap().map.slots(), slots);
     assert_eq!(ker.acc_vec(32).shape(), &[2, slots]);
+}
+
+/// The `ldmatrix.x4` plan of the `mma.sync` fragment (`fa_cuda_references.md` §(c)):
+/// lane `L` addresses row `L % 16`, columns `8·(L/16)..` — matrices TL, BL, TR, BR
+/// — so a `Row` read takes the words in order, and a `Col` read (V) needs `.trans`
+/// with the ThunderKittens `ldsm4t(tmp[0], tmp[2], tmp[1], tmp[3])` permutation.
+/// The AMD maps have no `ldmatrix` form.
+#[test_case(RT_16X16_MMA, false, Some(LdmatrixX4 { trans: false, words: [0, 1, 2, 3] }); "mma.sync row")]
+#[test_case(RT_16X16_MMA, true, Some(LdmatrixX4 { trans: true, words: [0, 2, 1, 3] }); "mma.sync col is ldsm4t")]
+#[test_case(RT_16X16, false, None; "gfx942")]
+#[test_case(RT_16X16_W32_IN, false, None; "gfx1151 input")]
+#[test_case(RT_16X16_W32_ACC, false, None; "gfx1151 acc")]
+fn ldmatrix_x4_plan(f: RTBaseShape, transpose: bool, plan: Option<LdmatrixX4>) {
+    assert_eq!(f.map.ldmatrix_x4(transpose), plan);
+}
+
+/// Following the plan reproduces the map: register pair `p` of lane `L` is what the
+/// hardware hands lane `L` for matrix `words[p]` — `(L/4, 2(L%4) + e)` of the 8×8
+/// block, `(2(L%4) + e, L/4)` under `.trans` — at that block's tile offset.
+#[test_case(false; "row")]
+#[test_case(true; "col")]
+fn ldmatrix_x4_plan_reproduces_the_map(transpose: bool) {
+    let plan = RT_16X16_MMA.map.ldmatrix_x4(transpose).expect("mma.sync has an ldmatrix form");
+    for lane in 0..32i64 {
+        let (g, t) = (lane / 4, lane % 4);
+        for (p, &m) in plan.words.iter().enumerate() {
+            let (rb, cb) = ((m % 2) as i64, (m / 2) as i64); // matrix m = row block + 2·col block
+            for e in 0..2i64 {
+                let got = rc(&RT_16X16_MMA, transpose, lane as usize, 2 * p + e as usize);
+                let want = if plan.trans { (8 * rb + 2 * t + e, 8 * cb + g) } else { (8 * rb + g, 8 * cb + 2 * t + e) };
+                assert_eq!(got, want, "lane {lane} pair {p} element {e}");
+            }
+        }
+    }
 }

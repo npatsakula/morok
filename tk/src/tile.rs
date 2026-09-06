@@ -245,6 +245,12 @@ impl ST {
         }
     }
 
+    /// Rewrap with extra ordering dependencies (the [`RegTile::after`] analog): the
+    /// tile's next LDS access observes `deps` first (a barrier, an async-copy commit).
+    pub fn after(&self, deps: impl AfterDeps) -> ST {
+        self.rewrap(self.buf.after(deps.into_afters()))
+    }
+
     /// The per-half flat element count (the full single-half tile size); a
     /// [`Kernel::st_db`] buffer holds two of these. Used to form parity offsets.
     pub fn half_elems(&self) -> usize {

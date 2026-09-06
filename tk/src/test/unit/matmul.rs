@@ -266,6 +266,25 @@ fn test_matmul_sm86_renders_mma_sync() {
     }
     assert!(code.contains("llvm.nvvm.mma.m16n8k16.row.col.bf16"), "sm_86 matmul must emit mma.sync m16n8k16 bf16");
     assert!(!code.contains("mfma") && !code.contains("amdgcn"), "no AMD intrinsics on NVPTX");
+    // The LDS strips fill by `cp.async` (one 16-byte copy per lane per pass of each
+    // strip, retired by `wait_group 0` + barrier) and the operands gather by
+    // `ldmatrix.x4`: plain for the `Row` A sub-tile, `.trans` for the `Col` B sub-tile.
+    let calls = |needle: &str| code.lines().filter(|l| l.contains(needle) && !l.contains("declare")).count();
+    let (reg, k_step) = (cfg.reg(), cfg.k_step());
+    let passes = (cfg.block * k_step * 2).div_ceil(cfg.threads(32) as usize * 16);
+    assert_eq!(calls("@llvm.nvvm.cp.async.cg.shared.global.16("), 2 * passes);
+    assert_eq!(calls("@llvm.nvvm.cp.async.wait.group(i32 0)"), 2);
+    assert_eq!(calls("ldmatrix.sync.aligned.m8n8.x4.b16("), cfg.n_accum * (reg / 16) * (k_step / 16), "A");
+    assert_eq!(calls("ldmatrix.sync.aligned.m8n8.x4.trans.b16("), (k_step / 16) * (reg / 16), "B");
+    if let Some(ptx) = super::fa::ptx_of(&code) {
+        let count = |needle: &str| ptx.matches(needle).count();
+        assert_eq!((count("ld.shared.b16"), count("st.shared")), (0, 0), "scalar LDS traffic in the PTX:\n{ptx}");
+        assert_eq!(
+            count("ldmatrix.sync.aligned.m8n8.x4"),
+            cfg.n_accum * (reg / 16) * (k_step / 16) + (k_step / 16) * (reg / 16)
+        );
+        assert_eq!(count("cp.async.cg.shared.global"), 2 * passes);
+    }
 }
 
 /// A `group_2d(2,4)` is 8 waves / 512 threads, with `warp_row`/`warp_col`
@@ -676,5 +695,39 @@ fn test_matmul_adaptive_gpu() {
         let max_abs = max_abs_err(&got, &expected);
         println!("adaptive N={n} (block={}): max abs error = {max_abs:e}", cfg.block);
         assert!(max_abs < 5e-2, "adaptive N={n}: max abs error {max_abs} exceeds 5e-2");
+    }
+}
+
+/// `SVOD_DEVICE=CUDA:0 cargo test -p svod-tk --lib matmul::test_matmul_bench_cuda -- --ignored --nocapture`.
+///
+/// Per-dispatch GPU time and TFLOP/s of the arch's bf16 matmul config at
+/// N = 1024 / 2048 — the measurement behind the CUDA fill/gather lowering.
+#[test]
+#[ignore]
+fn test_matmul_bench_cuda() {
+    if !cuda_device() {
+        eprintln!("skip test_matmul_bench_cuda: no CUDA sm_80+ device / toolchain");
+        return;
+    }
+    let ws = super::fragment_device().expect("caps").wave_size;
+    for n in [1024usize, 2048] {
+        let cfg = cfg_for_arch(SM_86, n);
+        let (a, b) = matmul_inputs(n);
+        let mut c = Tensor::empty(&[n, n], DType::Float32);
+        let compiled =
+            crate::compile_kernel("matmul_bench", cfg.grid_dims(n), cfg.threads(ws), &mut [&mut c], &[&a, &b], |ker| {
+                build_matmul_cfg(ker, n, cfg);
+                ker.finish(cfg.n_accum)
+            })
+            .expect("compile");
+        let mut us: Vec<f64> =
+            (0..12).map(|_| compiled.dispatch_gpu_ns().expect("dispatch").expect("stamped") as f64 / 1e3).collect();
+        us.sort_by(f64::total_cmp);
+        let median = us[us.len() / 2];
+        let tflops = 2.0 * (n as f64).powi(3) / (median * 1e-6) / 1e12;
+        println!(
+            "matmul[cuda] N={n} block={}: median {median:.1} µs = {tflops:.2} TFLOP/s (min {:.1})",
+            cfg.block, us[0]
+        );
     }
 }
