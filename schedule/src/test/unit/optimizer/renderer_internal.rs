@@ -146,16 +146,19 @@ fn test_metal_profile_follows_gpu_family() {
     assert_eq!(Renderer::for_metal_family(MetalFamily::Apple(9)).cache_fingerprint(), m4.cache_fingerprint());
 }
 
-/// Tinygrad `tc.get_cuda` minus fp8: bf16/tf32 and `m16n8k16` need sm_80,
-/// sm_75 keeps the f16 `m16n8k8` core only, and older parts run without
-/// tensor cores. fp8 stays off even on sm_89+ (no NVPTX cast lowering yet).
-#[test_case::test_case(7, 0, RendererDevice::CudaSm75, 0, false, false; "volta has no m16n8 mma")]
-#[test_case::test_case(7, 5, RendererDevice::CudaSm75, 2, false, false; "turing")]
-#[test_case::test_case(8, 0, RendererDevice::CudaSm80, 5, true, false; "ampere a100")]
-#[test_case::test_case(8, 6, RendererDevice::CudaSm80, 5, true, false; "ampere ga10x")]
-#[test_case::test_case(8, 9, RendererDevice::CudaSm80, 5, true, false; "ada withholds fp8")]
-#[test_case::test_case(9, 0, RendererDevice::CudaSm80, 5, true, false; "hopper")]
-#[test_case::test_case(12, 0, RendererDevice::CudaSm80, 5, true, false; "blackwell consumer")]
+/// Tinygrad `tc.get_cuda` minus fp8 plus int8: bf16/tf32, `m16n8k16` and the
+/// s8 `m16n8k32` need sm_80, sm_75 keeps the f16 `m16n8k8` core only, and
+/// older parts run without tensor cores. fp8 stays off even on sm_89+ (no
+/// NVPTX cast lowering yet). The int8 core is the `CUDA_81632` fragment shape
+/// with the `int8 -> int32` dtype pair the RDNA3 profile declares, so a
+/// quantized linear selects it on both vendors.
+#[test_case::test_case(7, 0, RendererDevice::CudaSm75, 0, false, false, false; "volta has no m16n8 mma")]
+#[test_case::test_case(7, 5, RendererDevice::CudaSm75, 2, false, false, false; "turing")]
+#[test_case::test_case(8, 0, RendererDevice::CudaSm80, 6, true, false, true; "ampere a100")]
+#[test_case::test_case(8, 6, RendererDevice::CudaSm80, 6, true, false, true; "ampere ga10x")]
+#[test_case::test_case(8, 9, RendererDevice::CudaSm80, 6, true, false, true; "ada withholds fp8")]
+#[test_case::test_case(9, 0, RendererDevice::CudaSm80, 6, true, false, true; "hopper")]
+#[test_case::test_case(12, 0, RendererDevice::CudaSm80, 6, true, false, true; "blackwell consumer")]
 fn test_for_cuda_arch_follows_capability(
     major: u8,
     minor: u8,
@@ -163,6 +166,7 @@ fn test_for_cuda_arch_follows_capability(
     tensor_cores: usize,
     bf16: bool,
     fp8: bool,
+    int8: bool,
 ) {
     use svod_dtype::{CudaArch, ScalarDType};
     let arch = CudaArch::from_compute_capability(major, minor);
@@ -172,6 +176,20 @@ fn test_for_cuda_arch_follows_capability(
     assert_eq!(renderer.target.as_deref(), Some(arch.to_string().as_str()));
     assert_eq!(renderer.supports_storage_dtype(ScalarDType::BFloat16), bf16);
     assert_eq!(renderer.supports_matrix_dtype(ScalarDType::BFloat16), bf16 && tensor_cores > 0);
+    assert!(renderer.supports_storage_dtype(ScalarDType::Int8));
+    assert_eq!(renderer.supports_matrix_dtype(ScalarDType::Int8), int8);
+    let int8_cores: Vec<_> = renderer.tensor_cores.iter().filter(|tc| tc.dtype_in == DType::Int8).collect();
+    assert_eq!(int8_cores.len(), usize::from(int8));
+    if let Some(tc) = int8_cores.first() {
+        let fp8_shape = CUDA_81632.build(DType::Int8, DType::Int32);
+        assert_eq!(**tc, fp8_shape, "int8 must reuse the byte-wide m16n8k32 fragment layout");
+        assert_eq!((tc.dims, tc.elements_per_thread, tc.dtype_out.clone()), ((8, 16, 32), (16, 8, 4), DType::Int32));
+        let rdna3 = Renderer::amd_rdna3();
+        assert!(
+            rdna3.tensor_cores.iter().any(|amd| (&amd.dtype_in, &amd.dtype_out) == (&tc.dtype_in, &tc.dtype_out)),
+            "CUDA int8 core must share the RDNA3 dtype pair"
+        );
+    }
     assert_eq!(renderer.supports_storage_dtype(ScalarDType::FP8E4M3), fp8);
     assert_eq!(renderer.supports_matrix_dtype(ScalarDType::FP8E4M3), fp8);
     assert!(!renderer.tensor_cores.iter().any(|tc| tc.dtype_in.scalar_dtype().is_fp8()));

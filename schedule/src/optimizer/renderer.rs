@@ -512,11 +512,13 @@ impl Renderer {
     }
 
     /// Select the CUDA optimizer profile for a compute capability, tinygrad's
-    /// `tc.get_cuda`: sm_80+ has the bf16 / tf32 shapes and `m16n8k16`, sm_75
-    /// the f16 `m16n8k8` core only, and anything older runs without tensor
-    /// cores. The sm_89 fp8 profile is withheld from every capability until
-    /// the NVPTX renderer lowers the `cvt.*.e4m3x2` conversions; its fp8
-    /// storage dtype would fail at render time today.
+    /// `tc.get_cuda` plus int8: sm_80+ has the bf16 / tf32 shapes, `m16n8k16`
+    /// and the s8 `m16n8k32`, sm_75 the f16 `m16n8k8` core only (its integer
+    /// `mma.sync` shapes are `m8n8k16`, which the NVPTX renderer does not
+    /// lower), and anything older runs without tensor cores. The sm_89 fp8
+    /// profile is withheld from every capability until the NVPTX renderer
+    /// lowers the `cvt.*.e4m3x2` conversions; its fp8 storage dtype would fail
+    /// at render time today.
     pub fn for_cuda_arch(arch: CudaArch) -> Self {
         let sm = arch.sm();
         let mut renderer = if arch.has_bf16_mma() { Self::cuda_sm80(false) } else { Self::cuda_sm75() };
@@ -967,7 +969,10 @@ impl TensorCore {
         vec![CUDA_8168.build(DType::Float16, DType::Float32), CUDA_8168.build(DType::Float16, DType::Float16)]
     }
 
-    /// Get all tensor cores for NVIDIA SM80 architecture (Ampere).
+    /// Get all tensor cores for NVIDIA SM80 architecture (Ampere). The
+    /// `m16n8k32` int8 core shares the fp8 fragment layout (both are one byte
+    /// per element), so it reuses `CUDA_81632`; it mirrors the RDNA3
+    /// `int8 -> int32` core that quantized linears already engage on AMD.
     pub fn sm80_tensor_cores(allow_tf32: bool) -> Vec<TensorCore> {
         let mut tcs = vec![
             CUDA_81616.build(DType::Float16, DType::Float32),
@@ -975,6 +980,7 @@ impl TensorCore {
             CUDA_81616.build(DType::Float16, DType::Float16),
             CUDA_8168.build(DType::Float16, DType::Float32),
             CUDA_8168.build(DType::Float16, DType::Float16),
+            CUDA_81632.build(DType::Int8, DType::Int32),
         ];
         if allow_tf32 {
             tcs.push(CUDA_8168_TF32.build(DType::Float32, DType::Float32));

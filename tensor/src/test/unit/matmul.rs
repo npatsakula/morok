@@ -989,13 +989,16 @@ fn test_matmul_m5_gfx1151_padded_wmma_amd() {
 }
 
 /// Ampere+ tensor cores end to end on `CUDA:0`: an `in_dtype` matmul
-/// accumulating in f32 must lower through `mma.sync` (asserted on the rendered
-/// IR of the prepared plan) and match the f32 reference. The inputs are small
-/// integers, exact in f16 and bf16, so only accumulation order separates the
-/// GPU from the reference.
-#[test_case(DType::Float16, 0, "m16n8k16.row.col.f32.f32"; "f16")]
-#[test_case(DType::BFloat16, 1, "m16n8k16.row.col.bf16"; "bf16")]
-fn test_matmul_cuda_tensor_core_matches_reference(in_dtype: DType, tc_index: usize, intrinsic: &str) {
+/// accumulating in `out_dtype` must lower through `mma.sync` (asserted on the
+/// rendered IR of the prepared plan) and match the f32 reference. The inputs
+/// are small integers, exact in f16, bf16 and int8, so only accumulation order
+/// separates the float GPU sums from the reference; the int8 `m16n8k32`
+/// (`satfinite.s8`, the quantized-linear path) accumulates in int32 and must
+/// match exactly.
+#[test_case(DType::Float16, DType::Float32, 0, "m16n8k16.row.col.f32.f32"; "f16")]
+#[test_case(DType::BFloat16, DType::Float32, 1, "m16n8k16.row.col.bf16"; "bf16")]
+#[test_case(DType::Int8, DType::Int32, 5, "m16n8k32.row.col.satfinite.s8"; "int8")]
+fn test_matmul_cuda_tensor_core_matches_reference(in_dtype: DType, out_dtype: DType, tc_index: usize, intrinsic: &str) {
     setup_test_tracing();
     let Some(config) = PrepareConfig::for_cuda_if_available() else {
         eprintln!("skipped: default device is not a CUDA GPU");
@@ -1015,7 +1018,7 @@ fn test_matmul_cuda_tensor_core_matches_reference(in_dtype: DType, tc_index: usi
     let optimizer = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).heuristics(heuristics).build();
     let config = PrepareConfig { optimizer, ..config };
 
-    let build = || a.matmul_with().other(&b).dtype(DType::Float32).call().unwrap();
+    let build = || a.matmul_with().other(&b).dtype(out_dtype.clone()).call().unwrap();
     let plan = build().prepare_with(&config).unwrap();
     let mma = format!("@llvm.nvvm.mma.{intrinsic}(");
     assert!(
@@ -1024,8 +1027,14 @@ fn test_matmul_cuda_tensor_core_matches_reference(in_dtype: DType, tc_index: usi
         plan.kernels().map(|kernel| kernel.code.as_str()).collect::<Vec<_>>().join("\n")
     );
     let mut c = build();
+    assert_eq!(c.uop().dtype(), out_dtype);
     c.realize_with(&config).unwrap();
-    assert_matmul_close(&c.as_vec::<f32>().unwrap(), &a_nd.dot(&b_nd), 1e-3);
+    let (actual, tolerance) = if out_dtype.is_float() {
+        (c.as_vec::<f32>().unwrap(), 1e-3)
+    } else {
+        (c.as_vec::<i32>().unwrap().into_iter().map(|value| value as f32).collect(), 0.5)
+    };
+    assert_matmul_close(&actual, &a_nd.dot(&b_nd), tolerance);
 }
 
 #[test]
