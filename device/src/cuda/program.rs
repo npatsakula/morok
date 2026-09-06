@@ -414,10 +414,14 @@ impl Program for CudaProgram {
         local_size: Option<[usize; 3]>,
         wait: bool,
     ) -> Result<()> {
-        let stream = self.dev.dispatch_stream();
+        let lane = self.dev.dispatch_lane();
+        self.dev.order_launch(lane)?;
+        // Fire-and-forget dispatches have no owner to publish a token: the
+        // lane stays flagged and every scoped host wait drains it.
+        lane.mark_unpublished();
         // SAFETY: forwarded contract.
-        unsafe { self.launch(stream, buffers, vals, global_size, local_size) }?;
-        if wait { self.dev.stream_synchronize(stream) } else { Ok(()) }
+        unsafe { self.launch(lane.raw(), buffers, vals, global_size, local_size) }?;
+        if wait { self.dev.synchronize_lane(lane) } else { Ok(()) }
     }
 
     unsafe fn execute_timed(
@@ -427,7 +431,9 @@ impl Program for CudaProgram {
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
     ) -> Result<Option<std::time::Duration>> {
-        let stream = self.dev.dispatch_stream();
+        let lane = self.dev.dispatch_lane();
+        self.dev.order_launch(lane)?;
+        let stream = lane.raw();
         let start = CudaEvent::new(Arc::clone(&self.dev), true)?;
         let end = CudaEvent::new(Arc::clone(&self.dev), true)?;
         start.record(stream)?;

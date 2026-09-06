@@ -78,16 +78,22 @@ A `RawBuffer::Cuda` carries a device pointer, an optional host pointer, and its
 | `host` | `Pinned` | `cuMemHostAlloc(PORTABLE \| DEVICEMAP)`, kernels read it over the bus |
 
 `supports_device_local()` is `true`, so intermediates stay on the device.
-Host <-> device copies first drain the context (`cuCtxSynchronize`: host access
-is not ordered against the plan streams), then move data in 4 MiB chunks
-through a lazily allocated **pinned staging buffer** with
-`cuMemcpyHtoDAsync` / `cuMemcpyDtoHAsync` on the copy stream, synchronizing
-the stream per chunk. Pinned buffers are `memcpy`'d directly.
-Device-to-device `_transfer` is `cuMemcpyDtoDAsync`; an overlapping range
+Host <-> device copies first wait the storage's in-flight producers and
+readers (`CudaDevice::wait_storage`, below — host access is not ordered
+against the lanes), then move data with one synchronous `cuMemcpy` up to
+4 MiB and above that in 4 MiB chunks through a lazily allocated **pinned
+staging buffer** with `cuMemcpyHtoDAsync` / `cuMemcpyDtoHAsync` on the copy
+stream, synchronizing the stream per chunk. Pinned buffers are `memcpy`'d
+directly. Device-to-device `_transfer` and zero-fills are asynchronous on
+the copy lane: ordered after the producers with `cuStreamWaitEvent`,
+published as the new producer of both ranges, and waited by every later
+launch on any lane, so they never block the host; an overlapping range
 inside one allocation bounces through a temporary to keep `memmove`
-semantics. Freeing drains first; if the drain fails (poisoned context) the
-allocation is **quarantined** (leaked) rather than freed under an in-flight
-kernel. Like every compute allocator it sits under `LruAllocator`.
+semantics. Freeing waits the storage's producers first; if the wait fails
+(poisoned context) the allocation is **quarantined** (leaked) rather than
+freed under an in-flight kernel. Like every compute allocator it sits under
+`LruAllocator`, which fences a recycled allocation on its previous owner's
+producers.
 
 ---
 
@@ -125,6 +131,28 @@ launch with timing events and returns a `CudaDispatchTimestamps`
 ([Profiling](./profiling.md)). `completion_token` records a completion-only
 event (`CU_EVENT_DISABLE_TIMING`) whose `wait` is `cuEventSynchronize` and
 whose `retired` is `cuEventQuery`; `synchronize` is `cuStreamSynchronize`.
+
+### Scoped synchronization
+
+Lanes are not ordered against each other, so `CudaDevice` keeps three
+tables (module docs of `device/src/cuda/device.rs`):
+
+- **producers** — storage base -> the newest completion token per lane that
+  read or wrote it (a host overwrite is a WAR hazard against in-flight
+  readers too). The executor publishes a plan's or graph's token on every
+  storage the plan touches after each execute; the allocator publishes a
+  copy-lane token after each transfer or memset. `wait_storage(base)` waits
+  those tokens only. A storage the table does not know falls back to
+  `cuCtxSynchronize`.
+- **lanes** — every live lane and whether it holds submissions no token
+  has been published for (per-call `Program::execute`, a plan that failed
+  mid-way, a graph replay before its token is fetched); every scoped wait
+  drains such lanes.
+- **copy tail** — the newest copy-lane event; each launch waits it on the
+  GPU before running, so asynchronous copies precede every later kernel.
+
+`SVOD_CUDA_SCOPED_SYNC=0` disables all of it: every wait drains the context
+and every copy synchronizes the copy stream.
 
 The executor's cross-plan ordering uses `CudaTimelineSignal`, a timeline
 published by events: `signal(stream, value)` records an event at the stream's

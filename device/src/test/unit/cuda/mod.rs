@@ -2,38 +2,69 @@
 //! kernarg packing, PTX entry parsing, alias signatures) run everywhere; the
 //! hardware tests return early through `cuda_device_or_skip()` — no
 //! `#[ignore]`, so a CUDA host runs them by default and CI without one skips.
+//!
+//! Hardware tests run one at a time ([`Hardware`]): every `cuMemFree*`
+//! synchronizes the device and stalls every other thread's driver call
+//! until it is idle, so a test asserting that a scoped wait did *not* wait
+//! an unrelated kernel needs the device to itself.
 
 mod allocator;
 pub(super) mod graph;
 pub(super) mod program;
+mod scoped_sync;
 mod sync;
 mod sys;
 
+use std::ops::Deref;
 use std::sync::Arc;
 
+use parking_lot::{ReentrantMutex, ReentrantMutexGuard, const_reentrant_mutex};
 use svod_dtype::{AddrSpace, DType};
 
 use crate::allocator::{Allocator, BufferSpec, RawBuffer};
 use crate::cuda::{CudaAllocator, CudaDevice, CudaProgram};
 use crate::device::{AbiParamDescriptor, AbiParamKind};
 
-pub(crate) fn cuda_device_or_skip() -> Option<Arc<CudaDevice>> {
-    let device = CudaDevice::open(0).ok();
-    if device.is_none() {
-        eprintln!("skipping CUDA hardware test: no CUDA device on this host");
-    }
-    device
+static SERIAL: ReentrantMutex<()> = const_reentrant_mutex(());
+
+/// A hardware test's exclusive hold on the device, dereferencing to the
+/// handle it wraps.
+pub(crate) struct Hardware<T> {
+    inner: T,
+    _serial: ReentrantMutexGuard<'static, ()>,
 }
 
-pub(crate) fn cuda_alloc_or_skip() -> Option<CudaAllocator> {
-    cuda_device_or_skip().map(|dev| CudaAllocator { dev, device_id: 0 })
+impl<T> Deref for Hardware<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+
+pub(crate) fn cuda_device_or_skip() -> Option<Hardware<Arc<CudaDevice>>> {
+    let serial = SERIAL.lock();
+    let Ok(device) = CudaDevice::open(0) else {
+        eprintln!("skipping CUDA hardware test: no CUDA device on this host");
+        return None;
+    };
+    Some(Hardware { inner: device, _serial: serial })
+}
+
+pub(crate) fn cuda_alloc_or_skip() -> Option<Hardware<CudaAllocator>> {
+    let Hardware { inner: dev, _serial } = cuda_device_or_skip()?;
+    Some(Hardware { inner: CudaAllocator { dev, device_id: 0 }, _serial })
 }
 
 /// Three kernels over the PTX kernel ABI (buffers as `.param .u64`, scalars
 /// as `.param .u32`), as `nvcc -arch=sm_75 -ptx` emits them with the ISA
 /// version lowered to 7.0 so any driver since CUDA 11 JITs them:
 /// `vadd`: `out[i] = a[i] + b[i]`; `scale`: `out[i] = a[i] * n`;
-/// `tile`: reverses each block through 4 KiB of shared memory.
+/// `tile`: reverses each block through 4 KiB of shared memory;
+/// `slow_double`: sleeps `iters` milliseconds (`nanosleep`), *then* reads
+/// `in[i]` and writes `out[i] = 2 * in[i]` — a long kernel whose reads and
+/// writes both land at its end, so a host access that fails to wait for it
+/// observes the race.
 pub(crate) const KERNELS_PTX: &str = r#"
 .version 7.0
 .target sm_75
@@ -130,6 +161,43 @@ pub(crate) const KERNELS_PTX: &str = r#"
 	st.global.f32 	[%rd4], %f2;
 	ret;
 }
+
+.visible .entry slow_double(
+	.param .u64 slow_double_param_0,
+	.param .u64 slow_double_param_1,
+	.param .u32 slow_double_param_2
+)
+{
+	.reg .pred 	%p<2>;
+	.reg .f32 	%f<3>;
+	.reg .b32 	%r<8>;
+	.reg .b64 	%rd<8>;
+
+	ld.param.u64 	%rd1, [slow_double_param_0];
+	ld.param.u64 	%rd2, [slow_double_param_1];
+	ld.param.u32 	%r1, [slow_double_param_2];
+	cvta.to.global.u64 	%rd3, %rd1;
+	cvta.to.global.u64 	%rd4, %rd2;
+	mov.u32 	%r2, %ctaid.x;
+	mov.u32 	%r3, %ntid.x;
+	mov.u32 	%r4, %tid.x;
+	mad.lo.s32 	%r5, %r2, %r3, %r4;
+	mul.wide.u32 	%rd5, %r5, 4;
+	mov.u32 	%r6, 0;
+$L_sleep:
+	setp.ge.u32 	%p1, %r6, %r1;
+	@%p1 bra 	$L_work;
+	nanosleep.u32 	1000000;
+	add.s32 	%r6, %r6, 1;
+	bra 	$L_sleep;
+$L_work:
+	add.s64 	%rd6, %rd4, %rd5;
+	ld.global.f32 	%f1, [%rd6];
+	add.f32 	%f2, %f1, %f1;
+	add.s64 	%rd7, %rd3, %rd5;
+	st.global.f32 	[%rd7], %f2;
+	ret;
+}
 "#;
 
 pub(crate) fn storage(slot: usize) -> AbiParamDescriptor {
@@ -146,6 +214,10 @@ pub(crate) fn vadd_abi() -> Vec<AbiParamDescriptor> {
 
 pub(crate) fn scale_abi() -> Vec<AbiParamDescriptor> {
     vec![storage(0), storage(1), scalar(2, "n")]
+}
+
+pub(crate) fn slow_abi() -> Vec<AbiParamDescriptor> {
+    vec![storage(0), storage(1), scalar(2, "iters")]
 }
 
 pub(crate) fn load(dev: &Arc<CudaDevice>, entry: &str, abi: &[AbiParamDescriptor]) -> CudaProgram {

@@ -15,7 +15,7 @@ or a documented fallback.
 | Gap | Today | Where |
 |---|---|---|
 | **fp8 conversions** | A cast to or from `FP8E4M3` / `FP8E5M2` fails at render (`NVPTX fp8 cast ...`); the sm_89 `cvt.*.e4m3x2` intrinsics are not emitted. The fp8 `mma.sync` rows exist in `resolve_mma` but cannot be fed. | `codegen/src/llvm/nvptx/ops.rs` |
-| **Scoped synchronization** | Host reads and writes drain the whole context (`cuCtxSynchronize` in `_copyin` / `_copyout`) instead of waiting only on the buffer's producers. Plans and graphs do hand out event-based `CompletionToken`s. | `device/src/cuda/allocator.rs` |
+| **Stream-ordered frees** | `cuMemFree*` synchronizes the whole device and blocks every other thread's driver call meanwhile; `_free` is rare under `LruAllocator`, but `cuMemFreeAsync` is not bound. | `device/src/cuda/allocator.rs` |
 | **Peer-to-peer copies** | `cuMemcpyPeerAsync` / `cuDeviceCanAccessPeer` are not bound. A `CUDA:0 → CUDA:1` copy takes `SyncStrategy::PeerToPeer` in the executor, which falls back to `Buffer::copy_from`; two allocators are two devices, so the bytes bounce through a host `Vec`. | `runtime/src/executor.rs`, `device/src/buffer.rs` |
 | **Hardware counters (Tier 4)** | No CUPTI; `pmc_available()` is `false`, `SVOD_PMC` degrades with a note. | [Profiling](./profiling.md) |
 | **Tile kernels (`tk`)** | AMD-only: `resolve_arch` yields no `AmdArch` for a CUDA spec, so a `tk` launch reports `UnsupportedArch`. | `tk/src/target.rs` |
@@ -42,8 +42,8 @@ available to the renderer but not used by ordinary graphs.
 
 In the order the plan (`nvidia_backend_plan.md`, phase 5) lists them:
 
-1. **Scoped sync**: a producer table per buffer so host access waits on
-   events instead of `cuCtxSynchronize`.
+1. **Stream-ordered frees**: `cuMemFreeAsync` on the copy lane for device
+   memory, so a free stops draining the device.
 2. **Real P2P**: bind `cuDeviceCanAccessPeer` / `cuCtxEnablePeerAccess` /
    `cuMemcpyPeerAsync` and route `SyncStrategy::PeerToPeer` through them.
 3. **CUPTI counters**: widen `PmcCounter` beyond the AMD SQ set and add a

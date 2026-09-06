@@ -239,6 +239,7 @@ cuda_api! {
     stream_create = "cuStreamCreate": fn(*mut CUstream, u32);
     stream_destroy = "cuStreamDestroy_v2": fn(CUstream);
     stream_synchronize = "cuStreamSynchronize": fn(CUstream);
+    stream_wait_event = "cuStreamWaitEvent": fn(CUstream, CUevent, u32);
     event_create = "cuEventCreate": fn(*mut CUevent, u32);
     event_destroy = "cuEventDestroy_v2": fn(CUevent);
     event_record = "cuEventRecord": fn(CUevent, CUstream);

@@ -116,7 +116,7 @@ fn buffer_spec_selects_the_memory_kind(spec: BufferSpec, expected: CudaMemory, h
 #[test]
 fn zero_initializes_fresh_and_recycled_allocations() {
     let Some(alloc) = cuda_alloc_or_skip() else { return };
-    let alloc: Arc<dyn Allocator> = Arc::new(crate::allocator::LruAllocator::new(Box::new(alloc)));
+    let alloc: Arc<dyn Allocator> = Arc::new(crate::allocator::LruAllocator::new(Box::new((*alloc).clone())));
     let spec = device_local();
     let mut first = Buffer::new_with_zero_init(alloc.clone(), DType::UInt8, vec![256], spec, true);
     first.ensure_allocated().unwrap();
@@ -168,7 +168,7 @@ fn transfer_copies_between_and_within_buffers() {
 fn buffer_views_expose_typed_host_slices() {
     let Some(alloc) = cuda_alloc_or_skip() else { return };
     let managed = alloc.dev.limits().managed_memory;
-    let alloc: Arc<dyn Allocator> = Arc::new(alloc);
+    let alloc: Arc<dyn Allocator> = Arc::new((*alloc).clone());
     let values: Vec<f32> = (0..8).map(|i| i as f32).collect();
     let mut buffer = Buffer::new(alloc.clone(), DType::Float32, vec![8], BufferSpec::default());
     buffer.copyin(super::f32_bytes(&values)).unwrap();

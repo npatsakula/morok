@@ -10,7 +10,8 @@
 //! `ptxas` cubin or from PTX text JIT-compiled by the driver; one
 //! non-blocking stream per execution plan; event pairs for
 //! GPU-clock timestamps; captured plans replay as CUDA graphs whose edges are
-//! the host hazard analysis.
+//! the host hazard analysis; host access waits only the storage's own
+//! in-flight producers and readers (scoped synchronization, see `device`).
 
 pub mod allocator;
 pub mod device;

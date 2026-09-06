@@ -1,25 +1,54 @@
 //! The opened CUDA device: primary context, attribute limits, the copy and
-//! dispatch streams, the base event that zeroes the GPU-clock timeline, and
-//! the poison latch.
+//! dispatch lanes, the base event that zeroes the GPU-clock timeline, the
+//! poison latch, and the scoped-synchronization tables that let host access
+//! wait only on the submissions that touched a storage.
+//!
+//! # Ordering model
+//!
+//! Every submission runs on an in-order stream (a [`Lane`]): one per plan
+//! context, one per graph, the device's dispatch lane for per-call
+//! `Program::execute`, and the copy lane for allocator copies and memsets.
+//! Lanes are not ordered against each other by the driver, so the device
+//! keeps three tables:
+//!
+//! - `producers`: storage base → the newest completion token per lane that
+//!   read or wrote it (a host overwrite is a WAR hazard against in-flight
+//!   readers too). Published by the executor after every plan execute and by
+//!   the allocator after every copy-lane operation. A storage absent from the
+//!   table has unknown producers and falls back to a context drain.
+//! - `lanes`: every live lane and whether it holds submissions no token has
+//!   been published for yet; such lanes are waited by every scoped wait.
+//! - `copy_tail`: the newest copy-lane event; every launch on any lane waits
+//!   it on the GPU, so an asynchronous copy or memset is ordered before all
+//!   later kernels without a host wait.
+//!
+//! `SVOD_CUDA_SCOPED_SYNC=0` disables all of it: every wait drains the
+//! context and every copy synchronizes the copy stream, as before.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int};
 use std::ptr::{NonNull, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use svod_dtype::CudaArch;
 
+use super::sync::CudaCompletionToken;
 use super::sys::{
     Api, CU_EVENT_DEFAULT, CU_EVENT_DISABLE_TIMING, CU_MEMHOSTALLOC_PORTABLE, CU_STREAM_NON_BLOCKING, CUcontext,
     CUdevice, CUdeviceptr, CUevent, CUresult, CUstream, api, attribute,
 };
 use crate::error::{Error, Result, TimelineTimeoutSnafu};
+use crate::sync::CompletionToken;
 
 static DEVICE_CACHE: LazyLock<Mutex<HashMap<usize, Arc<CudaDevice>>>> = LazyLock::new(Default::default);
 static HAS_DEVICES: OnceLock<bool> = OnceLock::new();
+/// Process-unique lane ids: a destroyed stream's handle may be reused by the
+/// driver, its lane id never is.
+static NEXT_LANE: AtomicU64 = AtomicU64::new(1);
 
 /// Bounce buffer for large pageable host ↔ device copies (`cuMemcpy*Async`
 /// needs pinned host memory to be asynchronous); transfers up to this size
@@ -27,6 +56,13 @@ static HAS_DEVICES: OnceLock<bool> = OnceLock::new();
 pub(crate) const STAGING_BYTES: usize = 4 << 20;
 /// Poll cadence of timed event waits; the driver offers no timed wait.
 const EVENT_POLL: Duration = Duration::from_micros(200);
+/// Producer lists longer than this are pruned of retired tokens on insert;
+/// below it, the per-lane replacement keeps them short without any query.
+const PRUNE_PRODUCERS_ABOVE: usize = 8;
+
+/// In-flight tokens of one storage: at most one per lane, since a lane is
+/// in order and its newest token implies the older ones.
+type Producers = smallvec::SmallVec<[CudaCompletionToken; 2]>;
 
 /// Whether the driver loads, initializes, and reports at least one device.
 /// Memoized; never panics; `false` on any failure.
@@ -49,23 +85,94 @@ pub struct CudaLimits {
     pub managed_memory: bool,
 }
 
+/// One in-order stream plus the scoped-sync state of its submissions. Owned
+/// by the device (dispatch and copy lanes) or a [`CudaStream`]; the device's
+/// lane registry holds it weakly, so an upgraded handle keeps the stream
+/// alive across a wait even while its owner is being dropped.
+pub struct Lane {
+    api: &'static Api,
+    raw: CUstream,
+    id: u64,
+    /// Submissions were made since the last completion token was published
+    /// (or the lane was synchronized): every scoped wait drains such a lane.
+    unpublished: AtomicBool,
+    /// `CudaDevice::copy_seq` value this lane last waited on.
+    copies_seen: AtomicU64,
+}
+
+// SAFETY: the driver's stream handle is thread-safe; the flags are atomic.
+unsafe impl Send for Lane {}
+unsafe impl Sync for Lane {}
+
+impl Lane {
+    fn create(api: &'static Api) -> Result<Arc<Self>> {
+        let mut raw = CUstream::NULL;
+        // SAFETY: out-pointer to a live handle slot.
+        unsafe { (api.stream_create)(&mut raw, CU_STREAM_NON_BLOCKING) }.check("cuStreamCreate")?;
+        Ok(Arc::new(Self {
+            api,
+            raw,
+            id: NEXT_LANE.fetch_add(1, Ordering::Relaxed),
+            unpublished: AtomicBool::new(false),
+            copies_seen: AtomicU64::new(0),
+        }))
+    }
+
+    pub(crate) fn raw(&self) -> CUstream {
+        self.raw
+    }
+
+    /// Flag a submission no token covers yet; called before the launch so a
+    /// concurrent scoped wait can never miss it.
+    pub(crate) fn mark_unpublished(&self) {
+        self.unpublished.store(true, Ordering::Release);
+    }
+
+    /// Clear the flag, returning whether it was set. Cleared *before* the
+    /// corresponding wait or publication: a submission racing the clear
+    /// either precedes the wait or re-sets the flag afterwards.
+    pub(crate) fn take_unpublished(&self) -> bool {
+        self.unpublished.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl Drop for Lane {
+    fn drop(&mut self) {
+        // SAFETY: the stream this lane created; the driver defers destruction
+        // until its work retires.
+        unsafe { (self.api.stream_destroy)(self.raw) };
+    }
+}
+
 pub struct CudaDevice {
     api: &'static Api,
     device_id: usize,
-    handle: CUdevice,
-    context: CUcontext,
     name: String,
     arch: CudaArch,
     limits: CudaLimits,
     /// Host ↔ device copies and memsets (`CudaAllocator`).
-    copy_stream: CUstream,
+    copy: Arc<Lane>,
     /// Per-call `Program::execute` dispatches.
-    dispatch_stream: CUstream,
+    dispatch: Arc<Lane>,
+    /// Every lane built on this device (weak: lanes die with their owners).
+    lanes: Mutex<Vec<Weak<Lane>>>,
+    /// Storage base → in-flight tokens (see the module docs). Tokens hold the
+    /// device; the cycle is moot because opened devices live in the
+    /// process-global cache.
+    producers: Mutex<HashMap<u64, Producers>>,
+    /// Serializes copy-lane enqueue + publication so tokens of the copy lane
+    /// are recorded in stream order.
+    copy_lock: Mutex<()>,
+    /// Newest copy-lane event and its sequence number (0 = none yet).
+    copy_tail: Mutex<Option<Arc<CudaEvent>>>,
+    copy_seq: AtomicU64,
     /// Recorded at open: the zero of every GPU-clock timestamp.
     base_event: CUevent,
     staging: Mutex<Option<NonNull<u8>>>,
     poisoned: AtomicBool,
     poison_message: OnceLock<String>,
+    /// Declared last: released after the lanes destroyed their streams.
+    context: PrimaryContext,
 }
 
 // SAFETY: every field is either immutable after open or guarded; the staging
@@ -98,7 +205,9 @@ impl CudaDevice {
         Ok(device)
     }
 
-    fn open_uncached(device_id: usize) -> Result<Self> {
+    /// A private handle on the same primary context, outside the cache; for
+    /// tests that poison a device without affecting the shared one.
+    pub(crate) fn open_uncached(device_id: usize) -> Result<Self> {
         let api = api()?;
         api.init().map_err(|error| Error::NoCudaGpu { reason: error.to_string() })?;
         let count = api.device_count()?;
@@ -110,13 +219,14 @@ impl CudaDevice {
         let mut handle: CUdevice = 0;
         // SAFETY: out-pointer to a live integer; the ordinal was range-checked.
         unsafe { (api.device_get)(&mut handle, device_id as c_int) }.check("cuDeviceGet")?;
-        let mut context = CUcontext::NULL;
+        let mut raw = CUcontext::NULL;
         // SAFETY: out-pointer to a live handle slot.
-        unsafe { (api.device_primary_ctx_retain)(&mut context, handle) }.check("cuDevicePrimaryCtxRetain")?;
-        // Everything below runs in the retained context; release it on failure.
-        let release = ContextGuard { api, handle };
+        unsafe { (api.device_primary_ctx_retain)(&mut raw, handle) }.check("cuDevicePrimaryCtxRetain")?;
+        // Everything below runs in the retained context; dropping the guard
+        // on failure releases it.
+        let context = PrimaryContext { api, handle, raw };
         // SAFETY: a context this process retains.
-        unsafe { (api.ctx_set_current)(context) }.check("cuCtxSetCurrent")?;
+        unsafe { (api.ctx_set_current)(raw) }.check("cuCtxSetCurrent")?;
 
         let attribute = |id: i32| -> Result<u32> {
             let mut value: c_int = 0;
@@ -145,14 +255,8 @@ impl CudaDevice {
                 && attribute(attribute::CONCURRENT_MANAGED_ACCESS)? == 1,
         };
 
-        let stream = || -> Result<CUstream> {
-            let mut stream = CUstream::NULL;
-            // SAFETY: out-pointer to a live handle slot.
-            unsafe { (api.stream_create)(&mut stream, CU_STREAM_NON_BLOCKING) }.check("cuStreamCreate")?;
-            Ok(stream)
-        };
-        let copy_stream = stream()?;
-        let dispatch_stream = stream()?;
+        let copy = Lane::create(api)?;
+        let dispatch = Lane::create(api)?;
         let mut base_event = CUevent::NULL;
         // SAFETY: out-pointer to a live handle slot; the event is then
         // recorded on the legacy default stream and waited for, so it is
@@ -170,23 +274,27 @@ impl CudaDevice {
             sms = limits.sm_count,
             managed = limits.managed_memory,
             driver = format!("{driver_major}.{driver_minor}"),
+            scoped_sync = Self::scoped_sync_enabled(),
             "opened CUDA device"
         );
-        std::mem::forget(release);
         Ok(Self {
             api,
             device_id,
-            handle,
-            context,
             name,
             arch,
             limits,
-            copy_stream,
-            dispatch_stream,
+            lanes: Mutex::new(vec![Arc::downgrade(&dispatch)]),
+            copy,
+            dispatch,
+            producers: Mutex::new(HashMap::new()),
+            copy_lock: Mutex::new(()),
+            copy_tail: Mutex::new(None),
+            copy_seq: AtomicU64::new(0),
             base_event,
             staging: Mutex::new(None),
             poisoned: AtomicBool::new(false),
             poison_message: OnceLock::new(),
+            context,
         })
     }
 
@@ -207,15 +315,25 @@ impl CudaDevice {
     }
 
     pub(crate) fn copy_stream(&self) -> CUstream {
-        self.copy_stream
+        self.copy.raw
     }
 
-    pub(crate) fn dispatch_stream(&self) -> CUstream {
-        self.dispatch_stream
+    pub(crate) fn dispatch_lane(&self) -> &Arc<Lane> {
+        &self.dispatch
     }
 
     pub(crate) fn base_event(&self) -> CUevent {
         self.base_event
+    }
+
+    /// A fresh non-blocking lane, registered for scoped waits.
+    pub(crate) fn new_lane(&self) -> Result<Arc<Lane>> {
+        self.enter()?;
+        let lane = Lane::create(self.api)?;
+        let mut lanes = self.lanes.lock();
+        lanes.retain(|weak| weak.strong_count() > 0);
+        lanes.push(Arc::downgrade(&lane));
+        Ok(lane)
     }
 
     /// Make this device's context current on the calling thread (the driver
@@ -226,7 +344,7 @@ impl CudaDevice {
             return Err(error);
         }
         // SAFETY: a context this device retains for its whole lifetime.
-        unsafe { (self.api.ctx_set_current)(self.context) }.check("cuCtxSetCurrent")?;
+        unsafe { (self.api.ctx_set_current)(self.context.raw) }.check("cuCtxSetCurrent")?;
         Ok(self.api)
     }
 
@@ -241,9 +359,13 @@ impl CudaDevice {
         outcome
     }
 
-    /// Wait for every stream of this context.
+    /// Wait for every stream of this context. Lanes drained here have no
+    /// unpublished work left.
     pub fn synchronize(&self) -> Result<()> {
         let api = self.enter()?;
+        for lane in self.live_lanes() {
+            lane.take_unpublished();
+        }
         // SAFETY: plain call in the current context.
         self.check(unsafe { (api.ctx_synchronize)() }, "cuCtxSynchronize")
     }
@@ -252,6 +374,12 @@ impl CudaDevice {
         let api = self.enter()?;
         // SAFETY: a live stream of this context.
         self.check(unsafe { (api.stream_synchronize)(stream) }, "cuStreamSynchronize")
+    }
+
+    /// Drain one lane; its work counts as published from here on.
+    pub(crate) fn synchronize_lane(&self, lane: &Lane) -> Result<()> {
+        lane.take_unpublished();
+        self.stream_synchronize(lane.raw)
     }
 
     /// `(free, total)` bytes of device memory.
@@ -263,13 +391,24 @@ impl CudaDevice {
         Ok((free, total))
     }
 
-    /// Zero `size` bytes at `device_ptr` after draining in-flight work.
-    pub(crate) fn zero(&self, device_ptr: CUdeviceptr, size: usize) -> Result<()> {
-        self.synchronize()?;
-        let api = self.api;
-        // SAFETY: the caller owns `size` bytes at `device_ptr`.
-        self.check(unsafe { (api.memset_d8_async)(device_ptr, 0, size, self.copy_stream) }, "cuMemsetD8Async")?;
-        self.stream_synchronize(self.copy_stream)
+    /// Zero `size` bytes of the storage at `device_ptr` on the copy lane,
+    /// ordered after its in-flight producers and before every later launch;
+    /// no host wait.
+    pub(crate) fn zero(self: &Arc<Self>, device_ptr: CUdeviceptr, size: usize) -> Result<()> {
+        self.with_copy_lane(|dev| {
+            dev.order_copies_after(&[device_ptr])?;
+            // SAFETY: the caller owns `size` bytes at `device_ptr`.
+            dev.check(unsafe { (dev.api.memset_d8_async)(device_ptr, 0, size, dev.copy.raw) }, "cuMemsetD8Async")?;
+            dev.record_copy(&[device_ptr])
+        })
+    }
+
+    /// Run one copy-lane operation — `order_copies_after`, the enqueue,
+    /// `record_copy` — serialized against the others so the lane's tokens
+    /// are published in stream order.
+    pub(crate) fn with_copy_lane<T>(self: &Arc<Self>, f: impl FnOnce(&Arc<Self>) -> Result<T>) -> Result<T> {
+        let _copy = self.copy_lock.lock();
+        f(self)
     }
 
     /// Run `f` with the pinned bounce buffer (allocated on first use). The
@@ -311,80 +450,235 @@ impl CudaDevice {
     }
 }
 
+/// Scoped synchronization (see the module docs).
+impl CudaDevice {
+    /// Kill switch: `SVOD_CUDA_SCOPED_SYNC=0` makes every wait a context
+    /// drain and every copy synchronous, for bisecting scoped-sync regressions.
+    pub(crate) fn scoped_sync_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("SVOD_CUDA_SCOPED_SYNC").as_deref() != Ok("0"))
+    }
+
+    /// Pre-register a storage so "known storage, nothing in flight" is
+    /// distinguishable from "unknown storage" (conservative drain).
+    pub(crate) fn register_storage(&self, base: u64) {
+        if Self::scoped_sync_enabled() {
+            self.producers.lock().entry(base).or_default();
+        }
+    }
+
+    pub(crate) fn unregister_storage(&self, base: u64) {
+        self.producers.lock().remove(&base);
+    }
+
+    /// Record `token` as an in-flight producer/reader of the storage at
+    /// `base`, replacing this lane's previous token. A token of another
+    /// backend cannot be ordered by event, so the storage's producers become
+    /// unknown (every later access drains).
+    pub(crate) fn record_producer(&self, base: u64, token: &Arc<dyn CompletionToken>) {
+        if !Self::scoped_sync_enabled() {
+            return;
+        }
+        let Some(token) = (token.as_ref() as &dyn Any).downcast_ref::<CudaCompletionToken>() else {
+            tracing::debug!(base, "non-CUDA completion token recorded on a CUDA storage; producers unknown");
+            self.producers.lock().remove(&base);
+            return;
+        };
+        self.record_cuda_producer(base, token);
+    }
+
+    fn record_cuda_producer(&self, base: u64, token: &CudaCompletionToken) {
+        let mut producers = self.producers.lock();
+        let tokens = producers.entry(base).or_default();
+        match tokens.iter_mut().find(|earlier| earlier.lane() == token.lane()) {
+            Some(slot) => *slot = token.clone(),
+            None => tokens.push(token.clone()),
+        }
+        if tokens.len() > PRUNE_PRODUCERS_ABOVE {
+            tokens.retain(|token| !token.retired());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn producer_count(&self, base: u64) -> Option<usize> {
+        self.producers.lock().get(&base).map(|tokens| tokens.len())
+    }
+
+    fn live_lanes(&self) -> Vec<Arc<Lane>> {
+        let mut lanes = self.lanes.lock();
+        lanes.retain(|weak| weak.strong_count() > 0);
+        lanes.iter().filter_map(Weak::upgrade).collect()
+    }
+
+    /// Wait on the host for everything that may still touch the storage at
+    /// `base`: its recorded tokens and every lane with unpublished
+    /// submissions. Unknown storages (and the kill switch) drain the context.
+    pub(crate) fn wait_storage(&self, base: u64) -> Result<()> {
+        if !Self::scoped_sync_enabled() {
+            return self.synchronize();
+        }
+        self.enter()?;
+        // The guard must not outlive the lookup: the drain below can take a
+        // kernel's duration and every publication needs the table.
+        let tokens = self.producers.lock().get(&base).cloned();
+        let Some(tokens) = tokens else { return self.synchronize() };
+        for lane in self.live_lanes() {
+            if lane.take_unpublished() {
+                self.stream_synchronize(lane.raw)?;
+            }
+        }
+        for token in &tokens {
+            token.event().wait(0).inspect_err(|error| self.poison(&error.to_string()))?;
+        }
+        if let Some(current) = self.producers.lock().get_mut(&base) {
+            current.retain(|token| !tokens.iter().any(|waited| Arc::ptr_eq(waited.event(), token.event())));
+        }
+        Ok(())
+    }
+
+    /// Order the copy lane after everything that may still touch `bases`,
+    /// on the GPU (`cuStreamWaitEvent`), so the following copy needs no host
+    /// wait. Lanes with unpublished submissions contribute a tail event;
+    /// unknown storages drain the context. Call within `with_copy_lane`.
+    pub(crate) fn order_copies_after(self: &Arc<Self>, bases: &[u64]) -> Result<()> {
+        if !Self::scoped_sync_enabled() {
+            return self.synchronize();
+        }
+        let api = self.enter()?;
+        let mut events: Vec<Arc<CudaEvent>> = Vec::new();
+        {
+            let producers = self.producers.lock();
+            for base in bases {
+                let Some(tokens) = producers.get(base) else {
+                    drop(producers);
+                    return self.synchronize();
+                };
+                events.extend(tokens.iter().map(|token| Arc::clone(token.event())));
+            }
+        }
+        for lane in self.live_lanes() {
+            if lane.unpublished.load(Ordering::Acquire) {
+                let tail = CudaEvent::new(Arc::clone(self), false)?;
+                tail.record(lane.raw)?;
+                events.push(Arc::new(tail));
+            }
+        }
+        for event in events.iter().filter(|event| !event.observed_complete()) {
+            // SAFETY: live stream and event of this context.
+            self.check(unsafe { (api.stream_wait_event)(self.copy.raw, event.raw, 0) }, "cuStreamWaitEvent")?;
+        }
+        Ok(())
+    }
+
+    /// Publish the copy-lane work just enqueued as the newest producer of
+    /// `bases` and as the copy tail every later launch waits on. Call within
+    /// `with_copy_lane`, after the enqueue.
+    pub(crate) fn record_copy(self: &Arc<Self>, bases: &[u64]) -> Result<()> {
+        if !Self::scoped_sync_enabled() {
+            return self.stream_synchronize(self.copy.raw);
+        }
+        let event = CudaEvent::new(Arc::clone(self), false)?;
+        event.record(self.copy.raw)?;
+        let event = Arc::new(event);
+        let token = CudaCompletionToken::new(Arc::clone(&event), self.copy.id);
+        for base in bases {
+            self.record_cuda_producer(*base, &token);
+        }
+        *self.copy_tail.lock() = Some(event);
+        self.copy_seq.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Order a launch on `lane` after every copy-lane operation published so
+    /// far; a no-op unless a copy happened since the lane's last launch.
+    pub(crate) fn order_launch(&self, lane: &Lane) -> Result<()> {
+        let seq = self.copy_seq.load(Ordering::Acquire);
+        if seq == lane.copies_seen.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let tail = self.copy_tail.lock().clone();
+        if let Some(event) = tail.filter(|event| !event.observed_complete()) {
+            let api = self.enter()?;
+            // SAFETY: live stream and event of this context.
+            self.check(unsafe { (api.stream_wait_event)(lane.raw, event.raw, 0) }, "cuStreamWaitEvent")?;
+        }
+        lane.copies_seen.store(seq, Ordering::Release);
+        Ok(())
+    }
+}
+
 impl Drop for CudaDevice {
     fn drop(&mut self) {
         let api = self.api;
-        // SAFETY: handles this device created; the context is released last.
+        // SAFETY: handles this device created; the lanes and the context
+        // release themselves afterwards, in field order.
         unsafe {
-            if (api.ctx_set_current)(self.context) != CUresult::SUCCESS {
+            if (api.ctx_set_current)(self.context.raw) != CUresult::SUCCESS {
                 return;
             }
             if let Some(staging) = self.staging.get_mut().take() {
                 (api.mem_free_host)(staging.as_ptr().cast());
             }
             (api.event_destroy)(self.base_event);
-            (api.stream_destroy)(self.copy_stream);
-            (api.stream_destroy)(self.dispatch_stream);
-            (api.device_primary_ctx_release)(self.handle);
         }
     }
 }
 
-/// Releases the primary context if `open_uncached` fails midway.
-struct ContextGuard {
+/// The retained primary context, released on drop.
+struct PrimaryContext {
     api: &'static Api,
     handle: CUdevice,
+    raw: CUcontext,
 }
 
-impl Drop for ContextGuard {
+impl Drop for PrimaryContext {
     fn drop(&mut self) {
-        // SAFETY: balances the retain that created this guard.
+        // SAFETY: balances the retain that created this value.
         unsafe { (self.api.device_primary_ctx_release)(self.handle) };
     }
 }
 
-/// An owned stream of a device.
+/// An owned lane of a device.
 pub struct CudaStream {
     dev: Arc<CudaDevice>,
-    raw: CUstream,
+    lane: Arc<Lane>,
 }
 
 impl CudaStream {
     /// A non-blocking stream (not ordered against the legacy default stream).
     pub fn new(dev: Arc<CudaDevice>) -> Result<Self> {
-        let api = dev.enter()?;
-        let mut raw = CUstream::NULL;
-        // SAFETY: out-pointer to a live handle slot.
-        unsafe { (api.stream_create)(&mut raw, CU_STREAM_NON_BLOCKING) }.check("cuStreamCreate")?;
-        Ok(Self { dev, raw })
+        let lane = dev.new_lane()?;
+        Ok(Self { dev, lane })
     }
 
     pub fn raw(&self) -> CUstream {
-        self.raw
+        self.lane.raw
     }
 
     pub fn device(&self) -> &Arc<CudaDevice> {
         &self.dev
     }
 
+    pub(crate) fn lane(&self) -> &Arc<Lane> {
+        &self.lane
+    }
+
     pub fn synchronize(&self) -> Result<()> {
-        self.dev.stream_synchronize(self.raw)
+        self.dev.synchronize_lane(&self.lane)
     }
 
     /// Record a fresh event at the current tail of this stream.
     pub fn record(&self, timing: bool) -> Result<Arc<CudaEvent>> {
         let event = CudaEvent::new(Arc::clone(&self.dev), timing)?;
-        event.record(self.raw)?;
+        event.record(self.lane.raw)?;
         Ok(Arc::new(event))
     }
-}
 
-impl Drop for CudaStream {
-    fn drop(&mut self) {
-        let api = self.dev.api();
-        // SAFETY: a stream this value created; destruction is deferred by the
-        // driver until its work retires.
-        unsafe { (api.stream_destroy)(self.raw) };
+    /// A completion token for everything submitted so far. The lane stays
+    /// flagged unpublished until the owner hands the token out
+    /// (`Lane::take_unpublished`), since only then is it recorded on storages.
+    pub fn token(&self) -> Result<CudaCompletionToken> {
+        Ok(CudaCompletionToken::new(self.record(false)?, self.lane.id))
     }
 }
 
@@ -392,6 +686,8 @@ impl Drop for CudaStream {
 pub struct CudaEvent {
     dev: Arc<CudaDevice>,
     raw: CUevent,
+    /// Completion, once observed, is final until the next record.
+    done: AtomicBool,
 }
 
 impl CudaEvent {
@@ -403,7 +699,7 @@ impl CudaEvent {
         let flags = if timing { CU_EVENT_DEFAULT } else { CU_EVENT_DISABLE_TIMING };
         // SAFETY: out-pointer to a live handle slot.
         unsafe { (api.event_create)(&mut raw, flags) }.check("cuEventCreate")?;
-        Ok(Self { dev, raw })
+        Ok(Self { dev, raw, done: AtomicBool::new(false) })
     }
 
     pub fn raw(&self) -> CUevent {
@@ -412,17 +708,29 @@ impl CudaEvent {
 
     pub fn record(&self, stream: CUstream) -> Result<()> {
         let api = self.dev.enter()?;
+        self.done.store(false, Ordering::Release);
         // SAFETY: live event and stream of this context.
         self.dev.check(unsafe { (api.event_record)(self.raw, stream) }, "cuEventRecord")
+    }
+
+    /// Whether completion was already observed (no driver call).
+    pub(crate) fn observed_complete(&self) -> bool {
+        self.done.load(Ordering::Acquire)
     }
 
     /// Whether the recorded work has completed (`cuEventQuery`). An event
     /// never recorded counts as completed, as the driver defines it.
     pub fn completed(&self) -> Result<bool> {
+        if self.observed_complete() {
+            return Ok(true);
+        }
         let api = self.dev.enter()?;
         // SAFETY: a live event.
         match unsafe { (api.event_query)(self.raw) } {
-            CUresult::SUCCESS => Ok(true),
+            CUresult::SUCCESS => {
+                self.done.store(true, Ordering::Release);
+                Ok(true)
+            }
             CUresult::NOT_READY => Ok(false),
             other => self.dev.check(other, "cuEventQuery").map(|()| true),
         }
@@ -430,10 +738,15 @@ impl CudaEvent {
 
     /// Block until completion; `timeout_ms == 0` waits forever.
     pub fn wait(&self, timeout_ms: u64) -> Result<()> {
+        if self.observed_complete() {
+            return Ok(());
+        }
         if timeout_ms == 0 {
             let api = self.dev.enter()?;
             // SAFETY: a live event.
-            return self.dev.check(unsafe { (api.event_synchronize)(self.raw) }, "cuEventSynchronize");
+            self.dev.check(unsafe { (api.event_synchronize)(self.raw) }, "cuEventSynchronize")?;
+            self.done.store(true, Ordering::Release);
+            return Ok(());
         }
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         while !self.completed()? {

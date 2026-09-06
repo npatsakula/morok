@@ -68,7 +68,7 @@ struct State {
     dag: Exec,
     chain: Option<Exec>,
     profiled: Option<Exec>,
-    last: Option<Arc<CudaEvent>>,
+    last: Option<CudaCompletionToken>,
 }
 
 pub struct CudaGraph {
@@ -173,11 +173,17 @@ impl CudaGraph {
         ))
     }
 
-    fn launch(&self, exec: &Exec) -> Result<Arc<CudaEvent>> {
+    /// Launch on this graph's lane, ordered after published copies, and
+    /// return the token covering it; the lane stays flagged unpublished
+    /// until the token is handed out or waited.
+    fn launch(&self, exec: &Exec) -> Result<CudaCompletionToken> {
         let api = self.dev.enter()?;
+        let lane = self.stream.lane();
+        self.dev.order_launch(lane)?;
+        lane.mark_unpublished();
         // SAFETY: a live exec launched on this graph's stream.
-        self.dev.check(unsafe { (api.graph_launch)(exec.exec, self.stream.raw()) }, "cuGraphLaunch")?;
-        self.stream.record(false)
+        self.dev.check(unsafe { (api.graph_launch)(exec.exec, lane.raw()) }, "cuGraphLaunch")?;
+        self.stream.token()
     }
 }
 
@@ -364,11 +370,9 @@ impl Graph for CudaGraph {
     }
 
     fn completion_token(&self) -> Option<Arc<dyn CompletionToken>> {
-        self.state
-            .lock()
-            .last
-            .clone()
-            .map(|event| Arc::new(CudaCompletionToken::new(event)) as Arc<dyn CompletionToken>)
+        let token = self.state.lock().last.clone()?;
+        self.stream.lane().take_unpublished();
+        Some(Arc::new(token))
     }
 
     fn replay_profiled(&self, buffers: &[u64], vals: &[i64]) -> Result<Option<Vec<Arc<dyn DispatchTimestamps>>>> {
@@ -382,7 +386,8 @@ impl Graph for CudaGraph {
         exec.patch(&self.nodes, blobs, buffers, vals)?;
         let events = exec.rearm_stamps()?;
         let done = self.launch(exec)?;
-        state.last = Some(Arc::clone(&done));
+        state.last = Some(done.clone());
+        self.stream.lane().take_unpublished();
         done.wait(0)?;
         Ok(Some(
             events

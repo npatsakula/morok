@@ -34,17 +34,21 @@ impl PlanContext for CudaPlanCtx {
             reason: format!("CudaPlanCtx dispatched non-CUDA program {:?}", program.name()),
         })?;
         let dev = self.stream.device();
-        let stream = self.stream.raw();
+        let lane = self.stream.lane();
+        dev.order_launch(lane)?;
+        lane.mark_unpublished();
         let start = profile.then(|| self.stream.record(true)).transpose()?;
         // SAFETY: forwarded contract.
-        unsafe { program.launch(stream, buffers, vals, global_size, local_size) }?;
+        unsafe { program.launch(lane.raw(), buffers, vals, global_size, local_size) }?;
         let Some(start) = start else { return Ok(None) };
         let end = self.stream.record(true)?;
         Ok(Some(Arc::new(CudaDispatchTimestamps { dev: Arc::clone(dev), start, end })))
     }
 
     fn completion_token(&self) -> Option<Arc<dyn CompletionToken>> {
-        self.stream.record(false).ok().map(|event| Arc::new(CudaCompletionToken { event }) as Arc<dyn CompletionToken>)
+        let token = self.stream.token().ok()?;
+        self.stream.lane().take_unpublished();
+        Some(Arc::new(token))
     }
 
     fn synchronize(&self) -> Result<()> {
@@ -87,14 +91,26 @@ impl DispatchTimestamps for CudaDispatchTimestamps {
     }
 }
 
-/// One event: retired once the stream reached the record.
+/// One event recorded on one lane: retired once the lane reached the record.
+/// The lane id lets the device's producer table keep only the newest token
+/// per lane and order copies after the event on the GPU.
+#[derive(Clone)]
 pub struct CudaCompletionToken {
     event: Arc<CudaEvent>,
+    lane: u64,
 }
 
 impl CudaCompletionToken {
-    pub fn new(event: Arc<CudaEvent>) -> Self {
-        Self { event }
+    pub fn new(event: Arc<CudaEvent>, lane: u64) -> Self {
+        Self { event, lane }
+    }
+
+    pub(crate) fn event(&self) -> &Arc<CudaEvent> {
+        &self.event
+    }
+
+    pub(crate) fn lane(&self) -> u64 {
+        self.lane
     }
 }
 

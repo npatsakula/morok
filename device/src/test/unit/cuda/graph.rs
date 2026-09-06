@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use test_case::test_case;
 
-use super::{cuda_alloc_or_skip, device_ptr, download, load, scale_abi, upload, vadd_abi};
+use super::{Hardware, cuda_alloc_or_skip, device_ptr, download, load, scale_abi, upload, vadd_abi};
 use crate::allocator::{Allocator, RawBuffer};
 use crate::cuda::graph::alias_signature;
 use crate::cuda::{CudaAllocator, CudaGraph, CudaProgram};
@@ -26,7 +26,7 @@ fn alias_signature_ignores_addresses_but_not_aliasing() {
 pub(super) const N: usize = 4096;
 
 pub(super) struct Chain {
-    pub(super) alloc: CudaAllocator,
+    pub(super) alloc: Hardware<CudaAllocator>,
     program: CudaProgram,
     a: RawBuffer,
     b: RawBuffer,
@@ -78,6 +78,10 @@ impl Chain {
     /// `out[i] = (a + b) + b + (a + b) = 2a + 3b`.
     pub(super) fn expected(&self) -> Vec<f32> {
         (0..N).map(|i| (2 * i + 3 * 2 * i) as f32).collect()
+    }
+
+    pub(super) fn alloc_len(&self) -> usize {
+        N
     }
 
     pub(super) fn capture(&self) -> Box<dyn Graph> {

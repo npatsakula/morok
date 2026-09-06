@@ -1,8 +1,11 @@
 //! Device-local allocations by default; host-visible buffers are managed
 //! memory (device-resident, migrated on host touch), `host` buffers are
-//! pinned host memory mapped into the device. Host ↔ device copies are one
+//! pinned host memory mapped into the device. Host ↔ device copies wait the
+//! storage's in-flight producers and readers on the host, then run as one
 //! synchronous `cuMemcpy` up to the bounce size and stage through the
-//! device's pinned bounce buffer on the copy stream above it.
+//! device's pinned bounce buffer on the copy stream above it. Device-to-
+//! device copies and memsets are asynchronous on the copy lane, ordered
+//! after the producers by event and published as the new producer.
 
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -116,6 +119,7 @@ impl Allocator for CudaAllocator {
         if memory == CudaMemory::Managed {
             host_ptr = NonNull::new(device_ptr as usize as *mut u8);
         }
+        self.dev.register_storage(device_ptr);
         let buffer = RawBuffer::Cuda { device_ptr, host_ptr, size, memory, device: Arc::clone(&self.dev) };
         if zero {
             self.dev.zero(device_ptr, alloc_len)?;
@@ -128,14 +132,15 @@ impl Allocator for CudaAllocator {
             tracing::debug!(?buffer, "CudaAllocator::free called with non-CUDA buffer; dropping");
             return;
         };
-        // In-flight kernels may still reference the allocation; a failed
-        // drain (or a poisoned context) cannot propagate from a free, so the
+        // In-flight submissions may still reference the allocation; a failed
+        // wait (or a poisoned context) cannot propagate from a free, so the
         // allocation is quarantined instead.
-        if let Err(error) = device.synchronize() {
-            tracing::warn!(?error, size, "CudaAllocator::free: drain failed; allocation quarantined");
+        if let Err(error) = device.wait_storage(*device_ptr) {
+            tracing::warn!(?error, size, "CudaAllocator::free: wait failed; allocation quarantined");
             std::mem::forget(buffer);
             return;
         }
+        device.unregister_storage(*device_ptr);
         let api = device.api();
         // SAFETY: the allocation this buffer owns, freed by the call that made it.
         let result = unsafe {
@@ -149,13 +154,14 @@ impl Allocator for CudaAllocator {
         }
     }
 
-    /// Host access is not ordered against the plan streams, so every path
-    /// drains the context first. Pinned memory is then a plain `memcpy`;
+    /// Host access is not ordered against the lanes, so the storage's
+    /// in-flight producers and readers are waited first (a host overwrite is
+    /// a WAR hazard against readers). Pinned memory is then a plain `memcpy`;
     /// device and managed memory take one synchronous `cuMemcpyHtoD` up to
     /// the bounce size and chunked pinned staging above it.
     fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> Result<()> {
         let (device_ptr, host_ptr, _, memory) = self.cuda_buffer(dest);
-        self.dev.synchronize()?;
+        self.dev.wait_storage(device_ptr)?;
         if src.is_empty() {
             return Ok(());
         }
@@ -189,7 +195,7 @@ impl Allocator for CudaAllocator {
     /// Mirror of [`Self::_copyin`].
     fn _copyout(&self, dest: &mut [u8], src: &RawBuffer, src_off: usize) -> Result<()> {
         let (device_ptr, host_ptr, _, memory) = self.cuda_buffer(src);
-        self.dev.synchronize()?;
+        self.dev.wait_storage(device_ptr)?;
         if dest.is_empty() {
             return Ok(());
         }
@@ -222,11 +228,12 @@ impl Allocator for CudaAllocator {
         })
     }
 
-    /// Device-to-device: one async copy on the copy stream and one stream
-    /// wait. The context is drained first because a plan stream may still be
-    /// writing `src` or reading `dest` (no per-storage producer tracking yet).
-    /// An overlapping range within one allocation (memory planning) bounces
-    /// through a temporary so it keeps memmove semantics.
+    /// Device-to-device: asynchronous on the copy lane, ordered on the GPU
+    /// after everything still touching `src` or `dest`, and published as the
+    /// new producer of both (the copy reads `src`, so a later host write to
+    /// it must wait). Every later launch waits the copy. An overlapping
+    /// range within one allocation (memory planning) bounces through a
+    /// temporary so it keeps memmove semantics.
     fn _transfer(&self, dest: &RawBuffer, dest_off: usize, src: &RawBuffer, src_off: usize, sz: usize) -> Result<()> {
         if !matches!((dest, src), (RawBuffer::Cuda { .. }, RawBuffer::Cuda { .. })) {
             return UnsupportedSnafu { op: "transfer" }.fail();
@@ -235,29 +242,43 @@ impl Allocator for CudaAllocator {
         let (src_base, ..) = self.cuda_buffer(src);
         let dst = dst_base + dest_off as u64;
         let source = src_base + src_off as u64;
-        self.dev.synchronize()?;
         if sz == 0 || dst == source {
             return Ok(());
         }
         let api = self.dev.api();
         let stream = self.dev.copy_stream();
         let overlaps = dst < source + sz as u64 && source < dst + sz as u64;
-        if overlaps {
-            let bounce = self._alloc(sz, &BufferSpec { cpu_access: false, ..BufferSpec::default() }, false)?;
-            let (tmp, ..) = self.cuda_buffer(&bounce);
-            // SAFETY: three device ranges of `sz` bytes each, bounded by the caller.
-            let result = unsafe {
-                self.dev
-                    .check((api.memcpy_dtod_async)(tmp, source, sz, stream), "cuMemcpyDtoDAsync")
-                    .and_then(|()| self.dev.check((api.memcpy_dtod_async)(dst, tmp, sz, stream), "cuMemcpyDtoDAsync"))
-                    .and_then(|()| self.dev.stream_synchronize(stream))
-            };
-            self._free(bounce, &BufferSpec::default());
-            return result;
+        let bounce = overlaps
+            .then(|| self._alloc(sz, &BufferSpec { cpu_access: false, ..BufferSpec::default() }, false))
+            .transpose()?;
+        let mut bases: smallvec::SmallVec<[u64; 3]> = smallvec::smallvec![dst_base];
+        if src_base != dst_base {
+            bases.push(src_base);
         }
-        // SAFETY: two device ranges bounded by the caller.
-        self.dev.check(unsafe { (api.memcpy_dtod_async)(dst, source, sz, stream) }, "cuMemcpyDtoDAsync")?;
-        self.dev.stream_synchronize(stream)
+        let result = self.dev.with_copy_lane(|dev| {
+            dev.order_copies_after(&bases)?;
+            match &bounce {
+                Some(bounce) => {
+                    let (tmp, ..) = self.cuda_buffer(bounce);
+                    bases.push(tmp);
+                    // SAFETY: three device ranges of `sz` bytes each, bounded by the caller.
+                    unsafe {
+                        dev.check((api.memcpy_dtod_async)(tmp, source, sz, stream), "cuMemcpyDtoDAsync")?;
+                        dev.check((api.memcpy_dtod_async)(dst, tmp, sz, stream), "cuMemcpyDtoDAsync")?;
+                    }
+                }
+                // SAFETY: two device ranges bounded by the caller.
+                None => unsafe {
+                    dev.check((api.memcpy_dtod_async)(dst, source, sz, stream), "cuMemcpyDtoDAsync")?;
+                },
+            }
+            dev.record_copy(&bases)
+        });
+        if let Some(bounce) = bounce {
+            // Waits the copies out of the bounce before releasing it.
+            self._free(bounce, &BufferSpec::default());
+        }
+        result
     }
 
     fn synchronize(&self) -> Result<()> {

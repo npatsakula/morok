@@ -174,18 +174,18 @@ fn shared_memory_kernel_runs_and_reports_lds() {
 fn jit_errors_carry_the_driver_log() {
     let Some(dev) = cuda_device_or_skip() else { return };
     let broken = KERNELS_PTX.replace("add.f32 \t%f3, %f1, %f2;", "add.f32 \t%f3, %f1, %nope;");
-    let error = CudaProgram::load_ptx(Arc::clone(&dev), broken.as_bytes(), "vadd", &vadd_abi()).expect_err("bad PTX");
+    let error = CudaProgram::load_ptx(Arc::clone(&*dev), broken.as_bytes(), "vadd", &vadd_abi()).expect_err("bad PTX");
     let crate::Error::CudaJit { kernel, cause, log } = &error else { panic!("{error:?}") };
     assert_eq!(kernel, "vadd");
     assert!(cause.contains("CUDA_ERROR"), "{cause}");
     assert!(log.contains("nope") || log.contains("ptxas") || log.contains("error"), "{log}");
-    let error = CudaProgram::load_ptx(Arc::clone(&dev), KERNELS_PTX.as_bytes(), "not_there", &vadd_abi())
+    let error = CudaProgram::load_ptx(Arc::clone(&*dev), KERNELS_PTX.as_bytes(), "not_there", &vadd_abi())
         .expect_err("missing entry point");
     assert!(format!("{error}").contains("not_there"), "{error}");
-    let error = CudaProgram::load_ptx(Arc::clone(&dev), &[], "vadd", &vadd_abi()).expect_err("empty image");
+    let error = CudaProgram::load_ptx(Arc::clone(&*dev), &[], "vadd", &vadd_abi()).expect_err("empty image");
     assert!(matches!(error, crate::Error::CudaJit { .. }), "{error:?}");
     // ABI validation happens before any driver call.
-    let error = CudaProgram::load_ptx(dev, KERNELS_PTX.as_bytes(), "vadd", &[storage(1), storage(0)])
+    let error = CudaProgram::load_ptx(Arc::clone(&*dev), KERNELS_PTX.as_bytes(), "vadd", &[storage(1), storage(0)])
         .expect_err("unsorted slots");
     assert!(matches!(error, crate::Error::ProgramAbiMismatch { .. }), "{error:?}");
 }
@@ -196,15 +196,15 @@ fn jit_errors_carry_the_driver_log() {
 #[test]
 fn load_rejects_an_abi_that_disagrees_with_the_ptx_entry() {
     let Some(dev) = cuda_device_or_skip() else { return };
-    let short = CudaProgram::load_ptx(Arc::clone(&dev), KERNELS_PTX.as_bytes(), "vadd", &vadd_abi()[..2])
+    let short = CudaProgram::load_ptx(Arc::clone(&*dev), KERNELS_PTX.as_bytes(), "vadd", &vadd_abi()[..2])
         .expect_err("two ABI slots for a three-parameter entry");
     assert!(matches!(short, crate::Error::ProgramAbiMismatch { .. }), "{short:?}");
     assert!(format!("{short}").contains("3 parameters"), "{short}");
-    let widened = CudaProgram::load_ptx(Arc::clone(&dev), KERNELS_PTX.as_bytes(), "scale", &vadd_abi())
+    let widened = CudaProgram::load_ptx(Arc::clone(&*dev), KERNELS_PTX.as_bytes(), "scale", &vadd_abi())
         .expect_err("a 32-bit scalar described as an 8-byte buffer");
     assert!(matches!(widened, crate::Error::ProgramAbiMismatch { .. }), "{widened:?}");
     assert!(format!("{widened}").contains("parameter 2"), "{widened}");
-    assert!(CudaProgram::load_ptx(dev, KERNELS_PTX.as_bytes(), "scale", &scale_abi()).is_ok());
+    assert!(CudaProgram::load_ptx(Arc::clone(&*dev), KERNELS_PTX.as_bytes(), "scale", &scale_abi()).is_ok());
 }
 
 /// `(name, byte width)` of every `.param` of the named entry, across
@@ -335,8 +335,8 @@ fn cubin_is_told_from_ptx_by_the_elf_magic() {
 fn load_dispatches_on_the_image_format() {
     let Some(dev) = cuda_device_or_skip() else { return };
     let image = elf_header(object::elf::ELFCLASS64, object::elf::ELFDATA2LSB, object::elf::EM_CUDA);
-    let error = CudaProgram::load_cubin(Arc::clone(&dev), &image, "vadd", &vadd_abi()).expect_err("no entry");
+    let error = CudaProgram::load_cubin(Arc::clone(&*dev), &image, "vadd", &vadd_abi()).expect_err("no entry");
     assert!(format!("{error}").contains("no entry"), "{error}");
-    let error = CudaProgram::load_ptx(Arc::clone(&dev), &image, "vadd", &vadd_abi()).expect_err("NUL bytes");
+    let error = CudaProgram::load_ptx(Arc::clone(&*dev), &image, "vadd", &vadd_abi()).expect_err("NUL bytes");
     assert!(format!("{error}").contains("NUL"), "{error}");
 }

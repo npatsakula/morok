@@ -566,8 +566,8 @@ impl LruAllocator {
                 unsafe { std::ptr::write_bytes(contents.as_ptr(), 0, *size) };
                 Ok(true)
             }
-            // A device-side memset, ordered after in-flight readers by the drain
-            // inside `zero`; works for every CUDA memory kind.
+            // A device-side memset on the copy lane, ordered after the
+            // storage's in-flight producers; works for every CUDA memory kind.
             RawBuffer::Cuda { device_ptr, size, device, .. } => {
                 device.zero(*device_ptr, (*size).max(1))?;
                 Ok(true)
@@ -610,9 +610,12 @@ impl Allocator for LruAllocator {
             // in-flight kernels (`free` never drains). Fence on the storage's
             // recorded producers before handing it out — nearly free once
             // everything has retired.
-            if let RawBuffer::AmdDevice { gpu_addr, device, .. } = &buffer
-                && let Err(error) = device.core().wait_storage(*gpu_addr)
-            {
+            let fenced = match &buffer {
+                RawBuffer::AmdDevice { gpu_addr, device, .. } => device.core().wait_storage(*gpu_addr),
+                RawBuffer::Cuda { device_ptr, device, .. } => device.wait_storage(*device_ptr),
+                _ => Ok(()),
+            };
+            if let Err(error) = fenced {
                 self.inner.free(buffer, size, options);
                 return Err(error);
             }

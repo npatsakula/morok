@@ -389,8 +389,8 @@ impl Buffer {
                 let base = metal_host_ptr(device, *contents, self.offset)?;
                 Ok(unsafe { std::slice::from_raw_parts(base, self.size) })
             }
-            RawBuffer::Cuda { host_ptr, device, .. } => {
-                let base = cuda_host_ptr(device, *host_ptr, self.offset)?;
+            RawBuffer::Cuda { device_ptr, host_ptr, device, .. } => {
+                let base = cuda_host_ptr(device, *device_ptr, *host_ptr, self.offset)?;
                 Ok(unsafe { std::slice::from_raw_parts(base, self.size) })
             }
             RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
@@ -451,8 +451,8 @@ impl Buffer {
                 let base = metal_host_ptr(device, *contents, self.offset)?;
                 Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
             }
-            RawBuffer::Cuda { host_ptr, device, .. } => {
-                let base = cuda_host_ptr(device, *host_ptr, self.offset)?;
+            RawBuffer::Cuda { device_ptr, host_ptr, device, .. } => {
+                let base = cuda_host_ptr(device, *device_ptr, *host_ptr, self.offset)?;
                 Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
             }
             RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
@@ -500,8 +500,8 @@ impl Buffer {
                 let typed = unsafe { std::slice::from_raw_parts(bytes_ptr, count) };
                 ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
-            RawBuffer::Cuda { host_ptr, device, .. } => {
-                let bytes_ptr = cuda_host_ptr(device, *host_ptr, self.offset)? as *const T;
+            RawBuffer::Cuda { device_ptr, host_ptr, device, .. } => {
+                let bytes_ptr = cuda_host_ptr(device, *device_ptr, *host_ptr, self.offset)? as *const T;
                 let count = self.size / T::DTYPE.bytes();
                 let typed = unsafe { std::slice::from_raw_parts(bytes_ptr, count) };
                 ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
@@ -561,8 +561,8 @@ impl Buffer {
                 let typed = unsafe { std::slice::from_raw_parts_mut(bytes_ptr, count) };
                 ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
-            RawBuffer::Cuda { host_ptr: host_ptr @ Some(_), device, .. } => {
-                let bytes_ptr = cuda_host_ptr(device, *host_ptr, self.offset)? as *mut T;
+            RawBuffer::Cuda { device_ptr, host_ptr: host_ptr @ Some(_), device, .. } => {
+                let bytes_ptr = cuda_host_ptr(device, *device_ptr, *host_ptr, self.offset)? as *mut T;
                 let count = self.size / T::DTYPE.bytes();
                 let typed = unsafe { std::slice::from_raw_parts_mut(bytes_ptr, count) };
                 ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
@@ -600,8 +600,8 @@ impl Buffer {
                 let count = self.size / T::DTYPE.bytes();
                 Ok(unsafe { std::slice::from_raw_parts(bytes_ptr, count) })
             }
-            RawBuffer::Cuda { host_ptr: host_ptr @ Some(_), device, .. } => {
-                let bytes_ptr = cuda_host_ptr(device, *host_ptr, self.offset)? as *const T;
+            RawBuffer::Cuda { device_ptr, host_ptr: host_ptr @ Some(_), device, .. } => {
+                let bytes_ptr = cuda_host_ptr(device, *device_ptr, *host_ptr, self.offset)? as *const T;
                 let count = self.size / T::DTYPE.bytes();
                 Ok(unsafe { std::slice::from_raw_parts(bytes_ptr, count) })
             }
@@ -803,12 +803,14 @@ impl Buffer {
     }
 
     /// Record `token` as an in-flight producer/reader of this buffer's
-    /// storage for scoped host synchronization (see the AMD backend's
-    /// `wait_storage`). No-op on non-AMD storage and on storage that was
+    /// storage for scoped host synchronization (the AMD and CUDA
+    /// `wait_storage`). No-op on other backends and on storage that was
     /// never allocated (nothing can be in flight against it).
     pub fn record_completion(&self, token: &Arc<dyn crate::sync::CompletionToken>) {
-        if let Some(RawBuffer::AmdDevice { gpu_addr, device, .. }) = self.data.raw.get() {
-            device.core().record_producer(*gpu_addr, token);
+        match self.data.raw.get() {
+            Some(RawBuffer::AmdDevice { gpu_addr, device, .. }) => device.core().record_producer(*gpu_addr, token),
+            Some(RawBuffer::Cuda { device_ptr, device, .. }) => device.record_producer(*device_ptr, token),
+            _ => {}
         }
     }
 
@@ -885,16 +887,17 @@ impl Buffer {
     }
 }
 
-/// Host pointer into a managed or pinned CUDA allocation after draining the
-/// device (host access is not ordered against the plan streams); device-only
-/// allocations have no host side.
+/// Host pointer into a managed or pinned CUDA allocation after waiting the
+/// storage's in-flight producers and readers (host access is not ordered
+/// against the plan streams); device-only allocations have no host side.
 fn cuda_host_ptr(
     device: &Arc<crate::cuda::CudaDevice>,
+    device_ptr: u64,
     host_ptr: Option<std::ptr::NonNull<u8>>,
     offset: usize,
 ) -> Result<*mut u8> {
     let host_ptr = host_ptr.ok_or(crate::error::Error::NotCpuAccessible)?;
-    device.synchronize()?;
+    device.wait_storage(device_ptr)?;
     // SAFETY: the view offset is bounded by the allocation (`Buffer::view`).
     Ok(unsafe { host_ptr.as_ptr().add(offset) })
 }

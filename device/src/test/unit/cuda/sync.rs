@@ -89,8 +89,8 @@ fn timestamps_are_none_until_the_dispatch_retires() {
 #[test]
 fn completion_token_from_a_plain_event() {
     let Some(dev) = cuda_device_or_skip() else { return };
-    let stream = CudaStream::new(Arc::clone(&dev)).unwrap();
-    let token = crate::cuda::CudaCompletionToken::new(stream.record(false).unwrap());
+    let stream = CudaStream::new(Arc::clone(&*dev)).unwrap();
+    let token = stream.token().unwrap();
     token.wait(0).unwrap();
     assert!(token.retired());
     token.wait(5).unwrap();
