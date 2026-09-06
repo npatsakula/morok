@@ -1770,7 +1770,12 @@ pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &Prepar
 pub(crate) fn get_optimizer_renderer(device: &Device) -> svod_schedule::OptimizerRenderer {
     let renderer = match device.device {
         DeviceSpec::Cpu => svod_schedule::OptimizerRenderer::cpu(),
-        DeviceSpec::Cuda { .. } => svod_schedule::OptimizerRenderer::cuda(),
+        DeviceSpec::Cuda { .. } => device
+            .renderer
+            .gpu_arch()
+            .and_then(svod_dtype::GpuArch::cuda)
+            .map(svod_schedule::OptimizerRenderer::for_cuda_arch)
+            .unwrap_or_else(svod_schedule::OptimizerRenderer::cuda),
         DeviceSpec::Metal { .. } => device
             .renderer
             .gpu_arch()

@@ -322,7 +322,12 @@ pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<Co
     svod_runtime::ensure_thread_pool(svod_schedule::thread_budget());
     let optimizer_renderer = match device.device {
         DeviceSpec::Cpu => svod_schedule::OptimizerRenderer::cpu(),
-        DeviceSpec::Cuda { .. } => svod_schedule::OptimizerRenderer::cuda(),
+        DeviceSpec::Cuda { .. } => device
+            .renderer
+            .gpu_arch()
+            .and_then(svod_dtype::GpuArch::cuda)
+            .map(svod_schedule::OptimizerRenderer::for_cuda_arch)
+            .unwrap_or_else(svod_schedule::OptimizerRenderer::cuda),
         DeviceSpec::Metal { .. } => svod_schedule::OptimizerRenderer::metal(),
         DeviceSpec::Amd { .. } => device
             .renderer

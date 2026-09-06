@@ -988,6 +988,46 @@ fn test_matmul_m5_gfx1151_padded_wmma_amd() {
     }
 }
 
+/// Ampere+ tensor cores end to end on `CUDA:0`: an `in_dtype` matmul
+/// accumulating in f32 must lower through `mma.sync` (asserted on the rendered
+/// IR of the prepared plan) and match the f32 reference. The inputs are small
+/// integers, exact in f16 and bf16, so only accumulation order separates the
+/// GPU from the reference.
+#[test_case(DType::Float16, 0, "m16n8k16.row.col.f32.f32"; "f16")]
+#[test_case(DType::BFloat16, 1, "m16n8k16.row.col.bf16"; "bf16")]
+fn test_matmul_cuda_tensor_core_matches_reference(in_dtype: DType, tc_index: usize, intrinsic: &str) {
+    setup_test_tracing();
+    let Some(config) = PrepareConfig::for_cuda_if_available() else {
+        eprintln!("skipped: default device is not a CUDA GPU");
+        return;
+    };
+    let arch = crate::config::cuda_test_arch().expect("CUDA:0 is open");
+    if !arch.has_bf16_mma() {
+        eprintln!("skipped: {arch} has no m16n8k16 tensor cores");
+        return;
+    }
+    let size = 64;
+    let a_nd = Array2::from_shape_fn((size, size), |(m, k)| ((m * 7 + k) % 7) as f32 - 3.0);
+    let b_nd = Array2::from_shape_fn((size, size), |(k, n)| ((k * 5 + n) % 5) as f32 - 2.0);
+    let a = Tensor::from_ndarray(&a_nd).cast(in_dtype.clone()).unwrap();
+    let b = Tensor::from_ndarray(&b_nd).cast(in_dtype).unwrap();
+    let heuristics = HeuristicsConfig::builder().tc_select(TcSelect::Index(tc_index)).matvec_enabled(false).build();
+    let optimizer = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).heuristics(heuristics).build();
+    let config = PrepareConfig { optimizer, ..config };
+
+    let build = || a.matmul_with().other(&b).dtype(DType::Float32).call().unwrap();
+    let plan = build().prepare_with(&config).unwrap();
+    let mma = format!("@llvm.nvvm.mma.{intrinsic}(");
+    assert!(
+        plan.kernels().any(|kernel| kernel.code.contains(&mma)),
+        "the prepared plan must carry {mma}:\n{}",
+        plan.kernels().map(|kernel| kernel.code.as_str()).collect::<Vec<_>>().join("\n")
+    );
+    let mut c = build();
+    c.realize_with(&config).unwrap();
+    assert_matmul_close(&c.as_vec::<f32>().unwrap(), &a_nd.dot(&b_nd), 1e-3);
+}
+
 #[test]
 fn test_beam_search_matmul() {
     // Test beam search optimization for matmul - reproduces float vector index bug

@@ -30,7 +30,13 @@ use crate::launch::{Result, ToolchainUnavailableSnafu, UnsupportedArchSnafu};
 pub fn resolve_arch(spec: &DeviceSpec) -> Option<AmdArch> {
     match spec {
         DeviceSpec::Amd { device_id } => svod_device::registry::resolve_amd_arch_from_topology(*device_id).ok(),
-        _ => None,
+        // Tile kernels are AMD-only today: a CUDA or Metal GPU has an arch of
+        // its own but no `AmdArch`, so the gate reports `UnsupportedArch`.
+        DeviceSpec::Cuda { .. }
+        | DeviceSpec::Metal { .. }
+        | DeviceSpec::Cpu
+        | DeviceSpec::WebGpu
+        | DeviceSpec::Disk { .. } => None,
     }
 }
 

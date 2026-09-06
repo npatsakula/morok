@@ -5,7 +5,7 @@
 //! and provides tensor core configurations for hardware-accelerated matrix multiplication.
 
 use smallvec::SmallVec;
-use svod_dtype::{AmdArch, DType, MetalFamily, ScalarDType};
+use svod_dtype::{AmdArch, CudaArch, DType, MetalFamily, ScalarDType};
 use svod_ir::{RendererDevice, RendererOps, TypedPatternMatcher};
 
 /// Tensor core optimization operation.
@@ -317,7 +317,8 @@ impl Renderer {
         }
     }
 
-    /// Create a CUDA GPU renderer for SM89 (Hopper - H100).
+    /// Create a CUDA GPU renderer for SM89 (Ada - RTX 40xx, L4; the first
+    /// capability with fp8 `mma.sync`).
     pub fn cuda_sm89(allow_tf32: bool) -> Self {
         Self {
             device: RendererDevice::CudaSm89,
@@ -510,6 +511,22 @@ impl Renderer {
         renderer
     }
 
+    /// Select the CUDA optimizer profile for a compute capability, tinygrad's
+    /// `tc.get_cuda`: sm_80+ has the bf16 / tf32 shapes and `m16n8k16`, sm_75
+    /// the f16 `m16n8k8` core only, and anything older runs without tensor
+    /// cores. The sm_89 fp8 profile is withheld from every capability until
+    /// the NVPTX renderer lowers the `cvt.*.e4m3x2` conversions; its fp8
+    /// storage dtype would fail at render time today.
+    pub fn for_cuda_arch(arch: CudaArch) -> Self {
+        let sm = arch.sm();
+        let mut renderer = if arch.has_bf16_mma() { Self::cuda_sm80(false) } else { Self::cuda_sm75() };
+        if sm < 75 {
+            renderer.tensor_cores.clear();
+        }
+        renderer.target = Some(arch.to_string());
+        renderer
+    }
+
     /// Create an Intel Xe GPU renderer.
     pub fn intel_xe() -> Self {
         Self {
@@ -573,6 +590,9 @@ impl Renderer {
                 | RendererDevice::AmdRdna4
                 | RendererDevice::AmdCdna3
                 | RendererDevice::AmdCdna4 => "amd-decomposition-v1",
+                RendererDevice::CudaSm75 | RendererDevice::CudaSm80 | RendererDevice::CudaSm89 => {
+                    "nvptx-decomposition-v1"
+                }
                 _ => "backend-decomposition-v1",
             }
         } else {
@@ -585,6 +605,7 @@ impl Renderer {
                 | RendererDevice::AmdRdna4
                 | RendererDevice::AmdCdna3
                 | RendererDevice::AmdCdna4 => "llvm-amd-fp8-extra-v1",
+                RendererDevice::CudaSm75 | RendererDevice::CudaSm80 | RendererDevice::CudaSm89 => "llvm-nvptx-extra-v1",
                 _ => "backend-extra-v1",
             }
         } else {
