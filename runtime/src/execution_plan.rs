@@ -1501,8 +1501,7 @@ impl ExecutionPlan {
         // Tier-4: arm hardware counters on the plan's context when requested and
         // the backend supports it in a stable power state. Degrade gracefully
         // (no counters, a one-line note) rather than failing the run.
-        let counters = opts.counters.counters();
-        let armed_ctx = if counters.is_empty() {
+        let armed_ctx = if !opts.counters.is_enabled() {
             None
         } else {
             let first_program = self.op_levels.iter().flatten().find_map(|&idx| match &self.ops[idx] {
@@ -1511,13 +1510,18 @@ impl ExecutionPlan {
             });
             match first_program.and_then(|p| self.plan_ctx(p).ok().flatten()) {
                 Some(ctx) if ctx.pmc_available() => {
+                    // `Default` means whatever this backend collects; an explicit
+                    // list may name another backend's counters, which it drops.
+                    let counters = opts.counters.resolve(&ctx.pmc_default());
                     ctx.set_pmc(&counters);
-                    Some(ctx)
+                    (!counters.is_empty()).then_some(ctx)
                 }
                 Some(_) => {
                     eprintln!(
-                        "SVOD_PMC: hardware counters unavailable (needs a profile_standard \
-                         power state — run `amd-smi set -l stable_std`); reporting timing only"
+                        "SVOD_PMC: hardware counters unavailable on this device (AMD needs a \
+                         profile_standard power state — `amd-smi set -l stable_std`; NVIDIA needs \
+                         profiling unrestricted — `NVreg_RestrictProfilingToAdminUsers=0`); \
+                         reporting timing only"
                     );
                     None
                 }

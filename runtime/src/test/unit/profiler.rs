@@ -4,12 +4,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use svod_device::PmcCounter;
 use svod_device::device::Program;
 use svod_device::hcq::{
     DeviceQueue, QueueKind, QueueMergeLimits, SemanticLinkedPlan, TopologyOperation, TopologyOperationKind,
     TopologyResource, schedule_device_lanes,
 };
+use svod_device::{AmdCounter, CudaCounter, PmcCounter};
 use svod_dtype::DeviceSpec;
 use svod_ir::UOp;
 use svod_ir::origin::{self, Origin, OriginFrame, OriginId, SourceLocation};
@@ -21,13 +21,41 @@ use crate::profiler::{
     aggregate_origins, analyze_execution_lanes, has_origins, parse_pmc,
 };
 
+/// Every counter of every backend round-trips through its token, and tokens are
+/// unique across backends so `from_token` needs no device context.
 #[test]
 fn pmc_counter_token_roundtrip() {
-    for c in [PmcCounter::SqBusyCycles, PmcCounter::SqWaves, PmcCounter::SqInstsValu] {
+    let all: Vec<PmcCounter> = AmdCounter::all()
+        .into_iter()
+        .map(PmcCounter::Amd)
+        .chain(CudaCounter::all().into_iter().map(PmcCounter::Cuda))
+        .collect();
+    for &c in &all {
         assert_eq!(PmcCounter::from_token(c.token()), Some(c), "token roundtrip for {c:?}");
     }
+    let mut tokens: Vec<&str> = all.iter().map(|c| c.token()).collect();
+    tokens.sort_unstable();
+    let unique = tokens.len();
+    tokens.dedup();
+    assert_eq!(tokens.len(), unique, "counter tokens collide across backends");
+
     assert_eq!(PmcCounter::from_token("nope"), None);
-    assert_eq!(PmcCounter::from_token("BUSY"), Some(PmcCounter::SqBusyCycles), "case-insensitive alias");
+    assert_eq!(
+        PmcCounter::from_token("BUSY"),
+        Some(PmcCounter::Amd(AmdCounter::SqBusyCycles)),
+        "case-insensitive alias"
+    );
+}
+
+/// The CUPTI metric names carry the `.sum` rollup: `ConfigAddMetrics` rejects a
+/// bare base name.
+#[test]
+fn cuda_counter_metrics_are_rollups() {
+    for c in CudaCounter::all() {
+        let metric = c.metric();
+        assert!(metric.ends_with(".sum"), "{c:?} metric {metric} lacks a rollup suffix");
+        assert!(metric.contains("__"), "{c:?} metric {metric} is not a PerfWorks name");
+    }
 }
 
 /// `SVOD_PMC` parsing, and what each resulting selection enables. Counters are
@@ -35,6 +63,7 @@ fn pmc_counter_token_roundtrip() {
 /// rather than silently profiling nothing.
 #[test]
 fn pmc_selection_is_parsed_and_resolved() {
+    let backend: Vec<PmcCounter> = AmdCounter::all().into_iter().map(PmcCounter::Amd).collect();
     assert_eq!(ProfileOptions::default().counters, PmcSelection::None);
     assert_eq!(ProfileOptions::default().iters, 1);
     assert!(ProfileOptions::default().static_analysis);
@@ -43,15 +72,20 @@ fn pmc_selection_is_parsed_and_resolved() {
     assert_eq!(parse_pmc(""), PmcSelection::None);
     assert_eq!(parse_pmc("0"), PmcSelection::None);
     assert!(!PmcSelection::None.is_enabled());
-    assert!(PmcSelection::None.counters().is_empty());
+    assert!(PmcSelection::None.resolve(&backend).is_empty());
 
     assert_eq!(parse_pmc("1"), PmcSelection::Default);
     assert_eq!(parse_pmc("bogus"), PmcSelection::Default, "all-unknown tokens fall back to the default set");
     assert!(PmcSelection::Default.is_enabled());
-    assert_eq!(PmcSelection::Default.counters().len(), 3);
+    assert_eq!(PmcSelection::Default.resolve(&backend), backend, "Default takes the backend's set");
 
-    assert_eq!(parse_pmc("valu,waves"), PmcSelection::Custom(vec![PmcCounter::SqInstsValu, PmcCounter::SqWaves]));
-    assert_eq!(PmcSelection::Custom(vec![PmcCounter::SqInstsValu]).counters(), vec![PmcCounter::SqInstsValu]);
+    let valu = PmcCounter::Amd(AmdCounter::SqInstsValu);
+    let waves = PmcCounter::Amd(AmdCounter::SqWaves);
+    assert_eq!(parse_pmc("valu,waves"), PmcSelection::Custom(vec![valu, waves]));
+    assert_eq!(PmcSelection::Custom(vec![valu]).resolve(&backend), vec![valu], "an explicit list ignores the default");
+
+    // Tokens resolve across backends; the arming context drops what it cannot collect.
+    assert_eq!(parse_pmc("dram"), PmcSelection::Custom(vec![PmcCounter::Cuda(CudaCounter::DramBytes)]));
 }
 
 /// `SVOD_ORIGIN_DEPTH` parsing. Only a positive count is a depth: zero would key

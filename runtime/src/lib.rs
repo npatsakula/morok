@@ -69,4 +69,4 @@ pub use profiler::{
     OriginNodeExport, OriginView, PmcSelection, ProfileExport, ProfileOptions, RunProfile, StageExport, StageProfile,
     UNATTRIBUTED, aggregate_origins, aggregate_profiles, has_origins, render_histogram, render_origins,
 };
-pub use svod_device::{CounterSet, KernelResources, PmcCounter};
+pub use svod_device::{AmdCounter, CounterSet, CudaCounter, KernelResources, PmcCounter};

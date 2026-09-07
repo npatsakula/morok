@@ -7,11 +7,11 @@
 
 use std::collections::BTreeMap;
 
-/// A hardware performance counter selectable via PMC. The current set is the
-/// SQ block (gfx11/RDNA3.5), which answers the ILP/occupancy question: VALU
-/// instructions issued vs SQ-busy cycles, plus waves launched.
+/// An AMD hardware counter: the SQ block (gfx11/RDNA3.5), which answers the
+/// ILP/occupancy question: VALU instructions issued vs SQ-busy cycles, plus
+/// waves launched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum PmcCounter {
+pub enum AmdCounter {
     /// Cycles the shader sequencer (SQ) was busy.
     SqBusyCycles,
     /// Waves launched.
@@ -20,7 +20,7 @@ pub enum PmcCounter {
     SqInstsValu,
 }
 
-impl PmcCounter {
+impl AmdCounter {
     /// Short token used in `SVOD_PMC=…` selection and as a table header.
     pub fn token(self) -> &'static str {
         match self {
@@ -30,19 +30,95 @@ impl PmcCounter {
         }
     }
 
-    /// Parse a `SVOD_PMC` token; unknown tokens return `None`.
-    pub fn from_token(s: &str) -> Option<Self> {
-        Some(match s.trim().to_ascii_lowercase().as_str() {
-            "sqbusy" | "busy" => Self::SqBusyCycles,
-            "waves" => Self::SqWaves,
-            "valu" => Self::SqInstsValu,
-            _ => return None,
-        })
+    /// Every AMD counter, in table order.
+    pub fn all() -> [AmdCounter; 3] {
+        [Self::SqBusyCycles, Self::SqWaves, Self::SqInstsValu]
+    }
+}
+
+/// A CUDA hardware counter, collected through the CUPTI range profiler. The set
+/// covers issue rate, launch geometry, tensor-pipe residency and DRAM traffic —
+/// enough to place a kernel on the roofline. All of them schedule in one pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CudaCounter {
+    /// Cycles with at least one warp resident on an SM.
+    SmCyclesActive,
+    /// Warps launched.
+    SmWarpsLaunched,
+    /// Warp instructions executed.
+    SmspInstExecuted,
+    /// Cycles the tensor pipe was active.
+    SmPipeTensorCyclesActive,
+    /// Bytes moved through DRAM.
+    DramBytes,
+}
+
+impl CudaCounter {
+    /// Short token used in `SVOD_PMC=…` selection and as a table header.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::SmCyclesActive => "cycles",
+            Self::SmWarpsLaunched => "warps",
+            Self::SmspInstExecuted => "inst",
+            Self::SmPipeTensorCyclesActive => "tensor",
+            Self::DramBytes => "dram",
+        }
     }
 
-    /// All implemented counters (the default selection).
-    pub fn all() -> [PmcCounter; 3] {
-        [Self::SqBusyCycles, Self::SqWaves, Self::SqInstsValu]
+    /// The CUPTI metric name. The `.sum` rollup is required: `ConfigAddMetrics`
+    /// rejects a bare base name.
+    pub fn metric(self) -> &'static str {
+        match self {
+            Self::SmCyclesActive => "sm__cycles_active.sum",
+            Self::SmWarpsLaunched => "sm__warps_launched.sum",
+            Self::SmspInstExecuted => "smsp__inst_executed.sum",
+            Self::SmPipeTensorCyclesActive => "sm__pipe_tensor_cycles_active.sum",
+            Self::DramBytes => "dram__bytes.sum",
+        }
+    }
+
+    /// Every CUDA counter, in table order.
+    pub fn all() -> [CudaCounter; 5] {
+        [
+            Self::SmCyclesActive,
+            Self::SmWarpsLaunched,
+            Self::SmspInstExecuted,
+            Self::SmPipeTensorCyclesActive,
+            Self::DramBytes,
+        ]
+    }
+}
+
+/// A hardware performance counter selectable via PMC. Counters are
+/// backend-specific; a selection may name counters the running backend does not
+/// implement, and those are dropped when the counters are armed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PmcCounter {
+    Amd(AmdCounter),
+    Cuda(CudaCounter),
+}
+
+impl PmcCounter {
+    /// Short token used in `SVOD_PMC=…` selection and as a table header. Tokens
+    /// are unique across backends, so [`from_token`](Self::from_token) needs no
+    /// device context.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Amd(c) => c.token(),
+            Self::Cuda(c) => c.token(),
+        }
+    }
+
+    /// Parse a `SVOD_PMC` token; unknown tokens return `None`.
+    pub fn from_token(s: &str) -> Option<Self> {
+        let lowered = s.trim().to_ascii_lowercase();
+        // `busy` is a legacy alias for the AMD SQ busy-cycles counter.
+        let token = if lowered == "busy" { "sqbusy" } else { lowered.as_str() };
+        AmdCounter::all()
+            .into_iter()
+            .map(Self::Amd)
+            .chain(CudaCounter::all().into_iter().map(Self::Cuda))
+            .find(|c| c.token() == token)
     }
 }
 

@@ -9,7 +9,7 @@ use crate::allocator::RawBuffer;
 use crate::amd::connector::SubmissionFinalizer;
 use crate::amd::pmc::{PmcGrid, PmcHandle, build_streams, readback_bytes};
 use crate::error::Error;
-use crate::profile::PmcCounter;
+use crate::profile::AmdCounter;
 use std::sync::Arc;
 
 #[test]
@@ -25,7 +25,7 @@ fn readback_sizing() {
 #[test]
 fn build_streams_resolves_all_registers_within_the_dispatch_budget() {
     let grid = PmcGrid { se: 2, sa: 2, wgp: 5 };
-    let (start, read) = build_streams(&PmcCounter::all(), &grid, 0x1_0000);
+    let (start, read) = build_streams(&AmdCounter::all(), &grid, 0x1_0000);
     assert!(!start.is_empty(), "start stream programs SELECTs + CTRL");
     assert!(!read.is_empty(), "read stream copies counters out");
     assert!(start.len() + read.len() < 900, "pmc streams = {} dwords", start.len() + read.len());

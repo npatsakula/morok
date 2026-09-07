@@ -226,6 +226,12 @@ pub trait PlanContext: Send + Sync {
     fn pmc_available(&self) -> bool {
         false
     }
+
+    /// The counters [`set_pmc`](Self::set_pmc) collects for a caller that asked
+    /// for the default selection. Empty on backends without PMC.
+    fn pmc_default(&self) -> Vec<crate::profile::PmcCounter> {
+        Vec::new()
+    }
 }
 
 /// Why an execution plan could not use backend-native linked replay.

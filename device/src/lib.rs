@@ -50,7 +50,7 @@ pub use device::{
 };
 pub use error::{Error, Result};
 pub use inprocess::claim_inprocess_llvm;
-pub use profile::{CounterSet, KernelResources, PmcCounter};
+pub use profile::{AmdCounter, CounterSet, CudaCounter, KernelResources, PmcCounter};
 pub use sync::{CompletionToken, CpuTimelineSignal, DispatchTimestamps, TimelineSignal};
 
 #[cfg(test)]

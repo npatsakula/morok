@@ -321,19 +321,19 @@ pub enum PmcSelection {
     /// No hardware counters (Tiers 1–3 only).
     #[default]
     None,
-    /// The default set, [`PmcCounter::all`]: SQ busy cycles, waves launched, and
-    /// VALU instructions issued.
+    /// The running backend's default set (`PlanContext::pmc_default`).
     Default,
     /// An explicit counter list.
     Custom(Vec<PmcCounter>),
 }
 
 impl PmcSelection {
-    /// Resolve to the concrete counter list (empty when disabled).
-    pub fn counters(&self) -> Vec<PmcCounter> {
+    /// Resolve to the concrete counter list, taking `backend_default` for
+    /// [`Default`](Self::Default). Empty when disabled.
+    pub fn resolve(&self, backend_default: &[PmcCounter]) -> Vec<PmcCounter> {
         match self {
             Self::None => Vec::new(),
-            Self::Default => PmcCounter::all().to_vec(),
+            Self::Default => backend_default.to_vec(),
             Self::Custom(v) => v.clone(),
         }
     }
