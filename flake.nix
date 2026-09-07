@@ -41,7 +41,7 @@
 
         treefmt = treefmtSrc.lib.evalModule pkgs ./nix/treefmt.nix;
 
-        llvm = pkgs.llvmPackages_21;
+        llvm = pkgs.llvmPackages_22;
         stdenv = llvm.stdenv;
         mkShell = pkgs.mkShell.override { inherit stdenv; };
         crane' = (crane.mkLib pkgs).overrideToolchain (pkgs.rust_stable);
@@ -79,12 +79,12 @@
           libxml2
           z3
           zlib
-          clang
+          llvm.clang
         ];
 
         commonArgs = {
           inherit src nativeBuildInputs;
-          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib/";
+          LIBCLANG_PATH = "${llvm.libclang.lib}/lib/";
           ONNX_TEST_DATA = "${onnxTestData}/onnx/backend/test/data";
           # cc-wrapper appends NIX_HARDENING_ENABLE flags to *every* clang call,
           # including the runtime `clang --target=amdgcn-amd-amdhsa` cross-compile
