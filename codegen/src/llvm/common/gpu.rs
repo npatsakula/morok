@@ -14,7 +14,7 @@ use super::{RenderContext, ldt};
 
 /// Parse a SPECIAL axis name: `'g'/'l'/'i'` prefix + 0/1/2 axis suffix.
 ///
-/// Matches `device::ProgramSpec::special_launch_axis` (`device/src/device.rs`),
+/// Matches the names `schedule/src/gpudims.rs` mints (`gidx{i}` / `lidx{i}`),
 /// which is the producer side for these strings.
 pub fn parse_special_axis(name: &str) -> Option<(char, u8)> {
     let prefix = name.chars().next()?;
@@ -32,23 +32,27 @@ pub fn parse_special_axis(name: &str) -> Option<(char, u8)> {
 /// Hardware dimension letter of a SPECIAL axis index.
 pub const AXIS_LETTERS: [char; 3] = ['x', 'y', 'z'];
 
-/// Upper bound on the work-group size: the product of the `l` SPECIAL bounds
-/// (`1` for a kernel without local axes). Tinygrad `llvmir.py:259-263`; both
-/// GPU backends hand this to the compiler so it sizes registers / scratch for
-/// the real launch shape (`amdgpu-flat-work-group-size`, `nvvm.maxntid`).
-pub fn max_local_threads(nodes: &[Arc<UOp>]) -> u64 {
-    nodes
-        .iter()
-        .filter_map(|n| match n.op() {
-            Op::Special(ops::Special { name, end }) if name.starts_with('l') => match end.vmax() {
-                svod_ir::ConstValue::Int(v) => Some(*v as u64),
-                svod_ir::ConstValue::UInt(v) => Some(*v),
-                _ => None,
-            },
-            _ => None,
-        })
-        .product::<u64>()
-        .max(1)
+/// Upper bound on the work-group size per hardware axis: the `l` SPECIAL
+/// bounds (`[1, 1, 1]` for a kernel without local axes). Tinygrad
+/// `llvmir.py:259-263`; both GPU backends hand this to the compiler so it
+/// sizes registers / scratch for the real launch shape
+/// (`amdgpu-flat-work-group-size`, `nvvm.maxntid`). `None` when a bound is
+/// not a constant: the compiler then keeps its hardware maximum, since a
+/// bound the launch exceeds is a launch failure, not a hint.
+pub fn local_bounds(nodes: &[Arc<UOp>]) -> Option<[u64; 3]> {
+    let mut bounds = [1u64; 3];
+    for node in nodes {
+        if let Op::Special(ops::Special { name, end }) = node.op()
+            && let Some(('l', axis)) = parse_special_axis(name)
+        {
+            bounds[axis as usize] = match end.vmax() {
+                svod_ir::ConstValue::Int(v) => *v as u64,
+                svod_ir::ConstValue::UInt(v) => *v,
+                _ => return None,
+            };
+        }
+    }
+    Some(bounds)
 }
 
 /// LOCAL BUFFER → addrspace(3) module-level global, exposed to the body as a

@@ -144,13 +144,14 @@ fn nvptx_special_emits_ctaid_and_tid_sregs() {
         "tail call i32 @llvm.nvvm.read.ptx.sreg.tid.y()",
         "declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()",
         "declare i32 @llvm.nvvm.read.ptx.sreg.tid.y()",
-        // The local bound (4), not the global one, sets the launch bound.
-        "\"nvvm.maxntid\"=\"4\"",
+        // The local bound (4 on the y axis), not the global one, sets the
+        // per-axis launch bound.
+        "\"nvvm.maxntid\"=\"1,4\"",
     ] {
         assert!(result.code.contains(needle), "missing {needle}:\n{}", result.code);
     }
     if let Some(ptx) = assert_ptx_compiles(&result.code, SM86) {
-        for needle in ["%ctaid.x", "%tid.y", ".maxntid 4"] {
+        for needle in ["%ctaid.x", "%tid.y", ".maxntid 1, 4"] {
             assert!(ptx.contains(needle), "missing {needle}:\n{ptx}");
         }
     }
@@ -461,6 +462,29 @@ fn nvptx_shfl_moves_a_packed_half_pair_as_one_word() {
     assert_ptx_compiles(&rendered.code, SM86);
 }
 
+/// A packed byte pair (`<2 x i8>`, an int8 fragment half-word) reinterprets
+/// as one `i16` before widening; an elementwise widen would hand the
+/// intrinsic a `<2 x i32>`.
+#[test]
+fn nvptx_shfl_moves_a_packed_byte_pair_as_one_word() {
+    let pair = load(0, DType::Int16).bitcast(DType::Int8.vec(2).unwrap());
+    let shuffled = shfl_down(&pair, &UOp::native_const(1i32));
+    let out = indexed(1, DType::Int8, UOp::native_const(0i32)).store(shuffled);
+    let rendered = render_raw(UOp::sink(vec![out]), SM86, "nvptx_shfl_bytes").expect("render");
+    for needle in [
+        "bitcast <2 x i8> %",
+        "to i16",
+        "zext i16 %",
+        "call i32 @llvm.nvvm.shfl.sync.down.i32(i32 -1, i32 %",
+        "trunc i32 %",
+        "to <2 x i8>",
+    ] {
+        assert!(rendered.code.contains(needle), "missing {needle}:\n{}", rendered.code);
+    }
+    assert!(!rendered.code.contains("<2 x i32>"), "{}", rendered.code);
+    assert_ptx_compiles(&rendered.code, SM86);
+}
+
 /// A `STACK` of lanes is shaped, not packed: its casts are elementwise.
 #[test]
 #[should_panic(expected = "split a shaped")]
@@ -496,10 +520,16 @@ fn nvvm_builders_are_rejected_on_other_targets(renderer: LlvmTextRenderer, targe
 }
 
 /// The ISA pin follows the arch: 7.8 everywhere the profiles select only
-/// f16/bf16/tf32/int8 shapes, 8.4 where fp8 `mma.sync` exists.
+/// f16/bf16/tf32/int8 shapes, 8.4 where fp8 `mma.sync` exists, and the ISA
+/// that introduced each Blackwell target (clang refuses an older one).
 #[test_case::test_case(SM75, "+ptx78"; "turing")]
 #[test_case::test_case(SM86, "+ptx78"; "ampere")]
 #[test_case::test_case(SM89, "+ptx84"; "ada has fp8")]
+#[test_case::test_case(CudaArch::from_compute_capability(9, 0), "+ptx84"; "hopper")]
+#[test_case::test_case(CudaArch::from_compute_capability(10, 0), "+ptx86"; "blackwell b100")]
+#[test_case::test_case(CudaArch::from_compute_capability(10, 3), "+ptx88"; "blackwell b300")]
+#[test_case::test_case(CudaArch::from_compute_capability(12, 0), "+ptx87"; "blackwell rtx 50")]
+#[test_case::test_case(CudaArch::from_compute_capability(12, 1), "+ptx88"; "blackwell dgx spark")]
 fn clang_flags_pin_the_ptx_isa_per_arch(arch: CudaArch, feature: &str) {
     let flags = crate::llvm::nvptx::clang_flags(arch);
     assert_eq!(&flags[..2], ["-x", "ir"]);

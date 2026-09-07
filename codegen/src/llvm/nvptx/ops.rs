@@ -192,10 +192,12 @@ pub fn shfl(mode: ShflMode, value: &Arc<UOp>, lane: &Arc<UOp>) -> Arc<UOp> {
     let dtype = value.dtype();
     assert_eq!(value_width(value), dtype.vcount(), "shfl moves one register: split a shaped {dtype:?} value per lane");
     // The integer type carrying the value's bits; 16-bit ones widen from it.
+    // A 16-bit integer widens as itself; a float or a packed byte pair
+    // reinterprets as `i16` first (elementwise casts would keep the pair).
     let bits = match dtype.bytes() {
         4 => DType::Int32,
-        2 if dtype.is_float() => DType::UInt16,
-        2 => dtype.clone(),
+        2 if !dtype.is_float() && dtype.vcount() == 1 => dtype.clone(),
+        2 => DType::UInt16,
         bytes => panic!("shfl moves one 32-bit register; {dtype:?} is {bytes} bytes"),
     };
     let suffix = mode.suffix();

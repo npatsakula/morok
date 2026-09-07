@@ -22,10 +22,19 @@ pub use ops::{ShflMode, globaltimer, render_uop, shfl, shfl_bfly, shfl_down, shf
 /// The PTX ISA the emitted module declares, hence the oldest driver that
 /// JITs it: 7.8 (CUDA 11.8 / R520) carries every `mma.sync` shape the
 /// profiles select up to sm_90; the fp8 shapes of sm_89 and newer exist from
-/// 8.4 (CUDA 12.4 / R550). Pinned rather than left to clang, whose default
-/// follows whatever CUDA toolkit it finds (none: too old for any tensor core).
+/// 8.4 (CUDA 12.4 / R550); each Blackwell target then needs the ISA that
+/// introduced it (8.6 for sm_100/101, 8.7 for sm_120, 8.8 for sm_103/121),
+/// and anything newer the latest one clang knows. Pinned rather than left to
+/// clang, whose default follows whatever CUDA toolkit it finds (none: too old
+/// for any tensor core).
 pub fn ptx_isa(arch: svod_dtype::CudaArch) -> u32 {
-    if arch.has_fp8() { 84 } else { 78 }
+    match (arch.major, arch.minor) {
+        (10, 0..=2) => 86,
+        (12, 0) => 87,
+        (10.., _) => 88,
+        _ if arch.has_fp8() => 84,
+        _ => 78,
+    }
 }
 
 /// Clang flags compiling rendered IR on stdin to PTX text on stdout for

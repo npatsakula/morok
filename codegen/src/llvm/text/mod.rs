@@ -19,7 +19,7 @@ use svod_ir::{Op, prelude::*};
 
 use crate::common::{collect_abi_params, is_output_buffer};
 use crate::llvm::amd;
-use crate::llvm::common::gpu::max_local_threads;
+use crate::llvm::common::gpu::local_bounds;
 use crate::llvm::common::{LlvmTarget, RenderContext, ldt};
 use crate::llvm::cpu;
 use crate::llvm::nvptx;
@@ -556,16 +556,23 @@ fn build_function_attributes(target: &LlvmTarget, nodes: &[Arc<UOp>]) -> String 
         LlvmTarget::Amd(_) => format!(
             "alwaysinline nounwind \"no-builtins\" \"amdgpu-flat-work-group-size\"=\"1,{}\" \
              \"no-trapping-math\"=\"true\"",
-            max_local_threads(nodes)
+            local_bounds(nodes).map_or(1024, |bounds| bounds.iter().product::<u64>())
         ),
         // `nvvm.maxntid` is the PTX `.maxntid` launch bound: ptxas budgets
         // registers per thread against it instead of the 1024-thread worst
-        // case. Older LLVMs ignore the unknown string attribute (they only read
-        // the `!nvvm.annotations` form), which merely costs the hint.
-        LlvmTarget::Nvptx(_) => format!(
-            "nounwind \"no-builtins\" \"no-trapping-math\"=\"true\" \"nvvm.maxntid\"=\"{}\"",
-            max_local_threads(nodes)
-        ),
+        // case. It is per axis (`.maxntid nx, ny, nz`, the rest defaulting to
+        // 1), so a 2-D block is declared as such rather than as a flat product
+        // ptxas could take as `(n, 1, 1)`. Older LLVMs ignore the unknown
+        // string attribute (they only read the `!nvvm.annotations` form),
+        // which merely costs the hint.
+        LlvmTarget::Nvptx(_) => match local_bounds(nodes) {
+            Some(bounds) => {
+                let used = bounds.iter().rposition(|&bound| bound > 1).map_or(1, |last| last + 1);
+                let list = bounds[..used].iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+                format!("nounwind \"no-builtins\" \"no-trapping-math\"=\"true\" \"nvvm.maxntid\"=\"{list}\"")
+            }
+            None => "nounwind \"no-builtins\" \"no-trapping-math\"=\"true\"".to_string(),
+        },
     }
 }
 
