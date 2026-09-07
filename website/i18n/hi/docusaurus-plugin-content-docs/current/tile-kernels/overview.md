@@ -115,7 +115,7 @@ end to end ट्रेस करता है।
 3. **[IR में authoring](./lowering)** — एक `tk` कर्नेल कैसे UOps में बदलता है और
    lazy graph में शामिल होता है।
 4. **[एक कर्नेल लिखना](./first-kernel)** — सबसे सरल कर्नेल को step by step author और run करना।
-5. **[Wave32 बनाम Wave64](./wave-portability)** — एक ही कर्नेल को दो AMD architectures पर correct रखना।
+5. **[Wave32 बनाम Wave64](./wave-portability)** — एक ही कर्नेल को AMD की दो wave चौड़ाइयों और NVIDIA के warp32 पर correct रखना।
 6. **[Flash Attention](./flash-attention)** — वह worked example जिसने इस सबकी नींव रखी।
 7. **[डीबगिंग](./debugging)** — कर्नेल को हाथ से run और verify करना।
 8. **[Profiling और Benchmarking](./profiling)** — किसी भी `Tensor` या `ExecutionPlan` के लिए, layered

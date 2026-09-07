@@ -23,6 +23,7 @@ numbers बिल्कुल कचरा निकलते हैं — न 
 |--------------|---------|-----------|-----------|
 | **CDNA** | gfx942 (datacenter) | MFMA | **wave64** — 64 lanes |
 | **RDNA** | gfx1151 (RDNA3.5) | WMMA | **wave32** — 32 lanes |
+| **CUDA** | sm_80+ (Ampere और उसके बाद) | `mma.sync` | **warp32** — 32 lanes |
 
 बस यही एक number है जिसका असर हर चीज़ पर पड़ता है। एक `16×16` tile में 256 elements होते हैं। 64 lanes में
 बाँटें तो प्रति lane 4 elements; 32 lanes में बाँटें तो 8। अलग-अलग lanes अलग-अलग elements की मालिक होती हैं।
@@ -71,17 +72,19 @@ backends भेजता है, `cdna4` (wave64) और `udna1` (wave32), ज�
 जो एक value को पूरी wave भर में sum करने के काम आता है — एक hardcoded wave64 reduction tree के साथ लिखा गया
 था। RDNA की 32-lane waves पर इसने उन lanes पर reduce कर दिया जो हिस्सा ही नहीं लेतीं, और ठीक उन्हीं
 softmax-style reductions के लिए ग़लत sums निकाल दिए जिन पर attention टिका है। हल था — reduction को किसी
-constant से नहीं, बल्कि `caps.wave_size` और role-resolved fragment से चलाना। अब `tk/src/group.rs` में
+constant से नहीं, बल्कि `caps.wave_size` और role-resolved fragment से चलाना। अब `tk/src/group/shuffle.rs` में
 shuffle primitives wave size पढ़ते हैं; पूरी bug class को design से ही बाहर कर दिया गया।
 
 :::tip GPU विशेषज्ञों के लिए
 `ArchCaps` (`tk/src/arch.rs`) पर दो capability methods अधिकांश wave-specific बोझ संभालती हैं:
 
-- **`reduce_tree()`** cross-lane sibling-fold offsets लौटाता है। wave64 पर यह `[16, 32, 48]` होता है
-  (4 sub-fragments को fold करने के लिए तीन xor steps); wave32 पर यह `[16]` है (एक step)। Cross-lane
-  reductions इसी list पर iterate करती हैं — इसे `caps` से लें, कभी hardcode न करें।
+- **fragment का `LaneMap`** fold को साथ लाता है। कोई reduction अपना tree resolve हुए fragment से पढ़ती
+  है (`tk/src/group/reduce.rs` में `src.base.map.tree(...)`), किसी constant से नहीं: wave64 पर वह 4
+  sub-fragments को fold करते तीन xor steps `[16, 32, 48]` हैं, RDNA के wave32 पर एक step `[16]`, और
+  CUDA के `MmaSync` layout पर `[1, 2]` पर एक butterfly। `ArchCaps::reduce_tree()` अब भी मौजूद है, पर
+  अब वह सिर्फ़ graph-shape tests वाला AMD रूप है।
 - **`acc_reusable_as_input()`** यह जवाब देता है: "क्या एक matrix accumulator को सीधे अगले multiply के
-  operand के रूप में वापस feed किया जा सकता है?" CDNA पर यह `true` है — layouts मेल खाते हैं, इसलिए यह बिना
+  operand के रूप में वापस feed किया जा सकता है?" CDNA और CUDA पर यह `true` है — layouts मेल खाते हैं, इसलिए यह बिना
   किसी अलग लागत के एक register copy है। RDNA पर यह `false` है — accumulator और operand layouts अलग होते हैं,
   इसलिए value relayout के लिए LDS से होकर एक round-trip करती है। [Flash Attention](./flash-attention) इस
   बँटवारे को अपने दो matmuls के बीच handle करता है।

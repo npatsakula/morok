@@ -122,10 +122,16 @@ f32 累加器以 `float` 传递；聚合结果会被重新组装回 WMMA 天然�
 `declare` 行由每个调用点的操作数类型合成而来
 （`wmma_declaration_from_call`），与 AMD 的 WMMA/MFMA intrinsic 是同一套机制。
 
-两个面向带类型 `CUSTOM` 节点的 warp 级构造器补全了这一套：
-`shfl_bfly(value, lane_mask)`（`llvm.nvvm.shfl.sync.bfly.i32`，warp 归约的
-蝶形步）与 `globaltimer()`（`llvm.nvvm.read.ptx.sreg.globaltimer`，纳秒级的
-GPU 时钟）。
+另外两族带类型 `CUSTOM` 节点补全了这一套。warp 构造器是 `shfl` 及其四种模式
+——`shfl_bfly(value, lane_mask)`（`llvm.nvvm.shfl.sync.bfly.i32`，warp 归约的
+蝶形步）、`shfl_idx`、`shfl_up` 与 `shfl_down`——外加 `globaltimer()`
+（`llvm.nvvm.read.ptx.sreg.globaltimer`，纳秒级的 GPU 时钟）。
+
+共享内存构造器（`codegen/src/llvm/nvptx/smem.rs`）正是让 tile 内核能像在 AMD
+上那样借 `.shared` 中转的东西：`ldmatrix`（sm_75+）直接按 `mma.sync` 期望的
+寄存器布局载入一块矩阵片段，而 `cp_async` / `cp_async_16`（sm_80+）把
+global → shared 的拷贝绕开寄存器，再用 `cp_async_commit`、`cp_async_wait` 和
+`cp_async_wait_all` 提交与等待。`CpAsyncCache` 为每个 module 只保留一份声明。
 
 ---
 

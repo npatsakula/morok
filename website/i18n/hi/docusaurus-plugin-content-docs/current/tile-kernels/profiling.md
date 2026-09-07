@@ -40,7 +40,7 @@ flowchart TD
 |------|-----------------|--------|------------------|
 | **1 — device time** | हर कर्नेल का GPU execution time | GPU-clock dispatch timestamps | हाँ |
 | **2 — roofline** | derived **GFLOP/s** और **GB/s** | कर्नेल के IR से FLOP estimate; bytes plan के buffers से | हाँ (rates के लिए time चाहिए) |
-| **3 — static occupancy** | VGPR / SGPR / LDS / scratch usage और VGPR-limited **occupancy %** | AMD kernel descriptor से decoded | नहीं — pure static decode |
+| **3 — static occupancy** | VGPR / SGPR / LDS / scratch usage और **occupancy %** | AMD: kernel descriptor से decoded। CUDA: `cuFuncGetAttribute` और driver का अपना occupancy calculator | नहीं — pure static decode |
 | **4 — hardware counters (PMC)** | AMD: SQ busy cycles, waves, VALU instructions. CUDA: SM cycles, warps, instructions, tensor-pipe cycles, DRAM bytes | AMD: PM4 packets, grid भर में summed. CUDA: CUPTI range profiler | हाँ, और counters unlocked होने चाहिए |
 
 कुछ बातें जानने लायक़:

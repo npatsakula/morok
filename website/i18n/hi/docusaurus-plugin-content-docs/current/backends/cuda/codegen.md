@@ -124,10 +124,17 @@ vector में फिर से जोड़ दिया जाता है�
 से synthesize होती हैं (`wmma_declaration_from_call`), वही mechanism जो AMD WMMA/MFMA
 intrinsics का है।
 
-Typed `CUSTOM` nodes के लिए दो warp-level builders इस set को पूरा करते हैं:
-`shfl_bfly(value, lane_mask)` (`llvm.nvvm.shfl.sync.bfly.i32`, एक warp reduction का
-butterfly step) और `globaltimer()` (`llvm.nvvm.read.ptx.sreg.globaltimer`, nanosecond GPU
-clock)।
+Typed `CUSTOM` nodes के दो और परिवार इस set को पूरा करते हैं। Warp builders हैं `shfl` और उसके
+चार modes — `shfl_bfly(value, lane_mask)` (`llvm.nvvm.shfl.sync.bfly.i32`, एक warp reduction का
+butterfly step), `shfl_idx`, `shfl_up` और `shfl_down` — तथा `globaltimer()`
+(`llvm.nvvm.read.ptx.sreg.globaltimer`, nanosecond GPU clock)।
+
+Shared-memory builders (`codegen/src/llvm/nvptx/smem.rs`) वही हैं जो एक tile kernel को `.shared`
+से होकर stage करने देते हैं, ठीक जैसे AMD पर: `ldmatrix` (sm_75+) एक matrix fragment को सीधे उसी
+register layout में load करता है जिसकी `mma.sync` अपेक्षा करता है, और `cp_async` / `cp_async_16`
+(sm_80+) global → shared copy को registers से बचाकर करते हैं, जिन्हें `cp_async_commit`,
+`cp_async_wait` और `cp_async_wait_all` से commit और await किया जाता है। `CpAsyncCache` हर module
+के लिए एक ही declaration रखता है।
 
 ---
 

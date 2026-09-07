@@ -17,7 +17,6 @@ sidebar_label: Ограничения и дорожная карта
 | **Преобразования fp8** | Каст в `FP8E4M3` / `FP8E5M2` или из них падает на рендеринге (`NVPTX fp8 cast ...`); интринсики `cvt.*.e4m3x2` для sm_89 не выдаются. Строки fp8 `mma.sync` в `resolve_mma` есть, но накормить их нечем. | `codegen/src/llvm/nvptx/ops.rs` |
 | **Синхронизация с областью видимости** | Чтения и записи с хоста дренируют весь контекст (`cuCtxSynchronize` в `_copyin` / `_copyout`) вместо ожидания только производителей буфера. Планы и графы при этом выдают `CompletionToken`'ы на основе событий. | `device/src/cuda/allocator.rs` |
 | **Копии peer-to-peer** | `cuMemcpyPeerAsync` / `cuDeviceCanAccessPeer` не привязаны. Копия `CUDA:0 → CUDA:1` идёт в исполнителе по `SyncStrategy::PeerToPeer`, который откатывается к `Buffer::copy_from`; два аллокатора — это два устройства, так что байты проходят через хостовый `Vec`. | `runtime/src/executor.rs`, `device/src/buffer.rs` |
-| **Tile-ядра (`tk`)** | Только AMD: `resolve_arch` не даёт `AmdArch` для CUDA-спецификации, поэтому запуск `tk` сообщает `UnsupportedArch`. | `tk/src/target.rs` |
 | **Динамическая разделяемая память** | Запуски передают `shared_mem_bytes = 0`; используется только статический `.shared`, а `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` никогда не вызывается, так что ядро, которому нужно больше дефолтного лимита на блок, падает на JIT. Фабрика устройств заранее отказывает устройству, чей лимит ниже `shared_max` профиля (48 КиБ). | `device/src/cuda/program.rs`, `runtime/src/devices/cuda.rs` |
 | **Матричные пути Hopper / Blackwell** | Опускается только `mma.sync` (`m16n8kK`); ни `wgmma`, ни `tcgen05`. | `codegen/src/llvm/nvptx/wmma.rs` |
 | **Предассемблированные объекты** | Кэш объектов хранит текст PTX; каждая свежая загрузка платит за JIT драйвера (который драйвер кэширует в `~/.nv/ComputeCache`). Предассемблирование через `ptxas` (`object_format: cubin`) не подключено. | `runtime/src/devices/cuda.rs` |
@@ -53,5 +52,5 @@ sidebar_label: Ограничения и дорожная карта
    стали достижимы.
 4. **Предассемблирование через `ptxas`**, когда тулкит присутствует, с
    кэшированием в виде cubin.
-5. **Динамическая разделяемая память** через `cuFuncSetAttribute`, и `tk`
-   поверх `GpuArch`, чтобы tile-ядра работали на CUDA.
+5. **Динамическая разделяемая память** через `cuFuncSetAttribute`, чтобы ядро
+   могло выйти за стандартный предел 48 КиБ на блок.

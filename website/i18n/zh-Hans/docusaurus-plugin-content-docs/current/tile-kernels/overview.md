@@ -75,7 +75,7 @@ BEAM，连同它兜底时所用的启发式优化器，搜索的是某个*固定
 2. **[什么是分块](./tiling)**：回应这些瓶颈的抽象，以及 `tk` 如何在类型系统里表示 tile。
 3. **[向 IR 中编写](./lowering)**：一个 `tk` 内核如何变成 UOp 并融入惰性图。
 4. **[编写一个内核](./first-kernel)**：手把手编写并运行最简单的内核。
-5. **[Wave32 与 Wave64](./wave-portability)**：让同一个内核在两种 AMD 架构上都保持正确。
+5. **[Wave32 与 Wave64](./wave-portability)**：让同一个内核在 AMD 的两种 wave 宽度和 NVIDIA 的 warp32 上都保持正确。
 6. **[Flash Attention](./flash-attention)**：促成这一切的实战范例。
 7. **[调试](./debugging)**：手动运行并验证内核。
 8. **[剖析与基准测试](./profiling)**：分层 profiler 与 criterion 集成，适用于任何 `Tensor` 或 `ExecutionPlan`。

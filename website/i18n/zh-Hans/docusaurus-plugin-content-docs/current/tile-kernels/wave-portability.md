@@ -18,6 +18,7 @@ sidebar_label: Wave32 与 Wave64
 |--------------|---------|-----------|------------|
 | **CDNA** | gfx942（数据中心） | MFMA | **wave64**，64 个 lane |
 | **RDNA** | gfx1151（RDNA3.5） | WMMA | **wave32**，32 个 lane |
+| **CUDA** | sm_80+（Ampere 及更新） | `mma.sync` | **warp32**，32 个 lane |
 
 就这么一个数字，却牵动着一切。一个 `16×16` tile 有 256 个元素：摊到 64 个 lane 上，每 lane 4 个；摊到 32 个 lane 上，每 lane 8 个。不同的 lane 持有不同的元素。于是：
 
@@ -54,8 +55,8 @@ HipKittens 学到的也是这一课（见 [tk、HipKittens 与 CuTile 对比](./
 :::tip 面向 GPU 专家
 `ArchCaps`（`tk/src/arch.rs`）上有两个能力方法，承担了 wave 相关的大部分分量：
 
-- **`reduce_tree()`** 返回跨 lane 的兄弟折叠偏移。wave64 上是 `[16, 32, 48]`（三步 xor 折叠 4 个子片段），wave32 上是 `[16]`（一步）。跨 lane 规约会遍历这个列表，从 `caps` 拿它，永远别硬编码。
-- **`acc_reusable_as_input()`** 回答的是：「一个矩阵累加器能否直接回喂、当作下一个乘法的操作数？」CDNA 上是 `true`，布局相符，所以那是一次免费的寄存器拷贝；RDNA 上是 `false`，累加器与操作数布局不同，于是这个值得经 LDS 往返一趟重新布局。[Flash Attention](./flash-attention) 在它的两个 matmul 之间处理了这一分歧。
+- **片段的 `LaneMap`** 承载着折叠方式。规约是从解析出的片段上读取它的树（`tk/src/group/reduce.rs` 里的 `src.base.map.tree(...)`），而不是从常量：wave64 上是三步 xor `[16, 32, 48]` 折叠 4 个子片段，RDNA 的 wave32 上是一步 `[16]`，而 CUDA 的 `MmaSync` 布局上是一个跨 `[1, 2]` 的蝶形。`ArchCaps::reduce_tree()` 仍然存在，但如今只是图形状测试所用的 AMD 形式。
+- **`acc_reusable_as_input()`** 回答的是：「一个矩阵累加器能否直接回喂、当作下一个乘法的操作数？」CDNA 与 CUDA 上是 `true`，布局相符，所以那是一次免费的寄存器拷贝；RDNA 上是 `false`，累加器与操作数布局不同，于是这个值得经 LDS 往返一趟重新布局。[Flash Attention](./flash-attention) 在它的两个 matmul 之间处理了这一分歧。
 
 `BaseShape` 上的 `ept` 字段（来自 [什么是分块](./tiling)）也出于同样的理由而存在：RDNA 上操作数被跨 lane 复制，所以每线程元素数并不等于 `element_count / wave_size`，必须显式存储。
 :::

@@ -116,8 +116,8 @@ The rest of this section builds up from the hardware problem to the design compa
 3. **[Authoring into the IR](./lowering)** — how a `tk` kernel becomes UOps and joins the
    lazy graph.
 4. **[Writing a Kernel](./first-kernel)** — authoring and running the simplest kernel, step by step.
-5. **[Wave32 vs Wave64](./wave-portability)** — keeping one kernel correct across two AMD
-   architectures.
+5. **[Wave32 vs Wave64](./wave-portability)** — keeping one kernel correct across AMD's two
+   wave widths and NVIDIA's warp32.
 6. **[Flash Attention](./flash-attention)** — the worked example that motivated all of this.
 7. **[Debugging](./debugging)** — running and verifying kernels by hand.
 8. **[Profiling & Benchmarking](./profiling)** — the layered profiler and criterion integration,

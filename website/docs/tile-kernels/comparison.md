@@ -35,12 +35,12 @@ like HipKittens, but instead of being a standalone backend it lowers into Svod's
 |------|--------|----------------|------------|
 | **Authoring surface** | Rust *builder API* (`Kernel`/`Group` mint UOps) | C++ *templates* | Rust *macro DSL* — write plain Rust in `#[cutile::module]`, the macro captures the AST |
 | **IR target** | Svod's **one UOp IR** — same as the whole compiler | none (templates → clang amdgcn) | a *separate* MLIR `cuda_tile` dialect, serialized to Tile IR bytecode |
-| **Lowering** | Svod render → LLVM → AMD binary | clang | bytecode → external `tileiras` assembler → cubin (JIT at first launch) |
+| **Lowering** | Svod render → LLVM → AMD binary, or → PTX (assembled to a cubin by `ptxas`, else JIT by the driver) | clang | bytecode → external `tileiras` assembler → cubin (JIT at first launch) |
 | **Memory model** | **explicit** register *and* shared tiles | explicit register *and* shared tiles | **one** tile type (register-resident); shared-mem staging is implicit, chosen by the compiler |
 | **Matrix-core API** | explicit `WMMA` op + role-based fragments | typed tiles → `__builtin_amdgcn_mfma_*` | a single functional `mma()` intrinsic |
 | **Compute/memory overlap** | a `sched::pipeline` marker + a codegen pass | hand-written per kernel (raw scheduling intrinsics) | delegated to `tileiras` |
 | **Headline differentiator** | one IR ⇒ hand kernels and autotuned kernels are peers | "built from the hardware up" | memory safety across the launch boundary |
-| **Target** | AMD CDNA / RDNA | AMD CDNA / RDNA | NVIDIA `sm_80+` only |
+| **Target** | AMD CDNA / RDNA **and** NVIDIA `sm_80+` | AMD CDNA / RDNA | NVIDIA `sm_80+` only |
 
 ---
 

@@ -34,12 +34,12 @@ CuTile उस छोर पर जहाँ कंपाइलर ही सब 
 |------|--------|----------------|------------|
 | **Authoring surface** | Rust *builder API* (`Kernel`/`Group` UOps mint करते हैं) | C++ *templates* | Rust *macro DSL* — `#[cutile::module]` में plain Rust लिखो, macro AST capture करता है |
 | **IR target** | Svod का **एक UOp IR** — पूरे compiler के समान | कोई नहीं (templates → clang amdgcn) | एक *अलग* MLIR `cuda_tile` dialect, Tile IR bytecode में serialized |
-| **Lowering** | Svod render → LLVM → AMD binary | clang | bytecode → external `tileiras` assembler → cubin (पहले launch पर JIT) |
+| **Lowering** | Svod render → LLVM → AMD binary, या → PTX (`ptxas` से cubin में assemble, वरना driver का JIT) | clang | bytecode → external `tileiras` assembler → cubin (पहले launch पर JIT) |
 | **Memory model** | **explicit** register *और* shared tiles | explicit register *और* shared tiles | **एक** tile type (register-resident); shared-mem staging implicit है, compiler ख़ुद चुनता है |
 | **Matrix-core API** | explicit `WMMA` op + role-based fragments | typed tiles → `__builtin_amdgcn_mfma_*` | एक single functional `mma()` intrinsic |
 | **Compute/memory overlap** | एक `sched::pipeline` marker + एक codegen pass | हर कर्नेल में हाथ से लिखा (raw scheduling intrinsics) | `tileiras` के हवाले |
 | **Headline differentiator** | एक IR ⇒ hand कर्नेल और autotuned कर्नेल बराबर के peers हैं | "hardware up से बना" | launch boundary के आर-पार memory safety |
-| **Target** | AMD CDNA / RDNA | AMD CDNA / RDNA | केवल NVIDIA `sm_80+` |
+| **Target** | AMD CDNA / RDNA **और** NVIDIA `sm_80+` | AMD CDNA / RDNA | केवल NVIDIA `sm_80+` |
 
 ---
 

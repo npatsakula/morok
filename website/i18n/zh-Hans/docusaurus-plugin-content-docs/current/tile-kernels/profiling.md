@@ -30,7 +30,7 @@ flowchart TD
 |------|-----------------|--------|------------------|
 | **1 — 设备时间** | 每个内核的 GPU 执行时间 | GPU 时钟派发时间戳 | 是 |
 | **2 — roofline** | 推导出的 **GFLOP/s** 与 **GB/s** | FLOP 由内核的 IR 估算；字节数来自 plan 的缓冲区 | 是（速率需要时间） |
-| **3 — 静态占用率** | VGPR / SGPR / LDS / scratch 用量，以及受 VGPR 限制的**占用率 %** | 从 AMD 内核描述符解码而来 | 否——纯静态解码 |
+| **3 — 静态占用率** | VGPR / SGPR / LDS / scratch 用量，以及**占用率 %** | AMD：从内核描述符解码而来。CUDA：`cuFuncGetAttribute` 加驱动自己的占用率计算器 | 否——纯静态解码 |
 | **4 — 硬件计数器（PMC）** | AMD：SQ 忙碌周期、wave 数、VALU 指令数。CUDA：SM 周期、warp 数、指令数、tensor 流水线周期、DRAM 字节数 | AMD：PM4 性能计数器包跨网格求和。CUDA：CUPTI range profiler | 是，且计数器必须已解锁 |
 
 有几个细节值得了解：

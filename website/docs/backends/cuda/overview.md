@@ -75,7 +75,7 @@ open-ended `CudaArch { major, minor }` (`sm_86`, `sm_120`, ...). It selects
 |---|---|
 | below `sm_75` | none |
 | `sm_75` | f16 `m16n8k8` |
-| `sm_80`+ | f16 and bf16 `m16n8k16`, f16 `m16n8k8`; bf16 storage. tf32 stays opt-in (`cuda_sm80(true)`) |
+| `sm_80`+ | f16 and bf16 `m16n8k16`, f16 `m16n8k8`, int8 `m16n8k32` accumulating into i32; bf16 storage. tf32 stays opt-in (`cuda_sm80(true)`) |
 | `sm_89`+ | the sm_80 set plus fp8 `m16n8k32`, which the renderer cannot feed yet (see [Limitations](./limitations.md)) |
 
 ---

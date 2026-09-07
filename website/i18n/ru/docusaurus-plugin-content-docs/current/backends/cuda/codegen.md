@@ -130,10 +130,19 @@ WMMA. Соответствующие строки `declare` синтезирую
 места вызова (`wmma_declaration_from_call`) — тот же механизм, что и у
 интринсиков AMD WMMA/MFMA.
 
-Набор дополняют два билдера уровня варпа для типизированных узлов `CUSTOM`:
-`shfl_bfly(value, lane_mask)` (`llvm.nvvm.shfl.sync.bfly.i32`, шаг «бабочки»
-варп-редукции) и `globaltimer()`
+Набор дополняют ещё два семейства типизированных узлов `CUSTOM`. Варп-билдеры —
+это `shfl` с четырьмя режимами: `shfl_bfly(value, lane_mask)`
+(`llvm.nvvm.shfl.sync.bfly.i32`, шаг «бабочки» варп-редукции), `shfl_idx`,
+`shfl_up` и `shfl_down`, — плюс `globaltimer()`
 (`llvm.nvvm.read.ptx.sreg.globaltimer`, наносекундные часы GPU).
+
+Билдеры разделяемой памяти (`codegen/src/llvm/nvptx/smem.rs`) — это то, что
+позволяет tile-ядру гонять данные через `.shared` так же, как на AMD:
+`ldmatrix` (sm_75+) загружает фрагмент матрицы сразу в регистровой раскладке,
+которую ждёт `mma.sync`, а `cp_async` / `cp_async_16` (sm_80+) копируют
+global → shared, минуя регистры; фиксация и ожидание — через
+`cp_async_commit`, `cp_async_wait` и `cp_async_wait_all`. `CpAsyncCache`
+держит по одному объявлению на модуль.
 
 ---
 

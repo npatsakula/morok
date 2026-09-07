@@ -25,12 +25,12 @@ sidebar_label: tk、HipKittens 与 CuTile 对比
 |------|--------|----------------|------------|
 | **编写界面** | Rust *构建器 API*（`Kernel`/`Group` 铸造 UOp） | C++ *模板* | Rust *宏 DSL*，在 `#[cutile::module]` 里写普通 Rust，由宏捕获 AST |
 | **IR 目标** | Svod 的**唯一 UOp IR**，与整个编译器一致 | 无（模板 → clang amdgcn） | 一个*单独*的 MLIR `cuda_tile` 方言，序列化为 Tile IR 字节码 |
-| **降级** | Svod render → LLVM → AMD 二进制 | clang | 字节码 → 外部 `tileiras` 汇编器 → cubin（首次启动时 JIT） |
+| **降级** | Svod render → LLVM → AMD 二进制，或 → PTX（由 `ptxas` 汇编成 cubin，否则由驱动 JIT） | clang | 字节码 → 外部 `tileiras` 汇编器 → cubin（首次启动时 JIT） |
 | **内存模型** | **显式**的寄存器*和*共享 tile | 显式的寄存器*和*共享 tile | **一种** tile 类型（寄存器驻留）；共享内存分阶段是隐式的，由编译器选择 |
 | **矩阵核心 API** | 显式的 `WMMA` 操作 + 基于角色的片段 | 带类型的 tile → `__builtin_amdgcn_mfma_*` | 单个函数式的 `mma()` 内建函数 |
 | **计算/内存重叠** | 一个 `sched::pipeline` 标记 + 一个 codegen 遍 | 逐内核手写（原始调度内建函数） | 委托给 `tileiras` |
 | **核心差异** | 一套 IR ⇒ 手写内核与自动调优内核平级 | 「从硬件向上构建」 | 跨越启动边界的内存安全 |
-| **目标** | AMD CDNA / RDNA | AMD CDNA / RDNA | 仅 NVIDIA `sm_80+` |
+| **目标** | AMD CDNA / RDNA **以及** NVIDIA `sm_80+` | AMD CDNA / RDNA | 仅 NVIDIA `sm_80+` |
 
 ---
 

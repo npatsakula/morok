@@ -92,7 +92,7 @@ nix fmt # Format source files
 | 依赖 | 版本 | 必需 | 描述 |
 |------------|---------|----------|-------------|
 | Rust | 1.85+ | 是 | Edition 2024 |
-| LLVM | 21.x | 是 | CPU 代码生成后端 |
+| LLVM | 22.x | 是 | CPU 代码生成后端 |
 | Clang | - | 是 | LLVM 构建所需的 C 编译器 |
 | pkgconf | - | 是 | 构建配置工具 |
 | protobuf | - | 是 | ONNX proto 编译 |

@@ -72,7 +72,7 @@ SVOD_DEVICE=CUDA:0 cargo run --release -p svod-model --example gigaam_infer -- .
 |---|---|
 | 低于 `sm_75` | 无 |
 | `sm_75` | f16 `m16n8k8` |
-| `sm_80`+ | f16 与 bf16 `m16n8k16`、f16 `m16n8k8`；bf16 存储。tf32 保持为选择启用（`cuda_sm80(true)`） |
+| `sm_80`+ | f16 与 bf16 `m16n8k16`、f16 `m16n8k8`、累加到 i32 的 int8 `m16n8k32`；bf16 存储。tf32 保持为选择启用（`cuda_sm80(true)`） |
 | `sm_89`+ | sm_80 的那一组，外加 fp8 `m16n8k32`，而渲染器尚无法喂给它（见[限制](./limitations.md)） |
 
 ---

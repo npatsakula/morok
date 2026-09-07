@@ -45,9 +45,9 @@ let ta = Tensor::from_slice(&a);
 let tb = Tensor::from_slice(&b);
 let mut out = Tensor::empty(&[1, 1, 16, 16], DType::Float32);
 
-// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA.
-let arch = svod_tk::target::resolve_arch(&ta.device()).expect("an AMD device");
-let w = arch.wave_size() as i64;
+// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA and CUDA.
+let arch = svod_tk::target::resolve_arch(&ta.device()).expect("a GPU device");
+let w = svod_tk::ArchCaps::for_arch(arch).wave_size as i64;
 
 run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| {
     let warp = ker.warp();
@@ -209,7 +209,7 @@ let result = out.as_vec::<f32>().expect("read out"); // result[i] == 3 * i
 | **Tile dims `16` के गुणक हों** | एक tile `16×16` matrix-core fragments की पूरी संख्या है; `ker.rt` इसे assert करता है। |
 | **`gl()` order = launch buffer order** | पहले outputs, फिर inputs। bind positional है; एक mismatch चुपचाप buffers swap कर देता है — ग़लत numbers, कोई error नहीं, इसलिए compiler इसे पकड़ नहीं पाता। |
 | **fragments role से माँगें, constant से नहीं** | `caps.frag(role)` ही वह चीज़ है जो एक body को wave32 *और* wave64, दोनों पर चलाती है। |
-| **यह एक GPU कर्नेल है** | builder असली lane indices (`Op::Special`) mint करता है, इसलिए execution एक AMD device को target करता है, CPU को नहीं। |
+| **यह एक GPU कर्नेल है** | builder असली lane indices (`Op::Special`) mint करता है, इसलिए execution एक GPU को target करता है — AMD या CUDA — CPU को नहीं। |
 
 ---
 
@@ -222,7 +222,7 @@ register-only round-trip है, सबसे compact कर्नेल जि�
 
 चूँकि कर्नेल `Special` ops emit करता है, यह एक पूरी तरह hand-lowered GPU कर्नेल *है* — optimizer और
 workgroup-dimension passes एक `Special`-bearing graph को already-lowered मानकर उसे pass through कर देते हैं
-(वही gate जिसे `opts_to_apply: Some(vec![])` enforce करता है)। इसीलिए यह सिर्फ़ AMD LLVM backend पर render
+(वही gate जिसे `opts_to_apply: Some(vec![])` enforce करता है)। इसीलिए यह सिर्फ़ किसी GPU backend — AMD या NVPTX — पर render
 होता है: lane index का scalar CPU path पर कोई मतलब नहीं। हालाँकि `SINK` *बनाना* तो विशुद्ध UOp construction
 है — इसके लिए किसी GPU की ज़रूरत नहीं; ज़रूरत सिर्फ़ इसे execute करने में पड़ती है। यही बँटवारा एक कर्नेल को
 हर build पर एक host-side shape check से guarded रहने देता है, और on-device numbers के लिए एक अलग gated test रखता है।

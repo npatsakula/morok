@@ -73,7 +73,7 @@ Compute capability को open पर driver से पढ़ा जाता �
 |---|---|
 | `sm_75` से नीचे | कोई नहीं |
 | `sm_75` | f16 `m16n8k8` |
-| `sm_80`+ | f16 और bf16 `m16n8k16`, f16 `m16n8k8`; bf16 storage। tf32 opt-in ही रहता है (`cuda_sm80(true)`) |
+| `sm_80`+ | f16 और bf16 `m16n8k16`, f16 `m16n8k8`, i32 में accumulate होने वाला int8 `m16n8k32`; bf16 storage। tf32 opt-in ही रहता है (`cuda_sm80(true)`) |
 | `sm_89`+ | sm_80 वाला set और साथ में fp8 `m16n8k32`, जिसे renderer अभी feed नहीं कर सकता (देखें [Limitations](./limitations.md)) |
 
 ---

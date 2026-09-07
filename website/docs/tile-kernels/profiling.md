@@ -40,7 +40,7 @@ flowchart TD
 |------|-----------------|--------|------------------|
 | **1 — device time** | per-kernel GPU execution time | GPU-clock dispatch timestamps | yes |
 | **2 — roofline** | derived **GFLOP/s** and **GB/s** | FLOP estimate from the kernel's IR; bytes from the plan's buffers | yes (rates need time) |
-| **3 — static occupancy** | VGPR / SGPR / LDS / scratch usage and VGPR-limited **occupancy %** | decoded from the AMD kernel descriptor | no — pure static decode |
+| **3 — static occupancy** | VGPR / SGPR / LDS / scratch usage and an **occupancy %** | AMD: decoded from the kernel descriptor. CUDA: `cuFuncGetAttribute` and the driver's own occupancy calculator | no — pure static decode |
 | **4 — hardware counters (PMC)** | AMD: SQ busy cycles, waves, VALU instructions. CUDA: SM cycles, warps, instructions, tensor-pipe cycles, DRAM bytes | AMD: PM4 perf-counter packets summed across the grid. CUDA: the CUPTI range profiler | yes, and the counters must be unlocked |
 
 A few details worth knowing:

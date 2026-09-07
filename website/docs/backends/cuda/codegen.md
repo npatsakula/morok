@@ -128,10 +128,19 @@ are synthesized from each call site's operand types
 (`wmma_declaration_from_call`), the same mechanism as the AMD WMMA/MFMA
 intrinsics.
 
-Two warp-level builders for typed `CUSTOM` nodes complete the set:
-`shfl_bfly(value, lane_mask)` (`llvm.nvvm.shfl.sync.bfly.i32`, the butterfly
-step of a warp reduction) and `globaltimer()`
+Two further families of typed `CUSTOM` nodes complete the set. The warp
+builders are `shfl` and its four modes — `shfl_bfly(value, lane_mask)`
+(`llvm.nvvm.shfl.sync.bfly.i32`, the butterfly step of a warp reduction),
+`shfl_idx`, `shfl_up` and `shfl_down` — plus `globaltimer()`
 (`llvm.nvvm.read.ptx.sreg.globaltimer`, the nanosecond GPU clock).
+
+The shared-memory builders (`codegen/src/llvm/nvptx/smem.rs`) are what let a
+tile kernel stage through `.shared` the way it does on AMD: `ldmatrix`
+(sm_75+) loads a matrix fragment in the register layout `mma.sync` expects,
+and `cp_async` / `cp_async_16` (sm_80+) copy global → shared without staging
+through registers, committed and awaited with `cp_async_commit`,
+`cp_async_wait` and `cp_async_wait_all`. `CpAsyncCache` keeps one declaration
+per module.
 
 ---
 
