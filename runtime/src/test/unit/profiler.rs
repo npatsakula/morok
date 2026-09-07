@@ -9,7 +9,7 @@ use svod_device::hcq::{
     DeviceQueue, QueueKind, QueueMergeLimits, SemanticLinkedPlan, TopologyOperation, TopologyOperationKind,
     TopologyResource, schedule_device_lanes,
 };
-use svod_device::{AmdCounter, CudaCounter, PmcCounter};
+use svod_device::{AmdCounter, CounterSet, CudaCounter, PmcCounter};
 use svod_dtype::DeviceSpec;
 use svod_ir::UOp;
 use svod_ir::origin::{self, Origin, OriginFrame, OriginId, SourceLocation};
@@ -275,6 +275,42 @@ fn dispatch(name: &'static str, micros: u64, origin: Option<OriginId>, origins: 
         static_info: None,
         counters: None,
     }
+}
+
+/// `merge_min` keeps the fastest pass's timing, but counters only ever come
+/// from a counted pass — which is always the slow one, because collecting them
+/// serializes the context and replays each kernel. Dropping them with the slow
+/// sample would leave a counted run reporting no counters at all.
+#[test]
+fn merge_min_keeps_the_best_time_and_the_captured_counters() {
+    let counted = |micros, value| {
+        let mut k = dispatch("k", micros, None, &[]);
+        k.counters = Some(CounterSet {
+            values: [(PmcCounter::Cuda(CudaCounter::SmWarpsLaunched), value)].into_iter().collect(),
+        });
+        k
+    };
+    let stage =
+        |k| RunProfile { stages: vec![StageProfile::gpu("profile", Duration::ZERO, vec![k])], origin_depth: None };
+
+    // Counted pass first, then a faster disarmed one.
+    let mut report = stage(counted(900, 32));
+    report.merge_min(stage(dispatch("k", 10, None, &[])));
+    let kept = &report.stages[0].kernels[0];
+    assert_eq!(kept.wall, Duration::from_micros(10), "the disarmed pass times the kernel");
+    let values = &kept.counters.as_ref().expect("counters survive the faster sample").values;
+    assert_eq!(values[&PmcCounter::Cuda(CudaCounter::SmWarpsLaunched)], 32);
+
+    // ...and in the other order, where the faster sample arrives first.
+    let mut report = stage(dispatch("k", 10, None, &[]));
+    report.merge_min(stage(counted(900, 32)));
+    let kept = &report.stages[0].kernels[0];
+    assert_eq!(kept.wall, Duration::from_micros(10));
+    assert_eq!(
+        kept.counters.as_ref().expect("counters are adopted from the slower sample").values
+            [&PmcCounter::Cuda(CudaCounter::SmWarpsLaunched)],
+        32
+    );
 }
 
 /// Intern is independent of capture, so scopes can be built directly here

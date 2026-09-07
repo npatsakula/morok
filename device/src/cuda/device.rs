@@ -380,6 +380,17 @@ impl CudaDevice {
         Ok(self.api)
     }
 
+    /// The CUDA ordinal this device was opened with.
+    pub(crate) fn device_id(&self) -> usize {
+        self.device_id
+    }
+
+    /// The retained primary context, for APIs that take a `CUcontext` directly
+    /// (CUPTI's range profiler binds to one).
+    pub(crate) fn context_raw(&self) -> CUcontext {
+        self.context.raw
+    }
+
     /// [`CUresult::check`] that also latches sticky (context-killing) errors.
     pub(crate) fn check(&self, result: CUresult, call: &'static str) -> Result<()> {
         let outcome = result.check(call);

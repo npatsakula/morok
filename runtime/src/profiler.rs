@@ -780,9 +780,15 @@ impl RunProfile {
         self.origin_depth = self.origin_depth.or(other.origin_depth);
         for (stage, incoming) in self.stages.iter_mut().zip(other.stages) {
             for (best, sample) in stage.kernels.iter_mut().zip(incoming.kernels) {
+                // Counters are captured on a counted pass only, and that pass
+                // pays the backend's counter overhead (CUPTI replays each
+                // kernel), so it is never the fastest. Keep the best timing
+                // without dropping counters a slower pass captured.
+                let counters = best.counters.take().or_else(|| sample.counters.clone());
                 if sample.gpu_or_wall() < best.gpu_or_wall() {
                     *best = sample;
                 }
+                best.counters = counters;
             }
         }
     }

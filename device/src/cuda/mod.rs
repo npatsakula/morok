@@ -14,6 +14,7 @@
 //! in-flight producers and readers (scoped synchronization, see `device`).
 
 pub mod allocator;
+pub mod cupti;
 pub mod device;
 pub mod graph;
 pub mod program;

@@ -9,6 +9,7 @@
 //! an unrelated kernel needs the device to itself.
 
 mod allocator;
+mod cupti;
 pub(super) mod graph;
 pub(super) mod program;
 mod scoped_sync;
