@@ -250,3 +250,25 @@ fn host_transfer_latency_benchmark() {
         }
     }
 }
+
+/// A copy-in whose source is another buffer's pinned or managed mapping is
+/// read by the DMA itself (the driver stages only pageable memory), so the
+/// copy retires before the caller can overwrite the source.
+#[test]
+fn copyin_from_a_host_mapped_source_retires_before_returning() {
+    let Some(alloc) = cuda_alloc_or_skip() else { return };
+    let alloc: Arc<dyn Allocator> = Arc::new((*alloc).clone());
+    let len = STAGING_BYTES / 2; // the asynchronous copy-lane path
+    let data = pattern(len);
+    let mut dst = Buffer::new(alloc.clone(), DType::UInt8, vec![len], device_local());
+    for spec in [BufferSpec { host: true, ..BufferSpec::default() }, BufferSpec::default()] {
+        let mut src = Buffer::new(alloc.clone(), DType::UInt8, vec![len], spec);
+        src.copyin(&data).unwrap();
+        let Ok(bytes) = src.as_host_bytes() else { continue }; // no managed memory
+        dst.copyin(bytes).unwrap();
+        src.as_host_bytes_mut().unwrap().fill(0xEE);
+        let mut back = vec![0u8; len];
+        dst.copyout(&mut back).unwrap();
+        assert_eq!(back, data, "{spec:?}");
+    }
+}

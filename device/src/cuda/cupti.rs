@@ -21,6 +21,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libloading::Library;
 
@@ -36,6 +37,8 @@ pub struct CUptiResult(pub c_int);
 
 impl CUptiResult {
     pub const SUCCESS: Self = Self(0);
+    /// Among other causes, a params `struct_size` this CUPTI has never seen.
+    pub const INVALID_PARAMETER: Self = Self(1);
     /// CUPTI could not load `libnvperf_host.so`.
     pub const NOT_INITIALIZED: Self = Self(15);
     pub const INVALID_METRIC_NAME: Self = Self(17);
@@ -121,7 +124,8 @@ pub struct GetCounterAvailabilityParams {
     pub image: *mut u8,
     pub allow_device_level_counters: u8,
 }
-const GET_COUNTER_AVAILABILITY_SIZE: usize = 41;
+/// CUDA 13.3 added `allow_device_level_counters`; 13.0 ends at `image`.
+const GET_COUNTER_AVAILABILITY_SIZES: [usize; 2] = [41, 40];
 
 /// `cuptiProfilerHostInitialize`.
 #[repr(C)]
@@ -136,7 +140,8 @@ pub struct HostInitializeParams {
     /// PM sampling only; NULL for the range profiler.
     pub single_pass_metric_set_name: *const c_char,
 }
-const HOST_INITIALIZE_SIZE: usize = 56;
+/// CUDA 13.3 added `single_pass_metric_set_name`; 13.0 ends at `host_object`.
+const HOST_INITIALIZE_SIZES: [usize; 2] = [56, 48];
 const PROFILER_TYPE_RANGE_PROFILER: u32 = 0;
 
 /// `cuptiProfilerHostDeinitialize`.
@@ -300,12 +305,16 @@ const GET_COUNTER_DATA_INFO_SIZE: usize = 40;
 
 /// Rust layout must reproduce the C offsets exactly, and each `STRUCT_SIZE` is
 /// the C `offsetof(last) + sizeof(last)` — equal to `size_of` except where the
-/// struct ends in padding.
+/// struct ends in padding. CUPTI accepts exactly the sizes a struct has ever
+/// had (never a larger one), so the two structs that grew since CUDA 13.0
+/// carry both sizes and [`abi_ladder`] steps back on an older library; the
+/// 13.0 layouts are prefixes of these, so the same Rust struct serves both.
 const _: () = {
     assert!(size_of::<InitializeParams>() == INITIALIZE_SIZE);
     assert!(size_of::<GetChipNameParams>() == GET_CHIP_NAME_SIZE);
-    assert!(size_of::<GetCounterAvailabilityParams>() == 48 && GET_COUNTER_AVAILABILITY_SIZE == 41);
-    assert!(size_of::<HostInitializeParams>() == HOST_INITIALIZE_SIZE);
+    assert!(size_of::<GetCounterAvailabilityParams>() == 48);
+    assert!(GET_COUNTER_AVAILABILITY_SIZES[0] == 41 && GET_COUNTER_AVAILABILITY_SIZES[1] == 40);
+    assert!(size_of::<HostInitializeParams>() == HOST_INITIALIZE_SIZES[0] && HOST_INITIALIZE_SIZES[1] == 48);
     assert!(size_of::<HostDeinitializeParams>() == HOST_DEINITIALIZE_SIZE);
     assert!(size_of::<ConfigAddMetricsParams>() == CONFIG_ADD_METRICS_SIZE);
     assert!(size_of::<GetConfigImageSizeParams>() == GET_CONFIG_IMAGE_SIZE_SIZE);
@@ -321,30 +330,8 @@ const _: () = {
     assert!(size_of::<GetCounterDataInfoParams>() == GET_COUNTER_DATA_INFO_SIZE);
 };
 
-/// Declares the bound entry points: the Rust field name, the exact export
-/// resolved with `dlsym`, and the C prototype (every CUPTI call returns
-/// `CUptiResult`).
-macro_rules! cupti_api {
-    ($($field:ident = $symbol:literal: fn($($arg:ty),* $(,)?);)*) => {
-        /// The loaded CUPTI.
-        pub struct Api {
-            $(pub $field: unsafe extern "C" fn($($arg),*) -> CUptiResult,)*
-            // Declared last so the function pointers never outlive the library.
-            _library: Library,
-        }
-
-        impl Api {
-            fn bind(library: Library) -> Result<Self, String> {
-                Ok(Self { $($field: sym(&library, $symbol)?,)* _library: library })
-            }
-        }
-
-        /// `(Rust name, dlsym symbol)` of every bound entry point.
-        pub const SYMBOLS: &[(&str, &str)] = &[$((stringify!($field), $symbol)),*];
-    };
-}
-
-cupti_api! {
+dl_api! {
+    "The loaded CUPTI.", LIBCUPTI, CUptiResult, String, std::convert::identity;
     get_result_string = "cuptiGetResultString": fn(CUptiResult, *mut *const c_char);
     profiler_initialize = "cuptiProfilerInitialize": fn(*mut InitializeParams);
     device_get_chip_name = "cuptiDeviceGetChipName": fn(*mut GetChipNameParams);
@@ -378,13 +365,6 @@ const LIBCUPTI: &str = "libcupti.so.13";
 
 /// Toolkit locations searched after the loader's own path.
 const FALLBACK_DIRS: &[&str] = &["/opt/cuda/lib64", "/usr/local/cuda/extras/CUPTI/lib64"];
-
-fn sym<T: Copy>(library: &Library, name: &str) -> Result<T, String> {
-    // SAFETY: `T` is declared from the symbol's C prototype at the call site.
-    let symbol = unsafe { library.get::<T>(name.as_bytes()) }
-        .map_err(|error| format!("{LIBCUPTI} has no symbol {name}: {}", crate::error::describe(&error)))?;
-    Ok(*symbol)
-}
 
 /// `libcupti.so.13` on the loader path, then the toolkit fallbacks, then
 /// `$CUDA_PATH`.
@@ -444,6 +424,33 @@ fn params<T>(struct_size: usize) -> T {
     p
 }
 
+/// Call `call` with the newest ABI size of a params struct that grew across
+/// CUPTI releases, stepping back to the older size when the library rejects it
+/// with `INVALID_PARAMETER` (a CUDA 13.0 CUPTI knows only its own sizes). The
+/// accepted size is remembered in `chosen` so later calls try it alone; any
+/// other outcome ends the ladder, since it is the call's real answer.
+pub(crate) fn abi_ladder(
+    sizes: &[usize],
+    chosen: &AtomicUsize,
+    name: &'static str,
+    mut call: impl FnMut(usize) -> CUptiResult,
+) -> Result<(), String> {
+    let known = [chosen.load(Ordering::Relaxed)];
+    let candidates = if known[0] != 0 { &known[..] } else { sizes };
+    let mut result = CUptiResult::INVALID_PARAMETER;
+    for &size in candidates {
+        result = call(size);
+        if result != CUptiResult::INVALID_PARAMETER {
+            chosen.store(size, Ordering::Relaxed);
+            break;
+        }
+    }
+    result.check(name)
+}
+
+static GET_COUNTER_AVAILABILITY_ABI: AtomicUsize = AtomicUsize::new(0);
+static HOST_INITIALIZE_ABI: AtomicUsize = AtomicUsize::new(0);
+
 /// `cuptiProfilerInitialize`, once per process. Idempotent.
 fn profiler_initialize(api: &Api) -> Result<(), String> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
@@ -459,10 +466,18 @@ fn profiler_initialize(api: &Api) -> Result<(), String> {
 /// privilege probe: unprivileged it fails with `INSUFFICIENT_PRIVILEGES` while
 /// `Enable` and `SetConfig` still succeed.
 fn counter_availability(api: &Api, ctx: CUcontext) -> Result<Vec<u8>, String> {
-    let mut p: GetCounterAvailabilityParams = params(GET_COUNTER_AVAILABILITY_SIZE);
-    p.ctx = ctx;
-    // SAFETY: image NULL, so CUPTI only reports the size it needs.
-    unsafe { (api.get_counter_availability)(&mut p) }.check("cuptiProfilerGetCounterAvailability")?;
+    let mut p: GetCounterAvailabilityParams = params(0);
+    abi_ladder(
+        &GET_COUNTER_AVAILABILITY_SIZES,
+        &GET_COUNTER_AVAILABILITY_ABI,
+        "cuptiProfilerGetCounterAvailability",
+        |size| {
+            p = params(size);
+            p.ctx = ctx;
+            // SAFETY: image NULL, so CUPTI only reports the size it needs.
+            unsafe { (api.get_counter_availability)(&mut p) }
+        },
+    )?;
     let mut image = vec![0u8; p.image_size];
     p.image = image.as_mut_ptr();
     // SAFETY: `image` is live and `image_size` bytes long.
@@ -499,6 +514,10 @@ pub struct Session {
     /// call, so they must outlive the pointer array.
     _metrics: Vec<CString>,
     metric_ptrs: Vec<*const c_char>,
+    /// The counter-availability image the host object was initialized with.
+    /// CUPTI documents it as an input of that call only, but keeps no copy it
+    /// promises to own, so the session holds it for the host object's life.
+    _availability: Option<Vec<u8>>,
     config: Vec<u8>,
     counter_data: Vec<u8>,
 }
@@ -546,12 +565,16 @@ impl Session {
         // privileged fetch is refused.
         let availability = counter_availability(api, ctx).ok();
 
-        let mut host: HostInitializeParams = params(HOST_INITIALIZE_SIZE);
-        host.profiler_type = PROFILER_TYPE_RANGE_PROFILER;
-        host.chip_name = chip.chip_name;
-        host.counter_availability_image = availability.as_ref().map_or(null(), |i| i.as_ptr());
-        // SAFETY: live params; the chip name and image outlive the call.
-        unsafe { (api.host_initialize)(&mut host) }.check("cuptiProfilerHostInitialize")?;
+        let mut host: HostInitializeParams = params(0);
+        abi_ladder(&HOST_INITIALIZE_SIZES, &HOST_INITIALIZE_ABI, "cuptiProfilerHostInitialize", |size| {
+            host = params(size);
+            host.profiler_type = PROFILER_TYPE_RANGE_PROFILER;
+            host.chip_name = chip.chip_name;
+            host.counter_availability_image = availability.as_ref().map_or(null(), |i| i.as_ptr());
+            // SAFETY: live params; the chip name is static and the image is kept
+            // for the host object's life.
+            unsafe { (api.host_initialize)(&mut host) }
+        })?;
 
         // From here a failure must still release the host object, so the session
         // is built first and every fallible step runs against it.
@@ -561,6 +584,7 @@ impl Session {
             counters: counters.to_vec(),
             _metrics: metrics,
             metric_ptrs,
+            _availability: availability,
             config: Vec::new(),
             counter_data: Vec::new(),
         };

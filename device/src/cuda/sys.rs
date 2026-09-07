@@ -149,6 +149,7 @@ pub const CU_EVENT_DISABLE_TIMING: u32 = 0x2;
 pub const CU_MEMHOSTALLOC_PORTABLE: u32 = 0x01;
 pub const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
 pub const CU_MEM_ATTACH_GLOBAL: u32 = 0x1;
+pub const CU_POINTER_ATTRIBUTE_MEMORY_TYPE: c_int = 2;
 
 /// `CUdevice_attribute` ids.
 pub mod attribute {
@@ -179,30 +180,8 @@ pub mod jit_option {
     pub const ERROR_LOG_BUFFER_SIZE_BYTES: i32 = 6;
 }
 
-/// Declares the bound entry points: the Rust field name, the exact export
-/// resolved with `dlsym`, and the C prototype (every driver call returns
-/// `CUresult`).
-macro_rules! cuda_api {
-    ($($field:ident = $symbol:literal: fn($($arg:ty),* $(,)?);)*) => {
-        /// The loaded driver.
-        pub struct Api {
-            $(pub $field: unsafe extern "C" fn($($arg),*) -> CUresult,)*
-            // Declared last so the function pointers never outlive the library.
-            _library: Library,
-        }
-
-        impl Api {
-            fn bind(library: Library) -> Result<Self> {
-                Ok(Self { $($field: sym(&library, $symbol)?,)* _library: library })
-            }
-        }
-
-        /// `(Rust name, dlsym symbol)` of every bound entry point.
-        pub const SYMBOLS: &[(&str, &str)] = &[$((stringify!($field), $symbol)),*];
-    };
-}
-
-cuda_api! {
+dl_api! {
+    "The loaded driver.", LIBCUDA, CUresult, Error, unavailable;
     init = "cuInit": fn(u32);
     driver_get_version = "cuDriverGetVersion": fn(*mut c_int);
     get_error_name = "cuGetErrorName": fn(CUresult, *mut *const c_char);
@@ -223,6 +202,7 @@ cuda_api! {
     mem_host_get_device_pointer = "cuMemHostGetDevicePointer_v2": fn(*mut CUdeviceptr, *mut c_void, u32);
     mem_free_host = "cuMemFreeHost": fn(*mut c_void);
     memcpy_htod_async = "cuMemcpyHtoDAsync_v2": fn(CUdeviceptr, *const c_void, usize, CUstream);
+    pointer_get_attribute = "cuPointerGetAttribute": fn(*mut c_void, c_int, CUdeviceptr);
     memcpy_dtoh_async = "cuMemcpyDtoHAsync_v2": fn(*mut c_void, CUdeviceptr, usize, CUstream);
     memcpy_dtod_async = "cuMemcpyDtoDAsync_v2": fn(CUdeviceptr, CUdeviceptr, usize, CUstream);
     memcpy_dtoh = "cuMemcpyDtoH_v2": fn(*mut c_void, CUdeviceptr, usize);
@@ -272,13 +252,6 @@ const LIBCUDA: &str = "libcuda.so.1";
 
 fn unavailable(reason: String) -> Error {
     Error::DeviceUnavailable { reason }
-}
-
-fn sym<T: Copy>(library: &Library, name: &str) -> Result<T> {
-    // SAFETY: `T` is declared from the symbol's C prototype at the call site.
-    let symbol = unsafe { library.get::<T>(name.as_bytes()) }
-        .map_err(|error| unavailable(format!("{LIBCUDA} has no symbol {name}: {}", describe(&error))))?;
-    Ok(*symbol)
 }
 
 impl Api {

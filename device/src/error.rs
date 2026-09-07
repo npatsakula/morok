@@ -172,3 +172,17 @@ pub enum Error {
 pub fn describe(error: &dyn std::error::Error) -> String {
     snafu::ChainCompat::new(error).map(ToString::to_string).collect::<Vec<_>>().join(": ")
 }
+
+/// Resolve `symbol` (NUL-terminated or not) in `library` as a function pointer
+/// of type `T`, naming `library_name` in the failure message.
+pub(crate) fn dlsym<T: Copy>(
+    library: &libloading::Library,
+    library_name: &str,
+    symbol: &[u8],
+) -> std::result::Result<T, String> {
+    // SAFETY: `T` is declared from the symbol's C prototype at the call site.
+    unsafe { library.get::<T>(symbol) }.map(|symbol| *symbol).map_err(|error| {
+        let name = String::from_utf8_lossy(symbol);
+        format!("{library_name} has no symbol {}: {}", name.trim_end_matches('\0'), describe(&error))
+    })
+}

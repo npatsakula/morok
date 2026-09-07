@@ -13,6 +13,35 @@
 //! the host hazard analysis; host access waits only the storage's own
 //! in-flight producers and readers (scoped synchronization, see `device`).
 
+/// Declares a runtime-bound C API: a doc line, the library name for
+/// diagnostics, the result type every entry point returns, the error type
+/// `bind` fails with and how a loader message becomes one; then the Rust
+/// field name, the exact export resolved with `dlsym`, and the C prototype
+/// of each entry point.
+macro_rules! dl_api {
+    ($doc:literal, $library:expr, $result:ty, $error:ty, $wrap:expr;
+     $($field:ident = $symbol:literal: fn($($arg:ty),* $(,)?);)*) => {
+        #[doc = $doc]
+        pub struct Api {
+            $(pub $field: unsafe extern "C" fn($($arg),*) -> $result,)*
+            // Declared last so the function pointers never outlive the library.
+            _library: Library,
+        }
+
+        impl Api {
+            fn bind(library: Library) -> std::result::Result<Self, $error> {
+                Ok(Self {
+                    $($field: crate::error::dlsym(&library, $library, $symbol.as_bytes()).map_err($wrap)?,)*
+                    _library: library,
+                })
+            }
+        }
+
+        /// `(Rust name, dlsym symbol)` of every bound entry point.
+        pub const SYMBOLS: &[(&str, &str)] = &[$((stringify!($field), $symbol)),*];
+    };
+}
+
 pub mod allocator;
 pub mod cupti;
 pub mod device;

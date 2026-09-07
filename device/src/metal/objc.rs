@@ -91,10 +91,7 @@ fn load(path: &str) -> Result<Library> {
 
 /// Resolve `name` as a function pointer of type `T`.
 fn sym<T: Copy>(lib: &Library, path: &str, name: &CStr) -> Result<T> {
-    // SAFETY: every call site declares `T` from the symbol's C prototype.
-    let symbol = unsafe { lib.get::<T>(name.to_bytes_with_nul()) }
-        .map_err(|error| unavailable(format!("{path} has no symbol {name:?}: {}", describe(&error))))?;
-    Ok(*symbol)
+    crate::error::dlsym(lib, path, name.to_bytes_with_nul()).map_err(unavailable)
 }
 
 /// Address of a data symbol (the symbol itself, not the value stored there).

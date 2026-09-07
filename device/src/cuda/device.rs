@@ -152,12 +152,15 @@ impl Lane {
         self.seq() != self.published.load(Ordering::Acquire)
     }
 
-    /// Count every submission so far as published, returning whether any
-    /// was not. Done *before* the corresponding drain: a submission racing
-    /// it either precedes the drain or stays unpublished.
-    pub(crate) fn take_unpublished(&self) -> bool {
+    /// The submission count to publish once a drain started now completes,
+    /// or `None` when a token already covers everything. Read *before* the
+    /// drain, published after it succeeds: a submission racing the drain
+    /// either precedes it or stays unpublished, and a failed drain (a
+    /// non-sticky error) leaves the lane flagged so later waits still drain
+    /// the work it did not cover.
+    pub(crate) fn unpublished(&self) -> Option<u64> {
         let seq = self.seq();
-        self.published.fetch_max(seq, Ordering::AcqRel) < seq
+        (self.published.load(Ordering::Acquire) < seq).then_some(seq)
     }
 }
 
@@ -406,11 +409,16 @@ impl CudaDevice {
     /// unpublished work left.
     pub fn synchronize(&self) -> Result<()> {
         let api = self.enter()?;
-        for lane in self.live_lanes() {
-            lane.take_unpublished();
-        }
+        let lanes = self.live_lanes();
+        let seqs: Vec<Option<u64>> = lanes.iter().map(|lane| lane.unpublished()).collect();
         // SAFETY: plain call in the current context.
-        self.check(unsafe { (api.ctx_synchronize)() }, "cuCtxSynchronize")
+        self.check(unsafe { (api.ctx_synchronize)() }, "cuCtxSynchronize")?;
+        for (lane, seq) in lanes.iter().zip(seqs) {
+            if let Some(seq) = seq {
+                lane.publish(seq);
+            }
+        }
+        Ok(())
     }
 
     pub fn stream_synchronize(&self, stream: CUstream) -> Result<()> {
@@ -421,8 +429,12 @@ impl CudaDevice {
 
     /// Drain one lane; its work counts as published from here on.
     pub(crate) fn synchronize_lane(&self, lane: &Lane) -> Result<()> {
-        lane.take_unpublished();
-        self.stream_synchronize(lane.raw)
+        let seq = lane.unpublished();
+        self.stream_synchronize(lane.raw)?;
+        if let Some(seq) = seq {
+            lane.publish(seq);
+        }
+        Ok(())
     }
 
     /// `(free, total)` bytes of device memory.
@@ -566,8 +578,8 @@ impl CudaDevice {
         let tokens = self.producers.lock().get(&base).cloned();
         let Some(tokens) = tokens else { return self.synchronize() };
         for lane in self.live_lanes() {
-            if lane.take_unpublished() {
-                self.stream_synchronize(lane.raw)?;
+            if lane.unpublished().is_some() {
+                self.synchronize_lane(&lane)?;
             }
         }
         for token in &tokens {

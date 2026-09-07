@@ -17,7 +17,10 @@ use std::sync::Arc;
 use svod_dtype::DeviceSpec;
 
 use super::device::{CudaDevice, STAGING_BYTES};
-use super::sys::{CU_MEM_ATTACH_GLOBAL, CU_MEMHOSTALLOC_DEVICEMAP, CU_MEMHOSTALLOC_PORTABLE, CUdeviceptr};
+use super::sys::{
+    CU_MEM_ATTACH_GLOBAL, CU_MEMHOSTALLOC_DEVICEMAP, CU_MEMHOSTALLOC_PORTABLE, CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+    CUdeviceptr, CUresult,
+};
 use crate::allocator::{Allocator, BufferSpec, RawBuffer};
 use crate::error::UnsupportedSnafu;
 use crate::{Error, Result};
@@ -184,15 +187,30 @@ impl Allocator for CudaAllocator {
         let dst = device_ptr + dest_off as u64;
         let stream = self.dev.copy_stream();
         if src.len() <= STAGING_BYTES {
+            // The driver stages an unregistered pageable source before it
+            // returns, so `src` is free afterwards while the DMA retires in
+            // stream order. A source it tracks (pinned, registered or managed:
+            // another buffer's host mapping) is read by the DMA itself, so the
+            // copy must retire before `src` escapes the caller. Tracked is what
+            // the attribute query answers; `INVALID_VALUE` is pageable.
+            let mut memory_type: u32 = 0;
+            // SAFETY: out-pointer to a live `u32`; the query never touches `src`.
+            let tracked = unsafe {
+                (api.pointer_get_attribute)(
+                    (&raw mut memory_type).cast(),
+                    CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                    src.as_ptr() as CUdeviceptr,
+                )
+            } == CUresult::SUCCESS;
             return self.dev.with_copy_lane(|dev| {
-                // SAFETY: the destination range is bounded by the caller; the
-                // driver returns once the pageable `src` is staged, so it is
-                // free afterwards while the DMA retires in stream order.
+                // SAFETY: the destination range is bounded by the caller and
+                // `src` outlives the copy per the classification above.
                 dev.check(
                     unsafe { (api.memcpy_htod_async)(dst, src.as_ptr().cast(), src.len(), stream) },
                     "cuMemcpyHtoDAsync",
                 )?;
-                dev.record_copy(&[device_ptr])
+                dev.record_copy(&[device_ptr])?;
+                if tracked { dev.stream_synchronize(stream) } else { Ok(()) }
             });
         }
         self.staged(src.len(), |staging, done, chunk| {

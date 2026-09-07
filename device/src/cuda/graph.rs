@@ -91,15 +91,34 @@ impl std::fmt::Debug for CudaGraph {
     }
 }
 
+/// Each node's `(buffer, val)` slot ranges in the plan's flattened binding
+/// lists: the one walk `build` packs by and `patch` re-points by.
+fn slot_ranges(nodes: &[Node]) -> impl Iterator<Item = (std::ops::Range<usize>, std::ops::Range<usize>)> + '_ {
+    nodes.iter().scan((0, 0), |(buffers, vals), node| {
+        let ranges = (*buffers..*buffers + node.layout.globals, *vals..*vals + node.layout.vars);
+        (*buffers, *vals) = (ranges.0.end, ranges.1.end);
+        Some(ranges)
+    })
+}
+
 /// For every slot, the first slot bound to the same address: two bindings
 /// with equal signatures have identical hazards, so capture-time
 /// dependencies stay valid.
 pub(crate) fn alias_signature(buffers: &[u64]) -> Vec<usize> {
-    buffers
-        .iter()
-        .enumerate()
-        .map(|(index, address)| buffers[..index].iter().position(|earlier| earlier == address).unwrap_or(index))
-        .collect()
+    let mut first: std::collections::HashMap<u64, usize> = std::collections::HashMap::with_capacity(buffers.len());
+    buffers.iter().enumerate().map(|(index, address)| *first.entry(*address).or_insert(index)).collect()
+}
+
+/// Whether `buffers` binds the slots with the aliasing `signature` recorded
+/// at capture, without allocating: the check every replay makes.
+fn matches_alias_signature(buffers: &[u64], signature: &[usize]) -> bool {
+    let mut first: std::collections::HashMap<u64, usize> = std::collections::HashMap::with_capacity(buffers.len());
+    buffers.len() == signature.len()
+        && buffers
+            .iter()
+            .zip(signature)
+            .enumerate()
+            .all(|(index, (address, &expected))| *first.entry(*address).or_insert(index) == expected)
 }
 
 impl CudaGraph {
@@ -212,13 +231,8 @@ impl Exec {
             packed: (Vec::new(), Vec::new()),
         };
         let mut tails: Vec<CUgraphNode> = Vec::with_capacity(nodes.len());
-        let (mut buffer_offset, mut var_offset) = (0, 0);
-        for (index, node) in nodes.iter().enumerate() {
-            let slot_buffers = &buffers[buffer_offset..buffer_offset + node.layout.globals];
-            let slot_vals = &vals[var_offset..var_offset + node.layout.vars];
-            node.layout.pack(&mut blobs[index], slot_buffers, slot_vals)?;
-            buffer_offset += node.layout.globals;
-            var_offset += node.layout.vars;
+        for (index, (node, (buffer_range, var_range))) in nodes.iter().zip(slot_ranges(nodes)).enumerate() {
+            node.layout.pack(&mut blobs[index], &buffers[buffer_range], &vals[var_range])?;
 
             let mut deps: Vec<CUgraphNode> = match topology {
                 Topology::Dag => node.deps.iter().map(|&dep| tails[dep]).collect(),
@@ -299,32 +313,39 @@ impl Exec {
         Ok(handle)
     }
 
-    /// Re-point the kernel nodes whose bindings changed.
+    /// Re-point the kernel nodes whose bindings changed. A failure part-way
+    /// leaves nodes re-pointed while `packed` still describes the old
+    /// bindings, so it forgets them: the next call re-points every node.
     fn patch(&mut self, nodes: &[Node], blobs: &mut [Vec<u8>], buffers: &[u64], vals: &[i64]) -> Result<()> {
         if self.packed.0 == buffers && self.packed.1 == vals {
             return Ok(());
         }
         let api = self.dev.enter()?;
-        let (mut buffer_offset, mut var_offset) = (0, 0);
-        for (index, node) in nodes.iter().enumerate() {
-            let (buffer_range, var_range) =
-                (buffer_offset..buffer_offset + node.layout.globals, var_offset..var_offset + node.layout.vars);
-            buffer_offset = buffer_range.end;
-            var_offset = var_range.end;
-            let changed = self.packed.0[buffer_range.clone()] != buffers[buffer_range.clone()]
-                || self.packed.1[var_range.clone()] != vals[var_range.clone()];
-            if !changed {
+        for (index, (node, (buffer_range, var_range))) in nodes.iter().zip(slot_ranges(nodes)).enumerate() {
+            let unchanged = self.packed.0.get(buffer_range.clone()) == Some(&buffers[buffer_range.clone()])
+                && self.packed.1.get(var_range.clone()) == Some(&vals[var_range.clone()]);
+            if unchanged {
                 continue;
             }
-            node.layout.pack(&mut blobs[index], &buffers[buffer_range], &vals[var_range])?;
-            let mut size = 0;
-            let mut extra = [std::ptr::null_mut(); 5];
-            let params = Self::params(node, &mut blobs[index], &mut size, &mut extra);
-            // SAFETY: as `add_kernel_node`; only future launches see the update.
-            unsafe { (api.graph_exec_kernel_node_set_params)(self.exec, self.kernels[index], &params) }
-                .check("cuGraphExecKernelNodeSetParams")?;
+            let repoint = || -> Result<()> {
+                node.layout.pack(&mut blobs[index], &buffers[buffer_range], &vals[var_range])?;
+                let mut size = 0;
+                let mut extra = [std::ptr::null_mut(); 5];
+                let params = Self::params(node, &mut blobs[index], &mut size, &mut extra);
+                // SAFETY: as `add_kernel_node`; only future launches see the update.
+                unsafe { (api.graph_exec_kernel_node_set_params)(self.exec, self.kernels[index], &params) }
+                    .check("cuGraphExecKernelNodeSetParams")
+            };
+            if let Err(error) = repoint() {
+                self.packed.0.clear();
+                self.packed.1.clear();
+                return Err(error);
+            }
         }
-        self.packed = (buffers.to_vec(), vals.to_vec());
+        self.packed.0.clear();
+        self.packed.0.extend_from_slice(buffers);
+        self.packed.1.clear();
+        self.packed.1.extend_from_slice(vals);
         Ok(())
     }
 
@@ -355,7 +376,7 @@ impl Graph for CudaGraph {
         let (buffers, vals) = self.bindings(buffers, vals)?;
         let mut state = self.state.lock();
         let State { blobs, dag, chain, .. } = &mut *state;
-        let exec = if alias_signature(buffers) == self.aliasing {
+        let exec = if matches_alias_signature(buffers, &self.aliasing) {
             dag
         } else {
             if chain.is_none() {
