@@ -52,9 +52,14 @@ flowchart TD
   occupancy % report करता है। CDNA3 (wave64) पर resources (VGPR/SGPR/LDS/scratch) फिर भी decode होकर दिखते
   हैं, पर occupancy column `-` दिखाता है क्योंकि वह geometry modeled नहीं है। यहाँ occupancy सिर्फ़
   **VGPR-limited** first-order limiter है — LDS और workgroup limits इसमें fold नहीं किए गए।
-- **Tier 4** SQ-block counters को PM4 packets के ज़रिए program करता है और उन्हें grid भर में sum करता है।
-  तीन implemented counters हैं `sqbusy` (busy cycles), `waves` (launch हुई waves), और `valu` (issue हुए
-  VALU instructions) — मिलकर ये वह ILP/occupancy सवाल जवाब देते हैं जिसे अकेला timing नहीं दे सकता।
+- **Tier 4** backend के हिसाब से अलग है। AMD पर यह SQ block को PM4 packets से program करता है और grid
+  भर में sum करता है: `sqbusy` (busy cycles), `waves` (launch हुई waves), और `valu` (issue हुए VALU
+  instructions) — मिलकर ये वह ILP/occupancy सवाल जवाब देते हैं जिसे अकेला timing नहीं दे सकता। CUDA पर
+  यह CUPTI range profiler चलाता है: `cycles`, `warps`, `inst`, `tensor` (tensor pipe के active cycles)
+  और `dram` (DRAM से गुज़रे bytes) — `cycles` के सापेक्ष `tensor` tensor-core utilization है, और `dram`
+  bandwidth-bound kernel को issue-bound से अलग करता है। Counter tokens सभी backends में unique हैं,
+  इसलिए दूसरे backend के counters नाम लेने वाला selection उन्हें गिरा देता है, किसी और block को गलत
+  program नहीं करता।
 
 report के columns इस हिसाब से ढलते हैं कि क्या collect हुआ: सिर्फ़ Tier-1 वाला run केवल timing print करता
 है, और GFLOP/s, resource, और counter columns तभी दिखते हैं जब उनका tier चला हो।
@@ -277,7 +282,8 @@ IR से नहीं।) हाथ से लिखे कर्नेल क�
 report करता है और एक one-line note print करता है कि counters के लिए `profile_standard` state चाहिए। पहले GPU
 को उस state में डालें (जैसे `amd-smi set -l stable_std`), फिर `SVOD_PMC` के साथ दोबारा चलाएँ। CUDA पर
 शर्त अलग है: जब तक `NVreg_RestrictProfilingToAdminUsers=0` सेट न हो, driver counter collection सिर्फ़
-admin users को देता है, और CUPTI load होने लायक़ होनी चाहिए। NVIDIA की बारीक़ियाँ
+admin users को देता है, और CUPTI load होने लायक़ होनी चाहिए (`SVOD_CUDA_CUPTI=0` उसे जानबूझकर बंद कर
+देता है)। NVIDIA की बारीक़ियाँ
 [CUDA पर Profiling](../backends/cuda/profiling.md) में हैं, यह भी कि वहाँ counters इकट्ठा करने में एक
 अतिरिक्त pass क्यों लगता है।
 :::
