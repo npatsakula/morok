@@ -13,7 +13,7 @@ sidebar_label: 剖析
 | **1 — 设备时间** | 有 | 环绕每次启动的 CUDA event 对 |
 | **2 — roofline** | 有 | 后端中立（IR FLOP 估算、plan 的缓冲区） |
 | **3 — 静态占用率** | 有 | `cuFuncGetAttribute` + `cuOccupancyMaxActiveBlocksPerMultiprocessor` |
-| **4 — 硬件计数器** | **无** | 需要 CUPTI；未做绑定 |
+| **4 — 硬件计数器** | 有 | CUPTI range profiler（`libcupti.so.13`） |
 
 ```bash
 SVOD_DEVICE=CUDA:0 SVOD_PROFILE_ITERS=20 cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav
@@ -69,12 +69,65 @@ BEAM 所用的 `Program::execute_timed` 是调度流上的同一对 event，以
 
 ---
 
-## 第 4 层：不可用
+## 第 4 层：硬件计数器
 
-这里没有 CUPTI 绑定，因此 CUDA 上的 `PlanContext::pmc_available()` 为
-`false`。设置 `SVOD_PMC=1` 不会失败：profiler 会退化到第 1-3 层，并打印它
-那行说明计数器不可用的提示。`PmcCounter` 枚举今天是 AMD-SQ 专属的；把它拓宽
-是[路线图](./limitations.md)的一部分。
+计数器来自 CUPTI 的 range profiler，运行期从 `libcupti.so.13` 绑定
+（`device/src/cuda/cupti.rs`）。CUDA 13 把 PerfWorks 的 host API 并入了 CUPTI，
+因此整条调用序列由这一个库承载 —— CUPTI 自己会 `dlopen`
+`libnvperf_host.so`，所以它必须能被动态链接器解析到。这个绑定和 `ptxas` 一样是
+可选的：库缺失、不可用，或用 `SVOD_CUDA_CUPTI=0` 显式关闭时，`pmc_available()`
+为 `false`，profiler 退化到第 1-3 层并打印它那行提示。
+
+`SVOD_PMC=1` 选择该后端的默认集合：
+
+| 令牌 | 指标 | 含义 |
+|---|---|---|
+| `cycles` | `sm__cycles_active.sum` | 至少有一个 warp 驻留的周期数 |
+| `warps` | `sm__warps_launched.sum` | 启动的 warp 数 |
+| `inst` | `smsp__inst_executed.sum` | 执行的 warp 指令数 |
+| `tensor` | `sm__pipe_tensor_cycles_active.sum` | tensor 流水线活跃的周期数 |
+| `dram` | `dram__bytes.sum` | 经过 DRAM 的字节数 |
+
+用令牌指定子集 —— `SVOD_PMC=tensor,dram`。令牌在各后端之间唯一，所以在 CUDA 上
+写 AMD 的令牌只会被丢弃，而不会去错误地编程另一个模块。`tensor` 与 `cycles`
+之比就是 matmul 或 flash-attention 内核的 tensor core 利用率；`dram` 则把受带宽
+限制的内核和受发射限制的内核区分开。
+
+```bash
+SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo bench -p svod-tk --bench matmul -- --profile-time 5
+```
+
+### 权限
+
+驱动默认只允许管理员采集计数器，而且这个限制并不在你以为的地方生效：
+`cuptiRangeProfilerEnable` 和 `cuptiRangeProfilerSetConfig` 没有权限也会成功，
+只有计数器可用性镜像和 `cuptiRangeProfilerStart` 会返回
+`CUPTI_ERROR_INSUFFICIENT_PRIVILEGES`。因此 `pmc_available()` 探测的正是这个
+可用性镜像。解除限制：
+
+```bash
+echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' \
+  | sudo tee /etc/modprobe.d/nvidia-profiling.conf
+# 按你的发行版重建 initramfs，然后重启
+```
+
+`scripts/cupti_probe.cu` 会独立跑完整条序列并报告它停在哪一步，这是区分权限
+问题和工具链问题最快的办法。
+
+### 采集的代价
+
+采集运行在 `CUPTI_AutoRange` 加 `CUPTI_KernelReplay` 模式下：CUPTI 为每次启动
+开一个 range，并在内部重放内核以覆盖多趟配置（上面这五个计数器一趟即可调度完）。
+两个后果已经替你处理好了：
+
+- 被捕获的 CUDA graph 会作为一次不透明的提交重放，那样什么计数器都拿不到，
+  所以带计数器的运行走逐次 dispatch 的路径。
+- 内核重放会把该次 dispatch 自己的 event pair 放大好几个数量级，所以带计数器的
+  运行会额外做一趟不带计数器的 pass；`merge_min` 保留它的计时，同时保留带计数器
+  那一趟的计数器。因此同一张表里的计时和计数器来自不同的 pass。
+
+回读由主机驱动，且一个 session 不能与下一个重叠，所以带计数器的 dispatch 会就地
+同步。任何 CUPTI 失败都只会让该次 dispatch 退化为仅有计时，而不会让整个运行失败。
 
 若要做内核内的计时实验，`svod_codegen::llvm::nvptx::globaltimer()` 会构建一个
 读取 `%globaltimer` 的 `CUSTOM` 节点，那是纳秒级的 GPU 时钟。

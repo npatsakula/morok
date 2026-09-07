@@ -13,7 +13,7 @@ CUDA backend puts into those handles, and which tiers exist.
 | **1 — device time** | yes | CUDA event pairs around each launch |
 | **2 — roofline** | yes | backend-neutral (IR FLOP estimate, plan buffers) |
 | **3 — static occupancy** | yes | `cuFuncGetAttribute` + `cuOccupancyMaxActiveBlocksPerMultiprocessor` |
-| **4 — hardware counters** | **no** | needs CUPTI; not bound |
+| **4 — hardware counters** | yes | CUPTI range profiler (`libcupti.so.13`) |
 
 ```bash
 SVOD_DEVICE=CUDA:0 SVOD_PROFILE_ITERS=20 cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav
@@ -71,13 +71,72 @@ registers, shared memory and the per-SM block limit.
 
 ---
 
-## Tier 4: not available
+## Tier 4: hardware counters
 
-There is no CUPTI binding, so `PlanContext::pmc_available()` is `false` on
-CUDA. Setting `SVOD_PMC=1` does not fail: the profiler degrades to Tiers 1-3
-and prints its one-line note that counters are unavailable. The `PmcCounter`
-enum is AMD-SQ-specific today; widening it is part of the
-[roadmap](./limitations.md).
+Counters come from the CUPTI range profiler, bound at runtime from
+`libcupti.so.13` (`device/src/cuda/cupti.rs`). CUDA 13 folded the PerfWorks
+host API into CUPTI, so that one library carries the whole sequence — CUPTI
+`dlopen`s `libnvperf_host.so` itself, which therefore has to be resolvable by
+the loader. The binding is optional the way `ptxas` is: when it is absent,
+unusable, or disabled with `SVOD_CUDA_CUPTI=0`, `pmc_available()` is `false`
+and the profiler degrades to Tiers 1-3 with its one-line note.
+
+`SVOD_PMC=1` selects the backend default:
+
+| Token | Metric | Meaning |
+|---|---|---|
+| `cycles` | `sm__cycles_active.sum` | cycles with at least one warp resident |
+| `warps` | `sm__warps_launched.sum` | warps launched |
+| `inst` | `smsp__inst_executed.sum` | warp instructions executed |
+| `tensor` | `sm__pipe_tensor_cycles_active.sum` | cycles the tensor pipe was active |
+| `dram` | `dram__bytes.sum` | bytes moved through DRAM |
+
+Name a subset by token — `SVOD_PMC=tensor,dram`. Tokens are unique across
+backends, so an AMD token on CUDA is dropped rather than mis-programming a
+block. `tensor` against `cycles` is the tensor-core utilization of a matmul or
+a flash-attention kernel; `dram` is what separates a bandwidth-bound kernel
+from an issue-bound one.
+
+```bash
+SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo bench -p svod-tk --bench matmul -- --profile-time 5
+```
+
+### Privileges
+
+The driver restricts counter collection to admin users by default, and the
+restriction is not where it first appears: `cuptiRangeProfilerEnable` and
+`cuptiRangeProfilerSetConfig` both succeed without it, and only the counter
+availability image and `cuptiRangeProfilerStart` fail with
+`CUPTI_ERROR_INSUFFICIENT_PRIVILEGES`. `pmc_available()` therefore probes the
+availability image. To lift the restriction:
+
+```bash
+echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' \
+  | sudo tee /etc/modprobe.d/nvidia-profiling.conf
+# rebuild the initramfs for your distro, then reboot
+```
+
+`scripts/cupti_probe.cu` runs the whole sequence standalone and reports where
+it stops, which is the quickest way to tell a privilege problem from a
+toolkit one.
+
+### What collection costs
+
+Capture runs in `CUPTI_AutoRange` with `CUPTI_KernelReplay`: CUPTI opens one
+range per launch and replays the kernel internally to cover a multi-pass
+config (the five counters above schedule in one pass). Two consequences are
+handled for you:
+
+- A captured CUDA graph replays as one opaque submission and would report no
+  counters, so a counted run takes the per-dispatch path.
+- Kernel replay inflates the dispatch's own event pair by orders of magnitude,
+  so a counted run adds one disarmed pass; `merge_min` keeps its timing next
+  to the counted pass's counters. Timing and counters in one table therefore
+  come from different passes.
+
+Readback is host-driven and one session cannot overlap the next, so a counted
+dispatch synchronizes in place. Any CUPTI failure degrades that dispatch to
+timing only rather than failing the run.
 
 For in-kernel timing experiments, `svod_codegen::llvm::nvptx::globaltimer()`
 builds a `CUSTOM` node reading `%globaltimer`, the nanosecond GPU clock.

@@ -16,7 +16,6 @@ sidebar_label: Limitations और Roadmap
 | **fp8 conversions** | `FP8E4M3` / `FP8E5M2` से या उसकी ओर एक cast render पर fail होता है (`NVPTX fp8 cast ...`); sm_89 वाले `cvt.*.e4m3x2` intrinsics emit नहीं होते। fp8 `mma.sync` rows `resolve_mma` में मौजूद हैं लेकिन उन्हें feed नहीं किया जा सकता। | `codegen/src/llvm/nvptx/ops.rs` |
 | **Scoped synchronization** | Host reads और writes केवल buffer के producers का wait करने के बजाय पूरे context को drain करते हैं (`_copyin` / `_copyout` में `cuCtxSynchronize`)। Plans और graphs event-आधारित `CompletionToken` ज़रूर सौंपते हैं। | `device/src/cuda/allocator.rs` |
 | **Peer-to-peer copies** | `cuMemcpyPeerAsync` / `cuDeviceCanAccessPeer` bound नहीं हैं। एक `CUDA:0 → CUDA:1` copy executor में `SyncStrategy::PeerToPeer` लेती है, जो `Buffer::copy_from` पर fall back करती है; दो allocators दो devices हैं, इसलिए bytes एक host `Vec` से होकर उछलते हैं। | `runtime/src/executor.rs`, `device/src/buffer.rs` |
-| **Hardware counters (Tier 4)** | कोई CUPTI नहीं; `pmc_available()` `false` है, `SVOD_PMC` एक नोट के साथ घट जाता है। | [Profiling](./profiling.md) |
 | **Tile kernels (`tk`)** | केवल AMD: `resolve_arch` एक CUDA spec के लिए कोई `AmdArch` नहीं देता, इसलिए एक `tk` launch `UnsupportedArch` report करता है। | `tk/src/target.rs` |
 | **Dynamic shared memory** | Launches `shared_mem_bytes = 0` पास करते हैं; केवल static `.shared` उपयोग होती है और `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` कभी call नहीं होता, इसलिए एक kernel जिसे default per-block limit से ज़्यादा चाहिए वह JIT पर fail होता है। Device factory ऐसे device को पहले ही मना कर देता है जिसकी limit profile की `shared_max` (48 KiB) से नीचे हो। | `device/src/cuda/program.rs`, `runtime/src/devices/cuda.rs` |
 | **Hopper / Blackwell matrix paths** | केवल `mma.sync` (`m16n8kK`) lower होता है; कोई `wgmma` नहीं, कोई `tcgen05` नहीं। | `codegen/src/llvm/nvptx/wmma.rs` |
@@ -46,9 +45,7 @@ path लेते हैं ([Codegen](./codegen.md)); `lg2.approx.f32` renderer
    बजाय events का wait करे।
 2. **असली P2P**: `cuDeviceCanAccessPeer` / `cuCtxEnablePeerAccess` / `cuMemcpyPeerAsync` को
    bind करना और `SyncStrategy::PeerToPeer` को उनके माध्यम से route करना।
-3. **CUPTI counters**: `PmcCounter` को AMD SQ set से आगे चौड़ा करना और एक Tier 4 provider
-   जोड़ना।
-4. **fp8**: sm_89 वाले `cvt` intrinsics को lower करना ताकि fp8 `mma.sync` rows तक पहुँचा जा
+3. **fp8**: sm_89 वाले `cvt` intrinsics को lower करना ताकि fp8 `mma.sync` rows तक पहुँचा जा
    सके।
 5. Toolkit मौजूद होने पर **`ptxas` pre-assembly**, एक cubin के रूप में cached।
 6. `cuFuncSetAttribute` के माध्यम से **Dynamic shared memory**, और `GpuArch` के ऊपर `tk`

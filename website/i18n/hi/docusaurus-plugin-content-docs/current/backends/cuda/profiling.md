@@ -13,7 +13,7 @@ handles में क्या डालता है, और कौन-से t
 | **1 — device time** | हाँ | हर launch के इर्द-गिर्द CUDA event जोड़ियाँ |
 | **2 — roofline** | हाँ | backend-neutral (IR FLOP estimate, plan buffers) |
 | **3 — static occupancy** | हाँ | `cuFuncGetAttribute` + `cuOccupancyMaxActiveBlocksPerMultiprocessor` |
-| **4 — hardware counters** | **नहीं** | CUPTI चाहिए; bound नहीं है |
+| **4 — hardware counters** | हाँ | CUPTI range profiler (`libcupti.so.13`) |
 
 ```bash
 SVOD_DEVICE=CUDA:0 SVOD_PROFILE_ITERS=20 cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav
@@ -70,12 +70,71 @@ driver की गिनती में registers, shared memory और per-SM b
 
 ---
 
-## Tier 4: उपलब्ध नहीं
+## Tier 4: hardware counters
 
-कोई CUPTI binding नहीं है, इसलिए CUDA पर `PlanContext::pmc_available()` `false` है।
-`SVOD_PMC=1` सेट करना fail नहीं होता: profiler घटकर Tiers 1-3 पर आ जाता है और अपना एक-line
-नोट print करता है कि counters उपलब्ध नहीं हैं। `PmcCounter` enum आज AMD-SQ-specific है; उसे
-चौड़ा करना [roadmap](./limitations.md) का हिस्सा है।
+Counters CUPTI के range profiler से आते हैं, जो runtime पर `libcupti.so.13` से
+bind होता है (`device/src/cuda/cupti.rs`)। CUDA 13 ने PerfWorks का host API
+CUPTI में ही समेट दिया, इसलिए पूरी sequence यही एक library उठाती है — और
+`libnvperf_host.so` को CUPTI खुद `dlopen` करता है, तो वह loader को मिलनी चाहिए।
+यह binding उतना ही optional है जितना `ptxas`: library न हो, काम की न हो, या
+`SVOD_CUDA_CUPTI=0` से बंद कर दी गई हो, तो `pmc_available()` `false` रहता है और
+profiler अपनी एक-line नोट के साथ Tiers 1-3 पर घट जाता है।
+
+`SVOD_PMC=1` इस backend का default set चुनता है:
+
+| Token | Metric | अर्थ |
+|---|---|---|
+| `cycles` | `sm__cycles_active.sum` | वे cycles जिनमें कम से कम एक warp resident था |
+| `warps` | `sm__warps_launched.sum` | launch हुए warps |
+| `inst` | `smsp__inst_executed.sum` | execute हुए warp instructions |
+| `tensor` | `sm__pipe_tensor_cycles_active.sum` | tensor pipe के active cycles |
+| `dram` | `dram__bytes.sum` | DRAM से गुज़रे bytes |
+
+Subset tokens से चुनें — `SVOD_PMC=tensor,dram`। Tokens सभी backends में unique
+हैं, इसलिए CUDA पर AMD का token गिरा दिया जाता है, किसी दूसरे block को गलत
+program नहीं करता। `cycles` के सापेक्ष `tensor` किसी matmul या flash-attention
+kernel का tensor-core utilization है; और `dram` bandwidth-bound kernel को
+issue-bound से अलग कर देता है।
+
+```bash
+SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo bench -p svod-tk --bench matmul -- --profile-time 5
+```
+
+### Privileges
+
+Driver default रूप से counter collection सिर्फ़ admin users तक सीमित रखता है, और
+यह पाबंदी वहाँ नहीं दिखती जहाँ आप उम्मीद करेंगे: `cuptiRangeProfilerEnable` और
+`cuptiRangeProfilerSetConfig` बिना privileges के भी सफल होते हैं, और
+`CUPTI_ERROR_INSUFFICIENT_PRIVILEGES` सिर्फ़ counter availability image तथा
+`cuptiRangeProfilerStart` पर आता है। इसीलिए `pmc_available()` उसी availability
+image को probe करता है। पाबंदी हटाने के लिए:
+
+```bash
+echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' \
+  | sudo tee /etc/modprobe.d/nvidia-profiling.conf
+# अपने distro के हिसाब से initramfs दोबारा बनाएँ, फिर reboot करें
+```
+
+`scripts/cupti_probe.cu` पूरी sequence अलग से चलाकर बताता है कि वह कहाँ रुकती है —
+privilege की दिक्कत को toolkit की दिक्कत से अलग करने का यह सबसे तेज़ तरीका है।
+
+### Collection की क़ीमत
+
+Capture `CUPTI_AutoRange` में `CUPTI_KernelReplay` के साथ चलता है: CUPTI हर launch
+पर एक range खोलता है और multi-pass config पूरा करने के लिए kernel को अंदर ही
+replay करता है (ऊपर के पाँचों counters एक ही pass में schedule हो जाते हैं)। दो
+नतीजे आपके लिए पहले ही सँभाल लिए गए हैं:
+
+- Capture किया गया CUDA graph एक अपारदर्शी submission की तरह replay होता है और
+  कोई counter नहीं देता, इसलिए counters वाला run per-dispatch रास्ता लेता है।
+- Kernel replay उसी dispatch की event pair को कई गुना बढ़ा देता है, इसलिए counters
+  वाला run एक disarmed pass और जोड़ता है; `merge_min` उसकी timing को counted pass
+  के counters के साथ रखता है। यानी एक ही table में timing और counters अलग-अलग
+  passes से आते हैं।
+
+Readback host-driven है और एक session अगली से overlap नहीं कर सकता, इसलिए counters
+वाला dispatch वहीं synchronize करता है। कोई भी CUPTI failure उस dispatch को सिर्फ़
+timing तक घटा देता है, पूरा run fail नहीं करता।
 
 In-kernel timing प्रयोगों के लिए, `svod_codegen::llvm::nvptx::globaltimer()` एक `CUSTOM`
 node बनाता है जो `%globaltimer`, यानी nanosecond GPU clock, पढ़ता है।

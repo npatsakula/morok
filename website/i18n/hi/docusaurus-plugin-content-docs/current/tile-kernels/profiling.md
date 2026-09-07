@@ -7,7 +7,7 @@ sidebar_label: Profiling और Benchmarking
 [Debugging](./debugging) एक ही hardware timestamp से इस सवाल का जवाब देता है कि "क्या यह कर्नेल correct
 है, और मोटे तौर पर कितना तेज़?" यह chapter उसके बाद वाले सवाल के बारे में है: *समय कहाँ जाता है, और
 bottleneck क्या है?* Svod एक **layered kernel profiler** ship करता है जो इसका जवाब चार tiers में देता है —
-device time, एक roofline, static occupancy, और AMD hardware counters — और वह भी एक ही call के पीछे।
+device time, एक roofline, static occupancy, और hardware counters — और वह भी एक ही call के पीछे।
 
 profiler `runtime` crate में रहता है, `tk` में नहीं, और यही placement असल बात है: यह **किसी भी** `Tensor`
 या `ExecutionPlan` पर काम करता है, चाहे उसके अंदर के कर्नेल graph optimizer से आए हों या `tk` से हाथ से
@@ -33,7 +33,7 @@ flowchart TD
   P["Tensor::profile / ExecutionPlan::profile"] --> T1["Tier 1 - device time (GPU-clock timestamps)"]
   P --> T2["Tier 2 - roofline (GFLOP/s, GB/s)"]
   P --> T3["Tier 3 - static occupancy (VGPR/SGPR/LDS, occ%)"]
-  P --> T4["Tier 4 - HW counters / PMC (SQ busy, waves, VALU)"]
+  P --> T4["Tier 4 - HW counters / PMC (AMD SQ block, CUDA CUPTI)"]
 ```
 
 | Tier | यह क्या report करता है | Source | Execution चाहिए? |
@@ -41,7 +41,7 @@ flowchart TD
 | **1 — device time** | हर कर्नेल का GPU execution time | GPU-clock dispatch timestamps | हाँ |
 | **2 — roofline** | derived **GFLOP/s** और **GB/s** | कर्नेल के IR से FLOP estimate; bytes plan के buffers से | हाँ (rates के लिए time चाहिए) |
 | **3 — static occupancy** | VGPR / SGPR / LDS / scratch usage और VGPR-limited **occupancy %** | AMD kernel descriptor से decoded | नहीं — pure static decode |
-| **4 — hardware counters (PMC)** | SQ-block counters: busy cycles, launch हुई waves, issue हुए VALU instructions | PM4 perf-counter packets, compute grid भर में summed | हाँ, एक stable GPU पर |
+| **4 — hardware counters (PMC)** | AMD: SQ busy cycles, waves, VALU instructions. CUDA: SM cycles, warps, instructions, tensor-pipe cycles, DRAM bytes | AMD: PM4 packets, grid भर में summed. CUDA: CUPTI range profiler | हाँ, और counters unlocked होने चाहिए |
 
 कुछ बातें जानने लायक़:
 
@@ -130,7 +130,7 @@ let opts = ProfileOptions {
 };
 ```
 
-`PmcSelection` है `None` (सिर्फ़ Tiers 1–3), `Default` (implemented SQ counters), या
+`PmcSelection` है `None` (सिर्फ़ Tiers 1–3), `Default` (जो भी चल रहा backend इकट्ठा करता है, `PlanContext::pmc_default` से resolve होकर), या
 `Custom(Vec<PmcCounter>)` (एक explicit list)।
 
 `ProfileOptions::from_env()` वह इकलौती जगह है जहाँ profiling env vars पढ़े जाते हैं:
@@ -138,7 +138,7 @@ let opts = ProfileOptions {
 | Env var | असर |
 |---------|--------|
 | `SVOD_PROFILE_ITERS` | min-merge के लिए replay count (कम से कम 1 तक clamp किया गया) |
-| `SVOD_PMC` | Tier-4 selection: empty या `0` → off; `1` → default counter set; वरना एक comma-separated token list (`sqbusy`, `waves`, `valu`) |
+| `SVOD_PMC` | Tier-4 selection: empty या `0` → off; `1` → backend का default set; वरना एक comma-separated token list (AMD: `sqbusy`, `waves`, `valu`; CUDA: `cycles`, `warps`, `inst`, `tensor`, `dram`) |
 | `SVOD_ORIGIN` | `1` हर op का scope दर्ज करता है — module path, call site, ONNX node; नीचे देखें |
 | `SVOD_ORIGIN_DEPTH` | origin rollups path के कितने segments रखें (`origin_depth`); unset या `0` = पूरा path |
 
@@ -148,15 +148,23 @@ SVOD_DEVICE=AMD:0 SVOD_PROFILE_ITERS=20 SVOD_PMC=1 ...
 
 # Only VALU instructions and SQ-busy cycles.
 SVOD_DEVICE=AMD:0 SVOD_PMC=valu,sqbusy ...
+
+# CUDA पर tensor-core utilization और DRAM traffic।
+SVOD_DEVICE=CUDA:0 SVOD_PMC=tensor,dram ...
 ```
 
 ### Accumulate-and-min
 
 जब `iters > 1` हो (या criterion के कई invocations भर में), profiler **average नहीं** करता। हर pass एक
 `RunProfile` produce करता है, और passes को `RunProfile::merge_min` से merge किया जाता है: हर कर्नेल के लिए,
-तेज़ (minimum device-time) वाला sample जीतता है, और *उसी* sample के counters और static analysis को साथ ले
+तेज़ (minimum device-time) वाला sample जीतता है, और *उसी* sample का static analysis साथ ले
 जाता है। एक कर्नेल की intrinsic cost का robust estimator minimum ही है — यह scheduling jitter, contention,
 और clock-ramp outliers को reject कर देता है जो किसी mean को फुला देते हैं।
+
+Counters इसका अपवाद हैं: उन्हें इकट्ठा करना उसी pass को विचलित कर देता है जो उन्हें इकट्ठा कर रहा है,
+इसलिए वह pass कभी सबसे तेज़ नहीं होता; merge उन्हीं counters को रखता है जिस pass ने उन्हें capture किया,
+धीमे sample के साथ उन्हें फेंकता नहीं। इसलिए एक ही table में timing और counters अलग-अलग passes से आ
+सकते हैं — और यही ठीक है, क्योंकि counted pass कर्नेल की timing नहीं नापता।
 
 ## कर्नेल को model code से जोड़ना {#attributing-kernels-to-model-code}
 
@@ -264,7 +272,11 @@ IR से नहीं।) हाथ से लिखे कर्नेल क�
 **Tier 4 को एक stable power state चाहिए।** PM4 hardware counters तभी अर्थपूर्ण होते हैं जब GPU एक fixed clock
 पकड़े रखे। default `auto` power state पर profiler *fail नहीं होता* — यह degrade होता है: यह सिर्फ़ timing
 report करता है और एक one-line note print करता है कि counters के लिए `profile_standard` state चाहिए। पहले GPU
-को उस state में डालें (जैसे `amd-smi set -l stable_std`), फिर `SVOD_PMC` के साथ दोबारा चलाएँ।
+को उस state में डालें (जैसे `amd-smi set -l stable_std`), फिर `SVOD_PMC` के साथ दोबारा चलाएँ। CUDA पर
+शर्त अलग है: जब तक `NVreg_RestrictProfilingToAdminUsers=0` सेट न हो, driver counter collection सिर्फ़
+admin users को देता है, और CUPTI load होने लायक़ होनी चाहिए। NVIDIA की बारीक़ियाँ
+[CUDA पर Profiling](../backends/cuda/profiling.md) में हैं, यह भी कि वहाँ counters इकट्ठा करने में एक
+अतिरिक्त pass क्यों लगता है।
 :::
 
 ---
@@ -277,6 +289,7 @@ report करता है और एक one-line note print करता है
 | "क्या यह कर्नेल compute- या bandwidth-bound है?" | Tier-2 GFLOP/s और GB/s columns (graph कर्नेल), या roofline हाथ से compute करें (tk कर्नेल) |
 | "occupancy कम क्यों है — registers या LDS?" | Tier-3 VGPR/SGPR/LDS/occ% columns (कोई run ज़रूरी नहीं) |
 | "क्या कर्नेल हर busy cycle में काफ़ी VALU work issue कर रहा है?" | Tier-4 `SVOD_PMC=1`, एक `profile_standard` GPU पर |
+| "कर्नेल tensor cores सचमुच इस्तेमाल कर रहा है, या DRAM पर अटका है?" | CUDA पर Tier-4 `SVOD_PMC=tensor,dram` |
 | "कई runs भर में यह graph-native baseline से कैसे तुलना करता है?" | `cargo bench --profile-time` — देखें [Debugging → असली hardware पर timing](./debugging) |
 
 performance के बजाय correctness और structural checks के लिए, [Debugging](./debugging) में ही रहें; कर्नेल से
