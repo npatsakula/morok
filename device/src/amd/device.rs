@@ -12,7 +12,7 @@
 #![cfg(unix)]
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -980,40 +980,10 @@ pub(crate) fn pack_tmpring(waves: u32, wave_scratch: u32, arch: &AmdArch) -> u32
 
 pub(crate) fn open_owned(path: &str) -> Result<OwnedFd> {
     match open(path, OFlag::O_RDWR | OFlag::O_CLOEXEC, Mode::empty()) {
-        Ok(fd) => {
-            // `nix::fcntl::open` in our pinned version returns a bare `RawFd`;
-            // adopt it as an `OwnedFd` so Drop closes it for us.
-            let raw = fd_to_raw(fd);
-            // SAFETY: nix just opened this fd and transferred ownership to us;
-            // no other code can be observing it.
-            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
-        }
+        Ok(fd) => Ok(fd),
         Err(nix::errno::Errno::ENOENT) | Err(nix::errno::Errno::EACCES) => {
             Err(Error::NoAmdGpu { reason: format!("cannot open {path}") })
         }
         Err(e) => Err(Error::AmdIoctl { ioctl: "open", errno: e as i32 }),
-    }
-}
-
-/// Extract the raw fd from whatever `nix::fcntl::open` returns. In older nix
-/// versions this is `RawFd`; in 0.30+ it's `OwnedFd`. We use a small trait
-/// dispatch so the call site stays version-agnostic.
-fn fd_to_raw<T: ToRawFdShim>(fd: T) -> RawFd {
-    fd.to_raw()
-}
-
-trait ToRawFdShim {
-    fn to_raw(self) -> RawFd;
-}
-
-impl ToRawFdShim for RawFd {
-    fn to_raw(self) -> RawFd {
-        self
-    }
-}
-
-impl ToRawFdShim for OwnedFd {
-    fn to_raw(self) -> RawFd {
-        std::os::fd::IntoRawFd::into_raw_fd(self)
     }
 }

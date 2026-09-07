@@ -5,7 +5,7 @@ use super::jit::{WhisperDecoderJit, WhisperDecoderStepJit, WhisperPrefillJit};
 use super::profile::{CopyProfile, GraphProfile, begin_host_copy, timed_d2d};
 use super::tokenizer::WhisperTokenizer;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use snafu::ResultExt;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
@@ -1532,7 +1532,7 @@ fn finish_decode(
     })
 }
 
-fn pick_token_with_rng(logits: &[f32], temperature: f32, rng: &mut impl Rng) -> u32 {
+fn pick_token_with_rng(logits: &[f32], temperature: f32, rng: &mut impl RngExt) -> u32 {
     if temperature > 0.0 { sample_from_logits(logits, temperature, rng) } else { argmax(logits) as u32 }
 }
 
@@ -1771,14 +1771,14 @@ fn compression_ratio_text(text: &str) -> f32 {
 /// reference's `Categorical(logits=logits/T).sample()` (`decoding.py:283`),
 /// which PyTorch implements as a numerically stable softmax (max-subtract
 /// before exp) followed by inverse-CDF sampling.
-fn sample_from_logits(logits: &[f32], temperature: f32, rng: &mut impl Rng) -> u32 {
+fn sample_from_logits(logits: &[f32], temperature: f32, rng: &mut impl RngExt) -> u32 {
     // Max-subtract for numerical stability: exp(x - m) avoids overflow on
     // large positive logits. The max is a no-op for the sampling distribution
     // (it's a constant shift that cancels in normalization).
     let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) / temperature;
     let probs: Vec<f32> = logits.iter().map(|&l| ((l / temperature) - max_val).exp()).collect();
     let sum: f32 = probs.iter().copied().sum();
-    let mut r = rng.r#gen::<f32>() * sum;
+    let mut r = rng.random::<f32>() * sum;
     for (i, &p) in probs.iter().enumerate() {
         r -= p;
         if r <= 0.0 {

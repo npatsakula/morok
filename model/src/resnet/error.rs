@@ -14,7 +14,7 @@ pub enum Error {
         source: Box<crate::state::Error>,
     },
     #[snafu(display("hub error: {source}"))]
-    Hub { source: hf_hub::api::sync::ApiError },
+    Hub { source: hf_hub::HFError },
     #[snafu(display("invalid resnet config: {message}"))]
     Config { message: String },
 }

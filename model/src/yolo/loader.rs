@@ -11,9 +11,7 @@ use super::error::{HubSnafu, Result, StateSnafu, TensorSnafu};
 
 /// Download `model.safetensors` from HuggingFace Hub.
 pub fn download_safetensors(model_id: &str, revision: &str) -> Result<std::path::PathBuf> {
-    let api = hf_hub::api::sync::Api::new().context(HubSnafu)?;
-    let repo =
-        api.repo(hf_hub::Repo::with_revision(model_id.to_string(), hf_hub::RepoType::Model, revision.to_string()));
+    let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
     repo.get("model.safetensors").context(HubSnafu)
 }
 

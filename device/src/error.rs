@@ -166,3 +166,9 @@ pub enum Error {
     #[snafu(display("allocator does not support operation: {op}"))]
     Unsupported { op: &'static str },
 }
+
+/// Flatten `error` and its source chain into one line; `libloading` keeps the
+/// `dlerror` text in `source()` rather than in `Display`.
+pub fn describe(error: &dyn std::error::Error) -> String {
+    snafu::ChainCompat::new(error).map(ToString::to_string).collect::<Vec<_>>().join(": ")
+}

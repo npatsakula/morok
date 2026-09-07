@@ -21,7 +21,7 @@ pub enum Error {
         source: Box<crate::wespeaker::pickle::Error>,
     },
     #[snafu(display("HF Hub op failed"))]
-    Hub { source: hf_hub::api::sync::ApiError },
+    Hub { source: hf_hub::HFError },
     #[snafu(display("reading config.json failed: {message}"))]
     Config { message: String },
     #[snafu(display("{what} requires a concrete sequence length, got a symbolic dim"))]

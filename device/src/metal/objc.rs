@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 
 use libloading::Library;
 
+use crate::error::describe;
 use crate::{Error, Result};
 
 pub(crate) type Id = *mut c_void;
@@ -85,14 +86,14 @@ fn unavailable(reason: String) -> Error {
 fn load(path: &str) -> Result<Library> {
     // SAFETY: these are Apple system libraries whose initializers are safe to
     // run from any thread; the paths resolve through the dyld shared cache.
-    unsafe { Library::new(path) }.map_err(|error| unavailable(format!("cannot load {path}: {error}")))
+    unsafe { Library::new(path) }.map_err(|error| unavailable(format!("cannot load {path}: {}", describe(&error))))
 }
 
 /// Resolve `name` as a function pointer of type `T`.
 fn sym<T: Copy>(lib: &Library, path: &str, name: &CStr) -> Result<T> {
     // SAFETY: every call site declares `T` from the symbol's C prototype.
     let symbol = unsafe { lib.get::<T>(name.to_bytes_with_nul()) }
-        .map_err(|error| unavailable(format!("{path} has no symbol {name:?}: {error}")))?;
+        .map_err(|error| unavailable(format!("{path} has no symbol {name:?}: {}", describe(&error))))?;
     Ok(*symbol)
 }
 
@@ -102,7 +103,7 @@ fn data_sym(lib: &Library, path: &str, name: &CStr) -> Result<*const c_void> {
     // `Symbol<T>` dereferences to the symbol location itself, so the reference's
     // address is the symbol's address (the class object of the block).
     let symbol = unsafe { lib.get::<*const c_void>(name.to_bytes_with_nul()) }
-        .map_err(|error| unavailable(format!("{path} has no symbol {name:?}: {error}")))?;
+        .map_err(|error| unavailable(format!("{path} has no symbol {name:?}: {}", describe(&error))))?;
     Ok((&*symbol as *const *const c_void).cast())
 }
 

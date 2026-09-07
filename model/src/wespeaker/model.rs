@@ -122,9 +122,7 @@ impl WeSpeakerResNet34 {
     }
 
     pub fn from_hub_with_revision(model_id: &str, revision: &str, config: WeSpeakerConfig) -> Result<Self> {
-        let api = hf_hub::api::sync::Api::new().context(HubSnafu)?;
-        let repo =
-            api.repo(hf_hub::Repo::with_revision(model_id.to_string(), hf_hub::RepoType::Model, revision.to_string()));
+        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
         let weights_path = repo.get("pytorch_model.bin").context(HubSnafu)?;
         Self::from_pytorch_bin(&weights_path, config)
     }

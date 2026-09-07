@@ -83,7 +83,7 @@ pub(crate) fn validate_amd_object(bytes: &[u8], arch: AmdArch, kernel_name: &str
     if header.e_ident().class != ELFCLASS64
         || header.e_ident().data != ELFDATA2LSB
         || header.e_machine.get(endian) != EM_AMDGPU
-        || header.e_flags.get(endian) & 0xff != amd_elf_machine(arch)
+        || header.e_flags.get(endian).0 & 0xff != amd_elf_machine(arch)
     {
         return Err(crate::Error::JitCompilation {
             reason: format!("cached AMD object is not compatible with {}", arch.mcpu()),

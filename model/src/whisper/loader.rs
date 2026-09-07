@@ -88,9 +88,8 @@ impl Whisper {
 
     /// Load a named safetensors checkpoint from Hugging Face Hub.
     pub fn from_hub_with_weights(model_id: &str, revision: &str, weights: &str, dims: ModelDimensions) -> Result<Self> {
-        let api = hf_hub::api::sync::Api::new().map_err(|e| Error::Checkpoint { msg: e.to_string() })?;
         let repo =
-            api.repo(hf_hub::Repo::with_revision(model_id.to_string(), hf_hub::RepoType::Model, revision.to_string()));
+            crate::hub::HubRepo::open(model_id, revision).map_err(|e| Error::Checkpoint { msg: e.to_string() })?;
         let path = repo.get(weights).map_err(|e| Error::Checkpoint { msg: e.to_string() })?;
         let sd = state::load_safetensors(&path).map_err(|e| Error::State { source: e })?;
         Self::from_state_dict(&sd, dims)

@@ -300,10 +300,11 @@ impl CanonicalGraph {
     }
 
     /// Stream the same fields as [`Self::to_pretty_json`] into `writer` as
-    /// fixed-width little-endian bincode. Identity digests hash this directly
-    /// instead of materializing text.
-    pub fn encode_into(&self, writer: impl std::io::Write) -> bincode::Result<()> {
-        bincode::serialize_into(writer, self)
+    /// fixed-width little-endian bincode (the 1.x wire format, so identity
+    /// digests stay stable). Identity digests hash this directly instead of
+    /// materializing text.
+    pub fn encode_into(&self, mut writer: impl std::io::Write) -> Result<(), bincode::error::EncodeError> {
+        bincode::serde::encode_into_std_write(self, &mut writer, bincode::config::legacy()).map(drop)
     }
 }
 

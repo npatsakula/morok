@@ -24,7 +24,7 @@ pub enum Error {
     #[snafu(display("invalid encoder dtype: {dtype:?}; expected f16, bf16, or f32"))]
     EncoderDtype { dtype: svod_dtype::DType },
     #[snafu(display("hub error: {source}"))]
-    Hub { source: hf_hub::api::sync::ApiError },
+    Hub { source: hf_hub::HFError },
     #[snafu(display("flash-attention kernel: {source}"))]
     Tk {
         #[snafu(source(from(svod_tk::LaunchError, Box::new)))]

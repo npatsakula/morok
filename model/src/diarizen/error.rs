@@ -21,7 +21,7 @@ pub enum Error {
         source: Box<crate::wavlm::Error>,
     },
     #[snafu(display("HF Hub op failed"))]
-    Hub { source: hf_hub::api::sync::ApiError },
+    Hub { source: hf_hub::HFError },
     #[snafu(display("pickle loader failed"))]
     Pickle {
         #[snafu(source(from(crate::wespeaker::pickle::Error, Box::new)))]

@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 
 use libloading::Library;
 
+use crate::error::describe;
 use crate::{Error, Result};
 
 pub type CUdevice = c_int;
@@ -276,15 +277,15 @@ fn unavailable(reason: String) -> Error {
 fn sym<T: Copy>(library: &Library, name: &str) -> Result<T> {
     // SAFETY: `T` is declared from the symbol's C prototype at the call site.
     let symbol = unsafe { library.get::<T>(name.as_bytes()) }
-        .map_err(|error| unavailable(format!("{LIBCUDA} has no symbol {name}: {error}")))?;
+        .map_err(|error| unavailable(format!("{LIBCUDA} has no symbol {name}: {}", describe(&error))))?;
     Ok(*symbol)
 }
 
 impl Api {
     fn load() -> Result<Self> {
         // SAFETY: the driver's initializers are safe to run from any thread.
-        let library =
-            unsafe { Library::new(LIBCUDA) }.map_err(|error| unavailable(format!("cannot load {LIBCUDA}: {error}")))?;
+        let library = unsafe { Library::new(LIBCUDA) }
+            .map_err(|error| unavailable(format!("cannot load {LIBCUDA}: {}", describe(&error))))?;
         Self::bind(library)
     }
 

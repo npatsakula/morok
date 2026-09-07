@@ -34,9 +34,9 @@ fn ptxas_or_skip() -> Option<Ptxas> {
 /// header checks catch a corrupted or foreign image.
 #[test_case::test_case(|_| {}, "k", true; "ptxas cubin")]
 #[test_case::test_case(|_| {}, "other", false; "missing entry")]
-#[test_case::test_case(|cubin| cubin[18..20].copy_from_slice(&object::elf::EM_X86_64.to_le_bytes()), "k", false; "wrong machine")]
-#[test_case::test_case(|cubin| cubin[4] = object::elf::ELFCLASS32, "k", false; "elf32")]
-#[test_case::test_case(|cubin| cubin[5] = object::elf::ELFDATA2MSB, "k", false; "big endian")]
+#[test_case::test_case(|cubin| cubin[18..20].copy_from_slice(&object::elf::EM_X86_64.0.to_le_bytes()), "k", false; "wrong machine")]
+#[test_case::test_case(|cubin| cubin[4] = object::elf::ELFCLASS32.0, "k", false; "elf32")]
+#[test_case::test_case(|cubin| cubin[5] = object::elf::ELFDATA2MSB.0, "k", false; "big endian")]
 #[test_case::test_case(|cubin| cubin.truncate(200), "k", false; "truncated")]
 fn validate_cubin_cases(mutate: fn(&mut Vec<u8>), entry: &str, valid: bool) {
     let Some(ptxas) = ptxas_or_skip() else { return };

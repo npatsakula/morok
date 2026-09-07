@@ -890,7 +890,7 @@ impl CacheKey {
         let ast_hash = hasher.finish();
 
         Self {
-            schema: 8,
+            schema: 9,
             ast_hash,
             beam_width: config.beam_width,
             device: scheduler.ren.device,
@@ -934,12 +934,12 @@ impl CacheKey {
 
 /// Serialize applied opts to bytes for caching using bincode.
 fn serialize_opts(opts: &[Opt]) -> Vec<u8> {
-    bincode::serialize(opts).expect("Opt serialization should not fail")
+    bincode::serde::encode_to_vec(opts, bincode::config::standard()).expect("Opt serialization should not fail")
 }
 
 /// Deserialize opts from cached bytes using bincode.
 fn deserialize_opts(bytes: &[u8]) -> Option<Vec<Opt>> {
-    bincode::deserialize(bytes).ok()
+    bincode::serde::decode_from_slice(bytes, bincode::config::standard()).ok().map(|(opts, _)| opts)
 }
 
 fn cached_opt_suffix<'a>(scheduler: &Scheduler, cached: &'a [Opt]) -> Option<&'a [Opt]> {

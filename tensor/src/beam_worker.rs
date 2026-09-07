@@ -71,7 +71,7 @@ struct WorkerReady {
 }
 
 pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> std::io::Result<()> {
-    let bytes = bincode::serialize(value).map_err(std::io::Error::other)?;
+    let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard()).map_err(std::io::Error::other)?;
     writer.write_all(&(bytes.len() as u64).to_le_bytes())?;
     writer.write_all(&bytes)?;
     writer.flush()
@@ -88,7 +88,9 @@ pub fn read_frame<T: serde::de::DeserializeOwned>(reader: &mut impl Read) -> std
         .map_err(|_| std::io::Error::other("BEAM frame length does not fit usize"))?;
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes)?;
-    bincode::deserialize(&bytes).map(Some).map_err(std::io::Error::other)
+    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+        .map(|(value, _)| Some(value))
+        .map_err(std::io::Error::other)
 }
 
 struct WorkerCodegen {

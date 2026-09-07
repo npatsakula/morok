@@ -291,14 +291,18 @@ fn device_reports_limits_and_arch() {
 
 /// A 64-byte ELF header with no section table: enough for the header checks
 /// of `validate_cubin`, never enough to define an entry.
-fn elf_header(class: u8, data: u8, machine: u16) -> Vec<u8> {
+fn elf_header(
+    class: object::elf::FileClass,
+    data: object::elf::DataEncoding,
+    machine: object::elf::Machine,
+) -> Vec<u8> {
     let mut header = vec![0u8; 64];
     header[..4].copy_from_slice(&object::elf::ELFMAG);
-    header[4] = class;
-    header[5] = data;
-    header[6] = object::elf::EV_CURRENT;
-    header[16..18].copy_from_slice(&object::elf::ET_EXEC.to_le_bytes());
-    header[18..20].copy_from_slice(&machine.to_le_bytes());
+    header[4] = class.0;
+    header[5] = data.0;
+    header[6] = object::elf::EV_CURRENT.0;
+    header[16..18].copy_from_slice(&object::elf::ET_EXEC.0.to_le_bytes());
+    header[18..20].copy_from_slice(&machine.0.to_le_bytes());
     header[20..24].copy_from_slice(&1u32.to_le_bytes());
     header[52..54].copy_from_slice(&64u16.to_le_bytes());
     header[58..60].copy_from_slice(&64u16.to_le_bytes());

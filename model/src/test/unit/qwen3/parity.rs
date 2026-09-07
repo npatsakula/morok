@@ -27,9 +27,8 @@ fn resolve_file(name: &str) -> PathBuf {
     if p.exists() {
         return p;
     }
-    let api = hf_hub::api::sync::Api::new().expect("HF Hub API");
-    let repo = hf_hub::Repo::with_revision(HUB_REPO.into(), hf_hub::RepoType::Model, "main".into());
-    api.repo(repo).get(name).unwrap_or_else(|_| panic!("download {name} from {HUB_REPO}"))
+    let repo = crate::hub::HubRepo::open(HUB_REPO, "main").expect("HF Hub API");
+    repo.get(name).unwrap_or_else(|_| panic!("download {name} from {HUB_REPO}"))
 }
 
 fn load_cfg() -> Qwen3Config {
@@ -171,9 +170,8 @@ fn resolve_reranker_file(name: &str) -> PathBuf {
     if p.exists() {
         return p;
     }
-    let api = hf_hub::api::sync::Api::new().expect("HF Hub API");
-    let repo = hf_hub::Repo::with_revision(RERANKER_HUB_REPO.into(), hf_hub::RepoType::Model, "main".into());
-    api.repo(repo).get(name).unwrap_or_else(|_| panic!("download {name} from {RERANKER_HUB_REPO}"))
+    let repo = crate::hub::HubRepo::open(RERANKER_HUB_REPO, "main").expect("HF Hub API");
+    repo.get(name).unwrap_or_else(|_| panic!("download {name} from {RERANKER_HUB_REPO}"))
 }
 
 fn load_reranker() -> Qwen3Reranker {

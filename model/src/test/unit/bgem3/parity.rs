@@ -33,9 +33,8 @@ fn resolve_file(name: &str, hub_repo: &str) -> PathBuf {
     if p.exists() {
         return p;
     }
-    let api = hf_hub::api::sync::Api::new().expect("HF Hub API");
-    let repo = hf_hub::Repo::with_revision(hub_repo.into(), hf_hub::RepoType::Model, "main".into());
-    api.repo(repo).get(name).unwrap_or_else(|_| panic!("download {name} from {hub_repo}"))
+    let repo = crate::hub::HubRepo::open(hub_repo, "main").expect("HF Hub API");
+    repo.get(name).unwrap_or_else(|_| panic!("download {name} from {hub_repo}"))
 }
 
 fn load_fixture() -> (BgeM3, StateDict) {
