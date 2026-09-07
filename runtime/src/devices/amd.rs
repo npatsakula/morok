@@ -159,27 +159,20 @@ impl Renderer for AmdRendererWrapper {
     }
 
     fn supported_ops(&self) -> svod_ir::RendererOps {
-        let mut ops = svod_ir::RendererOps::all();
-        ops.binary.remove(&svod_ir::BinaryOp::Threefry);
-        ops.binary.remove(&svod_ir::BinaryOp::Pow);
-        ops.binary.remove(&svod_ir::BinaryOp::Max);
-        for op in [
+        // Sin must decompose (tinygrad `llvmir.py` `llvm_intrinsics` is exactly
+        // {sqrt, log2, exp2}): `@llvm.sin.f32` lowers to the hardware
+        // `v_sin_f32` behind an f32 `1/(2π)` pre-scale, which is only accurate
+        // for small arguments — sin(±1e6) comes back as ±sin(π/8) because the
+        // reduction happens in f32 revolutions. `v_exp_f32`/`v_log_f32`/
+        // `v_sqrt_f32` are ~1-ulp and stay native.
+        super::gpu_supported_ops(&[
             svod_ir::UnaryOp::Exp,
             svod_ir::UnaryOp::Log,
-            // Sin must decompose (tinygrad `llvmir.py` `llvm_intrinsics` is
-            // exactly {sqrt, log2, exp2}): `@llvm.sin.f32` lowers to the
-            // hardware `v_sin_f32` behind an f32 `1/(2π)` pre-scale, which is
-            // only accurate for small arguments — sin(±1e6) comes back as
-            // ±sin(π/8) because the reduction happens in f32 revolutions.
-            // `v_exp_f32`/`v_log_f32`/`v_sqrt_f32` are ~1-ulp and stay native.
             svod_ir::UnaryOp::Sin,
             svod_ir::UnaryOp::Cos,
             svod_ir::UnaryOp::Tan,
             svod_ir::UnaryOp::Erf,
-        ] {
-            ops.unary.remove(&op);
-        }
-        ops
+        ])
     }
 
     fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {

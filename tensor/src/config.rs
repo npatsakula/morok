@@ -154,10 +154,10 @@ impl PrepareConfig {
 }
 
 /// Whether a device can hold buffers of `dtype`, per its optimizer profile
-/// (Metal and WebGPU have no `double`; CUDA below sm_80 has no bf16). CUDA
-/// resolves the opened device's compute capability; the other GPU families
-/// are family-level, so arch-specific refinements (AMD fp8 variants) need the
-/// opened device's renderer.
+/// (Metal and WebGPU have no `double`; CUDA below sm_80 has no bf16; AMD fp8
+/// is per gfx family). The GPU arch is resolved from the device (CUDA's
+/// compute capability, AMD's KFD topology), falling back to the family
+/// profile when it cannot be.
 pub fn device_supports_storage_dtype(spec: &DeviceSpec, dtype: svod_dtype::ScalarDType) -> bool {
     use svod_schedule::OptimizerRenderer;
     let profile = match spec {
@@ -165,7 +165,9 @@ pub fn device_supports_storage_dtype(spec: &DeviceSpec, dtype: svod_dtype::Scala
         DeviceSpec::Cuda { device_id } => svod_device::registry::resolve_cuda_arch(*device_id)
             .map(OptimizerRenderer::for_cuda_arch)
             .unwrap_or_else(|_| OptimizerRenderer::cuda()),
-        DeviceSpec::Amd { .. } => OptimizerRenderer::amd_rdna3(),
+        DeviceSpec::Amd { device_id } => svod_device::registry::resolve_amd_arch_from_topology(*device_id)
+            .map(OptimizerRenderer::for_amd_arch)
+            .unwrap_or_else(|_| OptimizerRenderer::amd_rdna3()),
         DeviceSpec::Metal { .. } => OptimizerRenderer::metal(),
         DeviceSpec::WebGpu => OptimizerRenderer::webgpu(),
     };
@@ -181,10 +183,21 @@ pub fn amd_test_arch() -> Option<svod_dtype::AmdArch> {
     nodes.into_iter().find_map(|n| svod_dtype::AmdArch::from_gfx_target_version(n.gfx_target_version))
 }
 
-/// Detect a CUDA GPU on this host: the compute capability of device 0 when
-/// the driver loads and reports one.
+/// The CUDA device the tests run on: the default device when it is CUDA,
+/// else device 0 when the driver reports one.
+pub fn cuda_test_device() -> Option<DeviceSpec> {
+    let device_id = match svod_dtype::default_device::default_device() {
+        DeviceSpec::Cuda { device_id } => device_id,
+        _ if svod_device::cuda::has_devices() => 0,
+        _ => return None,
+    };
+    Some(DeviceSpec::Cuda { device_id })
+}
+
+/// The compute capability of [`cuda_test_device`], when the driver opens it.
 pub fn cuda_test_arch() -> Option<svod_dtype::CudaArch> {
-    svod_device::cuda::has_devices().then(|| svod_device::registry::resolve_cuda_arch(0).ok()).flatten()
+    let DeviceSpec::Cuda { device_id } = cuda_test_device()? else { return None };
+    svod_device::registry::resolve_cuda_arch(device_id).ok()
 }
 
 impl PrepareConfig {

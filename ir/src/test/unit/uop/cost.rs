@@ -14,9 +14,9 @@ fn alu_weight_is_the_product_of_enclosing_ranges() {
     let under_both = outer.try_add(&inner).unwrap();
     let unenclosed = UOp::define_var("a".to_string(), 1, 16).try_add(&UOp::define_var("b".to_string(), 1, 16)).unwrap();
 
-    assert_eq!(compute_ops_estimate(&under_both), 8 * 4);
-    assert_eq!(compute_ops_estimate(&unenclosed), 1);
-    assert_eq!(compute_ops_estimate(&UOp::sink(vec![under_both, unenclosed])), 8 * 4 + 1);
+    assert_eq!(compute_ops_estimate(&under_both), Some(8 * 4));
+    assert_eq!(compute_ops_estimate(&unenclosed), Some(1));
+    assert_eq!(compute_ops_estimate(&UOp::sink(vec![under_both, unenclosed])), Some(8 * 4 + 1));
 }
 
 #[test]
@@ -27,7 +27,7 @@ fn more_than_64_ranges_span_multiple_bitset_words() {
     let ranges: Vec<Arc<UOp>> = (0..70).map(|i| loop_range(i, if i == 69 { 3 } else { 1 })).collect();
     let sum = ranges.iter().skip(1).fold(ranges[0].clone(), |acc, r| acc.try_add(r).unwrap());
 
-    assert_eq!(compute_ops_estimate(&sum), 68 + 3);
+    assert_eq!(compute_ops_estimate(&sum), Some(68 + 3));
 }
 
 /// Address arithmetic is not compute. An INDEX's operands are how a kernel
@@ -41,14 +41,14 @@ fn index_arithmetic_is_not_counted() {
     // `outer * 4 + inner` is addressing, and the INDEX it feeds is not an ALU op.
     let address = outer.try_mul(&UOp::index_const(4)).unwrap().try_add(&inner).unwrap();
     let indexed = UOp::index().buffer(buffer.clone()).indices(vec![address]).call().unwrap();
-    assert_eq!(compute_ops_estimate(&indexed), 0, "an address computation is not flops");
+    assert_eq!(compute_ops_estimate(&indexed), Some(0), "an address computation is not flops");
 
     // The same arithmetic used as a value still counts, and a value that also
     // addresses stays counted — the conservative direction.
     let value = outer.try_add(&inner).unwrap();
-    assert_eq!(compute_ops_estimate(&value), 8 * 4);
+    assert_eq!(compute_ops_estimate(&value), Some(8 * 4));
     let both = UOp::index().buffer(buffer).indices(vec![value.clone()]).call().unwrap();
-    assert_eq!(compute_ops_estimate(&UOp::sink(vec![both, value])), 8 * 4);
+    assert_eq!(compute_ops_estimate(&UOp::sink(vec![both, value])), Some(8 * 4));
 }
 
 /// A WMMA is one instruction but a whole tile of MACs, so it cannot weigh the
@@ -71,14 +71,14 @@ fn wmma_weighs_its_macs() {
 
     let c = UOp::native_const(0.0f32);
     let mma = UOp::wmma(c.clone(), c.clone(), c, metadata());
-    assert_eq!(compute_ops_estimate(&mma), macs, "m16n8k16 is 4096 MACs, not one op");
+    assert_eq!(compute_ops_estimate(&mma), Some(macs), "m16n8k16 is 4096 MACs, not one op");
 
     // An accumulator carried by a loop puts the mma inside it, and the tile is
     // then worth its MACs on every iteration.
     let outer = loop_range(0, 8);
     let acc = outer.cast(DType::Float32);
     let looped = UOp::wmma(acc.clone(), acc.clone(), acc, metadata());
-    assert_eq!(compute_ops_estimate(&looped), macs * 8);
+    assert_eq!(compute_ops_estimate(&looped), Some(macs * 8));
 }
 
 /// A hand-lowered tile-DSL AST (`opts_to_apply == Some([])`) carries its own
@@ -89,8 +89,8 @@ fn wmma_weighs_its_macs() {
 fn hand_lowered_kernels_report_no_estimate() {
     let body = loop_range(0, 8).try_add(&loop_range(1, 4)).unwrap();
     let scheduled = UOp::sink_with_info(vec![body.clone()], KernelInfo::default());
-    assert_eq!(compute_ops_estimate(&scheduled), 8 * 4, "an optimizer-scheduled AST still counts");
+    assert_eq!(compute_ops_estimate(&scheduled), Some(8 * 4), "an optimizer-scheduled AST still counts");
 
     let hand = UOp::sink_with_info(vec![body], KernelInfo { opts_to_apply: Some(Vec::new()), ..KernelInfo::default() });
-    assert_eq!(compute_ops_estimate(&hand), u64::MAX, "no reliable count for a hand-lowered body");
+    assert_eq!(compute_ops_estimate(&hand), None, "no reliable count for a hand-lowered body");
 }

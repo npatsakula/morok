@@ -133,26 +133,18 @@ impl Renderer for CudaRendererWrapper {
     }
 
     fn supported_ops(&self) -> svod_ir::RendererOps {
-        // AMD's table plus `Log2`: `sqrt.rn` and `ex2.approx` stay native.
-        let mut ops = svod_ir::RendererOps::all();
-        ops.binary.remove(&svod_ir::BinaryOp::Threefry);
-        ops.binary.remove(&svod_ir::BinaryOp::Pow);
-        ops.binary.remove(&svod_ir::BinaryOp::Max);
-        for op in [
+        // AMD's table plus `Log2`: `sqrt.rn` and `ex2.approx` stay native, while
+        // `lg2.approx.f32` is a 2^-22.6 approximation where AMD's `v_log_f32` is
+        // exact; the polynomial `xlog2` keeps the shared 2e-6 test tolerances.
+        super::gpu_supported_ops(&[
             svod_ir::UnaryOp::Exp,
             svod_ir::UnaryOp::Log,
-            // `lg2.approx.f32` is a 2^-22.6 approximation where AMD's
-            // `v_log_f32` is exact; the polynomial `xlog2` keeps the shared
-            // 2e-6 test tolerances.
             svod_ir::UnaryOp::Log2,
             svod_ir::UnaryOp::Sin,
             svod_ir::UnaryOp::Cos,
             svod_ir::UnaryOp::Tan,
             svod_ir::UnaryOp::Erf,
-        ] {
-            ops.unary.remove(&op);
-        }
-        ops
+        ])
     }
 
     fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {

@@ -216,9 +216,13 @@ pub trait PlanContext: Send + Sync {
     }
 
     /// Arm hardware performance counters for subsequent profiling dispatches on
-    /// this context (empty disables). Default no-op: backends without PMC ignore
-    /// it. Counters are reported via [`DispatchTimestamps::counters`].
-    fn set_pmc(&self, _counters: &[crate::profile::PmcCounter]) {}
+    /// this context (empty disables), returning how many of `counters` this
+    /// backend collects: those naming another backend are dropped. Default
+    /// collects none. Counters are reported via
+    /// [`DispatchTimestamps::counters`].
+    fn set_pmc(&self, _counters: &[crate::profile::PmcCounter]) -> usize {
+        0
+    }
 
     /// Whether hardware counter collection is currently available on this
     /// context (backend supports PMC and the GPU is in a stable power state).

@@ -1521,9 +1521,18 @@ impl ExecutionPlan {
                 Some(ctx) if ctx.pmc_available() => {
                     // `Default` means whatever this backend collects; an explicit
                     // list may name another backend's counters, which it drops.
+                    // Arming follows what it kept, so a list it drops entirely
+                    // costs neither the counted passes nor graph replay.
                     let counters = opts.counters.resolve(&ctx.pmc_default());
-                    ctx.set_pmc(&counters);
-                    (!counters.is_empty()).then_some(ctx)
+                    let collected = ctx.set_pmc(&counters);
+                    if collected < counters.len() {
+                        eprintln!(
+                            "SVOD_PMC: {} of {} requested counters are not collected on this backend",
+                            counters.len() - collected,
+                            counters.len()
+                        );
+                    }
+                    (collected > 0).then_some(ctx)
                 }
                 Some(_) => {
                     eprintln!(
@@ -1584,11 +1593,7 @@ impl ExecutionPlan {
     /// byte traffic (each distinct buffer counted once), and decoded GPU
     /// resources when the backend exposes them.
     fn kernel_static_info(&self, pk: &PreparedKernel) -> KernelStaticInfo {
-        // The AST walk saturates to u64::MAX when a range/special has an
-        // unbounded symbolic end (common in hand-built kernels) — treat that as
-        // "no reliable count" rather than reporting a garbage roofline.
-        let raw_flops = svod_ir::compute_ops_estimate(&pk.ast);
-        let est_flops = (raw_flops != u64::MAX).then_some(raw_flops);
+        let est_flops = svod_ir::compute_ops_estimate(&pk.ast);
         let mut seen = std::collections::HashSet::new();
         let est_bytes =
             pk.buffer_indices.iter().filter(|&&i| seen.insert(i)).map(|&i| self.buffers[i].size() as u64).sum();

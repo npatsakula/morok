@@ -33,3 +33,17 @@ pub use cpu::{
 };
 pub use cuda::{create_cuda_codegen, create_cuda_device, create_cuda_program};
 pub use metal::{create_metal_codegen, create_metal_device, create_metal_program};
+
+/// The op table of a GPU renderer: everything but `Threefry` (renders as a
+/// bare XOR), `Pow` and `Max` (decompose to a select) and the transcendentals
+/// in `decomposed`, which the shared polynomial decompositions lower.
+pub(crate) fn gpu_supported_ops(decomposed: &[svod_ir::UnaryOp]) -> svod_ir::RendererOps {
+    let mut ops = svod_ir::RendererOps::all();
+    for op in [svod_ir::BinaryOp::Threefry, svod_ir::BinaryOp::Pow, svod_ir::BinaryOp::Max] {
+        ops.binary.remove(&op);
+    }
+    for op in decomposed {
+        ops.unary.remove(op);
+    }
+    ops
+}

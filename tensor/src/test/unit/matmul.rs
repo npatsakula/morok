@@ -1004,7 +1004,7 @@ fn test_matmul_cuda_tensor_core_matches_reference(in_dtype: DType, out_dtype: DT
         eprintln!("skipped: default device is not a CUDA GPU");
         return;
     };
-    let arch = crate::config::cuda_test_arch().expect("CUDA:0 is open");
+    let arch = crate::config::cuda_test_arch().expect("the CUDA test device is open");
     if !arch.has_bf16_mma() {
         eprintln!("skipped: {arch} has no m16n8k16 tensor cores");
         return;

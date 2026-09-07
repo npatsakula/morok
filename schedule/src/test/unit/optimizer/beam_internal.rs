@@ -142,7 +142,7 @@ fn beam_search_runs_with_an_inline_scorer() {
             timing: Duration::from_micros(100),
             // Vary the hash per candidate so dedup does not collapse them all.
             ir_hash: scheduler as *const Scheduler as u64,
-            compute_ops: 1,
+            compute_ops: Some(1),
         })
     };
 
@@ -177,7 +177,7 @@ fn test_remote_beam_parent_tracks_only_opt_sequences() {
                         CompiledCandidate {
                             artifact: index,
                             binary_key: index.to_le_bytes().to_vec(),
-                            compute_ops: 1,
+                            compute_ops: Some(1),
                             preparation: Duration::ZERO,
                             compilation: Duration::ZERO,
                         },
@@ -235,7 +235,7 @@ fn test_staged_beam_streams_unordered_compiles_dedups_and_serializes_timing() {
                         CompiledCandidate {
                             artifact: FakeArtifact { index },
                             binary_key,
-                            compute_ops: if index == 2 { 1001 } else { 1 },
+                            compute_ops: Some(if index == 2 { 1001 } else { 1 }),
                             preparation: Duration::ZERO,
                             compilation: Duration::ZERO,
                         },
@@ -324,7 +324,7 @@ fn test_staged_beam_cache_cold_and_warm_choose_same_winner() {
                         CompiledCandidate {
                             artifact: identity,
                             binary_key: identity.to_le_bytes().to_vec(),
-                            compute_ops: 1,
+                            compute_ops: Some(1),
                             preparation: Duration::ZERO,
                             compilation: Duration::ZERO,
                         },
@@ -383,7 +383,7 @@ fn test_remote_beam_cache_reuses_winner_across_parallel_and_recycling_changes() 
                         CompiledCandidate {
                             artifact,
                             binary_key: artifact.to_le_bytes().to_vec(),
-                            compute_ops: 1,
+                            compute_ops: Some(1),
                             preparation: Duration::ZERO,
                             compilation: Duration::ZERO,
                         },
@@ -440,7 +440,7 @@ fn test_remote_beam_does_not_cache_unbenchmarked_search() {
                     CompiledCandidate {
                         artifact: index,
                         binary_key: index.to_le_bytes().to_vec(),
-                        compute_ops: 1,
+                        compute_ops: Some(1),
                         preparation: Duration::ZERO,
                         compilation: Duration::ZERO,
                     },

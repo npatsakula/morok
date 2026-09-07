@@ -53,7 +53,7 @@ pub struct WorkerArtifact {
     pub global_size: [usize; 3],
     pub local_size: Option<[usize; 3]>,
     pub vals: Vec<i64>,
-    pub compute_ops: u64,
+    pub compute_ops: Option<u64>,
     pub preparation_ns: u64,
     pub compilation_ns: u64,
 }

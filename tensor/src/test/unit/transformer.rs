@@ -540,7 +540,7 @@ fn test_sdpa_cuda_masked_f16_matches_cpu(beam: bool) {
         OptimizerConfig::builder().strategy(OptStrategy::Heuristic).build()
     };
     let cuda = PrepareConfig { optimizer, ..config };
-    let actual = case.run(DeviceSpec::Cuda { device_id: 0 }, &cuda, &cuda, build);
+    let actual = case.run(crate::config::cuda_test_device().expect("a CUDA device is open"), &cuda, &cuda, build);
     assert_all_close(&actual, &expected, 2e-2);
 }
 
@@ -591,6 +591,6 @@ fn test_sdpa_scores_cuda_tc_warp_with_three_locals_matches_cpu() {
     ];
     let optimizer = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).opts_to_apply(plan).build();
     let forced = PrepareConfig { optimizer, ..config.clone() };
-    let actual = case.run(DeviceSpec::Cuda { device_id: 0 }, &config, &forced, build);
+    let actual = case.run(crate::config::cuda_test_device().expect("a CUDA device is open"), &config, &forced, build);
     assert_all_close(&actual, &expected, 1e-2);
 }

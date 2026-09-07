@@ -834,15 +834,16 @@ impl crate::device::PlanContext for OwnerCtx {
         Ok(crate::device::NativeReplayOutcome::Executed)
     }
 
-    fn set_pmc(&self, counters: &[crate::profile::PmcCounter]) {
-        // Counters naming another backend are simply not collected here.
-        *self.pmc.lock() = counters
+    fn set_pmc(&self, counters: &[crate::profile::PmcCounter]) -> usize {
+        let mut armed = self.pmc.lock();
+        *armed = counters
             .iter()
             .filter_map(|c| match c {
                 crate::profile::PmcCounter::Amd(c) => Some(*c),
                 _ => None,
             })
             .collect();
+        armed.len()
     }
 
     fn pmc_available(&self) -> bool {

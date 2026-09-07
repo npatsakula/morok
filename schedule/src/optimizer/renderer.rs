@@ -171,6 +171,16 @@ impl std::fmt::Debug for Renderer {
 }
 
 impl Renderer {
+    /// Lanes a block's threads are issued in: 64 on AMD CDNA, 32 everywhere
+    /// else (CUDA warps, Metal SIMD-groups, RDNA wave32). A block whose size
+    /// is not a multiple leaves its last wave partly idle.
+    pub fn wave_size(&self) -> usize {
+        match self.device {
+            RendererDevice::AmdCdna3 | RendererDevice::AmdCdna4 => 64,
+            _ => 32,
+        }
+    }
+
     fn dtype_set(dtypes: &[ScalarDType]) -> std::collections::HashSet<ScalarDType> {
         dtypes.iter().copied().collect()
     }

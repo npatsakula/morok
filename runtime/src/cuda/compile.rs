@@ -2,16 +2,14 @@
 //! PTX text, which [`Ptxas`] assembles to a cubin when the CUDA toolkit is
 //! installed and the driver JITs otherwise.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
-use sha2::{Digest, Sha256};
 use svod_codegen::llvm::nvptx::clang_flags;
 use svod_dtype::CudaArch;
 use tracing::debug;
 
-use crate::clang::{ClangToolchain, dump_ir, hex, path_clang_has_target, resolve_executable, run_probe};
+use crate::clang::{ClangToolchain, dump_ir, path_clang_has_target, resolve_executable, run_piped, run_probe};
 use crate::error::JitResultExt;
 use crate::object_cache::ObjectCache;
 
@@ -117,18 +115,25 @@ impl Ptxas {
         }
     }
 
+    /// The identity is the `--version` line (release and build id), which
+    /// names the assembler exactly; the persisted probe is keyed on the
+    /// executable's path, size and mtime so a replaced binary is re-probed
+    /// without hashing its tens of megabytes at every process start.
     fn identify(cache: Option<&ObjectCache>, executable: PathBuf) -> crate::Result<Self> {
-        let digest: [u8; 32] = Sha256::digest(std::fs::read(&executable).jit("read ptxas executable")?).into();
         let probe = || run_probe(&executable, &["--version"]);
         let version = match cache {
-            Some(cache) => cache.get_or_create_probe("ptxas-version", &digest, probe)?,
+            Some(cache) => {
+                let meta = std::fs::metadata(&executable).jit("stat ptxas executable")?;
+                let modified = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+                let key = format!("{};{};{:?}", executable.display(), meta.len(), modified);
+                cache.get_or_create_probe("ptxas-version", key.as_bytes(), probe)?
+            }
             None => probe()?,
         };
         let version = String::from_utf8(version).map_err(|error| crate::Error::JitCompilation {
             reason: format!("ptxas --version was not UTF-8: {error}"),
         })?;
-        let identity =
-            format!("ptxas:path={};sha256={};version={}", executable.display(), hex(&digest), version.trim());
+        let identity = format!("ptxas:path={};version={}", executable.display(), version.trim());
         Ok(Self { executable, identity })
     }
 
@@ -143,24 +148,9 @@ impl Ptxas {
 
     /// Assemble PTX text into a cubin for `arch`.
     pub(crate) fn assemble(&self, ptx: &[u8], arch: CudaArch) -> crate::Result<Vec<u8>> {
-        let what = format!("ptxas (arch={arch})");
-        let mut child = Command::new(&self.executable)
-            .args(ptxas_flags(arch))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .jit("spawn ptxas")?;
-        child.stdin.take().expect("stdin piped").write_all(ptx).jit("write PTX to ptxas stdin")?;
-        let output = child.wait_with_output().jit("wait for ptxas")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(crate::Error::JitCompilation { reason: format!("{what} failed:\n{stderr}") });
-        }
-        if output.stdout.is_empty() {
-            return Err(crate::Error::JitCompilation { reason: format!("{what} produced an empty cubin") });
-        }
-        Ok(output.stdout)
+        let mut command = Command::new(&self.executable);
+        command.args(ptxas_flags(arch));
+        run_piped(command, ptx, &format!("ptxas (arch={arch})"))
     }
 }
 

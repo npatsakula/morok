@@ -266,6 +266,19 @@ fn local_dims_fall_back_for_undividable_axes(size: i64, expected: &[Opt]) {
     assert_eq!(scheduler.applied_opts, expected);
 }
 
+/// The lane-efficiency model follows the renderer's wave width: a padded
+/// 32-thread block fills a whole warp on CUDA and RDNA but half a wave on
+/// CDNA, where the exact divisor 115 (of 5·11·23·41) then wins.
+#[test_case(Renderer::cuda(), &[Opt::padto(0, 32), Opt::local(0, 32)]; "warp32 pads")]
+#[test_case(Renderer::amd_rdna3(), &[Opt::padto(0, 32), Opt::local(0, 32)]; "wave32 pads")]
+#[test_case(Renderer::amd_cdna3(), &[Opt::local(0, 115)]; "wave64 keeps the divisor")]
+fn local_fallback_scores_lanes_per_wave(renderer: Renderer, expected: &[Opt]) {
+    let mut scheduler = Scheduler::new(create_elementwise_pattern(&[51865], AxisType::Global), renderer);
+
+    assert!(apply_local_dims(&mut scheduler, &HeuristicsConfig::builder().build()));
+    assert_eq!(scheduler.applied_opts, expected);
+}
+
 /// The decoder logits shape `[2, 51865]`: the vocabulary axis is padded and
 /// localized, and the row axis still folds into the same block.
 #[test]

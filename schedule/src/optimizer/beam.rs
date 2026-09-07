@@ -402,7 +402,9 @@ pub struct BeamStageTimings {
 pub struct CompiledCandidate<T> {
     pub artifact: T,
     pub binary_key: Vec<u8>,
-    pub compute_ops: u64,
+    /// `None` when the AST has no reliable count; such a candidate is never
+    /// filtered as bloated and never lowers the bar for the others.
+    pub compute_ops: Option<u64>,
     pub preparation: Duration,
     pub compilation: Duration,
 }
@@ -420,7 +422,17 @@ pub struct CandidateMetrics {
     pub ir_hash: u64,
     /// Cheap upper bound on the kernel's compute work; used by the
     /// `least_compute_ops*1000` filter to discard degenerate candidates.
-    pub compute_ops: u64,
+    /// `None` when no reliable count exists, which exempts the candidate.
+    pub compute_ops: Option<u64>,
+}
+
+/// The `least_compute_ops*1000` bloat filter: fold `compute_ops` into the
+/// running minimum and report whether the candidate is a thousand times the
+/// leanest one seen so far.
+fn bloated(least_compute_ops: &mut u64, compute_ops: Option<u64>) -> bool {
+    let Some(compute_ops) = compute_ops else { return false };
+    *least_compute_ops = (*least_compute_ops).min(compute_ops);
+    least_compute_ops.saturating_mul(1000) < compute_ops
 }
 
 /// Hash a UOp tree to a `u64` for `seen_libs` dedup.
@@ -509,8 +521,7 @@ where
             if !seen_libs.insert(metrics.ir_hash) {
                 continue;
             }
-            least_compute_ops = least_compute_ops.min(metrics.compute_ops);
-            if least_compute_ops.saturating_mul(1000) < metrics.compute_ops {
+            if bloated(&mut least_compute_ops, metrics.compute_ops) {
                 continue;
             }
 
@@ -652,8 +663,7 @@ where
             result.compiled += 1;
             result.stage_timings.filtering += compiled.preparation;
             result.stage_timings.compilation += compiled.compilation;
-            least_compute_ops = least_compute_ops.min(compiled.compute_ops);
-            if least_compute_ops.saturating_mul(1000) < compiled.compute_ops {
+            if bloated(&mut least_compute_ops, compiled.compute_ops) {
                 return;
             }
             let started = Instant::now();
@@ -742,8 +752,7 @@ where
             result.compiled += 1;
             result.stage_timings.filtering += compiled.preparation;
             result.stage_timings.compilation += compiled.compilation;
-            least_compute_ops = least_compute_ops.min(compiled.compute_ops);
-            if least_compute_ops.saturating_mul(1000) < compiled.compute_ops {
+            if bloated(&mut least_compute_ops, compiled.compute_ops) {
                 return;
             }
             let started = Instant::now();

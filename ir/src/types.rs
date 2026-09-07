@@ -584,6 +584,14 @@ pub struct KernelInfo {
     pub name: Option<String>,
 }
 
+impl KernelInfo {
+    /// Whether the AST is a finished, hand-lowered body the optimizer passes
+    /// through untouched (`opts_to_apply == Some([])`), as a tile-DSL kernel.
+    pub fn is_hand_lowered(&self) -> bool {
+        self.opts_to_apply.as_ref().is_some_and(Vec::is_empty)
+    }
+}
+
 /// Target-defined instruction identity. Operands remain ordinary UOp sources;
 /// target-specific encoding facts live in sorted, deterministic attributes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]

@@ -25,17 +25,20 @@ use crate::uop::UOp;
 /// scheduler-built AST barely has any, but a hand-lowered kernel body (a `tk`
 /// tile kernel) is mostly index math, and counting it reported a matmul at
 /// tens of times the hardware's peak.
-pub fn compute_ops_estimate(uop: &Arc<UOp>) -> u64 {
+///
+/// `None` when no reliable count exists: the count overflowed, or the kernel
+/// is hand-lowered.
+pub fn compute_ops_estimate(uop: &Arc<UOp>) -> Option<u64> {
     // A hand-lowered kernel does its own addressing, and the nesting an op sits
     // in is then no longer recoverable from what its operands depend on: a tile
     // kernel's loop variables reach the arithmetic only through addresses, so
     // the fold below both misses real nesting and inherits unrelated ranges. It
     // is honest to report no count rather than one that came out tens of times
-    // off. `KernelInfo::opts_to_apply == Some([])` is exactly that AST.
+    // off.
     if let Op::Sink(ops::Sink { info: Some(info), .. }) = uop.op()
-        && info.opts_to_apply.as_ref().is_some_and(Vec::is_empty)
+        && info.is_hand_lowered()
     {
-        return u64::MAX;
+        return None;
     }
     let topo = uop.toposort();
     let pos: FxHashMap<u64, usize> = topo.iter().enumerate().map(|(i, node)| (node.id, i)).collect();
@@ -109,7 +112,7 @@ pub fn compute_ops_estimate(uop: &Arc<UOp>) -> u64 {
             flops = flops.saturating_add(weight.saturating_mul(per_op));
         }
     }
-    flops
+    (flops != u64::MAX).then_some(flops)
 }
 
 /// The children of `op` that carry values. Everything an INDEX uses to address

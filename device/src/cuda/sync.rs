@@ -113,9 +113,9 @@ impl PlanContext for CudaPlanCtx {
         self.stream.synchronize()
     }
 
-    fn set_pmc(&self, counters: &[PmcCounter]) {
-        // Counters naming another backend are simply not collected here.
-        *self.pmc.lock() = counters
+    fn set_pmc(&self, counters: &[PmcCounter]) -> usize {
+        let mut armed = self.pmc.lock();
+        *armed = counters
             .iter()
             .filter_map(|c| match c {
                 PmcCounter::Cuda(c) => Some(*c),
@@ -125,6 +125,7 @@ impl PlanContext for CudaPlanCtx {
         // The session pins one metric set at construction, so a changed
         // selection needs a fresh one.
         *self.session.lock() = None;
+        armed.len()
     }
 
     fn pmc_available(&self) -> bool {

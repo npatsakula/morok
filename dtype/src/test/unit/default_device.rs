@@ -19,7 +19,7 @@ fn parse_simple_variants() {
     assert_eq!(parse_simple("METAL:x"), None);
     assert_eq!(parse_simple("cuda"), Some(DeviceSpec::Cuda { device_id: 0 }));
     assert_eq!(parse_simple("CUDA:1"), Some(DeviceSpec::Cuda { device_id: 1 }));
-    assert_eq!(parse_simple("nv:2"), Some(DeviceSpec::Cuda { device_id: 2 }));
+    assert_eq!(parse_simple("nv:2"), None, "NV is reserved, as in the device crate's parser");
     assert_eq!(parse_simple("GPU"), Some(DeviceSpec::Cuda { device_id: 0 }));
     assert_eq!(parse_simple("CUDA:x"), None);
     assert_eq!(parse_simple("webgpu"), None);

@@ -25,11 +25,6 @@ pub const DEFAULT_UPCAST_FACTOR: usize = 4;
 /// Cumulative LOCAL size budget per kernel (tinygrad heuristic.py:184).
 const LOCAL_BUDGET: usize = 128;
 
-/// Threads of a block are issued in warps of this many lanes on every renderer
-/// with locals (CUDA, Metal SIMD-groups, RDNA wave32); a block whose size is
-/// not a multiple leaves its last warp partly idle.
-const WARP_LANES: usize = 32;
-
 /// Block sizes a global axis may be padded to, best first.
 const PAD_BLOCKS: [usize; 3] = [32, 16, 8];
 
@@ -58,14 +53,15 @@ fn const_extent(rng: &Arc<UOp>) -> Option<usize> {
 /// PADTO alignment it needs first.
 ///
 /// Two options compete on the fraction of lanes that do useful work in a
-/// block of `cumulative * threads` (the block occupies whole warps, and
-/// padded elements are computed then masked): the largest divisor of `size`
-/// within `budget`, and the largest of [`PAD_BLOCKS`] whose padding stays
-/// cheap ([`padded_extent`]). Ties keep the exact divisor.
-fn local_fallback(size: usize, cumulative: usize, budget: usize) -> Option<(usize, Option<usize>)> {
+/// block of `cumulative * threads` (the block occupies whole waves of
+/// `wave_size` lanes, and padded elements are computed then masked): the
+/// largest divisor of `size` within `budget`, and the largest of
+/// [`PAD_BLOCKS`] whose padding stays cheap ([`padded_extent`]). Ties keep
+/// the exact divisor.
+fn local_fallback(size: usize, cumulative: usize, budget: usize, wave_size: usize) -> Option<(usize, Option<usize>)> {
     let lane_efficiency = |threads: usize, useful: usize, total: usize| {
         let block = cumulative * threads;
-        block as f64 / (block.div_ceil(WARP_LANES) * WARP_LANES) as f64 * useful as f64 / total as f64
+        block as f64 / (block.div_ceil(wave_size) * wave_size) as f64 * useful as f64 / total as f64
     };
     let divisor = (2..=budget.min(size)).rev().find(|d| size.is_multiple_of(*d));
     let padded = PAD_BLOCKS
@@ -1008,7 +1004,9 @@ pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
             .copied()
             .find(|&x| axis_size.is_multiple_of(x) && cumulative_local * x <= LOCAL_BUDGET)
             .map(|sz| (sz, None))
-            .or_else(|| local_fallback(axis_size, cumulative_local, budget / cumulative_local));
+            .or_else(|| {
+                local_fallback(axis_size, cumulative_local, budget / cumulative_local, scheduler.renderer().wave_size())
+            });
 
         if let Some((sz, padto)) = local_sz {
             to_local.push((axis, sz, padto));

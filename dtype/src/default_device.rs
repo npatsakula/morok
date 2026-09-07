@@ -94,8 +94,9 @@ where
 /// Minimal `DeviceSpec` parser for the `SVOD_DEVICE` env var. We intentionally
 /// do NOT pull `svod_device::DeviceSpecExt` here — that crate depends on
 /// `svod-dtype`, not the other way around. Supports `CPU`, `AMD[:N]` / `HIP`,
-/// `METAL[:N]` and `CUDA[:N]` / `NV` / `GPU`; the GPU arch is a property of
-/// the opened device, never of the spec.
+/// `METAL[:N]` and `CUDA[:N]` / `GPU` (`NV` stays reserved for a userspace
+/// driver, as in `svod_device`'s parser); the GPU arch is a property of the
+/// opened device, never of the spec.
 fn parse_simple(s: &str) -> Option<DeviceSpec> {
     let upper = s.to_uppercase();
     let parts: Vec<&str> = upper.split(':').collect();
@@ -104,7 +105,7 @@ fn parse_simple(s: &str) -> Option<DeviceSpec> {
         "CPU" => Some(DeviceSpec::Cpu),
         "AMD" | "HIP" => Some(DeviceSpec::Amd { device_id: device_id()? }),
         "METAL" => Some(DeviceSpec::Metal { device_id: device_id()? }),
-        "CUDA" | "NV" | "GPU" => Some(DeviceSpec::Cuda { device_id: device_id()? }),
+        "CUDA" | "GPU" => Some(DeviceSpec::Cuda { device_id: device_id()? }),
         _ => None,
     }
 }

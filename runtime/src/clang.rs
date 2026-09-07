@@ -84,40 +84,39 @@ impl ClangToolchain {
     /// `amdgcn` or `nvptx64`)? Memoized per executable: an installation does
     /// not change during a run, and the probe forks a subprocess.
     pub(crate) fn has_target(&self, target: &'static str) -> bool {
-        static CACHE: std::sync::OnceLock<papaya::HashMap<(PathBuf, &'static str), bool>> = std::sync::OnceLock::new();
-        let probed = CACHE.get_or_init(papaya::HashMap::new).pin();
-        let key = (self.executable.clone(), target);
-        if let Some(known) = probed.get(&key) {
-            return *known;
-        }
-        let result = probe_target(&self.executable, target);
-        probed.insert(key, result);
-        result
+        cached_target(&self.executable, target)
     }
 
     /// Feed LLVM IR text to clang on stdin and return its stdout. `args` must
     /// already select `-x ir`, the target and the output form; `what` names
     /// the target in diagnostics.
     pub(crate) fn compile_ir(&self, args: &[String], ir: &str, what: &str) -> Result<Vec<u8>> {
-        let mut child = self
-            .command()
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .jit("spawn clang for LLVM IR")?;
-        child.stdin.take().expect("stdin piped").write_all(ir.as_bytes()).jit("write LLVM IR to clang stdin")?;
-        let output = child.wait_with_output().jit("wait for clang")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::JitCompilation { reason: format!("clang {what} compilation failed:\n{stderr}") });
-        }
-        if output.stdout.is_empty() {
-            return Err(Error::JitCompilation { reason: format!("clang produced empty output for {what}") });
-        }
-        Ok(output.stdout)
+        let mut command = self.command();
+        command.args(args);
+        run_piped(command, ir.as_bytes(), &format!("clang {what} compilation"))
     }
+}
+
+/// Run `command` with `input` on its stdin and return its stdout; a failing
+/// status carries the stderr, and empty output is a failure too (`what`
+/// names the tool in both).
+pub(crate) fn run_piped(mut command: Command, input: &[u8], what: &str) -> Result<Vec<u8>> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .jit("spawn the compiler")?;
+    child.stdin.take().expect("stdin piped").write_all(input).jit("write the compiler's stdin")?;
+    let output = child.wait_with_output().jit("wait for the compiler")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::JitCompilation { reason: format!("{what} failed:\n{stderr}") });
+    }
+    if output.stdout.is_empty() {
+        return Err(Error::JitCompilation { reason: format!("{what} produced empty output") });
+    }
+    Ok(output.stdout)
 }
 
 /// Does `executable` list `target` under `--print-targets`?
@@ -127,17 +126,23 @@ pub(crate) fn probe_target(executable: &Path, target: &str) -> bool {
         && String::from_utf8_lossy(&output.stdout).lines().any(|line| line.split_whitespace().next() == Some(target))
 }
 
-/// Does the `clang` on `PATH` advertise `target`? Cached for the lifetime of
-/// the process, keyed by target name.
-pub(crate) fn path_clang_has_target(target: &'static str) -> bool {
-    static CACHE: std::sync::OnceLock<papaya::HashMap<&'static str, bool>> = std::sync::OnceLock::new();
+/// [`probe_target`] memoized per executable for the process: an installation
+/// does not change during a run, and the probe forks a subprocess.
+fn cached_target(executable: &Path, target: &'static str) -> bool {
+    static CACHE: std::sync::OnceLock<papaya::HashMap<(PathBuf, &'static str), bool>> = std::sync::OnceLock::new();
     let probed = CACHE.get_or_init(papaya::HashMap::new).pin();
-    if let Some(known) = probed.get(target) {
+    let key = (executable.to_path_buf(), target);
+    if let Some(known) = probed.get(&key) {
         return *known;
     }
-    let result = probe_target(Path::new("clang"), target);
-    probed.insert(target, result);
+    let result = probe_target(executable, target);
+    probed.insert(key, result);
     result
+}
+
+/// Does the `clang` on `PATH` advertise `target`?
+pub(crate) fn path_clang_has_target(target: &'static str) -> bool {
+    cached_target(Path::new("clang"), target)
 }
 
 /// When `env_var` names a directory, write `ir` there as `<tag>_<module>.ll`

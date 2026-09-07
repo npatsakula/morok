@@ -771,8 +771,11 @@ impl RunProfile {
     }
 
     /// Merge another profiling pass of the SAME plan into this one, keeping each
-    /// kernel's faster (min device-time) sample — and carrying that sample's
-    /// counters/static analysis. Both must share stage + kernel ordering (extra
+    /// kernel's faster (min device-time) sample and its static analysis. The
+    /// counters are the first counted pass's: they describe the kernel, not a
+    /// run, and a counted pass never has the best time (see below), so the
+    /// timing and the counters of a merged kernel come from different passes
+    /// by design. Both must share stage + kernel ordering (extra
     /// stages/kernels in `other` are ignored); `self`'s stage metadata is kept.
     /// This is the single min-merge policy used to accumulate repeated passes
     /// (the `profile()` `iters` loop and the criterion `--profile-time` hook).
