@@ -67,17 +67,6 @@ fn invalid_utf8_is_rejected() {
     assert!(validate_ptx(&[0xff, 0xfe, 0xfd], SM86, "k").is_err());
 }
 
-#[test]
-fn ptx_flags_select_ir_input_assembly_output_and_arch() {
-    let flags = ptx_flags(SM86);
-    assert_eq!(&flags[..2], ["-x", "ir"]);
-    assert!(flags.contains(&"-S".to_string()));
-    assert!(flags.contains(&"--target=nvptx64-nvidia-cuda".to_string()));
-    assert!(flags.contains(&"-march=sm_86".to_string()));
-    assert!(flags.contains(&"--cuda-feature=+ptx78".to_string()));
-    assert_eq!(&flags[flags.len() - 3..], ["-", "-o", "-"]);
-}
-
 /// Round-trips a tiny NVPTX kernel through clang and pins that the resulting
 /// PTX validates only against the arch and entry point it was built for.
 /// Without an NVPTX target, the failure must at least be a clean error.

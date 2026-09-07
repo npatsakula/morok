@@ -39,10 +39,11 @@ fn render_raw(root: Arc<UOp>, arch: CudaArch, name: &str) -> crate::Result<crate
     LlvmTextRenderer::nvptx(arch).render(&linear, Some(name))
 }
 
-/// Compile `ir` to PTX with `clang --target=nvptx64-nvidia-cuda` and assemble
-/// it with `ptxas`, returning the PTX text. Returns `None` without asserting
-/// when the host clang has no NVPTX target; the `ptxas` step is skipped when
-/// no CUDA toolkit is installed. A PTX module containing `.extern .func` is
+/// Compile `ir` to PTX with the renderer's clang flags (the ISA pin matters:
+/// without a CUDA toolkit clang defaults to a PTX version no tensor-core
+/// shape exists in) and assemble it with `ptxas`, returning the PTX text.
+/// Returns `None` without asserting when the host clang has no NVPTX target;
+/// the `ptxas` step is skipped when no CUDA toolkit is installed. A PTX module containing `.extern .func` is
 /// an intrinsic LLVM did not recognize (it emits the name as an external
 /// call), so that is rejected here even though clang accepted the module.
 pub(crate) fn assert_ptx_compiles(ir: &str, arch: CudaArch) -> Option<String> {
@@ -57,9 +58,8 @@ pub(crate) fn assert_ptx_compiles(ir: &str, arch: CudaArch) -> Option<String> {
         return None;
     }
 
-    let march = format!("-march={arch}");
     let mut child = Command::new("clang")
-        .args(["-x", "ir", "-S", "-O3", "--target=nvptx64-nvidia-cuda", &march, "-Wno-override-module", "-", "-o", "-"])
+        .args(crate::llvm::nvptx::clang_flags(arch))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -493,4 +493,19 @@ fn nvvm_builders_are_rejected_on_other_targets(renderer: LlvmTextRenderer, targe
         }
         other => panic!("expected ForeignIntrinsic, got {other}"),
     }
+}
+
+/// The ISA pin follows the arch: 7.8 everywhere the profiles select only
+/// f16/bf16/tf32/int8 shapes, 8.4 where fp8 `mma.sync` exists.
+#[test_case::test_case(SM75, "+ptx78"; "turing")]
+#[test_case::test_case(SM86, "+ptx78"; "ampere")]
+#[test_case::test_case(SM89, "+ptx84"; "ada has fp8")]
+fn clang_flags_pin_the_ptx_isa_per_arch(arch: CudaArch, feature: &str) {
+    let flags = crate::llvm::nvptx::clang_flags(arch);
+    assert_eq!(&flags[..2], ["-x", "ir"]);
+    assert!(flags.contains(&"-S".to_string()));
+    assert!(flags.contains(&"--target=nvptx64-nvidia-cuda".to_string()));
+    assert!(flags.contains(&format!("-march={arch}")));
+    assert!(flags.contains(&format!("--cuda-feature={feature}")));
+    assert_eq!(&flags[flags.len() - 3..], ["-", "-o", "-"]);
 }

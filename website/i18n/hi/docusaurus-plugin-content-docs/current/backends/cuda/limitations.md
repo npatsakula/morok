@@ -32,8 +32,8 @@ path लेते हैं ([Codegen](./codegen.md)); `lg2.approx.f32` renderer
 ## वे आवश्यकताएँ जिन पर आज कोई समझौता नहीं
 
 - Driver कम से कम CUDA 12.0 / R525 होना चाहिए: CUDA graph के entry points अपने 12.0
-  versioned नामों से bind हैं। PTX ISA `--cuda-feature=+ptx78` से 7.8 पर pin है, इसलिए
-  नया clang यह floor नहीं बढ़ाता।
+  versioned नामों से bind हैं। PTX ISA `--cuda-feature` से pin है (7.8; sm_89 और नए पर 8.4,
+  जिसे CUDA 12.4 / R550 चाहिए), इसलिए नया clang यह floor नहीं बढ़ाता।
 - `clang` में NVPTX target होना चाहिए; कोई NVRTC fallback नहीं है।
 
 ---

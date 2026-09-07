@@ -32,7 +32,8 @@ sidebar_label: 限制与路线图
 ## 今天没得商量的要求
 
 - 驱动至少要到 CUDA 12.0 / R525：CUDA graph 的入口点按其 12.0 的版本化名称绑定。
-  PTX ISA 由 `--cuda-feature=+ptx78` 锁定在 7.8，因此更新的 clang 不会抬高这个下限。
+  PTX ISA 由 `--cuda-feature` 锁定（7.8；在 sm_89 及更新架构上为 8.4，需要 CUDA 12.4 /
+  R550），因此更新的 clang 不会抬高这个下限。
 - `clang` 必须带有 NVPTX target；没有 NVRTC 回退。
 
 ---

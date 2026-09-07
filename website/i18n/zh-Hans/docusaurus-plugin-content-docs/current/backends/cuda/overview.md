@@ -19,7 +19,7 @@ PTX 文本，并在模块加载时由驱动 JIT 编译为 SASS。该设计遵循
 | 要求 | 为什么 |
 |---|---|
 | 一个暴露 `libcuda.so.1` 的 NVIDIA 驱动 | 每一次驱动调用都在运行时用 `libloading` 从中解析出来 |
-| 驱动为 **CUDA 12.0（R525）或更新** | CUDA graph 的入口点按其版本化名称绑定（`cuGraphAddKernelNode_v2`、`cuGraphExecKernelNodeSetParams_v2`），它们始于 12.0；PTX ISA 锁定在 **7.8**（`--cuda-feature=+ptx78`），任何这样的驱动都能 JIT 它 |
+| 驱动为 **CUDA 12.0（R525）或更新** | CUDA graph 的入口点按其版本化名称绑定（`cuGraphAddKernelNode_v2`、`cuGraphExecKernelNodeSetParams_v2`），它们始于 12.0；PTX ISA 锁定在 **7.8**（`--cuda-feature=+ptx78`），任何这样的驱动都能 JIT 它；sm_89 及更新架构为其 fp8 形状锁定 **8.4**，需要 CUDA 12.4 / R550 |
 | 带 **NVPTX** target 构建的 `clang` | `clang -x ir --target=nvptx64-nvidia-cuda` 把渲染出的 IR 变成 PTX |
 
 在宿主上检查它们：

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
+use svod_codegen::llvm::nvptx::clang_flags;
 use svod_dtype::CudaArch;
 use tracing::debug;
 
@@ -25,20 +26,6 @@ pub fn compile_ir_to_ptx(ir: &str, arch: CudaArch) -> crate::Result<Vec<u8>> {
     compile_ir_to_ptx_with(&toolchain, ir, arch)
 }
 
-/// Clang driver flags for one kernel: IR on stdin, PTX assembly on stdout.
-/// `-Wno-override-module` silences the note about the module's own
-/// `target triple` (the renderer sets it to match). `+ptx78` pins the ISA
-/// the driver must accept to 7.8 (R520+) instead of the host clang's newest
-/// (clang 22 emits 8.8, which needs R570+); 7.8 carries every `mma.sync`
-/// shape the renderer selects, fp8 included, and LLVM raises it on its own
-/// for capabilities newer than sm_90.
-pub(crate) fn ptx_flags(arch: CudaArch) -> Vec<String> {
-    let mut flags: Vec<String> = ["-x", "ir", "-S", "-O3", "--target=nvptx64-nvidia-cuda"].map(str::to_string).into();
-    flags.push(format!("-march={arch}"));
-    flags.extend(["--cuda-feature=+ptx78", "-Wno-override-module", "-", "-o", "-"].map(str::to_string));
-    flags
-}
-
 pub(crate) fn compile_ir_to_ptx_with(toolchain: &ClangToolchain, ir: &str, arch: CudaArch) -> crate::Result<Vec<u8>> {
     if !toolchain.has_target("nvptx64") {
         return Err(crate::Error::JitCompilation {
@@ -50,7 +37,7 @@ pub(crate) fn compile_ir_to_ptx_with(toolchain: &ClangToolchain, ir: &str, arch:
     }
     dump_ir("SVOD_DUMP_NVPTX_IR", &arch.to_string(), ir);
     debug!(arch = %arch, ir.length = ir.len(), "compiling nvptx IR via clang");
-    toolchain.compile_ir(&ptx_flags(arch), ir, &format!("nvptx (march={arch})"))
+    toolchain.compile_ir(&clang_flags(arch), ir, &format!("nvptx (march={arch})"))
 }
 
 /// Check PTX text before it reaches the driver JIT, on cached and fresh bytes

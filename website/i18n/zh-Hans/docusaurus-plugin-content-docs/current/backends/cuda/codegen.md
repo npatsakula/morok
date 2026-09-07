@@ -148,6 +148,7 @@ NVPTX 的 clang 变成一个干净的 `JitCompilation` 错误。
 很要紧：一个拼错的 `llvm.nvvm.*` 名字并不是编译错误，LLVM 会静默地把它发射
 成一个外部调用，而它本来只会以一次 `cuModuleLoadDataEx` 失败的形式浮现。
 
-PTX ISA 版本锁定在 7.8（`--cuda-feature=+ptx78`），而不是 clang 发行版会发出的那个
-（clang 22：`.version 8.8`，它需要一个 CUDA 12.8 / R570 驱动）；渲染器选择的每一种
-`mma.sync` 形状在 7.8 中都存在。
+PTX ISA 版本按架构锁定（`--cuda-feature=+ptx78`，或在 sm_89 及更新架构上为 `+ptx84`，
+它们的 fp8 `mma.sync` 形状自 8.4 起才存在），而不是交给 clang——它的默认值取决于它找到的
+CUDA toolkit（带 CUDA 13 的 clang 22：`.version 8.8`，需要一个 CUDA 12.8 / R570 驱动；
+没有 toolkit 时：一个对任何 tensor core 都太老的版本）。

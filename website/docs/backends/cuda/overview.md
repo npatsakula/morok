@@ -20,7 +20,7 @@ design follows tinygrad's `ops_cuda.py`; the code lives in `device/src/cuda/`
 | Requirement | Why |
 |---|---|
 | An NVIDIA driver exposing `libcuda.so.1` | Every driver call is resolved from it at runtime with `libloading` |
-| Driver **CUDA 12.0 (R525) or newer** | The CUDA-graph entry points are bound by their versioned names (`cuGraphAddKernelNode_v2`, `cuGraphExecKernelNodeSetParams_v2`), which date from 12.0; the PTX ISA is pinned to **7.8** (`--cuda-feature=+ptx78`), which any such driver JITs |
+| Driver **CUDA 12.0 (R525) or newer** | The CUDA-graph entry points are bound by their versioned names (`cuGraphAddKernelNode_v2`, `cuGraphExecKernelNodeSetParams_v2`), which date from 12.0; the PTX ISA is pinned to **7.8** (`--cuda-feature=+ptx78`), which any such driver JITs; sm_89 and newer pin **8.4** for their fp8 shapes, which needs CUDA 12.4 / R550 |
 | `clang` built with the **NVPTX** target | `clang -x ir --target=nvptx64-nvidia-cuda` turns the rendered IR into PTX |
 
 Check them on a host:

@@ -151,6 +151,8 @@ clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 -Wno-override-modul
 रूप में emit कर देता है, और वह अन्यथा केवल एक `cuModuleLoadDataEx` failure के रूप में सामने
 आता।
 
-PTX ISA version 7.8 पर pin है (`--cuda-feature=+ptx78`), न कि वह जो clang release emit
-करती (clang 22: `.version 8.8`, जिसे एक CUDA 12.8 / R570 driver चाहिए); renderer जो भी
-`mma.sync` shape चुनता है वह 7.8 में मौजूद है।
+PTX ISA version arch के अनुसार pin है (`--cuda-feature=+ptx78`, या sm_89 और नए पर
+`+ptx84`, जिनके fp8 `mma.sync` shapes 8.4 से मौजूद हैं), clang पर नहीं छोड़ा जाता, जिसका
+default उस CUDA toolkit पर निर्भर है जो उसे मिलता है (CUDA 13 के साथ clang 22:
+`.version 8.8`, जिसे एक CUDA 12.8 / R570 driver चाहिए; बिना toolkit: किसी भी tensor core
+के लिए बहुत पुराना version)।

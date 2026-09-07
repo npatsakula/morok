@@ -22,7 +22,9 @@ use svod_dtype::{CudaArch, DeviceSpec, GpuArch};
 use svod_ir::UOp;
 
 use crate::clang::ClangToolchain;
-use crate::cuda::compile::{Ptxas, compile_ir_to_ptx_with, ptx_flags, ptxas_flags, validate_ptx};
+use svod_codegen::llvm::nvptx::clang_flags;
+
+use crate::cuda::compile::{Ptxas, compile_ir_to_ptx_with, ptxas_flags, validate_ptx};
 use crate::object_cache::{CompilerIdentity, OBJECT_CACHE_SCHEMA, ObjectCache, ObjectCacheKey};
 
 /// Create a `CUDA:N` device end-to-end (allocator + renderer + compiler +
@@ -90,7 +92,7 @@ pub(crate) fn cuda_compiler_identity(
     clang: &ClangToolchain,
     ptxas: Option<&Ptxas>,
 ) -> CompilerIdentity {
-    let mut flags = ptx_flags(arch);
+    let mut flags = clang_flags(arch);
     let (toolchain, object_format) = match ptxas {
         Some(ptxas) => {
             flags.extend(ptxas_flags(arch));

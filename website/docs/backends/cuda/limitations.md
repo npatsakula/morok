@@ -33,8 +33,9 @@ available to the renderer but not used by ordinary graphs.
 ## Requirements that are not negotiable today
 
 - The driver must be at least CUDA 12.0 / R525: the CUDA-graph entry points
-  are bound by their 12.0 versioned names. The PTX ISA is pinned to 7.8 by
-  `--cuda-feature=+ptx78`, so a newer clang does not raise that floor.
+  are bound by their 12.0 versioned names. The PTX ISA is pinned by
+  `--cuda-feature` (7.8; 8.4 on sm_89 and newer, which needs CUDA 12.4 /
+  R550), so a newer clang does not raise that floor.
 - `clang` must carry the NVPTX target; there is no NVRTC fallback.
 
 ---
