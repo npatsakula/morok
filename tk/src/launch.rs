@@ -171,6 +171,11 @@ pub enum Error {
     #[snafu(display("{kernel}: operands disagree on {dim}: {a} != {b}"))]
     OperandDimMismatch { kernel: &'static str, dim: &'static str, a: usize, b: usize },
 
+    /// An operand's shape is not the one the others imply (e.g. FA's `k` and `v`
+    /// must be `[B, N, H_kv, D]` for `q`'s `[B, N, H, D]`).
+    #[snafu(display("{kernel}: operand {operand}: expected shape {expected:?}, got {got:?}"))]
+    OperandShape { kernel: &'static str, operand: &'static str, expected: Vec<usize>, got: Vec<usize> },
+
     /// An operand's shape could not be determined.
     #[snafu(display("{kernel}: operand {operand}: shape is indeterminate"))]
     OperandIndeterminateShape { kernel: &'static str, operand: &'static str },
@@ -655,10 +660,18 @@ where
         .device(&device_spec, svod_device::registry::registry())
         .context(DeviceFactorySnafu { spec: format!("{device_spec:?}") })?;
 
-    // Caps from the realized buffers' arch; a host render target falls back to
+    // Caps from the realized buffers' arch. A GPU whose arch does not resolve
+    // is an error: gfx942 caps would build wave64 MFMA fragments into whatever
+    // module the device compiles. Only a host render target falls back to
     // gfx942 so the WMMA descriptor still resolves.
-    let caps =
-        crate::target::resolve_arch(&device_spec).map(crate::ArchCaps::for_arch).unwrap_or(crate::ArchCaps::GFX942);
+    let caps = match (crate::target::resolve_arch(&device_spec), &device_spec) {
+        (Some(arch), _) => crate::ArchCaps::for_arch(arch),
+        (None, DeviceSpec::Cpu | DeviceSpec::Disk { .. } | DeviceSpec::WebGpu) => crate::ArchCaps::GFX942,
+        (None, DeviceSpec::Amd { .. } | DeviceSpec::Cuda { .. } | DeviceSpec::Metal { .. }) => {
+            return UnsupportedArchSnafu { supported: crate::ArchSet::amd(&[]), spec: device_spec, resolved: None }
+                .fail();
+        }
+    };
     let ker = crate::Kernel::new(name, grid, block, buf_uops, caps);
     let sink = build(&ker);
     compile(&device, sink, &buffers)

@@ -159,7 +159,7 @@ impl<'k> Group<'k> {
                 flat_index(vec.uop(), vec.shape(), &at).store(op(&vec_acc, &acc))
             })
             .collect();
-        let grouped = if stores.len() == 1 { stores.into_iter().next().unwrap() } else { UOp::group(stores) };
+        let grouped = super::group_or_single(stores);
         self.finalize_tile(vec, grouped.end(smallvec![outer]))
     }
 

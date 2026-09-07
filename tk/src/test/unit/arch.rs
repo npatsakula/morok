@@ -13,7 +13,9 @@ use svod_schedule::optimizer::Renderer;
 use test_case::test_case;
 
 use crate::ArchCaps;
+use crate::arch::FragRole;
 use crate::arch::FragRole::{Accumulator, AccumulatorT, Operand};
+use crate::layout::ReduceTree;
 use crate::tiles::{
     RT_16X16, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, ST_16X16, ST_16X16_MMA,
     ST_16X16_SWIZZLED, ST_16X16_SWIZZLED_W32,
@@ -31,8 +33,12 @@ fn gfx942_caps_reproduce_wave64_literals() {
     assert_eq!(c, ArchCaps::GFX942, "GFX942 const == for_amd(Gfx942)");
     assert_eq!(c, ArchCaps::for_arch(GpuArch::Amd(AmdArch::Gfx942)), "for_amd is for_arch(Amd)");
     assert_eq!(c.wave_size, 64);
-    assert_eq!(c.reduce_tree().as_slice(), &[16, 32, 48], "prior ds_bpermute sibling tree");
-    assert_eq!(c.frag_row_stride(), 4, "prior FA `*4` lane→KV-row stride (256/64)");
+    let acc = c.frag(FragRole::Accumulator).expect("CDNA fragments");
+    assert_eq!(
+        acc.map.tree(c.wave_size),
+        ReduceTree::Gather([16, 32, 48].into_iter().collect()),
+        "prior ds_bpermute sibling tree"
+    );
 }
 
 /// RDNA3.5 (gfx1151) control-path caps: wave32 (the warp/lane math + launch block),
@@ -46,7 +52,12 @@ fn gfx942_caps_reproduce_wave64_literals() {
 fn gfx1151_caps_are_wave32() {
     let c = ArchCaps::for_amd(AmdArch::Gfx1151);
     assert_eq!(c.wave_size, 32);
-    assert_eq!(c.reduce_tree().as_slice(), &[16], "wave32 even/odd accumulator folds one sibling at L+16");
+    let acc = c.frag(FragRole::Accumulator).expect("RDNA fragments");
+    assert_eq!(
+        acc.map.tree(c.wave_size),
+        ReduceTree::Gather([16].into_iter().collect()),
+        "wave32 even/odd accumulator folds one sibling at L+16"
+    );
     let amd = c.amd().expect("AMD arch");
     assert!(amd.is_rdna3_5() && !amd.is_rdna3(), "gfx1151 is RDNA3.5, distinct from RDNA3");
     assert_eq!(c.cuda(), None);

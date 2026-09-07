@@ -78,9 +78,8 @@ pub fn flash_attention_supported(device: &svod_dtype::DeviceSpec) -> bool {
     crate::target::resolve_supported_arch(device, FA_SUPPORTED_ARCHS).is_ok()
 }
 
-/// The **direct-launch** FA wrappers ([`flash_attention_forward`], `_mw`, `_mw_db`,
-/// `_mw_rdb`) hardcode the wave64 block size and the CDNA fragment tiles, so they
-/// stay gfx942-only.
+/// The **direct-launch** FA wrapper ([`flash_attention_forward_mw_rdb`]) builds the
+/// wave64 block and the CDNA fragment tiles, so it stays gfx942-only.
 const FA_DIRECT_SUPPORTED_ARCHS: crate::ArchSet = crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942]);
 
 /// Validate a direct-launch wrapper's device against [`FA_DIRECT_SUPPORTED_ARCHS`].
@@ -535,16 +534,18 @@ pub(crate) fn build_fa_mw_rdb(
 /// Per-arch policy of [`flash_attention_with`]: the per-warp tile crossover and
 /// the loop-body form. The bigger `big` tile (which amortizes the softmax over
 /// more matrix-core work) is chosen once the launch grid `b·h·n/(q_blk·NUM_WARPS)`
-/// covers the machine's `compute_units` and `N` divides its block; otherwise the
+/// covers the device's `compute_units` and `N` divides its block; otherwise the
 /// baseline `small` tile (the bigger tile shrinks the grid, so it loses at low
-/// occupancy). The CU counts are the arch's flagship part (MI300X 304, Strix
-/// Halo 40); `big == small` disables the crossover.
+/// occupancy). [`Self::for_device`] reads the CU count off the device;
+/// [`Self::for_arch`] alone assumes the arch's flagship part (MI300X 304, Strix
+/// Halo 40, an RTX 3060's 28 SMs). `big == small` disables the crossover.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FaPolicy {
     pub compute_units: usize,
     pub big: (usize, usize),
-    /// The largest head dim the `big` tile fits at (CUDA: `{16,64}` at d=128 needs
-    /// 64 KiB of K/V double buffers, past the 48 KiB static LDS).
+    /// The largest head dim the `big` tile is chosen at (CUDA: `{16,64}` needs
+    /// more registers than `{16,32}` above d=64, and 64 KiB of K/V double
+    /// buffers at d=128).
     pub big_max_d: usize,
     pub small: (usize, usize),
     /// Emit the flat (fully-unrolled) body. Every register index is then a
@@ -552,11 +553,21 @@ pub struct FaPolicy {
     /// registers (a rolled elementwise loop it declines to unroll pins `o_reg`
     /// to local memory); the AMD path keeps the rolled iglp baseline.
     pub unroll: bool,
+    /// Shared memory a block may take: the static 48 KiB on CUDA, the 64 KiB
+    /// LDS on AMD. A tile whose buffers exceed it is not chosen, so a large
+    /// head dim declines (`None`) instead of failing in the assembler.
+    pub shared_max: usize,
+    /// Whether the body stages the softmax band through shared memory (RDNA,
+    /// where the accumulator is not reusable as an operand).
+    pub att_band: bool,
 }
 
+/// Bytes per element of the 16-bit operand dtypes the kernel accepts.
+const IN_BYTES: usize = 2;
+
 impl FaPolicy {
-    /// gfx942 keeps the bench-calibrated 304-CU `{32,32}` crossover and gfx1151
-    /// the baseline tile. CUDA (measured on sm_86, 28 SMs, with the `ldmatrix` +
+    /// gfx942 keeps the bench-calibrated `{32,32}` crossover and gfx1151 the
+    /// baseline tile. CUDA (measured on sm_86, 28 SMs, with the `ldmatrix` +
     /// `cp.async` K/V stream): the taller KV super-block `{16,64}` (117 registers,
     /// 32 KiB LDS at d=64 — two blocks per SM) is fastest on every grid that covers
     /// the SMs (GigaAM b=8/h=16/n=1536: 3.20 ms vs 3.26 at `{16,32}` and 3.55 at
@@ -564,35 +575,79 @@ impl FaPolicy {
     /// buffers would need 64 KiB, so d=128 keeps `{16,32}` (158 registers, no
     /// spill). Both CUDA tiles are flat: the rolled body pins the register tiles to
     /// local memory (3-15× slower).
+    ///
+    /// # Panics
+    /// Panics for a Metal arch: tk has no Metal lowering, and no [`crate::ArchSet`]
+    /// admits one.
     pub fn for_arch(arch: svod_dtype::GpuArch) -> Self {
         let small = (Q_BLK, KV_BLK);
+        let att_band = !crate::ArchCaps::for_arch(arch).acc_reusable_as_input();
         match arch {
-            svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx942) => {
-                Self { compute_units: 304, big: (32, 32), big_max_d: usize::MAX, small, unroll: false }
-            }
-            svod_dtype::GpuArch::Amd(_) => {
-                Self { compute_units: 40, big: small, big_max_d: usize::MAX, small, unroll: false }
-            }
-            svod_dtype::GpuArch::Cuda(_) | svod_dtype::GpuArch::Metal(_) => {
-                Self { compute_units: 28, big: (Q_BLK, 2 * KV_BLK), big_max_d: 64, small, unroll: true }
-            }
+            svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx942) => Self {
+                compute_units: 304,
+                big: (32, 32),
+                big_max_d: usize::MAX,
+                small,
+                unroll: false,
+                shared_max: 64 << 10,
+                att_band,
+            },
+            svod_dtype::GpuArch::Amd(_) => Self {
+                compute_units: 40,
+                big: small,
+                big_max_d: usize::MAX,
+                small,
+                unroll: false,
+                shared_max: 64 << 10,
+                att_band,
+            },
+            svod_dtype::GpuArch::Cuda(_) => Self {
+                compute_units: 28,
+                big: (Q_BLK, 2 * KV_BLK),
+                big_max_d: 64,
+                small,
+                unroll: true,
+                shared_max: 48 << 10,
+                att_band,
+            },
+            svod_dtype::GpuArch::Metal(_) => unreachable!("tk has no Metal lowering; no ArchSet admits it"),
         }
     }
 
-    /// The `(q_blk, kv_blk)` for a `[b, n, h, d]` attention.
-    pub fn tile(&self, b: usize, n: usize, h: usize, d: usize) -> (usize, usize) {
+    /// [`Self::for_arch`] with the compute-unit count of the device behind
+    /// `spec`, when the backend reports it.
+    pub fn for_device(spec: &svod_dtype::DeviceSpec, arch: svod_dtype::GpuArch) -> Self {
+        let mut policy = Self::for_arch(arch);
+        if let Some(compute_units) = crate::target::compute_units(spec) {
+            policy.compute_units = compute_units;
+        }
+        policy
+    }
+
+    /// Shared memory [`build_fa_mw_rdb`] takes for a `(q_blk, kv_blk)` tile at
+    /// head dim `d`: the K and V double buffers, plus the per-warp softmax band
+    /// where the arch stages it.
+    pub fn shared_bytes(&self, (q_blk, kv_blk): (usize, usize), d: usize) -> usize {
+        2 * 2 * kv_blk * d * IN_BYTES + if self.att_band { NUM_WARPS * kv_blk * q_blk * IN_BYTES } else { 0 }
+    }
+
+    /// The `(q_blk, kv_blk)` for a `[b, n, h, d]` attention, or `None` when even
+    /// the `small` tile's buffers exceed [`Self::shared_max`].
+    pub fn tile(&self, b: usize, n: usize, h: usize, d: usize) -> Option<(usize, usize)> {
+        let fits = |tile| self.shared_bytes(tile, d) <= self.shared_max;
         let big_n = self.big.0 * NUM_WARPS;
-        if d <= self.big_max_d && n.is_multiple_of(big_n) && b * h * (n / big_n) >= self.compute_units {
-            self.big
+        if d <= self.big_max_d && n.is_multiple_of(big_n) && b * h * (n / big_n) >= self.compute_units && fits(self.big)
+        {
+            Some(self.big)
         } else {
-            self.small
+            fits(self.small).then_some(self.small)
         }
     }
 
-    /// The builder config for a `[b, n, h, d]` attention.
-    pub fn config(&self, b: usize, n: usize, h: usize, d: usize, causal: bool) -> FaConfig {
-        let (q_blk, kv_blk) = self.tile(b, n, h, d);
-        FaConfig { q_blk, kv_blk, unroll: self.unroll, causal }
+    /// The builder config for a `[b, n, h, d]` attention; `None` as [`Self::tile`].
+    pub fn config(&self, b: usize, n: usize, h: usize, d: usize, causal: bool) -> Option<FaConfig> {
+        let (q_blk, kv_blk) = self.tile(b, n, h, d)?;
+        Some(FaConfig { q_blk, kv_blk, unroll: self.unroll, causal })
     }
 }
 
@@ -619,11 +674,14 @@ pub fn flash_attention_forward_mw_rdb(o: &mut Tensor, q: &Tensor, k: &Tensor, v:
     let kd = crate::launch::concrete_dims(k, "flash-attention", "k", 4)?;
     let (b, n, h, d) = (qd[0], qd[1], qd[2], qd[3]);
     let h_kv = kd[2];
-    let cfg = FaPolicy::for_arch(svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx942)).config(b, n, h, d, true);
+    let caps = crate::ArchCaps::GFX942;
+    let cfg = FaPolicy::for_device(&q.device(), caps.arch)
+        .config(b, n, h, d, true)
+        .expect("the gfx942 tiles fit its LDS at every head dim the builder accepts");
     let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
 
     let in_dtype = q.uop().dtype();
-    crate::run_kernel("fa_mw_rdb", grid, (NUM_WARPS * 64) as i64, &mut [o], &[q, k, v], |ker| {
+    crate::run_kernel("fa_mw_rdb", grid, (NUM_WARPS * caps.wave_size) as i64, &mut [o], &[q, k, v], |ker| {
         build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, in_dtype.clone(), false);
         ker.finish(1)
     })
@@ -688,11 +746,18 @@ impl Default for FaOpts<'_> {
 pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) -> crate::LaunchResult<Option<Tensor>> {
     let qd = crate::launch::concrete_dims(q, "flash-attention", "q", 4)?;
     let kd = crate::launch::concrete_dims(k, "flash-attention", "k", 4)?;
+    let vd = crate::launch::concrete_dims(v, "flash-attention", "v", 4)?;
     let (b, n, h, d) = (qd[0], qd[1], qd[2], qd[3]);
     let h_kv = kd[2];
     let dtype = q.uop().dtype();
     let dtype_ok = dtype == DType::BFloat16 || dtype == DType::Float16;
     let err_dtype = dtype.clone();
+    // The builder binds k and v to q's dtype and to `[B, N, H_kv, D]`; a mismatch
+    // would pass `Kernel::gl` (which checks only the byte width) and then
+    // silently change which K/V stream the body takes.
+    let kv_dtype = [k, v].into_iter().map(|t| t.uop().dtype()).find(|dt| *dt != dtype);
+    let kv_shape = [("k", kd), ("v", vd)].into_iter().find(|(_, dims)| *dims != [b, n, h_kv, d]);
+    let (tiling_device, build_device) = (q.device(), q.device());
 
     crate::launch_custom(
         &q.device(),
@@ -704,6 +769,18 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
                 dtype_ok,
                 crate::launch::DtypeSnafu { kernel: "flash-attention", got: err_dtype, expected: "bf16 or f16" }
             );
+            if let Some(got) = kv_dtype {
+                return crate::launch::DtypeSnafu { kernel: "flash-attention", got, expected: "the dtype of q" }.fail();
+            }
+            if let Some((operand, got)) = kv_shape {
+                return crate::launch::OperandShapeSnafu {
+                    kernel: "flash-attention",
+                    operand,
+                    expected: vec![b, n, h_kv, d],
+                    got,
+                }
+                .fail();
+            }
             ensure!(
                 d % BLK == 0,
                 crate::launch::DimMultipleSnafu {
@@ -726,12 +803,19 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
             Ok(())
         },
         // Runtime tiling (`None`) — `N` is the (audio) sequence length and may
-        // legitimately not tile, so the caller falls back per-clip instead of padding.
-        move |arch| n % (FaPolicy::for_arch(arch).tile(b, n, h, d).0 * NUM_WARPS) == 0,
+        // legitimately not tile, so the caller falls back per-clip instead of
+        // padding; a head dim whose tiles overflow shared memory declines too.
+        move |arch| {
+            FaPolicy::for_device(&tiling_device, arch)
+                .tile(b, n, h, d)
+                .is_some_and(|(q_blk, _)| n.is_multiple_of(q_blk * NUM_WARPS))
+        },
         // Build for the resolved arch — caps track the real wave width.
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
-            let cfg = FaPolicy::for_arch(arch).config(b, n, h, d, opts.causal);
+            let cfg = FaPolicy::for_device(&build_device, arch)
+                .config(b, n, h, d, opts.causal)
+                .expect("checked by the tiling predicate");
             let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
             let out = Tensor::empty(&[b, n, h, d], dtype.clone());
             let masked = opts.key_lens.is_some();

@@ -151,3 +151,8 @@ pub fn resolve_amd_arch_from_topology(device_id: usize) -> Result<svod_dtype::Am
 pub fn resolve_cuda_arch(device_id: usize) -> Result<svod_dtype::CudaArch> {
     Ok(crate::cuda::CudaDevice::open(device_id)?.arch())
 }
+
+/// The streaming-multiprocessor count of CUDA device `device_id`.
+pub fn resolve_cuda_sm_count(device_id: usize) -> Result<u32> {
+    Ok(crate::cuda::CudaDevice::open(device_id)?.limits().sm_count)
+}

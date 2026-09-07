@@ -246,17 +246,23 @@ impl<'k> Group<'k> {
     ///
     /// Wave-agnostic: each wave runs the matrix op on its own per-lane RT operands
     /// (the wave sub-tile selection happens in the LDS→REG load, not here).
+    /// The resolved plan and the `[height, width, k]` fragment extents shared by
+    /// the rolled and unrolled bodies, so both walk the operands identically.
+    fn mma_plan(&self, c: &RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool) -> (MmaPlan, [i64; 3]) {
+        let plan = MmaPlan::resolve(self.ker.caps.arch, c, a, b, a_t, b_t);
+        let h_end = c.shape()[c.shape().len() - 3] as i64;
+        let w_end = c.shape()[c.shape().len() - 2] as i64;
+        let k_end = if a_t { a.shape()[a.shape().len() - 3] } else { a.shape()[a.shape().len() - 2] } as i64;
+        (plan, [h_end, w_end, k_end])
+    }
+
     fn mma(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool) -> RT<'k> {
         // Flat (cross-tile-pipeline) FA opts into the fully-unrolled body so the
         // QKᵀ / A·V MFMAs render loop-free for the attention scheduling comb.
         if self.ker.unrolled() {
             return self.mma_u(c, a, b, a_t, b_t);
         }
-        let plan = MmaPlan::resolve(self.ker.caps.arch, &c, a, b, a_t, b_t);
-
-        let h_end = c.shape()[c.shape().len() - 3] as i64;
-        let w_end = c.shape()[c.shape().len() - 2] as i64;
-        let k_end = if a_t { a.shape()[a.shape().len() - 3] } else { a.shape()[a.shape().len() - 2] } as i64;
+        let (plan, [h_end, w_end, k_end]) = self.mma_plan(&c, a, b, a_t, b_t);
         let height = self.ker.raw_range(h_end, AxisType::Loop);
         let width = self.ker.raw_range(w_end, AxisType::Loop);
         let inner = self.ker.raw_range(k_end, AxisType::Reduce);
@@ -288,11 +294,7 @@ impl<'k> Group<'k> {
     /// KV loop's `END` scopes them all (cf. the matmul accumulator chain,
     /// `kernels/matmul.rs:201`). Bit-identical accumulation order to [`Self::mma`].
     fn mma_u(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool) -> RT<'k> {
-        let plan = MmaPlan::resolve(self.ker.caps.arch, &c, a, b, a_t, b_t);
-
-        let h_end = c.shape()[c.shape().len() - 3] as i64;
-        let w_end = c.shape()[c.shape().len() - 2] as i64;
-        let k_end = if a_t { a.shape()[a.shape().len() - 3] } else { a.shape()[a.shape().len() - 2] } as i64;
+        let (plan, [h_end, w_end, k_end]) = self.mma_plan(&c, a, b, a_t, b_t);
 
         // Fragment-scoping chain: each fragment's first (k=0) accumulator read
         // orders after the previous fragment's terminal store, so the LAST

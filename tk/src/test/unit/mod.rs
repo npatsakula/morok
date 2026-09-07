@@ -29,6 +29,11 @@ pub(crate) fn fragment_device() -> Option<crate::ArchCaps> {
     crate::target::resolve_arch(&dev).map(crate::ArchCaps::for_arch).filter(crate::ArchCaps::has_matrix_core_layouts)
 }
 
+/// Whether the env-selected device is an AMD GPU with fragment layouts.
+pub(crate) fn is_amd_device() -> bool {
+    fragment_device().and_then(|caps| caps.amd()).is_some()
+}
+
 /// Whether the env-selected device is AMD CDNA (gfx942, wave64).
 pub(crate) fn is_cdna_device() -> bool {
     fragment_device().and_then(|caps| caps.amd()).is_some_and(svod_dtype::AmdArch::is_cdna)

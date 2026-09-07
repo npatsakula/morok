@@ -83,6 +83,22 @@ pub fn resolve_arch(spec: &DeviceSpec) -> Option<GpuArch> {
     }
 }
 
+/// The compute-unit count (AMD CUs, CUDA SMs) of the device behind `spec`,
+/// when the backend reports it: what a kernel's tile crossover measures its
+/// launch grid against.
+pub fn compute_units(spec: &DeviceSpec) -> Option<usize> {
+    match spec {
+        DeviceSpec::Amd { device_id } => {
+            let node = svod_device::amd::topology::enumerate().into_iter().nth(*device_id)?;
+            (node.simd_per_cu > 0).then(|| (node.simd_count / node.simd_per_cu) as usize)
+        }
+        DeviceSpec::Cuda { device_id } => {
+            svod_device::registry::resolve_cuda_sm_count(*device_id).ok().map(|sms| sms as usize)
+        }
+        DeviceSpec::Metal { .. } | DeviceSpec::Cpu | DeviceSpec::WebGpu | DeviceSpec::Disk { .. } => None,
+    }
+}
+
 /// Gate the kernel inputs' device `spec` to the kernel's `supported` arches
 /// **and** verify the matching LLVM GPU backend (`clang` amdgcn / nvptx64) —
 /// returning the resolved arch so the launcher can build

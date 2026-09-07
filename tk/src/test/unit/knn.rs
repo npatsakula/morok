@@ -169,7 +169,7 @@ fn topk_sink(corpus: usize, query: usize, d: usize, k: usize, caps: ArchCaps) ->
 /// The topk kernel's graph carries the full argmin-insert machinery on BOTH archs:
 /// the score WMMA, the index-carrying `row_arg_reduce` `ds_bpermute` `Op::Custom`
 /// gathers (two reduces per insert step — a corpus-min and a K-slot-max — each
-/// riding the arch's `reduce_tree`), the `Op::Ternary` evict/mask `where`s, and the
+/// riding the arch's sibling gather), the `Op::Ternary` evict/mask `where`s, and the
 /// two `[query, k]` output stores. Built rolled (the corpus loop).
 #[test]
 fn test_knn_topk_graph_shape() {
@@ -181,9 +181,12 @@ fn test_knn_topk_graph_shape() {
         assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma(..))), "{arch:?}: score WMMA");
 
         // The arg-reduce cross-lane gathers (value + index each ride a ds_bpermute):
-        // many across the k insert steps × 2 reduces × reduce_tree length.
+        // many across the k insert steps × 2 reduces × sibling-gather length.
         let customs = topo.iter().filter(|u| matches!(u.op(), Op::Custom(..))).count();
-        assert!(customs >= 4 * caps.reduce_tree().len(), "{arch:?}: arg_reduce ds_bpermute Op::Customs, got {customs}");
+        assert!(
+            customs >= 4 * (caps.wave_size / 16 - 1),
+            "{arch:?}: arg_reduce ds_bpermute Op::Customs, got {customs}"
+        );
 
         // The evict/mask conditional rewrites are `where` (Ternary) selects.
         let ternaries = topo.iter().filter(|u| matches!(u.op(), Op::Ternary(..))).count();

@@ -2,7 +2,7 @@
 //! perf-canary; the model itself uses the generic optimizer via `Tensor::linear`) — vs
 //! svod's generic bf16→f32 GEMM. See [`common`] for device-time stamping and self-skip.
 //!
-//! Run: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench matmul`
+//! Run: `SVOD_DEVICE={AMD,CUDA}:0 cargo bench -p svod-tk --bench matmul`
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use svod_dtype::DType;
@@ -17,7 +17,7 @@ use common::{bench_plan, randn_bf16, requirements_met};
 /// f32 accumulate.
 fn bench_matmul(c: &mut Criterion) {
     if !requirements_met(svod_tk::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
-        eprintln!("svod-tk matmul bench: skipped (no supported AMD GPU / toolchain)");
+        eprintln!("svod-tk matmul bench: skipped (no supported GPU / toolchain)");
         return;
     }
     let mut group = c.benchmark_group("matmul");

@@ -207,17 +207,8 @@ fn reduce_plan_matches_brute_force(which: usize) {
         match f.map.tree(wave) {
             ReduceTree::Gather(offsets) => {
                 assert_eq!(offsets.iter().copied().collect::<BTreeSet<_>>(), deltas, "{name}: sibling gather offsets");
-                assert_eq!(
-                    offsets.as_slice(),
-                    ArchCaps::for_arch(if wave == 64 {
-                        GpuArch::Amd(AmdArch::Gfx942)
-                    } else {
-                        GpuArch::Amd(AmdArch::Gfx1151)
-                    })
-                    .reduce_tree()
-                    .as_slice(),
-                    "{name}: the AMD caps tree"
-                );
+                let siblings: Vec<i64> = (1..wave as i64 / 16).map(|i| i * 16).collect();
+                assert_eq!(offsets.as_slice(), siblings.as_slice(), "{name}: one gather per sibling row-group");
             }
             ReduceTree::Butterfly(masks) => {
                 // The butterfly's masks span the partner group: every delta is a subset-xor of the masks.

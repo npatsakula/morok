@@ -290,7 +290,7 @@ impl<'k> Group<'k> {
     {
         if self.ker.unrolled() {
             let stores: Vec<Arc<UOp>> = cartesian(shape).iter().map(|idxs| store_at(idxs)).collect();
-            if stores.len() == 1 { stores.into_iter().next().unwrap() } else { UOp::group(stores) }
+            group_or_single(stores)
         } else {
             let rngs: Vec<Arc<UOp>> = shape.iter().map(|&d| self.ker.raw_range(d as i64, AxisType::Loop)).collect();
             let idxs: Vec<Idx> = rngs.iter().map(Idx::from).collect();
@@ -418,4 +418,10 @@ fn cartesian(shape: &[usize]) -> Vec<Vec<Idx>> {
             .collect();
     }
     acc
+}
+
+/// One store as itself, several as a `GROUP`: the terminal of an unrolled
+/// per-element emission.
+pub(crate) fn group_or_single(mut stores: Vec<Arc<UOp>>) -> Arc<UOp> {
+    if stores.len() == 1 { stores.pop().expect("one store") } else { UOp::group(stores) }
 }

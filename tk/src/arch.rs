@@ -26,12 +26,10 @@
 //!
 //! gfx942 is the validated/calibrated target — the register-tile fragment-layout
 //! tables ([`crate::tiles`] strides and `group::mma`'s per-lane upcast counts) and
-//! the [`crate::WARP_THREADS`] layout-table constant are pinned to it.
-//! [`ArchCaps::frag_row_stride`] is the one remaining CDNA-only datum (the legacy
-//! direct-launch FA mask — the production rolled-db kernel derives its mask from
-//! the accumulator's own lane map instead).
+//! the [`crate::WARP_THREADS`] layout-table constant are pinned to it. Every
+//! lane-dependent datum beyond the wave size lives on the fragment's
+//! [`crate::layout::LaneMap`] (the reduce tree, the row/column of a register).
 
-use smallvec::SmallVec;
 use svod_dtype::{AmdArch, CudaArch, GpuArch};
 
 use crate::tiles::{
@@ -113,28 +111,6 @@ impl ArchCaps {
         self.amd().is_some() || self.cuda().is_some_and(CudaArch::has_bf16_mma)
     }
 
-    /// The AMD sibling-gather reduce-tree offsets: a lane folds the partials of the
-    /// `wave_size / 16` sibling row-groups, each one WMMA-column span (16 lanes)
-    /// apart → wave64 `[16, 32, 48]`, wave32 `[16]`. Correct for **both** the CDNA
-    /// MFMA layout *and* the RDNA even/odd accumulator: at wave32 a softmax row
-    /// (16 KV) is split across a lane's 8 in-register elements (the even/odd half)
-    /// and its sibling lane `L+16` (the other half). The reductions themselves read
-    /// the tree off the fragment's [`crate::layout::LaneMap::tree`] (the quad
-    /// butterfly on CUDA); this is the AMD form for the graph-shape tests.
-    pub fn reduce_tree(&self) -> SmallVec<[i64; 3]> {
-        (1..self.wave_size as i64 / 16).map(|i| i * 16).collect()
-    }
-
-    /// Per-lane row stride of a 16×16 **CDNA MFMA** accumulator fragment
-    /// (`256 / wave_size`): wave64 → 4. Used only by the legacy direct-launch FA
-    /// builders' causal/padding mask (which map each `laneid / 16` row-group to KV
-    /// rows with this contiguous stride). The production rolled-db FA derives its
-    /// mask from the att accumulator's own `lane_rc` instead — arch-correct for both
-    /// the CDNA stride and the RDNA even/odd interleave — so it does not call this.
-    pub const fn frag_row_stride(&self) -> i64 {
-        (16 * 16 / self.wave_size) as i64
-    }
-
     /// Physical register fragment for a logical [`FragRole`] on this arch — the
     /// single arch→fragment table the kernels resolve through. CDNA's MFMA
     /// accumulator and input fragments share a layout, so every role resolves to
@@ -191,12 +167,13 @@ impl ArchCaps {
     }
 
     /// Whether an MMA accumulator fragment can be reused directly as a WMMA input via
-    /// a register copy. True on CDNA (MFMA acc == input fragment) and CUDA (the
-    /// two-half 16×16 f32 accumulator holds the m16n8 C fragments in exactly the A
-    /// fragment's register order — ThunderKittens `mma_AB(o, att_bf, v)`); false on
-    /// RDNA (the even/odd `<8×f32>` accumulator and the replicated `<16×in>` input
-    /// differ), where the acc→input handoff must round-trip through LDS instead.
+    /// a register copy. True on CDNA (MFMA acc == input fragment) and CUDA with the
+    /// `mma.sync` layouts (the two-half 16×16 f32 accumulator holds the m16n8 C
+    /// fragments in exactly the A fragment's register order — ThunderKittens
+    /// `mma_AB(o, att_bf, v)`); false on RDNA (the even/odd `<8×f32>` accumulator
+    /// and the replicated `<16×in>` input differ), where the acc→input handoff
+    /// must round-trip through LDS instead, and wherever [`Self::frag`] is `None`.
     pub fn acc_reusable_as_input(&self) -> bool {
-        self.is_cdna() || self.cuda().is_some()
+        self.is_cdna() || self.cuda().is_some_and(CudaArch::has_bf16_mma)
     }
 }

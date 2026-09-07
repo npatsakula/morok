@@ -498,18 +498,16 @@ fn fa_causal_reference(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor, svo
 // `flash_attention` vs causal SDPA on gfx942/gfx1151. Demonstrates the reusable
 // definition(`Tensor::graph_kernel`)/check(`custom_kernel_check!`) facility: tk just
 // supplies the kernel `run` + the `reference` op; the boilerplate (build inputs, run
-// both, cast f32, compare within tol) is generated. On a device the FA kernel
-// declines (`Ok(None)`: CUDA until the FA port), `run` self-skips onto the reference.
-// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_graph_check_amd -- --ignored --nocapture`.
+// both, cast f32, compare within tol) is generated. The kernel must apply on the
+// device under test (every arch in `FA_SUPPORTED_ARCHS` tiles this shape): a
+// decline fails loudly rather than comparing the reference with itself.
+// `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib fa::test_fa_graph_check -- --ignored --nocapture`.
 svod_tensor::custom_kernel_check! {
-    test_fa_graph_check_amd,
+    test_fa_graph_check,
     inputs (q, k, v): shape [1, 128, 2, 64], dtype svod_dtype::DType::BFloat16,
-    run: |q, k, v| match crate::kernels::fa::flash_attention(q, k, v).expect("FA build") {
-        Some(o) => Ok(o),
-        None => {
-            eprintln!("skip test_fa_graph_check_amd: the FA kernel does not apply on this device");
-            fa_causal_reference(q, k, v)
-        }
+    run: |q, k, v| {
+        let out = crate::kernels::fa::flash_attention(q, k, v).expect("FA build");
+        Ok::<_, crate::LaunchError>(out.expect("the FA kernel applies to [1, 128, 2, 64] bf16 on every supported arch"))
     },
     reference: fa_causal_reference,
     tol: 2e-2,
@@ -856,8 +854,8 @@ fn fa_policy_tile(
     unroll: bool,
 ) {
     let policy = crate::kernels::fa::FaPolicy::for_arch(arch);
-    assert_eq!(policy.tile(b, n, h, d), tile);
-    let cfg = policy.config(b, n, h, d, false);
+    assert_eq!(policy.tile(b, n, h, d), Some(tile));
+    let cfg = policy.config(b, n, h, d, false).expect("the tile fits");
     assert_eq!((cfg.q_blk, cfg.kv_blk, cfg.unroll, cfg.causal), (tile.0, tile.1, unroll, false));
 }
 
@@ -969,4 +967,29 @@ fn fa_sink_leaves_no_range_in_scope(arch: svod_dtype::GpuArch, unroll: bool) {
     build_fa_mw_rdb(&ker, b, n, h, h_kv, d, cfg, DType::BFloat16, false);
     let sink = ker.finish(1);
     assert!(sink.in_scope_ranges().is_empty(), "RANGE {:?} still open at the SINK", sink.in_scope_ranges());
+}
+
+/// A head dim whose K/V double buffers overflow the arch's shared memory
+/// declines instead of reaching the assembler: 48 KiB on CUDA holds the small
+/// `{16,32}` tile up to d=192, the big `{16,64}` tile only up to d=96 (and the
+/// policy caps the big tile at d=64 anyway); AMD's 64 KiB LDS holds d=256.
+#[test_case::test_case(SM_86, 192, Some((16, 32)); "sm_86 d=192 fills the 48 KiB")]
+#[test_case::test_case(SM_86, 208, None; "sm_86 d=208 declines")]
+#[test_case::test_case(SM_86, 256, None; "sm_86 d=256 declines")]
+#[test_case::test_case(svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx942), 256, Some((16, 32)); "gfx942 d=256 fits")]
+#[test_case::test_case(svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx942), 272, None; "gfx942 d=272 declines")]
+fn fa_policy_declines_tiles_past_shared_memory(arch: svod_dtype::GpuArch, d: usize, tile: Option<(usize, usize)>) {
+    let policy = crate::kernels::fa::FaPolicy::for_arch(arch);
+    assert_eq!(policy.tile(1, 1024, 8, d), tile);
+    assert_eq!(policy.config(1, 1024, 8, d, true).map(|cfg| (cfg.q_blk, cfg.kv_blk)), tile);
+}
+
+/// The relayout band RDNA stages through LDS counts toward the budget.
+#[test]
+fn fa_policy_counts_the_rdna_band() {
+    let rdna = crate::kernels::fa::FaPolicy::for_arch(svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx1151));
+    let cdna = crate::kernels::fa::FaPolicy::for_arch(svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx942));
+    assert!(rdna.att_band && !cdna.att_band);
+    assert_eq!(rdna.shared_bytes((16, 32), 64) - cdna.shared_bytes((16, 32), 64), 8 * 32 * 16 * 2);
+    assert_eq!(cdna.shared_bytes((16, 32), 64), 4 * 32 * 64 * 2);
 }

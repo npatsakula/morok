@@ -2,7 +2,7 @@
 //! attention kernel — vs the SDPA fallback the model would otherwise take. See [`common`]
 //! for how device time is stamped and when the bench self-skips.
 //!
-//! Run: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench fa`
+//! Run: `SVOD_DEVICE={AMD,CUDA}:0 cargo bench -p svod-tk --bench fa`
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use svod_dtype::DType;
@@ -17,7 +17,7 @@ use common::{bench_plan, randn_bf16, requirements_met};
 /// timed through `prepare()` → `execute_profiled`.
 fn bench_fa(c: &mut Criterion) {
     if !requirements_met(svod_tk::kernels::fa::FA_SUPPORTED_ARCHS) {
-        eprintln!("svod-tk flash_attention bench: skipped (target does not meet the kernel's AMD-LLVM requirement)");
+        eprintln!("svod-tk flash_attention bench: skipped (no supported GPU / toolchain)");
         return;
     }
     let (b, h, d) = (1usize, 16usize, 64usize);

@@ -70,6 +70,15 @@ impl Kernel {
             caps.wave_size,
             caps.arch
         );
+        // `warpid`/`laneid` split the thread index by the wave, so a block of
+        // several waves must be whole waves of this arch's width (a single
+        // partial wave, as a one-thread host probe, is fine).
+        debug_assert!(
+            block > 0 && (block as usize <= caps.wave_size || (block as usize).is_multiple_of(caps.wave_size)),
+            "block {block} is not whole wave{} waves of {:?}",
+            caps.wave_size,
+            caps.arch
+        );
         let globals = buffers.iter().enumerate().map(|(slot, buf)| flat_param(slot, buf)).collect();
         let block_idx = [
             UOp::special(cidx(grid[0]), "gidx0".to_string()),

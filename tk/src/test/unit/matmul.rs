@@ -424,8 +424,10 @@ fn max_abs_err(got: &[f32], expected: &[f32]) -> f32 {
 #[test]
 #[ignore]
 fn test_matmul_rdna_computes_ab() {
-    if !super::device_supported(crate::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
-        eprintln!("skip test_matmul_rdna_computes_ab: unsupported device/toolchain");
+    // `SMALL_CFG` is the wave64/wave32 AMD config; on a warp it would hand one
+    // warp a 64×64 f32 accumulator (128 registers per lane).
+    if !super::is_amd_device() {
+        eprintln!("skip test_matmul_rdna_computes_ab: needs an AMD device");
         return;
     }
     use svod_tensor::Tensor;
@@ -468,8 +470,10 @@ fn test_matmul_rdna_computes_ab() {
 #[test]
 #[ignore]
 fn test_matmul_rdna_grid() {
-    if !super::device_supported(crate::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
-        eprintln!("skip test_matmul_rdna_grid: unsupported device/toolchain");
+    // `SMALL_CFG` is the wave64/wave32 AMD config; on a warp it would hand one
+    // warp a 64×64 f32 accumulator (128 registers per lane).
+    if !super::is_amd_device() {
+        eprintln!("skip test_matmul_rdna_grid: needs an AMD device");
         return;
     }
     use svod_tensor::Tensor;

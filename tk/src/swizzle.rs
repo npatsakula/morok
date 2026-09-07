@@ -75,7 +75,8 @@ impl Swizzle {
     pub(crate) fn period_bytes(&self, cols: usize, itemsize: i64) -> Option<i64> {
         match self {
             Swizzle::Identity => None,
-            Swizzle::Sw16x16Mma => Some(256), // the row-bit-2 pattern repeats every 8 rows of 32 bytes
+            // The row-bit-2 pattern repeats every 8 rows.
+            Swizzle::Sw16x16Mma => Some(8 * cols as i64 * itemsize),
             _ => Some(swizzle_bytes(cols, itemsize)),
         }
     }
@@ -96,12 +97,19 @@ impl Swizzle {
     ///
     /// # Panics
     /// For a non-[`Swizzle::Identity`] variant, panics if the scalar itemsize is
-    /// not 1, 2, or 4 bytes (only bf16/f16/f32 LDS tiles are swizzled).
+    /// not 1, 2, or 4 bytes (only bf16/f16/f32 LDS tiles are swizzled); for
+    /// [`Swizzle::Sw16x16Mma`], if a row is a single 16-byte chunk (the XOR
+    /// would leave the tile).
     pub fn swizzle_rc(&self, row: Arc<UOp>, col: Arc<UOp>, cols: usize, scalar: ScalarDType) -> (Arc<UOp>, Arc<UOp>) {
         match self {
             Swizzle::Identity => (row, col),
             Swizzle::Sw16x16Mma => {
                 let chunk = 16 / scalar.bytes() as i64;
+                assert!(
+                    chunk < cols as i64,
+                    "Sw16x16Mma needs two 16-byte chunks per row; {cols} {scalar:?} columns are {} bytes",
+                    cols * scalar.bytes()
+                );
                 (row.clone(), col.xor(&row.shr(&cidx(2)).mod_(&cidx(2)).mul(&cidx(chunk))))
             }
             Swizzle::Sw16x16 | Swizzle::Sw32x32 | Swizzle::Sw16x32 | Swizzle::Sw32x16 => {

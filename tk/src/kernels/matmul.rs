@@ -343,20 +343,24 @@ pub fn gemm_core(
     let lp = ker.loop_static((k / k_step) as i64);
     let tile = lp.index().clone();
 
-    // Collaborative GLOBAL→LDS fill over all threads (each ends in a barrier);
-    // Uses 128-bit-coalescible shaped loads for the large-N strips. B is indexed as
-    // [K-strip, N-block] at (tile, col).
+    // Collaborative GLOBAL→LDS fill over all threads, the two strips sharing ONE
+    // barrier below; 128-bit-coalescible shaped loads (`cp.async` on sm_80+) for
+    // the large-N strips. B is indexed as [K-strip, N-block] at (tile, col).
+    let a_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(&tile)];
+    let b_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&tile), Idx::from(&col)];
     let (a_smem, b_smem) = if cfg.vec_load {
-        (
-            g.fill_local_vec(a_smem, a_gl, &[Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(&tile)], 2),
-            g.fill_local_vec(b_smem, b_gl, &[Idx::Const(0), Idx::Const(0), Idx::from(&tile), Idx::from(&col)], 2),
-        )
+        (g.fill_local_vec_nobar(a_smem, a_gl, &a_idx, 2), g.fill_local_vec_nobar(b_smem, b_gl, &b_idx, 2))
     } else {
-        (
-            g.load(a_smem, a_gl, MoveIdx::block((0, 0, row.clone(), tile.clone()), 2)),
-            g.load(b_smem, b_gl, MoveIdx::block((0, 0, tile.clone(), col.clone()), 2)),
-        )
+        (g.fill_local_nobar(a_smem, a_gl, &a_idx, 2), g.fill_local_nobar(b_smem, b_gl, &b_idx, 2))
     };
+    // The RAW edge: every wave's share of the A *and* B fill is visible before
+    // any wave gathers. Depending on B's fill makes "after both fills" a graph
+    // edge rather than a linearizer accident, and saves the barrier each strip
+    // used to close with. The WAR edge back to the next fill is the barrier
+    // after the gathers.
+    let filled = a_smem.uop().barrier(smallvec![b_smem.uop().clone()]);
+    let a_smem = a_smem.after(smallvec![filled.clone()]);
+    let b_smem = b_smem.after(smallvec![filled]);
 
     // Shared B sub-tile (N col-block {warp_col}, same for every accumulator) read as a
     // [k_step, reg] Col fragment, and per-accumulator A sub-tiles (M row-block

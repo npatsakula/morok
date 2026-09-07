@@ -105,9 +105,9 @@ fn test_row_reduce_graph_shape() {
     assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma(..))), "a reduction has no WMMA");
 }
 
-/// `row_arg_reduce` threads an index alongside the value: each `reduce_tree` step
+/// `row_arg_reduce` threads an index alongside the value: each sibling-gather step
 /// shuffles BOTH payloads (so the partner's index rides its own `ds_bpermute`,
-/// never re-derived) → exactly `2 * reduce_tree().len()` `Op::Custom` gathers, plus
+/// never re-derived) → exactly `2 * (wave_size / 16 - 1)` `Op::Custom` gathers, plus
 /// the `where`-select pair-fold (`Ternary` + `Lt`/`Eq` compares), and still no LDS,
 /// no barrier, no WMMA. Holds on both wave64 (gfx942) and wave32 (gfx1151).
 #[test]
@@ -125,7 +125,7 @@ fn test_row_arg_reduce_graph_shape() {
         idx.uop().toposort()
     };
     for caps in [ArchCaps::GFX942, ArchCaps::for_amd(AmdArch::Gfx1151)] {
-        let want_customs = 2 * caps.reduce_tree().len();
+        let want_customs = 2 * (caps.wave_size / 16 - 1);
         let topo = build(caps);
         let customs = topo.iter().filter(|u| matches!(u.op(), Op::Custom(..))).count();
         assert_eq!(customs, want_customs, "{:?}: value+index each ride a ds_bpermute per tree step", caps.arch);

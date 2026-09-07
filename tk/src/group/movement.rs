@@ -305,13 +305,19 @@ impl<'k> Group<'k> {
 
     /// Whether the collaborative fill of `st` from `src` can be `cp.async`
     /// 16-byte copies: a CUDA target, one lane's `elements_per_thread` run is
-    /// exactly 16 bytes, no element cast, and the swizzle keeps 16-byte chunks
-    /// contiguous ([`crate::swizzle::Swizzle::keeps_16b_chunks`]).
+    /// exactly 16 bytes, no element cast, the swizzle keeps 16-byte chunks
+    /// contiguous ([`crate::swizzle::Swizzle::keeps_16b_chunks`]), and every
+    /// lane has its own chunk on every pass. The register-staged fill lets an
+    /// over-subscribed last pass redo the final chunk (an idempotent store);
+    /// overlapping in-flight `cp.async` copies to one address have no such
+    /// guarantee, so a tile that does not divide into whole passes stays on
+    /// the staged path.
     pub fn cp_async_fill_applies(&self, st: &ST, src: &GL) -> bool {
         self.ker.caps.cuda().is_some()
             && st.base.base.elements_per_thread() * st.elem().bytes() == 16
             && src.elem() == st.elem()
             && st.base.swizzle.keeps_16b_chunks()
+            && !self.lds_fill_geom(st).clamp
     }
 
     /// Asynchronous GLOBAL→LOCAL tile fill (sm_80+): every group thread issues one
@@ -375,12 +381,22 @@ impl<'k> Group<'k> {
         self.load_global_to_local_vec(dst, &src, idxs, axis, true)
     }
 
+    /// [`Self::fill_local_vec`] without the trailing workgroup barrier — the
+    /// vectorized peer of [`Self::fill_local_nobar`]. On sm_80+ the `cp.async`
+    /// copies are still retired (`wait_group 0`); only the barrier is left to
+    /// the caller, which must order one after *every* fill it batched before
+    /// any lane gathers from the filled tiles.
+    pub fn fill_local_vec_nobar(&self, dst: ST, src: GL, idxs: &[Idx], axis: usize) -> ST {
+        self.load_global_to_local_vec(dst, &src, idxs, axis, false)
+    }
+
     fn load_global_to_local_vec(&self, st: ST, src: &GL, idxs: &[Idx], axis: usize, barrier: bool) -> ST {
         // sm_80+: the 128-bit lane copy is a `cp.async`, retired (`wait_group 0`)
         // under the same trailing barrier the register path ends in.
-        if barrier && self.cp_async_fill_applies(&st, src) {
+        if self.cp_async_fill_applies(&st, src) {
             let commit = self.cp_async_fill(&st, src, idxs, axis);
-            let landed = cp_async_wait(0, smallvec![commit]).barrier(SmallVec::new());
+            let landed = cp_async_wait(0, smallvec![commit]);
+            let landed = if barrier { landed.barrier(SmallVec::new()) } else { landed };
             return self.finalize_st(st, landed);
         }
         let itemsize = st.elem().base().bytes() as i64;
@@ -479,7 +495,7 @@ impl<'k> Group<'k> {
                 dst.store(val)
             })
             .collect();
-        let grouped = if stores.len() == 1 { stores.into_iter().next().unwrap() } else { UOp::group(stores) };
+        let grouped = super::group_or_single(stores);
         let stored = grouped.end(smallvec![outer]);
         let ended = if barrier { stored.barrier(SmallVec::new()) } else { stored };
         self.finalize_st(st, ended)
@@ -576,7 +592,7 @@ impl<'k> Group<'k> {
                 }
             }
         }
-        let ended = if stores.len() == 1 { stores.into_iter().next().unwrap() } else { UOp::group(stores) };
+        let ended = super::group_or_single(stores);
         self.finalize_reg(rt, ended)
     }
 
