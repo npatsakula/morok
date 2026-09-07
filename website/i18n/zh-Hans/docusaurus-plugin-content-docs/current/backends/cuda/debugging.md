@@ -53,7 +53,7 @@ ptxas application ptx input, line 27; error   : ...
 ```
 
 `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` 意味着驱动比模块中的 PTX ISA 更老
-（锁定在 7.8，或在 sm_89 及更新架构上为 8.4：CUDA 12.4 / R550），见[要求](./overview.md)。信息日志
+（锁定随算力递增：sm_88 及更早为 7.8，sm_89 与 sm_90 为 8.4，Blackwell 上为 8.6 到 8.8），见[要求](./overview.md)。信息日志
 （警告、寄存器溢出）以 `debug` 级别记录在 `svod_device` 之下。
 
 有两个错误来自 Svod 自己的校验器，在驱动看到任何东西之前：

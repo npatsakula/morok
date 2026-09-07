@@ -80,13 +80,13 @@ constant. The shuffle primitives in `tk/src/group/shuffle.rs` now read the wave 
 designed out.
 
 :::tip For GPU experts
-Two capability methods on `ArchCaps` (`tk/src/arch.rs`) carry most of the wave-specific weight:
+Two things carry most of the wave-specific weight:
 
 - **The fragment's `LaneMap`** carries the fold. A reduction reads its tree off the resolved
   fragment (`src.base.map.tree(...)` in `tk/src/group/reduce.rs`), never off a constant: on
-  wave64 that is three xor steps `[16, 32, 48]` folding 4 sub-fragments, on RDNA wave32 one step
-  `[16]`, and on CUDA's `MmaSync` layout a butterfly over `[1, 2]`. `ArchCaps::reduce_tree()`
-  still exists but is now only the AMD form used by the graph-shape tests.
+  wave64 that is a sibling gather over offsets `[16, 32, 48]` (`ds_bpermute` of the original
+  partial from lane `L + d`) folding 4 sub-fragments, on RDNA wave32 the same gather with the
+  single offset `[16]`, and on CUDA's `MmaSync` layout an xor butterfly over masks `[1, 2]`.
 - **`acc_reusable_as_input()`** answers: "can a matrix accumulator be fed straight back in as an
   operand to the next multiply?" On CDNA and on CUDA it's `true` — the layouts match, so it's a
   free register copy. On RDNA it's `false` — the accumulator and operand layouts differ, so the

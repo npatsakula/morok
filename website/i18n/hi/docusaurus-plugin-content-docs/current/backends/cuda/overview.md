@@ -19,7 +19,7 @@ memory, programs, graphs), `runtime/src/cuda/` और `runtime/src/devices/cuda.
 | Requirement | क्यों |
 |---|---|
 | एक NVIDIA driver जो `libcuda.so.1` उजागर करता हो | हर driver call उसी से runtime पर `libloading` के साथ resolve होती है |
-| Driver **CUDA 12.0 (R525) या नया** | CUDA graph के entry points अपने versioned नामों (`cuGraphAddKernelNode_v2`, `cuGraphExecKernelNodeSetParams_v2`) से bind होते हैं, जो 12.0 से हैं; PTX ISA **7.8** पर pin है (`--cuda-feature=+ptx78`), जिसे ऐसा कोई भी driver JIT कर लेता है; sm_89 और नए अपने fp8 shapes के लिए **8.4** pin करते हैं, जिसे CUDA 12.4 / R550 चाहिए |
+| Driver **CUDA 12.0 (R525) या नया** | CUDA graph के entry points अपने versioned नामों (`cuGraphAddKernelNode_v2`, `cuGraphExecKernelNodeSetParams_v2`) से bind होते हैं, जो 12.0 से हैं। PTX ISA का pin compute capability के साथ बढ़ता है: sm_88 तक **7.8**, sm_89 और sm_90 पर **8.4** (उनके fp8 `mma.sync` shapes; CUDA 12.4 / R550), sm_100/sm_101 पर **8.6** (CUDA 12.7), sm_120 पर **8.7** (CUDA 12.8), और sm_103, sm_121 तथा उससे नए पर **8.8** (CUDA 12.9) — किसी Blackwell part को उसी ISA वाला driver चाहिए जिसने उसे पेश किया |
 | **NVPTX** target के साथ बना `clang` | `clang -x ir --target=nvptx64-nvidia-cuda` rendered IR को PTX में बदल देता है |
 
 किसी host पर इनकी जाँच करें:

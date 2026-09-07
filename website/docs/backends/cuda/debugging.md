@@ -54,7 +54,8 @@ ptxas application ptx input, line 27; error   : ...
 ```
 
 `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` means the driver is older than the PTX
-ISA of the module (pinned to 7.8, or 8.4 on sm_89 and newer: CUDA 12.4 / R550), see the
+ISA of the module (the pin follows the compute capability: 7.8 up to sm_88, 8.4 on sm_89
+and sm_90, 8.6 to 8.8 across Blackwell), see the
 [requirements](./overview.md). The info log (warnings, register spills) is
 logged at `debug` level under `svod_device`.
 

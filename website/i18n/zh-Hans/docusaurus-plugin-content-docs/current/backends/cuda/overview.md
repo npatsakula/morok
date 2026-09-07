@@ -19,7 +19,7 @@ PTX 文本，并在模块加载时由驱动 JIT 编译为 SASS。该设计遵循
 | 要求 | 为什么 |
 |---|---|
 | 一个暴露 `libcuda.so.1` 的 NVIDIA 驱动 | 每一次驱动调用都在运行时用 `libloading` 从中解析出来 |
-| 驱动为 **CUDA 12.0（R525）或更新** | CUDA graph 的入口点按其版本化名称绑定（`cuGraphAddKernelNode_v2`、`cuGraphExecKernelNodeSetParams_v2`），它们始于 12.0；PTX ISA 锁定在 **7.8**（`--cuda-feature=+ptx78`），任何这样的驱动都能 JIT 它；sm_89 及更新架构为其 fp8 形状锁定 **8.4**，需要 CUDA 12.4 / R550 |
+| 驱动为 **CUDA 12.0（R525）或更新** | CUDA graph 的入口点按其版本化名称绑定（`cuGraphAddKernelNode_v2`、`cuGraphExecKernelNodeSetParams_v2`），它们始于 12.0。PTX ISA 的锁定随算力递增：sm_88 及更早为 **7.8**，sm_89 与 sm_90 为 **8.4**（为其 fp8 `mma.sync` 形状，需要 CUDA 12.4 / R550），sm_100/sm_101 为 **8.6**（CUDA 12.7），sm_120 为 **8.7**（CUDA 12.8），sm_103、sm_121 及更新为 **8.8**（CUDA 12.9）——一块 Blackwell 卡需要引入其 ISA 的那一版驱动 |
 | 带 **NVPTX** target 构建的 `clang` | `clang -x ir --target=nvptx64-nvidia-cuda` 把渲染出的 IR 变成 PTX |
 
 在宿主上检查它们：

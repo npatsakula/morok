@@ -53,7 +53,8 @@ ptxas application ptx input, line 27; error   : ...
 ```
 
 `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` का अर्थ है कि driver module की PTX ISA से पुराना है
-(7.8 पर pin, या sm_89 और नए पर 8.4: CUDA 12.4 / R550), देखें [आवश्यकताएँ](./overview.md)। Info log
+(pin compute capability के साथ चलता है: sm_88 तक 7.8, sm_89 और sm_90 पर 8.4, Blackwell भर में
+8.6 से 8.8), देखें [आवश्यकताएँ](./overview.md)। Info log
 (warnings, register spills) `svod_device` के अंतर्गत `debug` level पर log होता है।
 
 दो errors Svod के अपने validator से आती हैं, driver के कुछ भी देखने से पहले:

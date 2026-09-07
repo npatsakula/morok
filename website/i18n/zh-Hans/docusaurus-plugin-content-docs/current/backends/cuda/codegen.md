@@ -38,9 +38,11 @@ attributes #0 = { nounwind "no-builtins" "no-trapping-math"="true" "nvvm.maxntid
 - `target datalayout` 是 clang 22 对 `nvptx64` 的默认值；clang 会静默地覆盖
   不匹配的值，所以这一行的存在是为了那些独立读取该模块的工具
   （`opt`、`llvm-as`、IR 转储）。
-- `"nvvm.maxntid"` 就是 PTX 的 `.maxntid` **launch bound**，被设为该内核最大的
-  local size：`ptxas` 会照着它而不是 1024 线程的最坏情况来给每线程分配
-  寄存器预算。更老的 LLVM 会忽略这个字符串属性，只是丢掉这条提示而已。
+- `"nvvm.maxntid"` 就是 PTX 的 `.maxntid` **launch bound**，每根轴一个界：内核的各个
+  local size 渲染成 `nx[, ny[, nz]]`（`"16,8"` 得到 `.maxntid 16, 8`；缺失的轴默认为 1），
+  于是 `ptxas` 会照着它而不是 1024 线程的最坏情况来给每线程分配寄存器预算。若某根 local
+  轴的长度不是常量，这个属性就干脆不加——按硬件上限来，而不是声明一个启动本身就会超出的界。
+  更老的 LLVM 会忽略这个字符串属性，只是丢掉这条提示而已。
 
 | 概念 | AMD | NVPTX |
 |---|---|---|
@@ -154,7 +156,9 @@ NVPTX 的 clang 变成一个干净的 `JitCompilation` 错误。
 很要紧：一个拼错的 `llvm.nvvm.*` 名字并不是编译错误，LLVM 会静默地把它发射
 成一个外部调用，而它本来只会以一次 `cuModuleLoadDataEx` 失败的形式浮现。
 
-PTX ISA 版本按架构锁定（`--cuda-feature=+ptx78`，或在 sm_89 及更新架构上为 `+ptx84`，
-它们的 fp8 `mma.sync` 形状自 8.4 起才存在），而不是交给 clang——它的默认值取决于它找到的
-CUDA toolkit（带 CUDA 13 的 clang 22：`.version 8.8`，需要一个 CUDA 12.8 / R570 驱动；
-没有 toolkit 时：一个对任何 tensor core 都太老的版本）。
+PTX ISA 版本按架构锁定，而不是交给 clang——它的默认值取决于它找到的 CUDA toolkit
+（带 CUDA 13 的 clang 22：`.version 8.8`，需要一个 CUDA 12.9 驱动；没有 toolkit 时：
+一个对任何 tensor core 都太老的版本）。这个锁定随算力单调递增：sm_88 及更早为 `+ptx78`，
+sm_89 与 sm_90 为 `+ptx84`（它们的 fp8 `mma.sync` 形状自 8.4 起才存在），sm_100/sm_101 为
+`+ptx86`，sm_120 为 `+ptx87`，sm_103、sm_121 及更新为 `+ptx88`。更老的会被 clang 拒绝：
+`PTX version 8.4 does not support target 'sm_120'. Minimum required PTX version is 8.7`。

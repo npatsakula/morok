@@ -38,10 +38,13 @@ attributes #0 = { nounwind "no-builtins" "no-trapping-math"="true" "nvvm.maxntid
 - The `target datalayout` is clang 22's default for `nvptx64`; clang overrides
   a mismatch silently, so the line exists for tools that read the module
   standalone (`opt`, `llvm-as`, IR dumps).
-- `"nvvm.maxntid"` is the PTX `.maxntid` **launch bound**, set to the kernel's
-  largest local size: `ptxas` budgets registers per thread against it instead
-  of the 1024-thread worst case. An older LLVM ignores the string attribute
-  and merely loses the hint.
+- `"nvvm.maxntid"` is the PTX `.maxntid` **launch bound**, one bound per axis:
+  the kernel's local sizes render as `nx[, ny[, nz]]` (`"16,8"` becomes
+  `.maxntid 16, 8`; missing axes default to 1), so `ptxas` budgets registers
+  per thread against it instead of the 1024-thread worst case. A local extent
+  that is not a constant drops the attribute — the hardware maximum applies,
+  rather than a bound the launch would exceed. An older LLVM ignores the
+  string attribute and merely loses the hint.
 
 | Concept | AMD | NVPTX |
 |---|---|---|
@@ -164,8 +167,11 @@ one matters: a misspelt `llvm.nvvm.*` name is not a compile error, LLVM
 silently emits it as an external call, and it would otherwise only surface as
 a `cuModuleLoadDataEx` failure.
 
-The PTX ISA version is pinned per arch (`--cuda-feature=+ptx78`, or `+ptx84`
-on sm_89 and newer, whose fp8 `mma.sync` shapes exist from 8.4) rather than
-left to clang, whose default follows the CUDA toolkit it finds (clang 22 with
-CUDA 13: `.version 8.8`, which needs a CUDA 12.8 / R570 driver; with no
-toolkit: a version too old for any tensor core).
+The PTX ISA version is pinned per arch rather than left to clang, whose
+default follows the CUDA toolkit it finds (clang 22 with CUDA 13: `.version
+8.8`, which needs a CUDA 12.9 driver; with no toolkit: a version too old for
+any tensor core). The pin is monotone in the compute capability: `+ptx78` up
+to sm_88, `+ptx84` on sm_89 and sm_90 (whose fp8 `mma.sync` shapes exist from
+8.4), `+ptx86` on sm_100/sm_101, `+ptx87` on sm_120, `+ptx88` on sm_103,
+sm_121 and newer. Clang refuses an older one: `PTX version 8.4 does not
+support target 'sm_120'. Minimum required PTX version is 8.7`.

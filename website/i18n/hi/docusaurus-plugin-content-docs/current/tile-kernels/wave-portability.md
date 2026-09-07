@@ -76,13 +76,13 @@ constant से नहीं, बल्कि `caps.wave_size` और role-resol
 shuffle primitives wave size पढ़ते हैं; पूरी bug class को design से ही बाहर कर दिया गया।
 
 :::tip GPU विशेषज्ञों के लिए
-`ArchCaps` (`tk/src/arch.rs`) पर दो capability methods अधिकांश wave-specific बोझ संभालती हैं:
+दो चीज़ें अधिकांश wave-specific बोझ संभालती हैं:
 
 - **fragment का `LaneMap`** fold को साथ लाता है। कोई reduction अपना tree resolve हुए fragment से पढ़ती
-  है (`tk/src/group/reduce.rs` में `src.base.map.tree(...)`), किसी constant से नहीं: wave64 पर वह 4
-  sub-fragments को fold करते तीन xor steps `[16, 32, 48]` हैं, RDNA के wave32 पर एक step `[16]`, और
-  CUDA के `MmaSync` layout पर `[1, 2]` पर एक butterfly। `ArchCaps::reduce_tree()` अब भी मौजूद है, पर
-  अब वह सिर्फ़ graph-shape tests वाला AMD रूप है।
+  है (`tk/src/group/reduce.rs` में `src.base.map.tree(...)`), किसी constant से नहीं: wave64 पर वह
+  offsets `[16, 32, 48]` पर एक sibling gather है (lane `L + d` से मूल partial का `ds_bpermute`) जो 4
+  sub-fragments को fold करता है, RDNA के wave32 पर वही gather एकमात्र offset `[16]` के साथ, और
+  CUDA के `MmaSync` layout पर masks `[1, 2]` पर एक xor butterfly।
 - **`acc_reusable_as_input()`** यह जवाब देता है: "क्या एक matrix accumulator को सीधे अगले multiply के
   operand के रूप में वापस feed किया जा सकता है?" CDNA और CUDA पर यह `true` है — layouts मेल खाते हैं, इसलिए यह बिना
   किसी अलग लागत के एक register copy है। RDNA पर यह `false` है — accumulator और operand layouts अलग होते हैं,

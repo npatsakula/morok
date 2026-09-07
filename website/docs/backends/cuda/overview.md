@@ -20,7 +20,7 @@ design follows tinygrad's `ops_cuda.py`; the code lives in `device/src/cuda/`
 | Requirement | Why |
 |---|---|
 | An NVIDIA driver exposing `libcuda.so.1` | Every driver call is resolved from it at runtime with `libloading` |
-| Driver **CUDA 12.0 (R525) or newer** | The CUDA-graph entry points are bound by their versioned names (`cuGraphAddKernelNode_v2`, `cuGraphExecKernelNodeSetParams_v2`), which date from 12.0; the PTX ISA is pinned to **7.8** (`--cuda-feature=+ptx78`), which any such driver JITs; sm_89 and newer pin **8.4** for their fp8 shapes, which needs CUDA 12.4 / R550 |
+| Driver **CUDA 12.0 (R525) or newer** | The CUDA-graph entry points are bound by their versioned names (`cuGraphAddKernelNode_v2`, `cuGraphExecKernelNodeSetParams_v2`), which date from 12.0. The PTX ISA pin follows the compute capability: **7.8** up to sm_88, **8.4** on sm_89 and sm_90 (their fp8 `mma.sync` shapes; CUDA 12.4 / R550), **8.6** on sm_100/sm_101 (CUDA 12.7), **8.7** on sm_120 (CUDA 12.8), **8.8** on sm_103, sm_121 and newer (CUDA 12.9) — a Blackwell part needs the driver of the ISA that introduced it |
 | `clang` built with the **NVPTX** target | `clang -x ir --target=nvptx64-nvidia-cuda` turns the rendered IR into PTX |
 
 Check them on a host:

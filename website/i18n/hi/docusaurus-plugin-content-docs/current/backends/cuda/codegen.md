@@ -37,9 +37,12 @@ attributes #0 = { nounwind "no-builtins" "no-trapping-math"="true" "nvvm.maxntid
 - `target datalayout` clang 22 का `nvptx64` के लिए default है; clang एक mismatch को चुपचाप
   override कर देता है, इसलिए यह line उन tools के लिए मौजूद है जो module को अकेले पढ़ते हैं
   (`opt`, `llvm-as`, IR dumps)।
-- `"nvvm.maxntid"` PTX का `.maxntid` **launch bound** है, जिसे kernel के सबसे बड़े local
-  size पर सेट किया जाता है: `ptxas` 1024-thread worst case के बजाय उसके विरुद्ध प्रति
-  thread registers का बजट बनाता है। एक पुराना LLVM string attribute को नज़रअंदाज़ कर देता है
+- `"nvvm.maxntid"` PTX का `.maxntid` **launch bound** है, हर axis पर एक bound: kernel के
+  local sizes `nx[, ny[, nz]]` की तरह render होते हैं (`"16,8"` से `.maxntid 16, 8` बनता है;
+  छूटी हुई axes default में 1 होती हैं), और `ptxas` 1024-thread worst case के बजाय उसके
+  विरुद्ध प्रति thread registers का बजट बनाता है। जहाँ किसी local axis की लंबाई constant नहीं
+  है, वहाँ attribute छोड़ ही दिया जाता है — hardware maximum लागू होता है, ऐसा bound नहीं
+  जिसे launch खुद ही पार कर जाए। एक पुराना LLVM string attribute को नज़रअंदाज़ कर देता है
   और केवल hint खो देता है।
 
 | Concept | AMD | NVPTX |
@@ -158,8 +161,10 @@ clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 -Wno-override-modul
 रूप में emit कर देता है, और वह अन्यथा केवल एक `cuModuleLoadDataEx` failure के रूप में सामने
 आता।
 
-PTX ISA version arch के अनुसार pin है (`--cuda-feature=+ptx78`, या sm_89 और नए पर
-`+ptx84`, जिनके fp8 `mma.sync` shapes 8.4 से मौजूद हैं), clang पर नहीं छोड़ा जाता, जिसका
-default उस CUDA toolkit पर निर्भर है जो उसे मिलता है (CUDA 13 के साथ clang 22:
-`.version 8.8`, जिसे एक CUDA 12.8 / R570 driver चाहिए; बिना toolkit: किसी भी tensor core
-के लिए बहुत पुराना version)।
+PTX ISA version arch के अनुसार pin है, clang पर नहीं छोड़ा जाता, जिसका default उस CUDA
+toolkit पर निर्भर है जो उसे मिलता है (CUDA 13 के साथ clang 22: `.version 8.8`, जिसे एक
+CUDA 12.9 driver चाहिए; बिना toolkit: किसी भी tensor core के लिए बहुत पुराना version)। यह
+pin compute capability में monotone है: sm_88 तक `+ptx78`, sm_89 और sm_90 पर `+ptx84`
+(जिनके fp8 `mma.sync` shapes 8.4 से मौजूद हैं), sm_100/sm_101 पर `+ptx86`, sm_120 पर
+`+ptx87`, और sm_103, sm_121 तथा उससे नए पर `+ptx88`। इससे पुराना clang मना कर देता है:
+`PTX version 8.4 does not support target 'sm_120'. Minimum required PTX version is 8.7`।
