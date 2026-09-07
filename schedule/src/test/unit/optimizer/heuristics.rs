@@ -298,8 +298,12 @@ fn matvec_fast_path_pads_the_row_axis(rows: i64, expected: Option<&[Opt]>) {
 #[test_case(96, 65536, &[Opt::thread(0, 32)]; "divisible rows are unchanged")]
 #[test_case(10007, 4, &[]; "too little work stays single threaded")]
 fn threading_pads_undividable_loop_axes(rows: i64, cols: i64, expected: &[Opt]) {
+    let mut renderer = Renderer::cpu();
+    // Renderer::cpu() caps threads at the host core count; these expectations need 32.
+    renderer.global_max = Some(vec![32]);
+
     let sink = create_row_reduce_pattern(AxisType::Weak, rows, cols, DType::Float32, None);
-    let mut scheduler = Scheduler::new(sink, Renderer::cpu());
+    let mut scheduler = Scheduler::new(sink, renderer);
 
     assert_eq!(apply_threading(&mut scheduler, 32), !expected.is_empty());
     assert_eq!(scheduler.applied_opts, expected);
