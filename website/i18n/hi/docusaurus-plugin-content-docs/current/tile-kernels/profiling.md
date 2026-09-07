@@ -262,10 +262,13 @@ SVOD_DEVICE=AMD:0 SVOD_PMC=1 cargo bench -p svod-tk --bench kmeans -- --profile-
 
 :::caution दो चीज़ें जो profiler आपको नहीं दे सकता
 **Tier 2 GFLOP/s हाथ से authored कर्नेल के लिए blank रहता है।** FLOP estimate कर्नेल के IR पर चलता है, और
-यह सिर्फ़ **scheduler-built** कर्नेल को ही auto-rate करता है। एक हाथ से authored `tk` कर्नेल unbounded
-symbolic ranges इस्तेमाल करता है, इसलिए AST walk एक असली count बनाने के बजाय *saturate* कर जाता है —
-profiler इसे एक garbage roofline print करने के बजाय "कोई भरोसेमंद estimate नहीं" मानता है, इसलिए उन कर्नेल
-के लिए **GFLOP/s column `-` दिखाता है**। (GB/s फिर भी काम करता है, क्योंकि bytes plan के buffers से आते हैं,
+यह सिर्फ़ **scheduler-built** कर्नेल को ही auto-rate करता है। कोई operation किन loops के भीतर बैठा है, यह
+वह उसके operands की निर्भरता से निकालता है — और यह तब तक सही है जब तक index expressions scheduler
+लिखता है। हाथ से lower किया गया `tk` कर्नेल अपनी addressing ख़ुद करता है, और तब उसके loop variables
+arithmetic तक सिर्फ़ addresses के रास्ते पहुँचते हैं, इसलिए यह walk nesting को दोबारा नहीं निकाल पाता — किसी भी
+दिशा में नहीं। profiler garbage roofline print करने के बजाय estimate देने से इनकार कर देता है (एक शुरुआती
+version एक matmul को hardware peak से आठ गुना बताता था), इसलिए उन कर्नेल के लिए **GFLOP/s column `-`
+दिखाता है**। (GB/s फिर भी काम करता है, क्योंकि bytes plan के buffers से आते हैं,
 IR से नहीं।) हाथ से लिखे कर्नेल के लिए roofline को algorithm की जानी-पहचानी FLOP count और Tier-1 device time
 से ख़ुद हाथ से compute करें।
 

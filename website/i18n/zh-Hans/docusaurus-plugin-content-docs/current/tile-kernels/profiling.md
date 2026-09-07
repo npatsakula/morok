@@ -197,7 +197,7 @@ SVOD_DEVICE=AMD:0 SVOD_PMC=1 cargo bench -p svod-tk --bench kmeans -- --profile-
 ## 如实交代局限
 
 :::caution profiler 给不了你的两样东西
-**第 2 层的 GFLOP/s 对手写内核是空白。** FLOP 估算会遍历内核的 IR，而它只会为**调度器构建的**内核自动计算速率。一个手写的 `tk` 内核用的是无界的符号范围，于是 AST 遍历会*饱和*，而非形成一个真实计数——profiler 把这当作「没有可靠估算」，而不是打印一份垃圾 roofline，所以对那些内核**GFLOP/s 这一列显示 `-`**。（GB/s 仍然有效，因为字节数来自 plan 的缓冲区，而非 IR。）手写内核的 roofline 请你自己来算：用算法已知的 FLOP 计数和第 1 层的设备时间。
+**第 2 层的 GFLOP/s 对手写内核是空白。** FLOP 估算会遍历内核的 IR，而它只会为**调度器构建的**内核自动计算速率。它是从一个操作的操作数依赖什么，来推断该操作位于哪些循环里的——只要索引表达式由调度器来写，这就成立。而手工 lower 的 `tk` 内核自己做寻址，它的循环变量只经由地址抵达算术，于是这趟遍历就再也还原不出嵌套关系了，两个方向都不行。profiler 会拒绝给出估算，而不是打印一份垃圾 roofline（早期版本曾把一个 matmul 报成硬件峰值的八倍），所以对那些内核**GFLOP/s 这一列显示 `-`**。（GB/s 仍然有效，因为字节数来自 plan 的缓冲区，而非 IR。）手写内核的 roofline 请你自己来算：用算法已知的 FLOP 计数和第 1 层的设备时间。
 
 **第 4 层必须先解锁，而且各家厂商的要求不同。** 在 AMD 上，PM4 硬件计数器只有在 GPU 保持固定时钟时才有意义，所以 GPU 必须处于 `profile_standard` 电源状态（`amd-smi set -l stable_std`）。在 CUDA 上，除非设置了 `NVreg_RestrictProfilingToAdminUsers=0`，驱动只允许管理员采集计数器，并且 CUPTI 必须能被加载（`SVOD_CUDA_CUPTI=0` 可以主动关掉它）。两种情况下 profiler 都*不会*失败：它只报告计时，并打印一行提示说明缺了什么。NVIDIA 的细节见[在 CUDA 上剖析](../backends/cuda/profiling.md)，其中也讲了为什么那里采集计数器要多花一趟。
 :::

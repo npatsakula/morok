@@ -264,10 +264,12 @@ completely unaffected — same numbers, no extra passes.
 
 :::caution Two things the profiler cannot give you
 **Tier 2 GFLOP/s is blank for hand-authored kernels.** The FLOP estimate walks the kernel's IR,
-and it only auto-rates **scheduler-built** kernels. A hand-authored `tk` kernel uses unbounded
-symbolic ranges, so the AST walk *saturates* instead of forming a real count — the profiler treats
-that as "no reliable estimate" rather than printing a garbage roofline, so the **GFLOP/s column
-shows `-`** for those kernels. (GB/s still works, since bytes come from the plan's buffers, not the
+and it only auto-rates **scheduler-built** kernels. It infers which loops an operation sits in from
+what its operands depend on, which holds while the scheduler writes the index expressions. A
+hand-lowered `tk` kernel does its own addressing, and its loop variables then reach the arithmetic
+only through addresses — so the walk can no longer recover the nesting, in either direction. The
+profiler declines the estimate rather than printing a garbage roofline (an early version reported a
+matmul at eight times the hardware's peak), so the **GFLOP/s column shows `-`** for those kernels. (GB/s still works, since bytes come from the plan's buffers, not the
 IR.) Compute the roofline for hand kernels by hand from the algorithm's known FLOP count and the
 Tier-1 device time.
 
