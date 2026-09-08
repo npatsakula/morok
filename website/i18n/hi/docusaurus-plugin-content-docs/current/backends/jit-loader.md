@@ -6,15 +6,17 @@ sidebar_label: JIT कंपाइलर
 
 अधिकांश ML कंपाइलर या तो पूरे LLVM टूलचेन को बाइनरी में लिंक करते हैं — सैकड़ों मेगाबाइट डिपेंडेंसी जोड़ते हुए — या डिस्क पर अस्थायी फ़ाइलें लिखकर `dlopen` से लोड करते हैं। Svod इनमें से कुछ भी नहीं करता।
 
-जब किसी kernel को execute करना होता है, Svod जनरेट किए गए सोर्स कोड को stdin से `clang` को भेजता है, stdout पर relocatable ELF ऑब्जेक्ट प्राप्त करता है, प्रक्रिया में ही पार्स करता है, मशीन कोड को anonymous memory mapping में कॉपी करता है, relocations लागू करता है, पेज permissions को executable में बदलता है, और function pointer को सीधे कॉल करता है। पूरी प्रक्रिया मेमोरी में होती है — कोई अस्थायी फ़ाइल डिस्क को नहीं छूती, कोई shared library लोड नहीं होती, और PATH में `clang` के अलावा किसी LLVM इंस्टॉलेशन की ज़रूरत नहीं।
+जब किसी kernel को execute करना होता है, Svod जनरेट किए गए सोर्स कोड को stdin से एक कंपाइलर को भेजता है, stdout पर relocatable ELF ऑब्जेक्ट प्राप्त करता है, प्रक्रिया में ही पार्स करता है, मशीन कोड को anonymous memory mapping में कॉपी करता है, relocations लागू करता है, पेज permissions को executable में बदलता है, और function pointer को सीधे कॉल करता है। पूरी प्रक्रिया मेमोरी में होती है — कंपाइलर को कोड सौंपने के लिए किसी अस्थायी फ़ाइल की ज़रूरत नहीं, JIT से बनी कोई shared library `dlopen` नहीं होती, और PATH में `clang` के अलावा किसी LLVM इंस्टॉलेशन की ज़रूरत नहीं।
 
-यह अध्याय CPU JIT लोडर की कार्यप्रणाली का वर्णन करता है। GPU बैकएंड उसी `clang` के माध्यम से pipe करते हैं लेकिन डिस्पैच अपने-अपने ड्राइवर से करते हैं: देखें [AMD बैकएंड](./amd/overview.md) (KFD-direct) और [CUDA बैकएंड](./cuda/overview.md) (ड्राइवर API, PTX JIT)।
+C बैकएंड के लिए कंपाइलर stdin/stdout पर `clang` है। **LLVM IR बैकएंड default है** (`SVOD_CPU_BACKEND=clang` दूसरा चुनता है) और वह libLLVM को `libloading` से प्रक्रिया के भीतर bind करना पसंद करता है, तथा जब library लोड न हो या `SVOD_LLVM_INPROCESS=0` मना कर दे तो उसी `clang -x ir` subprocess पर लौट आता है। दोनों ही स्थितियों में नीचे बताया गया लोडर वही ELF बाइट्स देखता है।
+
+यह अध्याय CPU JIT लोडर की कार्यप्रणाली का वर्णन करता है। GPU बैकएंड उसी `clang` के माध्यम से pipe करते हैं लेकिन डिस्पैच अपने-अपने ड्राइवर से करते हैं: देखें [AMD बैकएंड](./amd/overview.md) (KFD-direct) और [CUDA बैकएंड](./cuda/overview.md) (ड्राइवर API; PTX को ड्राइवर JIT करता है, या CUDA toolkit इंस्टॉल हो तो एक `ptxas` cubin)। उच्च-स्तरीय graph wrapper API, जो एक model graph को एक बार कंपाइल करके कई बार replay करती है, [JIT Graphs](../architecture/jit-graphs.md) में दस्तावेज़ीकृत है।
 
 ## पाइपलाइन
 
 ```mermaid
 flowchart TD
-  A["C source / LLVM IR"] --> B["clang -c (stdin to stdout)"]
+  A["C source / LLVM IR"] --> B["in-process libLLVM, or clang -c (stdin to stdout)"]
   B --> C["ELF .o bytes (in memory)"]
   C --> D["Parse sections (object crate)"]
   D --> E["Anonymous mmap + copy sections"]
@@ -26,7 +28,7 @@ flowchart TD
 
 **Clang** बैकएंड (C सोर्स, `-x c` से) और **LLVM** बैकएंड (LLVM IR टेक्स्ट, `-x ir` से) दोनों एक ही लोडर साझा करते हैं। एकमात्र अंतर clang का इनपुट language flag है।
 
-:::tip फ़ॉलबैक मोड
+:::tip[फ़ॉलबैक मोड]
 डिबगिंग या उन प्लेटफ़ॉर्म के लिए जहाँ कस्टम ELF लोडर काम नहीं करता, Cargo feature `dlopen-fallback` पारंपरिक पाइपलाइन पर स्विच करता है: `clang -shared` एक अस्थायी डायरेक्टरी में `.so` लिखता है, जिसे `dlopen` से लोड किया जाता है। यह धीमा है (डिस्क I/O + dynamic linker ओवरहेड), लेकिन अधिक पोर्टेबल।
 :::
 
@@ -35,12 +37,12 @@ flowchart TD
 | आर्किटेक्चर | Target triple | कंपाइल flag | I-cache | नोट्स |
 |---|---|---|---|---|
 | **x86_64** | `x86_64-none-unknown-elf` | `-march=native` | स्वतः सुसंगत | AMD64, Intel 64 |
-| **aarch64** | `aarch64-none-unknown-elf` | `-march=native` | `__clear_cache` | Apple Silicon, Ampere, Graviton |
-| **riscv64** | `riscv64-none-unknown-elf` | `-march=rv64gc` | `__clear_cache` | RV64I + M + A + F + D + C एक्सटेंशन |
+| **aarch64** | `aarch64-none-unknown-elf` | `-mcpu=native` | `__clear_cache` | Apple Silicon, Ampere, Graviton |
+| **riscv64** | `riscv64-none-unknown-elf` | `-march=rv64g` | `__clear_cache` | RV64I + M + A + F + D एक्सटेंशन |
 | **loongarch64** | `loongarch64-none-unknown-elf` | `-march=native` | `__clear_cache` | Loongson 3A5000+ |
 | **ppc64le** | `powerpc64le-none-unknown-elf` | `-mcpu=native` | `__clear_cache` | ELFv2 ABI, केवल little-endian |
 
-आर्किटेक्चर डिटेक्शन runtime पर `std::env::consts::ARCH` के माध्यम से स्वचालित है — किसी compile-time feature flag की आवश्यकता नहीं।
+ARM पर `-march=native` केवल आधार ISA परिवार तय करता है, इसलिए C बैकएंड उसकी जगह `-mcpu=native` माँगता है; ऊपर वाला कंपाइल flag कॉलम उसी बैकएंड का है, जबकि LLVM IR बैकएंड हर जगह `-march=native` पास करता है। आर्किटेक्चर डिटेक्शन runtime पर `std::env::consts::ARCH` के माध्यम से स्वचालित है — किसी compile-time feature flag की आवश्यकता नहीं।
 
 ### Relocation सपोर्ट
 
@@ -48,7 +50,7 @@ flowchart TD
 
 **x86_64** — PC-relative (`R_X86_64_PC32`, `PLT32`, `GOTPCRELX`, `REX_GOTPCRELX`), absolute 32/64-bit (`R_X86_64_32`, `32S`, `64`)।
 
-**aarch64** — 26-bit branches (`CALL26`, `JUMP26`) जब target ±128 MB से अधिक दूर हो तो स्वचालित veneer generation के साथ, page-relative ADRP (`ADR_PREL_PG_HI21`), access-size shifts के साथ 12-bit page offsets (`ADD_ABS_LO12_NC`, `LDST8/16/32/64/128_ABS_LO12_NC`)।
+**aarch64** — 26-bit branches (`CALL26`, `JUMP26`) जब target ±128 MiB से अधिक दूर हो तो स्वचालित veneer generation के साथ, page-relative ADRP (`ADR_PREL_PG_HI21`), access-size shifts के साथ 12-bit page offsets (`ADD_ABS_LO12_NC`, `LDST8/16/32/64/128_ABS_LO12_NC`)।
 
 **riscv64** — Call pairs (`CALL`, `CALL_PLT`), state tracking के साथ PC-relative split addressing (`PCREL_HI20` + `PCREL_LO12_I/S`), absolute (`HI20`, `LO12_I/S`), branches (`BRANCH`, `JAL`), data (`32`, `64`)। Linker relaxation hints (`RELAX`) छोड़ दिए जाते हैं।
 
@@ -64,7 +66,7 @@ flowchart TD
 |---|---|---|---|
 | `-c` | हाँ | हाँ | केवल कंपाइल (कोई linking नहीं) |
 | `-O2` | हाँ | हाँ | Optimization level |
-| `-march=native` | हाँ | हाँ | Host CPU features का उपयोग |
+| `-march=native` | प्रति arch (ऊपर देखें) | हाँ | Host CPU features का उपयोग |
 | `-fPIC` | हाँ | हाँ | Position-independent code |
 | `-ffreestanding` | हाँ | नहीं | Hosted environment नहीं माना जाता |
 | `-fno-math-errno` | हाँ | हाँ | Math builtins errno सेट नहीं करते |
@@ -72,7 +74,7 @@ flowchart TD
 | `-nostdlib` | हाँ | नहीं | Standard library नहीं |
 | `-fno-ident` | हाँ | नहीं | `.comment` section दबाएँ |
 | `--target=<arch>-none-unknown-elf` | हाँ | हाँ | Bare-metal ELF target |
-| `-ffixed-x18` | aarch64 macOS/Win | aarch64 macOS/Win | Platform register आरक्षित करें |
+| `-ffixed-x18` | aarch64 macOS | aarch64 macOS | Platform register आरक्षित करें |
 | `-funroll-loops` | नहीं | हाँ | आक्रामक loop unrolling |
 | `-fvectorize` | नहीं | हाँ | Loop vectorization |
 | `-fslp-vectorize` | नहीं | हाँ | SLP (straight-line) vectorization |
@@ -81,13 +83,13 @@ C बैकएंड `#include <math.h>` के बजाय `__builtin_*` फ�
 
 ## बाहरी सिंबल रिज़ॉल्यूशन
 
-यदि clang किसी बाहरी फ़ंक्शन का call उत्पन्न करता है (दुर्लभ — अधिकांश गणित builtins द्वारा संभाली जाती है), लोडर इसे लोड समय पर `dlsym(RTLD_DEFAULT, name)` के माध्यम से resolve करता है। यह `memcpy` या platform-specific libm symbols जैसे मामलों को कवर करता है।
+यदि clang किसी बाहरी फ़ंक्शन का call उत्पन्न करता है (दुर्लभ — अधिकांश गणित builtins द्वारा संभाली जाती है), लोडर इसे लोड समय पर `dlsym(RTLD_DEFAULT, name)` के माध्यम से resolve करता है। यह `memcpy` या ऐसे platform-specific libm symbols जैसे मामलों को कवर करता है जिन्हें clang inline करने के बजाय emit कर सकता है।
 
-### Branch veneers (aarch64)
+### Branch veneers (aarch64, x86_64)
 
-aarch64 पर, `CALL26`/`JUMP26` relocations PC-relative offset को 26 bits में encode करती हैं, जो ±128 MB की range देता है। ASLR वाले macOS पर, anonymous mmap region आमतौर पर libm जैसी system libraries से ~2 GB दूर होता है — इस range से बहुत आगे।
+aarch64 पर, `CALL26`/`JUMP26` relocations PC-relative offset को 26 bits में encode करती हैं, जो ±128 MiB की range देता है; x86_64 पर `PC32`/`PLT32` ±2 GiB देते हैं। एक लंबे समय तक चलने वाली process अपने mmap क्षेत्र को ऊपर से नीचे भरती है, इसलिए एक anonymous JIT mapping अंततः libm और उस जैसी libraries की उस पहुँच से बाहर जा गिरता है।
 
-जब लोडर out-of-range `CALL26`/`JUMP26` detect करता है, तो वह mmap के अंत में reserved area में एक **veneer** (branch trampoline) generate करता है:
+जब कोई direct branch वहाँ तक न पहुँच सके, तो लोडर उसे mmap के अंत में reserved area में मौजूद एक **veneer** (branch trampoline) से होकर भेजता है:
 
 ```text
 LDR X16, [PC, #8]   // 64-bit target address लोड करें
@@ -95,11 +97,11 @@ BR  X16              // indirect branch
 .quad <address>      // पूर्ण 64-bit address
 ```
 
-Veneers को पहले से scan किया जाता है (mmap allocation से पहले count) और deduplicate किया जाता है — यदि कई call sites एक ही external symbol को reference करते हैं, तो वे एक ही veneer साझा करते हैं।
+x86_64 वाला रूप `MOVABS $target, %r11` + `JMP *%r11` है, और वह तभी लिया जाता है जब patch site से ठीक पहले वाला byte एक असली `call`/`jmp rel32` opcode हो — एक out-of-range RIP-relative data reference इसके बजाय खुलकर fail होता है। हर unique external direct-branch symbol के लिए veneer की जगह mmap allocate होने से पहले ही reserve कर ली जाती है, और veneers स्वयं deduplicate किए जाते हैं, इसलिए एक ही symbol साझा करने वाले call sites एक ही trampoline साझा करते हैं।
 
 ### Platform register (aarch64)
 
-macOS और Windows ARM पर, register `x18` platform register के रूप में reserved है। चूँकि हम `--target=aarch64-none-unknown-elf` (bare-metal) के साथ compile करते हैं, compiler सामान्यतः `x18` को free GPR मानता। `-ffixed-x18` flag इसे रोकता है, macOS/Windows process में JIT code चलने पर crashes से बचाता है।
+macOS ARM पर, register `x18` platform register के रूप में reserved है और kernel context switch पर उसे बदल देता है। चूँकि हम `--target=aarch64-none-unknown-elf` (bare-metal) के साथ compile करते हैं, compiler सामान्यतः `x18` को free GPR मानता। `-ffixed-x18` flag इसे रोकता है, macOS process में JIT code चलने पर crashes से बचाता है। Linux ARM `x18` को एक साधारण GPR की तरह लेता है, और Windows ARM ऐसा target नहीं है जिसे Svod सपोर्ट करता हो।
 
 ## इंस्ट्रक्शन कैश सुसंगतता
 

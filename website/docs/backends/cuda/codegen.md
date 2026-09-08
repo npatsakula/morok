@@ -18,13 +18,14 @@ The lowering table was verified with clang 22 and `ptxas` 13.3 at `sm_86`.
 
 ```llvm
 ; ModuleID = 'r_64_32'
+source_filename = "r_64_32"
 target datalayout = "e-p6:32:32-i64:64-i128:128-i256:256-v16:16-v32:32-n16:32:64"
 target triple = "nvptx64-nvidia-cuda"
 
 declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
 declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
 
-define ptx_kernel void @r_64_32(ptr addrspace(1) %data0, ptr addrspace(1) %data1) #0 {
+define ptx_kernel void @r_64_32(ptr noalias align 32 %data0, ptr noalias align 32 %data1) #0 {
 entry:
   ...
   ret void
@@ -52,7 +53,7 @@ attributes #0 = { nounwind "no-builtins" "no-trapping-math"="true" "nvvm.maxntid
 | kernel ABI | `amdgpu_kernel`, `.kd` descriptor | `ptx_kernel` |
 | work ids | `llvm.amdgcn.workgroup.id.*` / `workitem.id.*` | `llvm.nvvm.read.ptx.sreg.ctaid.{x,y,z}` / `tid.{x,y,z}` |
 | barrier | `fence syncscope("workgroup")` + `s.barrier` | `fence syncscope("block") release; llvm.nvvm.barrier0; fence syncscope("block") acquire` (`bar.sync 0`) |
-| address spaces | global 1, LDS 3, private 5 | global 1, shared 3; REG buffers stay a plain generic `alloca` |
+| address spaces | global 1, LDS 3, private 5 | shared 3, global 1 in the `cp.async` / `ldmatrix` casts; kernel parameters are generic pointers and REG buffers stay a plain `alloca` |
 | shared memory | `addrspace(3)` module globals | same |
 | launch bound | `"amdgpu-flat-work-group-size"` | `"nvvm.maxntid"` |
 
@@ -80,7 +81,9 @@ call that only fails inside `ptxas`. The renderer therefore removes `Exp`,
 `supported_ops`, and the scheduler decomposes them with
 `nvptx_decomposition_patterns()`: the AMD set (polynomial `exp`/`log`/trig over
 native `exp2`/`log2`, integer-domain bf16 rounding) plus f64 `Exp2`/`Log2`
-expansions, because NVPTX lowers `@llvm.exp2` for f16/f32 only.
+expansions, because NVPTX lowers `@llvm.exp2` for f16/f32 only. `Max`, `Pow`
+and `Threefry` are dropped for every GPU renderer rather than as an NVPTX
+choice: they decompose to a select and to a bare XOR.
 
 What stays native: `@llvm.exp2.f32` selects `ex2.approx.f32`, `@llvm.sqrt`
 selects `sqrt.rn`, `fma`/`floor`/`rint`/`maxnum` lower directly.
@@ -142,8 +145,10 @@ tile kernel stage through `.shared` the way it does on AMD: `ldmatrix`
 (sm_75+) loads a matrix fragment in the register layout `mma.sync` expects,
 and `cp_async` / `cp_async_16` (sm_80+) copy global → shared without staging
 through registers, committed and awaited with `cp_async_commit`,
-`cp_async_wait` and `cp_async_wait_all`. `CpAsyncCache` keeps one declaration
-per module.
+`cp_async_wait` and `cp_async_wait_all`. `CpAsyncCache` is that copy's cache
+policy — `.cg` (L2 only, 16 bytes) or `.ca` (L1 and L2, 4, 8 or 16). Each
+builder carries its own `declare`; `dedup_declares` keeps the first per
+function name, so a kernel full of `cp.async` declares the intrinsic once.
 
 ---
 
@@ -153,12 +158,12 @@ per module.
 host clang, stdin to stdout, exactly like the AMD and CPU paths:
 
 ```text
-clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 -Wno-override-module - -o -
+clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx78 -Wno-override-module - -o -
 ```
 
-A cached `has_nvptx_target()` probe (`clang --print-targets`) turns a clang
-without NVPTX into a clean `JitCompilation` error. `SVOD_DUMP_NVPTX_IR=<dir>`
-writes each kernel's `.ll` there.
+A cached `clang --print-targets` probe turns a clang without NVPTX into a
+clean `JitCompilation` error. `SVOD_DUMP_NVPTX_IR=<dir>` writes each kernel's
+IR there as `sm_XY_<module>.ll`.
 
 Before any PTX reaches the driver, fresh or from the object cache,
 `validate_ptx` checks that it has a `.version`, a `.target` equal to the
@@ -167,11 +172,16 @@ one matters: a misspelt `llvm.nvvm.*` name is not a compile error, LLVM
 silently emits it as an external call, and it would otherwise only surface as
 a `cuModuleLoadDataEx` failure.
 
+When `ptxas` is installed the PTX is checked here, at compile time — including
+its `.param` list against the ABI, which a cubin no longer carries — and it is
+the assembled cubin that is cached; a hit then takes `validate_cubin` (a
+little-endian ELF64 for `EM_CUDA` defining the entry as code) instead.
+
 The PTX ISA version is pinned per arch rather than left to clang, whose
 default follows the CUDA toolkit it finds (clang 22 with CUDA 13: `.version
 8.8`, which needs a CUDA 12.9 driver; with no toolkit: a version too old for
-any tensor core). The pin is monotone in the compute capability: `+ptx78` up
-to sm_88, `+ptx84` on sm_89 and sm_90 (whose fp8 `mma.sync` shapes exist from
-8.4), `+ptx86` on sm_100/sm_101, `+ptx87` on sm_120, `+ptx88` on sm_103,
-sm_121 and newer. Clang refuses an older one: `PTX version 8.4 does not
+any tensor core). `ptx_isa` is monotone in the compute capability: `+ptx78` up
+to sm_88, `+ptx84` from sm_89 through every 9.x (the fp8 `mma.sync` shapes
+exist from 8.4), `+ptx86` on sm_100 to sm_102, `+ptx87` on sm_120, `+ptx88` on
+sm_103, sm_121 and newer. Clang refuses an older one: `PTX version 8.4 does not
 support target 'sm_120'. Minimum required PTX version is 8.7`.

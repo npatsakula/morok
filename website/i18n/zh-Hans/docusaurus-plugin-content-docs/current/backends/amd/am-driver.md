@@ -6,13 +6,14 @@ sidebar_label: AM 驱动
 
 **AM** 驱动是第二个 [`AmdIface`](./overview.md) 后端，它直接驱动
 GPU 的 PCI BAR，彻底绕过内核的 `amdgpu`/KFD 驱动。它
-是 tinygrad 用户态 AM 驱动的移植。其动机很具体：
-无锁的 [多队列调度](./queues-and-dispatch.md) 路径会在繁重的并发负载下令
-内核的 MES/runlist 调度器过载，并可能让内核崩溃。如果我们拥有
-GPU——页表、固件、调度——内核就永不处于调度路径中，
-也就无法被过载。
+是 tinygrad 用户态 AM 驱动的移植。其动机很具体：在单 XCC 的
+gfx11+ 硬件上，无锁的 [多队列调度](./queues-and-dispatch.md) 路径会把 CP
+微引擎停在内核 MES 固件无法抢占的等待中，从而把它卡进一次
+不可恢复的复位。内核调度器是那个共同的弱点——正是同一类故障
+迫使通道池在每一种硬件上都保持保守。如果我们拥有 GPU——页表、
+固件、调度——内核就永不处于调度路径中，也就无法被卡死。
 
-:::caution 开发中——尚不可选
+:::caution[开发中——尚不可选]
 本页同时记录当下存在什么，以及其余部分的路线图。
 **`SVOD_AMD_BACKEND=am` 目前会返回错误**（`device.rs` 只接受
 `kfd`）：尚无 AM 类型实现 [`AmdIface`](./overview.md) 接缝，因此
@@ -35,11 +36,12 @@ GPU——页表、固件、调度——内核就永不处于调度路径中，
 8 个 XCC——并且特指其 **SR-IOV 虚拟功能（Virtual Function，VF）**形态
 （该 GPU 是一个被透传进 KVM 客户机的 VF）。`AmDev::open` 会直接拒绝
 其他一切：非 VF 的功能，或 major.minor 不是 `(9, 4)` 的 GC 版本，
-都会快速失败（`device/src/amd/am/dev.rs`）。早先的 gfx1151（RDNA3.5）
-如今只剩下一份 vendored 寄存器表和一个残留的单元测试；它
-不再是目标。
+都会快速失败（`device/src/amd/am/dev.rs`）。gfx1151（RDNA3.5）不再是
+*目标*，但 gfx11 的 arch 分支仍保持已实现且有单元测试——而且正是
+它的页表几何与 palloc 范围辅助函数被 gfx9 路径复用。
 
-> Validated on AMD Instinct MI300X (gfx942) and Ryzen AI "Strix Halo" (gfx1151).
+> 启动用硬件：一块 AMD Instinct MI300X（gfx942 / GC 9.4.3）的 SR-IOV VF。
+> `AmDev::open` 不接受其他任何东西。
 
 **VF**（而非裸金属）这一身份是决定性的约束，它决定了
 整个驱动的形态：
@@ -73,8 +75,8 @@ GPU——页表、固件、调度——内核就永不处于调度路径中，
 
 | 分组 | 模块 | 它实现什么 | 状态 |
 |---|---|---|---|
-| **Discovery** | `pci.rs`, `discovery.rs` | sysfs BAR mmap（BAR0 VRAM / BAR2 doorbell / BAR5 MMIO）、配置空间读写、带边界检查的 IP-discovery 解析器（每 XCC 段基址，`gc_info` v1/v2） | **HW 验证** + 单元测试 |
-| **寄存器访问** | `regaccess.rs`, `rlcg.rs`, `mailbox.rs`, `regs.rs`, `regs_gen.rs` | mxgpu VF↔GIM mailbox 握手、RLCG 间接 GC/GCVM 读写（每 XCC）、MMIO/RLCG 路由器、vendored 寄存器表 | **HW 验证** + 单元测试 |
+| **Discovery** | `pci.rs`, `discovery.rs` | sysfs BAR mmap（BAR0 VRAM / BAR2 doorbell / BAR5 MMIO）、配置空间读写、带边界检查的 IP-discovery 解析器（每 XCC 段基址，`gc_info` v1/v2） | **HW 验证**；discovery 解析器有单元测试 |
+| **寄存器访问** | `regaccess.rs`, `rlcg.rs`, `mailbox.rs`, `regs.rs`, `regs_gen.rs` | mxgpu VF↔GIM mailbox 握手、RLCG 间接 GC/GCVM 读写（每 XCC）、MMIO/RLCG 路由器、vendored 寄存器表 | **HW 验证**；寄存器表的选择/编码逻辑有单元测试 |
 | **内存（GMMU）** | `mm/{tlsf,pagetable,manager,mod}.rs` | TLSF VA/PA/页表分配器、4 级/48 位遍历、gfx9 **与** gfx11 的 PTE/PDE 编码、大页选择、表回收、`valloc`/`vfree` | **完成** + 测试（PTE 写路径已硬件演练） |
 | **GMC 启动** | `ip/gmc.rs` | 编程两个 hub 的 context0（start/end/base + CNTL）、MX_L1_TLB 使能、每引擎失效范围、ENG17 TLB 刷新、HDP 刷新、故障状态解码 | **HW 验证**到 context 编程级别 |
 | **GFX 启动** | `ip/gfx.rs` | 使能 MEC（icache 失效、golden `GB_ADDR_CONFIG`、doorbell 范围、unhalt）、构建一个 v9 compute MQD、激活 HQD（`CP_HQD_ACTIVE=1`）、`WRITE_DATA` PM4 | **MEC HQD 激活**；队列尚不运行 |
@@ -87,8 +89,9 @@ GPU——页表、固件、调度——内核就永不处于调度路径中，
 一种**跨 gfx9/11/12 共享**的形状——因此几何本身不随 arch 分支。
 只有叶 PTE 编码（尤其是 MTYPE 内存类型字段）才是 arch 特定的，而
 **gfx9（CDNA）与 gfx11（RDNA3）现已实现并单元测试**——
-gfx9 叶标志把 MTYPE 放在第 57–58 位、置 PDB1 `bfs`、置 PDB0 的
-translate-further 位，以及更高叶上的 `PDE_PTE` 位。**gfx12 是唯一
+gfx9 把 MTYPE 放在第 57–58 位，在 PDB1 表项上置 `bfs`、在 PDB0 表项上置
+translate-further 位，并用 `PDE_PTE` 标记 PDB1/PDB2 的叶（一个 2 MiB 的
+PDB0 叶恰恰是 translate-further 的*缺席*）。**gfx12 是唯一
 剩下的 `unimplemented!`**（常量已捕获，尚未经过硬件验证；
 有一个测试断言它 panic）。`MemoryManager` 运行三个 TLSF 子分配器
 （VA 空间、物理 VRAM、页表池），并以 `Inspect` / `Create` /
@@ -177,11 +180,11 @@ GMMU 和 GMC 都已在活动的 VF 上得到证实——而 KFD 仍是那个可�
 
 ## 为什么这很重要
 
-AM 驱动是对那个内核过载问题的真正答案，而
-[单队列模式](./queues-and-dispatch.md) 只是绕开了它。那些昂贵、
+AM 驱动是对那个固件卡死问题的真正答案，而把通道池夹紧
+（[`SVOD_AMD_HW_QUEUES=1`](./queues-and-dispatch.md)）只是绕开了它。那些昂贵、
 不需 GPU 的部分——GMMU、寄存器表、mailbox/RLCG 间接访问
 机制——已经在活动的 VF 上构建并验证，而页表、GMC 与
 所有权握手全都可工作。剩下的差距是一道硬件边界（PF 拥有的
-doorbell aperture），而非设计上的。而且因为它接在同样的五方法
-[接缝](./overview.md) 之后，当它落地时，调度、编译或图机制
-没有一样需要改动。
+doorbell aperture），而非设计上的。而且因为它接在同一道
+[接缝](./overview.md) 之后——五个必需方法加三个默认实现的钩子方法——
+当它落地时，调度、编译或图机制没有一样需要改动。

@@ -7,7 +7,8 @@ sidebar_label: Overview
 Svod runs on NVIDIA GPUs through the **CUDA driver API** (`libcuda.so.1`) and
 nothing else from the CUDA stack: no toolkit, no `nvcc`, no NVRTC, no
 `libcudart`. Kernels are rendered as NVPTX LLVM IR, lowered to PTX text by the
-host `clang`, and JIT-compiled to SASS by the driver at module load. The
+host `clang`, assembled to a cubin by `ptxas` when the CUDA toolkit is
+installed and JIT-compiled to SASS by the driver at module load otherwise. The
 design follows tinygrad's `ops_cuda.py`; the code lives in `device/src/cuda/`
 (driver, memory, programs, graphs), `runtime/src/cuda/` and
 `runtime/src/devices/cuda.rs` (compile and device factory), and
@@ -20,7 +21,7 @@ design follows tinygrad's `ops_cuda.py`; the code lives in `device/src/cuda/`
 | Requirement | Why |
 |---|---|
 | An NVIDIA driver exposing `libcuda.so.1` | Every driver call is resolved from it at runtime with `libloading` |
-| Driver **CUDA 12.0 (R525) or newer** | The CUDA-graph entry points are bound by their versioned names (`cuGraphAddKernelNode_v2`, `cuGraphExecKernelNodeSetParams_v2`), which date from 12.0. The PTX ISA pin follows the compute capability: **7.8** up to sm_88, **8.4** on sm_89 and sm_90 (their fp8 `mma.sync` shapes; CUDA 12.4 / R550), **8.6** on sm_100/sm_101 (CUDA 12.7), **8.7** on sm_120 (CUDA 12.8), **8.8** on sm_103, sm_121 and newer (CUDA 12.9) — a Blackwell part needs the driver of the ISA that introduced it |
+| Driver **CUDA 12.0 (R525) or newer** | The CUDA-graph entry points are bound by their versioned names (`cuGraphAddKernelNode_v2`, `cuGraphExecKernelNodeSetParams_v2`), which date from 12.0. The PTX ISA pin follows the compute capability: **7.8** up to sm_88, **8.4** on sm_89 and sm_90 (their fp8 `mma.sync` shapes; CUDA 12.4 / R550), **8.6** on sm_100 to sm_102 (CUDA 12.7), **8.7** on sm_120 (CUDA 12.8), **8.8** on sm_103, sm_121 and newer (CUDA 12.9) — a Blackwell part needs the driver of the ISA that introduced it |
 | `clang` built with the **NVPTX** target | `clang -x ir --target=nvptx64-nvidia-cuda` turns the rendered IR into PTX |
 
 Check them on a host:
@@ -33,8 +34,9 @@ clang --print-targets | grep nvptx64     # the NVPTX backend
 
 A clang without NVPTX yields a clean `JitCompilation` error naming the fix
 (`-DLLVM_TARGETS_TO_BUILD='X86;AArch64;NVPTX'`). No CUDA toolkit is needed to
-run; `ptxas` and `compute-sanitizer` are useful for
-[debugging](./debugging.md) only.
+run: a `ptxas` on the path is used to pre-assemble kernels when it happens to
+be there (`SVOD_CUDA_PTXAS=0` opts out) and `compute-sanitizer` is useful for
+[debugging](./debugging.md), but neither is required.
 
 ---
 
@@ -56,15 +58,17 @@ call sites type-check in every `cargo check`, so an API change in the generic
 
 ## Running on CUDA
 
-Select the GPU with `SVOD_DEVICE` (`CUDA:N`; `NV` and `GPU` are accepted
-aliases, `CUDA` alone means device 0):
+Select the GPU with `SVOD_DEVICE` (`CUDA:N`; `GPU` is an accepted alias,
+`CUDA` alone means device 0). `NV` is deliberately **not** accepted — the name
+stays reserved for a future userspace driver backend:
 
 ```bash
 SVOD_DEVICE=CUDA:0 cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav
 ```
 
 Opening a device logs one `info` line with its name, `sm_XY`, SM count,
-managed-memory support and driver version (`RUST_LOG=svod_device=info`).
+managed-memory support, driver version and whether scoped synchronization is
+on (`RUST_LOG=svod_device=info`).
 
 The compute capability is read from the driver at open and kept as an
 open-ended `CudaArch { major, minor }` (`sm_86`, `sm_120`, ...). It selects
@@ -76,7 +80,7 @@ open-ended `CudaArch { major, minor }` (`sm_86`, `sm_120`, ...). It selects
 | below `sm_75` | none |
 | `sm_75` | f16 `m16n8k8` |
 | `sm_80`+ | f16 and bf16 `m16n8k16`, f16 `m16n8k8`, int8 `m16n8k32` accumulating into i32; bf16 storage. tf32 stays opt-in (`cuda_sm80(true)`) |
-| `sm_89`+ | the sm_80 set plus fp8 `m16n8k32`, which the renderer cannot feed yet (see [Limitations](./limitations.md)) |
+| `sm_89`+ | the sm_80 set unchanged: the fp8 `m16n8k32` cores exist (`sm89_tensor_cores`) but `for_cuda_arch` withholds them while the renderer cannot lower fp8 casts (see [Limitations](./limitations.md)) |
 
 ---
 
@@ -87,13 +91,16 @@ flowchart LR
   A["UOp IR"] --> B["NVPTX LLVM IR"]
   B --> C["clang (nvptx64)"]
   C --> D["PTX text"]
-  D --> E["driver JIT (cuModuleLoadDataEx)"]
-  E -->|"cuLaunchKernel / cuGraphLaunch"| F["GPU"]
+  D -->|"ptxas, with the toolkit"| E["cubin"]
+  D -->|"driver JIT, without it"| F["cuModuleLoadDataEx"]
+  E --> F
+  F -->|"cuLaunchKernel / cuGraphLaunch"| G["GPU"]
 ```
 
-Compiled PTX is cached on disk by the shared object cache; the driver keeps
-its own SASS cache (`~/.nv/ComputeCache`), so a warm start skips both clang
-and `ptxas`.
+The compiled object is cached on disk by the shared object cache — a cubin
+when `ptxas` is installed, PTX text otherwise, and the two formats never share
+an entry. On the PTX path the driver keeps its own SASS cache
+(`~/.nv/ComputeCache`), so a warm start skips clang and usually the JIT too.
 
 ---
 

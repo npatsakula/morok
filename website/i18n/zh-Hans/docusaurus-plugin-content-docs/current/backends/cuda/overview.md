@@ -7,7 +7,8 @@ sidebar_label: 概览
 Svod 通过 **CUDA 驱动 API**（`libcuda.so.1`）在 NVIDIA GPU 上运行，
 除此之外不用 CUDA 栈中的任何东西：没有 toolkit，没有 `nvcc`，没有 NVRTC，
 也没有 `libcudart`。内核被渲染为 NVPTX LLVM IR，由宿主的 `clang` 降低为
-PTX 文本，并在模块加载时由驱动 JIT 编译为 SASS。该设计遵循 tinygrad 的
+PTX 文本；装了 CUDA toolkit 时由 `ptxas` 汇编成 cubin，否则在模块加载时由
+驱动 JIT 编译为 SASS。该设计遵循 tinygrad 的
 `ops_cuda.py`；代码位于 `device/src/cuda/`（驱动、内存、程序、图）、
 `runtime/src/cuda/` 与 `runtime/src/devices/cuda.rs`（编译与设备工厂），
 以及 `codegen/src/llvm/nvptx/`（渲染器）。
@@ -19,7 +20,7 @@ PTX 文本，并在模块加载时由驱动 JIT 编译为 SASS。该设计遵循
 | 要求 | 为什么 |
 |---|---|
 | 一个暴露 `libcuda.so.1` 的 NVIDIA 驱动 | 每一次驱动调用都在运行时用 `libloading` 从中解析出来 |
-| 驱动为 **CUDA 12.0（R525）或更新** | CUDA graph 的入口点按其版本化名称绑定（`cuGraphAddKernelNode_v2`、`cuGraphExecKernelNodeSetParams_v2`），它们始于 12.0。PTX ISA 的锁定随算力递增：sm_88 及更早为 **7.8**，sm_89 与 sm_90 为 **8.4**（为其 fp8 `mma.sync` 形状，需要 CUDA 12.4 / R550），sm_100/sm_101 为 **8.6**（CUDA 12.7），sm_120 为 **8.7**（CUDA 12.8），sm_103、sm_121 及更新为 **8.8**（CUDA 12.9）——一块 Blackwell 卡需要引入其 ISA 的那一版驱动 |
+| 驱动为 **CUDA 12.0（R525）或更新** | CUDA graph 的入口点按其版本化名称绑定（`cuGraphAddKernelNode_v2`、`cuGraphExecKernelNodeSetParams_v2`），它们始于 12.0。PTX ISA 的锁定随算力递增：sm_88 及更早为 **7.8**，sm_89 与 sm_90 为 **8.4**（为其 fp8 `mma.sync` 形状，需要 CUDA 12.4 / R550），sm_100 到 sm_102 为 **8.6**（CUDA 12.7），sm_120 为 **8.7**（CUDA 12.8），sm_103、sm_121 及更新为 **8.8**（CUDA 12.9）——一块 Blackwell 卡需要引入其 ISA 的那一版驱动 |
 | 带 **NVPTX** target 构建的 `clang` | `clang -x ir --target=nvptx64-nvidia-cuda` 把渲染出的 IR 变成 PTX |
 
 在宿主上检查它们：
@@ -32,7 +33,9 @@ clang --print-targets | grep nvptx64     # the NVPTX backend
 
 一个不带 NVPTX 的 clang 会给出一个干净的 `JitCompilation` 错误，其中点名了
 修复方式（`-DLLVM_TARGETS_TO_BUILD='X86;AArch64;NVPTX'`）。运行时不需要 CUDA
-toolkit；`ptxas` 与 `compute-sanitizer` 只在[调试](./debugging.md)时有用。
+toolkit：路径上碰巧有 `ptxas` 时会拿它来预汇编内核（`SVOD_CUDA_PTXAS=0` 可以
+不用它），而 `compute-sanitizer` 对[调试](./debugging.md)很有用，但两者都不是
+必需的。
 
 ---
 
@@ -53,15 +56,16 @@ toolkit；`ptxas` 与 `compute-sanitizer` 只在[调试](./debugging.md)时有�
 
 ## 在 CUDA 上运行
 
-用 `SVOD_DEVICE` 选择 GPU（`CUDA:N`；`NV` 与 `GPU` 是被接受的别名，单独的
-`CUDA` 表示设备 0）：
+用 `SVOD_DEVICE` 选择 GPU（`CUDA:N`；`GPU` 是被接受的别名，单独的 `CUDA`
+表示设备 0）。`NV` 被刻意**不**接受——这个名字留给未来的用户态驱动后端：
 
 ```bash
 SVOD_DEVICE=CUDA:0 cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav
 ```
 
 打开一个设备会记录一行 `info`，其中带有它的名称、`sm_XY`、SM 数量、
-托管内存支持以及驱动版本（`RUST_LOG=svod_device=info`）。
+托管内存支持、驱动版本，以及带作用域的同步是否开启
+（`RUST_LOG=svod_device=info`）。
 
 计算能力在打开时从驱动读取，并保存为一个开放式的
 `CudaArch { major, minor }`（`sm_86`、`sm_120`……）。它选择 `clang -march`、
@@ -73,7 +77,7 @@ SVOD_DEVICE=CUDA:0 cargo run --release -p svod-model --example gigaam_infer -- .
 | 低于 `sm_75` | 无 |
 | `sm_75` | f16 `m16n8k8` |
 | `sm_80`+ | f16 与 bf16 `m16n8k16`、f16 `m16n8k8`、累加到 i32 的 int8 `m16n8k32`；bf16 存储。tf32 保持为选择启用（`cuda_sm80(true)`） |
-| `sm_89`+ | sm_80 的那一组，外加 fp8 `m16n8k32`，而渲染器尚无法喂给它（见[限制](./limitations.md)） |
+| `sm_89`+ | 原封不动的 sm_80 那一组：fp8 `m16n8k32` 的核心是存在的（`sm89_tensor_cores`），但只要渲染器还降不了 fp8 的 cast，`for_cuda_arch` 就扣着不给（见[限制](./limitations.md)） |
 
 ---
 
@@ -84,12 +88,16 @@ flowchart LR
   A["UOp IR"] --> B["NVPTX LLVM IR"]
   B --> C["clang (nvptx64)"]
   C --> D["PTX text"]
-  D --> E["driver JIT (cuModuleLoadDataEx)"]
-  E -->|"cuLaunchKernel / cuGraphLaunch"| F["GPU"]
+  D -->|"ptxas, with the toolkit"| E["cubin"]
+  D -->|"driver JIT, without it"| F["cuModuleLoadDataEx"]
+  E --> F
+  F -->|"cuLaunchKernel / cuGraphLaunch"| G["GPU"]
 ```
 
-编译出的 PTX 由共享的对象缓存缓存在磁盘上；驱动保有它自己的 SASS 缓存
-（`~/.nv/ComputeCache`），因此一次热启动会同时跳过 clang 与 `ptxas`。
+编译出的对象由共享的对象缓存缓存在磁盘上——装了 `ptxas` 时是一个 cubin，
+否则是 PTX 文本，而这两种格式绝不会共用同一条缓存项。走 PTX 这条路时，驱动
+保有它自己的 SASS 缓存（`~/.nv/ComputeCache`），因此一次热启动会跳过 clang，
+通常连 JIT 也一并跳过。
 
 ---
 

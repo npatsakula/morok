@@ -41,13 +41,18 @@ It is maintained at the two ends of an allocation's life:
 
 ### Tags
 
-Each allocation is tagged with its purpose (`AllocTag`), derived at the
-`alloc_raw` call sites:
+Each allocation is tagged with its purpose (`AllocTag`). `Vram` and `Gtt` are
+the defaults derived from the `AllocKind`; the finer tags are passed explicitly
+by the `alloc_*_tagged` call sites:
 
 | Tag | Covers |
 |---|---|
-| `Vram` | General device VRAM — tensor data, code, kernargs, EOP/ctx-save |
-| `Gtt` | GTT-pinned host-visible control memory — the queue ring, GART, signal slots |
+| `Vram` | General device VRAM — tensor data, code objects, EOP/ctx-save |
+| `Gtt` | GTT-pinned host-visible control memory |
+| `Kernarg` | Kernarg arenas — the per-dispatch, graph, and linked-plan argument pages |
+| `SignalPool` | The GTT signal-slot pool |
+| `QueueRing` / `QueueGart` / `QueueInactive` | A queue's ring, GART page, and queue-inactive signal |
+| `Staging` | The GTT SDMA bounce buffer |
 | `Scratch` | Register-spill scratch — GPU-only VRAM, realloc'd per kernel |
 
 The distinction that matters is **scratch vs everything else**: scratch is the
@@ -87,8 +92,8 @@ Unmapped: va is in NO tracked allocation; nearest live below: VRAM buffer
 ## How a fault is reported
 
 In `KfdIface::wait_events` (`device/src/amd/iface.rs`), when the memory-fault
-event has fired (`gpu_id != 0`), the fields are copied out of the
-`#[repr(packed)]` struct, the VA is classified, and an enriched message is built:
+event has fired (`gpu_id != 0`), the fields are copied out of the bindgen union
+payload into locals, the VA is classified, and an enriched message is built:
 
 ```text
 AMD GPU memory fault on gpu_id=… va=0x… (NotPresent=1 ReadOnly=0 NoExecute=0
@@ -98,10 +103,12 @@ Imprecise=0 ErrorType=…) — va is at offset +0x40 within a LIVE scratch …
 It is logged **once** via a `fault_logged: AtomicBool` latch and a
 `tracing::error!`. The one-shot matters: the memory-fault event is not
 auto-reset, so subsequent poll-fault calls (`wait_events(0)`) re-observe the same
-fault — logging every time would spam. The message is then returned as an
-`Error::Runtime` and surfaced to the caller. (A hardware-exception event,
-slot `[2]`, reports `reset_type`/`reset_cause`/`memory_lost` instead — those have
-no faulting VA to classify.)
+fault — logging every time would spam. It is then returned as a typed
+`Error::GpuFault`, whose `Display` is the string above; the poison latch
+re-throws the same text as an `Error::Runtime` at every later entry point.
+(A hardware-exception event, slot `[2]`, reports
+`reset_type`/`reset_cause`/`memory_lost` instead — those have no faulting VA to
+classify.)
 
 ---
 
@@ -115,29 +122,28 @@ dispatch and synchronize entry point:
 - `poison(msg)` records the message once and sets the flag;
 - `is_poisoned()` is the hot-path gate;
 - `poison_error()` returns the recorded `Error::Runtime` if poisoned;
-- `poll_faults_nonblocking()` issues `wait_events(0)` and is called from a
-  stalled signal wait (to attach the real error to a 30 s timeout) and from the
-  `WAIT_EVENTS` escalation path (to break out of polling early on a fault).
+- `poll_faults_nonblocking()` issues `wait_events(0)` from a stalled signal
+  wait, so the real error is attached to the 30 s timeout rather than a bare
+  deadline. (The spin-escalation path also breaks out early on a fault, but
+  through a short *blocking* `wait_events` instead of this poll.)
 
-Once poisoned, every `synchronize`/`execute` against any connector on the device
+Once poisoned, every `synchronize`/`execute` against any lane on the device
 fails fast — the GPU state and cached mappings are no longer trustworthy.
 
 ---
 
 ## Dispatch instrumentation: `SVOD_DEBUG_DISPATCH`
 
-Setting `SVOD_DEBUG_DISPATCH` (to anything) turns on `eprintln` dumps at three
-points:
+Setting `SVOD_DEBUG_DISPATCH` (to anything) turns on `eprintln` dumps at two
+points, both in `device/src/amd/program.rs`:
 
-- **`[program-load]`** (`program.rs`) — per program: kernarg/private/group
-  sizes, `kernel_code_properties` (decoded bit-by-bit), user-SGPR count,
-  `wave32`, and the raw `rsrc1/2/3`. It flags `kernel_code_properties` bits that
-  the loader does *not* populate (which would make the kernel read garbage
-  pointers and fault).
-- **`[dispatch tv=…]`** (`program.rs`) — per dispatch: kernel name, `grid`,
-  `local`, `is_pm4`, the kernarg GPU VA, the scratch VA, and each buffer's VA.
-- **`[graph capture]`** (`graph.rs`) — per captured graph: kernel count, the
-  kernargs page VA, the kick/self signal VAs, and the scratch VA.
+- **`[program-load]`** — per program: kernarg/private/group sizes,
+  `kernel_code_properties` (decoded bit-by-bit), user-SGPR count, `wave32`, and
+  the raw `rsrc1/2/3`. It flags `kernel_code_properties` bits that the loader
+  does *not* populate (which would make the kernel read garbage pointers and
+  fault).
+- **`[dispatch tv=…]`** — per dispatch: kernel name, `grid`, `local`, `is_pm4`,
+  the kernarg GPU VA, the scratch VA, and each buffer's VA.
 
 This is the fastest way to see exactly which VAs a faulting dispatch touched, to
 cross-reference against the registry's classification.
@@ -161,7 +167,7 @@ SVOD_DEVICE=AMD:0 \
   cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav
 ```
 
-:::tip The pipeline debugger
+:::tip[The pipeline debugger]
 For *compiler*-side issues (IR extraction, LLVM IR, UOp trees) rather than the
 driver, the project ships a `/svod-debug` skill documenting the frontend →
 codegen tracing targets (`SVOD_DUMP_LLVM_IR`, `SVOD_DUMP_AMD_IR`, per-stage

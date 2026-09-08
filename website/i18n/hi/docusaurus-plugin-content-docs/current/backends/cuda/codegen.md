@@ -18,13 +18,14 @@ verify किया गया था।
 
 ```llvm
 ; ModuleID = 'r_64_32'
+source_filename = "r_64_32"
 target datalayout = "e-p6:32:32-i64:64-i128:128-i256:256-v16:16-v32:32-n16:32:64"
 target triple = "nvptx64-nvidia-cuda"
 
 declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
 declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
 
-define ptx_kernel void @r_64_32(ptr addrspace(1) %data0, ptr addrspace(1) %data1) #0 {
+define ptx_kernel void @r_64_32(ptr noalias align 32 %data0, ptr noalias align 32 %data1) #0 {
 entry:
   ...
   ret void
@@ -51,7 +52,7 @@ attributes #0 = { nounwind "no-builtins" "no-trapping-math"="true" "nvvm.maxntid
 | kernel ABI | `amdgpu_kernel`, `.kd` descriptor | `ptx_kernel` |
 | work ids | `llvm.amdgcn.workgroup.id.*` / `workitem.id.*` | `llvm.nvvm.read.ptx.sreg.ctaid.{x,y,z}` / `tid.{x,y,z}` |
 | barrier | `fence syncscope("workgroup")` + `s.barrier` | `fence syncscope("block") release; llvm.nvvm.barrier0; fence syncscope("block") acquire` (`bar.sync 0`) |
-| address spaces | global 1, LDS 3, private 5 | global 1, shared 3; REG buffers एक सादे generic `alloca` ही रहते हैं |
+| address spaces | global 1, LDS 3, private 5 | `cp.async` / `ldmatrix` casts में shared 3, global 1; kernel parameters generic pointers हैं और REG buffers एक सादे `alloca` ही रहते हैं |
 | shared memory | `addrspace(3)` module globals | वही |
 | launch bound | `"amdgpu-flat-work-group-size"` | `"nvvm.maxntid"` |
 
@@ -79,7 +80,8 @@ emit करता है जो केवल `ptxas` के अंदर fail �
 है, और scheduler उन्हें `nvptx_decomposition_patterns()` से decompose करता है: AMD वाला set
 (native `exp2`/`log2` के ऊपर polynomial `exp`/`log`/trig, integer-domain bf16 rounding) साथ
 में f64 `Exp2`/`Log2` expansions, क्योंकि NVPTX `@llvm.exp2` को केवल f16/f32 के लिए lower
-करता है।
+करता है। `Max`, `Pow` और `Threefry` हर GPU renderer के लिए हटाए जाते हैं, किसी NVPTX-विशिष्ट
+निर्णय के रूप में नहीं: वे एक select में और एक सादे XOR में decompose हो जाते हैं।
 
 जो native रहता है: `@llvm.exp2.f32` `ex2.approx.f32` select करता है, `@llvm.sqrt` `sqrt.rn`
 select करता है, `fma`/`floor`/`rint`/`maxnum` सीधे lower होते हैं।
@@ -133,11 +135,13 @@ butterfly step), `shfl_idx`, `shfl_up` और `shfl_down` — तथा `globalt
 (`llvm.nvvm.read.ptx.sreg.globaltimer`, nanosecond GPU clock)।
 
 Shared-memory builders (`codegen/src/llvm/nvptx/smem.rs`) वही हैं जो एक tile kernel को `.shared`
-से होकर stage करने देते हैं, ठीक जैसे AMD पर: `ldmatrix` (sm_75+) एक matrix fragment को सीधे उसी
+से होकर stage करने देते हैं, ठीक जैसे AMD पर: `ldmatrix` (sm_75+) एक matrix fragment को उसी
 register layout में load करता है जिसकी `mma.sync` अपेक्षा करता है, और `cp_async` / `cp_async_16`
 (sm_80+) global → shared copy को registers से बचाकर करते हैं, जिन्हें `cp_async_commit`,
-`cp_async_wait` और `cp_async_wait_all` से commit और await किया जाता है। `CpAsyncCache` हर module
-के लिए एक ही declaration रखता है।
+`cp_async_wait` और `cp_async_wait_all` से commit और await किया जाता है। `CpAsyncCache` उसी copy
+की cache policy है — `.cg` (केवल L2, 16 bytes) या `.ca` (L1 और L2, 4, 8 या 16)। हर builder अपना
+`declare` ख़ुद साथ लाता है; `dedup_declares` प्रति function name पहला वाला रखता है, इसलिए
+`cp.async` से भरा एक kernel उस intrinsic को एक ही बार declare करता है।
 
 ---
 
@@ -147,12 +151,12 @@ register layout में load करता है जिसकी `mma.sync` �
 है, stdin से stdout तक, ठीक वैसे ही जैसे AMD और CPU paths करते हैं:
 
 ```text
-clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 -Wno-override-module - -o -
+clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx78 -Wno-override-module - -o -
 ```
 
-एक cached `has_nvptx_target()` probe (`clang --print-targets`) NVPTX के बिना एक clang को एक
-साफ़ `JitCompilation` error में बदल देता है। `SVOD_DUMP_NVPTX_IR=<dir>` हर kernel की `.ll`
-वहाँ लिख देता है।
+एक cached `clang --print-targets` probe NVPTX के बिना एक clang को एक साफ़ `JitCompilation`
+error में बदल देता है। `SVOD_DUMP_NVPTX_IR=<dir>` हर kernel का IR वहाँ
+`sm_XY_<module>.ll` के रूप में लिख देता है।
 
 कोई भी PTX driver तक पहुँचे उससे पहले, चाहे ताज़ा हो या object cache से, `validate_ptx`
 जाँचता है कि उसमें एक `.version` है, device के `sm_XY` के बराबर एक `.target` है, एक
@@ -161,10 +165,15 @@ clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 -Wno-override-modul
 रूप में emit कर देता है, और वह अन्यथा केवल एक `cuModuleLoadDataEx` failure के रूप में सामने
 आता।
 
+जब `ptxas` installed हो तो PTX की जाँच यहीं, compile time पर होती है — इसमें ABI के विरुद्ध
+उसकी `.param` list भी शामिल है, जिसे एक cubin अब साथ नहीं रखता — और cache में assemble किया
+गया cubin ही जाता है; तब एक hit इसके बजाय `validate_cubin` से होकर गुज़रता है (एक
+little-endian ELF64, `EM_CUDA` के लिए, जो entry को code के रूप में define करता है)।
+
 PTX ISA version arch के अनुसार pin है, clang पर नहीं छोड़ा जाता, जिसका default उस CUDA
 toolkit पर निर्भर है जो उसे मिलता है (CUDA 13 के साथ clang 22: `.version 8.8`, जिसे एक
-CUDA 12.9 driver चाहिए; बिना toolkit: किसी भी tensor core के लिए बहुत पुराना version)। यह
-pin compute capability में monotone है: sm_88 तक `+ptx78`, sm_89 और sm_90 पर `+ptx84`
-(जिनके fp8 `mma.sync` shapes 8.4 से मौजूद हैं), sm_100/sm_101 पर `+ptx86`, sm_120 पर
-`+ptx87`, और sm_103, sm_121 तथा उससे नए पर `+ptx88`। इससे पुराना clang मना कर देता है:
+CUDA 12.9 driver चाहिए; बिना toolkit: किसी भी tensor core के लिए बहुत पुराना version)।
+`ptx_isa` compute capability में monotone है: sm_88 तक `+ptx78`, sm_89 से लेकर हर 9.x तक
+`+ptx84` (fp8 `mma.sync` shapes 8.4 से मौजूद हैं), sm_100 से sm_102 पर `+ptx86`, sm_120 पर
+`+ptx87`, और sm_103, sm_121 तथा उससे नए पर `+ptx88`। Clang इससे पुराने को मना कर देता है:
 `PTX version 8.4 does not support target 'sm_120'. Minimum required PTX version is 8.7`।

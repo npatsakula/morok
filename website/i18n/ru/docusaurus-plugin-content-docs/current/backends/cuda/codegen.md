@@ -18,13 +18,14 @@ AMD-эмиттер, `codegen/src/llvm/nvptx/` надстраивается на�
 
 ```llvm
 ; ModuleID = 'r_64_32'
+source_filename = "r_64_32"
 target datalayout = "e-p6:32:32-i64:64-i128:128-i256:256-v16:16-v32:32-n16:32:64"
 target triple = "nvptx64-nvidia-cuda"
 
 declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
 declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
 
-define ptx_kernel void @r_64_32(ptr addrspace(1) %data0, ptr addrspace(1) %data1) #0 {
+define ptx_kernel void @r_64_32(ptr noalias align 32 %data0, ptr noalias align 32 %data1) #0 {
 entry:
   ...
   ret void
@@ -53,7 +54,7 @@ attributes #0 = { nounwind "no-builtins" "no-trapping-math"="true" "nvvm.maxntid
 | ABI ядра | `amdgpu_kernel`, дескриптор `.kd` | `ptx_kernel` |
 | идентификаторы работы | `llvm.amdgcn.workgroup.id.*` / `workitem.id.*` | `llvm.nvvm.read.ptx.sreg.ctaid.{x,y,z}` / `tid.{x,y,z}` |
 | барьер | `fence syncscope("workgroup")` + `s.barrier` | `fence syncscope("block") release; llvm.nvvm.barrier0; fence syncscope("block") acquire` (`bar.sync 0`) |
-| адресные пространства | global 1, LDS 3, private 5 | global 1, shared 3; REG-буферы остаются обычной generic-`alloca` |
+| адресные пространства | global 1, LDS 3, private 5 | shared 3, global 1 в кастах `cp.async` / `ldmatrix`; параметры ядра — generic-указатели, а REG-буферы остаются обычной `alloca` |
 | разделяемая память | глобалы модуля в `addrspace(3)` | то же |
 | launch bound | `"amdgpu-flat-work-group-size"` | `"nvvm.maxntid"` |
 
@@ -82,7 +83,8 @@ NVPTX опускает `fdiv ... arcp afn` в `rcp.approx.f32`, тогда ка�
 `nvptx_decomposition_patterns()`: набор AMD (полиномиальные `exp`/`log`/триг
 поверх нативных `exp2`/`log2`, округление bf16 в целочисленной области) плюс
 раскрытия f64 `Exp2`/`Log2`, поскольку NVPTX опускает `@llvm.exp2` только для
-f16/f32.
+f16/f32. `Max`, `Pow` и `Threefry` убраны у каждого GPU-рендерера, а не по
+выбору NVPTX: они декомпозируются в select и в голый XOR.
 
 Что остаётся нативным: `@llvm.exp2.f32` выбирает `ex2.approx.f32`, `@llvm.sqrt`
 выбирает `sqrt.rn`, `fma`/`floor`/`rint`/`maxnum` опускаются напрямую.
@@ -145,8 +147,11 @@ WMMA. Соответствующие строки `declare` синтезирую
 `ldmatrix` (sm_75+) загружает фрагмент матрицы сразу в регистровой раскладке,
 которую ждёт `mma.sync`, а `cp_async` / `cp_async_16` (sm_80+) копируют
 global → shared, минуя регистры; фиксация и ожидание — через
-`cp_async_commit`, `cp_async_wait` и `cp_async_wait_all`. `CpAsyncCache`
-держит по одному объявлению на модуль.
+`cp_async_commit`, `cp_async_wait` и `cp_async_wait_all`. `CpAsyncCache` — это
+политика кэша этого копирования: `.cg` (только L2, 16 байт) или `.ca` (L1 и L2,
+4, 8 или 16). Каждый билдер несёт собственный `declare`; `dedup_declares`
+оставляет первый на каждое имя функции, так что ядро, полное `cp.async`,
+объявляет интринсик один раз.
 
 ---
 
@@ -156,12 +161,12 @@ global → shared, минуя регистры; фиксация и ожидан
 clang, со stdin на stdout, ровно так же, как пути AMD и CPU:
 
 ```text
-clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 -Wno-override-module - -o -
+clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx78 -Wno-override-module - -o -
 ```
 
-Кэшированная проверка `has_nvptx_target()` (`clang --print-targets`) превращает
-clang без NVPTX в аккуратную ошибку `JitCompilation`.
-`SVOD_DUMP_NVPTX_IR=<dir>` записывает туда `.ll` каждого ядра.
+Кэшированная проверка `clang --print-targets` превращает clang без NVPTX в
+аккуратную ошибку `JitCompilation`. `SVOD_DUMP_NVPTX_IR=<dir>` записывает туда
+IR каждого ядра как `sm_XY_<module>.ll`.
 
 Прежде чем любой PTX дойдёт до драйвера — свежий или из кэша объектов —
 `validate_ptx` проверяет, что в нём есть `.version`, `.target`, равный `sm_XY`
@@ -170,11 +175,17 @@ clang без NVPTX в аккуратную ошибку `JitCompilation`.
 выдаёт её как внешний вызов, и иначе она всплыла бы лишь как сбой
 `cuModuleLoadDataEx`.
 
+Когда `ptxas` установлен, PTX проверяется здесь же, на этапе компиляции, —
+включая его список `.param` относительно ABI, которого cubin уже не несёт, — и в
+кэш попадает именно собранный cubin; тогда попадание проходит через
+`validate_cubin` (little-endian ELF64 для `EM_CUDA`, определяющий точку входа
+как код).
+
 Версия PTX ISA фиксируется по архитектуре, а не оставляется clang, чей вариант
 по умолчанию зависит от найденного CUDA toolkit (clang 22 с CUDA 13:
 `.version 8.8`, для которого нужен драйвер CUDA 12.9; без toolkit — версия,
-слишком старая для любых тензорных ядер). Фиксация монотонна по вычислительной
-способности: `+ptx78` вплоть до sm_88, `+ptx84` на sm_89 и sm_90 (их fp8-формы
-`mma.sync` появились в 8.4), `+ptx86` на sm_100/sm_101, `+ptx87` на sm_120,
-`+ptx88` на sm_103, sm_121 и новее. Более старую clang отвергает: `PTX version
-8.4 does not support target 'sm_120'. Minimum required PTX version is 8.7`.
+слишком старая для любых тензорных ядер). `ptx_isa` монотонна по вычислительной
+способности: `+ptx78` вплоть до sm_88, `+ptx84` от sm_89 и по всем 9.x
+(fp8-формы `mma.sync` существуют с 8.4), `+ptx86` на sm_100 — sm_102, `+ptx87`
+на sm_120, `+ptx88` на sm_103, sm_121 и новее. Более старую clang отвергает:
+`PTX version 8.4 does not support target 'sm_120'. Minimum required PTX version is 8.7`.

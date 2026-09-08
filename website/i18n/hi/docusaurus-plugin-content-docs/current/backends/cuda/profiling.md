@@ -72,13 +72,22 @@ driver की गिनती में registers, shared memory और per-SM b
 
 ## Tier 4: hardware counters
 
-Counters CUPTI के range profiler से आते हैं, जो runtime पर `libcupti.so.13` से
-bind होता है (`device/src/cuda/cupti.rs`)। CUDA 13 ने PerfWorks का host API
+Counters CUPTI के range profiler से आते हैं, जो runtime पर एक ही soname,
+`libcupti.so.13`, से bind होता है — पहले loader path पर और फिर `/opt/cuda/lib64`,
+`/usr/local/cuda/extras/CUPTI/lib64` तथा `$CUDA_PATH/{lib64,extras/CUPTI/lib64}`
+में खोजा जाता है (`device/src/cuda/cupti.rs`)। CUDA 13 ने PerfWorks का host API
 CUPTI में ही समेट दिया, इसलिए पूरी sequence यही एक library उठाती है — और
-`libnvperf_host.so` को CUPTI खुद `dlopen` करता है, तो वह loader को मिलनी चाहिए।
-यह binding उतना ही optional है जितना `ptxas`: library न हो, काम की न हो, या
-`SVOD_CUDA_CUPTI=0` से बंद कर दी गई हो, तो `pmc_available()` `false` रहता है और
-profiler अपनी एक-line नोट के साथ Tiers 1-3 पर घट जाता है।
+`libnvperf_host.so` को CUPTI खुद `dlopen` करता है, तो वह loader को मिलनी चाहिए;
+न मिलने पर यह `CUPTI_ERROR_NOT_INITIALIZED` की तरह दिखता है। यह binding उतना ही
+optional है जितना `ptxas`: library न हो, काम की न हो, या `SVOD_CUDA_CUPTI=0` से बंद
+कर दी गई हो, तो `pmc_available()` `false` रहता है और profiler अपनी एक-line नोट के
+साथ Tiers 1-3 पर घट जाता है।
+
+CUDA 13.3 में params वाले दो structs बड़े हो गए, इसलिए हर call पहले सबसे नया
+`struct_size` भेजती है और `CUPTI_ERROR_INVALID_PARAMETER` पर एक size पीछे हट जाती है —
+`cuptiProfilerGetCounterAvailability` (41, फिर 40) और `cuptiProfilerHostInitialize`
+(56, फिर 48) — और `abi_ladder` याद रखता है कि installed CUPTI ने कौन-सा size स्वीकार
+किया।
 
 `SVOD_PMC=1` इस backend का default set चुनता है:
 
@@ -92,9 +101,17 @@ profiler अपनी एक-line नोट के साथ Tiers 1-3 पर �
 
 Subset tokens से चुनें — `SVOD_PMC=tensor,dram`। Tokens सभी backends में unique
 हैं, इसलिए CUDA पर AMD का token गिरा दिया जाता है, किसी दूसरे block को गलत
-program नहीं करता। `cycles` के सापेक्ष `tensor` किसी matmul या flash-attention
-kernel का tensor-core utilization है; और `dram` bandwidth-bound kernel को
-issue-bound से अलग कर देता है।
+program नहीं करता; `set_pmc` बताता है कि उसने कितने रखे और executor यह stderr पर
+कह देता है:
+
+```text
+SVOD_PMC: 2 of 5 requested counters are not collected on this backend
+```
+
+जिस list के सारे tokens अनजान हों वह default set पर वापस आ जाती है, और ऐसा चयन
+जिसमें से कुछ भी न बचे एक सामान्य, बिना-arm किए timing run के बराबर है। `cycles`
+के सापेक्ष `tensor` किसी matmul या flash-attention kernel का tensor-core
+utilization है; और `dram` bandwidth-bound kernel को issue-bound से अलग कर देता है।
 
 ```bash
 SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo bench -p svod-tk --bench matmul -- --profile-time 5
@@ -115,18 +132,22 @@ echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' \
 # अपने distro के हिसाब से initramfs दोबारा बनाएँ, फिर reboot करें
 ```
 
-`scripts/cupti_probe.cu` पूरी sequence अलग से चलाकर बताता है कि वह कहाँ रुकती है —
-privilege की दिक्कत को toolkit की दिक्कत से अलग करने का यह सबसे तेज़ तरीका है।
+`scripts/cupti_probe.cu` पूरी sequence एक saxpy kernel के विरुद्ध अलग से चलाकर
+बताता है कि वह कहाँ रुकती है — privilege की दिक्कत को toolkit की दिक्कत से अलग
+करने का यह सबसे तेज़ तरीका है; उसे `sudo` के नीचे चलाना बिना reboot किए इस
+निदान की पुष्टि कर देता है।
 
 ### Collection की क़ीमत
 
 Capture `CUPTI_AutoRange` में `CUPTI_KernelReplay` के साथ चलता है: CUPTI हर launch
 पर एक range खोलता है और multi-pass config पूरा करने के लिए kernel को अंदर ही
-replay करता है (ऊपर के पाँचों counters एक ही pass में schedule हो जाते हैं)। दो
-नतीजे आपके लिए पहले ही सँभाल लिए गए हैं:
+replay करता है (ऊपर के पाँचों counters हर उस chip पर एक ही pass में schedule हुए
+हैं जिस पर हमने चलाया है; जिस set को इससे ज़्यादा चाहिए वह `Stop` पर पकड़ा जाता है
+और timing पर घट जाता है)। दो नतीजे आपके लिए पहले ही सँभाल लिए गए हैं:
 
 - Capture किया गया CUDA graph एक अपारदर्शी submission की तरह replay होता है और
-  कोई counter नहीं देता, इसलिए counters वाला run per-dispatch रास्ता लेता है।
+  उसके handles कभी counters नहीं ले जाते, इसलिए counters वाला run per-dispatch
+  रास्ता लेता है।
 - Kernel replay उसी dispatch की event pair को कई गुना बढ़ा देता है, इसलिए counters
   वाला run एक disarmed pass और जोड़ता है; `merge_min` उसकी timing को counted pass
   के counters के साथ रखता है। यानी एक ही table में timing और counters अलग-अलग

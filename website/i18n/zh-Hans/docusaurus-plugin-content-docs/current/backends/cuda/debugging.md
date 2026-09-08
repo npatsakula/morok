@@ -14,12 +14,17 @@ sidebar_label: 调试
 
 | 变量 | 默认 | 效果 |
 |---|---|---|
-| `SVOD_DEVICE` | `CPU` | `CUDA:N`（别名 `NV`、`GPU`）选择默认的张量设备 |
+| `SVOD_DEVICE` | `CPU` | `CUDA:N`（别名 `GPU`）选择默认的张量设备；`NV` *不是*别名，它留给未来的用户态驱动 |
 | `SVOD_DUMP_NVPTX_IR` | 未设置 | 接收每个内核 NVPTX LLVM IR 的目录，文件名为 `sm_XY_<kernel>.ll` |
-| `SVOD_OBJECT_CACHE` | 开 | `0` 关闭磁盘上的 PTX 缓存 |
+| `SVOD_CUDA_PTXAS` | 开 | `0` 跳过 `ptxas` 的预汇编，把 PTX 文本交给驱动 JIT |
+| `SVOD_CUDA_SCOPED_SYNC` | 开 | `0` 把每一次带作用域的等待换成一次完整的 `cuCtxSynchronize`，并让复制变为同步（[架构](./architecture.md)） |
+| `SVOD_CUDA_CUPTI` | 开 | `0` 跳过加载 `libcupti.so.13`，于是没有硬件计数器 |
+| `SVOD_PMC` | 未设置 | `1` 表示该后端的默认计数器集合，也可以是一个逗号分隔的令牌列表，见[剖析](./profiling.md) |
+| `SVOD_OBJECT_CACHE` | 开 | `0` 关闭编译产物在磁盘上的缓存 |
 | `SVOD_OBJECT_CACHE_DIR` | `$XDG_CACHE_HOME` / `~/.cache` | 迁移缓存位置 |
+| `CUDA_PATH` | 未设置 | 查找 `ptxas`（`$CUDA_PATH/bin`）与 CUPTI（`$CUDA_PATH/lib64`）时最后搜索的地方 |
 | `SVOD_PROFILE_ITERS`、`SVOD_ORIGIN`、`SVOD_ORIGIN_DEPTH` | | profiler 旋钮，见[剖析](./profiling.md) |
-| `RUST_LOG` | 未设置 | `svod_device=debug` 显示设备打开行、PTX JIT 信息日志、图捕获与重放回退；`svod_runtime=debug` 显示每一次 clang 调用 |
+| `RUST_LOG` | 未设置 | `svod_device=info` 带上设备打开那一行；`svod_device=debug` 再加上 JIT 信息日志、图捕获与重放回退；`svod_runtime=debug` 记录每个内核的 clang 调用 |
 
 没有 CUDA 专属的调度转储；驱动 JIT 日志与 `tracing` 覆盖了
 `SVOD_DEBUG_DISPATCH` 在 AMD 上所做的事。
@@ -54,7 +59,9 @@ ptxas application ptx input, line 27; error   : ...
 
 `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` 意味着驱动比模块中的 PTX ISA 更老
 （锁定随算力递增：sm_88 及更早为 7.8，sm_89 与 sm_90 为 8.4，Blackwell 上为 8.6 到 8.8），见[要求](./overview.md)。信息日志
-（警告、寄存器溢出）以 `debug` 级别记录在 `svod_device` 之下。
+（警告、寄存器溢出）以 `debug` 级别记录在 `svod_device` 之下。当 `ptxas` 已经把
+内核预汇编过时，就根本没有驱动 JIT，同样的诊断改由 `ptxas` 自己给出，表现为
+一次失败编译的消息。
 
 有两个错误来自 Svod 自己的校验器，在驱动看到任何东西之前：
 
@@ -68,19 +75,23 @@ cached PTX targets sm_80, not sm_86                          # a corrupt or fore
 它会变成一次外部调用。修复之处在 `codegen/src/llvm/nvptx/`，或者
 `codegen/src/llvm/text/mod.rs` 中的 intrinsic 声明表。
 
+一条 cubin 缓存项则改由 `validate_cubin` 检查（一个面向 `EM_CUDA` 的小端
+ELF64，且把入口定义为代码），而它的 `.param` 列表是在汇编之前就在 PTX 文本上
+对着 ABI 检查过的，因为 cubin 并不携带这份信息。
+
 ---
 
 ## 用 toolkit 做离线检查
 
-运行时没有任何东西需要 CUDA toolkit，但如果它已安装，它的工具可以作用于
-转储出来的 IR：
+运行时没有任何东西*需要* CUDA toolkit——`ptxas` 只是在碰巧装好时被用来预汇编
+内核——而如果它在，它的工具也可以作用于转储出来的 IR：
 
 ```bash
 SVOD_DUMP_NVPTX_IR=/tmp/nvptx SVOD_DEVICE=CUDA:0 cargo test -p svod-tensor -- some_test
 
 # Reproduce the exact compile, then assemble with ptxas to see the real diagnostics
-clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 -Wno-override-module \
-      /tmp/nvptx/sm_86_r_64_32.ll -o r_64_32.ptx
+clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx78 \
+      -Wno-override-module /tmp/nvptx/sm_86_r_64_32.ll -o r_64_32.ptx
 ptxas -arch=sm_86 -v r_64_32.ptx -o r_64_32.cubin   # -v prints registers, shared, spills
 nvdisasm r_64_32.cubin | less                         # the SASS
 ```
@@ -126,7 +137,7 @@ with re-aliased buffers; using the capture-order chain`；而
 `SVOD_DEVICE=CUDA:0 cargo test -p svod-tensor` 会运行 `codegen_tests!` 的
 `cuda` 变体，也就是 CPU 后端所通过的那套张量级断言，一次一个内核。
 
-:::tip 流水线调试器
+:::tip[流水线调试器]
 对于编译器侧的问题（哪些 UOp 产生了哪些 IR），`/svod-debug` skill 记录了
 前端 → codegen 的追踪目标；`SVOD_DUMP_NVPTX_IR` 是那一家族中 CUDA 的成员，
 与 `SVOD_DUMP_AMD_IR` 和 `SVOD_DUMP_LLVM_IR` 并列。

@@ -71,12 +71,21 @@ BEAM 所用的 `Program::execute_timed` 是调度流上的同一对 event，以
 
 ## 第 4 层：硬件计数器
 
-计数器来自 CUPTI 的 range profiler，运行期从 `libcupti.so.13` 绑定
-（`device/src/cuda/cupti.rs`）。CUDA 13 把 PerfWorks 的 host API 并入了 CUPTI，
+计数器来自 CUPTI 的 range profiler，运行期从唯一一个 soname —— `libcupti.so.13`
+—— 绑定：先在加载器路径上查找，再到 `/opt/cuda/lib64`、
+`/usr/local/cuda/extras/CUPTI/lib64` 和 `$CUDA_PATH/{lib64,extras/CUPTI/lib64}`
+里找（`device/src/cuda/cupti.rs`）。CUDA 13 把 PerfWorks 的 host API 并入了 CUPTI，
 因此整条调用序列由这一个库承载 —— CUPTI 自己会 `dlopen`
-`libnvperf_host.so`，所以它必须能被动态链接器解析到。这个绑定和 `ptxas` 一样是
+`libnvperf_host.so`，所以它必须能被动态链接器解析到，而解析不到时的样子就是一个
+`CUPTI_ERROR_NOT_INITIALIZED`。这个绑定和 `ptxas` 一样是
 可选的：库缺失、不可用，或用 `SVOD_CUDA_CUPTI=0` 显式关闭时，`pmc_available()`
 为 `false`，profiler 退化到第 1-3 层并打印它那行提示。
+
+其中两个 params 结构体在 CUDA 13.3 中变大了，所以每次调用都先送出最新的
+`struct_size`，遇到 `CUPTI_ERROR_INVALID_PARAMETER` 就退回一档 ——
+`cuptiProfilerGetCounterAvailability`（41 然后 40）与
+`cuptiProfilerHostInitialize`（56 然后 48）—— 而 `abi_ladder` 会记住已安装的
+CUPTI 究竟接受了哪个尺寸。
 
 `SVOD_PMC=1` 选择该后端的默认集合：
 
@@ -89,7 +98,15 @@ BEAM 所用的 `Program::execute_timed` 是调度流上的同一对 event，以
 | `dram` | `dram__bytes.sum` | 经过 DRAM 的字节数 |
 
 用令牌指定子集 —— `SVOD_PMC=tensor,dram`。令牌在各后端之间唯一，所以在 CUDA 上
-写 AMD 的令牌只会被丢弃，而不会去错误地编程另一个模块。`tensor` 与 `cycles`
+写 AMD 的令牌只会被丢弃，而不会去错误地编程另一个模块；`set_pmc` 会返回它保留了
+多少个，执行器则在 stderr 上把这件事说出来：
+
+```text
+SVOD_PMC: 2 of 5 requested counters are not collected on this backend
+```
+
+一个令牌全都无法识别的列表会回落到默认集合，而一个什么都没能存活下来的选择，
+意味着一次普通的、未布防的计时运行。`tensor` 与 `cycles`
 之比就是 matmul 或 flash-attention 内核的 tensor core 利用率；`dram` 则把受带宽
 限制的内核和受发射限制的内核区分开。
 
@@ -111,13 +128,15 @@ echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' \
 # 按你的发行版重建 initramfs，然后重启
 ```
 
-`scripts/cupti_probe.cu` 会独立跑完整条序列并报告它停在哪一步，这是区分权限
-问题和工具链问题最快的办法。
+`scripts/cupti_probe.cu` 会拿一个 saxpy 内核独立跑完整条序列并报告它停在哪一步，
+这是区分权限问题和 toolkit 问题最快的办法；在 `sudo` 下跑一遍就能不重启地确认
+这个判断。
 
 ### 采集的代价
 
 采集运行在 `CUPTI_AutoRange` 加 `CUPTI_KernelReplay` 模式下：CUPTI 为每次启动
-开一个 range，并在内部重放内核以覆盖多趟配置（上面这五个计数器一趟即可调度完）。
+开一个 range，并在内部重放内核以覆盖多趟配置（上面这五个计数器在我们跑过的每一块
+芯片上都是一趟就调度完的；需要更多趟的集合会在 `Stop` 处被抓住，并退化为仅有计时）。
 两个后果已经替你处理好了：
 
 - 被捕获的 CUDA graph 会作为一次不透明的提交重放，那样什么计数器都拿不到，

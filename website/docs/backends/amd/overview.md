@@ -94,8 +94,10 @@ flowchart TD
 Everything that is *not* a kernel call — the 16 MiB command ring, the PM4/AQL
 packet construction, the kernarg bump arena, the timeline counter, the program
 loader — lives above the seam and is shared by every backend. The trait is
-deliberately tiny: **five methods** (`alloc_raw`, `free_raw`, `setup_ring`,
-`teardown_ring`, `wait_events`). The key insight that keeps it small is that the
+deliberately tiny: **five required methods** (`alloc_raw`, `free_raw`,
+`setup_ring`, `teardown_ring`, `wait_events`) plus three hooks that default to a
+no-op (`queue_event_mailbox`, `publication_checkpoint`,
+`update_queue_percentage`). The key insight that keeps it small is that the
 ring, GART page, EOP buffer and MQD are *just GPU memory* — they get allocated
 above the seam via `alloc_raw`, and the only thing a driver genuinely has to do
 differently is **activate the queue** (map the doorbell, tell the scheduler the
@@ -109,7 +111,7 @@ environment variable:
 | `kfd` (default) | `KfdIface` — KFD-direct | Production |
 | `am` | `AmIface` — userspace AM driver | Not yet selectable — see below |
 
-:::caution AM is not runnable yet
+:::caution[AM is not runnable yet]
 Setting `SVOD_AMD_BACKEND=am` currently returns an error (`device.rs` accepts
 only `kfd`) — no AM type implements the seam yet. The userspace **AM** driver
 targets a **CDNA3 SR-IOV VF** (gfx9.4.3) and is a work in progress:
@@ -124,9 +126,10 @@ boundary is.
 
 ## Device-local memory and the SDMA copy queue
 
-The backend installs an **SDMA copy queue** (`AmdCopyQueue`) at device-open when
-one can be created, which flips `has_sdma_queue` true. With it, intermediates can
-live in **device-only VRAM** (`cpu_access = false`) and host↔device copies go
+The backend installs an **SDMA copy queue** (`AmdCopyQueue`) at device-open on
+CDNA parts — RDNA keeps the host-visible path, and `AMD_DISABLE_SDMA` turns the
+attempt off entirely — which flips `has_sdma_queue` true. With it, intermediates
+can live in **device-only VRAM** (`cpu_access = false`) and host↔device copies go
 through asynchronous DMA: `_copyin`/`_copyout` stage through the SDMA queue,
 `_transfer` does a direct device→device copy. When no copy queue is present the
 allocator falls back to the simpler model — every buffer is forced host-visible
@@ -149,7 +152,7 @@ SVOD_DEVICE=AMD:0 cargo run --release -p svod-model --example gigaam_infer -- ./
 The only host requirement beyond a supported AMD GPU is `clang` with the
 `amdgcn` target on `PATH` (used to compile kernels — see
 [Compile & Graph](./compile-and-graph.md)); there is no ROCm/HIP install. The
-[Queues & Dispatch](./queues-and-dispatch.md) page lists every `SVOD_*` knob.
+[Queues & Dispatch](./queues-and-dispatch.md) page lists every environment knob.
 
 ---
 
@@ -158,7 +161,7 @@ The only host requirement beyond a supported AMD GPU is `clang` with the
 The AMD backend is the device half of the compiler. The frontend lowers tensors
 to a single UOp IR; codegen maps that IR onto GPU thread indices (the
 ["Add GPU Dims"](../../architecture/codegen/devectorizer.md) stage turns ranges into
-`blockIdx`/`threadIdx`, per [IR Design](../../architecture/ir-design.md)); the renderer emits
+`gidxN`/`lidxN` SPECIAL indices, per [IR Design](../../architecture/ir-design.md)); the renderer emits
 AMD LLVM IR; and this backend compiles and runs it:
 
 ```mermaid
@@ -180,7 +183,7 @@ once and replays many times.
 | Page | What it covers |
 |---|---|
 | [KFD Bindings](./kfd-bindings.md) | How the kernel ABI is bound (bindgen over a vendored header), the exact ioctls used, sysfs topology, and the allocation flow |
-| [Queues & Dispatch](./queues-and-dispatch.md) | The command ring, PM4 vs AQL, connectors, the single-queue/multi-queue dispatcher, the timeline, and every configuration env var |
-| [Compile & Graph](./compile-and-graph.md) | How a kernel goes from LLVM IR to a loaded program, how it dispatches, and how PM4 graph capture/replay works |
+| [Queues & Dispatch](./queues-and-dispatch.md) | The command ring, PM4 vs AQL, the bounded compute-lane pool, publication and device-wide drains, the timeline, and every configuration env var |
+| [Compile & Graph](./compile-and-graph.md) | How a kernel goes from LLVM IR to a loaded program, how it dispatches, and how graph capture/replay works (AQL by default, PM4 opt-in) |
 | [The AM Driver](./am-driver.md) | The in-progress userspace driver: what is built, what is deferred, and how it plugs into the seam |
 | [Debugging](./debugging.md) | The VA→allocation registry for fault triage, the poison latch, and the dispatch/tracing diagnostics |

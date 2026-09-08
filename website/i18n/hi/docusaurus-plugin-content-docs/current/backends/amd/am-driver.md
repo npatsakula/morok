@@ -6,12 +6,15 @@ sidebar_label: AM Driver
 
 **AM** driver एक दूसरा [`AmdIface`](./overview.md) बैकएंड है जो GPU के PCI BARs को सीधे drive
 करता है, kernel `amdgpu`/KFD driver को पूरी तरह bypass करते हुए। यह tinygrad के userspace AM
-driver का एक port है। प्रेरणा ठोस है: lock-free [multi-queue dispatch](./queues-and-dispatch.md)
-path भारी concurrent load के तहत kernel के MES/runlist scheduler को overload कर देता है और
-kernel को crash कर सकता है। यदि हम GPU के मालिक हैं — page tables, firmware, scheduling — तो
-kernel कभी dispatch path में नहीं होता और overload नहीं हो सकता।
+driver का एक port है। प्रेरणा ठोस है: single-XCC gfx11+ parts पर lock-free
+[multi-queue dispatch](./queues-and-dispatch.md) path CP micro-engines को ऐसे waits में
+park कर सकता है जिन्हें kernel का MES firmware preempt नहीं कर पाता, और यह उसे एक
+unrecoverable reset में wedge कर देता है। kernel scheduler ही साझा कमज़ोरी है — इसी श्रेणी की
+failure वह वजह है जो lane pool को हर part पर conservative बनाए रखने पर मजबूर करती है। यदि हम
+GPU के मालिक हैं — page tables, firmware, scheduling — तो kernel कभी dispatch path में नहीं
+होता और wedge नहीं हो सकता।
 
-:::caution Work in progress — अभी selectable नहीं
+:::caution[Work in progress — अभी selectable नहीं]
 यह पेज आज जो मौजूद है और बाक़ी के लिए roadmap, दोनों का दस्तावेज़ीकरण करता है।
 **`SVOD_AMD_BACKEND=am` फ़िलहाल एक error देता है** (`device.rs` केवल `kfd` स्वीकार करता है):
 अभी तक कोई AM type [`AmdIface`](./overview.md) seam को implement नहीं करता, इसलिए आज पहुँच
@@ -34,10 +37,12 @@ driver का target है एक **CDNA3** GPU — **gfx9.4.3**, SPX mode म�
 विशेष रूप से उसका **SR-IOV Virtual Function** रूप (GPU एक VF है जो एक KVM guest में pass किया
 गया है)। `AmDev::open` बाक़ी हर चीज़ को सीधे अस्वीकार कर देता है: एक non-VF function, या एक
 ऐसा GC version जिसका major.minor `(9, 4)` नहीं है, fast fail करता है
-(`device/src/amd/am/dev.rs`)। पहले वाला gfx1151 (RDNA3.5) केवल एक vendored register
-table और एक vestigial unit test के रूप में बचा है; यह अब target नहीं है।
+(`device/src/amd/am/dev.rs`)। gfx1151 (RDNA3.5) अब *target* नहीं है, पर gfx11 arch branch
+implemented और unit-tested बनी रहती है — और उसकी page-table geometry तथा palloc-range
+helpers ही वे चीज़ें हैं जिन्हें gfx9 path दोबारा उपयोग करता है।
 
-> Validated on AMD Instinct MI300X (gfx942) and Ryzen AI "Strix Halo" (gfx1151).
+> Bring-up hardware: एक AMD Instinct MI300X (gfx942 / GC 9.4.3) का SR-IOV VF।
+> `AmDev::open` इसके अलावा कुछ भी स्वीकार नहीं करता।
 
 एक **VF** होना (bare metal के बजाय) defining constraint है, और यह पूरे driver को आकार देता
 है:
@@ -70,8 +75,8 @@ hardware-facing टुकड़े अतिरिक्त रूप से liv
 
 | Group | Module(s) | यह क्या करता है | Status |
 |---|---|---|---|
-| **Discovery** | `pci.rs`, `discovery.rs` | sysfs BAR mmap (BAR0 VRAM / BAR2 doorbell / BAR5 MMIO), config-space r/w, bounds-checked IP-discovery parser (per-XCC segment bases, `gc_info` v1/v2) | **HW-validated** + unit-tested |
-| **Register access** | `regaccess.rs`, `rlcg.rs`, `mailbox.rs`, `regs.rs`, `regs_gen.rs` | mxgpu VF↔GIM mailbox handshake, RLCG indirect GC/GCVM r/w (per-XCC), MMIO/RLCG router, vendored register tables | **HW-validated** + unit-tested |
+| **Discovery** | `pci.rs`, `discovery.rs` | sysfs BAR mmap (BAR0 VRAM / BAR2 doorbell / BAR5 MMIO), config-space r/w, bounds-checked IP-discovery parser (per-XCC segment bases, `gc_info` v1/v2) | **HW-validated**; discovery parser unit-tested है |
+| **Register access** | `regaccess.rs`, `rlcg.rs`, `mailbox.rs`, `regs.rs`, `regs_gen.rs` | mxgpu VF↔GIM mailbox handshake, RLCG indirect GC/GCVM r/w (per-XCC), MMIO/RLCG router, vendored register tables | **HW-validated**; register-table select/encode logic unit-tested है |
 | **Memory (GMMU)** | `mm/{tlsf,pagetable,manager,mod}.rs` | TLSF VA/PA/page-table allocators, 4-level/48-bit walk, gfx9 **और** gfx11 PTE/PDE encoding, huge-page selection, table reclaim, `valloc`/`vfree` | **Done** + tests (PTE write path HW-exercised) |
 | **GMC bring-up** | `ip/gmc.rs` | दोनों hubs का context0 program करें (start/end/base + CNTL), MX_L1_TLB enable, per-engine invalidation ranges, ENG17 TLB flush, HDP flush, fault-status decode | **HW-validated** context-program level तक |
 | **GFX bring-up** | `ip/gfx.rs` | MEC enable करें (icache invalidate, golden `GB_ADDR_CONFIG`, doorbell range, unhalt), एक v9 compute MQD बनाएँ, HQD activate करें (`CP_HQD_ACTIVE=1`), `WRITE_DATA` PM4 | **MEC HQD activate होता है**; queue अभी नहीं चलती |
@@ -83,9 +88,10 @@ hardware-facing टुकड़े अतिरिक्त रूप से liv
 page-table geometry **4-level / 48-bit** है (`va_shifts = [12, 21, 30, 39]`), एक आकार जो
 **gfx9/11/12 में साझा है** — इसलिए geometry ख़ुद arch पर branch नहीं करती। केवल leaf PTE
 encoding (विशेष रूप से MTYPE memory-type field) arch-specific है, और **अब gfx9 (CDNA)
-और gfx11 (RDNA3) दोनों implement और unit-tested हैं** — gfx9 leaf flags MTYPE को bits 57–58
-पर रखते हैं, PDB1 `bfs` set करते हैं, PDB0 translate-further bit, और higher leaves पर
-`PDE_PTE` bit। **gfx12 ही एकमात्र शेष `unimplemented!` है** (constants captured हैं, अभी तक
+और gfx11 (RDNA3) दोनों implement और unit-tested हैं** — gfx9 MTYPE को bits 57–58 पर रखता
+है, PDB1 table entries पर `bfs` और PDB0 table entries पर translate-further bit set करता है,
+और PDB1/PDB2 leaves को `PDE_PTE` से चिह्नित करता है (एक 2 MiB PDB0 leaf का मतलब है
+translate-further का *अभाव*)। **gfx12 ही एकमात्र शेष `unimplemented!` है** (constants captured हैं, अभी तक
 hardware-validated नहीं; एक test assert करता है कि यह panic करता है)। `MemoryManager` तीन
 TLSF sub-allocators (VA space, physical VRAM, page-table pool) चलाता है और table को `Inspect`
 / `Create` / `Free` modes में walk करता है, unmap पर empty tables को reclaim करते हुए।
@@ -173,9 +179,10 @@ unchanged चलाता है। तब वह crash-inducing concurrency ज
 
 ## यह क्यों ज़रूरी है
 
-AM driver उस kernel-overload समस्या का असली उत्तर है जिसे [single-queue mode](./queues-and-dispatch.md)
-केवल sidestep करता है। महँगे, GPU-free हिस्से — GMMU, register tables, mailbox/RLCG
+AM driver उस firmware-wedge समस्या का असली उत्तर है जिसे lane pool को clamp करना
+([`SVOD_AMD_HW_QUEUES=1`](./queues-and-dispatch.md)) केवल sidestep करता है। महँगे, GPU-free हिस्से — GMMU, register tables, mailbox/RLCG
 indirect-access machinery — live VF पर built और validated हैं, और page tables, GMC, और
 ownership handshake सभी काम करते हैं। बचा हुआ gap एक hardware boundary है (PF-owned doorbell
-aperture), design वाला नहीं। और चूँकि यह उसी पाँच-method [seam](./overview.md) के पीछे slot
-होता है, इसके उतरने पर dispatch, compile, या graph machinery में से किसी को बदलना नहीं पड़ता।
+aperture), design वाला नहीं। और चूँकि यह उसी [seam](./overview.md) के पीछे slot होता है —
+पाँच required methods और तीन defaulted hooks — इसके उतरने पर dispatch, compile, या graph
+machinery में से किसी को बदलना नहीं पड़ता।

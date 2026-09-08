@@ -40,13 +40,18 @@ GPU VA 范围映射回其所属的分配。它是纯记账——没有 GPU
 
 ### 标签
 
-每个分配都被打上其用途的标签（`AllocTag`），在
-`alloc_raw` 的各个调用点推导：
+每个分配都被打上其用途的标签（`AllocTag`）。`Vram` 与 `Gtt` 是
+由 `AllocKind` 推导出的默认值；更细的标签则由 `alloc_*_tagged`
+的各个调用点显式传入：
 
 | 标签 | 涵盖 |
 |---|---|
-| `Vram` | 通用设备 VRAM——张量数据、代码、kernarg、EOP/ctx-save |
-| `Gtt` | GTT 固定的宿主可见控制内存——队列环、GART、信号槽 |
+| `Vram` | 通用设备 VRAM——张量数据、code object、EOP/ctx-save |
+| `Gtt` | GTT 固定的宿主可见控制内存 |
+| `Kernarg` | kernarg arena——每调度、图以及已链接 plan 的参数页 |
+| `SignalPool` | GTT 信号槽池 |
+| `QueueRing` / `QueueGart` / `QueueInactive` | 一个队列的环、GART 页与 queue-inactive 信号 |
+| `Staging` | GTT 上的 SDMA 反弹缓冲区 |
 | `Scratch` | 寄存器溢出的 scratch——仅 GPU 的 VRAM，每内核重分配 |
 
 真正要紧的区别是 **scratch 与其他一切**：scratch 是
@@ -85,9 +90,8 @@ Unmapped: va is in NO tracked allocation; nearest live below: VRAM buffer
 ## 一次故障是如何被报告的
 
 在 `KfdIface::wait_events`（`device/src/amd/iface.rs`）中，当内存故障
-事件已触发（`gpu_id != 0`），字段会从那个
-`#[repr(packed)]` 结构体中被复制出来，VA 被分类，并构建出一条
-丰富化的消息：
+事件已触发（`gpu_id != 0`），字段会从 bindgen 生成的 union 载荷中被
+复制进局部变量，VA 被分类，并构建出一条丰富化的消息：
 
 ```text
 AMD GPU memory fault on gpu_id=… va=0x… (NotPresent=1 ReadOnly=0 NoExecute=0
@@ -97,10 +101,11 @@ Imprecise=0 ErrorType=…) — va is at offset +0x40 within a LIVE scratch …
 它通过一个 `fault_logged: AtomicBool` 闩锁和一个
 `tracing::error!` **只记录一次**。这一点很要紧：内存故障事件不会
 自动重置，因此后续的 poll-fault 调用（`wait_events(0)`）会重新观测到同一个
-故障——每次都记录会刷屏。该消息随后作为一个
-`Error::Runtime` 返回，并浮现给调用方。（一个硬件异常事件，
-槽 `[2]`，改为报告 `reset_type`/`reset_cause`/`memory_lost`——这些
-没有可分类的故障 VA。）
+故障——每次都记录会刷屏。它随后作为一个有类型的
+`Error::GpuFault` 返回，其 `Display` 就是上面那个字符串；poison 闩锁
+则会在此后的每一个入口点把同样的文本重抛为 `Error::Runtime`。
+（一个硬件异常事件，槽 `[2]`，改为报告
+`reset_type`/`reset_cause`/`memory_lost`——这些没有可分类的故障 VA。）
 
 ---
 
@@ -114,28 +119,27 @@ Imprecise=0 ErrorType=…) — va is at offset +0x40 within a LIVE scratch …
 - `poison(msg)` 把消息记录一次并置位标志；
 - `is_poisoned()` 是热路径上的门；
 - `poison_error()` 在被毒化时返回已记录的 `Error::Runtime`；
-- `poll_faults_nonblocking()` 发出 `wait_events(0)`，从一次
-  停滞的信号等待中被调用（以把真实错误附到一个 30 秒超时上），也从
-  `WAIT_EVENTS` 升级路径中被调用（以在故障时提前跳出轮询）。
+- `poll_faults_nonblocking()` 从一次停滞的信号等待中发出
+  `wait_events(0)`，这样附到那个 30 秒超时上的就是真实错误，而不是
+  一个光秃秃的截止时间。（自旋升级路径同样会在故障时提前跳出，
+  但走的是一次短暂的*阻塞式* `wait_events`，而非这个 poll。）
 
-一旦被毒化，对该设备上任何 connector 的每一次 `synchronize`/`execute`
+一旦被毒化，对该设备上任何通道的每一次 `synchronize`/`execute`
 都会快速失败——GPU 状态和缓存的映射不再可信。
 
 ---
 
 ## 调度插桩：`SVOD_DEBUG_DISPATCH`
 
-设置 `SVOD_DEBUG_DISPATCH`（设成任何值）会在三个点
-打开 `eprintln` 转储：
+设置 `SVOD_DEBUG_DISPATCH`（设成任何值）会在两个点打开 `eprintln`
+转储，二者都位于 `device/src/amd/program.rs`：
 
-- **`[program-load]`**（`program.rs`）——每程序：kernarg/private/group
-  尺寸、`kernel_code_properties`（逐位解码）、user-SGPR 计数、
-  `wave32`，以及原始的 `rsrc1/2/3`。它会标出加载器*没有*填充的
+- **`[program-load]`**——每程序：kernarg/private/group 尺寸、
+  `kernel_code_properties`（逐位解码）、user-SGPR 计数、`wave32`，
+  以及原始的 `rsrc1/2/3`。它会标出加载器*没有*填充的
   `kernel_code_properties` 位（那会让内核读到垃圾指针并故障）。
-- **`[dispatch tv=…]`**（`program.rs`）——每调度：内核名、`grid`、
-  `local`、`is_pm4`、kernarg 的 GPU VA、scratch VA，以及每个缓冲区的 VA。
-- **`[graph capture]`**（`graph.rs`）——每捕获的图：内核数、
-  kernargs 页 VA、kick/self 信号 VA，以及 scratch VA。
+- **`[dispatch tv=…]`**——每调度：内核名、`grid`、`local`、`is_pm4`、
+  kernarg 的 GPU VA、scratch VA，以及每个缓冲区的 VA。
 
 这是看清一次故障调度究竟触碰了哪些 VA 的最快方式，以便
 与注册表的分类相互参照。
@@ -159,7 +163,7 @@ SVOD_DEVICE=AMD:0 \
   cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav
 ```
 
-:::tip 流水线调试器
+:::tip[流水线调试器]
 对于*编译器*侧的问题（IR 提取、LLVM IR、UOp 树）而非
 驱动，项目附带一个 `/svod-debug` skill，记录了前端 →
 codegen 的追踪目标（`SVOD_DUMP_LLVM_IR`、`SVOD_DUMP_AMD_IR`、每阶段的

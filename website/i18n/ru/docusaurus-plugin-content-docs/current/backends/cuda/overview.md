@@ -6,7 +6,8 @@ sidebar_label: Обзор
 
 Svod работает на GPU NVIDIA через **CUDA driver API** (`libcuda.so.1`) и больше
 ни через что из стека CUDA: ни тулкита, ни `nvcc`, ни NVRTC, ни `libcudart`.
-Ядра рендерятся в NVPTX LLVM IR, опускаются в текст PTX хостовым `clang` и
+Ядра рендерятся в NVPTX LLVM IR, опускаются в текст PTX хостовым `clang`,
+ассемблируются в cubin через `ptxas`, когда установлен CUDA-тулкит, и иначе
 JIT-компилируются в SASS драйвером при загрузке модуля. Дизайн следует
 `ops_cuda.py` из tinygrad; код живёт в `device/src/cuda/` (драйвер, память,
 программы, графы), `runtime/src/cuda/` и `runtime/src/devices/cuda.rs`
@@ -19,7 +20,7 @@ JIT-компилируются в SASS драйвером при загрузк�
 | Требование | Зачем |
 |---|---|
 | Драйвер NVIDIA, предоставляющий `libcuda.so.1` | Каждый вызов драйвера разрешается из неё во время выполнения через `libloading` |
-| Драйвер **CUDA 12.0 (R525) или новее** | Точки входа CUDA-графов привязаны по версионированным именам (`cuGraphAddKernelNode_v2`, `cuGraphExecKernelNodeSetParams_v2`), появившимся в 12.0. Фиксация PTX ISA следует вычислительной способности: **7.8** вплоть до sm_88, **8.4** на sm_89 и sm_90 (ради их fp8-форм `mma.sync`; CUDA 12.4 / R550), **8.6** на sm_100/sm_101 (CUDA 12.7), **8.7** на sm_120 (CUDA 12.8), **8.8** на sm_103, sm_121 и новее (CUDA 12.9) — карте Blackwell нужен драйвер той ISA, которая её ввела |
+| Драйвер **CUDA 12.0 (R525) или новее** | Точки входа CUDA-графов привязаны по версионированным именам (`cuGraphAddKernelNode_v2`, `cuGraphExecKernelNodeSetParams_v2`), появившимся в 12.0. Фиксация PTX ISA следует вычислительной способности: **7.8** вплоть до sm_88, **8.4** на sm_89 и sm_90 (ради их fp8-форм `mma.sync`; CUDA 12.4 / R550), **8.6** на sm_100 — sm_102 (CUDA 12.7), **8.7** на sm_120 (CUDA 12.8), **8.8** на sm_103, sm_121 и новее (CUDA 12.9) — карте Blackwell нужен драйвер той ISA, которая её ввела |
 | `clang`, собранный с таргетом **NVPTX** | `clang -x ir --target=nvptx64-nvidia-cuda` превращает отрендеренный IR в PTX |
 
 Проверить их на хосте:
@@ -32,8 +33,10 @@ clang --print-targets | grep nvptx64     # бэкенд NVPTX
 
 clang без NVPTX даёт аккуратную ошибку `JitCompilation`, называющую способ
 исправления (`-DLLVM_TARGETS_TO_BUILD='X86;AArch64;NVPTX'`). Для запуска
-CUDA-тулкит не нужен; `ptxas` и `compute-sanitizer` полезны только для
-[отладки](./debugging.md).
+CUDA-тулкит не нужен: `ptxas` с пути используется для предассемблирования ядер,
+когда он там оказался (`SVOD_CUDA_PTXAS=0` отключает это), а
+`compute-sanitizer` полезен для [отладки](./debugging.md), но обязательным не
+является ни то, ни другое.
 
 ---
 
@@ -56,16 +59,17 @@ cargo-фичей (старой фичи `cuda` на основе `cudarc` бол
 
 ## Запуск на CUDA
 
-Выберите GPU переменной `SVOD_DEVICE` (`CUDA:N`; `NV` и `GPU` принимаются как
-алиасы, просто `CUDA` означает устройство 0):
+Выберите GPU переменной `SVOD_DEVICE` (`CUDA:N`; `GPU` принимается как алиас,
+просто `CUDA` означает устройство 0). `NV` намеренно **не** принимается — имя
+остаётся зарезервированным под будущий бэкенд с userspace-драйвером:
 
 ```bash
 SVOD_DEVICE=CUDA:0 cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav
 ```
 
 Открытие устройства логирует одну строку уровня `info` с его именем, `sm_XY`,
-числом SM, поддержкой managed-памяти и версией драйвера
-(`RUST_LOG=svod_device=info`).
+числом SM, поддержкой managed-памяти, версией драйвера и тем, включена ли
+синхронизация с областью видимости (`RUST_LOG=svod_device=info`).
 
 Compute capability читается у драйвера при открытии и хранится как открытый
 `CudaArch { major, minor }` (`sm_86`, `sm_120`, ...). Она выбирает
@@ -77,7 +81,7 @@ Compute capability читается у драйвера при открытии 
 | ниже `sm_75` | нет |
 | `sm_75` | f16 `m16n8k8` |
 | `sm_80`+ | f16 и bf16 `m16n8k16`, f16 `m16n8k8`, int8 `m16n8k32` с накоплением в i32; хранение в bf16. tf32 остаётся opt-in (`cuda_sm80(true)`) |
-| `sm_89`+ | набор sm_80 плюс fp8 `m16n8k32`, который рендерер пока не может накормить (см. [Ограничения](./limitations.md)) |
+| `sm_89`+ | набор sm_80 без изменений: fp8-ядра `m16n8k32` существуют (`sm89_tensor_cores`), но `for_cuda_arch` придерживает их, пока рендерер не умеет опускать fp8-касты (см. [Ограничения](./limitations.md)) |
 
 ---
 
@@ -88,13 +92,16 @@ flowchart LR
   A["UOp IR"] --> B["NVPTX LLVM IR"]
   B --> C["clang (nvptx64)"]
   C --> D["PTX text"]
-  D --> E["driver JIT (cuModuleLoadDataEx)"]
-  E -->|"cuLaunchKernel / cuGraphLaunch"| F["GPU"]
+  D -->|"ptxas, with the toolkit"| E["cubin"]
+  D -->|"driver JIT, without it"| F["cuModuleLoadDataEx"]
+  E --> F
+  F -->|"cuLaunchKernel / cuGraphLaunch"| G["GPU"]
 ```
 
-Скомпилированный PTX кэшируется на диске общим кэшем объектов; драйвер держит
-собственный кэш SASS (`~/.nv/ComputeCache`), так что горячий старт пропускает и
-clang, и `ptxas`.
+Скомпилированный объект кэшируется на диске общим кэшем объектов — cubin, когда
+установлен `ptxas`, и текст PTX иначе, причём два формата никогда не делят одну
+запись. На PTX-пути драйвер держит собственный кэш SASS (`~/.nv/ComputeCache`),
+так что горячий старт пропускает clang и обычно ещё и JIT.
 
 ---
 
