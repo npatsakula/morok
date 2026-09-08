@@ -96,7 +96,7 @@ impl Tensor {
         let ndim = self_shape.len();
         let dim = Self::normalize_axis(dim, ndim)?;
         // Reshape 1D index [K] → [1, ..., K, ..., 1] matching input ndim.
-        let idx_len = index.shape()?[0].as_const().expect("index_select: index length must be concrete");
+        let idx_len = index.dim_const(0)?;
         let mut idx_shape = vec![1isize; ndim];
         idx_shape[dim] = idx_len as isize;
         let idx_nd = index.try_reshape(&idx_shape)?;
@@ -331,11 +331,7 @@ impl Tensor {
             .ok_or_else(|| crate::error::Error::SymbolicShapeUnsupported { operation: "sort".into() })?;
 
         if orig_len <= 1 {
-            let idx = Tensor::full(
-                &svod_ir::shape::to_vec_usize(&shape).unwrap(),
-                ConstValue::Int(0),
-                svod_dtype::DType::Int32,
-            )?;
+            let idx = Tensor::full(&self.dims()?, ConstValue::Int(0), svod_dtype::DType::Int32)?;
             return Ok((self.clone(), idx));
         }
 

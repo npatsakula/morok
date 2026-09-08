@@ -32,10 +32,10 @@ fn dummy_buffers(n: usize) -> Vec<Arc<UOp>> {
 fn matmul_non_rank2_operand_is_operand_shape_err() {
     let sq = Tensor::randn(&[64, 64]).expect("randn");
     let a1 = Tensor::randn(&[64]).expect("randn"); // operand a: rank 1
-    let e = matmul(&a1, &sq).err().expect("rank-1 a must error, not panic");
+    let e = matmul(&a1, &sq).expect_err("rank-1 a must error, not panic");
     assert!(matches!(e, crate::launch::Error::OperandRank { operand: "a", .. }), "got {e:?}");
     let b3 = Tensor::randn(&[2, 64, 64]).expect("randn"); // operand b: rank 3
-    let e = matmul(&sq, &b3).err().expect("rank-3 b must error, not panic");
+    let e = matmul(&sq, &b3).expect_err("rank-3 b must error, not panic");
     assert!(matches!(e, crate::launch::Error::OperandRank { operand: "b", .. }), "got {e:?}");
 }
 

@@ -360,20 +360,20 @@ fn test_knn_err_paths() {
     // D mismatch: x is [4, 8], c is [16, 6] → query/corpus dims disagree.
     let x = Tensor::randn(&[4, 8]).expect("x");
     let c_baddim = Tensor::randn(&[16, 6]).expect("c bad-d");
-    crate::knn(&x, &c_baddim, 2).err().expect("D mismatch must error, not None/panic");
+    crate::knn(&x, &c_baddim, 2).expect_err("D mismatch must error, not None/panic");
 
     // k > M: only 3 corpus rows but k = 4.
     let c_small = Tensor::randn(&[3, 8]).expect("c small");
-    crate::knn(&x, &c_small, 4).err().expect("k > M must error");
+    crate::knn(&x, &c_small, 4).expect_err("k > M must error");
 
     // k > 16 (and k == 0) are outside the kernel's 1..=16.
     let c = Tensor::randn(&[64, 8]).expect("c");
-    crate::knn(&x, &c, 17).err().expect("k > 16 must error");
-    crate::knn(&x, &c, 0).err().expect("k == 0 must error");
+    crate::knn(&x, &c, 17).expect_err("k > 16 must error");
+    crate::knn(&x, &c, 0).expect_err("k == 0 must error");
 
     // Non-rank-2 (rank-1 query) errors via `concrete_dims`, also device-independent.
     let x1 = Tensor::randn(&[8]).expect("x rank-1");
-    crate::knn(&x1, &c, 2).err().expect("rank-1 query must error");
+    crate::knn(&x1, &c, 2).expect_err("rank-1 query must error");
 }
 
 /// Device-gated **graph-shape** check (builds the lazy `(dists, idxs)` but does NOT

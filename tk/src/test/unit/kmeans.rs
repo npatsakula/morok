@@ -227,16 +227,16 @@ fn test_kmeans_assign_err_paths() {
     // D mismatch: x is [32, 64], c is [16, 32].
     let x = Tensor::randn(&[32, 64]).expect("x");
     let c_bad = Tensor::randn(&[16, 32]).expect("c bad-D");
-    crate::kmeans_assign(&x, &c_bad).err().expect("D mismatch must error");
+    crate::kmeans_assign(&x, &c_bad).expect_err("D mismatch must error");
 
     // Non-rank-2 (rank-1 points).
     let x1 = Tensor::randn(&[64]).expect("x rank-1");
     let c = Tensor::randn(&[16, 64]).expect("c");
-    crate::kmeans_assign(&x1, &c).err().expect("rank-1 points must error");
+    crate::kmeans_assign(&x1, &c).expect_err("rank-1 points must error");
 
     // Non-rank-2 (rank-3 centroids).
     let c3 = Tensor::randn(&[1, 16, 64]).expect("c rank-3");
-    crate::kmeans_assign(&x, &c3).err().expect("rank-3 centroids must error");
+    crate::kmeans_assign(&x, &c3).expect_err("rank-3 centroids must error");
 }
 
 /// Device-gated **graph-shape** check (builds the lazy `(ids, dists)` but does
@@ -344,17 +344,17 @@ fn test_kmeans_update_err_paths() {
 
     // D mismatch: c has D=32, x has D=64.
     let c_bad = Tensor::randn(&[4, 32]).expect("c bad-D");
-    crate::kmeans_update(&x, &ids, &c_bad).err().expect("D mismatch must error");
+    crate::kmeans_update(&x, &ids, &c_bad).expect_err("D mismatch must error");
 
     // N mismatch: ids has 4 elements, x has 32 rows.
-    crate::kmeans_update(&x, &ids, &c_ok).err().expect("N mismatch must error");
+    crate::kmeans_update(&x, &ids, &c_ok).expect_err("N mismatch must error");
 
     // Non-rank-1 ids.
     let ids2 = Tensor::from_slice([0i32, 1]).cast(DType::Int32).expect("ids rank-1");
     let ids2 = ids2.try_reshape([1isize, 2]).expect("ids 2D");
     let x_small = Tensor::randn(&[2, 64]).expect("x small");
     let c_small = Tensor::randn(&[4, 64]).expect("c small");
-    crate::kmeans_update(&x_small, &ids2, &c_small).err().expect("rank-2 ids must error");
+    crate::kmeans_update(&x_small, &ids2, &c_small).expect_err("rank-2 ids must error");
 }
 
 // ── generic-baseline phi-dominance regression guard ─────────────────────────

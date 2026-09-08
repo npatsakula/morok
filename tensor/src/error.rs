@@ -19,6 +19,9 @@ pub enum Error {
     #[snafu(display("Operation '{operation}' does not support symbolic shapes"))]
     SymbolicShapeUnsupported { operation: String },
 
+    #[snafu(display("dimension {axis} is symbolic ({dim}), a concrete size is required"))]
+    NonConstDim { axis: isize, dim: svod_ir::SInt },
+
     #[snafu(display("Axis {axis} is out of range for tensor with {ndim} dimensions"))]
     AxisOutOfRange { axis: isize, ndim: usize },
 

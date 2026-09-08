@@ -215,31 +215,30 @@ impl Tensor {
         let shape = uop.shape().context(UOpSnafu)?.ok_or(Error::NoShape)?;
 
         // Refuse symbolic shapes — matches Tinygrad: assert all_int(self.shape)
-        if shape.iter().any(|dim| dim.as_const().is_none()) {
-            return SymbolicShapeSnafu.fail();
+        snafu::ensure!(shape.iter().all(SInt::is_const), SymbolicShapeSnafu);
+        let dims: Vec<usize> = shape.iter().filter_map(SInt::as_const).collect();
+
+        let data = if dims.contains(&0) { vec![] } else { self.as_vec::<T>()? };
+        ArrayD::from_shape_vec(IxDyn(&dims), data).context(NdarrayShapeSnafu)
+    }
+
+    /// The tensor whose buffer holds exactly this tensor's logical elements,
+    /// contiguously and in row-major order.
+    ///
+    /// A view (shrink, permute, pad, …) carries no buffer of its own and
+    /// resolves to its *base's* buffer, which holds the base's elements — read
+    /// directly it yields the wrong count in the wrong order. Anything that is
+    /// not a buffer identity is therefore materialized through a contiguous
+    /// copy. A tensor with nothing realized upstream is returned untouched so
+    /// the caller still reports [`Error::NoBuffer`] rather than realizing a
+    /// lazy graph behind the user's back.
+    fn materialized(&self) -> Result<Self> {
+        if self.uop().has_buffer_identity() || self.buffer().is_none() {
+            return Ok(self.clone());
         }
-
-        let dims: Vec<usize> = shape.iter().map(|dim| dim.as_const().unwrap()).collect();
-
-        if dims.contains(&0) {
-            let arr = ArrayD::from_shape_vec(IxDyn(&dims), vec![]).context(NdarrayShapeSnafu)?;
-            return Ok(arr);
-        }
-
-        let buffer = self.buffer().ok_or(Error::NoBuffer)?;
-
-        if buffer.dtype() != T::DTYPE {
-            return TypeMismatchSnafu { expected: T::DTYPE, actual: buffer.dtype() }.fail();
-        }
-
-        let count = buffer.size() / T::DTYPE.bytes();
-        let mut data = vec![T::default(); count];
-        buffer
-            .copyout(unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, count * T::DTYPE.bytes()) })
-            .context(DeviceSnafu)?;
-
-        let arr = ArrayD::from_shape_vec(IxDyn(&dims), data).context(NdarrayShapeSnafu)?;
-        Ok(arr)
+        let mut copy = self.contiguous();
+        copy.realize()?;
+        Ok(copy)
     }
 
     /// Read realized tensor data as a flat `Vec<T>`.
@@ -255,27 +254,29 @@ impl Tensor {
     /// assert_eq!(v, vec![1.0, 2.0, 3.0]);
     /// ```
     pub fn as_vec<T: HasDType + Default + Clone>(&self) -> Result<Vec<T>> {
-        let uop = self.uop();
-        if let Ok(Some(shape)) = uop.shape() {
+        if let Ok(Some(shape)) = self.uop().shape() {
             // Refuse symbolic shapes — matches Tinygrad: assert all_int(self.shape)
-            if shape.iter().any(|dim| dim.as_const().is_none()) {
-                return SymbolicShapeSnafu.fail();
-            }
+            snafu::ensure!(shape.iter().all(SInt::is_const), SymbolicShapeSnafu);
             if shape.iter().any(|dim| dim.as_const() == Some(0)) {
                 return Ok(vec![]);
             }
         }
 
-        let buffer = self.buffer().ok_or(Error::NoBuffer)?;
+        let source = self.materialized()?;
+        let buffer = source.buffer().ok_or(Error::NoBuffer)?;
 
         if buffer.dtype() != T::DTYPE {
             return TypeMismatchSnafu { expected: T::DTYPE, actual: buffer.dtype() }.fail();
         }
 
-        let count = buffer.size() / T::DTYPE.bytes();
+        // The logical element count — the backing allocation may be larger
+        // (a `SLICE` alias, or a buffer sized to a symbolic dim's `vmax`).
+        let count = source.numel().unwrap_or(buffer.size() / T::DTYPE.bytes());
         let mut data = vec![T::default(); count];
         buffer
-            .copyout(unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, count * T::DTYPE.bytes()) })
+            .copyout_prefix(unsafe {
+                std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, count * T::DTYPE.bytes())
+            })
             .context(DeviceSnafu)?;
 
         Ok(data)
@@ -294,7 +295,12 @@ impl Tensor {
     /// let view = t.array_view::<f32>().unwrap();
     /// assert_eq!(view[[0, 1]], 2.0);
     /// ```
+    /// A view (shrink, permute, …) borrows its base's buffer, whose contents are
+    /// neither the right elements nor the right order, and a zero-copy borrow
+    /// cannot outlive a materialized copy — so only a buffer identity is
+    /// viewable; use [`as_ndarray`](Self::as_ndarray) for anything else.
     pub fn array_view<T: HasDType>(&self) -> Result<ndarray::ArrayViewD<'_, T>> {
+        snafu::ensure!(self.uop().has_buffer_identity(), NoBufferSnafu);
         let buffer_arc = self.buffer.as_ref().or_else(|| self.entry.buffer()).ok_or(Error::NoBuffer)?;
         let flat = buffer_arc.as_array::<T>().context(DeviceSnafu)?;
         // Reshape to tensor's logical shape if concrete
@@ -317,7 +323,11 @@ impl Tensor {
     /// t.array_view_mut::<f32>().unwrap()[[1, 2]] = 42.0;
     /// assert_eq!(t.array_view::<f32>().unwrap()[[1, 2]], 42.0);
     /// ```
+    /// Writable counterpart of [`array_view`](Self::array_view), with the same
+    /// buffer-identity requirement — writing through a view would land the
+    /// values at the wrong offsets in the base buffer.
     pub fn array_view_mut<T: HasDType>(&self) -> Result<ndarray::ArrayViewMutD<'_, T>> {
+        snafu::ensure!(self.uop().has_buffer_identity(), NoBufferSnafu);
         let buffer_arc = self.buffer.as_ref().or_else(|| self.entry.buffer()).ok_or(Error::NoBuffer)?;
         let flat = buffer_arc.as_array_mut::<T>().context(DeviceSnafu)?;
         if let Ok(shape) = self.shape() {

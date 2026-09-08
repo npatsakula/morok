@@ -18,10 +18,10 @@ use svod_ir::ops;
 fn flash_attention_with_non_rank4_operand_is_operand_shape_err() {
     let q4 = Tensor::randn(&[1, 128, 4, 64]).expect("randn");
     let q3 = Tensor::randn(&[128, 4, 64]).expect("randn"); // q: rank 3
-    let e = flash_attention_with(&q3, &q4, &q4, FaOpts::default()).err().expect("rank-3 q must error, not panic");
+    let e = flash_attention_with(&q3, &q4, &q4, FaOpts::default()).expect_err("rank-3 q must error, not panic");
     assert!(matches!(e, crate::launch::Error::OperandRank { operand: "q", .. }), "got {e:?}");
     let k2 = Tensor::randn(&[4, 64]).expect("randn"); // k: rank 2
-    let e = flash_attention_with(&q4, &k2, &q4, FaOpts::default()).err().expect("rank-2 k must error, not panic");
+    let e = flash_attention_with(&q4, &k2, &q4, FaOpts::default()).expect_err("rank-2 k must error, not panic");
     assert!(matches!(e, crate::launch::Error::OperandRank { operand: "k", .. }), "got {e:?}");
 }
 

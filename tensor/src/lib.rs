@@ -185,6 +185,27 @@ impl Clone for Tensor {
     }
 }
 
+/// Metadata only — never the data, which would force a device read.
+impl std::fmt::Debug for Tensor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shape = match self.shape() {
+            Ok(shape) => {
+                svod_ir::shape::to_vec_usize(&shape).map_or_else(|_| "symbolic".to_string(), |dims| format!("{dims:?}"))
+            }
+            Err(_) => "unknown".to_string(),
+        };
+        let realized = self.buffer.is_some()
+            || self.entry.buffer().is_some()
+            || tensor_registry::get_buffer_arc(self.uop().base().id).is_some();
+        f.debug_struct("Tensor")
+            .field("shape", &format_args!("{shape}"))
+            .field("dtype", &self.dtype())
+            .field("device", &self.device())
+            .field("realized", &realized)
+            .finish()
+    }
+}
+
 /// Symbolic ceiling division, mirroring tinygrad `helpers.py:63-66`.
 ///
 /// The `(num + amt - 1) / amt` form is exact only for a non-negative numerator
@@ -565,6 +586,18 @@ impl Tensor {
         origin_call!("from_const");
         let dtype = T::DTYPE;
         Self::const_(value, dtype)
+    }
+
+    /// Element type of this tensor.
+    ///
+    /// # Examples
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// # use svod_dtype::DType;
+    /// assert_eq!(Tensor::from_slice(&[1.0f32, 2.0]).dtype(), DType::Float32);
+    /// ```
+    pub fn dtype(&self) -> DType {
+        self.uop().dtype()
     }
 
     /// Get device specification from underlying UOp graph.

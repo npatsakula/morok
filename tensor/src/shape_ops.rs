@@ -64,8 +64,8 @@ impl Tensor {
             let known_product: usize = dims
                 .iter()
                 .filter(|d| !d.is_infer())
-                .map(|d| d.as_const().expect("non-infer dims must be concrete for -1 inference"))
-                .product();
+                .map(|d| d.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "reshape with -1 inference" }))
+                .product::<Result<usize>>()?;
             snafu::ensure!(
                 known_product > 0 && total_elements % known_product == 0,
                 ReshapeSizeMismatchSnafu { operation: "reshape with inference".to_string() }
@@ -86,11 +86,16 @@ impl Tensor {
         let requested: Vec<SInt> = new_shape.into_iter().map(Into::into).collect();
         // Resolve Infer (-1) to current dimension (expand's "keep" semantics)
         let current_shape = self.shape()?;
+        let ndim = current_shape.len();
         let shape: Shape = requested
             .into_iter()
             .enumerate()
-            .map(|(i, s)| if s.is_infer() { current_shape[i].clone() } else { s })
-            .collect();
+            .map(|(i, s)| match s.is_infer() {
+                // `-1` keeps the current extent, so it needs one to keep.
+                true => current_shape.get(i).cloned().context(AxisOutOfRangeSnafu { axis: i as isize, ndim }),
+                false => Ok(s),
+            })
+            .collect::<Result<_>>()?;
         self.uop().try_expand(&shape).map(Self::new).context(UOpSnafu)
     }
 
@@ -473,12 +478,14 @@ impl Tensor {
                 .iter()
                 .zip(shape.iter())
                 .map(|((b, e), s)| {
-                    let dim = s.as_const().expect("pad with negative values requires concrete shape") as isize;
+                    let dim =
+                        s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "pad with negative values" })?
+                            as isize;
                     let begin = (-*b).max(0);
                     let end = (dim + *e).min(dim);
-                    (begin, end)
+                    Ok((begin, end))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             self.try_shrink(&shrink_ranges)?
         } else {
             self.clone()
@@ -655,7 +662,7 @@ impl Tensor {
     pub fn meshgrid(tensors: &[&Tensor], indexing: MeshgridIndexing) -> Result<Vec<Tensor>> {
         origin_call!("meshgrid");
         let n = tensors.len();
-        let sizes: Vec<usize> = tensors.iter().map(|t| t.numel().unwrap()).collect();
+        let sizes: Vec<usize> = tensors.iter().map(|t| t.numel()).collect::<Result<_>>()?;
         // For "xy" indexing, swap the first two inputs
         let swapped: Vec<usize> = if indexing == MeshgridIndexing::Xy && n >= 2 {
             let mut s: Vec<usize> = (0..n).collect();
@@ -771,6 +778,10 @@ impl Tensor {
                     } else {
                         (begin, end)
                     };
+                    // Still negative after normalization: `as usize` would wrap
+                    // to a huge extent instead of reporting the bad index.
+                    snafu::ensure!(nb >= 0, NegativeDimensionSnafu { dim: begin });
+                    snafu::ensure!(ne >= 0, NegativeDimensionSnafu { dim: end });
                     Ok((SInt::Const(nb as usize), SInt::Const(ne as usize)))
                 }
             })
@@ -832,6 +843,24 @@ impl Tensor {
         })
     }
 
+    /// Concrete dimensions of this tensor.
+    ///
+    /// # Errors
+    ///
+    /// Fails if any dimension is symbolic; use [`shape`](Self::shape) to keep
+    /// symbolic dimensions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// let t = Tensor::from_slice(&[1.0f32; 6]).try_reshape(&[2, 3]).unwrap();
+    /// assert_eq!(t.dims().unwrap(), vec![2, 3]);
+    /// ```
+    pub fn dims(&self) -> Result<Vec<usize>> {
+        svod_ir::shape::to_vec_usize(&self.shape()?).context(UOpSnafu)
+    }
+
     /// Get the size of a specific dimension.
     ///
     /// Supports negative indexing (e.g., -1 for last dimension).
@@ -839,21 +868,31 @@ impl Tensor {
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// let t = Tensor::from_slice([1.0f32; 6]).try_reshape(&[2, 3])?;
-    /// assert_eq!(t.dim(0)?.as_const(), Some(2));   // First dimension
-    /// assert_eq!(t.dim(1)?.as_const(), Some(3));   // Second dimension
-    /// assert_eq!(t.dim(-1)?.as_const(), Some(3));  // Last dimension (negative indexing)
-    /// assert_eq!(t.dim(-2)?.as_const(), Some(2));  // Second-to-last dimension
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// let t = Tensor::from_slice(&[1.0f32; 6]).try_reshape(&[2, 3]).unwrap();
+    /// assert_eq!(t.dim(0).unwrap().as_const(), Some(2)); // First dimension
+    /// assert_eq!(t.dim(-1).unwrap().as_const(), Some(3)); // Last dimension
     /// ```
     ///
     /// # Errors
     ///
     /// Returns error if axis is out of range.
-    pub(crate) fn dim(&self, axis: isize) -> Result<svod_ir::SInt> {
+    pub fn dim(&self, axis: isize) -> Result<svod_ir::SInt> {
         let shape = self.shape()?;
         let idx = Self::normalize_axis(axis, shape.len())?;
         Ok(shape[idx].clone())
+    }
+
+    /// Get the size of a specific dimension, requiring it to be concrete.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AxisOutOfRange`] if `axis` is out of range,
+    /// [`Error::NonConstDim`] if the dimension is symbolic.
+    pub fn dim_const(&self, axis: isize) -> Result<usize> {
+        let dim = self.dim(axis)?;
+        dim.as_const().ok_or(Error::NonConstDim { axis, dim })
     }
 
     /// Normalize a single axis index (handle negative indices).

@@ -191,14 +191,12 @@ fn sq_attention_packed_validates_head_geometry() {
     let k = Tensor::empty(&[1, 5, 4, 64], DType::Float32);
     let v = Tensor::empty(&[1, 5, 4, 64], DType::Float32);
     let err = crate::single_query_attention_packed(&q, &k, &v, 2, SqAttentionOpts::default())
-        .err()
-        .expect("out-of-range heads");
+        .expect_err("out-of-range heads");
     assert!(matches!(err, crate::LaunchError::OperandDimMismatch { .. }));
 
     let bad_v = Tensor::empty(&[1, 5, 5, 64], DType::Float32);
     let err = crate::single_query_attention_packed(&q, &k, &bad_v, 1, SqAttentionOpts::default())
-        .err()
-        .expect("mismatched total heads");
+        .expect_err("mismatched total heads");
     assert!(matches!(err, crate::LaunchError::OperandDimMismatch { .. }));
 }
 

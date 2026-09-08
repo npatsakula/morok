@@ -1,3 +1,4 @@
+pub mod accessors;
 pub mod activation;
 pub mod arithmetic;
 pub mod batch;
