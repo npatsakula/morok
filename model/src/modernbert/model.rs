@@ -74,9 +74,7 @@ impl ModernBert {
     }
 
     pub fn from_hub_with_revision(model_id: &str, revision: &str, config: &mut ModernBertConfig) -> Result<Self> {
-        let api = hf_hub::api::sync::Api::new().context(HubSnafu)?;
-        let repo =
-            api.repo(hf_hub::Repo::with_revision(model_id.to_string(), hf_hub::RepoType::Model, revision.to_string()));
+        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
         // Parse the published config.json, then splice back the caller-chosen
         // dtype / max_batch_size (those aren't in the on-disk config).
         let cfg_path = repo.get("config.json").context(HubSnafu)?;

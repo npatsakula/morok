@@ -94,7 +94,7 @@ nix fmt # Format source files
 | Зависимость | Версия | Обязательна | Описание |
 |-------------|--------|-------------|----------|
 | Rust | 1.85+ | да | Edition 2024 |
-| LLVM | 21.x | да | Backend кодогенерации для CPU |
+| LLVM | 22.x | да | Backend кодогенерации для CPU |
 | Clang | - | да | C-компилятор для сборки LLVM |
 | pkgconf | - | да | Инструмент конфигурации сборки |
 | protobuf | - | да | Компиляция ONNX proto |
@@ -102,11 +102,12 @@ nix fmt # Format source files
 | libffi | >=3.4 | да | Foreign function interface |
 | libxml2 | >=2.13 | да | Парсинг XML |
 | Z3 | >=4.15 | нет | SMT-решатель для верификации оптимизаций |
+| Драйвер NVIDIA | CUDA >=12.8 (R570) | нет | `libcuda.so.1` для CUDA-бэкенда, загружается во время выполнения; тулкит не нужен |
+| Таргеты Clang NVPTX / AMDGPU | - | нет | Компиляция GPU-ядер (`clang --print-targets`) |
 
 ## Тестирование
 
 ```bash
 cargo test
 cargo test --features z3,proptest  # With Z3 verification and PB generated tests
-cargo test --features cuda   # With CUDA tests
 ```

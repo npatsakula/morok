@@ -92,7 +92,7 @@ nix fmt # Format source files
 | 依赖 | 版本 | 必需 | 描述 |
 |------------|---------|----------|-------------|
 | Rust | 1.85+ | 是 | Edition 2024 |
-| LLVM | 21.x | 是 | CPU 代码生成后端 |
+| LLVM | 22.x | 是 | CPU 代码生成后端 |
 | Clang | - | 是 | LLVM 构建所需的 C 编译器 |
 | pkgconf | - | 是 | 构建配置工具 |
 | protobuf | - | 是 | ONNX proto 编译 |
@@ -100,11 +100,12 @@ nix fmt # Format source files
 | libffi | >=3.4 | 是 | 外部函数接口 |
 | libxml2 | >=2.13 | 是 | XML 解析 |
 | Z3 | >=4.15 | 否 | 用于优化验证的 SMT 求解器 |
+| NVIDIA 驱动 | CUDA >=12.8 (R570) | 否 | CUDA 后端所需的 `libcuda.so.1`，在运行时加载；无需 toolkit |
+| Clang NVPTX / AMDGPU target | - | 否 | GPU 内核编译（`clang --print-targets`） |
 
 ## 测试
 
 ```bash
 cargo test
 cargo test --features z3,proptest  # With Z3 verification and PB generated tests
-cargo test --features cuda   # With CUDA tests
 ```

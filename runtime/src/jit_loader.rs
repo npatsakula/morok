@@ -404,7 +404,7 @@ fn apply_relocation(
     patch: u64,
     target: u64,
     addend: i64,
-    r_type: u32,
+    r_type: object::elf::RelocationType,
     arch: Architecture,
     state: &mut RelocState,
 ) -> crate::Result<()> {
@@ -426,7 +426,7 @@ fn reloc_x86_64(
     patch: u64,
     target: u64,
     addend: i64,
-    r_type: u32,
+    r_type: object::elf::RelocationType,
     state: &mut RelocState,
 ) -> crate::Result<()> {
     use object::elf::*;
@@ -487,7 +487,7 @@ fn reloc_aarch64(
     patch: u64,
     target: u64,
     addend: i64,
-    r_type: u32,
+    r_type: object::elf::RelocationType,
     state: &mut RelocState,
 ) -> crate::Result<()> {
     use object::elf::*;
@@ -554,7 +554,7 @@ fn reloc_riscv64(
     patch: u64,
     target: u64,
     addend: i64,
-    r_type: u32,
+    r_type: object::elf::RelocationType,
     state: &mut RelocState,
 ) -> crate::Result<()> {
     use object::elf::*;
@@ -646,7 +646,7 @@ fn reloc_loongarch64(
     patch: u64,
     target: u64,
     addend: i64,
-    r_type: u32,
+    r_type: object::elf::RelocationType,
 ) -> crate::Result<()> {
     use object::elf::*;
     match r_type {
@@ -694,7 +694,7 @@ fn reloc_ppc64(
     patch: u64,
     target: u64,
     addend: i64,
-    r_type: u32,
+    r_type: object::elf::RelocationType,
     state: &mut RelocState,
 ) -> crate::Result<()> {
     use object::elf::*;
@@ -767,11 +767,11 @@ fn patch_insn(mmap: &mut [u8], off: usize, mask: u32, bits: u32) {
     mmap[off..off + 4].copy_from_slice(&((insn & mask) | bits).to_le_bytes());
 }
 
-fn unsupported_reloc(arch: &str, r_type: u32) -> crate::Error {
+fn unsupported_reloc(arch: &str, r_type: object::elf::RelocationType) -> crate::Error {
     crate::Error::JitCompilation { reason: format!("Unsupported {arch} relocation type: {r_type}") }
 }
 
-fn out_of_range_reloc(arch: &str, r_type: u32, value: i64) -> crate::Error {
+fn out_of_range_reloc(arch: &str, r_type: object::elf::RelocationType, value: i64) -> crate::Error {
     crate::Error::JitCompilation {
         reason: format!("{arch} relocation type {r_type} out of range: {value:#x} does not fit its field"),
     }

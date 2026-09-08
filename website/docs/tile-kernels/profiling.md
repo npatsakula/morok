@@ -7,7 +7,7 @@ sidebar_label: Profiling & Benchmarking
 [Debugging](./debugging) answers "is this kernel correct, and roughly how fast?" with a single
 hardware timestamp. This chapter is about the question after that: *where does the time go, and
 what is the bottleneck?* Svod ships a **layered kernel profiler** that answers it in four tiers —
-device time, a roofline, static occupancy, and AMD hardware counters — all behind one call.
+device time, a roofline, static occupancy, and hardware counters — all behind one call.
 
 The profiler lives in the `runtime` crate, not in `tk`, and that placement is the point: it works
 on **any** `Tensor` or `ExecutionPlan`, whether the kernels inside came from the graph optimizer
@@ -33,15 +33,15 @@ flowchart TD
   P["Tensor::profile / ExecutionPlan::profile"] --> T1["Tier 1 - device time (GPU-clock timestamps)"]
   P --> T2["Tier 2 - roofline (GFLOP/s, GB/s)"]
   P --> T3["Tier 3 - static occupancy (VGPR/SGPR/LDS, occ%)"]
-  P --> T4["Tier 4 - HW counters / PMC (SQ busy, waves, VALU)"]
+  P --> T4["Tier 4 - HW counters / PMC (AMD SQ block, CUDA CUPTI)"]
 ```
 
 | Tier | What it reports | Source | Needs execution? |
 |------|-----------------|--------|------------------|
 | **1 — device time** | per-kernel GPU execution time | GPU-clock dispatch timestamps | yes |
 | **2 — roofline** | derived **GFLOP/s** and **GB/s** | FLOP estimate from the kernel's IR; bytes from the plan's buffers | yes (rates need time) |
-| **3 — static occupancy** | VGPR / SGPR / LDS / scratch usage and VGPR-limited **occupancy %** | decoded from the AMD kernel descriptor | no — pure static decode |
-| **4 — hardware counters (PMC)** | SQ-block counters: busy cycles, waves launched, VALU instructions issued | PM4 perf-counter packets, summed across the compute grid | yes, on a stable GPU |
+| **3 — static occupancy** | VGPR / SGPR / LDS / scratch usage and an **occupancy %** | AMD: decoded from the kernel descriptor. CUDA: `cuFuncGetAttribute` and the driver's own occupancy calculator | no — pure static decode |
+| **4 — hardware counters (PMC)** | AMD: SQ busy cycles, waves, VALU instructions. CUDA: SM cycles, warps, instructions, tensor-pipe cycles, DRAM bytes | AMD: PM4 perf-counter packets summed across the grid. CUDA: the CUPTI range profiler | yes, and the counters must be unlocked |
 
 A few details worth knowing:
 
@@ -52,10 +52,13 @@ A few details worth knowing:
   an occupancy %. On CDNA3 (wave64) the resources (VGPR/SGPR/LDS/scratch) are still decoded and
   shown, but the occupancy column reads `-` because that geometry is not modeled. Occupancy here is
   the **VGPR-limited** first-order limiter only — LDS and workgroup limits are not folded in.
-- **Tier 4** programs the SQ-block counters via PM4 packets and sums them across the grid. The
-  three implemented counters are `sqbusy` (busy cycles), `waves` (waves launched), and `valu`
-  (VALU instructions issued) — together they answer the ILP/occupancy question that timing alone
-  cannot.
+- **Tier 4** is per-backend. On AMD it programs the SQ block with PM4 packets and sums across the
+  grid: `sqbusy` (busy cycles), `waves` (waves launched) and `valu` (VALU instructions issued),
+  which together answer the ILP/occupancy question timing alone cannot. On CUDA it drives the
+  CUPTI range profiler: `cycles`, `warps`, `inst`, `tensor` (tensor-pipe active cycles) and `dram`
+  (bytes through DRAM) — `tensor` against `cycles` is tensor-core utilization, and `dram` separates
+  a bandwidth-bound kernel from an issue-bound one. Counter tokens are unique across backends, so a
+  selection naming another backend's counters drops them rather than mis-programming a block.
 
 The report's columns adapt to what was collected: a Tier-1-only run prints just timing, and the
 GFLOP/s, resource, and counter columns appear only when their tier ran.
@@ -131,15 +134,15 @@ let opts = ProfileOptions {
 };
 ```
 
-`PmcSelection` is `None` (Tiers 1–3 only), `Default` (the implemented SQ counters), or
-`Custom(Vec<PmcCounter>)` (an explicit list).
+`PmcSelection` is `None` (Tiers 1–3 only), `Default` (whatever the running backend collects,
+resolved through `PlanContext::pmc_default`), or `Custom(Vec<PmcCounter>)` (an explicit list).
 
 `ProfileOptions::from_env()` is the single place profiling env vars are read:
 
 | Env var | Effect |
 |---------|--------|
 | `SVOD_PROFILE_ITERS` | replay count for the min-merge (clamped to at least 1) |
-| `SVOD_PMC` | Tier-4 selection: empty or `0` → off; `1` → the default counter set; otherwise a comma-separated token list (`sqbusy`, `waves`, `valu`) |
+| `SVOD_PMC` | Tier-4 selection: empty or `0` → off; `1` → the backend's default set; otherwise a comma-separated token list (AMD `sqbusy`, `waves`, `valu`; CUDA `cycles`, `warps`, `inst`, `tensor`, `dram`) |
 | `SVOD_ORIGIN` | `1` records the scope every op is built under (module path, call site, ONNX node), see below |
 | `SVOD_ORIGIN_DEPTH` | path segments the origin rollups keep (`origin_depth`); unset — or `0` — keeps the full path |
 
@@ -149,15 +152,23 @@ SVOD_DEVICE=AMD:0 SVOD_PROFILE_ITERS=20 SVOD_PMC=1 ...
 
 # Only VALU instructions and SQ-busy cycles.
 SVOD_DEVICE=AMD:0 SVOD_PMC=valu,sqbusy ...
+
+# Tensor-core utilization and DRAM traffic on CUDA.
+SVOD_DEVICE=CUDA:0 SVOD_PMC=tensor,dram ...
 ```
 
 ### Accumulate-and-min
 
 When `iters > 1` (or across criterion's many invocations), the profiler does **not** average. Each
 pass produces a `RunProfile`, and passes are merged by `RunProfile::merge_min`: per kernel, the
-faster (minimum device-time) sample wins, carrying *that* sample's counters and static analysis.
+faster (minimum device-time) sample wins, carrying *that* sample's static analysis.
 Minimum is the robust estimator of a kernel's intrinsic cost — it rejects the scheduling jitter,
 contention, and clock-ramp outliers that inflate a mean.
+
+Counters are the exception: collecting them perturbs the pass that collects them, so that pass is
+never the fastest, and the merge keeps counters from whichever pass captured them rather than
+dropping them with the slower sample. Timing and counters in one table can therefore come from
+different passes — which is the point, since a counted pass does not time the kernel.
 
 ## Attributing kernels to model code
 
@@ -253,17 +264,23 @@ completely unaffected — same numbers, no extra passes.
 
 :::caution Two things the profiler cannot give you
 **Tier 2 GFLOP/s is blank for hand-authored kernels.** The FLOP estimate walks the kernel's IR,
-and it only auto-rates **scheduler-built** kernels. A hand-authored `tk` kernel uses unbounded
-symbolic ranges, so the AST walk *saturates* instead of forming a real count — the profiler treats
-that as "no reliable estimate" rather than printing a garbage roofline, so the **GFLOP/s column
-shows `-`** for those kernels. (GB/s still works, since bytes come from the plan's buffers, not the
+and it only auto-rates **scheduler-built** kernels. It infers which loops an operation sits in from
+what its operands depend on, which holds while the scheduler writes the index expressions. A
+hand-lowered `tk` kernel does its own addressing, and its loop variables then reach the arithmetic
+only through addresses — so the walk can no longer recover the nesting, in either direction. The
+profiler declines the estimate rather than printing a garbage roofline (an early version reported a
+matmul at eight times the hardware's peak), so the **GFLOP/s column shows `-`** for those kernels. (GB/s still works, since bytes come from the plan's buffers, not the
 IR.) Compute the roofline for hand kernels by hand from the algorithm's known FLOP count and the
 Tier-1 device time.
 
-**Tier 4 needs a stable power state.** The PM4 hardware counters are only meaningful when the GPU
-holds a fixed clock. On the default `auto` power state the profiler does *not* fail — it degrades:
-it reports timing only and prints a one-line note that counters need the `profile_standard` state.
-Put the GPU in that state first (e.g. `amd-smi set -l stable_std`), then re-run with `SVOD_PMC`.
+**Tier 4 has to be unlocked, and the requirement differs by vendor.** On AMD the PM4 counters are
+only meaningful at a fixed clock, so the GPU must hold the `profile_standard` power state
+(`amd-smi set -l stable_std`). On CUDA the driver restricts counter collection to admin users
+unless `NVreg_RestrictProfilingToAdminUsers=0` is set, and CUPTI must be loadable
+(`SVOD_CUDA_CUPTI=0` disables it deliberately). In neither case does the profiler fail: it reports
+timing only and prints a one-line note saying what is missing. See
+[Profiling on CUDA](../backends/cuda/profiling.md) for the NVIDIA specifics, including why counter
+collection costs an extra pass there.
 :::
 
 ---
@@ -276,6 +293,7 @@ Put the GPU in that state first (e.g. `amd-smi set -l stable_std`), then re-run 
 | "Is this kernel compute- or bandwidth-bound?" | the Tier-2 GFLOP/s and GB/s columns (graph kernels), or compute the roofline by hand (tk kernels) |
 | "Why is occupancy low — registers or LDS?" | the Tier-3 VGPR/SGPR/LDS/occ% columns (no run needed) |
 | "Is the kernel issuing enough VALU work per busy cycle?" | Tier-4 `SVOD_PMC=1`, on a `profile_standard` GPU |
+| "Is the kernel actually using the tensor cores, or bound on DRAM?" | Tier-4 `SVOD_PMC=tensor,dram` on CUDA |
 | "How does this compare to the graph-native baseline over many runs?" | `cargo bench --profile-time` — see [Debugging → Timing on real hardware](./debugging) |
 
 For correctness and structural checks rather than performance, stay in [Debugging](./debugging);

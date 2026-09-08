@@ -201,7 +201,7 @@ fn load_pytorch_bin_with_state_dict_key(
             if zf.compression() != zip::CompressionMethod::STORE {
                 return Err(Error::CompressedStorage);
             }
-            let start = zf.data_start();
+            let start = zf.data_start().expect("by_name locates the entry data");
             drop(zf);
             data_starts.insert(sfile.clone(), start);
             start

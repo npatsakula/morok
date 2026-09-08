@@ -56,7 +56,7 @@ pub enum Error {
         source: Box<crate::state::Error>,
     },
     #[snafu(display("hub error: {source}"))]
-    Hub { source: hf_hub::api::sync::ApiError },
+    Hub { source: hf_hub::HFError },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -171,8 +171,7 @@ pub(crate) const HUB_REPO: &str = "vpermilp/firered_vad";
 
 /// Download a file from [`HUB_REPO`] into the local HF cache.
 pub(crate) fn hub_file(name: &str) -> Result<std::path::PathBuf> {
-    let api = hf_hub::api::sync::Api::new().context(HubSnafu)?;
-    let repo = api.repo(hf_hub::Repo::with_revision(HUB_REPO.into(), hf_hub::RepoType::Model, "main".into()));
+    let repo = crate::hub::HubRepo::open(HUB_REPO, "main").context(HubSnafu)?;
     repo.get(name).context(HubSnafu)
 }
 

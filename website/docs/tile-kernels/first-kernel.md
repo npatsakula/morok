@@ -45,9 +45,9 @@ let ta = Tensor::from_slice(&a);
 let tb = Tensor::from_slice(&b);
 let mut out = Tensor::empty(&[1, 1, 16, 16], DType::Float32);
 
-// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA.
-let arch = svod_tk::target::resolve_arch(&ta.device()).expect("an AMD device");
-let w = arch.wave_size() as i64;
+// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA and CUDA.
+let arch = svod_tk::target::resolve_arch(&ta.device()).expect("a GPU device");
+let w = svod_tk::ArchCaps::for_arch(arch).wave_size as i64;
 
 run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| {
     let warp = ker.warp();
@@ -96,7 +96,7 @@ run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| { /* bo
 The `[1, 1, 1]` grid and `w` block are the launch geometry. We use **one workgroup of one wave**:
 the whole `16×16` tile fits in a single wave's registers, so there is nothing to spread across
 blocks. The block size is `w`, the **wave width** — which we queried from the device up front
-(`resolve_arch(&ta.device()).wave_size()`), because a wave is 64 lanes on CDNA but 32 on RDNA and
+(`ArchCaps::for_arch(resolve_arch(&ta.device())).wave_size`), because a wave is 64 lanes on CDNA but 32 on RDNA and
 the block dimension *is* that lane count. The output slice comes first, the inputs second — and
 **that order is the contract** the next step depends on.
 
@@ -209,7 +209,7 @@ wrong answer:
 | **Tile dims are a multiple of `16`** | A tile is a whole number of `16×16` matrix-core fragments; `ker.rt` asserts it. |
 | **`gl()` order = launch buffer order** | Outputs first, then inputs. The bind is positional; a mismatch silently swaps buffers — wrong numbers, no error, so the compiler can't catch it. |
 | **Request fragments by role, not by constant** | `caps.frag(role)` is what makes one body run on wave32 *and* wave64. |
-| **It's a GPU kernel** | The builder mints real lane indices (`Op::Special`), so execution targets an AMD device, not the CPU. |
+| **It's a GPU kernel** | The builder mints real lane indices (`Op::Special`), so execution targets a GPU — AMD or CUDA — not the CPU. |
 
 ---
 
@@ -223,7 +223,8 @@ and **no** `DefineLocal`: this is a register-only round-trip, the leanest kernel
 Because the kernel emits `Special` ops, it *is* a fully hand-lowered GPU kernel — the optimizer and
 the workgroup-dimension passes treat a `Special`-bearing graph as already-lowered and pass it
 through (the same gate `opts_to_apply: Some(vec![])` enforces). That is also why it renders only on
-the AMD LLVM backend: the lane index has no meaning on the scalar CPU path. *Building* the `SINK`,
+a GPU backend — AMD or NVPTX: the lane index has no meaning on the scalar CPU
+path. *Building* the `SINK`,
 though, is pure UOp construction — that needs no GPU; only executing it does. That split is what
 lets a kernel be guarded by a host-side shape check on every build, with a separate gated test for
 the on-device numbers.

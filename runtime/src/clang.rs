@@ -76,13 +76,90 @@ impl ClangToolchain {
             .map_err(|error| Error::JitCompilation { reason: format!("clang target probe was not UTF-8: {error}") })
     }
 
-    pub(crate) fn executable(&self) -> &Path {
-        &self.executable
-    }
-
     pub(crate) fn command(&self) -> Command {
         Command::new(&self.executable)
     }
+
+    /// Does this clang advertise `target` (an LLVM target name such as
+    /// `amdgcn` or `nvptx64`)? Memoized per executable: an installation does
+    /// not change during a run, and the probe forks a subprocess.
+    pub(crate) fn has_target(&self, target: &'static str) -> bool {
+        cached_target(&self.executable, target)
+    }
+
+    /// Feed LLVM IR text to clang on stdin and return its stdout. `args` must
+    /// already select `-x ir`, the target and the output form; `what` names
+    /// the target in diagnostics.
+    pub(crate) fn compile_ir(&self, args: &[String], ir: &str, what: &str) -> Result<Vec<u8>> {
+        let mut command = self.command();
+        command.args(args);
+        run_piped(command, ir.as_bytes(), &format!("clang {what} compilation"))
+    }
+}
+
+/// Run `command` with `input` on its stdin and return its stdout; a failing
+/// status carries the stderr, and empty output is a failure too (`what`
+/// names the tool in both).
+pub(crate) fn run_piped(mut command: Command, input: &[u8], what: &str) -> Result<Vec<u8>> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .jit("spawn the compiler")?;
+    child.stdin.take().expect("stdin piped").write_all(input).jit("write the compiler's stdin")?;
+    let output = child.wait_with_output().jit("wait for the compiler")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::JitCompilation { reason: format!("{what} failed:\n{stderr}") });
+    }
+    if output.stdout.is_empty() {
+        return Err(Error::JitCompilation { reason: format!("{what} produced empty output") });
+    }
+    Ok(output.stdout)
+}
+
+/// Does `executable` list `target` under `--print-targets`?
+pub(crate) fn probe_target(executable: &Path, target: &str) -> bool {
+    let Ok(output) = Command::new(executable).arg("--print-targets").output() else { return false };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout).lines().any(|line| line.split_whitespace().next() == Some(target))
+}
+
+/// [`probe_target`] memoized per executable for the process: an installation
+/// does not change during a run, and the probe forks a subprocess.
+fn cached_target(executable: &Path, target: &'static str) -> bool {
+    static CACHE: std::sync::OnceLock<papaya::HashMap<(PathBuf, &'static str), bool>> = std::sync::OnceLock::new();
+    let probed = CACHE.get_or_init(papaya::HashMap::new).pin();
+    let key = (executable.to_path_buf(), target);
+    if let Some(known) = probed.get(&key) {
+        return *known;
+    }
+    let result = probe_target(executable, target);
+    probed.insert(key, result);
+    result
+}
+
+/// Does the `clang` on `PATH` advertise `target`?
+pub(crate) fn path_clang_has_target(target: &'static str) -> bool {
+    cached_target(Path::new("clang"), target)
+}
+
+/// When `env_var` names a directory, write `ir` there as `<tag>_<module>.ll`
+/// so each kernel lands in its own file. The module name comes from the
+/// `; ModuleID = '<name>'` directive: the dispatcher pre-compiles many
+/// kernels ahead of any dispatch, so a single fixed path would only ever hold
+/// the last one compiled, never the failing one.
+pub(crate) fn dump_ir(env_var: &str, tag: &str, ir: &str) {
+    let Ok(dir) = std::env::var(env_var) else { return };
+    let module = ir
+        .lines()
+        .find_map(|l| l.strip_prefix("; ModuleID = '").and_then(|s| s.strip_suffix("'")))
+        .unwrap_or("unknown");
+    // Kernel names are `[A-Za-z0-9_]` in practice; be defensive anyway.
+    let safe: String = module.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(Path::new(&dir).join(format!("{tag}_{safe}.ll")), ir);
 }
 
 /// Probe-cache key for one flag set, or `None` when the result must not be
@@ -266,7 +343,7 @@ fn host_endianness() -> Endianness {
     if cfg!(target_endian = "little") { Endianness::Little } else { Endianness::Big }
 }
 
-fn resolve_executable(name: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_executable(name: &str) -> Result<PathBuf> {
     let path = std::env::var_os("PATH").ok_or_else(|| Error::JitCompilation { reason: "PATH is not set".into() })?;
     for directory in std::env::split_paths(&path) {
         let candidate = directory.join(name);
@@ -277,11 +354,15 @@ fn resolve_executable(name: &str) -> Result<PathBuf> {
     Err(Error::JitCompilation { reason: format!("{name} not found in PATH") })
 }
 
-fn run_probe(executable: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new(executable).args(args).output().jit("run clang identity probe")?;
+pub(crate) fn run_probe(executable: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new(executable).args(args).output().jit("run compiler identity probe")?;
     if !output.status.success() {
         return Err(Error::JitCompilation {
-            reason: format!("clang identity probe failed:\n{}", String::from_utf8_lossy(&output.stderr)),
+            reason: format!(
+                "{} identity probe failed:\n{}",
+                executable.display(),
+                String::from_utf8_lossy(&output.stderr)
+            ),
         });
     }
     let mut bytes = output.stdout;
@@ -289,7 +370,7 @@ fn run_probe(executable: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

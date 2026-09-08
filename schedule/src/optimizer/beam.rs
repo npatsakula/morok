@@ -402,7 +402,9 @@ pub struct BeamStageTimings {
 pub struct CompiledCandidate<T> {
     pub artifact: T,
     pub binary_key: Vec<u8>,
-    pub compute_ops: u64,
+    /// `None` when the AST has no reliable count; such a candidate is never
+    /// filtered as bloated and never lowers the bar for the others.
+    pub compute_ops: Option<u64>,
     pub preparation: Duration,
     pub compilation: Duration,
 }
@@ -420,7 +422,17 @@ pub struct CandidateMetrics {
     pub ir_hash: u64,
     /// Cheap upper bound on the kernel's compute work; used by the
     /// `least_compute_ops*1000` filter to discard degenerate candidates.
-    pub compute_ops: u64,
+    /// `None` when no reliable count exists, which exempts the candidate.
+    pub compute_ops: Option<u64>,
+}
+
+/// The `least_compute_ops*1000` bloat filter: fold `compute_ops` into the
+/// running minimum and report whether the candidate is a thousand times the
+/// leanest one seen so far.
+fn bloated(least_compute_ops: &mut u64, compute_ops: Option<u64>) -> bool {
+    let Some(compute_ops) = compute_ops else { return false };
+    *least_compute_ops = (*least_compute_ops).min(compute_ops);
+    least_compute_ops.saturating_mul(1000) < compute_ops
 }
 
 /// Hash a UOp tree to a `u64` for `seen_libs` dedup.
@@ -509,8 +521,7 @@ where
             if !seen_libs.insert(metrics.ir_hash) {
                 continue;
             }
-            least_compute_ops = least_compute_ops.min(metrics.compute_ops);
-            if least_compute_ops.saturating_mul(1000) < metrics.compute_ops {
+            if bloated(&mut least_compute_ops, metrics.compute_ops) {
                 continue;
             }
 
@@ -652,8 +663,7 @@ where
             result.compiled += 1;
             result.stage_timings.filtering += compiled.preparation;
             result.stage_timings.compilation += compiled.compilation;
-            least_compute_ops = least_compute_ops.min(compiled.compute_ops);
-            if least_compute_ops.saturating_mul(1000) < compiled.compute_ops {
+            if bloated(&mut least_compute_ops, compiled.compute_ops) {
                 return;
             }
             let started = Instant::now();
@@ -742,8 +752,7 @@ where
             result.compiled += 1;
             result.stage_timings.filtering += compiled.preparation;
             result.stage_timings.compilation += compiled.compilation;
-            least_compute_ops = least_compute_ops.min(compiled.compute_ops);
-            if least_compute_ops.saturating_mul(1000) < compiled.compute_ops {
+            if bloated(&mut least_compute_ops, compiled.compute_ops) {
                 return;
             }
             let started = Instant::now();
@@ -890,7 +899,7 @@ impl CacheKey {
         let ast_hash = hasher.finish();
 
         Self {
-            schema: 8,
+            schema: 9,
             ast_hash,
             beam_width: config.beam_width,
             device: scheduler.ren.device,
@@ -934,12 +943,12 @@ impl CacheKey {
 
 /// Serialize applied opts to bytes for caching using bincode.
 fn serialize_opts(opts: &[Opt]) -> Vec<u8> {
-    bincode::serialize(opts).expect("Opt serialization should not fail")
+    bincode::serde::encode_to_vec(opts, bincode::config::standard()).expect("Opt serialization should not fail")
 }
 
 /// Deserialize opts from cached bytes using bincode.
 fn deserialize_opts(bytes: &[u8]) -> Option<Vec<Opt>> {
-    bincode::deserialize(bytes).ok()
+    bincode::serde::decode_from_slice(bytes, bincode::config::standard()).ok().map(|(opts, _)| opts)
 }
 
 fn cached_opt_suffix<'a>(scheduler: &Scheduler, cached: &'a [Opt]) -> Option<&'a [Opt]> {
@@ -958,7 +967,9 @@ fn replay_cached(scheduler: &Scheduler, cached_opts: &[Opt]) -> Result<Scheduler
 fn cache_get(key: &CacheKey) -> Option<Vec<Opt>> {
     let db = CACHE_DB.as_ref()?;
     let bytes = db.get(key.to_bytes()).ok()??;
-    deserialize_opts(&bytes)
+    let opts = deserialize_opts(&bytes);
+    tracing::debug!(ast_hash = format_args!("{:016x}", key.ast_hash), hit = opts.is_some(), "Beam cache lookup");
+    opts
 }
 
 /// Store beam search result in cache.

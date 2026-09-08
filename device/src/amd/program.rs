@@ -75,7 +75,7 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
     // First pass: place sections with sh_addr != 0 directly.
     for section in file.sections() {
         let alloc =
-            matches!(section.flags(), SectionFlags::Elf { sh_flags } if sh_flags & object::elf::SHF_ALLOC as u64 != 0);
+            matches!(section.flags(), SectionFlags::Elf { sh_flags, .. } if sh_flags.contains(object::elf::SHF_ALLOC));
         if !alloc || section.size() == 0 {
             continue;
         }
@@ -96,7 +96,7 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
     let mut zero_addr_remap: std::collections::HashMap<object::SectionIndex, u64> = std::collections::HashMap::new();
     for section in file.sections() {
         let alloc =
-            matches!(section.flags(), SectionFlags::Elf { sh_flags } if sh_flags & object::elf::SHF_ALLOC as u64 != 0);
+            matches!(section.flags(), SectionFlags::Elf { sh_flags, .. } if sh_flags.contains(object::elf::SHF_ALLOC));
         if !alloc || section.size() == 0 || section.address() != 0 {
             continue;
         }
@@ -166,7 +166,7 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
         let section_base = image_offset(section.index()).unwrap_or(0);
         for (sec_off, reloc) in section.relocations() {
             let r_type = match reloc.flags() {
-                RelocationFlags::Elf { r_type } => r_type,
+                RelocationFlags::Elf { r_type } => r_type.0,
                 _ => continue,
             };
             let sym_value: i64 = match reloc.target() {

@@ -27,8 +27,7 @@ fn real_file(name: &str) -> PathBuf {
     if local.exists() {
         local
     } else {
-        let api = hf_hub::api::sync::Api::new().expect("HF Hub API");
-        let repo = api.repo(hf_hub::Repo::with_revision(HUB_REPO.into(), hf_hub::RepoType::Model, "main".into()));
+        let repo = crate::hub::HubRepo::open(HUB_REPO, "main").expect("HF Hub API");
         repo.get(name).unwrap_or_else(|_| panic!("download {name} from HF Hub"))
     }
 }

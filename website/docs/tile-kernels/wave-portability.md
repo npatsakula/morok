@@ -4,9 +4,12 @@ sidebar_label: Wave32 vs Wave64
 
 # Keeping One Kernel Correct on Two Architectures
 
-Here is a bug that doesn't exist on NVIDIA. You write a tile kernel, test it on a CDNA
+Here is a bug NVIDIA hardware cannot give you. You write a tile kernel, test it on a CDNA
 datacenter GPU, and it's perfect. You run the *same* kernel on an RDNA laptop APU and the
 numbers are garbage — no crash, no error, just wrong. Nothing in the code looks different.
+CUDA is spared this particular trap — a warp is 32 lanes everywhere — but not the reason
+behind it: the fragment layout still differs, so the same indirection carries the kernel
+onto NVIDIA.
 
 [What Tiling Is](./tiling) introduced fragments and role-based selection; this chapter explains
 why that indirection has to exist. The culprit is the **wavefront size**, and dealing with it
@@ -16,13 +19,14 @@ cleanly is what separates a tile library that works on one chip from one that's 
 
 ## The 32-vs-64 split
 
-A wavefront (AMD's "warp") is the group of lanes that execute in lockstep. On AMD there are two
-sizes, and Svod targets both:
+A wavefront (NVIDIA's "warp") is the group of lanes that execute in lockstep. On AMD there are
+two sizes, and Svod targets both, plus NVIDIA's single one:
 
 | Architecture | Example | Matrix op | Wavefront |
 |--------------|---------|-----------|-----------|
 | **CDNA** | gfx942 (datacenter) | MFMA | **wave64** — 64 lanes |
 | **RDNA** | gfx1151 (RDNA3.5) | WMMA | **wave32** — 32 lanes |
+| **CUDA** | sm_80+ (Ampere and later) | `mma.sync` | **warp32** — 32 lanes |
 
 That single number ripples through everything. A `16×16` tile has 256 elements. Spread across
 64 lanes, that's 4 elements per lane; across 32 lanes, it's 8. Different lanes own different
@@ -72,20 +76,22 @@ the `shuffle_xor` primitive used to sum a value across a wave — was written wi
 wave64 reduction tree. On RDNA's 32-lane waves it reduced over lanes that don't participate,
 producing wrong sums for exactly the softmax-style reductions attention depends on. The fix was
 to drive the reduction off `caps.wave_size` and the role-resolved fragment instead of a
-constant. The shuffle primitives in `tk/src/group.rs` now read the wave size; the bug class is
+constant. The shuffle primitives in `tk/src/group/shuffle.rs` now read the wave size; the bug class is
 designed out.
 
 :::tip For GPU experts
-Two capability methods on `ArchCaps` (`tk/src/arch.rs`) carry most of the wave-specific weight:
+Two things carry most of the wave-specific weight:
 
-- **`reduce_tree()`** returns the cross-lane sibling-fold offsets. On wave64 that's
-  `[16, 32, 48]` (three xor steps to fold 4 sub-fragments); on wave32 it's `[16]` (one step).
-  Cross-lane reductions iterate over this list — get it from `caps`, never hardcode it.
+- **The fragment's `LaneMap`** carries the fold. A reduction reads its tree off the resolved
+  fragment (`src.base.map.tree(...)` in `tk/src/group/reduce.rs`), never off a constant: on
+  wave64 that is a sibling gather over offsets `[16, 32, 48]` (`ds_bpermute` of the original
+  partial from lane `L + d`) folding 4 sub-fragments, on RDNA wave32 the same gather with the
+  single offset `[16]`, and on CUDA's `MmaSync` layout an xor butterfly over masks `[1, 2]`.
 - **`acc_reusable_as_input()`** answers: "can a matrix accumulator be fed straight back in as an
-  operand to the next multiply?" On CDNA it's `true` — the layouts match, so it's a free register
-  copy. On RDNA it's `false` — the accumulator and operand layouts differ, so the value makes a
-  round-trip through LDS to be relaid out. [Flash Attention](./flash-attention) handles this split
-  between its two matmuls.
+  operand to the next multiply?" On CDNA and on CUDA it's `true` — the layouts match, so it's a
+  free register copy. On RDNA it's `false` — the accumulator and operand layouts differ, so the
+  value makes a round-trip through LDS to be relaid out. [Flash Attention](./flash-attention)
+  handles this split between its two matmuls.
 
 The `ept` field on `BaseShape` (from [What Tiling Is](./tiling)) exists for the same
 reason: on RDNA, operands are replicated across lanes, so elements-per-thread isn't
@@ -96,8 +102,10 @@ reason: on RDNA, operands are replicated across lanes, so elements-per-thread is
 
 ## Why this matters
 
-Portability across wave sizes is the AMD-specific tax on hand-written kernels, and it's why a
-naive port of an NVIDIA tile library doesn't just work. `tk` pays the tax once, in the
-`ArchCaps` abstraction, so individual kernels stay readable: they speak in *roles* and let the
-hardware table sort out the lanes. [Flash Attention](./flash-attention) is where you see this
+Portability across wave sizes is the tax hand-written kernels pay, and it's why a naive port of
+an NVIDIA tile library onto AMD doesn't just work. `tk` pays the tax once, in the `ArchCaps`
+abstraction, so individual kernels stay readable: they speak in *roles* and let the hardware
+table sort out the lanes. That the same abstraction then carries a kernel *onto* NVIDIA — where
+the warp is always 32 but the fragment layout is `mma.sync`'s own — is the payoff for having
+built it. [Flash Attention](./flash-attention) is where you see this
 pay off in a real kernel.

@@ -36,7 +36,7 @@ pub use rotary::RotaryTable;
 
 use std::path::PathBuf;
 
-use hf_hub::api::sync::ApiRepo;
+use crate::hub::HubRepo;
 use snafu::ResultExt;
 
 /// Download all safetensors weight files from a HuggingFace repo into the
@@ -44,7 +44,7 @@ use snafu::ResultExt;
 ///
 /// Handles both single-file (`model.safetensors`) and multi-shard
 /// (`model-NNNNN-of-NNNNN.safetensors` + `model.safetensors.index.json`).
-pub(crate) fn download_safetensors(repo: &ApiRepo) -> Result<PathBuf> {
+pub(crate) fn download_safetensors(repo: &HubRepo) -> Result<PathBuf> {
     // Try single-file first.
     if let Ok(path) = repo.get("model.safetensors") {
         return Ok(path.parent().expect("non-root cache dir").to_path_buf());

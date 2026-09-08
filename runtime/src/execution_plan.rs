@@ -1368,6 +1368,14 @@ impl ExecutionPlan {
     /// Uses a captured graph's linked profiling variant when the backend exposes
     /// per-dispatch stamps; otherwise falls back to profiled per-call submissions.
     pub fn execute_profiled(&self) -> Result<Vec<KernelProfile>> {
+        self.execute_profiled_inner(/*per_dispatch=*/ false)
+    }
+
+    /// [`Self::execute_profiled`], optionally refusing backend-native graph
+    /// replay. Hardware counters are collected around individual launches, so a
+    /// counted run has to take the per-dispatch path; a captured graph replays
+    /// as one opaque submission and would report no counters at all.
+    fn execute_profiled_inner(&self, per_dispatch: bool) -> Result<Vec<KernelProfile>> {
         self.check_hcq_poison()?;
         let mut finalizer = SubmissionProfileFinalizer::with_capacity(self.op_order.len());
         let mut executor = self
@@ -1377,9 +1385,8 @@ impl ExecutionPlan {
         let result = (|| {
             let linked = self.hcq_linked.get().expect("HCQ plan linked by builder");
 
-            if let Some(graph) =
-                self.graph_endpoints_match_device()?.then(|| self.graph()).and_then(|graph| graph.as_deref())
-            {
+            let use_graph = !per_dispatch && self.graph_endpoints_match_device()?;
+            if let Some(graph) = use_graph.then(|| self.graph()).and_then(|graph| graph.as_deref()) {
                 let mut buffers = Vec::new();
                 let mut vals = Vec::new();
                 let mut kernels = Vec::new();
@@ -1496,13 +1503,14 @@ impl ExecutionPlan {
     /// counters (`opts.counters`) attach to each [`KernelProfile`] when enabled.
     /// Tier-4 is gated: it requires `pmc_available()` and a stable power state;
     /// otherwise it degrades gracefully to timing-only with a one-line note.
+    /// Counter collection perturbs the dispatch it measures, so a counted run
+    /// adds one disarmed pass and reports its timing alongside the counters.
     pub fn profile(&self, opts: &ProfileOptions) -> Result<RunProfile> {
         let start = Instant::now();
         // Tier-4: arm hardware counters on the plan's context when requested and
         // the backend supports it in a stable power state. Degrade gracefully
         // (no counters, a one-line note) rather than failing the run.
-        let counters = opts.counters.counters();
-        let armed_ctx = if counters.is_empty() {
+        let armed_ctx = if !opts.counters.is_enabled() {
             None
         } else {
             let first_program = self.op_levels.iter().flatten().find_map(|&idx| match &self.ops[idx] {
@@ -1511,13 +1519,27 @@ impl ExecutionPlan {
             });
             match first_program.and_then(|p| self.plan_ctx(p).ok().flatten()) {
                 Some(ctx) if ctx.pmc_available() => {
-                    ctx.set_pmc(&counters);
-                    Some(ctx)
+                    // `Default` means whatever this backend collects; an explicit
+                    // list may name another backend's counters, which it drops.
+                    // Arming follows what it kept, so a list it drops entirely
+                    // costs neither the counted passes nor graph replay.
+                    let counters = opts.counters.resolve(&ctx.pmc_default());
+                    let collected = ctx.set_pmc(&counters);
+                    if collected < counters.len() {
+                        eprintln!(
+                            "SVOD_PMC: {} of {} requested counters are not collected on this backend",
+                            counters.len() - collected,
+                            counters.len()
+                        );
+                    }
+                    (collected > 0).then_some(ctx)
                 }
                 Some(_) => {
                     eprintln!(
-                        "SVOD_PMC: hardware counters unavailable (needs a profile_standard \
-                         power state — run `amd-smi set -l stable_std`); reporting timing only"
+                        "SVOD_PMC: hardware counters unavailable on this device (AMD needs a \
+                         profile_standard power state — `amd-smi set -l stable_std`; NVIDIA needs \
+                         profiling unrestricted — `NVreg_RestrictProfilingToAdminUsers=0`); \
+                         reporting timing only"
                     );
                     None
                 }
@@ -1526,14 +1548,24 @@ impl ExecutionPlan {
         };
         // Each pass is one "profile" stage; merge passes by per-kernel min time.
         // Match from_env(): zero iterations still means one profiling pass.
+        let armed = armed_ctx.is_some();
         let result: Result<RunProfile> = (|| {
             let run = |kernels| RunProfile {
                 stages: vec![StageProfile::gpu("profile", start.elapsed(), kernels)],
                 origin_depth: opts.origin_depth,
             };
-            let mut report = run(self.execute_profiled()?);
+            let mut report = run(self.execute_profiled_inner(armed)?);
             for _ in 1..opts.iters.max(1) {
-                report.merge_min(run(self.execute_profiled()?));
+                report.merge_min(run(self.execute_profiled_inner(armed)?));
+            }
+            // Collecting counters serializes the context and replays each kernel,
+            // which inflates the dispatch's own event pair by orders of
+            // magnitude. Take one disarmed pass so the timing column measures the
+            // kernel rather than the profiler; `merge_min` keeps its time and the
+            // counted pass's counters.
+            if let Some(ctx) = armed_ctx {
+                ctx.set_pmc(&[]);
+                report.merge_min(run(self.execute_profiled_inner(true)?));
             }
             Ok(report)
         })();
@@ -1561,11 +1593,7 @@ impl ExecutionPlan {
     /// byte traffic (each distinct buffer counted once), and decoded GPU
     /// resources when the backend exposes them.
     fn kernel_static_info(&self, pk: &PreparedKernel) -> KernelStaticInfo {
-        // The AST walk saturates to u64::MAX when a range/special has an
-        // unbounded symbolic end (common in hand-built kernels) — treat that as
-        // "no reliable count" rather than reporting a garbage roofline.
-        let raw_flops = svod_ir::compute_ops_estimate(&pk.ast);
-        let est_flops = (raw_flops != u64::MAX).then_some(raw_flops);
+        let est_flops = svod_ir::compute_ops_estimate(&pk.ast);
         let mut seen = std::collections::HashSet::new();
         let est_bytes =
             pk.buffer_indices.iter().filter(|&&i| seen.insert(i)).map(|&i| self.buffers[i].size() as u64).sum();
@@ -1664,6 +1692,7 @@ impl ExecutionPlan {
         for &index in &self.distinct_storage_indices {
             self.buffers[index].record_completion(&token);
         }
+        token.published();
     }
 
     /// Deep-copy the plan for concurrent execution. Fork policy per storage:

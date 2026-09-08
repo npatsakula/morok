@@ -97,10 +97,13 @@ fn optimizer_wire_roundtrips_reduce_symbolic_wmma_multi_and_calls() {
     let expected_hash = root.content_hash;
     let expected_tag = root.tag().clone();
     let expected_canonical = crate::CanonicalGraph::from_root("wire", &root).unwrap().to_pretty_json().unwrap();
-    let encoded = bincode::serialize(&OptimizerWireGraph::from_root(&root).unwrap()).unwrap();
+    let encoded =
+        bincode::serde::encode_to_vec(OptimizerWireGraph::from_root(&root).unwrap(), bincode::config::standard())
+            .unwrap();
     drop(root);
 
-    let wire: OptimizerWireGraph = bincode::deserialize(&encoded).unwrap();
+    let (wire, _): (OptimizerWireGraph, usize) =
+        bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
     let decoded = wire.decode_root().unwrap();
     assert_eq!(decoded.content_hash, expected_hash);
     assert_eq!(decoded.tag(), &expected_tag);

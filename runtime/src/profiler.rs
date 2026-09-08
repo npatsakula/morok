@@ -321,19 +321,19 @@ pub enum PmcSelection {
     /// No hardware counters (Tiers 1–3 only).
     #[default]
     None,
-    /// The default set, [`PmcCounter::all`]: SQ busy cycles, waves launched, and
-    /// VALU instructions issued.
+    /// The running backend's default set (`PlanContext::pmc_default`).
     Default,
     /// An explicit counter list.
     Custom(Vec<PmcCounter>),
 }
 
 impl PmcSelection {
-    /// Resolve to the concrete counter list (empty when disabled).
-    pub fn counters(&self) -> Vec<PmcCounter> {
+    /// Resolve to the concrete counter list, taking `backend_default` for
+    /// [`Default`](Self::Default). Empty when disabled.
+    pub fn resolve(&self, backend_default: &[PmcCounter]) -> Vec<PmcCounter> {
         match self {
             Self::None => Vec::new(),
-            Self::Default => PmcCounter::all().to_vec(),
+            Self::Default => backend_default.to_vec(),
             Self::Custom(v) => v.clone(),
         }
     }
@@ -771,8 +771,11 @@ impl RunProfile {
     }
 
     /// Merge another profiling pass of the SAME plan into this one, keeping each
-    /// kernel's faster (min device-time) sample — and carrying that sample's
-    /// counters/static analysis. Both must share stage + kernel ordering (extra
+    /// kernel's faster (min device-time) sample and its static analysis. The
+    /// counters are the first counted pass's: they describe the kernel, not a
+    /// run, and a counted pass never has the best time (see below), so the
+    /// timing and the counters of a merged kernel come from different passes
+    /// by design. Both must share stage + kernel ordering (extra
     /// stages/kernels in `other` are ignored); `self`'s stage metadata is kept.
     /// This is the single min-merge policy used to accumulate repeated passes
     /// (the `profile()` `iters` loop and the criterion `--profile-time` hook).
@@ -780,9 +783,15 @@ impl RunProfile {
         self.origin_depth = self.origin_depth.or(other.origin_depth);
         for (stage, incoming) in self.stages.iter_mut().zip(other.stages) {
             for (best, sample) in stage.kernels.iter_mut().zip(incoming.kernels) {
+                // Counters are captured on a counted pass only, and that pass
+                // pays the backend's counter overhead (CUPTI replays each
+                // kernel), so it is never the fastest. Keep the best timing
+                // without dropping counters a slower pass captured.
+                let counters = best.counters.take().or_else(|| sample.counters.clone());
                 if sample.gpu_or_wall() < best.gpu_or_wall() {
                     *best = sample;
                 }
+                best.counters = counters;
             }
         }
     }

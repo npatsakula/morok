@@ -147,13 +147,7 @@ impl Renderer for AmdRendererWrapper {
         let renderer = LlvmTextRenderer::amd(self.arch);
         let rendered = svod_codegen::Renderer::render(&renderer, ast, name.or(Some("kernel")))
             .map_err(|e| svod_device::Error::Runtime { message: format!("AMD IR rendering failed: {e}") })?;
-        let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
-        spec.set_var_names(rendered.var_names.clone());
-        spec.abi = rendered.abi.clone();
-        if spec.buf_count == 0 {
-            spec.buf_count = rendered.buffer_args.len();
-        }
-        Ok(spec)
+        Ok(super::program_spec(&rendered, &self.device, ast))
     }
 
     fn device(&self) -> &DeviceSpec {
@@ -165,27 +159,20 @@ impl Renderer for AmdRendererWrapper {
     }
 
     fn supported_ops(&self) -> svod_ir::RendererOps {
-        let mut ops = svod_ir::RendererOps::all();
-        ops.binary.remove(&svod_ir::BinaryOp::Threefry);
-        ops.binary.remove(&svod_ir::BinaryOp::Pow);
-        ops.binary.remove(&svod_ir::BinaryOp::Max);
-        for op in [
+        // Sin must decompose (tinygrad `llvmir.py` `llvm_intrinsics` is exactly
+        // {sqrt, log2, exp2}): `@llvm.sin.f32` lowers to the hardware
+        // `v_sin_f32` behind an f32 `1/(2π)` pre-scale, which is only accurate
+        // for small arguments — sin(±1e6) comes back as ±sin(π/8) because the
+        // reduction happens in f32 revolutions. `v_exp_f32`/`v_log_f32`/
+        // `v_sqrt_f32` are ~1-ulp and stay native.
+        super::gpu_supported_ops(&[
             svod_ir::UnaryOp::Exp,
             svod_ir::UnaryOp::Log,
-            // Sin must decompose (tinygrad `llvmir.py` `llvm_intrinsics` is
-            // exactly {sqrt, log2, exp2}): `@llvm.sin.f32` lowers to the
-            // hardware `v_sin_f32` behind an f32 `1/(2π)` pre-scale, which is
-            // only accurate for small arguments — sin(±1e6) comes back as
-            // ±sin(π/8) because the reduction happens in f32 revolutions.
-            // `v_exp_f32`/`v_log_f32`/`v_sqrt_f32` are ~1-ulp and stay native.
             svod_ir::UnaryOp::Sin,
             svod_ir::UnaryOp::Cos,
             svod_ir::UnaryOp::Tan,
             svod_ir::UnaryOp::Erf,
-        ] {
-            ops.unary.remove(&op);
-        }
-        ops
+        ])
     }
 
     fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {

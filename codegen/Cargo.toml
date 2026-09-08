@@ -13,8 +13,7 @@ svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.6" }
 svod-ir = { path = "../ir", version = "=0.1.0-alpha.6" }
 svod-device = { path = "../device", version = "=0.1.0-alpha.6" }
 svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.6" }
-snafu = "0.8.9"
-itertools = "0.14.0"
+snafu = "0.9"
 tracing = "0.1"
 smallvec.workspace = true
 

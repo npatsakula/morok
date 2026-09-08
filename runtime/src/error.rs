@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use snafu::Snafu;
+use svod_device::error::describe;
 
 /// Result type for runtime operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -67,11 +68,11 @@ pub enum Error {
     LlvmUnavailable { failures: Vec<Error> },
 
     /// A shared library could not be loaded.
-    #[snafu(display("cannot load library {}: {source}", path.display()))]
+    #[snafu(display("cannot load library {}: {}", path.display(), describe(source)))]
     LibraryLoad { source: libloading::Error, path: PathBuf },
 
     /// A symbol could not be resolved in a loaded shared library.
-    #[snafu(display("cannot resolve symbol `{symbol}` in {}: {source}", path.display()))]
+    #[snafu(display("cannot resolve symbol `{symbol}` in {}: {}", path.display(), describe(source)))]
     LibrarySymbol { source: libloading::Error, path: PathBuf, symbol: String },
 
     /// Unsupported device type.
@@ -106,7 +107,7 @@ pub enum JitSource {
 
     /// Shared-library load/symbol resolution (`dlopen-fallback` path only).
     #[cfg(feature = "dlopen-fallback")]
-    #[snafu(display("{source}"))]
+    #[snafu(display("{}", describe(source)))]
     Lib { source: libloading::Error },
 }
 

@@ -14,7 +14,7 @@ use crate::amd::connector::SubmissionFinalizer;
 use crate::amd::signal::AmdSignal;
 use crate::amd::sys::pm4;
 use crate::amd::topology::AmdNode;
-use crate::profile::{CounterSet, PmcCounter};
+use crate::profile::{AmdCounter, CounterSet, PmcCounter};
 
 // gfx11_5_0 GC IP segment bases. Verified against Mesa register constants:
 // regGRBM_GFX_INDEX → abs 0xC200 dword = 0x30800 byte (R_030800);
@@ -38,12 +38,12 @@ pub fn stable_pstate() -> bool {
     })
 }
 
-/// gfx11 SQ perf-counter selector (perf_sel) for each [`PmcCounter`].
-fn sq_perf_sel(c: PmcCounter) -> u32 {
+/// gfx11 SQ perf-counter selector (perf_sel) for each [`AmdCounter`].
+fn sq_perf_sel(c: AmdCounter) -> u32 {
     match c {
-        PmcCounter::SqBusyCycles => 3,
-        PmcCounter::SqWaves => 4,
-        PmcCounter::SqInstsValu => 62,
+        AmdCounter::SqBusyCycles => 3,
+        AmdCounter::SqWaves => 4,
+        AmdCounter::SqInstsValu => 62,
     }
 }
 
@@ -123,7 +123,7 @@ pub fn readback_bytes(n_counters: usize, grid: &PmcGrid) -> usize {
 /// profiled kernel (sub-second), and it keeps the per-dispatch PM4 stream within
 /// the ring's single-dispatch budget. The read emits `GRBM_GFX_INDEX` once per
 /// instance, then copies every counter at that instance.
-pub fn build_streams(counters: &[PmcCounter], grid: &PmcGrid, buf_va: u64) -> (Vec<u32>, Vec<u32>) {
+pub fn build_streams(counters: &[AmdCounter], grid: &PmcGrid, buf_va: u64) -> (Vec<u32>, Vec<u32>) {
     let instances = grid.instances();
 
     // ── start: stop, program SELECTs + CTRL, enable, start ──
@@ -175,7 +175,7 @@ pub struct PmcHandle {
     finalizer: Arc<SubmissionFinalizer>,
     _buf: RawBuffer,
     host: NonNull<u8>,
-    counters: Vec<PmcCounter>,
+    counters: Vec<AmdCounter>,
     instances: u32,
 }
 
@@ -190,7 +190,7 @@ impl PmcHandle {
         finalizer: Arc<SubmissionFinalizer>,
         buf: RawBuffer,
         host: NonNull<u8>,
-        counters: Vec<PmcCounter>,
+        counters: Vec<AmdCounter>,
         instances: u32,
     ) -> Self {
         Self { ts, finalizer, _buf: buf, host, counters, instances }
@@ -231,7 +231,7 @@ impl crate::sync::DispatchTimestamps for PmcHandle {
                 };
                 sum = sum.saturating_add(v as u64);
             }
-            values.insert(c, sum);
+            values.insert(PmcCounter::Amd(c), sum);
         }
         Some(CounterSet { values })
     }

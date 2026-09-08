@@ -216,15 +216,25 @@ pub trait PlanContext: Send + Sync {
     }
 
     /// Arm hardware performance counters for subsequent profiling dispatches on
-    /// this context (empty disables). Default no-op: backends without PMC ignore
-    /// it. Counters are reported via [`DispatchTimestamps::counters`].
-    fn set_pmc(&self, _counters: &[crate::profile::PmcCounter]) {}
+    /// this context (empty disables), returning how many of `counters` this
+    /// backend collects: those naming another backend are dropped. Default
+    /// collects none. Counters are reported via
+    /// [`DispatchTimestamps::counters`].
+    fn set_pmc(&self, _counters: &[crate::profile::PmcCounter]) -> usize {
+        0
+    }
 
     /// Whether hardware counter collection is currently available on this
     /// context (backend supports PMC and the GPU is in a stable power state).
     /// Default `false`.
     fn pmc_available(&self) -> bool {
         false
+    }
+
+    /// The counters [`set_pmc`](Self::set_pmc) collects for a caller that asked
+    /// for the default selection. Empty on backends without PMC.
+    fn pmc_default(&self) -> Vec<crate::profile::PmcCounter> {
+        Vec::new()
     }
 }
 
@@ -401,12 +411,12 @@ fn linear_sha256(linear: &Arc<UOp>) -> Result<StageDigest> {
     let graph = svod_ir::CanonicalGraph::from_root("source-stage-linear-v2", linear).map_err(|error| {
         Error::ProgramStageMismatch { stage: "SOURCE", reason: format!("cannot encode LINEAR identity: {error}") }
     })?;
-    let mut hasher = Sha256::new();
+    let mut hasher = digest_io::IoWrapper(Sha256::new());
     graph.encode_into(&mut hasher).map_err(|error| Error::ProgramStageMismatch {
         stage: "SOURCE",
         reason: format!("cannot serialize LINEAR identity: {error}"),
     })?;
-    Ok(StageDigest(hasher.finalize().into()))
+    Ok(StageDigest(hasher.0.finalize().into()))
 }
 
 fn source_stage_identity_from_parts(

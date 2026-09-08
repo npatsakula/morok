@@ -39,9 +39,9 @@ let ta = Tensor::from_slice(&a);
 let tb = Tensor::from_slice(&b);
 let mut out = Tensor::empty(&[1, 1, 16, 16], DType::Float32);
 
-// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA.
-let arch = svod_tk::target::resolve_arch(&ta.device()).expect("an AMD device");
-let w = arch.wave_size() as i64;
+// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA and CUDA.
+let arch = svod_tk::target::resolve_arch(&ta.device()).expect("a GPU device");
+let w = svod_tk::ArchCaps::for_arch(arch).wave_size as i64;
 
 run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| {
     let warp = ker.warp();
@@ -165,14 +165,14 @@ let result = out.as_vec::<f32>().expect("read out"); // result[i] == 3 * i
 | **tile 维度是 `16` 的倍数** | 一个 tile 是整数个 `16×16` 矩阵核心片段；`ker.rt` 会断言这一点。 |
 | **`gl()` 顺序 = 启动缓冲区顺序** | 输出在前，再到输入。绑定是位置式的；一处不匹配就会悄无声息地把缓冲区调换，数字错了却没有报错，编译器也抓不住。 |
 | **按角色请求片段，而非按常量** | 正是 `caps.frag(role)` 让同一个内核体能在 wave32 *和* wave64 上都跑起来。 |
-| **它是 GPU 内核** | 构建器铸出真实的 lane 索引（`Op::Special`），所以执行瞄准的是 AMD 设备，而非 CPU。 |
+| **它是 GPU 内核** | 构建器铸出真实的 lane 索引（`Op::Special`），所以执行瞄准的是 GPU——AMD 或 CUDA——而非 CPU。 |
 
 ---
 
 :::tip 面向 GPU 专家
 内核体降级成的，恰好是 [向 IR 中编写](./lowering) 里那副 `RANGE` / `INDEX` / `LOAD` / `STORE` 形状，没有新节点类型。内核铸出一个 lane 索引 `Op::Special`，wave 的各次加载搭在它上面；每次 `warp.load` 在那个 lane 下变成一个全局 `LOAD`，`warp.add` 是单个 `Op::Binary(Add)`，存储则是 `SINK` 罩住的那唯一一个 `STORE`。这里**没有** `Wmma`，也**没有** `DefineLocal`：它是一次纯寄存器的往返，是 IR 所能表达的最精简内核。
 
-因为内核发射 `Special` 操作，它*就是*一个完全手工降级的 GPU 内核：优化器和工作组维度遍把带 `Special` 的图当成已降级的来对待并直接放行（即 `opts_to_apply: Some(vec![])` 所把守的那同一道关卡）。这也正是它只在 AMD LLVM 后端上渲染的原因：lane 索引在标量 CPU 路径上毫无意义。不过，*构建*那个 `SINK` 纯粹是 UOp 构造，不需要 GPU；只有执行它才需要。正是这道分割，让一个内核能在每次构建时由主机侧的形状检查把守，再由一个单独的、受门控的测试来检验设备上的数字。
+因为内核发射 `Special` 操作，它*就是*一个完全手工降级的 GPU 内核：优化器和工作组维度遍把带 `Special` 的图当成已降级的来对待并直接放行（即 `opts_to_apply: Some(vec![])` 所把守的那同一道关卡）。这也正是它只在 GPU 后端（AMD 或 NVPTX）上渲染的原因：lane 索引在标量 CPU 路径上毫无意义。不过，*构建*那个 `SINK` 纯粹是 UOp 构造，不需要 GPU；只有执行它才需要。正是这道分割，让一个内核能在每次构建时由主机侧的形状检查把守，再由一个单独的、受门控的测试来检验设备上的数字。
 :::
 
 ---

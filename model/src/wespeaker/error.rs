@@ -19,7 +19,7 @@ pub enum Error {
         source: Box<crate::blocks::Error>,
     },
     #[snafu(display("hub error: {source}"))]
-    Hub { source: hf_hub::api::sync::ApiError },
+    Hub { source: hf_hub::HFError },
     #[snafu(display("{source}"))]
     Pickle {
         #[snafu(source(from(super::pickle::Error, Box::new)))]

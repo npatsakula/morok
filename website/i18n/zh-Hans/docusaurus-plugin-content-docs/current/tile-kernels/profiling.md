@@ -4,7 +4,7 @@ sidebar_label: 剖析与基准测试
 
 # 剖析与基准测试内核
 
-[调试](./debugging) 用单次硬件时间戳回答「这个内核对不对、大致有多快」。本章则讲它之后的那个问题：*时间都花到哪去了，瓶颈在哪里？* Svod 附带一个**分层内核 profiler**，分四个层级来回答它——设备时间、roofline、静态占用率，以及 AMD 硬件计数器——全都统一到一次调用之后。
+[调试](./debugging) 用单次硬件时间戳回答「这个内核对不对、大致有多快」。本章则讲它之后的那个问题：*时间都花到哪去了，瓶颈在哪里？* Svod 附带一个**分层内核 profiler**，分四个层级来回答它——设备时间、roofline、静态占用率，以及硬件计数器——全都统一到一次调用之后。
 
 这个 profiler 位于 `runtime` crate 而非 `tk`，这一安放位置正是关键所在：它对**任何** `Tensor` 或 `ExecutionPlan` 都管用，无论其中的内核出自图优化器，还是由 `tk` 手写而成。一个图 matmul、一个融合的前馈块、一个手写的 Flash Attention，全都出现在同一张表里，以同样的方式计时、分析。之所以放在本节介绍，只是因为手写内核的作者最可能用到它。
 
@@ -23,21 +23,21 @@ flowchart TD
   P["Tensor::profile / ExecutionPlan::profile"] --> T1["Tier 1 - device time (GPU-clock timestamps)"]
   P --> T2["Tier 2 - roofline (GFLOP/s, GB/s)"]
   P --> T3["Tier 3 - static occupancy (VGPR/SGPR/LDS, occ%)"]
-  P --> T4["Tier 4 - HW counters / PMC (SQ busy, waves, VALU)"]
+  P --> T4["Tier 4 - HW counters / PMC (AMD SQ 块, CUDA CUPTI)"]
 ```
 
 | 层级 | 报告什么 | 来源 | 需要执行吗？ |
 |------|-----------------|--------|------------------|
 | **1 — 设备时间** | 每个内核的 GPU 执行时间 | GPU 时钟派发时间戳 | 是 |
 | **2 — roofline** | 推导出的 **GFLOP/s** 与 **GB/s** | FLOP 由内核的 IR 估算；字节数来自 plan 的缓冲区 | 是（速率需要时间） |
-| **3 — 静态占用率** | VGPR / SGPR / LDS / scratch 用量，以及受 VGPR 限制的**占用率 %** | 从 AMD 内核描述符解码而来 | 否——纯静态解码 |
-| **4 — 硬件计数器（PMC）** | SQ 块计数器：忙碌周期、启动的 wave 数、发射的 VALU 指令数 | PM4 性能计数器包，跨整个计算网格求和 | 是，需在状态稳定的 GPU 上 |
+| **3 — 静态占用率** | VGPR / SGPR / LDS / scratch 用量，以及**占用率 %** | AMD：从内核描述符解码而来。CUDA：`cuFuncGetAttribute` 加驱动自己的占用率计算器 | 否——纯静态解码 |
+| **4 — 硬件计数器（PMC）** | AMD：SQ 忙碌周期、wave 数、VALU 指令数。CUDA：SM 周期、warp 数、指令数、tensor 流水线周期、DRAM 字节数 | AMD：PM4 性能计数器包跨网格求和。CUDA：CUPTI range profiler | 是，且计数器必须已解锁 |
 
 有几个细节值得了解：
 
 - **第 2 层**通过遍历内核的 IR（AST）来估算 FLOP。对调度器构建的内核而言，其范围是有界的，于是估算就是一个真实计数，GFLOP/s 这一列也就有了值。GB/s 这个数字把每个不同的 LOAD/STORE 缓冲区各算一次，所以只要第 2 层在跑，它就可用。
 - **第 3 层**针对 RDNA3.5 (wave32) 建模，其寄存器堆的几何结构是已知的，因此它会报告一个占用率 %。在 CDNA3 (wave64) 上，各项资源（VGPR/SGPR/LDS/scratch）仍会被解码并显示，但占用率这一列会显示 `-`，因为那种几何结构尚未建模。这里的占用率仅是**受 VGPR 限制**的一阶限制因素——LDS 与工作组上限并未折算进来。
-- **第 4 层**通过 PM4 包对 SQ 块计数器编程，并跨网格求和。已实现的三个计数器是 `sqbusy`（忙碌周期）、`waves`（启动的 wave 数）和 `valu`（发射的 VALU 指令数）——它们合在一起回答的，是单凭计时无法回答的 ILP / 占用率问题。
+- **第 4 层**因后端而异。在 AMD 上它用 PM4 包对 SQ 块编程并跨网格求和：`sqbusy`（忙碌周期）、`waves`（启动的 wave 数）和 `valu`（发射的 VALU 指令数）——它们合在一起回答的，是单凭计时无法回答的 ILP / 占用率问题。在 CUDA 上它驱动 CUPTI range profiler：`cycles`、`warps`、`inst`、`tensor`（tensor 流水线活跃周期）和 `dram`（经过 DRAM 的字节数）——`tensor` 比上 `cycles` 就是 tensor core 利用率，而 `dram` 能把受带宽限制的内核和受发射限制的内核区分开。计数器 token 在各后端之间唯一，所以一份写了别的后端计数器的选择只会把它们丢掉，而不会去错误地编程另一个模块。
 
 报告的各列会随采集到的内容自适应：若只跑了第 1 层，便仅打印计时；GFLOP/s、资源和计数器各列只有在对应层级运行过后才出现。
 
@@ -105,14 +105,14 @@ let opts = ProfileOptions {
 };
 ```
 
-`PmcSelection` 可取 `None`（仅第 1–3 层）、`Default`（已实现的那组 SQ 计数器），或 `Custom(Vec<PmcCounter>)`（一份显式列表）。
+`PmcSelection` 可取 `None`（仅第 1–3 层）、`Default`（当前后端所采集的那一组，经由 `PlanContext::pmc_default` 解析），或 `Custom(Vec<PmcCounter>)`（一份显式列表）。
 
 `ProfileOptions::from_env()` 是读取剖析环境变量的唯一地方：
 
 | 环境变量 | 作用 |
 |---------|--------|
 | `SVOD_PROFILE_ITERS` | 用于取最小合并的重放次数（钳制为至少 1） |
-| `SVOD_PMC` | 第 4 层的选择：空或 `0` → 关闭；`1` → 默认计数器组；否则为一份逗号分隔的 token 列表（`sqbusy`、`waves`、`valu`） |
+| `SVOD_PMC` | 第 4 层的选择：空或 `0` → 关闭；`1` → 该后端的默认计数器组；否则为一份逗号分隔的 token 列表（AMD 为 `sqbusy`、`waves`、`valu`；CUDA 为 `cycles`、`warps`、`inst`、`tensor`、`dram`） |
 | `SVOD_ORIGIN` | 取 `1` 时记录每个操作构建时所处的作用域（模块路径、调用点、ONNX 节点），见下文 |
 | `SVOD_ORIGIN_DEPTH` | 来源汇总保留的路径段数（`origin_depth`）；未设置或为 `0` 时保留完整路径 |
 
@@ -122,11 +122,16 @@ SVOD_DEVICE=AMD:0 SVOD_PROFILE_ITERS=20 SVOD_PMC=1 ...
 
 # Only VALU instructions and SQ-busy cycles.
 SVOD_DEVICE=AMD:0 SVOD_PMC=valu,sqbusy ...
+
+# CUDA 上的 tensor core 利用率与 DRAM 流量。
+SVOD_DEVICE=CUDA:0 SVOD_PMC=tensor,dram ...
 ```
 
 ### 累积取最小
 
-当 `iters > 1` 时（或跨 criterion 的多次调用），profiler **不会**取平均。每一趟都产出一个 `RunProfile`，各趟由 `RunProfile::merge_min` 合并：对每个内核，更快（设备时间最小）的那个样本胜出，并带上*那个*样本的计数器和静态分析。最小值是内核内在开销的稳健估计量——它把调度抖动、争用以及时钟爬升这些会抬高均值的离群点都剔除掉。
+当 `iters > 1` 时（或跨 criterion 的多次调用），profiler **不会**取平均。每一趟都产出一个 `RunProfile`，各趟由 `RunProfile::merge_min` 合并：对每个内核，更快（设备时间最小）的那个样本胜出，并带上*那个*样本的静态分析。最小值是内核内在开销的稳健估计量——它把调度抖动、争用以及时钟爬升这些会抬高均值的离群点都剔除掉。
+
+计数器是个例外：采集计数器会扰动采集它的那一趟，所以那一趟永远不会是最快的；合并时会保留真正采到计数器的那一趟的计数器，而不是把它们连同较慢的样本一起丢掉。因此同一张表里的计时和计数器可能来自不同的趟——这正是本意，因为带计数器的那一趟并不能用来给内核计时。
 
 ## 把内核归属到模型代码 {#attributing-kernels-to-model-code}
 
@@ -192,9 +197,9 @@ SVOD_DEVICE=AMD:0 SVOD_PMC=1 cargo bench -p svod-tk --bench kmeans -- --profile-
 ## 如实交代局限
 
 :::caution profiler 给不了你的两样东西
-**第 2 层的 GFLOP/s 对手写内核是空白。** FLOP 估算会遍历内核的 IR，而它只会为**调度器构建的**内核自动计算速率。一个手写的 `tk` 内核用的是无界的符号范围，于是 AST 遍历会*饱和*，而非形成一个真实计数——profiler 把这当作「没有可靠估算」，而不是打印一份垃圾 roofline，所以对那些内核**GFLOP/s 这一列显示 `-`**。（GB/s 仍然有效，因为字节数来自 plan 的缓冲区，而非 IR。）手写内核的 roofline 请你自己来算：用算法已知的 FLOP 计数和第 1 层的设备时间。
+**第 2 层的 GFLOP/s 对手写内核是空白。** FLOP 估算会遍历内核的 IR，而它只会为**调度器构建的**内核自动计算速率。它是从一个操作的操作数依赖什么，来推断该操作位于哪些循环里的——只要索引表达式由调度器来写，这就成立。而手工 lower 的 `tk` 内核自己做寻址，它的循环变量只经由地址抵达算术，于是这趟遍历就再也还原不出嵌套关系了，两个方向都不行。profiler 会拒绝给出估算，而不是打印一份垃圾 roofline（早期版本曾把一个 matmul 报成硬件峰值的八倍），所以对那些内核**GFLOP/s 这一列显示 `-`**。（GB/s 仍然有效，因为字节数来自 plan 的缓冲区，而非 IR。）手写内核的 roofline 请你自己来算：用算法已知的 FLOP 计数和第 1 层的设备时间。
 
-**第 4 层需要稳定的电源状态。** PM4 硬件计数器只有在 GPU 保持固定时钟时才有意义。在默认的 `auto` 电源状态下，profiler *不会*失败——它会降级：只报告计时，并打印一行提示，说明计数器需要 `profile_standard` 状态。先把 GPU 置于该状态（例如 `amd-smi set -l stable_std`），再带上 `SVOD_PMC` 重新运行。
+**第 4 层必须先解锁，而且各家厂商的要求不同。** 在 AMD 上，PM4 硬件计数器只有在 GPU 保持固定时钟时才有意义，所以 GPU 必须处于 `profile_standard` 电源状态（`amd-smi set -l stable_std`）。在 CUDA 上，除非设置了 `NVreg_RestrictProfilingToAdminUsers=0`，驱动只允许管理员采集计数器，并且 CUPTI 必须能被加载（`SVOD_CUDA_CUPTI=0` 可以主动关掉它）。两种情况下 profiler 都*不会*失败：它只报告计时，并打印一行提示说明缺了什么。NVIDIA 的细节见[在 CUDA 上剖析](../backends/cuda/profiling.md)，其中也讲了为什么那里采集计数器要多花一趟。
 :::
 
 ---
@@ -207,6 +212,7 @@ SVOD_DEVICE=AMD:0 SVOD_PMC=1 cargo bench -p svod-tk --bench kmeans -- --profile-
 | 「这个内核是计算受限还是带宽受限？」 | 第 2 层的 GFLOP/s 与 GB/s 两列（图内核），或手工算 roofline（tk 内核） |
 | 「占用率为什么低——是寄存器还是 LDS？」 | 第 3 层的 VGPR/SGPR/LDS/占用率 % 各列（无需运行） |
 | 「内核每个忙碌周期发射的 VALU 工作量够吗？」 | 第 4 层 `SVOD_PMC=1`，在 `profile_standard` 状态的 GPU 上 |
+| 「内核到底有没有用上 tensor core，还是卡在 DRAM 上？」 | CUDA 上的第 4 层 `SVOD_PMC=tensor,dram` |
 | 「跨多次运行，它与图原生基线相比如何？」 | `cargo bench --profile-time`——见 [调试 → 在真实硬件上计时](./debugging) |
 
 若要做的是正确性与结构检查而非性能，请留在 [调试](./debugging)；至于内核*之下*的问题（队列、故障、驱动），见 [AMD 后端 → 调试](../backends/amd/debugging)。

@@ -118,13 +118,7 @@ impl Renderer for MetalRendererWrapper {
     fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
         let rendered = svod_codegen::Renderer::render(&CRenderer::metal(), ast, name.or(Some("kernel")))
             .map_err(|e| svod_device::Error::Runtime { message: format!("MSL rendering failed: {e}") })?;
-        let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
-        spec.set_var_names(rendered.var_names.clone());
-        spec.abi = rendered.abi.clone();
-        if spec.buf_count == 0 {
-            spec.buf_count = rendered.buffer_args.len();
-        }
-        Ok(spec)
+        Ok(super::program_spec(&rendered, &self.device, ast))
     }
 
     fn device(&self) -> &DeviceSpec {
@@ -136,25 +130,15 @@ impl Renderer for MetalRendererWrapper {
     }
 
     fn supported_ops(&self) -> svod_ir::RendererOps {
-        let mut ops = svod_ir::RendererOps::all();
-        // Same removals as clang/AMD: Threefry renders as bare XOR and Max
-        // decomposes to a select; Pow and the non-native transcendentals go
-        // through the shared decompositions. `sqrt/exp2/log2` are native and
-        // `sin` renders as `precise::sin` (tinygrad's Metal choice).
-        ops.binary.remove(&svod_ir::BinaryOp::Threefry);
-        ops.binary.remove(&svod_ir::BinaryOp::Pow);
-        ops.binary.remove(&svod_ir::BinaryOp::Max);
-        for op in [
+        // `sqrt/exp2/log2` are native and `sin` renders as `precise::sin`
+        // (tinygrad's Metal choice); MSL has no erf().
+        super::gpu_supported_ops(&[
             svod_ir::UnaryOp::Exp,
             svod_ir::UnaryOp::Log,
             svod_ir::UnaryOp::Cos,
             svod_ir::UnaryOp::Tan,
-            // MSL has no erf().
             svod_ir::UnaryOp::Erf,
-        ] {
-            ops.unary.remove(&op);
-        }
-        ops
+        ])
     }
 
     fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {

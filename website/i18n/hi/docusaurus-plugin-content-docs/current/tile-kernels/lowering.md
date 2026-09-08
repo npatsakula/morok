@@ -48,7 +48,7 @@ flowchart LR
 UOps *ही है*, इसलिए compiler का सारा infrastructure इसे अपने-आप मिल जाता है — कुछ भी tk-specific न बनाना
 पड़ता है, न सीखना:
 
-- **एक ही renderer।** जो `svod-codegen` path graph कर्नेल को LLVM IR और एक AMD binary में lower करता है,
+- **एक ही renderer।** जो `svod-codegen` path graph कर्नेल को LLVM IR में — और वहाँ से एक AMD binary या PTX में — lower करता है,
   वही आपके `tk` कर्नेल को render करता है। न कोई दूसरा backend लिखना है, न port करना, न sync में रखना।
 - **एक ही debugger।** आप एक `tk` कर्नेल को बाक़ी किसी भी computation की तरह ही inspect करते हैं: UOp tree
   print कर लीजिए। हाथ से लिखा Flash Attention और एक autotuned matmul, दोनों *एक ही* textual रूप में, एक ही

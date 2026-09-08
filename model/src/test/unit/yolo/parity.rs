@@ -26,9 +26,8 @@ fn resolve_file(name: &str) -> PathBuf {
     if p.exists() {
         return p;
     }
-    let api = hf_hub::api::sync::Api::new().expect("HF Hub API");
-    let repo = hf_hub::Repo::with_revision(HUB_REPO.into(), hf_hub::RepoType::Model, "main".into());
-    api.repo(repo).get(name).unwrap_or_else(|_| panic!("download {name} from {HUB_REPO}"))
+    let repo = crate::hub::HubRepo::open(HUB_REPO, "main").expect("HF Hub API");
+    repo.get(name).unwrap_or_else(|_| panic!("download {name} from {HUB_REPO}"))
 }
 
 fn load_golden_vec<T: Clone + Default + svod_dtype::ext::HasDType>(sd: &StateDict, key: &str) -> Vec<T> {

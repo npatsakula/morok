@@ -43,7 +43,7 @@ pub enum Error {
         source: Box<crate::state::Error>,
     },
     #[snafu(display("hub error: {source}"))]
-    Hub { source: hf_hub::api::sync::ApiError },
+    Hub { source: hf_hub::HFError },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -70,9 +70,7 @@ pub struct SileroVad {
 
 impl SileroVad {
     pub fn from_hub() -> Result<Self> {
-        let api = hf_hub::api::sync::Api::new().context(HubSnafu)?;
-        let repo =
-            api.repo(hf_hub::Repo::with_revision("vpermilp/silero-vad".into(), hf_hub::RepoType::Model, "main".into()));
+        let repo = crate::hub::HubRepo::open("vpermilp/silero-vad", "main").context(HubSnafu)?;
         let path = repo.get("silero_vad_16k.safetensors").context(HubSnafu)?;
         Self::from_safetensors(&path)
     }

@@ -648,7 +648,7 @@ pub(crate) struct OwnerCtx {
     /// This owner's newest HCQ submission, independent of native queue path.
     newest: Mutex<Option<Arc<SubmissionFinalizer>>>,
     /// PMC: hardware counters to collect on profiling dispatches (empty = off).
-    pmc: Mutex<Vec<crate::profile::PmcCounter>>,
+    pmc: Mutex<Vec<crate::profile::AmdCounter>>,
     linked_plan: Mutex<Option<crate::amd::linked_plan::AmdLinkedPlan>>,
 }
 
@@ -665,7 +665,7 @@ impl OwnerCtx {
     }
 
     /// Hardware counters to collect on this owner's profiling dispatches.
-    pub fn pmc_counters(&self) -> Vec<crate::profile::PmcCounter> {
+    pub fn pmc_counters(&self) -> Vec<crate::profile::AmdCounter> {
         self.pmc.lock().clone()
     }
 
@@ -834,12 +834,24 @@ impl crate::device::PlanContext for OwnerCtx {
         Ok(crate::device::NativeReplayOutcome::Executed)
     }
 
-    fn set_pmc(&self, counters: &[crate::profile::PmcCounter]) {
-        *self.pmc.lock() = counters.to_vec();
+    fn set_pmc(&self, counters: &[crate::profile::PmcCounter]) -> usize {
+        let mut armed = self.pmc.lock();
+        *armed = counters
+            .iter()
+            .filter_map(|c| match c {
+                crate::profile::PmcCounter::Amd(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        armed.len()
     }
 
     fn pmc_available(&self) -> bool {
         crate::amd::pmc::stable_pstate()
+    }
+
+    fn pmc_default(&self) -> Vec<crate::profile::PmcCounter> {
+        crate::profile::AmdCounter::all().into_iter().map(crate::profile::PmcCounter::Amd).collect()
     }
 
     fn synchronize(&self) -> Result<()> {

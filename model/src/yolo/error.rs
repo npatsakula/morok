@@ -14,7 +14,7 @@ pub enum Error {
         source: Box<crate::state::Error>,
     },
     #[snafu(display("hub error: {source}"))]
-    Hub { source: hf_hub::api::sync::ApiError },
+    Hub { source: hf_hub::HFError },
     #[snafu(display("invalid yolo config: {message}"))]
     Config { message: String },
     #[snafu(display("{what} requires a concrete shape, got a symbolic dim"))]

@@ -8,9 +8,9 @@ repository.workspace = true
 description = "Ready-to-run model implementations (ASR, embeddings, vision) for the Svod ML compiler"
 
 [dependencies]
-base64 = "0.22"
-bon = "3.9.1"
-hf-hub = "0.5.0"
+base64 = "0.23"
+bon = "3.10"
+hf-hub = { version = "1.0", features = ["blocking"] }
 hound = "3.5.1"
 svod-arch = { path = "../arch", version = "=0.1.0-alpha.6" }
 svod-device = { path = "../device", version = "=0.1.0-alpha.6" }
@@ -25,20 +25,20 @@ prost = "0.14.3"
 nom = "7.1"
 realfft = "3.5.0"
 repugnant-pickle = { version = "0.0.1", features = ["torch"] }
-safetensors = "0.7.0"
-zip = { version = "0.6", default-features = false }
+safetensors = "0.8"
+zip = { version = "8", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 snafu = "0.9.0"
 tracing-subscriber = "0.3.23"
 tracing = "0.1.44"
 bytemuck = "1.25.0"
-flate2 = "1.1"
-rand = "0.8"
+flate2 = "1.1.10"
+rand = "0.10"
 rayon = "1.12.0"
 rustc-hash = "2"
 tiktoken-rs = "0.12"
-wide = "1.5.0"
+wide = "1.7"
 
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }

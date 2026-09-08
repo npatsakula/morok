@@ -48,8 +48,8 @@ This is the whole point of the chapter, so it's worth making concrete. Because a
 kernel *is* just more UOps, it inherits all of the compiler's infrastructure for free — there is
 nothing tk-specific to build or to learn:
 
-- **One renderer.** The same `svod-codegen` path that lowers graph kernels to LLVM IR and an AMD
-  binary renders your `tk` kernel. There is no second backend to write, port, or keep in sync.
+- **One renderer.** The same `svod-codegen` path that lowers graph kernels to LLVM IR — and from
+  there to an AMD binary or to PTX — renders your `tk` kernel. There is no second backend to write, port, or keep in sync.
 - **One debugger.** You inspect a `tk` kernel exactly like any computation: print the UOp tree.
   A hand-written Flash Attention and an autotuned matmul appear in the *same* textual form, with
   the same op names — no separate dump format, no "what is kernel X" mystery.

@@ -37,7 +37,7 @@ fn knn_sink(corpus: usize, query: usize, d: usize, caps: ArchCaps) -> Arc<UOp> {
 /// Holds on both wave64 (gfx942) and wave32 (gfx1151).
 #[test]
 fn test_knn_score_graph_shape() {
-    for caps in [ArchCaps::GFX942, ArchCaps::for_arch(AmdArch::Gfx1151)] {
+    for caps in [ArchCaps::GFX942, ArchCaps::for_amd(AmdArch::Gfx1151)] {
         let arch = caps.arch;
         let topo = knn_sink(32, 32, 32, caps).toposort();
 
@@ -96,7 +96,7 @@ fn test_knn_score_amd() {
     }
     let dev = Tensor::rand(&[16, 16]).expect("probe").device();
     let arch = crate::target::resolve_arch(&dev).expect("resolve arch");
-    let w = arch.wave_size() as i64;
+    let w = ArchCaps::for_arch(arch).wave_size as i64;
 
     for (corpus, query, d) in [(16usize, 16usize, 16usize), (32, 32, 32), (32, 16, 48)] {
         // Realized bf16 inputs so the kernel and the reference see identical rounding.
@@ -169,11 +169,11 @@ fn topk_sink(corpus: usize, query: usize, d: usize, k: usize, caps: ArchCaps) ->
 /// The topk kernel's graph carries the full argmin-insert machinery on BOTH archs:
 /// the score WMMA, the index-carrying `row_arg_reduce` `ds_bpermute` `Op::Custom`
 /// gathers (two reduces per insert step — a corpus-min and a K-slot-max — each
-/// riding the arch's `reduce_tree`), the `Op::Ternary` evict/mask `where`s, and the
+/// riding the arch's sibling gather), the `Op::Ternary` evict/mask `where`s, and the
 /// two `[query, k]` output stores. Built rolled (the corpus loop).
 #[test]
 fn test_knn_topk_graph_shape() {
-    for caps in [ArchCaps::GFX942, ArchCaps::for_arch(AmdArch::Gfx1151)] {
+    for caps in [ArchCaps::GFX942, ArchCaps::for_amd(AmdArch::Gfx1151)] {
         let arch = caps.arch;
         let (corpus, query, d, k) = (32usize, 16usize, 16usize, 4usize);
         let topo = topk_sink(corpus, query, d, k, caps).toposort();
@@ -181,9 +181,12 @@ fn test_knn_topk_graph_shape() {
         assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma(..))), "{arch:?}: score WMMA");
 
         // The arg-reduce cross-lane gathers (value + index each ride a ds_bpermute):
-        // many across the k insert steps × 2 reduces × reduce_tree length.
+        // many across the k insert steps × 2 reduces × sibling-gather length.
         let customs = topo.iter().filter(|u| matches!(u.op(), Op::Custom(..))).count();
-        assert!(customs >= 4 * caps.reduce_tree().len(), "{arch:?}: arg_reduce ds_bpermute Op::Customs, got {customs}");
+        assert!(
+            customs >= 4 * (caps.wave_size / 16 - 1),
+            "{arch:?}: arg_reduce ds_bpermute Op::Customs, got {customs}"
+        );
 
         // The evict/mask conditional rewrites are `where` (Ternary) selects.
         let ternaries = topo.iter().filter(|u| matches!(u.op(), Op::Ternary(..))).count();
@@ -233,7 +236,7 @@ fn test_knn_topk_amd() {
     }
     let dev = Tensor::rand(&[16, 16]).expect("probe").device();
     let arch = crate::target::resolve_arch(&dev).expect("resolve arch");
-    let w = arch.wave_size() as i64;
+    let w = ArchCaps::for_arch(arch).wave_size as i64;
 
     // (corpus, query, d, k, tie): a square/ragged sweep over k. `tie` forces two
     // corpus rows equidistant to query 0 (a duplicated corpus row) so the smaller
