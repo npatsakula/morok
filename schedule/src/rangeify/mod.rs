@@ -35,8 +35,8 @@ pub use patterns::{
     apply_rangeify_patterns, buffer_folding, buffer_limit_patterns, dead_axis_removal, early_rewrites,
     movement_op_patterns, pm_comparison_negations, pm_div_to_shr, pm_erf_decomposition, pm_fdiv_to_mul,
     pm_fma_decomposition, pm_load_collapse, pm_max_decomposition, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul,
-    pm_reduce_simplify, pm_remove_bufferize, pm_sqrt_decomposition, rangeify_codegen_patterns, rangeify_codegen_simple,
-    split_reduceop_patterns, to_param_patterns,
+    pm_reduce_simplify, pm_remove_bufferize, pm_sqrt_decomposition, rangeify_codegen_patterns, split_reduceop_patterns,
+    to_param_patterns,
 };
 
 // Transforms

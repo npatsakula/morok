@@ -35,7 +35,6 @@ fn main() {
         .allowlist_type("__u\\d+")
         .allowlist_type("__s\\d+")
         .allowlist_var("KFD_IOC_.*")
-        .allowlist_var("KFD_MMAP_TYPE.*")
         .allowlist_var("KFD_MAX_QUEUE_PERCENTAGE")
         .allowlist_var("AMDKFD_IOC_.*")
         .derive_default(true)
