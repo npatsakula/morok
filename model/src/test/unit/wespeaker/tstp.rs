@@ -25,12 +25,7 @@ fn forward_zero_weights_shape() {
 
     let out = model.forward(&feats, &weights, &b).unwrap();
 
-    let shape: Vec<usize> = out
-        .shape()
-        .unwrap()
-        .iter()
-        .map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete or symbolic-max shape"))
-        .collect();
+    let shape = crate::test::max_dims(&out);
     assert_eq!(shape, vec![1, 256]);
 }
 
@@ -51,11 +46,6 @@ fn forward_zero_weights_realize() {
     let mut out = model.forward(&feats, &weights, &b).unwrap();
     out.realize().unwrap();
 
-    let shape: Vec<usize> = out
-        .shape()
-        .unwrap()
-        .iter()
-        .map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete or symbolic-max shape"))
-        .collect();
+    let shape = crate::test::max_dims(&out);
     assert_eq!(shape, vec![1, 256]);
 }

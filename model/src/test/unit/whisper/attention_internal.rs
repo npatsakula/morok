@@ -45,7 +45,7 @@ fn padded_encoder_flash_attention_matches_unpadded_sdpa() {
             .unwrap()
             .cast(DType::Float32)
             .unwrap();
-    assert_eq!(got.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), [1, 1500, 2, 64]);
+    assert_eq!(got.dims().unwrap(), [1, 1500, 2, 64]);
     got.realize().unwrap();
 
     let perm = |t: &Tensor| t.cast(DType::Float32).unwrap().try_permute(&[0, 2, 1, 3]).unwrap();

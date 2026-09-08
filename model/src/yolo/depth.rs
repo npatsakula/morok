@@ -4,7 +4,6 @@
 //! level to `c_mid` channels, progressively upsamples+fuses from P5→P3,
 //! then runs Conv→ConvTranspose2d→Conv→Conv2d to produce `[B, 1, H/4, W/4]`.
 
-use snafu::ResultExt;
 use svod_tensor::{BoundVariable, Tensor};
 
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
@@ -12,19 +11,19 @@ use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 use super::backbone::YoloBackbone;
 use super::blocks::conv::{Conv2dBias, ConvTranspose2dBias, YoloConv};
 use super::config::YoloConfig;
-use super::error::{Result, StateSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::loader;
 use super::neck::YoloNeck;
 
 /// Bilinear 2× upsample with align_corners=True.
 fn resize_bilinear_2x(x: &Tensor) -> Result<Tensor> {
     use svod_tensor::nn::{CoordinateTransformMode, ResizeMode};
-    x.resize()
+    Ok(x.resize()
         .scales(&[1.0, 1.0, 2.0, 2.0])
         .mode(ResizeMode::Linear)
         .coordinate_transformation_mode(CoordinateTransformMode::AlignCorners)
-        .call()
-        .context(TensorSnafu)
+        .call()?)
 }
 
 /// Depth fusion decoder head.
@@ -72,7 +71,7 @@ impl DepthHead {
         let mut out = projected[nl - 1].clone();
         for i in (0..nl - 1).rev() {
             out = resize_bilinear_2x(&out)?;
-            out = out.try_add(&projected[i]).context(TensorSnafu)?;
+            out = out.try_add(&projected[i])?;
             out = self.refine[i].0.forward(&out)?;
             out = self.refine[i].1.forward(&out)?;
         }
@@ -85,12 +84,12 @@ impl DepthHead {
         // exp(clamp(out, -4, 5))
         let neg4 = Tensor::from_slice([-4.0f32]);
         let pos5 = Tensor::from_slice([5.0f32]);
-        let clamped = out.clamp().min(&neg4).max(&pos5).call().context(TensorSnafu)?;
-        let depth = clamped.try_exp().context(TensorSnafu)?;
+        let clamped = out.clamp().min(&neg4).max(&pos5).call()?;
+        let depth = clamped.try_exp()?;
         // Log-affine calibration: depth = depth^cal_a * exp(cal_b)
-        let depth = depth.try_pow(&self.cal_a).context(TensorSnafu)?;
-        let cal_b_exp = self.cal_b.try_exp().context(TensorSnafu)?;
-        depth.try_mul(&cal_b_exp).context(TensorSnafu)
+        let depth = depth.try_pow(&self.cal_a)?;
+        let cal_b_exp = self.cal_b.try_exp()?;
+        Ok(depth.try_mul(&cal_b_exp)?)
     }
 }
 
@@ -168,7 +167,7 @@ impl Yolo26Depth {
 
     pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "").context(StateSnafu)?;
+        model.load_state_dict(sd, "")?;
         Ok(model)
     }
 

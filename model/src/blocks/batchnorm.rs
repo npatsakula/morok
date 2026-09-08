@@ -1,11 +1,10 @@
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::init::{ones, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 /// BN with the running variance pre-folded into `invstd`. State-dict keys:
 /// `weight` (→ `scale`), `bias`, `running_mean` (→ `mean`), `invstd`.
@@ -31,13 +30,7 @@ impl BatchNormWeights {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.batchnorm()
-            .scale(&self.scale)
-            .bias(&self.bias)
-            .mean(&self.mean)
-            .invstd(&self.invstd)
-            .call()
-            .context(TensorSnafu)
+        Ok(x.batchnorm().scale(&self.scale).bias(&self.bias).mean(&self.mean).invstd(&self.invstd).call()?)
     }
 }
 

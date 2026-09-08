@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 use svod_arch::pipelines::audio::{Transcriber, Transcript};
 use svod_runtime::{RunProfile, StageProfile};
 use svod_tensor::PrepareConfig;
@@ -39,17 +39,17 @@ fn timed_d2d<T>(
     }
     // Exclude prior graph work, then wait for the complete async transfer group.
     // This is synchronized host wall, not a hardware SDMA timestamp.
-    fence.synchronize().context(DeviceSnafu)?;
+    fence.synchronize()?;
     let started = Instant::now();
     let value = work()?;
-    fence.synchronize().context(DeviceSnafu)?;
+    fence.synchronize()?;
     Ok((value, started.elapsed()))
 }
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum TranscribeError {
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Jit {
         #[snafu(source(from(crate::jit::JitError, Box::new)))]
         source: Box<crate::jit::JitError>,
@@ -59,12 +59,12 @@ pub enum TranscribeError {
         #[snafu(source(from(super::error::Error, Box::new)))]
         source: Box<super::error::Error>,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Tensor {
         #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
         source: Box<svod_tensor::error::Error>,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Device {
         #[snafu(source(from(svod_device::error::Error, Box::new)))]
         source: Box<svod_device::error::Error>,
@@ -159,7 +159,7 @@ impl WhisperRecognizer {
         let mel_spec = InputSpec::f32(&[max_batch, n_mels, N_FRAMES]);
         let mut enc_config = prepare_config.clone();
         enc_config.device_local_outputs = true;
-        encoder_jit.prepare_with_config(mel_spec, &enc_config).context(JitSnafu)?;
+        encoder_jit.prepare_with_config(mel_spec, &enc_config)?;
 
         let n_text_state = model.dims.n_text_state;
         let n_text_layer = model.dims.n_text_layer;
@@ -169,32 +169,31 @@ impl WhisperRecognizer {
         // Cache-consuming decoder used for language detection.
         let mut decoder_jit = WhisperDecoderJit::new(model.clone());
         let tokens_spec = InputSpec::i32(&[1, 1]);
-        decoder_jit
-            .prepare_with_config(cross_cache_spec.clone(), cross_cache_spec.clone(), tokens_spec, &prepare_config)
-            .context(JitSnafu)?;
+        decoder_jit.prepare_with_config(
+            cross_cache_spec.clone(),
+            cross_cache_spec.clone(),
+            tokens_spec,
+            &prepare_config,
+        )?;
 
         // Cross-attention K/V projection is token-independent. Compile it once
         // and execute it once per encoder window, before any fallback attempts.
         let mut cross_kv_jit = WhisperCrossKvJit::new(model.clone());
         let mut cross_config = prepare_config.clone();
         cross_config.device_local_outputs = true;
-        cross_kv_jit
-            .prepare_with_config(InputSpec::f32(&[1, N_AUDIO_CTX, model.dims.n_text_state]), &cross_config)
-            .context(JitSnafu)?;
+        cross_kv_jit.prepare_with_config(InputSpec::f32(&[1, N_AUDIO_CTX, model.dims.n_text_state]), &cross_config)?;
 
         // Timestamp-enabled prefill has a structural, model-specific prefix:
         // multilingual [SOT, language, task], English-only [SOT].
         // Compiled once at construction, reused every window.
         let init_len = if model.is_multilingual() { 3 } else { 1 };
         let mut prefill_jit = WhisperPrefillJit::new(model.clone());
-        prefill_jit
-            .prepare_with_config(
-                InputSpec::i32(&[1, init_len]),
-                cross_cache_spec.clone(),
-                cross_cache_spec,
-                &prepare_config,
-            )
-            .context(JitSnafu)?;
+        prefill_jit.prepare_with_config(
+            InputSpec::i32(&[1, init_len]),
+            cross_cache_spec.clone(),
+            cross_cache_spec,
+            &prepare_config,
+        )?;
 
         let n_text_head_local = n_text_head;
 
@@ -202,18 +201,16 @@ impl WhisperRecognizer {
         // cache movement when lanes finish.
         let max_lanes = plan.decoder_slots;
         let mut batched_step_jit = WhisperDecoderStepJit::new(model.clone());
-        batched_step_jit
-            .prepare_with_config(
-                InputSpec::i32(&[max_lanes, 1]),
-                InputSpec::f32(&[max_lanes, 1, n_text_state]),
-                InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
-                InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
-                InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
-                InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
-                InputSpec::i32(&[max_lanes]),
-                &prepare_config,
-            )
-            .context(JitSnafu)?;
+        batched_step_jit.prepare_with_config(
+            InputSpec::i32(&[max_lanes, 1]),
+            InputSpec::f32(&[max_lanes, 1, n_text_state]),
+            InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
+            InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
+            InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
+            InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
+            InputSpec::i32(&[max_lanes]),
+            &prepare_config,
+        )?;
 
         // Read positional embedding eagerly (static weight, reused every window).
         // Cast to fp32 — the host decode math (pos_embedding slicing in decode.rs)
@@ -485,14 +482,14 @@ impl WhisperRecognizer {
             let t = Instant::now();
             let batch_mels: Vec<Vec<f32>> = (0..b).map(|bi| self.compute_mel(windows[batch_start + bi])).collect();
             {
-                let mel_buf = self.encoder_jit.mel_mut().context(JitSnafu)?;
+                let mel_buf = self.encoder_jit.mel_mut()?;
                 let mut packed = vec![0f32; max_batch * mel_stride];
                 for bi in 0..b {
                     packed[bi * mel_stride..(bi + 1) * mel_stride].copy_from_slice(&batch_mels[bi][..mel_stride]);
                 }
                 let copy_started = begin_host_copy(profile, mel_buf)
                     .map_err(|source| TranscribeError::Model { source: Box::new(source) })?;
-                let dst = mel_buf.as_host_bytes_mut().context(DeviceSnafu)?;
+                let dst = mel_buf.as_host_bytes_mut()?;
                 let src_bytes: &[u8] = bytemuck::cast_slice(&packed);
                 dst[..src_bytes.len()].copy_from_slice(src_bytes);
                 if let Some(started) = copy_started {
@@ -504,14 +501,14 @@ impl WhisperRecognizer {
             // ── Encode: one dispatch for b windows ───────────────────────────
             if profile {
                 let graph_started = Instant::now();
-                let kernels = self.encoder_jit.execute_profiled_static().context(JitSnafu)?;
-                self.encoder_jit.output().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
+                let kernels = self.encoder_jit.execute_profiled_static()?;
+                self.encoder_jit.output()?.synchronize()?;
                 encoder_profile.record(graph_started.elapsed(), kernels);
             } else {
-                self.encoder_jit.execute().context(JitSnafu)?;
+                self.encoder_jit.execute()?;
             }
 
-            let out_buf = self.encoder_jit.output().context(JitSnafu)?;
+            let out_buf = self.encoder_jit.output()?;
 
             let mut seeds = Vec::with_capacity(b);
             let mut decode_options = Vec::with_capacity(b);
@@ -524,14 +521,13 @@ impl WhisperRecognizer {
 
                 // Project encoder features once for all fallback prefills.
                 let (_, projection_wall) = timed_d2d(profile, out_buf, || {
-                    let buf = self.cross_kv_jit.audio_features_mut().context(JitSnafu)?;
+                    let buf = self.cross_kv_jit.audio_features_mut()?;
                     buf.copy_region_from(
                         0,
                         out_buf,
                         base * std::mem::size_of::<f32>(),
                         item_stride * std::mem::size_of::<f32>(),
-                    )
-                    .context(DeviceSnafu)?;
+                    )?;
                     Ok(())
                 })?;
                 if profile {
@@ -539,39 +535,23 @@ impl WhisperRecognizer {
                 }
                 if profile {
                     let graph_started = Instant::now();
-                    let kernels = self.cross_kv_jit.execute_profiled_static().context(JitSnafu)?;
-                    self.cross_kv_jit.cross_k().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
+                    let kernels = self.cross_kv_jit.execute_profiled_static()?;
+                    self.cross_kv_jit.cross_k()?.synchronize()?;
                     cross_kv_profile.record(graph_started.elapsed(), kernels);
                 } else {
-                    self.cross_kv_jit.execute().context(JitSnafu)?;
+                    self.cross_kv_jit.execute()?;
                 }
-                let cross_k_fence = self.cross_kv_jit.cross_k().context(JitSnafu)?.clone();
+                let cross_k_fence = self.cross_kv_jit.cross_k()?.clone();
                 let mut fanout_bytes = 0usize;
                 let (_, fanout_wall) = timed_d2d(profile, &cross_k_fence, || {
-                    let src = self.cross_kv_jit.cross_k().context(JitSnafu)?;
+                    let src = self.cross_kv_jit.cross_k()?;
                     fanout_bytes = fanout_bytes.saturating_add(src.size().saturating_mul(2));
-                    self.prefill_jit
-                        .prepared_cross_k_mut()
-                        .context(JitSnafu)?
-                        .copy_region_from(0, src, 0, src.size())
-                        .context(DeviceSnafu)?;
-                    self.decoder_jit
-                        .prepared_cross_k_mut()
-                        .context(JitSnafu)?
-                        .copy_region_from(0, src, 0, src.size())
-                        .context(DeviceSnafu)?;
-                    let src = self.cross_kv_jit.cross_v().context(JitSnafu)?;
+                    self.prefill_jit.prepared_cross_k_mut()?.copy_region_from(0, src, 0, src.size())?;
+                    self.decoder_jit.prepared_cross_k_mut()?.copy_region_from(0, src, 0, src.size())?;
+                    let src = self.cross_kv_jit.cross_v()?;
                     fanout_bytes = fanout_bytes.saturating_add(src.size().saturating_mul(2));
-                    self.prefill_jit
-                        .prepared_cross_v_mut()
-                        .context(JitSnafu)?
-                        .copy_region_from(0, src, 0, src.size())
-                        .context(DeviceSnafu)?;
-                    self.decoder_jit
-                        .prepared_cross_v_mut()
-                        .context(JitSnafu)?
-                        .copy_region_from(0, src, 0, src.size())
-                        .context(DeviceSnafu)?;
+                    self.prefill_jit.prepared_cross_v_mut()?.copy_region_from(0, src, 0, src.size())?;
+                    self.decoder_jit.prepared_cross_v_mut()?.copy_region_from(0, src, 0, src.size())?;
                     Ok(())
                 })?;
                 if profile {

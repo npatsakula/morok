@@ -30,7 +30,7 @@ fn forward_shape_obb() {
     let var = Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();
     let out = model.forward(&images, &b).unwrap();
-    let shape: Vec<usize> = out.shape().unwrap().iter().map(|s| s.as_const().or_else(|| s.vmax()).unwrap()).collect();
+    let shape = crate::test::max_dims(&out);
     // 4 + 80 + 1 = 85 channels, 2100 anchors
     assert_eq!(shape, vec![1, 85, 2100]);
 }

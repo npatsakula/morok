@@ -16,7 +16,7 @@ fn s80_md_v2_feature_extractor_shape() {
     let wav = Tensor::zeros(&[1, n_samples], DType::Float32).unwrap();
     let out = fe.forward(&wav).expect("symbolic forward");
 
-    let shape: Vec<usize> = out.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let shape = out.dims().unwrap();
     let expected_t = fe.num_frames(n_samples);
     assert_eq!(shape, vec![1, expected_t, 211]);
 

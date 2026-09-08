@@ -19,7 +19,7 @@ pub use splitter::{SileroVadSplitter, SileroVadSplitterError};
 
 use std::path::Path;
 
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_macros::jit_wrapper;
@@ -32,17 +32,17 @@ use crate::state;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Tensor {
         #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
         source: Box<svod_tensor::error::Error>,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     State {
         #[snafu(source(from(crate::state::Error, Box::new)))]
         source: Box<crate::state::Error>,
     },
-    #[snafu(display("hub error: {source}"))]
+    #[snafu(display("hub error: {source}"), context(false))]
     Hub { source: hf_hub::HFError },
 }
 
@@ -70,13 +70,13 @@ pub struct SileroVad {
 
 impl SileroVad {
     pub fn from_hub() -> Result<Self> {
-        let repo = crate::hub::HubRepo::open("vpermilp/silero-vad", "main").context(HubSnafu)?;
-        let path = repo.get("silero_vad_16k.safetensors").context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open("vpermilp/silero-vad", "main")?;
+        let path = repo.get("silero_vad_16k.safetensors")?;
         Self::from_safetensors(&path)
     }
 
     pub fn from_safetensors(path: &Path) -> Result<Self> {
-        let sd = state::load_safetensors(path).context(StateSnafu)?;
+        let sd = state::load_safetensors(path)?;
         Ok(Self {
             stft_conv: Conv1d::new(get(&sd, "stft_conv.weight")?, None).with_stride(128),
             conv1: Conv1d::new(get(&sd, "conv1.weight")?, Some(get(&sd, "conv1.bias")?)).with_padding((1, 1)),
@@ -137,39 +137,26 @@ impl SileroVad {
             .pad_with()
             .padding(&[(0, 0), (0, STFT_PAD as isize)])
             .mode(PadMode::Reflect)
-            .call()
-            .context(TensorSnafu)?
-            .try_unsqueeze(1)
-            .context(TensorSnafu)?;
+            .call()?
+            .try_unsqueeze(1)?;
 
-        let x = self.stft_conv.forward(&x).context(TensorSnafu)?;
+        let x = self.stft_conv.forward(&x)?;
 
         // Keep the full (symbolic) batch dim (`None`); split STFT real/imag
         // channels and the fixed 4 time frames.
-        let real = x
-            .try_shrink([None, Some((SInt::Const(0), SInt::Const(CUTOFF))), Some((SInt::Const(0), SInt::Const(4)))])
-            .context(TensorSnafu)?;
-        let imag = x
-            .try_shrink([None, Some((SInt::Const(CUTOFF), SInt::Const(258))), Some((SInt::Const(0), SInt::Const(4)))])
-            .context(TensorSnafu)?;
-        let x = real
-            .square()
-            .context(TensorSnafu)?
-            .try_add(&imag.square().context(TensorSnafu)?)
-            .context(TensorSnafu)?
-            .try_sqrt()
-            .context(TensorSnafu)?;
+        let real =
+            x.try_shrink([None, Some((SInt::Const(0), SInt::Const(CUTOFF))), Some((SInt::Const(0), SInt::Const(4)))])?;
+        let imag = x.try_shrink([
+            None,
+            Some((SInt::Const(CUTOFF), SInt::Const(258))),
+            Some((SInt::Const(0), SInt::Const(4))),
+        ])?;
+        let x = real.square()?.try_add(&imag.square()?)?.try_sqrt()?;
 
-        let x = self.conv1.forward(&x).context(TensorSnafu)?.relu().context(TensorSnafu)?;
-        let x = self.conv2.forward(&x).context(TensorSnafu)?.relu().context(TensorSnafu)?;
-        let x = self.conv3.forward(&x).context(TensorSnafu)?.relu().context(TensorSnafu)?;
-        self.conv4
-            .forward(&x)
-            .context(TensorSnafu)?
-            .relu()
-            .context(TensorSnafu)?
-            .try_squeeze(Some(-1))
-            .context(TensorSnafu)
+        let x = self.conv1.forward(&x)?.relu()?;
+        let x = self.conv2.forward(&x)?.relu()?;
+        let x = self.conv3.forward(&x)?.relu()?;
+        Ok(self.conv4.forward(&x)?.relu()?.try_squeeze(Some(-1))?)
     }
 
     /// Conv front-end + the LSTM's non-recurrent input projection, batched:
@@ -179,41 +166,31 @@ impl SileroVad {
     /// `W_hh·h` and activations. Bias order: `(feat·W_ihᵀ + b_ih) + b_hh`.
     pub fn forward_gates(&self, chunks: &Tensor) -> Result<Tensor> {
         let feat = self.forward_features(chunks)?;
-        feat.linear()
-            .weight(&self.lstm.weight_ih)
-            .bias(&self.lstm.bias_ih)
-            .call()
-            .context(TensorSnafu)?
-            .try_add(&self.lstm.bias_hh)
-            .context(TensorSnafu)
+        Ok(feat.linear().weight(&self.lstm.weight_ih).bias(&self.lstm.bias_ih).call()?.try_add(&self.lstm.bias_hh)?)
     }
 
     pub fn forward_chunk(&self, chunk: &Tensor, state_h: &Tensor, state_c: &Tensor) -> Result<Tensor> {
         let x = self.forward_features(chunk)?;
 
-        let (new_h, new_c) = self.lstm.step(&x, state_h, state_c).context(TensorSnafu)?;
+        let (new_h, new_c) = self.lstm.step(&x, state_h, state_c)?;
 
-        let prob = new_h.try_unsqueeze(-1).context(TensorSnafu)?.relu().context(TensorSnafu)?;
+        let prob = new_h.try_unsqueeze(-1)?.relu()?;
         let prob = self
             .final_conv
-            .forward(&prob)
-            .context(TensorSnafu)?
-            .sigmoid()
-            .context(TensorSnafu)?
-            .try_squeeze(Some(-1))
-            .context(TensorSnafu)?
+            .forward(&prob)?
+            .sigmoid()?
+            .try_squeeze(Some(-1))?
             .mean_with()
             .axes(-1isize)
             .keepdim(true)
-            .call()
-            .context(TensorSnafu)?;
+            .call()?;
 
-        Tensor::cat(&[&prob, &new_h, &new_c], 1).context(TensorSnafu)
+        Ok(Tensor::cat(&[&prob, &new_h, &new_c], 1)?)
     }
 }
 
 fn get(sd: &state::StateDict, key: &str) -> Result<Tensor> {
-    state::get_tensor(sd, key).context(StateSnafu)
+    Ok(state::get_tensor(sd, key)?)
 }
 
 /// Max windows per batched conv-front-end dispatch. Larger = fewer dispatches
@@ -314,13 +291,14 @@ impl svod_arch::pipelines::audio::Vad for VadInference {
 
 impl VadInference {
     pub fn new(vad: SileroVad) -> crate::jit::Result<Self> {
-        use crate::jit::{InputSpec, TensorSnafu};
+        use crate::jit::InputSpec;
+
         let h = HIDDEN;
         // Pull the recurrent weights to host before `vad` moves into the JIT.
         let to_vec = |t: &Tensor| -> crate::jit::Result<Vec<f32>> {
             let mut t = t.clone();
-            t.realize().context(TensorSnafu)?;
-            t.as_vec::<f32>().context(TensorSnafu)
+            t.realize()?;
+            Ok(t.as_vec::<f32>()?)
         };
         let w_hh = ndarray::Array2::from_shape_vec((4 * h, h), to_vec(&vad.lstm.weight_hh)?).expect("w_hh shape");
         let final_w = ndarray::Array1::from_vec(to_vec(&vad.final_conv.weight)?); // [1,H,1] flat = H
@@ -368,7 +346,7 @@ impl VadInference {
             let b = (n_chunks - done).min(FEATURE_BATCH);
             {
                 let buf = self.jit.chunks_mut()?;
-                let mut view = buf.as_array_mut::<f32>().context(crate::jit::DeviceSnafu)?;
+                let mut view = buf.as_array_mut::<f32>()?;
                 let slice = view.as_slice_mut().expect("contiguous chunks");
                 for i in 0..b {
                     let start = (done + i) * NUM_SAMPLES;
@@ -378,7 +356,7 @@ impl VadInference {
             self.jit.execute()?;
             // Device-local output: SDMA-stage only the valid rows out.
             let dst = &mut gates[done * 4 * h..(done + b) * 4 * h];
-            self.jit.output()?.copyout_prefix(bytemuck::cast_slice_mut(dst)).context(crate::jit::DeviceSnafu)?;
+            self.jit.output()?.copyout_prefix(bytemuck::cast_slice_mut(dst))?;
             done += b;
         }
         let feature_ms = t_feat.elapsed().as_secs_f64() * 1e3;

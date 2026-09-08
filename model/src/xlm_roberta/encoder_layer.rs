@@ -6,14 +6,14 @@
 //! layer_out = LayerNorm_ffn(attn_out + FFN(attn_out))
 //! ```
 
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict};
 
 use super::attention::XlmRobertaAttention;
 use super::config::XlmRobertaConfig;
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
+
 use super::feed_forward::FeedForwardWeights;
 use super::normalization::LayerNormWeights;
 
@@ -41,11 +41,11 @@ impl EncoderLayer {
     /// Forward. `x`: `(B, L, D)` → `(B, L, D)`. Post-norm.
     pub fn forward(&self, x: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
         let attn_delta = self.attention.forward(x, padding_mask)?;
-        let x = x.try_add(&attn_delta).context(TensorSnafu)?;
+        let x = x.try_add(&attn_delta)?;
         let x = self.attention_norm.apply(&x)?;
 
         let ffn_delta = self.feed_forward.forward(&x)?;
-        let x = x.try_add(&ffn_delta).context(TensorSnafu)?;
+        let x = x.try_add(&ffn_delta)?;
         self.ffn_norm.apply(&x)
     }
 }

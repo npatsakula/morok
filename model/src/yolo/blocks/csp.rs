@@ -1,4 +1,3 @@
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict, prefixed};
@@ -6,7 +5,7 @@ use crate::state::{self, HasStateDict, StateDict, prefixed};
 use super::attention::PSABlock;
 use super::bottleneck::YoloBottleneck;
 use super::conv::YoloConv;
-use crate::yolo::error::{Result, TensorSnafu};
+use crate::yolo::error::Result;
 
 // ---------------------------------------------------------------------------
 // C2f — the C2f/C3k2 parent: 1×1 conv → chunk(2) → chain → cat → 1×1 conv
@@ -39,7 +38,7 @@ impl C2f {
     /// C2f forward shared with C3k2: `cv1 → chunk(2) → chain(m) → cat → cv2`.
     pub fn forward_chain(&self, x: &Tensor) -> Result<Tensor> {
         let y = self.cv1.forward(x)?;
-        let chunks = y.chunk(2, 1).context(TensorSnafu)?;
+        let chunks = y.chunk(2, 1)?;
         let mut parts = vec![chunks[0].clone(), chunks[1].clone()];
         let mut current = chunks[1].clone();
         for blk in &self.m {
@@ -47,7 +46,7 @@ impl C2f {
             parts.push(current.clone());
         }
         let refs: Vec<&Tensor> = parts.iter().collect();
-        let cat = Tensor::cat(&refs, 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&refs, 1)?;
         self.cv2.forward(&cat)
     }
 
@@ -109,7 +108,7 @@ impl C3k {
             current = blk.forward(&current)?;
         }
         let right = self.cv2.forward(x)?;
-        let cat = Tensor::cat(&[&current, &right], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&current, &right], 1)?;
         self.cv3.forward(&cat)
     }
 }
@@ -234,7 +233,7 @@ impl C3k2 {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let y = self.cv1.forward(x)?;
-        let chunks = y.chunk(2, 1).context(TensorSnafu)?;
+        let chunks = y.chunk(2, 1)?;
         let mut parts = vec![chunks[0].clone(), chunks[1].clone()];
         let mut current = chunks[1].clone();
         for blk in &self.m {
@@ -242,7 +241,7 @@ impl C3k2 {
             parts.push(current.clone());
         }
         let refs: Vec<&Tensor> = parts.iter().collect();
-        let cat = Tensor::cat(&refs, 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&refs, 1)?;
         self.cv2.forward(&cat)
     }
 }

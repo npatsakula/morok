@@ -27,12 +27,7 @@ fn forward_chunk_zero_weights_shape() {
     let state_c = Tensor::zeros(&[1, HIDDEN], DType::Float32).unwrap();
 
     let out = vad.forward_chunk(&chunk, &state_h, &state_c).unwrap();
-    let shape: Vec<usize> = out
-        .shape()
-        .unwrap()
-        .iter()
-        .map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete or symbolic-max shape"))
-        .collect();
+    let shape = crate::test::max_dims(&out);
     // [B=1, prob(1) + h(HIDDEN) + c(HIDDEN)]
     assert_eq!(shape, vec![1, 1 + 2 * HIDDEN]);
 }

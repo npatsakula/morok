@@ -12,7 +12,7 @@ fn pos_conv_preserves_shape() {
     let t = 799;
     let x = Tensor::zeros(&[1, t, 1024], DType::Float32).unwrap();
     let y = pe.forward(&x).expect("symbolic forward");
-    let shape: Vec<usize> = y.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let shape = y.dims().unwrap();
     assert_eq!(shape, vec![1, t, 1024]);
 }
 
@@ -47,7 +47,7 @@ fn pos_conv_weight_norm_reconstruction() {
     let mut got = pe.weight.clone();
     got.realize().unwrap();
     let got_vec: Vec<f32> = got.as_vec::<f32>().unwrap();
-    let got_shape: Vec<usize> = got.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let got_shape = got.dims().unwrap();
     assert_eq!(got_shape, vec![embed_dim, in_per_group, kernel]);
 
     // Compute g * v / ||v||_dim01 manually.

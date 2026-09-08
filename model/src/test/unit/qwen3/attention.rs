@@ -10,27 +10,27 @@ fn tiny_attn() -> Qwen3Attention {
 #[test]
 fn gqa_projection_shapes() {
     let attn = tiny_attn();
-    let q_shape = attn.q_proj_weight.shape().unwrap();
-    let k_shape = attn.k_proj_weight.shape().unwrap();
-    let v_shape = attn.v_proj_weight.shape().unwrap();
-    let o_shape = attn.o_proj_weight.shape().unwrap();
+    let q_shape = attn.q_proj_weight.dims().unwrap();
+    let k_shape = attn.k_proj_weight.dims().unwrap();
+    let v_shape = attn.v_proj_weight.dims().unwrap();
+    let o_shape = attn.o_proj_weight.dims().unwrap();
 
     // q: (4*32, 64) = (128, 64), k/v: (2*32, 64) = (64, 64), o: (64, 128)
-    assert_eq!(q_shape[0].as_const().unwrap(), 128);
-    assert_eq!(q_shape[1].as_const().unwrap(), 64);
-    assert_eq!(k_shape[0].as_const().unwrap(), 64);
-    assert_eq!(v_shape[0].as_const().unwrap(), 64);
-    assert_eq!(o_shape[0].as_const().unwrap(), 64);
-    assert_eq!(o_shape[1].as_const().unwrap(), 128);
+    assert_eq!(q_shape[0], 128);
+    assert_eq!(q_shape[1], 64);
+    assert_eq!(k_shape[0], 64);
+    assert_eq!(v_shape[0], 64);
+    assert_eq!(o_shape[0], 64);
+    assert_eq!(o_shape[1], 128);
 }
 
 #[test]
 fn qk_norm_dims() {
     let attn = tiny_attn();
-    let qn = attn.q_norm.weight.shape().unwrap();
-    let kn = attn.k_norm.weight.shape().unwrap();
-    assert_eq!(qn[0].as_const().unwrap(), 32);
-    assert_eq!(kn[0].as_const().unwrap(), 32);
+    let qn = attn.q_norm.weight.dims().unwrap();
+    let kn = attn.k_norm.weight.dims().unwrap();
+    assert_eq!(qn[0], 32);
+    assert_eq!(kn[0], 32);
 }
 
 #[test]
@@ -43,10 +43,10 @@ fn forward_output_shape() {
     let out = attn.forward(&x, &rotary, None).unwrap();
     let mut out = out;
     out.realize().unwrap();
-    let s = out.shape().unwrap();
-    assert_eq!(s[0].as_const().unwrap(), 1);
-    assert_eq!(s[1].as_const().unwrap(), 8);
-    assert_eq!(s[2].as_const().unwrap(), 64);
+    let s = out.dims().unwrap();
+    assert_eq!(s[0], 1);
+    assert_eq!(s[1], 8);
+    assert_eq!(s[2], 64);
 
     let v = out.as_vec::<f32>().unwrap();
     assert!(v.iter().all(|x| x.is_finite()));
@@ -63,16 +63,16 @@ fn published_weight_shapes() {
         cfg.rms_norm_eps,
         DType::BFloat16,
     );
-    let q = attn.q_proj_weight.shape().unwrap();
-    let k = attn.k_proj_weight.shape().unwrap();
-    let o = attn.o_proj_weight.shape().unwrap();
+    let q = attn.q_proj_weight.dims().unwrap();
+    let k = attn.k_proj_weight.dims().unwrap();
+    let o = attn.o_proj_weight.dims().unwrap();
     // q: (16*128, 1024) = (2048, 1024)
-    assert_eq!(q[0].as_const().unwrap(), 2048);
-    assert_eq!(q[1].as_const().unwrap(), 1024);
+    assert_eq!(q[0], 2048);
+    assert_eq!(q[1], 1024);
     // k: (8*128, 1024) = (1024, 1024)
-    assert_eq!(k[0].as_const().unwrap(), 1024);
-    assert_eq!(k[1].as_const().unwrap(), 1024);
+    assert_eq!(k[0], 1024);
+    assert_eq!(k[1], 1024);
     // o: (1024, 2048)
-    assert_eq!(o[0].as_const().unwrap(), 1024);
-    assert_eq!(o[1].as_const().unwrap(), 2048);
+    assert_eq!(o[0], 1024);
+    assert_eq!(o[1], 2048);
 }

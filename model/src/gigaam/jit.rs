@@ -8,11 +8,9 @@
 
 extern crate self as svod_model;
 
-use snafu::ResultExt;
 use svod_macros::jit_wrapper;
 
 use super::model::GigaAm;
-use crate::gigaam::error::TensorSnafu;
 
 jit_wrapper! {
     GigaAmEncoderJit(GigaAm) {
@@ -25,7 +23,7 @@ jit_wrapper! {
             // RN-T decoder consumes frame-major rows, and doing it here turns
             // the host-side strided transpose over the slow mapping into one
             // contiguous copyout.
-            out.cast(svod_dtype::DType::Float32).context(TensorSnafu)?.try_permute(&[0, 2, 1]).context(TensorSnafu)
+            Ok::<_, super::error::Error>(out.cast(svod_dtype::DType::Float32)?.try_permute(&[0, 2, 1])?)
         }
     }
 }

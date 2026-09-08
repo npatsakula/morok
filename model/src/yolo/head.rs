@@ -1,14 +1,13 @@
 //! Shared detection-head infrastructure: branches, anchor generation, box
 //! decoding, and postprocessing.
 
-use snafu::{OptionExt, ResultExt};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict, prefixed};
 
 use super::blocks::conv::{Conv2dBias, YoloConv};
-use super::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
 
 /// Generate anchor points and stride tensor from feature map sizes.
 ///
@@ -36,22 +35,18 @@ pub(crate) fn make_anchors(feat_sizes: &[(usize, usize)], strides: &[usize]) -> 
 ///
 /// `boxes [B, 4, A]`, `anchors [2, A]`, `strides [1, A]` → `[B, 4, A]`.
 pub(crate) fn dist2bbox(boxes: &Tensor, anchors: &Tensor, strides: &Tensor, num_anchors: usize) -> Result<Tensor> {
-    let parts = boxes.split(&[2, 2], 1).context(TensorSnafu)?;
+    let parts = boxes.split(&[2, 2], 1)?;
     let lt = &parts[0];
     let rb = &parts[1];
 
-    let anchors_3d = anchors
-        .try_reshape([SInt::from(1isize), SInt::from(2isize), SInt::from(num_anchors as isize)])
-        .context(TensorSnafu)?;
+    let anchors_3d = anchors.try_reshape([SInt::from(1isize), SInt::from(2isize), SInt::from(num_anchors as isize)])?;
 
-    let x1y1 = anchors_3d.try_sub(lt).context(TensorSnafu)?;
-    let x2y2 = anchors_3d.try_add(rb).context(TensorSnafu)?;
-    let bbox = Tensor::cat(&[&x1y1, &x2y2], 1).context(TensorSnafu)?;
+    let x1y1 = anchors_3d.try_sub(lt)?;
+    let x2y2 = anchors_3d.try_add(rb)?;
+    let bbox = Tensor::cat(&[&x1y1, &x2y2], 1)?;
 
-    let strides_3d = strides
-        .try_reshape([SInt::from(1isize), SInt::from(1isize), SInt::from(num_anchors as isize)])
-        .context(TensorSnafu)?;
-    bbox.try_mul(&strides_3d).context(TensorSnafu)
+    let strides_3d = strides.try_reshape([SInt::from(1isize), SInt::from(1isize), SInt::from(num_anchors as isize)])?;
+    Ok(bbox.try_mul(&strides_3d)?)
 }
 
 /// Box-regression branch: `Conv(k3) → Conv(k3) → Conv2d(k1, bias)`.
@@ -223,12 +218,8 @@ pub fn postprocess_raw(data: &[f32], shape: &[usize], nc: usize, max_det: usize)
 /// Top-k postprocess on a realized `[B, 4+nc, A]` tensor. Returns one
 /// `Vec<Detection>` per image, sorted by confidence descending.
 pub fn postprocess(preds: &mut Tensor, nc: usize, max_det: usize) -> Result<Vec<Vec<Detection>>> {
-    preds.realize().context(TensorSnafu)?;
-    let shape = preds.shape().context(TensorSnafu)?;
-    let batch: usize = shape[0].as_const().context(SymbolicShapeSnafu { what: "postprocess batch" })?;
-    let out_ch: usize = shape[1].as_const().context(SymbolicShapeSnafu { what: "postprocess channels" })?;
-    let anchors: usize = shape[2].as_const().context(SymbolicShapeSnafu { what: "postprocess anchors" })?;
-
-    let data = preds.as_vec::<f32>().context(TensorSnafu)?;
-    postprocess_raw(&data, &[batch, out_ch, anchors], nc, max_det)
+    preds.realize()?;
+    let dims = preds.dims()?;
+    let data = preds.as_vec::<f32>()?;
+    postprocess_raw(&data, &dims, nc, max_det)
 }

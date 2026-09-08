@@ -9,13 +9,13 @@
 //! `skip_first_prenorm = true` makes layer 0's `attn_norm` an identity (its
 //! state-dict key is absent), so `attn_norm` is `Option` and `None` for layer 0.
 
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict};
 
 use super::attention::ModernBertAttention;
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
+
 use super::mlp::ModernBertGlu;
 use super::normalization::LayerNormWeights;
 use super::rotary::RotaryTable;
@@ -57,11 +57,11 @@ impl EncoderLayer {
             None => x.clone(),
         };
         let delta = self.attention.forward(&normed, rotary, padding_mask)?;
-        let mut h = x.try_add(&delta).context(TensorSnafu)?;
+        let mut h = x.try_add(&delta)?;
 
         let normed = self.mlp_norm.apply(&h)?;
         let delta = self.mlp.forward(&normed)?;
-        h = h.try_add(&delta).context(TensorSnafu)?;
+        h = h.try_add(&delta)?;
         Ok(h)
     }
 }

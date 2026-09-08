@@ -8,7 +8,6 @@
 
 use std::path::Path;
 
-use snafu::ResultExt;
 use svod_ir::SInt;
 use svod_tensor::{BoundVariable, Tensor};
 
@@ -17,7 +16,8 @@ use crate::state::{self, HasStateDict, StateDict};
 use super::config::ModernBertConfig;
 use super::embeddings::Embeddings;
 use super::encoder::Encoder;
-use super::error::{HubSnafu, Result, StateSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::normalization::LayerNormWeights;
 
 #[derive(Clone)]
@@ -58,9 +58,9 @@ impl ModernBert {
         b: &BoundVariable,
     ) -> Result<Tensor> {
         let bv = b.as_sint();
-        let input_ids = input_ids.try_shrink([Some((SInt::Const(0), bv.clone())), None]).context(TensorSnafu)?;
+        let input_ids = input_ids.try_shrink([Some((SInt::Const(0), bv.clone())), None])?;
         let padding_mask = match padding_mask {
-            Some(m) => Some(m.try_shrink([Some((SInt::Const(0), bv)), None]).context(TensorSnafu)?),
+            Some(m) => Some(m.try_shrink([Some((SInt::Const(0), bv)), None])?),
             None => None,
         };
         self.forward(&input_ids, padding_mask.as_ref())
@@ -74,21 +74,21 @@ impl ModernBert {
     }
 
     pub fn from_hub_with_revision(model_id: &str, revision: &str, config: &mut ModernBertConfig) -> Result<Self> {
-        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open(model_id, revision)?;
         // Parse the published config.json, then splice back the caller-chosen
         // dtype / max_batch_size (those aren't in the on-disk config).
-        let cfg_path = repo.get("config.json").context(HubSnafu)?;
+        let cfg_path = repo.get("config.json")?;
         let parsed = ModernBertConfig::from_json(&cfg_path)?;
         config.merge_structural_from(&parsed);
 
-        let weights_path = repo.get("model.safetensors").context(HubSnafu)?;
+        let weights_path = repo.get("model.safetensors")?;
         Self::from_safetensors(&weights_path, config.clone())
     }
 
     /// Load from a `model.safetensors` checkpoint. Weights are cast to
     /// `config.dtype` as they are read.
     pub fn from_safetensors(path: &Path, config: ModernBertConfig) -> Result<Self> {
-        let sd = state::load_safetensors(path).context(StateSnafu)?;
+        let sd = state::load_safetensors(path)?;
         Self::from_state_dict(&sd, config)
     }
 
@@ -99,7 +99,7 @@ impl ModernBert {
     pub fn from_state_dict(sd: &StateDict, config: ModernBertConfig) -> Result<Self> {
         let dtype = config.dtype.clone();
         let mut model = Self::empty(config);
-        model.load_state_dict(&state::cast_all(sd, dtype), "").context(StateSnafu)?;
+        model.load_state_dict(&state::cast_all(sd, dtype), "")?;
         Ok(model)
     }
 }

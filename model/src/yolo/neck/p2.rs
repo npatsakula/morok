@@ -4,7 +4,6 @@
 //! P2/4) and one extra PAN bottom-up stage. Outputs four detection feature
 //! maps at strides 4, 8, 16, 32.
 
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict, prefixed};
@@ -13,7 +12,7 @@ use crate::yolo::backbone::upsample_nearest_2x;
 use crate::yolo::blocks::conv::YoloConv;
 use crate::yolo::blocks::csp::C3k2;
 use crate::yolo::config::{YoloScale, make_depth, scale_channels};
-use crate::yolo::error::{Result, TensorSnafu};
+use crate::yolo::error::Result;
 
 /// P2 neck (layers 11–28). Takes four backbone features `(l2, l4, l6, l10)`
 /// and produces `(P2, P3, P4, P5)` at strides 4, 8, 16, 32.
@@ -70,28 +69,28 @@ impl YoloNeckP2 {
     ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         // FPN top-down: l10 → up → cat(l6) → c3k2_13 → up → cat(l4) → c3k2_16 → up → cat(l2) → c3k2_19
         let up = upsample_nearest_2x(l10)?;
-        let cat = Tensor::cat(&[&up, l6], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&up, l6], 1)?;
         let l13 = self.c3k2_13.forward(&cat)?;
 
         let up = upsample_nearest_2x(&l13)?;
-        let cat = Tensor::cat(&[&up, l4], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&up, l4], 1)?;
         let l16 = self.c3k2_16.forward(&cat)?;
 
         let up = upsample_nearest_2x(&l16)?;
-        let cat = Tensor::cat(&[&up, l2], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&up, l2], 1)?;
         let l19 = self.c3k2_19.forward(&cat)?;
 
         // PAN bottom-up: l19 → conv20 → cat(l16) → c3k2_22 → conv23 → cat(l13) → c3k2_25 → conv26 → cat(l10) → c3k2_28
         let l20 = self.conv20.forward(&l19)?;
-        let cat = Tensor::cat(&[&l20, &l16], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&l20, &l16], 1)?;
         let l22 = self.c3k2_22.forward(&cat)?;
 
         let l23 = self.conv23.forward(&l22)?;
-        let cat = Tensor::cat(&[&l23, &l13], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&l23, &l13], 1)?;
         let l25 = self.c3k2_25.forward(&cat)?;
 
         let l26 = self.conv26.forward(&l25)?;
-        let cat = Tensor::cat(&[&l26, l10], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&l26, l10], 1)?;
         let l28 = self.c3k2_28.forward(&cat)?;
 
         Ok((l19, l22, l25, l28))

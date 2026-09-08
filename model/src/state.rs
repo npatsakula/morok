@@ -19,7 +19,7 @@ pub enum Error {
     UnsupportedDtype { dtype: String },
     #[snafu(display("missing key in state dict: {key}"))]
     MissingKey { key: String },
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Tensor {
         #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
         source: Box<svod_tensor::error::Error>,
@@ -44,7 +44,7 @@ pub fn load_safetensors(path: &Path) -> Result<StateDict> {
             shape: view.shape().to_vec(),
             device: svod_dtype::default_device::default_device(),
         };
-        let tensor = Tensor::from_shared_weight(key, view.data()).context(TensorSnafu)?;
+        let tensor = Tensor::from_shared_weight(key, view.data())?;
         sd.insert(name.to_string(), tensor);
     }
     Ok(sd)
@@ -127,8 +127,7 @@ pub fn get_tensor(sd: &StateDict, key: &str) -> Result<Tensor> {
 pub fn cast_all(sd: &StateDict, dtype: DType) -> StateDict {
     sd.iter()
         .map(|(k, v)| {
-            let t =
-                if v.uop().dtype() == dtype { v.clone() } else { v.cast(dtype.clone()).unwrap_or_else(|_| v.clone()) };
+            let t = if v.dtype() == dtype { v.clone() } else { v.cast(dtype.clone()).unwrap_or_else(|_| v.clone()) };
             (k.clone(), t)
         })
         .collect()

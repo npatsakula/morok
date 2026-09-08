@@ -54,7 +54,7 @@ fn encoder_layer_forward_skips_attention_when_none() {
     let x = Tensor::zeros(&[1, 4, cfg.encoder_embed_dim], DType::Float32).unwrap();
     // No position_bias needed when attention is None.
     let out = layer.forward(&x, None).expect("forward without attention");
-    let shape: Vec<usize> = out.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let shape = out.dims().unwrap();
     assert_eq!(shape, vec![1, 4, cfg.encoder_embed_dim]);
 }
 
@@ -72,7 +72,7 @@ fn encoder_extract_features_returns_n_plus_one() {
     let out = enc.extract_features(&features).expect("symbolic forward");
     assert_eq!(out.len(), cfg.encoder_num_layers + 1, "extract_features must return num_layers + 1 tensors");
     for t in &out {
-        let shape: Vec<usize> = t.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+        let shape = t.dims().unwrap();
         assert_eq!(shape, vec![1, l, cfg.encoder_embed_dim]);
     }
 }

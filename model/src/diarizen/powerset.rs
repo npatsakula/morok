@@ -6,11 +6,10 @@
 //! encoding (a pure tensor op), so it lives in the model layer; clustering and
 //! RTTM are downstream concerns and stay out of Svod.
 
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use super::config::powerset_table;
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 /// Decode `(.., K)` powerset log-probs to `(.., max_per_chunk)` binary
 /// multilabel speaker activations, where `K == powerset_class_count(
@@ -30,7 +29,7 @@ pub fn powerset_to_multilabel(logits: &Tensor, max_per_chunk: usize, max_per_fra
             membership[speaker * k + subset_idx] = 1.0;
         }
     }
-    let mapping = Tensor::from_slice(&membership).try_reshape([max_per_chunk, k]).context(TensorSnafu)?;
+    let mapping = Tensor::from_slice(&membership).try_reshape([max_per_chunk, k])?;
 
-    logits.hardmax(-1).context(TensorSnafu)?.linear().weight(&mapping).call().context(TensorSnafu)
+    Ok(logits.hardmax(-1)?.linear().weight(&mapping).call()?)
 }

@@ -3,14 +3,13 @@
 //! No biases. Three separate projections (gate, up, down) — not a fused
 //! 2×intermediate matrix like ModernBERT.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 #[derive(Clone)]
 pub struct Qwen3MLP {
@@ -30,10 +29,10 @@ impl Qwen3MLP {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = x.linear().weight(&self.gate_weight).call().context(TensorSnafu)?;
-        let up = x.linear().weight(&self.up_weight).call().context(TensorSnafu)?;
-        let act = gate.silu().context(TensorSnafu)?.try_mul(&up).context(TensorSnafu)?;
-        act.linear().weight(&self.down_weight).call().context(TensorSnafu)
+        let gate = x.linear().weight(&self.gate_weight).call()?;
+        let up = x.linear().weight(&self.up_weight).call()?;
+        let act = gate.silu()?.try_mul(&up)?;
+        Ok(act.linear().weight(&self.down_weight).call()?)
     }
 }
 

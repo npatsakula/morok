@@ -17,7 +17,6 @@
 
 use std::path::Path;
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::{BoundVariable, Tensor};
@@ -27,7 +26,7 @@ use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor};
 
 use super::config::{OutputMode, ResNetConfig, ResNetDepth};
-use super::error::{HubSnafu, Result, StateSnafu, TensorSnafu};
+use super::error::Result;
 
 /// Image classification / feature backbone. Construct via one of the loaders
 /// ([`ResNet::from_hub`], [`ResNet::from_safetensors`], or
@@ -114,15 +113,15 @@ impl ResNet {
         depth: ResNetDepth,
         output: OutputMode,
     ) -> Result<Self> {
-        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
-        let weights_path = repo.get("model.safetensors").context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open(model_id, revision)?;
+        let weights_path = repo.get("model.safetensors")?;
         Self::from_safetensors(&weights_path, depth, output)
     }
 
     /// Load from a local `model.safetensors`. The file must use the timm /
     /// torchvision key layout (see the module-level docs for the keys).
     pub fn from_safetensors(path: &Path, depth: ResNetDepth, output: OutputMode) -> Result<Self> {
-        let sd = state::load_safetensors(path).context(StateSnafu)?;
+        let sd = state::load_safetensors(path)?;
         Self::from_state_dict(&sd, ResNetConfig::new(depth, output))
     }
 
@@ -133,16 +132,16 @@ impl ResNet {
     pub fn from_state_dict(sd: &StateDict, config: ResNetConfig) -> Result<Self> {
         let sd = remap::fold_batchnorm(sd.clone())?;
         let mut model = Self::with_zero_weights(config);
-        model.stem_conv.load_state_dict(&sd, "conv1").context(StateSnafu)?;
-        model.stem_bn.load_state_dict(&sd, "bn1").context(StateSnafu)?;
-        model.stage1.load_state_dict(&sd, "layer1").context(StateSnafu)?;
-        model.stage2.load_state_dict(&sd, "layer2").context(StateSnafu)?;
-        model.stage3.load_state_dict(&sd, "layer3").context(StateSnafu)?;
-        model.stage4.load_state_dict(&sd, "layer4").context(StateSnafu)?;
+        model.stem_conv.load_state_dict(&sd, "conv1")?;
+        model.stem_bn.load_state_dict(&sd, "bn1")?;
+        model.stage1.load_state_dict(&sd, "layer1")?;
+        model.stage2.load_state_dict(&sd, "layer2")?;
+        model.stage3.load_state_dict(&sd, "layer3")?;
+        model.stage4.load_state_dict(&sd, "layer4")?;
 
         if let Some(head) = model.head.as_mut() {
-            head.weight = get_tensor(&sd, "fc.weight").context(StateSnafu)?;
-            head.bias = get_tensor(&sd, "fc.bias").context(StateSnafu)?;
+            head.weight = get_tensor(&sd, "fc.weight")?;
+            head.bias = get_tensor(&sd, "fc.bias")?;
         }
         Ok(model)
     }
@@ -159,15 +158,9 @@ impl ResNet {
     pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
         let b = batch.as_sint();
 
-        let x = images.try_shrink([Some((SInt::Const(0), b)), None, None, None]).context(TensorSnafu)?;
-        let x = self.stem_bn.forward(&self.stem_conv.forward(&x)?)?.relu().context(TensorSnafu)?;
-        let x = x
-            .max_pool2d()
-            .kernel_size(&[3, 3])
-            .stride(&[2, 2])
-            .padding(&[(1, 1), (1, 1)])
-            .call()
-            .context(TensorSnafu)?;
+        let x = images.try_shrink([Some((SInt::Const(0), b)), None, None, None])?;
+        let x = self.stem_bn.forward(&self.stem_conv.forward(&x)?)?.relu()?;
+        let x = x.max_pool2d().kernel_size(&[3, 3]).stride(&[2, 2]).padding(&[(1, 1), (1, 1)]).call()?;
 
         let x = self.stage1.forward(&x)?;
         let x = self.stage2.forward(&x)?;
@@ -177,8 +170,8 @@ impl ResNet {
         match (&self.head, &self.config.output) {
             (Some(fc), OutputMode::Classification { .. }) => {
                 // Global average pool over the two spatial axes.
-                let pooled = x.mean_with().axes(vec![2isize, 3]).keepdim(false).call().context(TensorSnafu)?;
-                pooled.linear().weight(&fc.weight).bias(&fc.bias).call().context(TensorSnafu)
+                let pooled = x.mean_with().axes(vec![2isize, 3]).keepdim(false).call()?;
+                Ok(pooled.linear().weight(&fc.weight).bias(&fc.bias).call()?)
             }
             _ => Ok(x),
         }

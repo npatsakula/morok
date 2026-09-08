@@ -9,11 +9,10 @@
 //! layers, `local_rope_theta` for local (sliding-window) layers. The encoder
 //! owns one [`RotaryTable`] per layer so each picks the right base.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 /// Precomputed `(cos, sin)` table for one rotary base, shaped
 /// `(1, 1, seq_len, head_dim/2)` so it broadcasts against q/k of shape
@@ -45,21 +44,20 @@ impl RotaryTable {
             }
         }
 
-        let cos_f32 =
-            Tensor::from_slice(freqs.clone()).try_reshape([seq_len as isize, half as isize]).context(TensorSnafu)?;
-        let sin_f32 = Tensor::from_slice(freqs).try_reshape([seq_len as isize, half as isize]).context(TensorSnafu)?;
-        let cos_f32 = cos_f32.cos().context(TensorSnafu)?;
-        let sin_f32 = sin_f32.sin().context(TensorSnafu)?;
+        let cos_f32 = Tensor::from_slice(freqs.clone()).try_reshape([seq_len as isize, half as isize])?;
+        let sin_f32 = Tensor::from_slice(freqs).try_reshape([seq_len as isize, half as isize])?;
+        let cos_f32 = cos_f32.cos()?;
+        let sin_f32 = sin_f32.sin()?;
 
         // (L, half) → (1, 1, L, half) to broadcast over (B, H, L, head_dim).
-        let cos = cos_f32.try_unsqueeze(0).context(TensorSnafu)?.try_unsqueeze(0).context(TensorSnafu)?;
-        let sin = sin_f32.try_unsqueeze(0).context(TensorSnafu)?.try_unsqueeze(0).context(TensorSnafu)?;
+        let cos = cos_f32.try_unsqueeze(0)?.try_unsqueeze(0)?;
+        let sin = sin_f32.try_unsqueeze(0)?.try_unsqueeze(0)?;
 
-        Ok(Self { cos: cos.cast(dtype.clone()).context(TensorSnafu)?, sin: sin.cast(dtype).context(TensorSnafu)? })
+        Ok(Self { cos: cos.cast(dtype.clone())?, sin: sin.cast(dtype)? })
     }
 
     /// Apply RoPE to a q/k tensor of shape `(B, H, L, head_dim)`.
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
-        x.apply_rotary_emb(&self.cos, &self.sin, false).context(TensorSnafu)
+        Ok(x.apply_rotary_emb(&self.cos, &self.sin, false)?)
     }
 }

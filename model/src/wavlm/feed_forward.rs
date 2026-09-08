@@ -3,14 +3,13 @@
 //! Mirrors `FeedForward` from `components.py:762-820`. Does NOT include a
 //! LayerNorm — the pre-FFN norm is the encoder layer's `final_layer_norm`.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::init::{fan_in_uniform, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 #[derive(Clone)]
 pub struct FeedForwardWeights {
@@ -35,13 +34,12 @@ impl FeedForwardWeights {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y =
-            x.linear().weight(&self.intermediate_weight).bias(&self.intermediate_bias).call().context(TensorSnafu)?;
+        let y = x.linear().weight(&self.intermediate_weight).bias(&self.intermediate_bias).call()?;
         // PyTorch's `nn.functional.gelu(x)` defaults to the EXACT erf-based
         // GELU; morok's `.gelu()` is the tanh approximation. Use `gelu_exact`
         // for numerical parity with the published checkpoint.
-        let y = y.gelu_exact().context(TensorSnafu)?;
-        y.linear().weight(&self.output_weight).bias(&self.output_bias).call().context(TensorSnafu)
+        let y = y.gelu_exact()?;
+        Ok(y.linear().weight(&self.output_weight).bias(&self.output_bias).call()?)
     }
 }
 

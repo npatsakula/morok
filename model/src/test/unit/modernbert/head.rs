@@ -35,13 +35,13 @@ fn head_weight_shapes() {
     let d = cfg.hidden_size;
     let v = cfg.vocab_size;
     let m = ModernBertForMaskedLm::empty(cfg);
-    assert_eq!(m.head.dense_weight.shape().unwrap()[0].as_const().unwrap(), d);
-    assert_eq!(m.head.dense_weight.shape().unwrap()[1].as_const().unwrap(), d);
-    assert_eq!(m.head.norm.weight.shape().unwrap()[0].as_const().unwrap(), d);
-    assert_eq!(m.head.decoder_weight.shape().unwrap()[0].as_const().unwrap(), v);
-    assert_eq!(m.head.decoder_weight.shape().unwrap()[1].as_const().unwrap(), d);
+    assert_eq!(m.head.dense_weight.dim_const(0).unwrap(), d);
+    assert_eq!(m.head.dense_weight.dim_const(1).unwrap(), d);
+    assert_eq!(m.head.norm.weight.dim_const(0).unwrap(), d);
+    assert_eq!(m.head.decoder_weight.dim_const(0).unwrap(), v);
+    assert_eq!(m.head.decoder_weight.dim_const(1).unwrap(), d);
     let bias = m.head.decoder_bias.expect("decoder_bias=true");
-    assert_eq!(bias.shape().unwrap()[0].as_const().unwrap(), v);
+    assert_eq!(bias.dim_const(0).unwrap(), v);
 }
 
 /// The head's `state_dict` → `load_state_dict` round-trip reproduces the exact

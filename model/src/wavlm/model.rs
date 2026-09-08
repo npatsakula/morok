@@ -12,7 +12,8 @@ use crate::state::{self, HasStateDict, StateDict};
 
 use super::config::WavLmConfig;
 use super::encoder::Encoder;
-use super::error::{HubSnafu, PickleSnafu, Result, StateSnafu, TensorSnafu};
+use super::error::{PickleSnafu, Result};
+
 use super::feature_extractor::FeatureExtractor;
 
 #[derive(Clone)]
@@ -37,11 +38,7 @@ impl WavLm {
     /// dim the caller already shaped. Use [`extract_features_batch`] for the
     /// JIT path where the batch dim is a symbolic [`BoundVariable`].
     pub fn extract_features(&self, waveform: &Tensor) -> Result<Vec<Tensor>> {
-        let normed = if self.config.normalize_waveform {
-            waveform.layernorm(-1, 1e-5).context(TensorSnafu)?
-        } else {
-            waveform.clone()
-        };
+        let normed = if self.config.normalize_waveform { waveform.layernorm(-1, 1e-5)? } else { waveform.clone() };
         let features = self.feature_extractor.forward(&normed)?;
         self.encoder.extract_features(&features)
     }
@@ -51,10 +48,10 @@ impl WavLm {
     /// downstream heads.
     pub fn extract_features_stacked(&self, waveform: &Tensor) -> Result<Tensor> {
         let layers = self.extract_features(waveform)?;
-        let unsq: Result<Vec<Tensor>> = layers.iter().map(|t| t.try_unsqueeze(-1).context(TensorSnafu)).collect();
+        let unsq: Result<Vec<Tensor>> = layers.iter().map(|t| Ok(t.try_unsqueeze(-1)?)).collect();
         let unsq = unsq?;
         let refs: Vec<&Tensor> = unsq.iter().collect();
-        Tensor::cat(&refs, -1).context(TensorSnafu)
+        Ok(Tensor::cat(&refs, -1)?)
     }
 
     /// JIT-path variant of [`extract_features`]. `waveform` is sized for the
@@ -62,17 +59,17 @@ impl WavLm {
     /// value at execute time. Mirrors gigaam's `forward_batch` pattern.
     pub fn extract_features_batch(&self, waveform: &Tensor, batch: &BoundVariable) -> Result<Vec<Tensor>> {
         let b = batch.as_sint();
-        let waveform = waveform.try_shrink([Some((SInt::Const(0), b)), None]).context(TensorSnafu)?;
+        let waveform = waveform.try_shrink([Some((SInt::Const(0), b)), None])?;
         self.extract_features(&waveform)
     }
 
     /// JIT-path variant of [`extract_features_stacked`].
     pub fn extract_features_stacked_batch(&self, waveform: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
         let layers = self.extract_features_batch(waveform, batch)?;
-        let unsq: Result<Vec<Tensor>> = layers.iter().map(|t| t.try_unsqueeze(-1).context(TensorSnafu)).collect();
+        let unsq: Result<Vec<Tensor>> = layers.iter().map(|t| Ok(t.try_unsqueeze(-1)?)).collect();
         let unsq = unsq?;
         let refs: Vec<&Tensor> = unsq.iter().collect();
-        Tensor::cat(&refs, -1).context(TensorSnafu)
+        Ok(Tensor::cat(&refs, -1)?)
     }
 
     /// Download `pytorch_model.bin` from a HuggingFace Hub repository and
@@ -83,8 +80,8 @@ impl WavLm {
     }
 
     pub fn from_hub_with_revision(model_id: &str, revision: &str, config: WavLmConfig) -> Result<Self> {
-        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
-        let weights_path = repo.get("pytorch_model.bin").context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open(model_id, revision)?;
+        let weights_path = repo.get("pytorch_model.bin")?;
         Self::from_pytorch_bin(&weights_path, config)
     }
 
@@ -103,7 +100,7 @@ impl WavLm {
     pub fn from_state_dict(sd: &StateDict, config: WavLmConfig) -> Result<Self> {
         let sd: StateDict = sd.iter().filter(|(k, _)| !is_inert_key(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
         let mut model = Self::empty(config);
-        model.load_state_dict(&sd, "").context(StateSnafu)?;
+        model.load_state_dict(&sd, "")?;
         Ok(model)
     }
 }

@@ -4,14 +4,13 @@
 //! tables. Unlike ModernBERT (which LayerNorms after embedding), Qwen3
 //! applies the first norm inside the decoder layer.
 
-use snafu::{OptionExt, ResultExt};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
 
 #[derive(Clone)]
 pub struct Qwen3Embeddings {
@@ -26,9 +25,8 @@ impl Qwen3Embeddings {
     }
 
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let shape = input_ids.shape().context(TensorSnafu)?;
-        let _l: usize = shape[1].as_const().context(SymbolicShapeSnafu { what: "qwen3 embeddings" })?;
-        self.embed_weight.embedding(input_ids).context(TensorSnafu)
+        let _l = input_ids.dim_const(1)?;
+        Ok(self.embed_weight.embedding(input_ids)?)
     }
 }
 

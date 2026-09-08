@@ -12,7 +12,6 @@
 //! Each block: `Conv1d → Norm? → GELU`. Block 0 takes input channels = 1
 //! (the raw mono waveform is unsqueezed at the channel axis).
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
@@ -20,7 +19,7 @@ use crate::init::{fan_in_uniform, ones, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::config::{ConvLayerConfig, ExtractorMode, WavLmConfig};
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 /// One feature-extractor conv block. The norm shape is `out_channels`; the
 /// conv weight shape is `(out_channels, in_channels, kernel_size)`.
@@ -83,33 +82,26 @@ impl ConvLayerBlock {
             .maybe_bias(self.conv_bias.as_ref())
             .stride(&[self.stride])
             .padding(&[(0, 0)])
-            .call()
-            .context(TensorSnafu)?;
+            .call()?;
 
         // Norm (if any).
         let y = match &self.norm {
             None => y,
             Some(BlockNorm { kind: NormKind::GroupNorm, weight, bias, eps }) => {
                 // GroupNorm with num_groups = out_channels, NCT layout.
-                y.group_norm()
-                    .scale(weight)
-                    .bias(bias)
-                    .num_groups(self.out_channels)
-                    .eps(*eps)
-                    .call()
-                    .context(TensorSnafu)?
+                y.group_norm().scale(weight).bias(bias).num_groups(self.out_channels).eps(*eps).call()?
             }
             Some(BlockNorm { kind: NormKind::LayerNorm, weight, bias, eps }) => {
                 // LayerNorm over channel axis: transpose to NTC, normalize, transpose back.
-                let yt = y.try_permute(&[0, 2, 1]).context(TensorSnafu)?;
-                let normed = yt.layernorm(-1, *eps).context(TensorSnafu)?;
-                let yt = normed.try_mul(weight).context(TensorSnafu)?.try_add(bias).context(TensorSnafu)?;
-                yt.try_permute(&[0, 2, 1]).context(TensorSnafu)?
+                let yt = y.try_permute(&[0, 2, 1])?;
+                let normed = yt.layernorm(-1, *eps)?;
+                let yt = normed.try_mul(weight)?.try_add(bias)?;
+                yt.try_permute(&[0, 2, 1])?
             }
         };
 
         // Exact (erf-based) GELU matches PyTorch's `nn.functional.gelu`.
-        y.gelu_exact().context(TensorSnafu)
+        Ok(y.gelu_exact()?)
     }
 }
 
@@ -175,13 +167,13 @@ impl FeatureExtractor {
     /// dim, runs each block in `NCT`, then transposes the result to `NTC` for
     /// downstream consumers (matches upstream `FeatureExtractor.forward`).
     pub fn forward(&self, waveform: &Tensor) -> Result<Tensor> {
-        let mut x = waveform.try_unsqueeze(1).context(TensorSnafu)?; // (B, 1, samples)
+        let mut x = waveform.try_unsqueeze(1)?; // (B, 1, samples)
         for block in &self.blocks {
             x = block.forward(&x)?;
         }
         // (B, C_out, T) → (B, T, C_out)
-        let x = x.try_permute(&[0, 2, 1]).context(TensorSnafu)?;
-        if let Some(dw) = &self.dummy_weight { x.try_mul(dw).context(TensorSnafu) } else { Ok(x) }
+        let x = x.try_permute(&[0, 2, 1])?;
+        if let Some(dw) = &self.dummy_weight { Ok(x.try_mul(dw)?) } else { Ok(x) }
     }
 
     /// Cumulative downsampling factor of all blocks (product of strides).

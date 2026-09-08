@@ -142,12 +142,12 @@ fn gigaam_encoder_dtype_conversion_leaves_head_fp32() {
     let model = GigaAm::from_state_dict_with_encoder_dtype(&sd, cfg, None, DType::BFloat16).expect("load BF16 encoder");
 
     assert_eq!(model.encoder.input_dtype(), DType::BFloat16);
-    assert_eq!(model.encoder.layers[0].mhsa.q_proj.uop().dtype(), DType::BFloat16);
-    assert_eq!(model.encoder.layers[0].mhsa.q_bias.uop().dtype(), DType::BFloat16);
-    assert_eq!(model.encoder.layers[0].final_norm.weight.uop().dtype(), DType::BFloat16);
+    assert_eq!(model.encoder.layers[0].mhsa.q_proj.dtype(), DType::BFloat16);
+    assert_eq!(model.encoder.layers[0].mhsa.q_bias.dtype(), DType::BFloat16);
+    assert_eq!(model.encoder.layers[0].final_norm.weight.dtype(), DType::BFloat16);
     let head = model.head.as_ctc().expect("CTC head");
-    assert_eq!(head.weight.uop().dtype(), DType::Float32);
-    assert_eq!(head.bias.uop().dtype(), DType::Float32);
+    assert_eq!(head.weight.dtype(), DType::Float32);
+    assert_eq!(head.bias.dtype(), DType::Float32);
 }
 
 #[test]
@@ -163,7 +163,7 @@ fn gigaam_quantization_scales_keep_checkpoint_dtype() {
         ("layers.0.ffn1.linear1.weight", "layers.0.ffn1.linear1.weight_scale"),
     ] {
         let quantized = sd[weight].cast(DType::Int8).expect("quantize weight");
-        let out = quantized.shape().expect("weight shape")[0].as_const().expect("static output dim");
+        let out = quantized.dim_const(0).unwrap();
         sd.insert(weight.into(), quantized);
         sd.insert(scale.into(), Tensor::full(&[out], 1.0f32, DType::Float32).unwrap());
     }
@@ -176,7 +176,7 @@ fn gigaam_quantization_scales_keep_checkpoint_dtype() {
         &mhsa.q_quantization.as_ref().expect("q quantization").weight_scale,
         &ffn1.linear1_quantization.as_ref().expect("linear1 quantization").weight_scale,
     ] {
-        assert_eq!(scale.uop().dtype(), DType::Float32);
+        assert_eq!(scale.dtype(), DType::Float32);
     }
 }
 

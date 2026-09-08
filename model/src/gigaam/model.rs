@@ -14,14 +14,14 @@
 
 use std::path::Path;
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 
 use crate::state::{self, HasStateDict, StateDict};
 
 use crate::gigaam::ctc::CTCHead;
 use crate::gigaam::encoder::Encoder;
-use crate::gigaam::error::{Error, HubSnafu, StateSnafu, TensorSnafu};
+use crate::gigaam::error::Error;
+
 use crate::gigaam::rnnt::RnntHead;
 use crate::gigaam::{GigaAmConfig, Result, remap};
 use crate::sentencepiece;
@@ -47,7 +47,7 @@ fn prepare_scaled_weights(sd: &mut StateDict, dtype: &DType) -> Result<()> {
                 message: format!("quantization scale {scale_key} has no matching weight {weight_key}"),
             })?
             .clone();
-        let weight_dtype = weight.uop().dtype();
+        let weight_dtype = weight.dtype();
         let encoder_weight = weight_key.starts_with("encoder.")
             || weight_key.starts_with("model.encoder.")
             || weight_key.starts_with("layers.")
@@ -57,7 +57,7 @@ fn prepare_scaled_weights(sd: &mut StateDict, dtype: &DType) -> Result<()> {
             weight.clone()
         } else if weight_dtype == DType::UInt8 {
             // Compatibility with the repository's original raw-bit FP8 export.
-            weight.bitcast(DType::FP8E4M3).context(TensorSnafu)?
+            weight.bitcast(DType::FP8E4M3)?
         } else if weight_dtype.is_signed() {
             continue;
         } else {
@@ -66,20 +66,17 @@ fn prepare_scaled_weights(sd: &mut StateDict, dtype: &DType) -> Result<()> {
             });
         };
         let target_dtype = if encoder_weight { dtype.clone() } else { DType::Float32 };
-        let shape = weight.shape().context(TensorSnafu)?;
+        let shape = weight.shape()?;
         let mut scale_shape = vec![1isize; shape.len()];
         scale_shape[0] = shape[0].as_const().ok_or_else(|| Error::CheckpointConfig {
             message: format!("quantized weight {weight_key} has symbolic output dimension"),
         })? as isize;
-        let dequantized = quantized
-            .cast(target_dtype.clone())
-            .context(TensorSnafu)?
-            .try_mul(&scale.cast(target_dtype).context(TensorSnafu)?.try_reshape(scale_shape).context(TensorSnafu)?)
-            .context(TensorSnafu)?;
+        let dequantized =
+            quantized.cast(target_dtype.clone())?.try_mul(&scale.cast(target_dtype)?.try_reshape(scale_shape)?)?;
         sd.remove(&scale_key);
         promoted.push((weight_key, dequantized.contiguous()));
     }
-    svod_tensor::Tensor::realize_batch(promoted.iter_mut().map(|(_, tensor)| tensor)).context(TensorSnafu)?;
+    svod_tensor::Tensor::realize_batch(promoted.iter_mut().map(|(_, tensor)| tensor))?;
     for (weight_key, tensor) in promoted {
         sd.insert(weight_key, tensor);
     }
@@ -185,9 +182,9 @@ impl GigaAm {
         weights: &str,
         encoder_dtype: DType,
     ) -> Result<Self> {
-        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
-        let config_path = repo.get("config.json").context(HubSnafu)?;
-        let weights_path = repo.get(weights).context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open(model_id, revision)?;
+        let config_path = repo.get("config.json")?;
+        let weights_path = repo.get(weights)?;
         let config = GigaAmConfig::from_json(&config_path)?;
         // SentencePiece-RN-T variants (e.g. `v3_e2e_rnnt`) ship the tokenizer
         // as `tokenizer.model`. CTC variants don't have one; skip the fetch.
@@ -225,7 +222,7 @@ impl GigaAm {
         config: GigaAmConfig,
         encoder_dtype: DType,
     ) -> Result<Self> {
-        let sd = state::load_safetensors(weights).context(StateSnafu)?;
+        let sd = state::load_safetensors(weights)?;
         let vocab_override = tokenizer
             .map(sentencepiece::load_vocab)
             .transpose()
@@ -268,8 +265,8 @@ impl GigaAm {
         }
         for (key, tensor) in &mut sd_owned {
             if (key.starts_with("subsampling.") || key.starts_with("layers."))
-                && tensor.uop().dtype().is_float()
-                && tensor.uop().dtype() != encoder_dtype
+                && tensor.dtype().is_float()
+                && tensor.dtype() != encoder_dtype
                 // Both scale spellings stay at checkpoint precision: `<x>.weight_scale`
                 // (FFN) and `<x>_weight_scale` (MHSA/conv), matching `prepare_scaled_weights`.
                 && !key.ends_with("weight_scale")
@@ -285,9 +282,9 @@ impl GigaAm {
         let head = match &config.transducer {
             None => {
                 let mut h = CTCHead::empty(&config);
-                h.load_state_dict(sd, "head").context(StateSnafu)?;
-                let weight_shape = h.weight.shape().context(TensorSnafu)?;
-                let bias_shape = h.bias.shape().context(TensorSnafu)?;
+                h.load_state_dict(sd, "head")?;
+                let weight_shape = h.weight.shape()?;
+                let bias_shape = h.bias.shape()?;
                 let expected_weight = [config.vocab_size, config.d_model, 1];
                 let expected_bias = [config.vocab_size];
                 let concrete =
@@ -323,7 +320,7 @@ impl GigaAm {
                     tr.joint_hidden,
                     tr.num_classes,
                 );
-                h.load_state_dict(sd, "head").context(StateSnafu)?;
+                h.load_state_dict(sd, "head")?;
                 h.predictor.prepare_for_inference()?;
                 Head::Rnnt {
                     head: h,

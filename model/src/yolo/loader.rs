@@ -2,22 +2,21 @@
 
 use std::path::Path;
 
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, StateDict};
 
-use super::error::{HubSnafu, Result, StateSnafu, TensorSnafu};
+use super::error::Result;
 
 /// Download `model.safetensors` from HuggingFace Hub.
 pub fn download_safetensors(model_id: &str, revision: &str) -> Result<std::path::PathBuf> {
-    let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
-    repo.get("model.safetensors").context(HubSnafu)
+    let repo = crate::hub::HubRepo::open(model_id, revision)?;
+    Ok(repo.get("model.safetensors")?)
 }
 
 /// Load + fold BN + strip `model.` prefix, returning a clean state dict.
 pub fn prepare_state_dict(path: &Path) -> Result<StateDict> {
-    let sd = state::load_safetensors(path).context(StateSnafu)?;
+    let sd = state::load_safetensors(path)?;
     prepare_state_dict_from_sd(&sd)
 }
 
@@ -45,5 +44,5 @@ pub fn strip_model_prefix(sd: &StateDict) -> StateDict {
 /// Shrink the batch dimension of a 4D NCHW tensor to a bound variable.
 pub fn shrink_batch(images: &Tensor, batch: &svod_tensor::BoundVariable) -> Result<Tensor> {
     use svod_ir::SInt;
-    images.try_shrink([Some((SInt::Const(0), batch.as_sint())), None, None, None]).context(TensorSnafu)
+    Ok(images.try_shrink([Some((SInt::Const(0), batch.as_sint())), None, None, None])?)
 }

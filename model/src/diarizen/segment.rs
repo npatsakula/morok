@@ -7,13 +7,13 @@
 //! log-probs `(num_chunks, frames, K)`, the pyannote `skip_aggregation=True`
 //! boundary (no overlap-add, no clustering, no RTTM).
 
-use snafu::ResultExt;
 use svod_tensor::{PrepareConfig, Tensor};
 
 use crate::jit::InputSpec;
 
 use super::config::chunk_plan;
-use super::error::{DeviceSnafu, JitSnafu, Result, SampleRateMismatchSnafu, TensorSnafu};
+use super::error::{Result, SampleRateMismatchSnafu};
+
 use super::jit::DiariZenSegmentationJit;
 use super::model::DiariZenSegmentationModel;
 
@@ -98,12 +98,11 @@ impl DiariZenSegmenter {
         };
 
         let mut jit = DiariZenSegmentationJit::new(model).with_b_bound(max_batch);
-        jit.prepare_with_config(InputSpec::f32(&[max_batch, 1, window_samples]), &PrepareConfig::from_env())
-            .context(JitSnafu)?;
+        jit.prepare_with_config(InputSpec::f32(&[max_batch, 1, window_samples]), &PrepareConfig::from_env())?;
 
         // Frames-per-chunk is fixed (the window length is concrete); derive it
         // from the prepared output buffer instead of hardcoding.
-        let out_len = jit.output().context(JitSnafu)?.as_array::<f32>().context(DeviceSnafu)?.len();
+        let out_len = jit.output()?.as_array::<f32>()?.len();
         let frames = out_len / (max_batch * k);
 
         Ok(Self { jit, max_batch, window_samples, hop_samples, frames, k, sample_rate, window, frame_window })
@@ -129,8 +128,8 @@ impl DiariZenSegmenter {
             // Pack `real` window slices into input rows 0..real (each row's tail
             // past the audio end stays zero — the trailing-window pad).
             {
-                let buf = self.jit.waveforms_mut().context(JitSnafu)?;
-                let mut view = buf.as_array_mut::<f32>().context(DeviceSnafu)?;
+                let buf = self.jit.waveforms_mut()?;
+                let mut view = buf.as_array_mut::<f32>()?;
                 let slice = view.as_slice_mut().expect("contiguous waveforms buffer");
                 slice.fill(0.0);
                 for bi in 0..real {
@@ -143,14 +142,14 @@ impl DiariZenSegmenter {
 
             // Rebind the batch var to the live count; the shrink makes the plan
             // compute exactly `real` rows, so the output is `(real, frames, k)`.
-            self.jit.execute_with_vars(&[("b", real as i64)]).context(JitSnafu)?;
+            self.jit.execute_with_vars(&[("b", real as i64)])?;
 
-            let out = self.jit.output().context(JitSnafu)?.as_array::<f32>().context(DeviceSnafu)?;
+            let out = self.jit.output()?.as_array::<f32>()?;
             let flat = out.as_slice().expect("contiguous segmentation output");
             acc.extend_from_slice(&flat[..real * row]);
         }
 
-        let logits = Tensor::from_slice(&acc).try_reshape([num_chunks, self.frames, self.k]).context(TensorSnafu)?;
+        let logits = Tensor::from_slice(&acc).try_reshape([num_chunks, self.frames, self.k])?;
         Ok(SegmentOutput {
             logits,
             frames_per_chunk: self.frames,

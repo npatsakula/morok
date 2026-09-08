@@ -30,7 +30,8 @@ use svod_dtype::DType;
 use svod_macros::jit_wrapper;
 use svod_tensor::Tensor;
 
-use super::{FRAME_SHIFT, FireRedFbank, LAYERS, N_MELS, ORDER, PROJ, Result, TensorSnafu, hub_file};
+use super::{FRAME_SHIFT, FireRedFbank, LAYERS, N_MELS, ORDER, PROJ, Result, hub_file};
+
 use crate::init::fan_in_uniform;
 use crate::jit::InputSpec;
 use crate::state;
@@ -56,15 +57,14 @@ impl FsmnStream {
     /// frames `[t - ORDER + 1, t]` of the extended sequence — the reference's
     /// padded conv with the cache standing in for the left zero-pad.
     fn forward(&self, x: &Tensor, cache: &Tensor) -> Result<(Tensor, Tensor)> {
-        let t = |r: std::result::Result<Tensor, svod_tensor::error::Error>| r.context(TensorSnafu);
-        let len = x.shape().context(TensorSnafu)?[1].as_const().expect("time dim must be concrete") as isize;
+        let len = x.dim_const(1)? as isize;
         // [1,T,P] -> [1,P,1,T]: conv2d wants (N, C, *spatial).
-        let xt = t(t(x.try_transpose(-1, -2))?.try_unsqueeze(2))?;
-        let ext = t(Tensor::cat(&[cache, &xt], -1))?;
-        let lookback = t(ext.conv2d().weight(&self.lookback).groups(PROJ).padding(&[(0, 0), (0, 0)]).call())?;
-        let memory = t(xt.try_add(&lookback))?;
-        let new_cache = t(ext.try_shrink([None, None, None, Some((len, len + STREAM_CACHE as isize))]))?;
-        Ok((t(t(memory.try_squeeze(Some(2)))?.try_transpose(-1, -2))?, new_cache))
+        let xt = x.try_transpose(-1, -2)?.try_unsqueeze(2)?;
+        let ext = Tensor::cat(&[cache, &xt], -1)?;
+        let lookback = ext.conv2d().weight(&self.lookback).groups(PROJ).padding(&[(0, 0), (0, 0)]).call()?;
+        let memory = xt.try_add(&lookback)?;
+        let new_cache = ext.try_shrink([None, None, None, Some((len, len + STREAM_CACHE as isize))])?;
+        Ok((memory.try_squeeze(Some(2))?.try_transpose(-1, -2)?, new_cache))
     }
 }
 
@@ -79,17 +79,10 @@ struct DfsmnBlockStream {
 
 impl DfsmnBlockStream {
     fn forward(&self, x: &Tensor, cache: &Tensor) -> Result<(Tensor, Tensor)> {
-        let h = x
-            .linear()
-            .weight(&self.fc1_weight)
-            .bias(&self.fc1_bias)
-            .call()
-            .context(TensorSnafu)?
-            .relu()
-            .context(TensorSnafu)?;
-        let p = h.linear().weight(&self.fc2_weight).call().context(TensorSnafu)?;
+        let h = x.linear().weight(&self.fc1_weight).bias(&self.fc1_bias).call()?.relu()?;
+        let p = h.linear().weight(&self.fc2_weight).call()?;
         let (memory, new_cache) = self.fsmn.forward(&p, cache)?;
-        Ok((memory.try_add(x).context(TensorSnafu)?, new_cache))
+        Ok((memory.try_add(x)?, new_cache))
     }
 }
 
@@ -121,8 +114,8 @@ impl FireRedVadStream {
     /// `scripts/convert_firered_vad.py --stream` (same layout as the
     /// non-streaming file minus the lookahead filters).
     pub fn from_safetensors(path: &std::path::Path) -> Result<Self> {
-        let sd = state::load_safetensors(path).context(super::StateSnafu)?;
-        let get = |key: &str| -> Result<Tensor> { state::get_tensor(&sd, key).context(super::StateSnafu) };
+        let sd = state::load_safetensors(path)?;
+        let get = |key: &str| -> Result<Tensor> { Ok(state::get_tensor(&sd, key)?) };
         let blocks = (0..super::BLOCKS)
             .map(|i| {
                 Ok(DfsmnBlockStream {
@@ -183,7 +176,7 @@ impl FireRedVadStream {
     /// state, equivalent to conv zero-padding at a sequence start. With these,
     /// `forward_stream` over a whole sequence IS the full causal forward.
     pub fn zero_caches() -> Result<Vec<Tensor>> {
-        (0..LAYERS).map(|_| Tensor::zeros(&[1, PROJ, 1, STREAM_CACHE], DType::Float32).context(TensorSnafu)).collect()
+        (0..LAYERS).map(|_| Ok(Tensor::zeros(&[1, PROJ, 1, STREAM_CACHE], DType::Float32)?)).collect()
     }
 
     /// Causal DFSMN forward over one chunk: pre-CMVN fbank `[1, T, N_MELS]` +
@@ -191,10 +184,9 @@ impl FireRedVadStream {
     /// in-graph as the first op.
     pub fn forward_stream(&self, feat: &Tensor, caches: &[Tensor]) -> Result<(Tensor, Vec<Tensor>)> {
         assert_eq!(caches.len(), LAYERS, "one cache per FSMN layer");
-        let t = |r: std::result::Result<Tensor, svod_tensor::error::Error>| r.context(TensorSnafu);
-        let x = t(t(feat.try_sub(&self.cmvn_means))?.try_mul(&self.cmvn_istd))?;
-        let h = t(t(x.linear().weight(&self.fc1_weight).bias(&self.fc1_bias).call())?.relu())?;
-        let mut m = t(t(h.linear().weight(&self.fc2_weight).bias(&self.fc2_bias).call())?.relu())?;
+        let x = feat.try_sub(&self.cmvn_means)?.try_mul(&self.cmvn_istd)?;
+        let h = x.linear().weight(&self.fc1_weight).bias(&self.fc1_bias).call()?.relu()?;
+        let mut m = h.linear().weight(&self.fc2_weight).bias(&self.fc2_bias).call()?.relu()?;
         let mut new_caches = Vec::with_capacity(LAYERS);
         let (m1, nc) = self.fsmn1.forward(&m, &caches[0])?;
         m = m1;
@@ -204,9 +196,9 @@ impl FireRedVadStream {
             m = mb;
             new_caches.push(nc);
         }
-        let d = t(t(m.linear().weight(&self.dnn_weight).bias(&self.dnn_bias).call())?.relu())?;
-        let logits = t(d.linear().weight(&self.out_weight).bias(&self.out_bias).call())?;
-        Ok((t(t(logits.sigmoid())?.try_squeeze(Some(-1)))?, new_caches))
+        let d = m.linear().weight(&self.dnn_weight).bias(&self.dnn_bias).call()?.relu()?;
+        let logits = d.linear().weight(&self.out_weight).bias(&self.out_bias).call()?;
+        Ok((logits.sigmoid()?.try_squeeze(Some(-1))?, new_caches))
     }
 }
 
@@ -226,7 +218,7 @@ fn forward_jit(model: &FireRedVadStream, feat: &Tensor, caches: [&Tensor; LAYERS
         .zip(&new_caches)
         .map(|(input, value)| {
             let out = Tensor::from_lazy(input.uop());
-            out.try_assign(value).context(TensorSnafu)?;
+            out.try_assign(value)?;
             Ok(out)
         })
         .collect::<Result<Vec<_>>>()?
@@ -637,15 +629,14 @@ impl FireRedVadStreamer {
     pub fn reset(&mut self) -> std::result::Result<(), FireRedVadStreamError> {
         let zeros = vec![0u8; PROJ * STREAM_CACHE * 4];
         let r = (|| -> crate::jit::Result<()> {
-            use crate::jit::DeviceSnafu;
-            self.jit.cache0_mut()?.copyin(&zeros).context(DeviceSnafu)?;
-            self.jit.cache1_mut()?.copyin(&zeros).context(DeviceSnafu)?;
-            self.jit.cache2_mut()?.copyin(&zeros).context(DeviceSnafu)?;
-            self.jit.cache3_mut()?.copyin(&zeros).context(DeviceSnafu)?;
-            self.jit.cache4_mut()?.copyin(&zeros).context(DeviceSnafu)?;
-            self.jit.cache5_mut()?.copyin(&zeros).context(DeviceSnafu)?;
-            self.jit.cache6_mut()?.copyin(&zeros).context(DeviceSnafu)?;
-            self.jit.cache7_mut()?.copyin(&zeros).context(DeviceSnafu)
+            self.jit.cache0_mut()?.copyin(&zeros)?;
+            self.jit.cache1_mut()?.copyin(&zeros)?;
+            self.jit.cache2_mut()?.copyin(&zeros)?;
+            self.jit.cache3_mut()?.copyin(&zeros)?;
+            self.jit.cache4_mut()?.copyin(&zeros)?;
+            self.jit.cache5_mut()?.copyin(&zeros)?;
+            self.jit.cache6_mut()?.copyin(&zeros)?;
+            Ok(self.jit.cache7_mut()?.copyin(&zeros)?)
         })();
         r.context(StreamStepSnafu)?;
         self.remainder.clear();
@@ -665,16 +656,15 @@ impl FireRedVadStreamer {
     /// One JIT dispatch over the first `n_real` pending rows (zero-filling
     /// the chunk tail), feeding the FSM with the real frames only.
     fn dispatch(&mut self, n_real: usize, events: &mut Vec<VadEvent>) -> crate::jit::Result<()> {
-        use crate::jit::DeviceSnafu;
         {
             let buf = self.jit.feat_mut()?;
-            let mut view = buf.as_array_mut::<f32>().context(DeviceSnafu)?;
+            let mut view = buf.as_array_mut::<f32>()?;
             let slice = view.as_slice_mut().expect("contiguous feat");
             slice[..n_real * N_MELS].copy_from_slice(&self.pending[..n_real * N_MELS]);
             slice[n_real * N_MELS..].fill(0.0);
         }
         self.jit.execute()?;
-        self.jit.probs()?.copyout_prefix(bytemuck::cast_slice_mut(&mut self.scratch[..n_real])).context(DeviceSnafu)?;
+        self.jit.probs()?.copyout_prefix(bytemuck::cast_slice_mut(&mut self.scratch[..n_real]))?;
         self.pending.drain(..n_real * N_MELS);
 
         self.probs.extend_from_slice(&self.scratch[..n_real]);

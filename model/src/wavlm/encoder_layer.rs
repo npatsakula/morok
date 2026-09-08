@@ -29,14 +29,14 @@
 //! dict (Python instantiates them unconditionally in `__init__`); only the
 //! `attention` and `feed_forward` sub-modules are optional.
 
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict};
 
 use super::attention::GatedRelPosAttention;
 use super::config::WavLmConfig;
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
+
 use super::feed_forward::FeedForwardWeights;
 use super::layer_norm::LayerNormWeights;
 
@@ -85,12 +85,12 @@ impl EncoderLayer {
             let normed = self.layer_norm.apply(&x)?;
             let bias = position_bias.expect("attention layer requires position_bias");
             let delta = attn.forward(&normed, bias)?;
-            x = residual.try_add(&delta).context(TensorSnafu)?;
+            x = residual.try_add(&delta)?;
         }
         if let Some(ff) = &self.feed_forward {
             let normed = self.final_layer_norm.apply(&x)?;
             let delta = ff.forward(&normed)?;
-            x = x.try_add(&delta).context(TensorSnafu)?;
+            x = x.try_add(&delta)?;
         }
         Ok(x)
     }
@@ -101,13 +101,13 @@ impl EncoderLayer {
             let residual = x.clone();
             let bias = position_bias.expect("attention layer requires position_bias");
             let delta = attn.forward(&x, bias)?;
-            x = residual.try_add(&delta).context(TensorSnafu)?;
+            x = residual.try_add(&delta)?;
         }
         x = self.layer_norm.apply(&x)?;
         if let Some(ff) = &self.feed_forward {
             let residual = x.clone();
             let delta = ff.forward(&x)?;
-            x = residual.try_add(&delta).context(TensorSnafu)?;
+            x = residual.try_add(&delta)?;
         }
         x = self.final_layer_norm.apply(&x)?;
         Ok(x)

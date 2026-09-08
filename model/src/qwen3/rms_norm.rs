@@ -9,14 +9,13 @@
 //! trailing axes from `axis` onward. With `axis = -1` only the last dim is
 //! the normalization axis, which is correct for all three roles.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::init::ones;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 #[derive(Clone)]
 pub struct RmsNormWeights {
@@ -30,8 +29,8 @@ impl RmsNormWeights {
     }
 
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
-        let normed = x.rms_norm(-1, self.eps).context(TensorSnafu)?;
-        normed.try_mul(&self.weight).context(TensorSnafu)
+        let normed = x.rms_norm(-1, self.eps)?;
+        Ok(normed.try_mul(&self.weight)?)
     }
 }
 

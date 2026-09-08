@@ -65,13 +65,13 @@ pub enum JitError {
     #[snafu(display("{source}"))]
     Build { source: Box<dyn std::error::Error + Send + Sync> },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Tensor {
         #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
         source: Box<svod_tensor::error::Error>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Device {
         #[snafu(source(from(svod_device::error::Error, Box::new)))]
         source: Box<svod_device::error::Error>,

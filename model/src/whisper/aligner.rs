@@ -1,6 +1,5 @@
 //! Fixed-shape teacher-forced decoder alignment and host-side DTW.
 
-use snafu::ResultExt;
 use std::time::{Duration, Instant};
 
 use crate::jit::InputSpec;
@@ -8,7 +7,8 @@ use crate::jit::InputSpec;
 use super::config::{HOP_LENGTH, N_AUDIO_CTX, N_FRAMES, N_TEXT_CTX, TOKENS_PER_SECOND, WhisperSize};
 use super::decode::WhisperTask;
 use super::dtw::{find_alignment_path_selected, path_to_word_timings};
-use super::error::{DeviceSnafu, JitSnafu, Result};
+use super::error::Result;
+
 use super::jit::{WhisperAlignmentJit, WhisperAlignmentModel};
 use super::model::Whisper;
 use super::profile::{CopyProfile, GraphProfile, begin_host_copy, timed_d2d};
@@ -67,7 +67,7 @@ impl WhisperAligner {
         let alignment_model = WhisperAlignmentModel::new(model, heads.clone());
         let mut jit = WhisperAlignmentJit::new(alignment_model);
         let cache_spec = InputSpec::f32(&[batch_size, N_AUDIO_CTX, n_layer_heads, d_head]).device_local();
-        jit.prepare(cache_spec.clone(), cache_spec, InputSpec::i32(&[batch_size, N_TEXT_CTX])).context(JitSnafu)?;
+        jit.prepare(cache_spec.clone(), cache_spec, InputSpec::i32(&[batch_size, N_TEXT_CTX]))?;
         Ok(Self { jit, n_heads: heads.len(), batch_size, cache_stride: N_AUDIO_CTX * n_layer_heads * d_head })
     }
 
@@ -98,7 +98,7 @@ impl WhisperAligner {
         let cache_bytes = self.cache_stride * std::mem::size_of::<f32>();
         let (_, packing_wall) = timed_d2d(copies.is_some(), inputs[0].cross_k, || {
             {
-                let packed_k = self.jit.cross_k_mut().context(JitSnafu)?;
+                let packed_k = self.jit.cross_k_mut()?;
                 for (lane, input) in inputs.iter().enumerate() {
                     if input.cross_k.dtype() != svod_dtype::DType::Float32
                         || input.cross_k.size() != cache_bytes
@@ -108,13 +108,11 @@ impl WhisperAligner {
                             msg: "alignment cross K has invalid dtype, size, or allocator".to_string(),
                         });
                     }
-                    packed_k
-                        .copy_region_from(lane * cache_bytes, input.cross_k, 0, cache_bytes)
-                        .context(DeviceSnafu)?;
+                    packed_k.copy_region_from(lane * cache_bytes, input.cross_k, 0, cache_bytes)?;
                 }
             }
             {
-                let packed_v = self.jit.cross_v_mut().context(JitSnafu)?;
+                let packed_v = self.jit.cross_v_mut()?;
                 for (lane, input) in inputs.iter().enumerate() {
                     if input.cross_v.dtype() != svod_dtype::DType::Float32
                         || input.cross_v.size() != cache_bytes
@@ -125,9 +123,7 @@ impl WhisperAligner {
                             msg: "alignment cross V has invalid dtype, size, or allocator".to_string(),
                         });
                     }
-                    packed_v
-                        .copy_region_from(lane * cache_bytes, input.cross_v, 0, cache_bytes)
-                        .context(DeviceSnafu)?;
+                    packed_v.copy_region_from(lane * cache_bytes, input.cross_v, 0, cache_bytes)?;
                 }
             }
             Ok(())
@@ -164,25 +160,25 @@ impl WhisperAligner {
             metadata.push((text_tokens, token_probs, valid_text, sot_len));
         }
 
-        let token_buffer = self.jit.tokens_mut().context(JitSnafu)?;
+        let token_buffer = self.jit.tokens_mut()?;
         let token_started = begin_host_copy(copies.is_some(), token_buffer)?;
-        token_buffer.as_host_bytes_mut().context(DeviceSnafu)?.copy_from_slice(bytemuck::cast_slice(&packed_tokens));
+        token_buffer.as_host_bytes_mut()?.copy_from_slice(bytemuck::cast_slice(&packed_tokens));
         if let (Some(copies), Some(started)) = (copies.as_deref_mut(), token_started) {
             copies.h2d("alignment_tokens", 1, packed_tokens.len() * std::mem::size_of::<i32>(), started.elapsed());
         }
         let profiling = copies.is_some();
         let (graph_wall, kernels) = if profiling {
             let graph_started = Instant::now();
-            let kernels = self.jit.execute_profiled_static().context(JitSnafu)?;
-            self.jit.output().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
+            let kernels = self.jit.execute_profiled_static()?;
+            self.jit.output()?.synchronize()?;
             (graph_started.elapsed(), kernels)
         } else {
-            self.jit.execute().context(JitSnafu)?;
+            self.jit.execute()?;
             (Duration::ZERO, Vec::new())
         };
-        let output = self.jit.output().context(JitSnafu)?;
+        let output = self.jit.output()?;
         let output_started = begin_host_copy(copies.is_some(), output)?;
-        let output_bytes = output.as_host_bytes().context(DeviceSnafu)?;
+        let output_bytes = output.as_host_bytes()?;
         let qk_stride = self.n_heads * N_TEXT_CTX * N_AUDIO_CTX;
         let active_qk_bytes = inputs.len() * qk_stride * std::mem::size_of::<f32>();
         let profiled_qk = output_started.map(|_| bytemuck::cast_slice(&output_bytes[..active_qk_bytes]).to_vec());

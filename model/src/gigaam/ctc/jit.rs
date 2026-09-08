@@ -17,10 +17,8 @@
 
 extern crate self as svod_model;
 
-use snafu::ResultExt;
 use svod_macros::jit_wrapper;
 
-use crate::gigaam::error::TensorSnafu;
 use crate::gigaam::model::GigaAm;
 
 jit_wrapper! {
@@ -32,7 +30,7 @@ jit_wrapper! {
             let out = model.encoder.forward_batch(mel, lengths)?;
             // Match the standalone encoder JIT's fp32 cast so the head sees the
             // same dtype regardless of the encoder's compute dtype.
-            let out = out.cast(svod_dtype::DType::Float32).context(TensorSnafu)?;
+            let out = out.cast(svod_dtype::DType::Float32)?;
             let head = model.head.expect_ctc("GigaAmCtcJit")?;
             crate::state::scoped("head", || head.forward(&out))
         }

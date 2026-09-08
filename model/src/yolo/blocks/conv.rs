@@ -1,11 +1,10 @@
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use crate::yolo::error::{Result, TensorSnafu};
+use crate::yolo::error::Result;
 
 fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
@@ -47,7 +46,7 @@ impl YoloConv {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.conv.forward(x)?;
         let x = self.bn.forward(&x)?;
-        if self.act { x.silu().context(TensorSnafu) } else { Ok(x) }
+        if self.act { Ok(x.silu()?) } else { Ok(x) }
     }
 }
 
@@ -91,13 +90,12 @@ impl Conv2dBias {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let p = self.padding as isize;
-        x.conv2d()
+        Ok(x.conv2d()
             .weight(&self.weight)
             .bias(&self.bias)
             .stride(&[self.stride, self.stride])
             .padding(&[(p, p), (p, p)])
-            .call()
-            .context(TensorSnafu)
+            .call()?)
     }
 }
 
@@ -135,12 +133,7 @@ impl ConvTranspose2dBias {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.conv_transpose2d()
-            .weight(&self.weight)
-            .maybe_bias(Some(&self.bias))
-            .stride(&[2, 2])
-            .call()
-            .context(TensorSnafu)
+        Ok(x.conv_transpose2d().weight(&self.weight).maybe_bias(Some(&self.bias)).stride(&[2, 2]).call()?)
     }
 }
 

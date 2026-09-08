@@ -17,14 +17,14 @@
 
 use std::path::Path;
 
-use snafu::ResultExt;
 use svod_tensor::{BoundVariable, Tensor};
 
 use crate::init::{fan_in_uniform, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::config::ModernBertConfig;
-use super::error::{HubSnafu, Result, StateSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::model::ModernBert;
 use super::normalization::LayerNormWeights;
 
@@ -66,12 +66,12 @@ impl MlmHead {
     /// The decoder weight is owned by the head (tied or standalone), so this is
     /// self-contained — no external tensor argument, mirroring `CTCHead`.
     pub fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
-        let h = hidden.linear().weight(&self.dense_weight).call().context(TensorSnafu)?;
-        let h = h.gelu_exact().context(TensorSnafu)?;
+        let h = hidden.linear().weight(&self.dense_weight).call()?;
+        let h = h.gelu_exact()?;
         let h = self.norm.apply(&h)?;
-        let logits = h.linear().weight(&self.decoder_weight).call().context(TensorSnafu)?;
+        let logits = h.linear().weight(&self.decoder_weight).call()?;
         match &self.decoder_bias {
-            Some(b) => logits.try_add(b).context(TensorSnafu),
+            Some(b) => Ok(logits.try_add(b)?),
             None => Ok(logits),
         }
     }
@@ -157,19 +157,19 @@ impl ModernBertForMaskedLm {
     }
 
     pub fn from_hub_with_revision(model_id: &str, revision: &str, config: &mut ModernBertConfig) -> Result<Self> {
-        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
-        let cfg_path = repo.get("config.json").context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open(model_id, revision)?;
+        let cfg_path = repo.get("config.json")?;
         let parsed = ModernBertConfig::from_json(&cfg_path)?;
         config.merge_structural_from(&parsed);
 
-        let weights_path = repo.get("model.safetensors").context(HubSnafu)?;
+        let weights_path = repo.get("model.safetensors")?;
         Self::from_safetensors(&weights_path, config.clone())
     }
 
     /// Load from a `model.safetensors` checkpoint. Weights are cast to
     /// `config.dtype` as they are read.
     pub fn from_safetensors(path: &Path, config: ModernBertConfig) -> Result<Self> {
-        let sd = state::load_safetensors(path).context(StateSnafu)?;
+        let sd = state::load_safetensors(path)?;
         Self::from_state_dict(&sd, config)
     }
 
@@ -177,7 +177,7 @@ impl ModernBertForMaskedLm {
     pub fn from_state_dict(sd: &StateDict, config: ModernBertConfig) -> Result<Self> {
         let dtype = config.dtype.clone();
         let mut model = Self::empty(config);
-        model.load_state_dict(&state::cast_all(sd, dtype), "").context(StateSnafu)?;
+        model.load_state_dict(&state::cast_all(sd, dtype), "")?;
         Ok(model)
     }
 }

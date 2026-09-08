@@ -30,10 +30,10 @@ fn forward_shape_segment() {
     let var = Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();
     let (preds, protos) = model.forward(&images, &b).unwrap();
-    let ps: Vec<usize> = preds.shape().unwrap().iter().map(|s| s.as_const().or_else(|| s.vmax()).unwrap()).collect();
+    let ps = crate::test::max_dims(&preds);
     // 4 + 80 + 32 = 116 channels, 2100 anchors
     assert_eq!(ps, vec![1, 116, 2100]);
-    let prs: Vec<usize> = protos.shape().unwrap().iter().map(|s| s.as_const().or_else(|| s.vmax()).unwrap()).collect();
+    let prs = crate::test::max_dims(&protos);
     // nm=32 protos at H/4=80, W/4=80
     assert_eq!(prs, vec![1, 32, 80, 80]);
 }

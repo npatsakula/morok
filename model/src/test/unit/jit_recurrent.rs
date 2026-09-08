@@ -4,9 +4,7 @@ use svod_dtype::DType;
 use svod_macros::jit_wrapper;
 use svod_tensor::Tensor;
 
-use snafu::ResultExt;
-
-use crate::jit::{DeviceSnafu, InputSpec, JitError, JitRecurrent, LstmState, RecurrentJit, Result, TensorSnafu};
+use crate::jit::{InputSpec, JitError, JitRecurrent, LstmState, RecurrentJit, Result};
 
 const HIDDEN: usize = 2;
 
@@ -17,13 +15,13 @@ impl RecurrentTestModel {
     /// Output is `[head | h_next | c_next]` along axis 0 (single 1-D tensor of
     /// length `1 + HIDDEN + HIDDEN`).
     fn forward(&self, x: &Tensor, h: &Tensor, c: &Tensor) -> Result<Tensor> {
-        let one_scalar = Tensor::ones(&[1], DType::Float32).context(TensorSnafu)?;
-        let one_vec = Tensor::ones(&[HIDDEN], DType::Float32).context(TensorSnafu)?;
-        let two_vec = Tensor::full(&[HIDDEN], 2.0f32, DType::Float32).context(TensorSnafu)?;
-        let head = x.try_add(&one_scalar).context(TensorSnafu)?;
-        let h_next = h.try_add(&one_vec).context(TensorSnafu)?;
-        let c_next = c.try_add(&two_vec).context(TensorSnafu)?;
-        Tensor::cat(&[&head, &h_next, &c_next], 0).context(TensorSnafu)
+        let one_scalar = Tensor::ones(&[1], DType::Float32)?;
+        let one_vec = Tensor::ones(&[HIDDEN], DType::Float32)?;
+        let two_vec = Tensor::full(&[HIDDEN], 2.0f32, DType::Float32)?;
+        let head = x.try_add(&one_scalar)?;
+        let h_next = h.try_add(&one_vec)?;
+        let c_next = c.try_add(&two_vec)?;
+        Ok(Tensor::cat(&[&head, &h_next, &c_next], 0)?)
     }
 }
 
@@ -43,12 +41,12 @@ impl RecurrentJit for RecurrentTestJit {
     fn pack_state(&mut self, s: &LstmState) -> Result<()> {
         {
             let buf = self.h_mut()?;
-            let mut view = buf.as_array_mut::<f32>().context(DeviceSnafu)?;
+            let mut view = buf.as_array_mut::<f32>()?;
             view.as_slice_mut().expect("contiguous h").copy_from_slice(&s.h);
         }
         {
             let buf = self.c_mut()?;
-            let mut view = buf.as_array_mut::<f32>().context(DeviceSnafu)?;
+            let mut view = buf.as_array_mut::<f32>()?;
             view.as_slice_mut().expect("contiguous c").copy_from_slice(&s.c);
         }
         Ok(())
@@ -71,7 +69,7 @@ fn prepare_jit() -> RecurrentTestJit {
 
 fn write_x(jit: &mut RecurrentTestJit, value: f32) -> Result<()> {
     let buf = jit.x_mut()?;
-    let mut view = buf.as_array_mut::<f32>().context(DeviceSnafu)?;
+    let mut view = buf.as_array_mut::<f32>()?;
     view.as_slice_mut().expect("contiguous x")[0] = value;
     Ok(())
 }

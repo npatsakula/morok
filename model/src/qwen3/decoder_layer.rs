@@ -6,13 +6,13 @@
 //! y = h + mlp(post_attention_layernorm(h))
 //! ```
 
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict};
 
 use super::attention::Qwen3Attention;
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
+
 use super::feed_forward::Qwen3MLP;
 use super::rms_norm::RmsNormWeights;
 use super::rotary::RotaryTable;
@@ -46,11 +46,11 @@ impl Qwen3DecoderLayer {
     pub fn forward(&self, x: &Tensor, rotary: &RotaryTable, padding_mask: Option<&Tensor>) -> Result<Tensor> {
         let normed = self.input_layernorm.apply(x)?;
         let delta = self.attention.forward(&normed, rotary, padding_mask)?;
-        let h = x.try_add(&delta).context(TensorSnafu)?;
+        let h = x.try_add(&delta)?;
 
         let normed = self.post_attention_layernorm.apply(&h)?;
         let delta = self.mlp.forward(&normed)?;
-        h.try_add(&delta).context(TensorSnafu)
+        Ok(h.try_add(&delta)?)
     }
 }
 

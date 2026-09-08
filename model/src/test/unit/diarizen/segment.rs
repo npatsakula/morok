@@ -62,7 +62,7 @@ fn segmenter_runs_multiple_batches() {
     assert!(out.frames_per_chunk > 0);
 
     let k = cfg.powerset_class_count();
-    let shape: Vec<usize> = out.logits.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let shape = out.logits.dims().unwrap();
     assert_eq!(shape, vec![3, out.frames_per_chunk, k]);
 
     // Reusing the same prepared plan is deterministic (stateless reuse).

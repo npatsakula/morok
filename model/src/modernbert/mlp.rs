@@ -5,14 +5,13 @@
 //! branches concatenated along the last axis); `Wo` takes the gated `I`-dim
 //! result back to `D`.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 #[derive(Clone)]
 pub struct ModernBertGlu {
@@ -32,13 +31,13 @@ impl ModernBertGlu {
     /// Forward. `x`: `(B, L, D)` → `(B, L, D)`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // (., 2I) → split into [input (., I), gate (., I)].
-        let h = x.linear().weight(&self.wi_weight).call().context(TensorSnafu)?;
-        let mut parts = h.chunk(2, -1).context(TensorSnafu)?;
+        let h = x.linear().weight(&self.wi_weight).call()?;
+        let mut parts = h.chunk(2, -1)?;
         let gate = parts.pop().expect("chunk(2) yields 2 parts");
         let input = parts.pop().expect("chunk(2) yields 2 parts");
         // GELU(input) * gate — exact (erf) GELU matches PyTorch's nn.GELU default.
-        let gated = input.gelu_exact().context(TensorSnafu)?.try_mul(&gate).context(TensorSnafu)?;
-        gated.linear().weight(&self.wo_weight).call().context(TensorSnafu)
+        let gated = input.gelu_exact()?.try_mul(&gate)?;
+        Ok(gated.linear().weight(&self.wo_weight).call()?)
     }
 }
 

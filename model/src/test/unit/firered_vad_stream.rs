@@ -33,9 +33,7 @@ fn stream_forward_shape() {
     let caches = FireRedVadStream::zero_caches().unwrap();
     let (probs, new_caches) = model.forward_stream(&feat, &caches).unwrap();
 
-    let shape = |t: &Tensor| -> Vec<usize> {
-        t.shape().unwrap().iter().map(|s| s.as_const().expect("concrete shape")).collect()
-    };
+    let shape = |t: &Tensor| -> Vec<usize> { t.dims().unwrap() };
     assert_eq!(shape(&probs), vec![1, 16]);
     assert_eq!(new_caches.len(), caches.len());
     for nc in &new_caches {

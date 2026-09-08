@@ -1,11 +1,10 @@
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict, prefixed};
 
 use super::batchnorm::BatchNormWeights;
 use super::conv::Conv2dWeights;
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 /// Which residual block class a stage uses.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -56,13 +55,13 @@ impl BasicBlock {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let out = self.bn1.forward(&self.conv1.forward(x)?)?;
-        let out = out.relu().context(TensorSnafu)?;
+        let out = out.relu()?;
         let out = self.bn2.forward(&self.conv2.forward(&out)?)?;
         let shortcut = match &self.downsample {
             Some((c, b)) => b.forward(&c.forward(x)?)?,
             None => x.clone(),
         };
-        out.try_add(&shortcut).context(TensorSnafu)?.relu().context(TensorSnafu)
+        Ok(out.try_add(&shortcut)?.relu()?)
     }
 }
 

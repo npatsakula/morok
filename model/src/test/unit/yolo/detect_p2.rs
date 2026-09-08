@@ -30,7 +30,7 @@ fn forward_shape_p2() {
     let var = Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();
     let out = model.forward(&images, &b).unwrap();
-    let shape: Vec<usize> = out.shape().unwrap().iter().map(|s| s.as_const().or_else(|| s.vmax()).unwrap()).collect();
+    let shape = crate::test::max_dims(&out);
     // 4 + 80 = 84 channels
     // P2: 80×80=6400, P3: 40×40=1600, P4: 20×20=400, P5: 10×10=100 → 8500 anchors
     assert_eq!(shape, vec![1, 84, 8500]);

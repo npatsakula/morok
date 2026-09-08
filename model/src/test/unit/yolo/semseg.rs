@@ -37,8 +37,7 @@ fn forward_shape_semseg() {
     let b = var.bind(1).unwrap();
 
     let out = model.forward(&images, &b).unwrap();
-    let shape: Vec<usize> =
-        out.shape().unwrap().iter().map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete shape")).collect();
+    let shape = crate::test::max_dims(&out);
 
     // 320×320 → P3 at stride 8 → 40×40, nc=19
     assert_eq!(shape, vec![1, 19, 40, 40]);

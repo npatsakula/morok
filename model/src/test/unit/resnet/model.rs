@@ -99,12 +99,7 @@ fn forward_zero_weights_shape_check(depth: ResNetDepth, output: OutputMode, expe
     let b = var.bind(1).unwrap();
 
     let out = model.forward(&images, &b).unwrap();
-    let shape: Vec<usize> = out
-        .shape()
-        .unwrap()
-        .iter()
-        .map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete or symbolic-max shape"))
-        .collect();
+    let shape = crate::test::max_dims(&out);
     assert_eq!(shape, expected);
 }
 
@@ -143,11 +138,11 @@ fn head_dimensions_per_depth(depth: ResNetDepth, expected_in: usize) {
 
     let sd = model.state_dict("");
     let fc_w = sd.get("fc.weight").expect("fc.weight present in classification mode");
-    let shape: Vec<usize> = fc_w.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let shape = fc_w.dims().unwrap();
     assert_eq!(shape, vec![1000, expected_in]);
 
     let fc_b = sd.get("fc.bias").unwrap();
-    let bias_shape: Vec<usize> = fc_b.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let bias_shape = fc_b.dims().unwrap();
     assert_eq!(bias_shape, vec![1000]);
 }
 
@@ -173,8 +168,7 @@ fn features_r18_returns_512_channel_map() {
     let mut out = model.forward(&images, &b1).unwrap();
     out.realize().unwrap();
 
-    let shape: Vec<usize> =
-        out.shape().unwrap().iter().map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete dim")).collect();
+    let shape = crate::test::max_dims(&out);
     assert_eq!(shape, vec![1, 512, 1, 1]);
 }
 
@@ -195,7 +189,6 @@ fn features_r50_returns_2048_channel_map() {
     let mut out = model.forward(&images, &b1).unwrap();
     out.realize().unwrap();
 
-    let shape: Vec<usize> =
-        out.shape().unwrap().iter().map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete dim")).collect();
+    let shape = crate::test::max_dims(&out);
     assert_eq!(shape, vec![1, 2048, 1, 1]);
 }

@@ -7,7 +7,7 @@
 use snafu::ResultExt;
 use svod_arch::rnnt::{BatchBlockStep, BlockTapes};
 
-use crate::jit::{BuildSnafu, DeviceSnafu, InputSpec, JitError};
+use crate::jit::{BuildSnafu, InputSpec, JitError};
 
 use super::block::BLOCK_STEPS;
 use super::jit::{RnntBlockJit, RnntEncProjJit};
@@ -111,19 +111,19 @@ impl RnntBlockBackend {
         for (i, f) in frames.iter().enumerate() {
             staged[i * row..i * row + f.len()].copy_from_slice(f);
         }
-        self.proj.enc_mut()?.copyin(bytemuck::cast_slice(&staged)).context(DeviceSnafu)?;
+        self.proj.enc_mut()?.copyin(bytemuck::cast_slice(&staged))?;
         self.proj.execute()?;
         // Projected rows -> block input, device->device (drains the proj exec).
         let proj_out = self.proj.output_buffers()?[0].clone();
         let bytes = proj_out.size();
-        self.jit.enc_mut()?.copy_region_from(0, &proj_out, 0, bytes).context(DeviceSnafu)?;
+        self.jit.enc_mut()?.copy_region_from(0, &proj_out, 0, bytes)?;
 
         let mut v = vec![0i32; self.lanes];
         for (i, &n) in valid.iter().enumerate() {
             v[i] = n as i32;
         }
         let buf = self.jit.valid_mut()?;
-        let mut view = buf.as_array_mut::<i32>().context(DeviceSnafu)?;
+        let mut view = buf.as_array_mut::<i32>()?;
         view.as_slice_mut().expect("contiguous valid").copy_from_slice(&v);
         Ok(())
     }
@@ -150,10 +150,10 @@ impl BatchBlockStep for RnntBlockBackend {
 
         let outs = self.jit.output_buffers()?;
         let mut any = [0i32; 1];
-        outs[TAPE_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut self.tokens)).context(DeviceSnafu)?;
-        outs[EMIT_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut self.emit)).context(DeviceSnafu)?;
-        outs[FRAME_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut self.frames_tape)).context(DeviceSnafu)?;
-        outs[ANY_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut any)).context(DeviceSnafu)?;
+        outs[TAPE_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut self.tokens))?;
+        outs[EMIT_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut self.emit))?;
+        outs[FRAME_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut self.frames_tape))?;
+        outs[ANY_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut any))?;
         let t2 = std::time::Instant::now();
 
         self.stats.n_blocks += 1;
@@ -166,12 +166,12 @@ impl BatchBlockStep for RnntBlockBackend {
     fn reset(&mut self) -> Result<(), Self::Error> {
         let zeros64 = vec![0u8; self.lanes * 8];
         let blanks: Vec<i64> = vec![self.blank_id as i64; self.lanes];
-        self.jit.time_mut()?.copyin(&zeros64).context(DeviceSnafu)?;
-        self.jit.prev_mut()?.copyin(bytemuck::cast_slice(&blanks)).context(DeviceSnafu)?;
-        self.jit.symbols_mut()?.copyin(&zeros64[..self.lanes * 4]).context(DeviceSnafu)?;
+        self.jit.time_mut()?.copyin(&zeros64)?;
+        self.jit.prev_mut()?.copyin(bytemuck::cast_slice(&blanks))?;
+        self.jit.symbols_mut()?.copyin(&zeros64[..self.lanes * 4])?;
         let zstate = vec![0u8; self.state_bytes];
-        self.jit.h_in_mut()?.copyin(&zstate).context(DeviceSnafu)?;
-        self.jit.c_in_mut()?.copyin(&zstate).context(DeviceSnafu)?;
+        self.jit.h_in_mut()?.copyin(&zstate)?;
+        self.jit.c_in_mut()?.copyin(&zstate)?;
         Ok(())
     }
 }

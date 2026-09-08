@@ -34,7 +34,7 @@ pub use stream::{
 
 use std::path::Path;
 
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 use svod_dtype::DType;
 use svod_macros::jit_wrapper;
 use svod_tensor::Tensor;
@@ -45,17 +45,17 @@ use crate::state;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Tensor {
         #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
         source: Box<svod_tensor::error::Error>,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     State {
         #[snafu(source(from(crate::state::Error, Box::new)))]
         source: Box<crate::state::Error>,
     },
-    #[snafu(display("hub error: {source}"))]
+    #[snafu(display("hub error: {source}"), context(false))]
     Hub { source: hf_hub::HFError },
 }
 
@@ -110,19 +110,18 @@ impl Fsmn {
     /// convs would leak them into real frames; masked, a pad row contributes
     /// exactly what conv zero-padding would.
     fn forward(&self, x: &Tensor, valid: Option<&Tensor>) -> Result<Tensor> {
-        let t = |r: std::result::Result<Tensor, svod_tensor::error::Error>| r.context(TensorSnafu);
-        let len = x.shape().context(TensorSnafu)?[1].as_const().expect("time dim must be concrete") as isize;
+        let len = x.dim_const(1)? as isize;
         let k = ORDER as isize;
         // [N,T,P] -> [N,P,1,T]: conv2d wants (N, C, *spatial).
-        let mut xt = t(t(x.try_transpose(-1, -2))?.try_unsqueeze(2))?;
+        let mut xt = x.try_transpose(-1, -2)?.try_unsqueeze(2)?;
         if let Some(valid) = valid {
-            xt = t(xt.try_mul(valid))?;
+            xt = xt.try_mul(valid)?;
         }
-        let lookback = t(xt.conv2d().weight(&self.lookback).groups(PROJ).padding(&[(0, 0), (k - 1, 0)]).call())?;
-        let lookahead = t(xt.conv2d().weight(&self.lookahead).groups(PROJ).padding(&[(0, 0), (0, k)]).call())?;
-        let lookahead = t(lookahead.try_shrink([None, None, None, Some((1, len + 1))]))?;
-        let memory = t(t(xt.try_add(&lookback))?.try_add(&lookahead))?;
-        t(t(memory.try_squeeze(Some(2)))?.try_transpose(-1, -2))
+        let lookback = xt.conv2d().weight(&self.lookback).groups(PROJ).padding(&[(0, 0), (k - 1, 0)]).call()?;
+        let lookahead = xt.conv2d().weight(&self.lookahead).groups(PROJ).padding(&[(0, 0), (0, k)]).call()?;
+        let lookahead = lookahead.try_shrink([None, None, None, Some((1, len + 1))])?;
+        let memory = xt.try_add(&lookback)?.try_add(&lookahead)?;
+        Ok(memory.try_squeeze(Some(2))?.try_transpose(-1, -2)?)
     }
 }
 
@@ -137,16 +136,9 @@ struct DfsmnBlock {
 
 impl DfsmnBlock {
     fn forward(&self, x: &Tensor, valid: Option<&Tensor>) -> Result<Tensor> {
-        let h = x
-            .linear()
-            .weight(&self.fc1_weight)
-            .bias(&self.fc1_bias)
-            .call()
-            .context(TensorSnafu)?
-            .relu()
-            .context(TensorSnafu)?;
-        let p = h.linear().weight(&self.fc2_weight).call().context(TensorSnafu)?;
-        self.fsmn.forward(&p, valid)?.try_add(x).context(TensorSnafu)
+        let h = x.linear().weight(&self.fc1_weight).bias(&self.fc1_bias).call()?.relu()?;
+        let p = h.linear().weight(&self.fc2_weight).call()?;
+        Ok(self.fsmn.forward(&p, valid)?.try_add(x)?)
     }
 }
 
@@ -171,8 +163,8 @@ pub(crate) const HUB_REPO: &str = "vpermilp/firered_vad";
 
 /// Download a file from [`HUB_REPO`] into the local HF cache.
 pub(crate) fn hub_file(name: &str) -> Result<std::path::PathBuf> {
-    let repo = crate::hub::HubRepo::open(HUB_REPO, "main").context(HubSnafu)?;
-    repo.get(name).context(HubSnafu)
+    let repo = crate::hub::HubRepo::open(HUB_REPO, "main")?;
+    Ok(repo.get(name)?)
 }
 
 impl FireRedVad {
@@ -183,8 +175,8 @@ impl FireRedVad {
     /// Load from a safetensors produced by `scripts/convert_firered_vad.py`
     /// (model weights + `cmvn_means`/`cmvn_istd` stats).
     pub fn from_safetensors(path: &Path) -> Result<Self> {
-        let sd = state::load_safetensors(path).context(StateSnafu)?;
-        let get = |key: &str| -> Result<Tensor> { state::get_tensor(&sd, key).context(StateSnafu) };
+        let sd = state::load_safetensors(path)?;
+        let get = |key: &str| -> Result<Tensor> { Ok(state::get_tensor(&sd, key)?) };
         let fsmn = |prefix: &str| -> Result<Fsmn> {
             Ok(Fsmn {
                 lookback: get(&format!("{prefix}.lookback.weight"))?,
@@ -259,22 +251,21 @@ impl FireRedVad {
     /// garbage but the valid rows match a pad-free forward exactly. `None`
     /// means all rows are real.
     pub fn forward(&self, feat: &Tensor, valid: Option<&Tensor>) -> Result<Tensor> {
-        let t = |r: std::result::Result<Tensor, svod_tensor::error::Error>| r.context(TensorSnafu);
         // [B,T,1] -> [B,1,1,T], broadcast over P in the convs' (N,C,1,T) layout.
         let valid = match valid {
-            Some(v) => Some(t(t(v.try_transpose(-1, -2))?.try_unsqueeze(2))?),
+            Some(v) => Some(v.try_transpose(-1, -2)?.try_unsqueeze(2)?),
             None => None,
         };
-        let x = t(t(feat.try_sub(&self.cmvn_means))?.try_mul(&self.cmvn_istd))?;
-        let h = t(t(x.linear().weight(&self.fc1_weight).bias(&self.fc1_bias).call())?.relu())?;
-        let mut m = t(t(h.linear().weight(&self.fc2_weight).bias(&self.fc2_bias).call())?.relu())?;
+        let x = feat.try_sub(&self.cmvn_means)?.try_mul(&self.cmvn_istd)?;
+        let h = x.linear().weight(&self.fc1_weight).bias(&self.fc1_bias).call()?.relu()?;
+        let mut m = h.linear().weight(&self.fc2_weight).bias(&self.fc2_bias).call()?.relu()?;
         m = self.fsmn1.forward(&m, valid.as_ref())?;
         for block in &self.blocks {
             m = block.forward(&m, valid.as_ref())?;
         }
-        let d = t(t(m.linear().weight(&self.dnn_weight).bias(&self.dnn_bias).call())?.relu())?;
-        let logits = t(d.linear().weight(&self.out_weight).bias(&self.out_bias).call())?;
-        t(t(logits.sigmoid())?.try_squeeze(Some(-1)))
+        let d = m.linear().weight(&self.dnn_weight).bias(&self.dnn_bias).call()?.relu()?;
+        let logits = d.linear().weight(&self.out_weight).bias(&self.out_bias).call()?;
+        Ok(logits.sigmoid()?.try_squeeze(Some(-1))?)
     }
 }
 
@@ -319,7 +310,6 @@ impl FireRedVadInference {
     /// only the core region is kept — so the stitched result equals a
     /// single full-length forward up to float reassociation.
     pub fn probs(&mut self, feat: &[f32], n_frames: usize) -> crate::jit::Result<Vec<f32>> {
-        use snafu::ResultExt;
         debug_assert_eq!(feat.len(), n_frames * N_MELS, "feat shape");
         if n_frames == 0 {
             return Ok(Vec::new());
@@ -342,7 +332,7 @@ impl FireRedVadInference {
             };
             {
                 let buf = self.jit.feat_mut()?;
-                let mut view = buf.as_array_mut::<f32>().context(crate::jit::DeviceSnafu)?;
+                let mut view = buf.as_array_mut::<f32>()?;
                 let slice = view.as_slice_mut().expect("contiguous feat");
                 slice[..b * CHUNK_T * N_MELS].fill(0.0);
                 for i in 0..b {
@@ -354,7 +344,7 @@ impl FireRedVadInference {
             }
             {
                 let buf = self.jit.valid_mut()?;
-                let mut view = buf.as_array_mut::<f32>().context(crate::jit::DeviceSnafu)?;
+                let mut view = buf.as_array_mut::<f32>()?;
                 let slice = view.as_slice_mut().expect("contiguous valid");
                 slice[..b * CHUNK_T].fill(0.0);
                 for i in 0..b {
@@ -363,10 +353,7 @@ impl FireRedVadInference {
                 }
             }
             self.jit.execute()?;
-            self.jit
-                .output()?
-                .copyout_prefix(bytemuck::cast_slice_mut(&mut out[..b * CHUNK_T]))
-                .context(crate::jit::DeviceSnafu)?;
+            self.jit.output()?.copyout_prefix(bytemuck::cast_slice_mut(&mut out[..b * CHUNK_T]))?;
             for i in 0..b {
                 let core_lo = (done + i) * CORE;
                 let core_len = CORE.min(n_frames - core_lo);

@@ -1,12 +1,12 @@
 //! Scheduled Whisper decoding, temperature fallback, and language detection.
 
-use super::error::{DeviceSnafu, Error, JitSnafu, Result};
+use super::error::{Error, Result};
+
 use super::jit::{WhisperDecoderJit, WhisperDecoderStepJit, WhisperPrefillJit};
 use super::profile::{CopyProfile, GraphProfile, begin_host_copy, timed_d2d};
 use super::tokenizer::WhisperTokenizer;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-use snafu::ResultExt;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use svod_arch::pipelines::audio::Segment;
@@ -39,20 +39,20 @@ pub(crate) fn detect_language_profile(
     graph_profile: Option<&mut GraphProfile>,
 ) -> Result<LanguageDetection> {
     let sot = tokenizer.sot() as i32;
-    let started = begin_host_copy(copies.is_some(), decoder_jit.tokens_mut().context(JitSnafu)?)?;
+    let started = begin_host_copy(copies.is_some(), decoder_jit.tokens_mut()?)?;
     write_uncached(decoder_jit, &[sot])?;
     if let (Some(copies), Some(started)) = (copies.as_deref_mut(), started) {
         copies.h2d("language_tokens", 1, std::mem::size_of::<i32>(), started.elapsed());
     }
     if let Some(graph_profile) = graph_profile {
         let graph_started = std::time::Instant::now();
-        let kernels = decoder_jit.execute_profiled_static().context(JitSnafu)?;
-        decoder_jit.output().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
+        let kernels = decoder_jit.execute_profiled_static()?;
+        decoder_jit.output()?.synchronize()?;
         graph_profile.record(graph_started.elapsed(), kernels);
     } else {
-        decoder_jit.execute().context(JitSnafu)?;
+        decoder_jit.execute()?;
     }
-    let started = begin_host_copy(copies.is_some(), decoder_jit.output().context(JitSnafu)?)?;
+    let started = begin_host_copy(copies.is_some(), decoder_jit.output()?)?;
     let sot_logits = read_uncached(decoder_jit, n_vocab)?;
     if let (Some(copies), Some(started)) = (copies, started) {
         copies.d2h("language_logits", 1, n_vocab * std::mem::size_of::<f32>(), started.elapsed());
@@ -315,10 +315,10 @@ pub(crate) fn prefill_decode_seed(
         copies.as_deref_mut(),
         graph_profile,
     )?;
-    let self_k_src = prefill_jit.self_k().context(JitSnafu)?.clone();
-    let self_v_src = prefill_jit.self_v().context(JitSnafu)?.clone();
-    let cross_k_src = prefill_jit.prepared_cross_k_mut().context(JitSnafu)?.clone();
-    let cross_v_src = prefill_jit.prepared_cross_v_mut().context(JitSnafu)?.clone();
+    let self_k_src = prefill_jit.self_k()?.clone();
+    let self_v_src = prefill_jit.self_v()?.clone();
+    let cross_k_src = prefill_jit.prepared_cross_k_mut()?.clone();
+    let cross_v_src = prefill_jit.prepared_cross_v_mut()?.clone();
     let bytes = self_k_src
         .size()
         .saturating_add(self_v_src.size())
@@ -351,9 +351,8 @@ pub(crate) fn clone_device_cache(src: &Buffer) -> Result<Buffer> {
         DType::Float32,
         vec![src.size() / std::mem::size_of::<f32>()],
         BufferSpec { cpu_access: false, ..BufferSpec::default() },
-    )
-    .context(DeviceSnafu)?;
-    clone.copy_from(src).context(DeviceSnafu)?;
+    )?;
+    clone.copy_from(src)?;
     Ok(clone)
 }
 
@@ -692,10 +691,10 @@ fn seed_attempt_rows(
         n_text_ctx.checked_mul(seed.per_pos_bytes).ok_or_else(|| decode_err("self cache stride overflow"))?;
     let cross_stride = seed.cross_cache_bytes;
     for &row in rows {
-        copy_device_cache_row(jit.self_k_cache_mut().context(JitSnafu)?, row, self_stride, &seed.self_k_cache)?;
-        copy_device_cache_row(jit.self_v_cache_mut().context(JitSnafu)?, row, self_stride, &seed.self_v_cache)?;
-        copy_device_cache_row(jit.cross_k_mut().context(JitSnafu)?, row, cross_stride, &seed.cross_k)?;
-        copy_device_cache_row(jit.cross_v_mut().context(JitSnafu)?, row, cross_stride, &seed.cross_v)?;
+        copy_device_cache_row(jit.self_k_cache_mut()?, row, self_stride, &seed.self_k_cache)?;
+        copy_device_cache_row(jit.self_v_cache_mut()?, row, self_stride, &seed.self_v_cache)?;
+        copy_device_cache_row(jit.cross_k_mut()?, row, cross_stride, &seed.cross_k)?;
+        copy_device_cache_row(jit.cross_v_mut()?, row, cross_stride, &seed.cross_v)?;
     }
     Ok(())
 }
@@ -712,8 +711,8 @@ fn append_row_cache(
         .and_then(|base| pos.checked_mul(per_pos_bytes).and_then(|offset| base.checked_add(offset)))
         .ok_or_else(|| decode_err("self cache append offset overflow"))?;
     let src = row.checked_mul(per_pos_bytes).ok_or_else(|| decode_err("step cache output offset overflow"))?;
-    jit.copy_output_to_self_k_cache(1, dst, src, per_pos_bytes).context(JitSnafu)?;
-    jit.copy_output_to_self_v_cache(2, dst, src, per_pos_bytes).context(JitSnafu)
+    jit.copy_output_to_self_k_cache(1, dst, src, per_pos_bytes)?;
+    Ok(jit.copy_output_to_self_v_cache(2, dst, src, per_pos_bytes)?)
 }
 
 fn clone_cache_prefix(
@@ -731,8 +730,8 @@ fn clone_cache_prefix(
             .dst_row
             .checked_mul(row_stride_bytes)
             .ok_or_else(|| decode_err("cache destination offset overflow"))?;
-        jit.self_k_cache_mut().context(JitSnafu)?.copy_within(dst, src, len).context(DeviceSnafu)?;
-        jit.self_v_cache_mut().context(JitSnafu)?.copy_within(dst, src, len).context(DeviceSnafu)?;
+        jit.self_k_cache_mut()?.copy_within(dst, src, len)?;
+        jit.self_v_cache_mut()?.copy_within(dst, src, len)?;
     }
     Ok(())
 }
@@ -847,7 +846,7 @@ pub(crate) fn run_fixed_slot_decode(
 
         // Attempts that finish from prefill (EOT or zero budget) need no graph dispatch.
         let mut dispatch = false;
-        let control_started = begin_host_copy(profile, step_jit.token_mut().context(JitSnafu)?)?;
+        let control_started = begin_host_copy(profile, step_jit.token_mut()?)?;
         let mut control_ops = 0usize;
         let mut control_bytes = 0usize;
         for &request in &active_requests {
@@ -919,11 +918,11 @@ pub(crate) fn run_fixed_slot_decode(
                 .sum::<usize>();
             if profile {
                 let graph_started = std::time::Instant::now();
-                let kernels = step_jit.execute_profiled_static().context(JitSnafu)?;
-                step_jit.logits().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
+                let kernels = step_jit.execute_profiled_static()?;
+                step_jit.logits()?.synchronize()?;
                 graph_profile.record(graph_started.elapsed(), kernels);
             } else {
-                step_jit.execute().context(JitSnafu)?;
+                step_jit.execute()?;
             }
             for &request in &active_requests {
                 let attempt = attempts[request].as_mut().expect("active attempt");
@@ -942,7 +941,7 @@ pub(crate) fn run_fixed_slot_decode(
                 match &mut attempt.kind {
                     AttemptKind::Single(single) => {
                         let row = attempt.reserved_rows[0];
-                        let fence = step_jit.new_self_k().context(JitSnafu)?.clone();
+                        let fence = step_jit.new_self_k()?.clone();
                         let (_, wall) = timed_d2d(profile, &fence, || {
                             append_row_cache(step_jit, row, attempt.pos, per_pos_bytes, row_stride_bytes)
                         })?;
@@ -950,7 +949,7 @@ pub(crate) fn run_fixed_slot_decode(
                             let (ops, bytes) = cache_append_copy_accounting(1, per_pos_bytes);
                             stats.copies.d2d("cache_append", ops, bytes, wall);
                         }
-                        let started = begin_host_copy(profile, step_jit.logits().context(JitSnafu)?)?;
+                        let started = begin_host_copy(profile, step_jit.logits()?)?;
                         let mut logits = read_logits_row(step_jit, row, n_vocab)?;
                         if let Some(started) = started {
                             stats.copies.d2h(
@@ -982,7 +981,7 @@ pub(crate) fn run_fixed_slot_decode(
                     }
                     AttemptKind::Beam(beam) => {
                         let append_rows = beam.rows.clone();
-                        let fence = step_jit.new_self_k().context(JitSnafu)?.clone();
+                        let fence = step_jit.new_self_k()?.clone();
                         let (_, wall) = timed_d2d(profile, &fence, || {
                             for &row in &append_rows {
                                 append_row_cache(step_jit, row, attempt.pos, per_pos_bytes, row_stride_bytes)?;
@@ -996,7 +995,7 @@ pub(crate) fn run_fixed_slot_decode(
                         let size = attempt.reserved_rows.len();
                         let mut candidates = Vec::new();
                         for (parent_index, (hypothesis, &row)) in beam.active.iter().zip(&beam.rows).enumerate() {
-                            let started = begin_host_copy(profile, step_jit.logits().context(JitSnafu)?)?;
+                            let started = begin_host_copy(profile, step_jit.logits()?)?;
                             let mut logits = read_logits_row(step_jit, row, n_vocab)?;
                             if let Some(started) = started {
                                 stats.copies.d2h(
@@ -1038,7 +1037,7 @@ pub(crate) fn run_fixed_slot_decode(
                         );
                         beam.finished.extend(newly_finished);
                         let assignment = plan_beam_rows(&attempt.reserved_rows, &survivors).map_err(decode_err)?;
-                        let fence = step_jit.self_k_cache_mut().context(JitSnafu)?.clone();
+                        let fence = step_jit.self_k_cache_mut()?.clone();
                         let (_, wall) = timed_d2d(profile, &fence, || {
                             clone_cache_prefix(
                                 step_jit,
@@ -1101,8 +1100,8 @@ pub(crate) fn run_fixed_slot_decode(
 // its row. These wrap the per-row slicing so the main loop stays readable.
 
 fn write_token_row(jit: &mut WhisperDecoderStepJit, row: usize, token: u32) -> Result<()> {
-    let buf = jit.token_mut().context(JitSnafu)?;
-    let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
+    let buf = jit.token_mut()?;
+    let dst = buf.as_host_bytes_mut()?;
     // token is [max_lanes, 1] i32; row stride = 4 bytes
     let off = row.checked_mul(std::mem::size_of::<i32>()).ok_or_else(|| decode_err("token row offset overflow"))?;
     let tok = [token as i32];
@@ -1113,8 +1112,8 @@ fn write_token_row(jit: &mut WhisperDecoderStepJit, row: usize, token: u32) -> R
 }
 
 fn write_pos_emb_row(jit: &mut WhisperDecoderStepJit, row: usize, emb: &[f32]) -> Result<()> {
-    let buf = jit.pos_emb_mut().context(JitSnafu)?;
-    let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
+    let buf = jit.pos_emb_mut()?;
+    let dst = buf.as_host_bytes_mut()?;
     // pos_emb is [max_lanes, 1, n_state] f32
     let row_bytes =
         emb.len().checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| decode_err("position row stride overflow"))?;
@@ -1126,8 +1125,8 @@ fn write_pos_emb_row(jit: &mut WhisperDecoderStepJit, row: usize, emb: &[f32]) -
 }
 
 fn write_self_key_len_row(jit: &mut WhisperDecoderStepJit, row: usize, pos: usize) -> Result<()> {
-    let buf = jit.self_key_lens_mut().context(JitSnafu)?;
-    let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
+    let buf = jit.self_key_lens_mut()?;
+    let dst = buf.as_host_bytes_mut()?;
     let off =
         row.checked_mul(std::mem::size_of::<i32>()).ok_or_else(|| decode_err("self key length row offset overflow"))?;
     let len = i32::try_from(pos).map_err(|_| decode_err("decoder position exceeds i32"))?;
@@ -1156,13 +1155,13 @@ pub(crate) fn copy_device_cache_row(
     if end > buf.size() || data.size() > row_stride_bytes {
         return Err(decode_err("cache seed row is out of bounds"));
     }
-    buf.copy_region_from(off, data, 0, data.size()).context(DeviceSnafu)
+    Ok(buf.copy_region_from(off, data, 0, data.size())?)
 }
 
 /// Read one lane's logits row `[n_vocab]` from the batched JIT output.
 fn read_logits_row(jit: &mut WhisperDecoderStepJit, row: usize, n_vocab: usize) -> Result<Vec<f32>> {
-    let buf = jit.logits().context(JitSnafu)?;
-    let src = buf.as_host_bytes().context(DeviceSnafu)?;
+    let buf = jit.logits()?;
+    let src = buf.as_host_bytes()?;
     let row_bytes = n_vocab.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| decode_err("logits row overflow"))?;
     let off = row.checked_mul(row_bytes).ok_or_else(|| decode_err("logits offset overflow"))?;
     let end = off.checked_add(row_bytes).ok_or_else(|| decode_err("logits end overflow"))?;
@@ -1366,7 +1365,7 @@ fn execute_prefill(
     // Write tokens to prefill JIT buffer
     {
         let token_data: Vec<i32> = initial_tokens.iter().map(|&t| t as i32).collect();
-        let buf = prefill_jit.tokens_mut().context(JitSnafu)?;
+        let buf = prefill_jit.tokens_mut()?;
         let started = begin_host_copy(copies.is_some(), buf)?;
         let data = bytemuck::cast_slice(&token_data);
         write_buf(buf, data)?;
@@ -1378,17 +1377,17 @@ fn execute_prefill(
     // Execute prefill JIT (plan manages all buffers, no realize)
     if let Some(graph_profile) = graph_profile {
         let graph_started = std::time::Instant::now();
-        let kernels = prefill_jit.execute_profiled_static().context(JitSnafu)?;
-        prefill_jit.logits().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
+        let kernels = prefill_jit.execute_profiled_static()?;
+        prefill_jit.logits()?.synchronize()?;
         graph_profile.record(graph_started.elapsed(), kernels);
     } else {
-        prefill_jit.execute().context(JitSnafu)?;
+        prefill_jit.execute()?;
     }
 
     // Read logits from output 0
-    let started = begin_host_copy(copies.is_some(), prefill_jit.logits().context(JitSnafu)?)?;
+    let started = begin_host_copy(copies.is_some(), prefill_jit.logits()?)?;
     let prefill_logits = {
-        let buf = prefill_jit.logits().context(JitSnafu)?;
+        let buf = prefill_jit.logits()?;
         read_buf(buf, buf.size() / std::mem::size_of::<f32>())?
     };
     if let (Some(copies), Some(started)) = (copies, started) {
@@ -1558,12 +1557,12 @@ fn decode_err(msg: &str) -> Error {
 // ─── JIT buffer helpers ─────────────────────────────────────────────────────
 
 fn write_uncached(jit: &mut WhisperDecoderJit, tokens: &[i32]) -> Result<()> {
-    let buf = jit.tokens_mut().context(JitSnafu)?;
+    let buf = jit.tokens_mut()?;
     write_buf(buf, bytemuck::cast_slice(tokens))
 }
 
 fn read_uncached(jit: &WhisperDecoderJit, n_vocab: usize) -> Result<Vec<f32>> {
-    let buf = jit.output().context(JitSnafu)?;
+    let buf = jit.output()?;
     read_buf(buf, n_vocab)
 }
 
@@ -1571,7 +1570,7 @@ fn read_uncached(jit: &WhisperDecoderJit, n_vocab: usize) -> Result<Vec<f32>> {
 /// `as_host_bytes_mut` syncs pending GPU work before returning the slice.
 /// Subsequent `execute()` sees our writes (unified memory / BAR).
 fn write_buf(buf: &svod_device::Buffer, data: &[u8]) -> Result<()> {
-    let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
+    let dst = buf.as_host_bytes_mut()?;
     let n = data.len().min(dst.len());
     dst[..n].copy_from_slice(&data[..n]);
     Ok(())
@@ -1580,7 +1579,7 @@ fn write_buf(buf: &svod_device::Buffer, data: &[u8]) -> Result<()> {
 /// Read data directly from the buffer's host-visible mapping.
 /// `as_host_bytes` syncs pending GPU work before returning the slice.
 fn read_buf(buf: &svod_device::Buffer, n: usize) -> Result<Vec<f32>> {
-    let src = buf.as_host_bytes().context(DeviceSnafu)?;
+    let src = buf.as_host_bytes()?;
     let n = n.min(src.len() / std::mem::size_of::<f32>());
     Ok(bytemuck::cast_slice(&src[..n * std::mem::size_of::<f32>()]).to_vec())
 }

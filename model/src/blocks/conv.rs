@@ -1,11 +1,10 @@
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 /// Bias-less 2D convolution wrapper. `weight` has layout
 /// `[out_ch, in_ch / groups, kH, kW]` (same as PyTorch / timm).
@@ -42,13 +41,12 @@ impl Conv2dWeights {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let p = self.padding as isize;
-        x.conv2d()
+        Ok(x.conv2d()
             .weight(&self.weight)
             .groups(self.groups)
             .stride(&[self.stride, self.stride])
             .padding(&[(p, p), (p, p)])
-            .call()
-            .context(TensorSnafu)
+            .call()?)
     }
 }
 

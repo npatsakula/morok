@@ -9,7 +9,6 @@
 //! `(B, H, L, hd)` for RoPE + SDPA. Sliding-window local layers pass a `window`;
 //! global layers pass `None`.
 
-use snafu::{OptionExt, ResultExt};
 use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
@@ -17,7 +16,8 @@ use svod_tensor::Tensor;
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::rotary::RotaryTable;
 
 #[derive(Clone)]
@@ -49,26 +49,22 @@ impl ModernBertAttention {
     /// `(B, 1, 1, L)` where `true` masks out (padding) positions in the KEY
     /// axis.
     pub fn forward(&self, x: &Tensor, rotary: &RotaryTable, padding_mask: Option<&Tensor>) -> Result<Tensor> {
-        let shape = x.shape().context(TensorSnafu)?;
-        let b = shape[0].clone();
-        let l: usize = shape[1].as_const().context(SymbolicShapeSnafu { what: "attention" })?;
+        let b = x.dim(0)?;
+        let l = x.dim_const(1)?;
         let h = self.num_heads as isize;
         let hd = self.head_dim as isize;
         let bsint: SInt = b;
 
         // Fused QKV: (B, L, 3D) → chunk into q, k, v each (B, L, D).
-        let qkv = x.linear().weight(&self.qkv_weight).call().context(TensorSnafu)?;
-        let mut parts = qkv.chunk(3, -1).context(TensorSnafu)?;
+        let qkv = x.linear().weight(&self.qkv_weight).call()?;
+        let mut parts = qkv.chunk(3, -1)?;
         let v = parts.pop().expect("chunk(3) yields 3 parts");
         let k = parts.pop().expect("chunk(3) yields 3 parts");
         let q = parts.pop().expect("chunk(3) yields 3 parts");
 
         // (B, L, D) → (B, L, H, hd) → (B, H, L, hd)
         let to_heads = |t: Tensor| -> Result<Tensor> {
-            t.view([bsint.clone(), l.into(), h.into(), hd.into()])
-                .context(TensorSnafu)?
-                .try_permute(&[0, 2, 1, 3])
-                .context(TensorSnafu)
+            Ok(t.view([bsint.clone(), l.into(), h.into(), hd.into()])?.try_permute(&[0, 2, 1, 3])?)
         };
         let q = rotary.apply(&to_heads(q)?)?;
         let k = rotary.apply(&to_heads(k)?)?;
@@ -83,16 +79,11 @@ impl ModernBertAttention {
             .value(&v)
             .maybe_attn_mask(padding_mask)
             .maybe_window(self.window)
-            .call()
-            .context(TensorSnafu)?;
+            .call()?;
 
         // (B, H, L, hd) → (B, L, H*hd) = (B, L, D) → output projection.
-        let attn = attn
-            .try_permute(&[0, 2, 1, 3])
-            .context(TensorSnafu)?
-            .view([bsint, l.into(), (self.num_heads * self.head_dim).into()])
-            .context(TensorSnafu)?;
-        attn.linear().weight(&self.out_weight).call().context(TensorSnafu)
+        let attn = attn.try_permute(&[0, 2, 1, 3])?.view([bsint, l.into(), (self.num_heads * self.head_dim).into()])?;
+        Ok(attn.linear().weight(&self.out_weight).call()?)
     }
 }
 

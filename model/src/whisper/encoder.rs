@@ -1,6 +1,5 @@
 //! Audio encoder: Conv1d frontend + sinusoidal positional embeddings + transformer blocks.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
@@ -10,7 +9,7 @@ use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed, scoped, 
 use super::attention::{MultiHeadAttention, padded_fa_sequence_len};
 use super::blocks::{Conv1dWeights, LayerNormWeights, linear_with_bias, sinusoids};
 use super::config::ModelDimensions;
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 /// Encoder transformer block: self-attention + MLP, pre-norm.
 #[derive(Clone)]
@@ -52,14 +51,14 @@ impl EncoderBlock {
         // Self-attention (pre-norm)
         let h = scoped("attn_ln", || self.attn_ln.apply(x))?;
         let attn_out = scoped("attn", || self.attn.forward_with_key_lens(&h, None, None, key_lens))?;
-        let x = x.try_add(&attn_out).context(TensorSnafu)?;
+        let x = x.try_add(&attn_out)?;
 
         // MLP (pre-norm)
         let h = scoped("mlp_ln", || self.mlp_ln.apply(&x))?;
         let h = linear_with_bias(&h, &self.mlp0_w, &self.mlp0_b)?;
-        let h = h.gelu_exact().context(TensorSnafu)?;
+        let h = h.gelu_exact()?;
         let h = linear_with_bias(&h, &self.mlp1_w, &self.mlp1_b)?;
-        let x = x.try_add(&h).context(TensorSnafu)?;
+        let x = x.try_add(&h)?;
         Ok(x)
     }
 }
@@ -123,37 +122,26 @@ impl AudioEncoder {
         // Cast input to the compute dtype (weights are dims.dtype; the host
         // feeds fp32 mel). Matches `model.py:48` weight.to(x.dtype) from the
         // other direction — we cast x to the weight dtype so the graph is uniform.
-        let dtype = self.conv1.weight.uop().dtype().clone();
-        let mel = mel.cast(dtype.clone()).context(TensorSnafu)?;
+        let dtype = self.conv1.weight.dtype().clone();
+        let mel = mel.cast(dtype.clone())?;
         let x = scoped("conv1", || self.conv1.forward(&mel))?;
-        let x = x.gelu_exact().context(TensorSnafu)?;
+        let x = x.gelu_exact()?;
         let x = scoped("conv2", || self.conv2.forward(&x))?;
-        let x = x.gelu_exact().context(TensorSnafu)?;
+        let x = x.gelu_exact()?;
 
         // [B, D, T/2] → [B, T/2, D]
-        let x = x.try_permute(&[0, 2, 1]).context(TensorSnafu)?;
+        let x = x.try_permute(&[0, 2, 1])?;
 
         // Add positional embedding [n_audio_ctx, D]
-        let x = x.try_add(&self.positional_embedding).context(TensorSnafu)?.cast(dtype).context(TensorSnafu)?;
+        let x = x.try_add(&self.positional_embedding)?.cast(dtype)?;
 
-        let shape = x.shape().context(TensorSnafu)?;
-        let concrete = |axis: usize, operation: &str| {
-            shape[axis].as_const().ok_or_else(|| super::error::Error::Tensor {
-                source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported { operation: operation.into() }),
-            })
-        };
-        let (batch, sequence, state) = (
-            concrete(0, "Whisper encoder batch")?,
-            concrete(1, "Whisper encoder sequence")?,
-            concrete(2, "Whisper encoder state")?,
-        );
+        let (batch, sequence, state) = (x.dim_const(0)?, x.dim_const(1)?, x.dim_const(2)?);
         let padded_sequence = encoder_padded_sequence_len(&x.device(), sequence);
         let (mut x, key_lens) = match padded_sequence {
             Some(padded) => {
-                let x = x.try_pad(&[(0, 0), (0, (padded - sequence) as isize), (0, 0)]).context(TensorSnafu)?;
-                let lens = Tensor::full(&[batch], svod_ir::ConstValue::Int(sequence as i64), DType::Int32)
-                    .context(TensorSnafu)?
-                    .to(x.device());
+                let x = x.try_pad(&[(0, 0), (0, (padded - sequence) as isize), (0, 0)])?;
+                let lens =
+                    Tensor::full(&[batch], svod_ir::ConstValue::Int(sequence as i64), DType::Int32)?.to(x.device());
                 (x, Some(lens))
             }
             None => (x, None),
@@ -164,14 +152,14 @@ impl AudioEncoder {
             x = scoped_index("blocks", index, || block.forward_with_key_lens(&x, key_lens.as_ref()))?;
         }
         if padded_sequence.is_some() {
-            x = x.try_shrink([(0, batch), (0, sequence), (0, state)]).context(TensorSnafu)?;
+            x = x.try_shrink([(0, batch), (0, sequence), (0, state)])?;
         }
 
         // Final LayerNorm + cast to fp32. The encoder output is consumed by the
         // host (copyout_prefix into Vec<f32>) and fed to the prefill/step JITs
         // which cast it back to the compute dtype. Keeping the output fp32 means
         // the host read path works regardless of compute dtype.
-        scoped("ln_post", || self.ln_post.apply(&x))?.cast(DType::Float32).context(TensorSnafu)
+        Ok(scoped("ln_post", || self.ln_post.apply(&x))?.cast(DType::Float32)?)
     }
 }
 

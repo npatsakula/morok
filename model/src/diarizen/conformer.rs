@@ -18,7 +18,6 @@
 //! `conv.{ln_norm, pointwise_conv1, depthwise_conv, bn_norm, pointwise_conv2}`,
 //! `ffn2.{ln_norm, w_1, w_2}`, and a final `ln_norm` on the block.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
@@ -27,7 +26,7 @@ use crate::init::{fan_in_uniform, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 use crate::wavlm::LayerNormWeights;
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 // ---------------------------------------------------------------------------
 // PositionwiseFeedForward
@@ -56,12 +55,12 @@ impl PositionwiseFeedForward {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let normed = self.ln_norm.apply(x)?;
-        let y = normed.linear().weight(&self.w1_weight).bias(&self.w1_bias).call().context(TensorSnafu)?;
-        let y = y.silu().context(TensorSnafu)?; // Python `Swish` == SiLU.
-        let y = y.linear().weight(&self.w2_weight).bias(&self.w2_bias).call().context(TensorSnafu)?;
-        let half = Tensor::const_(0.5f32, y.uop().dtype());
-        let scaled = y.try_mul(&half).context(TensorSnafu)?;
-        x.try_add(&scaled).context(TensorSnafu)
+        let y = normed.linear().weight(&self.w1_weight).bias(&self.w1_bias).call()?;
+        let y = y.silu()?; // Python `Swish` == SiLU.
+        let y = y.linear().weight(&self.w2_weight).bias(&self.w2_bias).call()?;
+        let half = Tensor::const_(0.5f32, y.dtype());
+        let scaled = y.try_mul(&half)?;
+        Ok(x.try_add(&scaled)?)
     }
 }
 
@@ -125,16 +124,13 @@ impl PlainMultiHeadSelfAttention {
 
     /// Forward on `(B, L, n_units)` → `(B, L, n_units)`. Plain scaled-dot-product.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let shape = x.shape().context(TensorSnafu)?;
-        let b = shape[0].clone();
-        let l = shape[1].as_const().expect("Conformer MHSA requires concrete sequence length");
+        let b = x.dim(0)?;
+        let l = x.dim_const(1)?;
 
         let project_and_split = |w: &Tensor, bias: &Tensor| -> Result<Tensor> {
-            let y = x.linear().weight(w).bias(bias).call().context(TensorSnafu)?;
-            y.try_reshape(&[b.clone(), l.into(), self.n_heads.into(), self.d_k.into()])
-                .context(TensorSnafu)?
-                .try_permute(&[0, 2, 1, 3])
-                .context(TensorSnafu)
+            let y = x.linear().weight(w).bias(bias).call()?;
+            Ok(y.try_reshape(&[b.clone(), l.into(), self.n_heads.into(), self.d_k.into()])?
+                .try_permute(&[0, 2, 1, 3])?)
         };
 
         let q = project_and_split(&self.linear_q_weight, &self.linear_q_bias)?; // (B, h, L, d_k)
@@ -142,20 +138,16 @@ impl PlainMultiHeadSelfAttention {
         let v = project_and_split(&self.linear_v_weight, &self.linear_v_bias)?;
 
         let scaling = (self.d_k as f32).powf(-0.5);
-        let scaling_t = Tensor::full(&[1], scaling, DType::Float32).context(TensorSnafu)?;
-        let q_scaled = q.try_mul(&scaling_t).context(TensorSnafu)?;
-        let k_t = k.try_transpose(-2, -1).context(TensorSnafu)?; // (B, h, d_k, L)
-        let scores = q_scaled.matmul(&k_t).context(TensorSnafu)?; // (B, h, L, L)
-        let weights = scores.softmax(-1).context(TensorSnafu)?;
-        let attn_out = weights.matmul(&v).context(TensorSnafu)?; // (B, h, L, d_k)
+        let scaling_t = Tensor::full(&[1], scaling, DType::Float32)?;
+        let q_scaled = q.try_mul(&scaling_t)?;
+        let k_t = k.try_transpose(-2, -1)?; // (B, h, d_k, L)
+        let scores = q_scaled.matmul(&k_t)?; // (B, h, L, L)
+        let weights = scores.softmax(-1)?;
+        let attn_out = weights.matmul(&v)?; // (B, h, L, d_k)
 
-        let attn_out = attn_out
-            .try_permute(&[0, 2, 1, 3])
-            .context(TensorSnafu)?
-            .try_reshape(&[b, l.into(), self.n_units.into()])
-            .context(TensorSnafu)?;
+        let attn_out = attn_out.try_permute(&[0, 2, 1, 3])?.try_reshape(&[b, l.into(), self.n_units.into()])?;
 
-        attn_out.linear().weight(&self.linear_o_weight).bias(&self.linear_o_bias).call().context(TensorSnafu)
+        Ok(attn_out.linear().weight(&self.linear_o_weight).bias(&self.linear_o_bias).call()?)
     }
 }
 
@@ -204,7 +196,7 @@ impl ConformerMHA {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let normed = self.ln_norm.apply(x)?;
         let delta = self.mha.forward(&normed)?;
-        x.try_add(&delta).context(TensorSnafu)
+        Ok(x.try_add(&delta)?)
     }
 }
 
@@ -264,7 +256,7 @@ impl ConvolutionModule {
         // x: (B, T, C)
         let normed = self.ln_norm.apply(x)?;
         // → (B, C, T)
-        let y = normed.try_permute(&[0, 2, 1]).context(TensorSnafu)?;
+        let y = normed.try_permute(&[0, 2, 1])?;
 
         // Pointwise conv1: (B, C, T) → (B, 2C, T)
         let y = y
@@ -273,11 +265,10 @@ impl ConvolutionModule {
             .bias(&self.pointwise1_bias)
             .stride(&[1])
             .padding(&[(0, 0)])
-            .call()
-            .context(TensorSnafu)?;
+            .call()?;
 
         // GLU over channel dim (dim 1).
-        let y = y.glu(1).context(TensorSnafu)?; // (B, C, T)
+        let y = y.glu(1)?; // (B, C, T)
 
         // Depthwise conv with groups=channels and SAME padding.
         let p = ((self.kernel_size - 1) / 2) as isize;
@@ -288,12 +279,11 @@ impl ConvolutionModule {
             .groups(self.channels)
             .stride(&[1])
             .padding(&[(p, p)])
-            .call()
-            .context(TensorSnafu)?;
+            .call()?;
 
         // BN over channel axis (axis 1 default works for NCT).
         let y = self.bn_norm.forward(&y)?;
-        let y = y.silu().context(TensorSnafu)?;
+        let y = y.silu()?;
 
         // Pointwise conv2: (B, C, T) → (B, C, T)
         let y = y
@@ -302,12 +292,11 @@ impl ConvolutionModule {
             .bias(&self.pointwise2_bias)
             .stride(&[1])
             .padding(&[(0, 0)])
-            .call()
-            .context(TensorSnafu)?;
+            .call()?;
 
         // Back to (B, T, C) and residual.
-        let y = y.try_permute(&[0, 2, 1]).context(TensorSnafu)?;
-        x.try_add(&y).context(TensorSnafu)
+        let y = y.try_permute(&[0, 2, 1])?;
+        Ok(x.try_add(&y)?)
     }
 }
 

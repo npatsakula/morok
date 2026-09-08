@@ -3,14 +3,13 @@
 //! The `Tensor::layernorm` op upcasts to f32 internally before casting back,
 //! so this is numerically exact in bf16.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::init::ones;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 #[derive(Clone)]
 pub struct LayerNormWeights {
@@ -31,10 +30,10 @@ impl LayerNormWeights {
     /// Apply LayerNorm over the last axis then affine:
     /// `(x - μ)/√(σ²+ε) * γ + β?`.
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
-        let normed = x.layernorm(-1, self.eps).context(TensorSnafu)?;
-        let scaled = normed.try_mul(&self.weight).context(TensorSnafu)?;
+        let normed = x.layernorm(-1, self.eps)?;
+        let scaled = normed.try_mul(&self.weight)?;
         match &self.bias {
-            Some(b) => scaled.try_add(b).context(TensorSnafu),
+            Some(b) => Ok(scaled.try_add(b)?),
             None => Ok(scaled),
         }
     }

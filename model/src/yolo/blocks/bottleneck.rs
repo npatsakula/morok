@@ -1,10 +1,9 @@
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict, prefixed};
 
 use super::conv::YoloConv;
-use crate::yolo::error::{Result, TensorSnafu};
+use crate::yolo::error::Result;
 
 /// Standard YOLO bottleneck: two Conv+BN+SiLU layers with optional residual.
 ///
@@ -31,7 +30,7 @@ impl YoloBottleneck {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let out = self.cv2.forward(&self.cv1.forward(x)?)?;
-        if self.add { out.try_add(x).context(TensorSnafu) } else { Ok(out) }
+        if self.add { Ok(out.try_add(x)?) } else { Ok(out) }
     }
 }
 

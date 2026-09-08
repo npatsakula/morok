@@ -94,8 +94,8 @@ fn published_weight_shapes() {
     let sd: StateDict = m.state_dict("");
     let qkv = &sd["model.layers.0.attn.Wqkv.weight"];
     let wi = &sd["model.layers.0.mlp.Wi.weight"];
-    assert_eq!(qkv.shape().unwrap()[0].as_const().unwrap(), 3 * d);
-    assert_eq!(qkv.shape().unwrap()[1].as_const().unwrap(), d);
-    assert_eq!(wi.shape().unwrap()[0].as_const().unwrap(), 2 * i);
-    assert_eq!(wi.shape().unwrap()[1].as_const().unwrap(), d);
+    assert_eq!(qkv.dim_const(0).unwrap(), 3 * d);
+    assert_eq!(qkv.dim_const(1).unwrap(), d);
+    assert_eq!(wi.dim_const(0).unwrap(), 2 * i);
+    assert_eq!(wi.dim_const(1).unwrap(), d);
 }

@@ -32,10 +32,10 @@ fn forward_output_shape() {
 
     let mut out = reranker.forward(&ids, &mask).unwrap();
     out.realize().unwrap();
-    let s = out.shape().unwrap();
+    let s = out.dims().unwrap();
     // (B,) scalar score per row (after sigmoid)
     assert_eq!(s.len(), 1);
-    assert_eq!(s[0].as_const().unwrap(), 1);
+    assert_eq!(s[0], 1);
 
     let v = out.as_vec::<f32>().unwrap();
     assert!(v.iter().all(|x| x.is_finite()));
@@ -47,7 +47,7 @@ fn forward_output_shape() {
 fn lm_head_tied_to_embeddings() {
     let reranker = Qwen3Reranker::empty(tiny_cfg());
     // The lm_head_weight should have the same shape as embed_tokens.weight
-    let lm_shape = reranker.lm_head_weight.shape().unwrap();
-    assert_eq!(lm_shape[0].as_const().unwrap(), 100); // vocab_size
-    assert_eq!(lm_shape[1].as_const().unwrap(), 64); // hidden_size
+    let lm_shape = reranker.lm_head_weight.dims().unwrap();
+    assert_eq!(lm_shape[0], 100); // vocab_size
+    assert_eq!(lm_shape[1], 64); // hidden_size
 }

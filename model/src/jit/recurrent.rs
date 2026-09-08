@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
-use snafu::{ResultExt, ensure};
+use snafu::ensure;
 use svod_device::Buffer;
 
-use crate::jit::{DeviceSnafu, OutputLayoutMismatchSnafu, Result};
+use crate::jit::{OutputLayoutMismatchSnafu, Result};
 
 /// Flat host-side LSTM state. `h` and `c` are `f32` vectors of equal length;
 /// for a single-layer cell `h.len() = hidden_size`, for a multi-layer stack
@@ -107,7 +107,7 @@ impl<J: RecurrentJit> JitRecurrent<J> {
         let t2 = Instant::now();
         {
             let out = self.jit.output_buffer()?;
-            let arr = out.as_array::<f32>().context(DeviceSnafu)?;
+            let arr = out.as_array::<f32>()?;
             let flat = arr.as_slice().expect("contiguous JIT output");
             let head_len = self.head_len;
             let h_len = self.state.h.len();

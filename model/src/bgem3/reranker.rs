@@ -10,14 +10,14 @@
 //! differs. Loads from `model.safetensors` with `roberta.` prefix on backbone
 //! keys.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::{BoundVariable, Tensor};
 
 use crate::init::{fan_in_uniform, zeros};
 use crate::state::{self, HasStateDict, StateDict, cast_all, get_tensor, prefixed};
 use crate::xlm_roberta::config::XlmRobertaConfig;
-use crate::xlm_roberta::error::{HubSnafu, Result, StateSnafu, TensorSnafu};
+use crate::xlm_roberta::error::Result;
+
 use crate::xlm_roberta::model::XlmRobertaModel;
 use crate::xlm_roberta::pooling::cls;
 
@@ -43,9 +43,9 @@ impl ClassificationHead {
     /// Forward: `CLS → dense → tanh → out_proj → (B, num_labels)`.
     pub fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
         let cls_emb = cls(hidden)?;
-        let h = cls_emb.linear().weight(&self.dense_weight).bias(&self.dense_bias).call().context(TensorSnafu)?;
-        let h = h.tanh().context(TensorSnafu)?;
-        h.linear().weight(&self.out_proj_weight).bias(&self.out_proj_bias).call().context(TensorSnafu)
+        let h = cls_emb.linear().weight(&self.dense_weight).bias(&self.dense_bias).call()?;
+        let h = h.tanh()?;
+        Ok(h.linear().weight(&self.out_proj_weight).bias(&self.out_proj_bias).call()?)
     }
 }
 
@@ -90,7 +90,7 @@ impl BgeRerankerV2M3 {
     /// Score with optional sigmoid normalization. Returns `(B, 1)`.
     pub fn compute_score(&self, input_ids: &Tensor, attention_mask: &Tensor, normalize: bool) -> Result<Tensor> {
         let logits = self.forward(input_ids, Some(attention_mask))?;
-        if normalize { logits.sigmoid().context(TensorSnafu) } else { Ok(logits) }
+        if normalize { Ok(logits.sigmoid()?) } else { Ok(logits) }
     }
 
     /// JIT-path forward with rebindable batch. Returns `(B, 1)`.
@@ -110,20 +110,20 @@ impl BgeRerankerV2M3 {
     }
 
     pub fn from_hub_with_revision(model_id: &str, revision: &str, config: &mut XlmRobertaConfig) -> Result<Self> {
-        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open(model_id, revision)?;
 
-        let cfg_path = repo.get("config.json").context(HubSnafu)?;
+        let cfg_path = repo.get("config.json")?;
         let parsed = XlmRobertaConfig::from_json(&cfg_path)?;
         config.merge_structural_from(&parsed);
 
-        let weights_path = repo.get("model.safetensors").context(HubSnafu)?;
+        let weights_path = repo.get("model.safetensors")?;
         Self::from_safetensors(&weights_path, config.clone())
     }
 
     /// Load from a `model.safetensors` checkpoint. Strips the `roberta.`
     /// prefix from backbone keys.
     pub fn from_safetensors(path: &std::path::Path, config: XlmRobertaConfig) -> Result<Self> {
-        let sd = crate::state::load_safetensors(path).context(StateSnafu)?;
+        let sd = crate::state::load_safetensors(path)?;
         Self::from_state_dict(&sd, config)
     }
 
@@ -133,7 +133,7 @@ impl BgeRerankerV2M3 {
         let stripped = strip_roberta_prefix(sd);
         let sd_cast = cast_all(&stripped, dtype);
         let mut model = Self::empty(config);
-        model.load_state_dict(&sd_cast, "").context(StateSnafu)?;
+        model.load_state_dict(&sd_cast, "")?;
         Ok(model)
     }
 }

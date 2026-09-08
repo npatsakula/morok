@@ -1,11 +1,10 @@
-use snafu::{OptionExt, ResultExt};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict, prefixed};
 
 use super::conv::YoloConv;
-use crate::yolo::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use crate::yolo::error::Result;
 
 /// Multi-head attention with a depthwise-conv positional encoding.
 ///
@@ -45,15 +44,14 @@ impl Attention {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let shape = x.shape().context(TensorSnafu)?;
-        let b = shape[0].clone();
+        let b = x.dim(0)?;
         let nh = self.num_heads;
         let kd = self.key_dim;
         let hd = self.head_dim;
         let kkd = kd * 2 + hd;
 
-        let h: usize = shape[2].as_const().context(SymbolicShapeSnafu { what: "yolo attention H" })?;
-        let w: usize = shape[3].as_const().context(SymbolicShapeSnafu { what: "yolo attention W" })?;
+        let h = x.dim_const(2)?;
+        let w = x.dim_const(3)?;
         let hw = h * w;
 
         // QKV 1×1 conv: [B, C, H, W] → [B, nh*kkd, H, W]
@@ -61,48 +59,51 @@ impl Attention {
 
         // Flatten spatial then separate heads:
         // [B, nh*kkd, H, W] → [B, nh*kkd, H*W] → [B, nh, kkd, N]
-        let qkv = qkv
-            .try_reshape([b.clone(), SInt::from(nh * kkd), SInt::from(hw)])
-            .context(TensorSnafu)?
-            .try_reshape([b.clone(), SInt::from(nh), SInt::from(kkd), SInt::from(hw)])
-            .context(TensorSnafu)?;
+        let qkv = qkv.try_reshape([b.clone(), SInt::from(nh * kkd), SInt::from(hw)])?.try_reshape([
+            b.clone(),
+            SInt::from(nh),
+            SInt::from(kkd),
+            SInt::from(hw),
+        ])?;
 
         // Split into q [B,nh,kd,N], k [B,nh,kd,N], v [B,nh,hd,N]
-        let parts = qkv.split(&[kd, kd, hd], 2).context(TensorSnafu)?;
+        let parts = qkv.split(&[kd, kd, hd], 2)?;
         let q = &parts[0];
         let k = &parts[1];
         let v = &parts[2];
 
         // Scale q
         let scale_t = Tensor::from_slice([self.scale]);
-        let q = q.try_mul(&scale_t).context(TensorSnafu)?;
+        let q = q.try_mul(&scale_t)?;
 
         // attn = q^T @ k : [B, nh, N, kd] @ [B, nh, kd, N] = [B, nh, N, N]
-        let q_t = q.try_transpose(-2, -1).context(TensorSnafu)?;
-        let attn = q_t.matmul(k).context(TensorSnafu)?;
-        let attn = attn.softmax(-1).context(TensorSnafu)?;
+        let q_t = q.try_transpose(-2, -1)?;
+        let attn = q_t.matmul(k)?;
+        let attn = attn.softmax(-1)?;
 
         // out = v @ attn^T : [B, nh, hd, N] @ [B, nh, N, N] = [B, nh, hd, N]
-        let attn_t = attn.try_transpose(-2, -1).context(TensorSnafu)?;
-        let out = v.matmul(&attn_t).context(TensorSnafu)?;
+        let attn_t = attn.try_transpose(-2, -1)?;
+        let out = v.matmul(&attn_t)?;
 
         // Reshape back to spatial: [B, nh, hd, N] → [B, C, H, W]
         let c = nh * hd;
-        let out = out
-            .try_reshape([b.clone(), SInt::from(c), SInt::from(hw)])
-            .context(TensorSnafu)?
-            .try_reshape([b.clone(), SInt::from(c), SInt::from(h), SInt::from(w)])
-            .context(TensorSnafu)?;
+        let out = out.try_reshape([b.clone(), SInt::from(c), SInt::from(hw)])?.try_reshape([
+            b.clone(),
+            SInt::from(c),
+            SInt::from(h),
+            SInt::from(w),
+        ])?;
 
         // Positional encoding: depthwise conv on v reshaped to spatial
-        let v_spatial = v
-            .try_reshape([b.clone(), SInt::from(c), SInt::from(hw)])
-            .context(TensorSnafu)?
-            .try_reshape([b.clone(), SInt::from(c), SInt::from(h), SInt::from(w)])
-            .context(TensorSnafu)?;
+        let v_spatial = v.try_reshape([b.clone(), SInt::from(c), SInt::from(hw)])?.try_reshape([
+            b.clone(),
+            SInt::from(c),
+            SInt::from(h),
+            SInt::from(w),
+        ])?;
         let pe = self.pe.forward(&v_spatial)?;
 
-        let out = out.try_add(&pe).context(TensorSnafu)?;
+        let out = out.try_add(&pe)?;
 
         self.proj.forward(&out)
     }
@@ -145,9 +146,9 @@ impl PSABlock {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let attn_out = self.attn.forward(x)?;
-        let x = x.try_add(&attn_out).context(TensorSnafu)?;
+        let x = x.try_add(&attn_out)?;
         let ffn_out = self.ffn1.forward(&self.ffn0.forward(&x)?)?;
-        x.try_add(&ffn_out).context(TensorSnafu)
+        Ok(x.try_add(&ffn_out)?)
     }
 }
 
@@ -194,13 +195,13 @@ impl C2PSA {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let y = self.cv1.forward(x)?;
-        let parts = y.split(&[self.c_hidden, self.c_hidden], 1).context(TensorSnafu)?;
+        let parts = y.split(&[self.c_hidden, self.c_hidden], 1)?;
         let a = &parts[0];
         let mut b = parts[1].clone();
         for blk in &self.m {
             b = blk.forward(&b)?;
         }
-        let cat = Tensor::cat(&[a, &b], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[a, &b], 1)?;
         self.cv2.forward(&cat)
     }
 }

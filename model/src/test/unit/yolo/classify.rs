@@ -29,8 +29,7 @@ fn forward_shape_cls() {
     let b = var.bind(1).unwrap();
 
     let out = model.forward(&images, &b).unwrap();
-    let shape: Vec<usize> =
-        out.shape().unwrap().iter().map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete shape")).collect();
+    let shape = crate::test::max_dims(&out);
 
     assert_eq!(shape, vec![1, 1000]);
 }

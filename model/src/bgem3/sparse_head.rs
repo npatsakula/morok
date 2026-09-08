@@ -10,14 +10,13 @@
 //! Weights are loaded from `sparse_linear.pt` (PyTorch pickle with bare
 //! `weight` / `bias` keys).
 
-use snafu::{OptionExt, ResultExt};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::indexing::ScatterReduction;
 
 use crate::init::{fan_in_uniform, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
-use crate::xlm_roberta::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use crate::xlm_roberta::error::Result;
 
 /// XLM-RoBERTa special token IDs — always zeroed in sparse output.
 /// `<s>`=0, `<pad>`=1, `</s>`=2, `<unk>`=3.
@@ -57,26 +56,17 @@ impl SparseHead {
     /// Forward. `hidden`: `(B, L, D)`, `input_ids`: `(B, L)` int.
     /// Returns `(B, vocab_size)` sparse embedding with special-token positions zeroed.
     pub fn forward(&self, hidden: &Tensor, input_ids: &Tensor) -> Result<Tensor> {
-        let shape = hidden.shape().context(TensorSnafu)?;
-        let b: usize = shape[0].as_const().context(SymbolicShapeSnafu { what: "sparse_head" })?;
+        let b = hidden.dim_const(0)?;
 
-        let token_weights = hidden
-            .linear()
-            .weight(&self.weight)
-            .bias(&self.bias)
-            .call()
-            .context(TensorSnafu)?
-            .relu()
-            .context(TensorSnafu)?;
+        let token_weights = hidden.linear().weight(&self.weight).bias(&self.bias).call()?.relu()?;
 
-        let token_weights = token_weights.try_squeeze(Some(-1)).context(TensorSnafu)?;
+        let token_weights = token_weights.try_squeeze(Some(-1))?;
 
-        let zeros = Tensor::zeros(&[b, self.vocab_size], hidden.uop().dtype()).expect("non-empty shape");
-        let sparse =
-            zeros.scatter_reduce(-1, input_ids, &token_weights, ScatterReduction::Amax, true).context(TensorSnafu)?;
+        let zeros = Tensor::zeros(&[b, self.vocab_size], hidden.dtype()).expect("non-empty shape");
+        let sparse = zeros.scatter_reduce(-1, input_ids, &token_weights, ScatterReduction::Amax, true)?;
 
-        let mask = self.unused_token_mask(hidden.uop().dtype())?;
-        sparse.try_mul(&mask).context(TensorSnafu)
+        let mask = self.unused_token_mask(hidden.dtype())?;
+        Ok(sparse.try_mul(&mask)?)
     }
 
     fn unused_token_mask(&self, dtype: DType) -> Result<Tensor> {
@@ -86,11 +76,7 @@ impl SparseHead {
                 vals[id] = 0.0;
             }
         }
-        let mask = Tensor::from_slice(&vals)
-            .try_reshape([1isize, self.vocab_size as isize])
-            .context(TensorSnafu)?
-            .cast(dtype)
-            .context(TensorSnafu)?;
+        let mask = Tensor::from_slice(&vals).try_reshape([1isize, self.vocab_size as isize])?.cast(dtype)?;
         Ok(mask)
     }
 }

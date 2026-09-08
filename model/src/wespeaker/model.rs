@@ -28,7 +28,8 @@ use svod_tensor::{BoundVariable, Tensor};
 use crate::blocks::{BatchNormWeights, BlockKind, Conv2dWeights, ResidualStage, remap};
 use crate::state::{self, HasStateDict, StateDict, get_tensor};
 
-use super::error::{HubSnafu, PickleSnafu, Result, StateSnafu, TensorSnafu};
+use super::error::{PickleSnafu, Result};
+
 use super::pickle;
 use super::tstp::tstp_forward;
 
@@ -122,8 +123,8 @@ impl WeSpeakerResNet34 {
     }
 
     pub fn from_hub_with_revision(model_id: &str, revision: &str, config: WeSpeakerConfig) -> Result<Self> {
-        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
-        let weights_path = repo.get("pytorch_model.bin").context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open(model_id, revision)?;
+        let weights_path = repo.get("pytorch_model.bin")?;
         Self::from_pytorch_bin(&weights_path, config)
     }
 
@@ -144,14 +145,14 @@ impl WeSpeakerResNet34 {
     pub fn from_state_dict(sd: &StateDict, config: WeSpeakerConfig) -> Result<Self> {
         let sd = remap::fold_batchnorm(sd.clone())?;
         let mut model = Self::with_zero_weights(config);
-        model.stem_conv.load_state_dict(&sd, "conv1").context(StateSnafu)?;
-        model.stem_bn.load_state_dict(&sd, "bn1").context(StateSnafu)?;
-        model.stage1.load_state_dict(&sd, "layer1").context(StateSnafu)?;
-        model.stage2.load_state_dict(&sd, "layer2").context(StateSnafu)?;
-        model.stage3.load_state_dict(&sd, "layer3").context(StateSnafu)?;
-        model.stage4.load_state_dict(&sd, "layer4").context(StateSnafu)?;
-        model.seg_1_weight = get_tensor(&sd, "seg_1.weight").context(StateSnafu)?;
-        model.seg_1_bias = get_tensor(&sd, "seg_1.bias").context(StateSnafu)?;
+        model.stem_conv.load_state_dict(&sd, "conv1")?;
+        model.stem_bn.load_state_dict(&sd, "bn1")?;
+        model.stage1.load_state_dict(&sd, "layer1")?;
+        model.stage2.load_state_dict(&sd, "layer2")?;
+        model.stage3.load_state_dict(&sd, "layer3")?;
+        model.stage4.load_state_dict(&sd, "layer4")?;
+        model.seg_1_weight = get_tensor(&sd, "seg_1.weight")?;
+        model.seg_1_bias = get_tensor(&sd, "seg_1.bias")?;
         Ok(model)
     }
 
@@ -166,15 +167,15 @@ impl WeSpeakerResNet34 {
         let b = batch.as_sint();
 
         // Shrink batch dim to live value
-        let feats = feats.try_shrink([Some((SInt::Const(0), b.clone())), None, None]).context(TensorSnafu)?;
-        let weights = weights.try_shrink([Some((SInt::Const(0), b)), None]).context(TensorSnafu)?;
+        let feats = feats.try_shrink([Some((SInt::Const(0), b.clone())), None, None])?;
+        let weights = weights.try_shrink([Some((SInt::Const(0), b)), None])?;
 
         // (B, T=1598, F=80) -> (B, F, T) -> (B, 1, F, T)
-        let x = feats.try_permute(&[0, 2, 1]).context(TensorSnafu)?;
-        let x = x.try_unsqueeze(1).context(TensorSnafu)?;
+        let x = feats.try_permute(&[0, 2, 1])?;
+        let x = x.try_unsqueeze(1)?;
 
         // Stem
-        let x = self.stem_bn.forward(&self.stem_conv.forward(&x)?)?.relu().context(TensorSnafu)?;
+        let x = self.stem_bn.forward(&self.stem_conv.forward(&x)?)?.relu()?;
 
         // Stages
         let x = self.stage1.forward(&x)?;
@@ -187,7 +188,7 @@ impl WeSpeakerResNet34 {
         let stats = tstp_forward(&x, &weights)?;
 
         // seg_1: Linear(5120 -> 256)
-        stats.linear().weight(&self.seg_1_weight).bias(&self.seg_1_bias).call().context(TensorSnafu)
+        Ok(stats.linear().weight(&self.seg_1_weight).bias(&self.seg_1_bias).call()?)
     }
 }
 

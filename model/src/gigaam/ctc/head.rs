@@ -3,7 +3,6 @@
 //! by `svod_arch::ctc` decoders — the head itself is just the final
 //! projection layer, not the decoder.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
@@ -11,7 +10,6 @@ use crate::init::fan_in_uniform;
 use crate::state::{HasStateDict, StateDict};
 use crate::{load_state_field, state_field};
 
-use crate::gigaam::error::TensorSnafu;
 use crate::gigaam::{GigaAmConfig, Result};
 
 #[derive(Clone)]
@@ -31,9 +29,9 @@ impl CTCHead {
 
     /// Forward pass. Input: `[B, d_model, T]`, output: `[B, T, vocab_size]` log-probs.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = x.conv2d().weight(&self.weight).bias(&self.bias).call().context(TensorSnafu)?;
-        let y = y.try_transpose(-1, -2).context(TensorSnafu)?;
-        y.log_softmax(-1isize).context(TensorSnafu)
+        let y = x.conv2d().weight(&self.weight).bias(&self.bias).call()?;
+        let y = y.try_transpose(-1, -2)?;
+        Ok(y.log_softmax(-1isize)?)
     }
 }
 

@@ -61,12 +61,7 @@ fn forward_shape_nano() {
     let b = var.bind(1).unwrap();
 
     let out = model.forward(&images, &b).unwrap();
-    let shape: Vec<usize> = out
-        .shape()
-        .unwrap()
-        .iter()
-        .map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete or symbolic-max shape"))
-        .collect();
+    let shape = crate::test::max_dims(&out);
 
     // 320×320: P3=40×40, P4=20×20, P5=10×10 → A=2100; out=[1, 84, 2100]
     assert_eq!(shape, vec![1, 84, 2100]);
@@ -86,7 +81,6 @@ fn forward_realize_nano() {
     let mut out = model.forward(&images, &b).unwrap();
     out.realize().unwrap();
 
-    let shape: Vec<usize> =
-        out.shape().unwrap().iter().map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete dim")).collect();
+    let shape = crate::test::max_dims(&out);
     assert_eq!(shape, vec![1, 84, 2100]);
 }

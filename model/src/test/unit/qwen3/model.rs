@@ -31,10 +31,10 @@ fn forward_output_shape() {
 
     let mut out = model.forward(&ids, None).unwrap();
     out.realize().unwrap();
-    let s = out.shape().unwrap();
-    assert_eq!(s[0].as_const().unwrap(), 1);
-    assert_eq!(s[1].as_const().unwrap(), 8);
-    assert_eq!(s[2].as_const().unwrap(), 64);
+    let s = out.dims().unwrap();
+    assert_eq!(s[0], 1);
+    assert_eq!(s[1], 8);
+    assert_eq!(s[2], 64);
 
     let v = out.as_vec::<f32>().unwrap();
     assert!(v.iter().all(|x| x.is_finite()));
@@ -48,9 +48,9 @@ fn embedding_output_shape() {
 
     let mut out = emb.encode(&ids, &mask).unwrap();
     out.realize().unwrap();
-    let s = out.shape().unwrap();
-    assert_eq!(s[0].as_const().unwrap(), 1);
-    assert_eq!(s[1].as_const().unwrap(), 64);
+    let s = out.dims().unwrap();
+    assert_eq!(s[0], 1);
+    assert_eq!(s[1], 64);
 
     let v = out.as_vec::<f32>().unwrap();
     assert!(v.iter().all(|x| x.is_finite()));

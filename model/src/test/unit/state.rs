@@ -57,7 +57,7 @@ fn test_load_safetensors_fp8() {
     safetensors::serialize_to_file(&tensors, None::<std::collections::HashMap<String, String>>, &path).unwrap();
 
     let loaded = crate::state::load_safetensors(&path).unwrap();
-    assert_eq!(loaded["weight"].uop().dtype(), svod_dtype::DType::FP8E4M3);
+    assert_eq!(loaded["weight"].dtype(), svod_dtype::DType::FP8E4M3);
 }
 
 /// Phase-3 acceptance: loading one checkpoint into two model instances

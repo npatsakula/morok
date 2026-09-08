@@ -1,6 +1,5 @@
 //! Shared building blocks: LinearWeights, LayerNormWeights, Conv1dWeights, sinusoids.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
@@ -8,7 +7,7 @@ use crate::init::{fan_in_uniform, ones, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 use crate::{load_state_field, state_field};
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 // ─── LinearWeights ──────────────────────────────────────────────────────────
 
@@ -34,28 +33,25 @@ impl LinearWeights {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match &self.bias {
             Some(bias) => linear_with_bias(x, &self.weight, bias),
-            None => x.linear().weight(&self.weight).call().context(TensorSnafu),
+            None => Ok(x.linear().weight(&self.weight).call()?),
         }
     }
 }
 
 pub(crate) fn linear_with_bias(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
-    let output_dtype = x.uop().dtype();
+    let output_dtype = x.dtype();
     let is_low_precision = |dtype: &DType| dtype == &DType::Float16 || dtype == &DType::BFloat16;
-    let low_precision = is_low_precision(&output_dtype) && is_low_precision(&weight.uop().dtype());
+    let low_precision = is_low_precision(&output_dtype) && is_low_precision(&weight.dtype());
     if !low_precision {
-        return x.linear().weight(weight).bias(bias).call().context(TensorSnafu);
+        return Ok(x.linear().weight(weight).bias(bias).call()?);
     }
 
-    x.linear()
+    Ok(x.linear()
         .weight(weight)
         .dtype(DType::Float32)
-        .call()
-        .context(TensorSnafu)?
-        .try_add(&bias.cast(DType::Float32).context(TensorSnafu)?)
-        .context(TensorSnafu)?
-        .cast(output_dtype)
-        .context(TensorSnafu)
+        .call()?
+        .try_add(&bias.cast(DType::Float32)?)?
+        .cast(output_dtype)?)
 }
 
 impl HasStateDict for LinearWeights {
@@ -96,24 +92,16 @@ impl LayerNormWeights {
     }
 
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
-        let output_dtype = x.uop().dtype();
+        let output_dtype = x.dtype();
         if output_dtype == DType::Float16 || output_dtype == DType::BFloat16 {
-            let x = x.cast(DType::Float32).context(TensorSnafu)?;
-            let weight = self.weight.cast(DType::Float32).context(TensorSnafu)?;
-            let bias = self.bias.cast(DType::Float32).context(TensorSnafu)?;
-            return x
-                .layernorm(-1, self.eps)
-                .context(TensorSnafu)?
-                .try_mul(&weight)
-                .context(TensorSnafu)?
-                .try_add(&bias)
-                .context(TensorSnafu)?
-                .cast(output_dtype)
-                .context(TensorSnafu);
+            let x = x.cast(DType::Float32)?;
+            let weight = self.weight.cast(DType::Float32)?;
+            let bias = self.bias.cast(DType::Float32)?;
+            return Ok(x.layernorm(-1, self.eps)?.try_mul(&weight)?.try_add(&bias)?.cast(output_dtype)?);
         }
 
-        let normed = x.layernorm(-1, self.eps).context(TensorSnafu)?;
-        normed.try_mul(&self.weight).context(TensorSnafu)?.try_add(&self.bias).context(TensorSnafu)
+        let normed = x.layernorm(-1, self.eps)?;
+        Ok(normed.try_mul(&self.weight)?.try_add(&self.bias)?)
     }
 }
 
@@ -166,13 +154,12 @@ impl Conv1dWeights {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let p = self.padding as isize;
-        x.conv2d()
+        Ok(x.conv2d()
             .weight(&self.weight)
             .maybe_bias(self.bias.as_ref())
             .stride(&[self.stride])
             .padding(&[(p, p)])
-            .call()
-            .context(TensorSnafu)
+            .call()?)
     }
 }
 
@@ -204,15 +191,9 @@ pub fn sinusoids(length: usize, channels: usize, max_timescale: f64) -> Result<T
     let log_inc = max_timescale.ln() / (half - 1) as f64;
     let inv_data: Vec<f32> = (0..half).map(|i| (-log_inc * i as f64).exp() as f32).collect();
     let inv = Tensor::from_slice(&inv_data);
-    let scaled_time = Tensor::arange(0, Some(length as i64), None)
-        .context(TensorSnafu)?
-        .cast(DType::Float32)
-        .context(TensorSnafu)?
-        .try_unsqueeze(-1)
-        .context(TensorSnafu)?
-        .try_mul(&inv)
-        .context(TensorSnafu)?;
-    let sin = scaled_time.sin().context(TensorSnafu)?;
-    let cos = scaled_time.cos().context(TensorSnafu)?;
-    Tensor::cat(&[&sin, &cos], -1).context(TensorSnafu)
+    let scaled_time =
+        Tensor::arange(0, Some(length as i64), None)?.cast(DType::Float32)?.try_unsqueeze(-1)?.try_mul(&inv)?;
+    let sin = scaled_time.sin()?;
+    let cos = scaled_time.cos()?;
+    Ok(Tensor::cat(&[&sin, &cos], -1)?)
 }

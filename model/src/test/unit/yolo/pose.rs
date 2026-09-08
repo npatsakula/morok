@@ -29,7 +29,7 @@ fn forward_shape_pose() {
     let var = Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();
     let out = model.forward(&images, &b).unwrap();
-    let shape: Vec<usize> = out.shape().unwrap().iter().map(|s| s.as_const().or_else(|| s.vmax()).unwrap()).collect();
+    let shape = crate::test::max_dims(&out);
     // 4 + 1 + 51 = 56 (boxes + cls + 17*3 keypoints), 2100 anchors
     assert_eq!(shape, vec![1, 56, 2100]);
 }

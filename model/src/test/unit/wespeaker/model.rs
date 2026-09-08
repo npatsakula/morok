@@ -56,10 +56,10 @@ fn shapes_match_pyannote_reference() {
     let sd = model.state_dict("");
 
     let seg_w = sd.get("seg_1.weight").unwrap();
-    let shape: Vec<usize> = seg_w.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let shape = seg_w.dims().unwrap();
     assert_eq!(shape, vec![256, 5120], "seg_1 weight must be (embed_dim=256, stats_dim*2=5120)");
 
     let seg_b = sd.get("seg_1.bias").unwrap();
-    let bias_shape: Vec<usize> = seg_b.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let bias_shape = seg_b.dims().unwrap();
     assert_eq!(bias_shape, vec![256]);
 }

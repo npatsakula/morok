@@ -4,7 +4,6 @@
 //! All three share the same [`Detect`] head (differing only in the number of
 //! detection scales) and differ in backbone/neck depth.
 
-use snafu::{OptionExt, ResultExt};
 use svod_ir::SInt;
 use svod_tensor::{BoundVariable, Tensor};
 
@@ -12,7 +11,8 @@ use crate::state::{self, HasStateDict, StateDict, prefixed};
 
 use super::backbone::{YoloBackbone, scaled_channels};
 use super::config::{P2_STRIDES, P6_STRIDES, YoloConfig};
-use super::error::{Result, StateSnafu, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::head::{BoxBranch, ClsBranch, dist2bbox, make_anchors};
 use super::loader;
 
@@ -54,7 +54,7 @@ impl Detect {
     /// Run box + cls heads on each feature map, decode boxes via dist2bbox,
     /// sigmoid scores, and cat into `[B, 4+nc, A]`.
     pub fn forward(&self, feats: &[Tensor]) -> Result<Tensor> {
-        let shape = feats[0].shape().context(TensorSnafu)?;
+        let shape = feats[0].shape()?;
         let b = shape[0].clone();
 
         let mut boxes_list: Vec<Tensor> = Vec::with_capacity(feats.len());
@@ -62,35 +62,33 @@ impl Detect {
         let mut feat_sizes: Vec<(usize, usize)> = Vec::with_capacity(feats.len());
 
         for (i, feat) in feats.iter().enumerate() {
-            let fshape = feat.shape().context(TensorSnafu)?;
-            let h: usize = fshape[2].as_const().context(SymbolicShapeSnafu { what: "yolo detect H" })?;
-            let w: usize = fshape[3].as_const().context(SymbolicShapeSnafu { what: "yolo detect W" })?;
+            let h = feat.dim_const(2)?;
+            let w = feat.dim_const(3)?;
             let hw = h * w;
             feat_sizes.push((h, w));
 
             let box_out = self.cv2[i].forward(feat)?;
-            let box_out =
-                box_out.try_reshape([b.clone(), SInt::from(4 * self.reg_max), SInt::from(hw)]).context(TensorSnafu)?;
+            let box_out = box_out.try_reshape([b.clone(), SInt::from(4 * self.reg_max), SInt::from(hw)])?;
             boxes_list.push(box_out);
 
             let cls_out = self.cv3[i].forward(feat)?;
-            let cls_out = cls_out.try_reshape([b.clone(), SInt::from(self.nc), SInt::from(hw)]).context(TensorSnafu)?;
+            let cls_out = cls_out.try_reshape([b.clone(), SInt::from(self.nc), SInt::from(hw)])?;
             scores_list.push(cls_out);
         }
 
         let boxes_refs: Vec<&Tensor> = boxes_list.iter().collect();
         let scores_refs: Vec<&Tensor> = scores_list.iter().collect();
 
-        let boxes = Tensor::cat(&boxes_refs, 2).context(TensorSnafu)?;
-        let scores = Tensor::cat(&scores_refs, 2).context(TensorSnafu)?;
+        let boxes = Tensor::cat(&boxes_refs, 2)?;
+        let scores = Tensor::cat(&scores_refs, 2)?;
 
         let num_anchors: usize = feat_sizes.iter().map(|&(h, w)| h * w).sum();
         let (anchors, strides) = make_anchors(&feat_sizes, &self.strides);
 
         let dbox = dist2bbox(&boxes, &anchors, &strides, num_anchors)?;
-        let scores = scores.sigmoid().context(TensorSnafu)?;
+        let scores = scores.sigmoid()?;
 
-        Tensor::cat(&[&dbox, &scores], 1).context(TensorSnafu)
+        Ok(Tensor::cat(&[&dbox, &scores], 1)?)
     }
 }
 
@@ -160,7 +158,7 @@ impl Yolo26Detect {
 
     pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "").context(StateSnafu)?;
+        model.load_state_dict(sd, "")?;
         Ok(model)
     }
 
@@ -233,7 +231,7 @@ impl Yolo26DetectP2 {
 
     pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "").context(StateSnafu)?;
+        model.load_state_dict(sd, "")?;
         Ok(model)
     }
 
@@ -305,7 +303,7 @@ impl Yolo26DetectP6 {
 
     pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "").context(StateSnafu)?;
+        model.load_state_dict(sd, "")?;
         Ok(model)
     }
 

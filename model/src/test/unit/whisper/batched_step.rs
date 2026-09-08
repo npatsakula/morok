@@ -36,9 +36,9 @@ fn forward_step_fixed_batch_keeps_batch_concrete() {
 
     let (mut logits, new_k, new_v) =
         model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens).unwrap();
-    assert_eq!(logits.shape().unwrap()[0].as_const(), Some(batch));
-    assert_eq!(new_k.shape().unwrap()[0].as_const(), Some(batch));
-    assert_eq!(new_v.shape().unwrap()[0].as_const(), Some(batch));
+    assert_eq!(logits.dim_const(0).unwrap(), batch);
+    assert_eq!(new_k.dim_const(0).unwrap(), batch);
+    assert_eq!(new_v.dim_const(0).unwrap(), batch);
     logits.realize().unwrap();
     assert!(logits.as_vec::<f32>().unwrap().into_iter().all(f32::is_finite));
 }
@@ -47,7 +47,7 @@ fn forward_step_fixed_batch_keeps_batch_concrete() {
 fn cached_step_key_lengths_mask_only_prefix_and_appended_key() {
     let key_lens = Tensor::from_slice([0i32, 3]);
     let mut mask = cached_step_mask(&key_lens, 2, 6).unwrap();
-    assert_eq!(mask.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(), [2, 1, 1, 6]);
+    assert_eq!(mask.dims().unwrap(), [2, 1, 1, 6]);
     mask.realize().unwrap();
     assert_eq!(
         mask.as_vec::<bool>().unwrap(),

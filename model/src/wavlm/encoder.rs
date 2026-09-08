@@ -19,7 +19,6 @@
 //!   **pre-LN**. Call [`Encoder::final_layer_norm_apply`] to get the
 //!   post-LN output.
 
-use snafu::{OptionExt, ResultExt};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
@@ -29,7 +28,8 @@ use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 use super::attention::compute_position_bias;
 use super::config::WavLmConfig;
 use super::encoder_layer::EncoderLayer;
-use super::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::layer_norm::LayerNormWeights;
 use super::pos_conv::ConvolutionalPositionalEmbedding;
 
@@ -100,21 +100,15 @@ impl Encoder {
     /// does not — and our `extract_features` mirrors the latter, which is
     /// what the published Python dump uses.
     pub fn extract_features(&self, features: &Tensor) -> Result<Vec<Tensor>> {
-        let shape = features.shape().context(TensorSnafu)?;
-        let l = shape[1].as_const().context(SymbolicShapeSnafu { what: "encoder" })?;
+        let l = features.dim_const(1)?;
 
         // FeatureProjection: LN → Linear → (dropout no-op)
         let h = self.feature_projection_norm.apply(features)?;
-        let h = h
-            .linear()
-            .weight(&self.feature_projection_weight)
-            .bias(&self.feature_projection_bias)
-            .call()
-            .context(TensorSnafu)?;
+        let h = h.linear().weight(&self.feature_projection_weight).bias(&self.feature_projection_bias).call()?;
 
         // Pos-conv add.
         let pe = self.pos_conv_embed.forward(&h)?;
-        let mut x = h.try_add(&pe).context(TensorSnafu)?;
+        let mut x = h.try_add(&pe)?;
 
         // Pre-norm: _preprocess applies LayerNorm after pos-conv.
         if self.layer_norm_first {

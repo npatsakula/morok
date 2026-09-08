@@ -12,12 +12,11 @@
 //! will fail with a "missing key" error rather than silently loading variance
 //! into `invstd`.
 
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use crate::state::StateDict;
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 /// Default PyTorch BatchNorm eps. timm and WeSpeaker checkpoints we target do
 /// not override it.
@@ -35,7 +34,7 @@ pub fn fold_batchnorm(mut sd: StateDict) -> Result<StateDict> {
     let var_keys: Vec<String> = sd.keys().filter(|k| k.ends_with("running_var")).cloned().collect();
     for key in var_keys {
         let var = sd.remove(&key).expect("key just enumerated");
-        let var_f32 = var.as_vec::<f32>().context(TensorSnafu)?;
+        let var_f32 = var.as_vec::<f32>()?;
         let invstd: Vec<f32> = var_f32.iter().map(|&v| 1.0 / (v + BN_EPS).sqrt()).collect();
         let invstd_key = key.replace(".running_var", ".invstd");
         sd.insert(invstd_key, Tensor::from_slice(&invstd));

@@ -1,10 +1,9 @@
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict, prefixed};
 
 use super::conv::YoloConv;
-use crate::yolo::error::{Result, TensorSnafu};
+use crate::yolo::error::Result;
 
 /// Spatial Pyramid Pooling - Fast: 1×1 conv → 3× MaxPool(k=5) → cat → 1×1 conv.
 /// When `shortcut` is true and `in_ch == out_ch`, a residual connection is added.
@@ -29,30 +28,12 @@ impl Sppf {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let y0 = self.cv1.forward(x)?;
-        let y1 = y0
-            .max_pool2d()
-            .kernel_size(&[5, 5])
-            .stride(&[1, 1])
-            .padding(&[(2, 2), (2, 2)])
-            .call()
-            .context(TensorSnafu)?;
-        let y2 = y1
-            .max_pool2d()
-            .kernel_size(&[5, 5])
-            .stride(&[1, 1])
-            .padding(&[(2, 2), (2, 2)])
-            .call()
-            .context(TensorSnafu)?;
-        let y3 = y2
-            .max_pool2d()
-            .kernel_size(&[5, 5])
-            .stride(&[1, 1])
-            .padding(&[(2, 2), (2, 2)])
-            .call()
-            .context(TensorSnafu)?;
-        let cat = Tensor::cat(&[&y0, &y1, &y2, &y3], 1).context(TensorSnafu)?;
+        let y1 = y0.max_pool2d().kernel_size(&[5, 5]).stride(&[1, 1]).padding(&[(2, 2), (2, 2)]).call()?;
+        let y2 = y1.max_pool2d().kernel_size(&[5, 5]).stride(&[1, 1]).padding(&[(2, 2), (2, 2)]).call()?;
+        let y3 = y2.max_pool2d().kernel_size(&[5, 5]).stride(&[1, 1]).padding(&[(2, 2), (2, 2)]).call()?;
+        let cat = Tensor::cat(&[&y0, &y1, &y2, &y3], 1)?;
         let out = self.cv2.forward(&cat)?;
-        if self.add { out.try_add(x).context(TensorSnafu) } else { Ok(out) }
+        if self.add { Ok(out.try_add(x)?) } else { Ok(out) }
     }
 }
 

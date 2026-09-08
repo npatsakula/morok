@@ -1,4 +1,3 @@
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict, prefixed};
@@ -6,7 +5,7 @@ use crate::state::{self, HasStateDict, StateDict, prefixed};
 use super::basic_block::BlockKind;
 use super::batchnorm::BatchNormWeights;
 use super::conv::Conv2dWeights;
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 #[derive(Clone)]
 pub struct Bottleneck {
@@ -40,14 +39,14 @@ impl Bottleneck {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let out = self.bn1.forward(&self.conv1.forward(x)?)?.relu().context(TensorSnafu)?;
-        let out = self.bn2.forward(&self.conv2.forward(&out)?)?.relu().context(TensorSnafu)?;
+        let out = self.bn1.forward(&self.conv1.forward(x)?)?.relu()?;
+        let out = self.bn2.forward(&self.conv2.forward(&out)?)?.relu()?;
         let out = self.bn3.forward(&self.conv3.forward(&out)?)?;
         let shortcut = match &self.downsample {
             Some((c, b)) => b.forward(&c.forward(x)?)?,
             None => x.clone(),
         };
-        out.try_add(&shortcut).context(TensorSnafu)?.relu().context(TensorSnafu)
+        Ok(out.try_add(&shortcut)?.relu()?)
     }
 }
 

@@ -1,7 +1,6 @@
 //! RNN-T joint network: encoder + predictor projections combined into per-step
 //! log-probabilities.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
@@ -10,7 +9,6 @@ use crate::state::{self, HasStateDict, StateDict};
 use crate::{load_state_field, state_field};
 
 use crate::gigaam::Result;
-use crate::gigaam::error::TensorSnafu;
 
 /// RNN-T joint: `log_softmax(out_w · ReLU(enc_w · enc_t + enc_b + pred_w · g + pred_b) + out_b)`.
 ///
@@ -42,17 +40,17 @@ impl RnntJoint {
     /// `enc_t [1, 1, enc_hidden]`, `g [1, 1, pred_hidden]` → raw logits
     /// `[1, 1, num_classes]` (pre-softmax).
     fn logits(&self, enc_t: &Tensor, g: &Tensor) -> Result<Tensor> {
-        let enc_proj = enc_t.linear().weight(&self.enc_w).bias(&self.enc_b).call().context(TensorSnafu)?;
-        let pred_proj = g.linear().weight(&self.pred_w).bias(&self.pred_b).call().context(TensorSnafu)?;
-        let summed = enc_proj.try_add(&pred_proj).context(TensorSnafu)?;
-        let activated = summed.relu().context(TensorSnafu)?;
-        activated.linear().weight(&self.out_w).bias(&self.out_b).call().context(TensorSnafu)
+        let enc_proj = enc_t.linear().weight(&self.enc_w).bias(&self.enc_b).call()?;
+        let pred_proj = g.linear().weight(&self.pred_w).bias(&self.pred_b).call()?;
+        let summed = enc_proj.try_add(&pred_proj)?;
+        let activated = summed.relu()?;
+        Ok(activated.linear().weight(&self.out_w).bias(&self.out_b).call()?)
     }
 
     /// `enc_t [1, 1, enc_hidden]`, `g [1, 1, pred_hidden]` → log-probs
     /// `[1, 1, num_classes]`.
     pub fn forward(&self, enc_t: &Tensor, g: &Tensor) -> Result<Tensor> {
-        self.logits(enc_t, g)?.log_softmax(-1isize).context(TensorSnafu)
+        Ok(self.logits(enc_t, g)?.log_softmax(-1isize)?)
     }
 
     /// Greedy variant: the device-side argmax token index `[1, 1]` (int32)
@@ -60,22 +58,22 @@ impl RnntJoint {
     /// monotonic log-softmax, so the chosen index is identical while the host
     /// reads back a single int instead of the full vocab logit vector.
     pub fn forward_argmax(&self, enc_t: &Tensor, g: &Tensor) -> Result<Tensor> {
-        self.logits(enc_t, g)?.argmax(-1isize).context(TensorSnafu)
+        Ok(self.logits(enc_t, g)?.argmax(-1isize)?)
     }
 
     /// Encoder projection `enc_w · enc + enc_b` over a whole frame axis —
     /// hoisted out of the decode loop (`[B, T, E] → [B, T, J]`, one MFMA
     /// matmul per wave instead of a per-step row projection).
     pub fn project_encoder(&self, enc: &Tensor) -> Result<Tensor> {
-        enc.linear().weight(&self.enc_w).bias(&self.enc_b).call().context(TensorSnafu)
+        Ok(enc.linear().weight(&self.enc_w).bias(&self.enc_b).call()?)
     }
 
     /// Greedy argmax over PRE-PROJECTED encoder rows ([`Self::project_encoder`]).
     pub fn argmax_preproj(&self, enc_proj_t: &Tensor, g: &Tensor) -> Result<Tensor> {
-        let pred_proj = g.linear().weight(&self.pred_w).bias(&self.pred_b).call().context(TensorSnafu)?;
-        let activated = enc_proj_t.try_add(&pred_proj).context(TensorSnafu)?.relu().context(TensorSnafu)?;
-        let logits = activated.linear().weight(&self.out_w).bias(&self.out_b).call().context(TensorSnafu)?;
-        logits.argmax(-1isize).context(TensorSnafu)
+        let pred_proj = g.linear().weight(&self.pred_w).bias(&self.pred_b).call()?;
+        let activated = enc_proj_t.try_add(&pred_proj)?.relu()?;
+        let logits = activated.linear().weight(&self.out_w).bias(&self.out_b).call()?;
+        Ok(logits.argmax(-1isize)?)
     }
 }
 

@@ -7,7 +7,6 @@
 
 use std::path::Path;
 
-use snafu::{OptionExt, ResultExt};
 use svod_ir::SInt;
 use svod_tensor::{BoundVariable, Tensor};
 
@@ -16,7 +15,8 @@ use crate::state::{self, HasStateDict, StateDict};
 use super::config::Qwen3Config;
 use super::decoder_layer::Qwen3DecoderLayer;
 use super::embeddings::Qwen3Embeddings;
-use super::error::{HubSnafu, Result, StateSnafu, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::rms_norm::RmsNormWeights;
 use super::rotary::RotaryTable;
 
@@ -41,9 +41,8 @@ impl Qwen3Model {
     /// bool → last-hidden-state `(B, L, D)`.
     pub fn forward(&self, input_ids: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
         let x = self.embeddings.forward(input_ids)?;
-        let shape = x.shape().context(TensorSnafu)?;
-        let b_dim = shape[0].clone();
-        let seq_len: usize = shape[1].as_const().context(SymbolicShapeSnafu { what: "qwen3 forward seq_len" })?;
+        let b_dim = x.dim(0)?;
+        let seq_len = x.dim_const(1)?;
 
         // Build the rotary table once — shared across all layers.
         let rotary =
@@ -52,9 +51,9 @@ impl Qwen3Model {
         // Build SDPA key-axis mask: bool (B,1,1,L), True = masked out.
         let mask_4d = match padding_mask {
             Some(m) => {
-                let m2 = m.try_reshape([b_dim.clone(), SInt::from(seq_len)]).context(TensorSnafu)?;
-                let inverted = m2.logical_not().context(TensorSnafu)?;
-                Some(inverted.try_unsqueeze(1).context(TensorSnafu)?.try_unsqueeze(1).context(TensorSnafu)?)
+                let m2 = m.try_reshape([b_dim.clone(), SInt::from(seq_len)])?;
+                let inverted = m2.logical_not()?;
+                Some(inverted.try_unsqueeze(1)?.try_unsqueeze(1)?)
             }
             None => None,
         };
@@ -74,9 +73,9 @@ impl Qwen3Model {
         b: &BoundVariable,
     ) -> Result<Tensor> {
         let bv = b.as_sint();
-        let input_ids = input_ids.try_shrink([Some((SInt::Const(0), bv.clone())), None]).context(TensorSnafu)?;
+        let input_ids = input_ids.try_shrink([Some((SInt::Const(0), bv.clone())), None])?;
         let padding_mask = match padding_mask {
-            Some(m) => Some(m.try_shrink([Some((SInt::Const(0), bv)), None]).context(TensorSnafu)?),
+            Some(m) => Some(m.try_shrink([Some((SInt::Const(0), bv)), None])?),
             None => None,
         };
         self.forward(&input_ids, padding_mask.as_ref())
@@ -87,8 +86,8 @@ impl Qwen3Model {
     }
 
     pub fn from_hub_with_revision(model_id: &str, revision: &str, config: &mut Qwen3Config) -> Result<Self> {
-        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
-        let cfg_path = repo.get("config.json").context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open(model_id, revision)?;
+        let cfg_path = repo.get("config.json")?;
         let parsed = Qwen3Config::from_json(&cfg_path)?;
         config.merge_structural_from(&parsed);
 
@@ -97,21 +96,21 @@ impl Qwen3Model {
     }
 
     pub fn from_safetensors(path: &Path, config: Qwen3Config) -> Result<Self> {
-        let sd = state::load_safetensors(path).context(StateSnafu)?;
+        let sd = state::load_safetensors(path)?;
         Self::from_state_dict(&sd, config)
     }
 
     /// Load from a directory containing `model.safetensors` (single-file) or
     /// `model.safetensors.index.json` + shards (multi-shard).
     pub fn from_safetensors_dir(dir: &Path, config: Qwen3Config) -> Result<Self> {
-        let sd = state::load_safetensors_dir(dir).context(StateSnafu)?;
+        let sd = state::load_safetensors_dir(dir)?;
         Self::from_state_dict(&sd, config)
     }
 
     pub fn from_state_dict(sd: &StateDict, config: Qwen3Config) -> Result<Self> {
         let dtype = config.dtype.clone();
         let mut model = Self::empty(config);
-        model.load_state_dict(&state::cast_all(sd, dtype), "").context(StateSnafu)?;
+        model.load_state_dict(&state::cast_all(sd, dtype), "")?;
         Ok(model)
     }
 }

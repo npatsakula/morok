@@ -2,7 +2,6 @@
 //! to `wavlm` (rather than reused from `gigaam::encoder::LayerNormWeights`,
 //! which lives in a private module) so the two modules don't develop coupling.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
@@ -10,7 +9,7 @@ use crate::init::{ones, zeros};
 use crate::state::{HasStateDict, StateDict};
 use crate::{load_state_field, state_field};
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 #[derive(Clone)]
 pub struct LayerNormWeights {
@@ -30,8 +29,8 @@ impl LayerNormWeights {
 
     /// Apply LayerNorm over the last axis.
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
-        let normed = x.layernorm(-1, self.eps).context(TensorSnafu)?;
-        normed.try_mul(&self.weight).context(TensorSnafu)?.try_add(&self.bias).context(TensorSnafu)
+        let normed = x.layernorm(-1, self.eps)?;
+        Ok(normed.try_mul(&self.weight)?.try_add(&self.bias)?)
     }
 }
 

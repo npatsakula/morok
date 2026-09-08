@@ -3,7 +3,6 @@
 //! Full backbone (layers 0–10) + partial FPN top-down (layers 11–16) +
 //! Conv→Conv2d classifier on P3. Forward returns `[B, nc, H/8, W/8]` logits.
 
-use snafu::ResultExt;
 use svod_tensor::{BoundVariable, Tensor};
 
 use crate::state::{self, HasStateDict, StateDict, prefixed};
@@ -12,7 +11,8 @@ use super::backbone::{YoloBackbone, upsample_nearest_2x};
 use super::blocks::conv::{Conv2dBias, YoloConv};
 use super::blocks::csp::C3k2;
 use super::config::{YoloConfig, make_depth};
-use super::error::{Result, StateSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::loader;
 
 /// Semantic segmentation classifier: Conv(k3) → Conv2d(k1, bias).
@@ -92,7 +92,7 @@ impl Yolo26SemSeg {
 
     pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "").context(StateSnafu)?;
+        model.load_state_dict(sd, "")?;
         Ok(model)
     }
 
@@ -103,11 +103,11 @@ impl Yolo26SemSeg {
 
         // Partial FPN top-down (layers 11–16)
         let up = upsample_nearest_2x(&l10)?;
-        let cat = Tensor::cat(&[&up, &l6], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&up, &l6], 1)?;
         let l13 = self.c3k2_13.forward(&cat)?;
 
         let up = upsample_nearest_2x(&l13)?;
-        let cat = Tensor::cat(&[&up, &l4], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&up, &l4], 1)?;
         let l16 = self.c3k2_16.forward(&cat)?;
 
         // Classifier on P3

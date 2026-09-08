@@ -163,7 +163,7 @@ type WindowDecode = Result<(Vec<svod_arch::pipelines::audio::Transcript>, Option
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum TranscribeError {
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Jit {
         #[snafu(source(from(crate::jit::JitError, Box::new)))]
         source: Box<crate::jit::JitError>,
@@ -177,12 +177,12 @@ pub enum TranscribeError {
         #[snafu(source(from(crate::gigaam::error::Error, Box::new)))]
         source: Box<crate::gigaam::error::Error>,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Tensor {
         #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
         source: Box<svod_tensor::error::Error>,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Device {
         #[snafu(source(from(svod_device::error::Error, Box::new)))]
         source: Box<svod_device::error::Error>,
@@ -279,8 +279,7 @@ impl GigaAmTranscriber {
                 let mut jit = GigaAmCtcJit::new(model.clone());
                 // The stage name the profiler groups by is the root of every
                 // origin path the capture below mints.
-                scoped("ctc_head", || jit.prepare_with_config(mel_spec, lengths_spec, &prepare_config))
-                    .context(JitSnafu)?;
+                scoped("ctc_head", || jit.prepare_with_config(mel_spec, lengths_spec, &prepare_config))?;
                 HeadDecoder::Ctc { jit, decoder }
             }
             Head::Rnnt { runtime, .. } => {
@@ -292,7 +291,7 @@ impl GigaAmTranscriber {
                 // all-static now).
                 let mut enc_config = prepare_config.clone();
                 enc_config.device_local_outputs = true;
-                scoped("encoder", || enc.prepare_with_config(mel_spec, lengths_spec, &enc_config)).context(JitSnafu)?;
+                scoped("encoder", || enc.prepare_with_config(mel_spec, lengths_spec, &enc_config))?;
                 encoder_jit = Some(enc);
                 // Decode lanes are independent of the encoder batch: wider
                 // waves amortize the per-step launch floor over more chunks
@@ -304,8 +303,8 @@ impl GigaAmTranscriber {
                     SubsamplingMode::Conv2d => 3,
                 };
                 let max_t_sub = subs_output_length(subs_kernel, max_t_mel);
-                let backend = scoped("decode", || RnntBlockBackend::from_model(model.clone(), DECODE_LANES, max_t_sub))
-                    .context(JitSnafu)?;
+                let backend =
+                    scoped("decode", || RnntBlockBackend::from_model(model.clone(), DECODE_LANES, max_t_sub))?;
                 let decoder = RnntDecoder::new(
                     runtime.vocabulary.clone(),
                     RnntOpts { max_symbols_per_step: runtime.max_symbols_per_step },
@@ -400,24 +399,23 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
             match &mut self.head_decoder {
                 HeadDecoder::Ctc { jit, decoder } => {
                     let t_pack = Instant::now();
-                    pack_mel_buffer(jit.mel_mut().context(JitSnafu)?, &batch_mels, &chunk_lengths, n_mels, max_t_mel)
-                        .context(DeviceSnafu)?;
-                    pack_lengths_buffer(jit.lengths_mut().context(JitSnafu)?, &chunk_lengths).context(DeviceSnafu)?;
+                    pack_mel_buffer(jit.mel_mut()?, &batch_mels, &chunk_lengths, n_mels, max_t_mel)?;
+                    pack_lengths_buffer(jit.lengths_mut()?, &chunk_lengths)?;
                     t_mel += t_pack.elapsed();
 
                     let t_enc = Instant::now();
                     if profile_batch == Some(chunk_batch_start) {
-                        let kernels = jit.execute_profiled().context(JitSnafu)?;
+                        let kernels = jit.execute_profiled()?;
                         if let Some(p) = &mut prof {
                             p.push(StageProfile::gpu("ctc_head", Duration::ZERO, kernels));
                         }
                     } else {
-                        jit.execute().context(JitSnafu)?;
+                        jit.execute()?;
                     }
                     let total_vocab = decoder.total_vocab();
                     let item_stride = max_t_sub * total_vocab;
-                    let logits_buf = jit.output().context(JitSnafu)?;
-                    let logits = logits_buf.as_array::<f32>().context(DeviceSnafu)?;
+                    let logits_buf = jit.output()?;
+                    let logits = logits_buf.as_array::<f32>()?;
                     // `as_array` drains the async fused encoder+head dispatch.
                     t_encoder += t_enc.elapsed();
                     let flat = logits.as_slice().expect("contiguous logits");
@@ -442,33 +440,25 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                 HeadDecoder::Rnnt { .. } => {
                     let enc_jit = self.encoder_jit.as_mut().expect("RN-T path has a standalone encoder JIT");
                     let t_pack = Instant::now();
-                    pack_mel_buffer(
-                        enc_jit.mel_mut().context(JitSnafu)?,
-                        &batch_mels,
-                        &chunk_lengths,
-                        n_mels,
-                        max_t_mel,
-                    )
-                    .context(DeviceSnafu)?;
-                    pack_lengths_buffer(enc_jit.lengths_mut().context(JitSnafu)?, &chunk_lengths)
-                        .context(DeviceSnafu)?;
+                    pack_mel_buffer(enc_jit.mel_mut()?, &batch_mels, &chunk_lengths, n_mels, max_t_mel)?;
+                    pack_lengths_buffer(enc_jit.lengths_mut()?, &chunk_lengths)?;
                     t_mel += t_pack.elapsed();
 
                     let t_enc = Instant::now();
                     if profile_batch == Some(chunk_batch_start) {
-                        let kernels = enc_jit.execute_profiled().context(JitSnafu)?;
+                        let kernels = enc_jit.execute_profiled()?;
                         if let Some(p) = &mut prof {
                             p.push(StageProfile::gpu("encoder", Duration::ZERO, kernels));
                         }
                     } else {
-                        enc_jit.execute().context(JitSnafu)?;
+                        enc_jit.execute()?;
                     }
                     let item_stride = max_t_sub * d_model;
                     // Frame-major [B, max_t_sub, d_model]: one contiguous prefix
                     // copyout drains the dispatch and skips inactive lanes.
-                    let enc_buf = enc_jit.output().context(JitSnafu)?;
+                    let enc_buf = enc_jit.output()?;
                     let mut raw = vec![0f32; b * item_stride];
-                    enc_buf.copyout_prefix(bytemuck::cast_slice_mut(&mut raw)).context(DeviceSnafu)?;
+                    enc_buf.copyout_prefix(bytemuck::cast_slice_mut(&mut raw))?;
                     t_encoder += t_enc.elapsed();
                     let flat: &[f32] = &raw;
                     // Lanes decouple from the encoder batch: collect every
@@ -492,7 +482,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                 let valid = &all_valid[wave_start..wave_end];
 
                 let t_dec = Instant::now();
-                backend.bind_batch(&all_frames[wave_start..wave_end], valid).context(JitSnafu)?;
+                backend.bind_batch(&all_frames[wave_start..wave_end], valid)?;
                 let lane_results = decoder.decode_batch_blocks(valid, backend).map_err(rnnt_decode_err)?;
                 t_decode += t_dec.elapsed();
 

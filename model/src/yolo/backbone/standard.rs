@@ -5,7 +5,6 @@
 //! P5/32) consumed by detection-family and depth neck/head. The classify
 //! variant stops at the C2PSA layer (layer 9) and omits SPPF.
 
-use snafu::{OptionExt, ResultExt};
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict, prefixed};
@@ -15,7 +14,7 @@ use crate::yolo::blocks::conv::YoloConv;
 use crate::yolo::blocks::csp::C3k2;
 use crate::yolo::blocks::sppf::Sppf;
 use crate::yolo::config::{YoloScale, make_depth, scale_channels};
-use crate::yolo::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use crate::yolo::error::Result;
 
 /// Backbone channels after scaling (used to construct neck/head).
 pub fn scaled_channels(scale: YoloScale) -> [usize; 5] {
@@ -213,29 +212,24 @@ impl HasStateDict for YoloBackboneCls {
 /// Nearest-neighbour 2× upsample via gather (tinygrad interpolate approach).
 pub fn upsample_nearest_2x(x: &Tensor) -> Result<Tensor> {
     use svod_ir::SInt;
-    let shape = x.shape().context(TensorSnafu)?;
-    let b = shape[0].clone();
-    let c = shape[1].clone();
-    let h: usize = shape[2].as_const().context(SymbolicShapeSnafu { what: "upsample H" })?;
-    let w: usize = shape[3].as_const().context(SymbolicShapeSnafu { what: "upsample W" })?;
+    let b = x.dim(0)?;
+    let c = x.dim(1)?;
+    let h = x.dim_const(2)?;
+    let w = x.dim_const(3)?;
 
     let h_idx: Vec<i64> = (0..h as i64).flat_map(|v| [v, v]).collect();
     let w_idx: Vec<i64> = (0..w as i64).flat_map(|v| [v, v]).collect();
 
     let h_index = Tensor::from_slice(&h_idx)
-        .try_reshape([SInt::from(1usize), SInt::from(1usize), SInt::from(h * 2), SInt::from(1usize)])
-        .context(TensorSnafu)?
-        .try_expand([b.clone(), c.clone(), SInt::from(h * 2), SInt::from(w)])
-        .context(TensorSnafu)?;
-    let x = x.gather(2, &h_index).context(TensorSnafu)?;
+        .try_reshape([SInt::from(1usize), SInt::from(1usize), SInt::from(h * 2), SInt::from(1usize)])?
+        .try_expand([b.clone(), c.clone(), SInt::from(h * 2), SInt::from(w)])?;
+    let x = x.gather(2, &h_index)?;
 
-    let shape = x.shape().context(TensorSnafu)?;
+    let shape = x.shape()?;
     let b = shape[0].clone();
     let c = shape[1].clone();
     let w_index = Tensor::from_slice(&w_idx)
-        .try_reshape([SInt::from(1usize), SInt::from(1usize), SInt::from(1usize), SInt::from(w * 2)])
-        .context(TensorSnafu)?
-        .try_expand([b, c, SInt::from(h * 2), SInt::from(w * 2)])
-        .context(TensorSnafu)?;
-    x.gather(3, &w_index).context(TensorSnafu)
+        .try_reshape([SInt::from(1usize), SInt::from(1usize), SInt::from(1usize), SInt::from(w * 2)])?
+        .try_expand([b, c, SInt::from(h * 2), SInt::from(w * 2)])?;
+    Ok(x.gather(3, &w_index)?)
 }

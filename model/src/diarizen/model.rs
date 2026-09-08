@@ -30,7 +30,8 @@ use crate::wavlm::{LayerNormWeights, WavLm};
 
 use super::config::DiariZenConfig;
 use super::conformer::ConformerEncoder;
-use super::error::{HubSnafu, PickleSnafu, Result, StateSnafu, TensorSnafu, WavLmSnafu};
+use super::error::{PickleSnafu, Result, WavLmSnafu};
+
 use super::remap::split_diarizen_state_dict;
 
 /// Every intermediate tensor captured during a [`DiariZenSegmentationModel`]
@@ -112,26 +113,25 @@ impl DiariZenSegmentationModel {
     /// plan's `max_batch`; `batch` shrinks the leading dim at execute time.
     pub fn forward_batch(&self, waveforms: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
         let b = batch.as_sint();
-        let waveforms = waveforms.try_shrink([Some((SInt::Const(0), b)), None, None]).context(TensorSnafu)?;
+        let waveforms = waveforms.try_shrink([Some((SInt::Const(0), b)), None, None])?;
         self.forward(&waveforms)
     }
 
     fn select_channel(&self, waveforms: &Tensor) -> Result<Tensor> {
         // Py: waveforms[:, 0, :]
-        waveforms.getitem(s![.., 0, ..]).context(TensorSnafu)
+        Ok(waveforms.getitem(s![.., 0, ..])?)
     }
 
     fn head_forward(&self, stacked: &Tensor) -> Result<Tensor> {
         // weight_sum: Linear(L+1 → 1, bias=False) over last axis.
-        let summed = stacked.linear().weight(&self.weight_sum_weight).call().context(TensorSnafu)?;
-        let summed = summed.try_squeeze(Some(-1)).context(TensorSnafu)?;
+        let summed = stacked.linear().weight(&self.weight_sum_weight).call()?;
+        let summed = summed.try_squeeze(Some(-1))?;
 
-        let h = summed.linear().weight(&self.proj_weight).bias(&self.proj_bias).call().context(TensorSnafu)?;
+        let h = summed.linear().weight(&self.proj_weight).bias(&self.proj_bias).call()?;
         let h = self.lnorm.apply(&h)?;
         let h = self.conformer.forward(&h)?;
-        let logits =
-            h.linear().weight(&self.classifier_weight).bias(&self.classifier_bias).call().context(TensorSnafu)?;
-        logits.log_softmax(-1).context(TensorSnafu)
+        let logits = h.linear().weight(&self.classifier_weight).bias(&self.classifier_bias).call()?;
+        Ok(logits.log_softmax(-1)?)
     }
 
     /// Eager forward that returns every intermediate stage. Used by the
@@ -142,26 +142,21 @@ impl DiariZenSegmentationModel {
 
         let wavlm_intermediates = self.wavlm.extract_features(&waveforms).context(WavLmSnafu)?;
         let unsq: Vec<Tensor> =
-            wavlm_intermediates.iter().map(|t| t.try_unsqueeze(-1).context(TensorSnafu)).collect::<Result<Vec<_>>>()?;
+            wavlm_intermediates.iter().map(|t| Ok(t.try_unsqueeze(-1)?)).collect::<Result<Vec<_>>>()?;
         let refs: Vec<&Tensor> = unsq.iter().collect();
-        let stacked = Tensor::cat(&refs, -1).context(TensorSnafu)?;
+        let stacked = Tensor::cat(&refs, -1)?;
 
-        let weighted_sum = stacked.linear().weight(&self.weight_sum_weight).call().context(TensorSnafu)?;
-        let weighted_sum = weighted_sum.try_squeeze(Some(-1)).context(TensorSnafu)?;
+        let weighted_sum = stacked.linear().weight(&self.weight_sum_weight).call()?;
+        let weighted_sum = weighted_sum.try_squeeze(Some(-1))?;
 
-        let proj_out =
-            weighted_sum.linear().weight(&self.proj_weight).bias(&self.proj_bias).call().context(TensorSnafu)?;
+        let proj_out = weighted_sum.linear().weight(&self.proj_weight).bias(&self.proj_bias).call()?;
         let lnorm_out = self.lnorm.apply(&proj_out)?;
 
         let (conformer_out, conformer_blocks) = self.conformer.forward_with_block_outputs(&lnorm_out)?;
 
-        let classifier_logits = conformer_out
-            .linear()
-            .weight(&self.classifier_weight)
-            .bias(&self.classifier_bias)
-            .call()
-            .context(TensorSnafu)?;
-        let final_out = classifier_logits.log_softmax(-1).context(TensorSnafu)?;
+        let classifier_logits =
+            conformer_out.linear().weight(&self.classifier_weight).bias(&self.classifier_bias).call()?;
+        let final_out = classifier_logits.log_softmax(-1)?;
 
         Ok(ForwardIntermediates {
             wavlm_intermediates,
@@ -179,12 +174,12 @@ impl DiariZenSegmentationModel {
     pub fn forward_logits(&self, waveforms: &Tensor) -> Result<Tensor> {
         let waveforms = self.select_channel(waveforms)?;
         let stacked = self.wavlm.extract_features_stacked(&waveforms).context(WavLmSnafu)?;
-        let summed = stacked.linear().weight(&self.weight_sum_weight).call().context(TensorSnafu)?;
-        let summed = summed.try_squeeze(Some(-1)).context(TensorSnafu)?;
-        let h = summed.linear().weight(&self.proj_weight).bias(&self.proj_bias).call().context(TensorSnafu)?;
+        let summed = stacked.linear().weight(&self.weight_sum_weight).call()?;
+        let summed = summed.try_squeeze(Some(-1))?;
+        let h = summed.linear().weight(&self.proj_weight).bias(&self.proj_bias).call()?;
         let h = self.lnorm.apply(&h)?;
         let h = self.conformer.forward(&h)?;
-        h.linear().weight(&self.classifier_weight).bias(&self.classifier_bias).call().context(TensorSnafu)
+        Ok(h.linear().weight(&self.classifier_weight).bias(&self.classifier_bias).call()?)
     }
 
     /// Download the published DiariZen segmentation checkpoint and load it.
@@ -193,8 +188,8 @@ impl DiariZenSegmentationModel {
     }
 
     pub fn from_hub_with_revision(model_id: &str, revision: &str, config: DiariZenConfig) -> Result<Self> {
-        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
-        let weights_path = repo.get("pytorch_model.bin").context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open(model_id, revision)?;
+        let weights_path = repo.get("pytorch_model.bin")?;
         Self::from_pytorch_bin(&weights_path, config)
     }
 
@@ -208,25 +203,25 @@ impl DiariZenSegmentationModel {
     }
 
     pub fn from_state_dict(sd: &StateDict, config: DiariZenConfig) -> Result<Self> {
-        let (wavlm_sd, head_sd) = split_diarizen_state_dict(sd.clone()).context(StateSnafu)?;
+        let (wavlm_sd, head_sd) = split_diarizen_state_dict(sd.clone())?;
         // PyTorch checkpoints carry raw `running_var`; fold to `invstd` (value
         // transform + key rename) once at load. Round-tripped state dicts
         // already use `invstd` keys and skip this call.
         let head_sd = crate::blocks::remap::fold_batchnorm(head_sd)?;
         let mut model = Self::empty(config);
-        model.wavlm.load_state_dict(&wavlm_sd, "").context(StateSnafu)?;
+        model.wavlm.load_state_dict(&wavlm_sd, "")?;
         model.load_head_state_dict(&head_sd)?;
         Ok(model)
     }
 
     fn load_head_state_dict(&mut self, sd: &StateDict) -> Result<()> {
-        self.weight_sum_weight = get_tensor(sd, "weight_sum.weight").context(StateSnafu)?;
-        self.proj_weight = get_tensor(sd, "proj.weight").context(StateSnafu)?;
-        self.proj_bias = get_tensor(sd, "proj.bias").context(StateSnafu)?;
-        self.lnorm.load_state_dict(sd, "lnorm").context(StateSnafu)?;
-        self.conformer.load_state_dict(sd, "conformer").context(StateSnafu)?;
-        self.classifier_weight = get_tensor(sd, "classifier.weight").context(StateSnafu)?;
-        self.classifier_bias = get_tensor(sd, "classifier.bias").context(StateSnafu)?;
+        self.weight_sum_weight = get_tensor(sd, "weight_sum.weight")?;
+        self.proj_weight = get_tensor(sd, "proj.weight")?;
+        self.proj_bias = get_tensor(sd, "proj.bias")?;
+        self.lnorm.load_state_dict(sd, "lnorm")?;
+        self.conformer.load_state_dict(sd, "conformer")?;
+        self.classifier_weight = get_tensor(sd, "classifier.weight")?;
+        self.classifier_bias = get_tensor(sd, "classifier.bias")?;
         Ok(())
     }
 }

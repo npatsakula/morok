@@ -10,14 +10,14 @@
 //! - **Causal attention**: `is_causal = true` in SDPA
 //! - **No bias** on any projection (`attention_bias = false`)
 
-use snafu::{OptionExt, ResultExt};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::rms_norm::RmsNormWeights;
 use super::rotary::RotaryTable;
 
@@ -31,24 +31,20 @@ fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
         return Ok(x.clone());
     }
-    let shape = x.shape().context(TensorSnafu)?;
-    let b = shape[0].clone();
-    let l = shape[2].clone();
-    let n_kv: usize = shape[1].as_const().context(SymbolicShapeSnafu { what: "repeat_kv" })?;
-    let hd: usize = shape[3].as_const().context(SymbolicShapeSnafu { what: "repeat_kv" })?;
+    let b = x.dim(0)?;
+    let l = x.dim(2)?;
+    let n_kv = x.dim_const(1)?;
+    let hd = x.dim_const(3)?;
     let total = n_kv * n_rep;
-    x.try_reshape([b.clone(), SInt::from(n_kv as isize), SInt::from(1isize), l.clone(), SInt::from(hd as isize)])
-        .context(TensorSnafu)?
+    Ok(x.try_reshape([b.clone(), SInt::from(n_kv as isize), SInt::from(1isize), l.clone(), SInt::from(hd as isize)])?
         .try_expand([
             b.clone(),
             SInt::from(n_kv as isize),
             SInt::from(n_rep as isize),
             l.clone(),
             SInt::from(hd as isize),
-        ])
-        .context(TensorSnafu)?
-        .try_reshape([b, SInt::from(total as isize), l, SInt::from(hd as isize)])
-        .context(TensorSnafu)
+        ])?
+        .try_reshape([b, SInt::from(total as isize), l, SInt::from(hd as isize)])?)
 }
 
 #[derive(Clone)]
@@ -100,25 +96,21 @@ impl Qwen3Attention {
     /// `rotary`: the shared cos/sin table. `padding_mask`: optional bool
     /// `(B, 1, 1, L)` where `true` = masked out (padding) position.
     pub fn forward(&self, x: &Tensor, rotary: &RotaryTable, padding_mask: Option<&Tensor>) -> Result<Tensor> {
-        let shape = x.shape().context(TensorSnafu)?;
-        let b = shape[0].clone();
-        let l: usize = shape[1].as_const().context(SymbolicShapeSnafu { what: "qwen3 attention" })?;
+        let b = x.dim(0)?;
+        let l = x.dim_const(1)?;
         let h = self.num_heads as isize;
         let kv_h = self.num_kv_heads as isize;
         let hd = self.head_dim as isize;
         let bsint: SInt = b;
 
         // Separate projections.
-        let q = x.linear().weight(&self.q_proj_weight).call().context(TensorSnafu)?;
-        let k = x.linear().weight(&self.k_proj_weight).call().context(TensorSnafu)?;
-        let v = x.linear().weight(&self.v_proj_weight).call().context(TensorSnafu)?;
+        let q = x.linear().weight(&self.q_proj_weight).call()?;
+        let k = x.linear().weight(&self.k_proj_weight).call()?;
+        let v = x.linear().weight(&self.v_proj_weight).call()?;
 
         // (B, L, H*kv_hd) → (B, L, n, hd) → (B, n, L, hd)
         let to_heads = |t: Tensor, n: isize| -> Result<Tensor> {
-            t.view([bsint.clone(), l.into(), n.into(), hd.into()])
-                .context(TensorSnafu)?
-                .try_permute(&[0, 2, 1, 3])
-                .context(TensorSnafu)
+            Ok(t.view([bsint.clone(), l.into(), n.into(), hd.into()])?.try_permute(&[0, 2, 1, 3])?)
         };
 
         let q = to_heads(q, h)?;
@@ -139,22 +131,12 @@ impl Qwen3Attention {
         let v = repeat_kv(&v, n_rep)?;
 
         // Causal SDPA + optional padding mask.
-        let attn = q
-            .scaled_dot_product_attention()
-            .key(&k)
-            .value(&v)
-            .is_causal(true)
-            .maybe_attn_mask(padding_mask)
-            .call()
-            .context(TensorSnafu)?;
+        let attn =
+            q.scaled_dot_product_attention().key(&k).value(&v).is_causal(true).maybe_attn_mask(padding_mask).call()?;
 
         // (B, H, L, hd) → (B, L, H*hd) → output projection.
-        let attn = attn
-            .try_permute(&[0, 2, 1, 3])
-            .context(TensorSnafu)?
-            .view([bsint, l.into(), (self.num_heads * self.head_dim).into()])
-            .context(TensorSnafu)?;
-        attn.linear().weight(&self.o_proj_weight).call().context(TensorSnafu)
+        let attn = attn.try_permute(&[0, 2, 1, 3])?.view([bsint, l.into(), (self.num_heads * self.head_dim).into()])?;
+        Ok(attn.linear().weight(&self.o_proj_weight).call()?)
     }
 }
 

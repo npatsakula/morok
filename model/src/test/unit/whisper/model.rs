@@ -100,11 +100,8 @@ fn materialized_cross_kv_matches_reference_projection() {
 
     let expected_shape = [2, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
     for (expected, actual) in [(&expected_k, &actual_k), (&expected_v, &actual_v)] {
-        assert_eq!(actual.uop().dtype(), DType::Float32);
-        assert_eq!(
-            actual.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(),
-            expected_shape
-        );
+        assert_eq!(actual.dtype(), DType::Float32);
+        assert_eq!(actual.dims().unwrap(), expected_shape);
         let expected = expected.as_vec::<f32>().unwrap();
         let actual = actual.as_vec::<f32>().unwrap();
         let max_delta = expected.iter().zip(&actual).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -139,7 +136,7 @@ fn low_precision_cross_projection_keeps_fp32_cache_storage() {
     for ((expected, legacy), actual) in
         [(&expected_k, &legacy_k), (&expected_v, &legacy_v)].into_iter().zip([&actual_k, &actual_v])
     {
-        assert_eq!(actual.uop().dtype(), DType::Float32);
+        assert_eq!(actual.dtype(), DType::Float32);
         let expected = expected.as_vec::<f32>().unwrap();
         let legacy = legacy.as_vec::<f32>().unwrap();
         let actual = actual.as_vec::<f32>().unwrap();
@@ -160,14 +157,14 @@ fn low_precision_load_preserves_openai_fp32_parameters(compute: DType) {
     low_dims.dtype = compute.clone();
     let model = Whisper::from_state_dict(&source, low_dims).unwrap();
 
-    assert_eq!(model.encoder.conv1.weight.uop().dtype(), compute);
-    assert_eq!(model.encoder.blocks[0].attn.query.weight.uop().dtype(), compute);
-    assert_eq!(model.encoder.positional_embedding.uop().dtype(), DType::Float32);
-    assert_eq!(model.encoder.blocks[0].attn_ln.weight.uop().dtype(), DType::Float32);
-    assert_eq!(model.decoder.token_embedding.uop().dtype(), DType::Float32);
-    assert_eq!(model.decoder.positional_embedding.uop().dtype(), DType::Float32);
-    assert_eq!(model.decoder.blocks[0].cross_attn_ln.bias.uop().dtype(), DType::Float32);
-    assert_eq!(model.decoder.ln.weight.uop().dtype(), DType::Float32);
+    assert_eq!(model.encoder.conv1.weight.dtype(), compute);
+    assert_eq!(model.encoder.blocks[0].attn.query.weight.dtype(), compute);
+    assert_eq!(model.encoder.positional_embedding.dtype(), DType::Float32);
+    assert_eq!(model.encoder.blocks[0].attn_ln.weight.dtype(), DType::Float32);
+    assert_eq!(model.decoder.token_embedding.dtype(), DType::Float32);
+    assert_eq!(model.decoder.positional_embedding.dtype(), DType::Float32);
+    assert_eq!(model.decoder.blocks[0].cross_attn_ln.bias.dtype(), DType::Float32);
+    assert_eq!(model.decoder.ln.weight.dtype(), DType::Float32);
 }
 
 #[test]
@@ -188,7 +185,7 @@ fn quantized_weight_scale_scales_output_channels() {
     let mut loaded = model.decoder.blocks[0].mlp0_w.contiguous();
     Tensor::realize_batch([&mut loaded]).unwrap();
 
-    assert_eq!(loaded.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(), [out, inp]);
+    assert_eq!(loaded.dims().unwrap(), [out, inp]);
     let expected: Vec<f32> = weight.iter().enumerate().map(|(index, value)| value * scale[index / inp]).collect();
     assert_eq!(loaded.as_vec::<f32>().unwrap(), expected);
 }
@@ -207,7 +204,7 @@ fn low_precision_prefill_does_not_inherit_fp32_cache_storage_dtype() {
     .unwrap();
     let tokens = Tensor::from_slice([1i32, 2, 3]).try_reshape([1usize, 3]).unwrap();
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
-    assert_eq!(cross_k.uop().dtype(), DType::Float32);
+    assert_eq!(cross_k.dtype(), DType::Float32);
 
     let (mut actual, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
     let (mut expected, _, _) = model
@@ -263,18 +260,14 @@ fn projected_cross_kv_and_prefill_shapes_are_concrete() {
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
     let expected_cross = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
     for cache in [&cross_k, &cross_v] {
-        let shape = cache.shape().unwrap();
-        assert_eq!(shape.iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(), expected_cross);
+        assert_eq!(cache.dims().unwrap(), expected_cross);
     }
 
     let (logits, self_k, self_v) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
-    assert_eq!(
-        logits.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(),
-        [1, 3, dims.n_vocab]
-    );
+    assert_eq!(logits.dims().unwrap(), [1, 3, dims.n_vocab]);
     let expected_self = [1, 3, dims.n_text_layer * dims.n_text_head, 4];
     for cache in [&self_k, &self_v] {
-        assert_eq!(cache.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(), expected_self);
+        assert_eq!(cache.dims().unwrap(), expected_self);
     }
 }
 
@@ -319,8 +312,8 @@ fn cached_steps_match_teacher_forced_full_prefix() {
     cache_k[..prefill_elements].copy_from_slice(&prefill_k.as_vec::<f32>().unwrap());
     cache_v[..prefill_elements].copy_from_slice(&prefill_v.as_vec::<f32>().unwrap());
     assert_eq!(cache_k.len() * std::mem::size_of::<f32>(), dims.n_text_ctx * layer_heads * d_head * 4);
-    assert_eq!(cross_k.uop().dtype(), DType::Float32);
-    assert_eq!(prefill_k.uop().dtype(), DType::Float32);
+    assert_eq!(cross_k.dtype(), DType::Float32);
+    assert_eq!(prefill_k.dtype(), DType::Float32);
 
     for next_token in [5i32, 11] {
         let pos = prefix.len();
@@ -396,10 +389,7 @@ fn prepared_language_detector_has_one_token_and_one_logits_row() {
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
     let token = Tensor::from_slice([1i32]).try_reshape([1usize, 1]).unwrap();
     let logits = model.decode_with_cross_kv(&token, &cross_k, &cross_v).unwrap();
-    assert_eq!(
-        logits.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(),
-        [1, 1, dims.n_vocab]
-    );
+    assert_eq!(logits.dims().unwrap(), [1, 1, dims.n_vocab]);
 
     let mut detector = WhisperDecoderJit::new(model);
     detector
@@ -497,7 +487,7 @@ fn alignment_compute_does_not_inherit_fp32_cache_storage_dtype() {
     let tokens = Tensor::from_slice([1i32, 2, 3, 4]).try_reshape([1usize, 4]).unwrap();
     let heads = [(0, 0), (1, 1)];
     let (cross_k, cross_v) = model.project_cross_kv(&features).unwrap();
-    assert_eq!(cross_k.uop().dtype(), DType::Float32);
+    assert_eq!(cross_k.dtype(), DType::Float32);
 
     let mut actual = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
     let low_k = cross_k.cast(DType::Float16).unwrap();
@@ -517,11 +507,11 @@ fn eager_audio_feature_alignment_reference(
     features: &Tensor,
     alignment_heads: &[(usize, usize)],
 ) -> Tensor {
-    let seq_len = tokens.shape().unwrap()[1].as_const().unwrap();
+    let seq_len = tokens.dim_const(1).unwrap();
     let tok_emb = model.decoder.token_embedding.embedding(tokens).unwrap();
     let pos_emb = model.decoder.positional_embedding.try_shrink([Some((0isize, seq_len as isize)), None]).unwrap();
-    let mut x = tok_emb.try_add(&pos_emb).unwrap().cast(features.uop().dtype()).unwrap();
-    let mask = crate::whisper::causal_mask(seq_len, x.uop().dtype().clone()).unwrap();
+    let mut x = tok_emb.try_add(&pos_emb).unwrap().cast(features.dtype()).unwrap();
+    let mask = crate::whisper::causal_mask(seq_len, x.dtype().clone()).unwrap();
     let mut selected: Vec<Option<Tensor>> = (0..alignment_heads.len()).map(|_| None).collect();
 
     for (layer, block) in model.decoder.blocks.iter().enumerate() {
@@ -538,7 +528,7 @@ fn eager_audio_feature_alignment_reference(
             let scores = q.matmul(&k.try_transpose(-1, -2).unwrap()).unwrap();
             let scale = Tensor::const_(
                 ConstValue::Float(1.0 / ((model.decoder.n_state / model.decoder.n_head) as f64).sqrt()),
-                scores.uop().dtype().clone(),
+                scores.dtype().clone(),
             );
             selected[index] = Some(scores.try_mul(&scale).unwrap());
         }

@@ -3,7 +3,6 @@
 //! Takes backbone skip features `(l4, l6, l10)` and produces three detection
 //! feature maps `(P3, P4, P5)` at strides 8, 16, 32.
 
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict, prefixed};
@@ -12,7 +11,7 @@ use crate::yolo::backbone::{scaled_channels, upsample_nearest_2x};
 use crate::yolo::blocks::conv::YoloConv;
 use crate::yolo::blocks::csp::C3k2;
 use crate::yolo::config::{YoloScale, make_depth};
-use crate::yolo::error::{Result, TensorSnafu};
+use crate::yolo::error::Result;
 
 /// Full FPN+PAN neck (layers 11–22). Shared by detect, segment, obb, pose,
 /// and depth models.
@@ -50,20 +49,20 @@ impl YoloNeck {
     pub fn forward(&self, l4: &Tensor, l6: &Tensor, l10: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         // FPN top-down
         let up = upsample_nearest_2x(l10)?;
-        let cat = Tensor::cat(&[&up, l6], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&up, l6], 1)?;
         let l13 = self.c3k2_13.forward(&cat)?;
 
         let up = upsample_nearest_2x(&l13)?;
-        let cat = Tensor::cat(&[&up, l4], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&up, l4], 1)?;
         let l16 = self.c3k2_16.forward(&cat)?;
 
         // PAN bottom-up
         let l17 = self.conv17.forward(&l16)?;
-        let cat = Tensor::cat(&[&l17, &l13], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&l17, &l13], 1)?;
         let l19 = self.c3k2_19.forward(&cat)?;
 
         let l20 = self.conv20.forward(&l19)?;
-        let cat = Tensor::cat(&[&l20, l10], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&l20, l10], 1)?;
         let l22 = self.c3k2_22.forward(&cat)?;
 
         Ok((l16, l19, l22))

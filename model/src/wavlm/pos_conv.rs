@@ -18,15 +18,14 @@
 //! - The pos-conv output is *added* to the input (residual-style), not
 //!   concatenated.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use crate::init::{fan_in_uniform, zeros};
-use crate::state::{self, HasStateDict, StateDict, TensorSnafu as StateTensorSnafu, get_tensor, prefixed};
+use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 #[derive(Clone)]
 pub struct ConvolutionalPositionalEmbedding {
@@ -57,7 +56,7 @@ impl ConvolutionalPositionalEmbedding {
     /// for the conv, then transposes back.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // (B, T, C) → (B, C, T)
-        let xt = x.try_permute(&[0, 2, 1]).context(TensorSnafu)?;
+        let xt = x.try_permute(&[0, 2, 1])?;
 
         let p = self.padding as isize;
         let mut y = xt
@@ -67,20 +66,19 @@ impl ConvolutionalPositionalEmbedding {
             .groups(self.groups)
             .stride(&[1])
             .padding(&[(p, p)])
-            .call()
-            .context(TensorSnafu)?;
+            .call()?;
 
         // Trim the trailing `num_remove` frames so output length matches input.
         if self.num_remove > 0 {
-            let t_full = y.shape().context(TensorSnafu)?[2].clone();
+            let t_full = y.shape()?[2].clone();
             let keep = t_full - SInt::from(self.num_remove);
-            y = y.try_shrink([None, None, Some((SInt::Const(0), keep))]).context(TensorSnafu)?;
+            y = y.try_shrink([None, None, Some((SInt::Const(0), keep))])?;
         }
 
         // Exact (erf-based) GELU matches PyTorch's `nn.functional.gelu`.
-        let y = y.gelu_exact().context(TensorSnafu)?;
+        let y = y.gelu_exact()?;
         // (B, C, T) → (B, T, C)
-        y.try_permute(&[0, 2, 1]).context(TensorSnafu)
+        Ok(y.try_permute(&[0, 2, 1])?)
     }
 }
 
@@ -89,16 +87,11 @@ impl ConvolutionalPositionalEmbedding {
 /// `g` is expected with shape `(1, 1, k)`, `v` with shape `(out, in/g, k)`.
 fn weight_norm_reconstruct(g: &Tensor, v: &Tensor) -> std::result::Result<Tensor, state::Error> {
     // ||v||_{dim=0,1}: sum of squares over dims 0 and 1, then sqrt, keepdim.
-    let v_sq = v.try_mul(v).context(StateTensorSnafu)?;
-    let v_norm_sq = v_sq
-        .sum_with()
-        .axes(svod_tensor::reduce::AxisSpec::Multiple(vec![0, 1]))
-        .keepdim(true)
-        .call()
-        .context(StateTensorSnafu)?;
-    let v_norm = v_norm_sq.try_sqrt().context(StateTensorSnafu)?;
-    let v_dir = v.try_div(&v_norm).context(StateTensorSnafu)?;
-    g.try_mul(&v_dir).context(StateTensorSnafu)
+    let v_sq = v.try_mul(v)?;
+    let v_norm_sq = v_sq.sum_with().axes(svod_tensor::reduce::AxisSpec::Multiple(vec![0, 1])).keepdim(true).call()?;
+    let v_norm = v_norm_sq.try_sqrt()?;
+    let v_dir = v.try_div(&v_norm)?;
+    Ok(g.try_mul(&v_dir)?)
 }
 
 impl HasStateDict for ConvolutionalPositionalEmbedding {

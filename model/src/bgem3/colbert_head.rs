@@ -6,13 +6,12 @@
 //! Weights are loaded from `colbert_linear.pt` (PyTorch pickle with bare
 //! `weight` / `bias` keys).
 
-use snafu::{OptionExt, ResultExt};
 use svod_dtype::DType;
 use svod_tensor::{Tensor, s};
 
 use crate::init::{fan_in_uniform, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
-use crate::xlm_roberta::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use crate::xlm_roberta::error::Result;
 
 #[derive(Clone)]
 pub struct ColbertHead {
@@ -51,24 +50,22 @@ impl ColbertHead {
     /// where `true` = real token. Returns `(B, L-1, colbert_dim)` — the CLS
     /// token (position 0) is dropped.
     pub fn forward(&self, hidden: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
-        let shape = hidden.shape().context(TensorSnafu)?;
-        let _l: usize = shape[1].as_const().context(SymbolicShapeSnafu { what: "colbert_head" })?;
+        let _l = hidden.dim_const(1)?;
 
-        let hidden_no_cls = hidden.getitem(s![.., 1.., ..]).context(TensorSnafu)?;
+        let hidden_no_cls = hidden.getitem(s![.., 1.., ..])?;
 
-        let vecs = hidden_no_cls.linear().weight(&self.weight).bias(&self.bias).call().context(TensorSnafu)?;
+        let vecs = hidden_no_cls.linear().weight(&self.weight).bias(&self.bias).call()?;
 
         let vecs = match attention_mask {
             Some(m) => {
-                let m_no_cls = m.getitem(s![.., 1..]).context(TensorSnafu)?;
-                let m_3d =
-                    m_no_cls.cast(vecs.uop().dtype()).context(TensorSnafu)?.try_unsqueeze(-1).context(TensorSnafu)?;
-                vecs.try_mul(&m_3d).context(TensorSnafu)?
+                let m_no_cls = m.getitem(s![.., 1..])?;
+                let m_3d = m_no_cls.cast(vecs.dtype())?.try_unsqueeze(-1)?;
+                vecs.try_mul(&m_3d)?
             }
             None => vecs,
         };
 
-        if self.normalize { vecs.lp_normalize(-1, 2).context(TensorSnafu) } else { Ok(vecs) }
+        if self.normalize { Ok(vecs.lp_normalize(-1, 2)?) } else { Ok(vecs) }
     }
 }
 

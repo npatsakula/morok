@@ -90,7 +90,7 @@ fn segmentation_forward_shape() {
     // (B, channels=1, samples) — small enough to stay cheap.
     let wav = Tensor::zeros(&[1, 1, 4096], DType::Float32).unwrap();
     let out = model.forward(&wav).expect("forward");
-    let shape: Vec<usize> = out.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let shape = out.dims().unwrap();
     assert_eq!(shape.len(), 3);
     assert_eq!(shape[0], 1);
     assert!(shape[1] > 0);
@@ -105,7 +105,7 @@ fn segmentation_forward_logits_shape() {
     let model = DiariZenSegmentationModel::empty(cfg.clone());
     let wav = Tensor::zeros(&[1, 1, 4096], DType::Float32).unwrap();
     let logits = model.forward_logits(&wav).expect("forward_logits");
-    let shape: Vec<usize> = logits.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let shape = logits.dims().unwrap();
     assert_eq!(shape[0], 1);
     assert_eq!(shape[2], cfg.powerset_class_count());
 }

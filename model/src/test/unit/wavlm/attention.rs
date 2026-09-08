@@ -63,7 +63,7 @@ fn position_bias_shape() {
     // rel_attn_embed: (num_buckets=320, total_num_heads=16)
     let rel_embed = Tensor::zeros(&[320, 16], DType::Float32).unwrap();
     let bias = compute_position_bias(&rel_embed, 10, 10, 320, 800).unwrap();
-    let shape: Vec<usize> = bias.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let shape = bias.dims().unwrap();
     assert_eq!(shape, vec![1, 16, 10, 10]);
 }
 
@@ -92,7 +92,7 @@ fn attention_forward_shape_full_heads() {
     let pb = compute_position_bias(&rel_embed, l, l, cfg.encoder_num_buckets, cfg.encoder_max_distance).unwrap();
 
     let out = attn.forward(&x, &pb).expect("symbolic forward");
-    let shape: Vec<usize> = out.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let shape = out.dims().unwrap();
     assert_eq!(shape, vec![b, l, cfg.encoder_embed_dim]);
 }
 
@@ -109,15 +109,14 @@ fn attention_pruned_head_shapes() {
     let attn = GatedRelPosAttention::empty(&cfg, 0);
     assert_eq!(attn.num_kept(), 3);
 
-    let q_shape: Vec<usize> = attn.q_weight.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let q_shape = attn.q_weight.dims().unwrap();
     assert_eq!(q_shape, vec![3 * 8, 64], "q_weight should be (num_kept*head_dim, embed_dim)");
-    let o_shape: Vec<usize> = attn.out_weight.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let o_shape = attn.out_weight.dims().unwrap();
     assert_eq!(o_shape, vec![64, 3 * 8], "out_weight should be (embed_dim, num_kept*head_dim)");
 
-    let gate_w: Vec<usize> =
-        attn.gru_rel_pos_linear_weight.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let gate_w: Vec<usize> = attn.gru_rel_pos_linear_weight.dims().unwrap();
     assert_eq!(gate_w, vec![8, 8], "gru_rel_pos_linear should be (8, head_dim)");
-    let gate_c: Vec<usize> = attn.gru_rel_pos_const.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let gate_c = attn.gru_rel_pos_const.dims().unwrap();
     assert_eq!(gate_c, vec![1, 8, 1, 1], "gru_rel_pos_const should be (1, total_num_heads, 1, 1) — NOT pruned");
 
     let l = 6;
@@ -125,7 +124,7 @@ fn attention_pruned_head_shapes() {
     let rel_embed = Tensor::zeros(&[cfg.encoder_num_buckets, attn.total_num_heads], DType::Float32).unwrap();
     let pb = compute_position_bias(&rel_embed, l, l, cfg.encoder_num_buckets, cfg.encoder_max_distance).unwrap();
     let out = attn.forward(&x, &pb).expect("symbolic forward");
-    let out_shape: Vec<usize> = out.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let out_shape = out.dims().unwrap();
     assert_eq!(out_shape, vec![1, l, cfg.encoder_embed_dim]);
 }
 

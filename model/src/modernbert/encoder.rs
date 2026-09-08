@@ -6,7 +6,6 @@
 //! concrete per call); global vs local theta is selected via
 //! [`ModernBertConfig::rope_theta`].
 
-use snafu::{OptionExt, ResultExt};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
@@ -14,7 +13,8 @@ use crate::state::{self, HasStateDict, StateDict};
 
 use super::config::ModernBertConfig;
 use super::encoder_layer::EncoderLayer;
-use super::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::rotary::RotaryTable;
 
 #[derive(Clone)]
@@ -34,17 +34,16 @@ impl Encoder {
     /// `false` = padding. When present it is reshaped to `(B, 1, 1, L)` and
     /// inverted to the SDPA "True = masked out" convention.
     pub fn forward(&self, x: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
-        let shape = x.shape().context(TensorSnafu)?;
-        let seq_len: usize = shape[1].as_const().context(SymbolicShapeSnafu { what: "encoder" })?;
+        let seq_len = x.dim_const(1)?;
         let head_dim = self.config.head_dim();
 
         // Build the SDPA key-axis mask once: bool (B,1,1,L), True = masked out.
         let mask_4d = match padding_mask {
             Some(m) => {
-                let b_dim = shape[0].clone();
-                let m2 = m.try_reshape([b_dim, SInt::from(seq_len)]).context(TensorSnafu)?;
-                let inverted = m2.logical_not().context(TensorSnafu)?;
-                Some(inverted.try_unsqueeze(1).context(TensorSnafu)?.try_unsqueeze(1).context(TensorSnafu)?)
+                let b_dim = x.dim(0)?;
+                let m2 = m.try_reshape([b_dim, SInt::from(seq_len)])?;
+                let inverted = m2.logical_not()?;
+                Some(inverted.try_unsqueeze(1)?.try_unsqueeze(1)?)
             }
             None => None,
         };

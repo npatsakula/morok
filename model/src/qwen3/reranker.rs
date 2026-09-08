@@ -17,13 +17,13 @@
 
 use std::path::Path;
 
-use snafu::{OptionExt, ResultExt};
 use svod_tensor::{BoundVariable, Tensor, s};
 
 use crate::state::{self, HasStateDict, StateDict};
 
 use super::config::Qwen3Config;
-use super::error::{HubSnafu, Result, StateSnafu, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::model::Qwen3Model;
 
 /// Token ID for "Yes" in the Qwen tokenizer — the reranker's positive class.
@@ -61,20 +61,19 @@ impl Qwen3Reranker {
     }
 
     fn score(&self, hidden: &Tensor) -> Result<Tensor> {
-        let shape = hidden.shape().context(TensorSnafu)?;
-        let l: usize = shape[1].as_const().context(SymbolicShapeSnafu { what: "qwen3 reranker" })?;
+        let l = hidden.dim_const(1)?;
 
         // Last-token hidden state: (B, D) — slice BEFORE the LM head to avoid
         // computing logits for all L positions when we only need one.
-        let last_hidden = hidden.getitem(s![.., (l - 1) as i64, ..]).context(TensorSnafu)?;
+        let last_hidden = hidden.getitem(s![.., (l - 1) as i64, ..])?;
 
         // LM head: (B, D) @ (D, V) → (B, V)
-        let logits = last_hidden.linear().weight(&self.lm_head_weight).call().context(TensorSnafu)?;
+        let logits = last_hidden.linear().weight(&self.lm_head_weight).call()?;
 
         // Extract the "Yes" logit: (B,)
-        let scores = logits.getitem(s![.., self.yes_loc as i64]).context(TensorSnafu)?;
+        let scores = logits.getitem(s![.., self.yes_loc as i64])?;
 
-        if self.normalize { scores.sigmoid().context(TensorSnafu) } else { Ok(scores) }
+        if self.normalize { Ok(scores.sigmoid()?) } else { Ok(scores) }
     }
 
     pub fn from_hub(model_id: &str, mut config: Qwen3Config) -> Result<Self> {
@@ -82,8 +81,8 @@ impl Qwen3Reranker {
     }
 
     pub fn from_hub_with_revision(model_id: &str, revision: &str, config: &mut Qwen3Config) -> Result<Self> {
-        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
-        let cfg_path = repo.get("config.json").context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open(model_id, revision)?;
+        let cfg_path = repo.get("config.json")?;
         let parsed = Qwen3Config::from_json(&cfg_path)?;
         config.merge_structural_from(&parsed);
 
@@ -92,13 +91,13 @@ impl Qwen3Reranker {
     }
 
     pub fn from_safetensors(path: &Path, config: Qwen3Config) -> Result<Self> {
-        let sd = state::load_safetensors(path).context(StateSnafu)?;
+        let sd = state::load_safetensors(path)?;
         Self::from_state_dict(&sd, config)
     }
 
     /// Load from a directory containing `model.safetensors` or multi-shard files.
     pub fn from_safetensors_dir(dir: &Path, config: Qwen3Config) -> Result<Self> {
-        let sd = state::load_safetensors_dir(dir).context(StateSnafu)?;
+        let sd = state::load_safetensors_dir(dir)?;
         Self::from_state_dict(&sd, config)
     }
 
@@ -106,7 +105,7 @@ impl Qwen3Reranker {
         let dtype = config.dtype.clone();
         let stripped = strip_model_prefix(sd);
         let mut model = Self::empty(config);
-        model.load_state_dict(&state::cast_all(&stripped, dtype), "").context(StateSnafu)?;
+        model.load_state_dict(&state::cast_all(&stripped, dtype), "")?;
         Ok(model)
     }
 }

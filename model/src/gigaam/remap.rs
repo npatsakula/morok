@@ -1,10 +1,9 @@
-use snafu::ResultExt;
 use svod_tensor::Tensor;
 
 use crate::state::StateDict;
 
 use super::GigaAmConfig;
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 use super::ConvNormType;
 
@@ -26,7 +25,7 @@ pub fn remap_pytorch(sd: StateDict, config: &GigaAmConfig) -> Result<StateDict> 
 
     if matches!(config.conv_norm_type, ConvNormType::BatchNorm) {
         for (layer_idx, var_tensor) in bn_var_keys {
-            let data = var_tensor.as_vec::<f32>().context(TensorSnafu)?;
+            let data = var_tensor.as_vec::<f32>()?;
             let invstd: Vec<f32> = data.iter().map(|&v| 1.0 / (v + 1e-5).sqrt()).collect();
             let invstd_tensor = Tensor::from_slice(&invstd);
             out.insert(format!("layers.{layer_idx}.conv.bn_invstd"), invstd_tensor);

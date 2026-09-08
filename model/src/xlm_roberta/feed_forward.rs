@@ -1,13 +1,12 @@
 //! XLM-RoBERTa feed-forward block: `Linear(D, I, bias) → GELU(exact) → Linear(I, D, bias)`.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::init::{fan_in_uniform, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 #[derive(Clone)]
 pub struct FeedForwardWeights {
@@ -33,10 +32,9 @@ impl FeedForwardWeights {
 
     /// Forward. `x`: `(B, L, D)` → `(B, L, D)`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y =
-            x.linear().weight(&self.intermediate_weight).bias(&self.intermediate_bias).call().context(TensorSnafu)?;
-        let y = y.gelu_exact().context(TensorSnafu)?;
-        y.linear().weight(&self.output_weight).bias(&self.output_bias).call().context(TensorSnafu)
+        let y = x.linear().weight(&self.intermediate_weight).bias(&self.intermediate_bias).call()?;
+        let y = y.gelu_exact()?;
+        Ok(y.linear().weight(&self.output_weight).bias(&self.output_bias).call()?)
     }
 }
 

@@ -3,7 +3,6 @@
 //! Detection head + mask coefficient branch + Proto26 prototype generator.
 //! Forward returns `(predictions [B, 4+nc+nm, A], protos [B, nm, H/4, W/4])`.
 
-use snafu::{OptionExt, ResultExt};
 use svod_ir::SInt;
 use svod_tensor::{BoundVariable, Tensor};
 
@@ -13,7 +12,8 @@ use super::backbone::{YoloBackbone, upsample_nearest_2x};
 use super::blocks::conv::ConvTranspose2dBias;
 use super::blocks::conv::{Conv2dBias, YoloConv};
 use super::config::DETECT_STRIDES;
-use super::error::{Result, StateSnafu, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::head::{BoxBranch, ClsBranch, dist2bbox, make_anchors};
 use super::loader;
 use super::neck::YoloNeck;
@@ -103,7 +103,7 @@ impl Proto26 {
             for _ in 0..(i + 1) {
                 upsampled = upsample_nearest_2x(&upsampled)?;
             }
-            feat = feat.try_add(&upsampled).context(TensorSnafu)?;
+            feat = feat.try_add(&upsampled)?;
         }
         let feat = self.feat_fuse.forward(&feat)?;
         // Proto parent: cv1 → ConvTranspose2d → cv2 → cv3
@@ -173,7 +173,7 @@ impl Segment26 {
     pub fn forward(&self, feats: &[Tensor]) -> Result<(Tensor, Tensor)> {
         let proto = self.proto.forward(feats)?;
 
-        let shape = feats[0].shape().context(TensorSnafu)?;
+        let shape = feats[0].shape()?;
         let b = shape[0].clone();
 
         let mut boxes_list: Vec<Tensor> = Vec::with_capacity(feats.len());
@@ -182,40 +182,35 @@ impl Segment26 {
         let mut feat_sizes: Vec<(usize, usize)> = Vec::with_capacity(feats.len());
 
         for (i, feat) in feats.iter().enumerate() {
-            let fshape = feat.shape().context(TensorSnafu)?;
-            let h: usize = fshape[2].as_const().context(SymbolicShapeSnafu { what: "seg H" })?;
-            let w: usize = fshape[3].as_const().context(SymbolicShapeSnafu { what: "seg W" })?;
+            let h = feat.dim_const(2)?;
+            let w = feat.dim_const(3)?;
             feat_sizes.push((h, w));
             let hw = h * w;
 
             let box_out = self.cv2[i].forward(feat)?;
-            boxes_list.push(
-                box_out.try_reshape([b.clone(), SInt::from(4 * self.reg_max), SInt::from(hw)]).context(TensorSnafu)?,
-            );
+            boxes_list.push(box_out.try_reshape([b.clone(), SInt::from(4 * self.reg_max), SInt::from(hw)])?);
 
             let cls_out = self.cv3[i].forward(feat)?;
-            scores_list
-                .push(cls_out.try_reshape([b.clone(), SInt::from(self.nc), SInt::from(hw)]).context(TensorSnafu)?);
+            scores_list.push(cls_out.try_reshape([b.clone(), SInt::from(self.nc), SInt::from(hw)])?);
 
             let mask_out = self.cv4[i].forward(feat)?;
-            mask_list
-                .push(mask_out.try_reshape([b.clone(), SInt::from(self.nm), SInt::from(hw)]).context(TensorSnafu)?);
+            mask_list.push(mask_out.try_reshape([b.clone(), SInt::from(self.nm), SInt::from(hw)])?);
         }
 
         let boxes_refs: Vec<&Tensor> = boxes_list.iter().collect();
         let scores_refs: Vec<&Tensor> = scores_list.iter().collect();
         let mask_refs: Vec<&Tensor> = mask_list.iter().collect();
 
-        let boxes = Tensor::cat(&boxes_refs, 2).context(TensorSnafu)?;
-        let scores = Tensor::cat(&scores_refs, 2).context(TensorSnafu)?;
-        let masks = Tensor::cat(&mask_refs, 2).context(TensorSnafu)?;
+        let boxes = Tensor::cat(&boxes_refs, 2)?;
+        let scores = Tensor::cat(&scores_refs, 2)?;
+        let masks = Tensor::cat(&mask_refs, 2)?;
 
         let num_anchors: usize = feat_sizes.iter().map(|&(h, w)| h * w).sum();
         let (anchors, strides) = make_anchors(&feat_sizes, &DETECT_STRIDES);
 
         let dbox = dist2bbox(&boxes, &anchors, &strides, num_anchors)?;
-        let scores = scores.sigmoid().context(TensorSnafu)?;
-        let preds = Tensor::cat(&[&dbox, &scores, &masks], 1).context(TensorSnafu)?;
+        let scores = scores.sigmoid()?;
+        let preds = Tensor::cat(&[&dbox, &scores, &masks], 1)?;
 
         Ok((preds, proto))
     }
@@ -291,7 +286,7 @@ impl Yolo26Segment {
 
     pub fn from_state_dict(sd: &StateDict, config: super::config::YoloConfig) -> Result<Self> {
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "").context(StateSnafu)?;
+        model.load_state_dict(sd, "")?;
         Ok(model)
     }
 

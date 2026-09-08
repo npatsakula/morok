@@ -22,7 +22,6 @@
 //!   the encoder passes down to every layer's attention forward. Each layer
 //!   gates and head-selects independently.
 
-use snafu::{OptionExt, ResultExt};
 use svod_dtype::DType;
 use svod_tensor::reduce::AxisSpec;
 use svod_tensor::{Tensor, s};
@@ -31,7 +30,7 @@ use crate::init::{fan_in_uniform, ones, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::config::WavLmConfig;
-use super::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
 
 // ---------------------------------------------------------------------------
 // Bucket math (matches `_relative_positions_bucket(bidirectional=True)`)
@@ -78,7 +77,7 @@ pub fn bucket_index_tensor(
 ) -> Result<Tensor> {
     let buckets = compute_bucket_indices(query_length, key_length, num_buckets, max_distance);
     let flat = Tensor::from_slice(&buckets);
-    flat.try_reshape([query_length as isize, key_length as isize]).context(TensorSnafu)
+    Ok(flat.try_reshape([query_length as isize, key_length as isize])?)
 }
 
 /// Compute the un-gated position bias `(1, total_num_heads, L, L)` from the
@@ -94,11 +93,11 @@ pub fn compute_position_bias(
     let idx = bucket_index_tensor(query_len, key_len, num_buckets, max_distance)?;
     // Embedding lookup: (L, L) indices into (num_buckets, total_num_heads) →
     // (L, L, total_num_heads).
-    let bias = rel_attn_embed.embedding(&idx).context(TensorSnafu)?;
+    let bias = rel_attn_embed.embedding(&idx)?;
     // → (total_num_heads, L, L)
-    let bias = bias.try_permute(&[2, 0, 1]).context(TensorSnafu)?;
+    let bias = bias.try_permute(&[2, 0, 1])?;
     // → (1, total_num_heads, L, L) for broadcast against batch dim.
-    let bias = bias.try_unsqueeze(0).context(TensorSnafu)?;
+    let bias = bias.try_unsqueeze(0)?;
     Ok(bias.contiguous())
 }
 
@@ -188,9 +187,8 @@ impl GatedRelPosAttention {
     /// Python ref: `WavLMSelfAttention.forward` (components.py:668-725)
     /// + `SelfAttention.forward` (components.py:429-486)
     pub fn forward(&self, x: &Tensor, position_bias: &Tensor) -> Result<Tensor> {
-        let x_shape = x.shape().context(TensorSnafu)?;
-        let bsz = x_shape[0].clone();
-        let seq_len: usize = x_shape[1].as_const().context(SymbolicShapeSnafu { what: "attention" })?;
+        let bsz = x.dim(0)?;
+        let seq_len = x.dim_const(1)?;
         let b = bsz.clone();
         let l = seq_len;
         let nk = self.num_kept();
@@ -203,11 +201,7 @@ impl GatedRelPosAttention {
 
         // Py:703  query_layer = query.view(bsz, seq_len, self.total_num_heads, -1)
         // Py:704  query_layer = query_layer.permute(0, 2, 1, 3)
-        let query_layer = x
-            .view(&[b.clone(), l.into(), h.into(), hd.into()])
-            .context(TensorSnafu)?
-            .try_permute(&[0, 2, 1, 3])
-            .context(TensorSnafu)?; // (B, h, L, hd)
+        let query_layer = x.view(&[b.clone(), l.into(), h.into(), hd.into()])?.try_permute(&[0, 2, 1, 3])?; // (B, h, L, hd)
 
         // Py:706-708  gate_a, gate_b = torch.sigmoid(
         //   self.gru_rel_pos_linear(query_layer).view(bsz, h, seq_len, 2, 4).sum(-1)
@@ -216,40 +210,34 @@ impl GatedRelPosAttention {
             .linear()
             .weight(&self.gru_rel_pos_linear_weight)
             .bias(&self.gru_rel_pos_linear_bias)
-            .call()
-            .context(TensorSnafu)? // (B, h, L, 8)
-            .view(&[b.clone(), h.into(), l.into(), 2usize.into(), 4usize.into()])
-            .context(TensorSnafu)?
+            .call()?
+            // (B, h, L, 8)
+            .view(&[b.clone(), h.into(), l.into(), 2usize.into(), 4usize.into()])?
             .sum_with()
             .axes(AxisSpec::Single(-1))
             .keepdim(false)
-            .call()
-            .context(TensorSnafu)? // (B, h, L, 2)
-            .sigmoid()
-            .context(TensorSnafu)?;
-        let mut gate_chunks = gate_raw.chunk(2, -1).context(TensorSnafu)?;
+            .call()?
+            // (B, h, L, 2)
+            .sigmoid()?;
+        let mut gate_chunks = gate_raw.chunk(2, -1)?;
         let gate_b = gate_chunks.pop().expect("chunk(2) yields 2 parts");
         let gate_a = gate_chunks.pop().expect("chunk(2) yields 2 parts");
 
         // Py:709  gate_a_1 = gate_a * (gate_b * self.gru_rel_pos_const - 1.0) + 2.0
-        let one = Tensor::const_(1.0, gate_b.uop().dtype());
-        let two = Tensor::const_(2.0, gate_b.uop().dtype());
-        let gate_a_1 = gate_a
-            .try_mul(&gate_b.try_mul(&self.gru_rel_pos_const).context(TensorSnafu)?.try_sub(&one).context(TensorSnafu)?)
-            .context(TensorSnafu)?
-            .try_add(&two)
-            .context(TensorSnafu)?; // (B, h, L, 1)
+        let one = Tensor::const_(1.0, gate_b.dtype());
+        let two = Tensor::const_(2.0, gate_b.dtype());
+        let gate_a_1 = gate_a.try_mul(&gate_b.try_mul(&self.gru_rel_pos_const)?.try_sub(&one)?)?.try_add(&two)?; // (B, h, L, 1)
 
         // =================================================================
         // Gated position bias (lines 710-713)
         // =================================================================
 
         // Py:710  attn_mask_rel_pos = gate_a_1.view(bsz * h, -1, 1) * position_bias
-        let attn_mask_rel_pos = gate_a_1.try_mul(position_bias).context(TensorSnafu)?; // (B, h, L, L)
+        let attn_mask_rel_pos = gate_a_1.try_mul(position_bias)?; // (B, h, L, L)
 
         // Py:712  attn_mask_rel_pos = attn_mask_rel_pos.view((-1, seq_len, seq_len))
         // Py:713  attn_mask_rel_pos = attn_mask_rel_pos.reshape(bsz, h, seq_len, seq_len)[:, self.remaining_heads, :, :]
-        let attn_mask = attn_mask_rel_pos.getitem(s![.., self.remaining_heads.clone(), .., ..]).context(TensorSnafu)?; // (B, nk, L, L)
+        let attn_mask = attn_mask_rel_pos.getitem(s![.., self.remaining_heads.clone(), .., ..])?; // (B, nk, L, L)
 
         // =================================================================
         // Q / K / V projections (SelfAttention.forward, lines 455-458)
@@ -263,32 +251,23 @@ impl GatedRelPosAttention {
             .linear()
             .weight(&self.q_weight)
             .bias(&self.q_bias)
-            .call()
-            .context(TensorSnafu)?
-            .view(&[b.clone(), l.into(), nk.into(), hd.into()])
-            .context(TensorSnafu)?
-            .try_transpose(2, 1)
-            .context(TensorSnafu)?; // (B, nk, L, hd)
+            .call()?
+            .view(&[b.clone(), l.into(), nk.into(), hd.into()])?
+            .try_transpose(2, 1)?; // (B, nk, L, hd)
         let k = x
             .linear()
             .weight(&self.k_weight)
             .bias(&self.k_bias)
-            .call()
-            .context(TensorSnafu)?
-            .view(&[b.clone(), l.into(), nk.into(), hd.into()])
-            .context(TensorSnafu)?
-            .try_permute(&[0, 2, 3, 1])
-            .context(TensorSnafu)?; // (B, nk, hd, L)
+            .call()?
+            .view(&[b.clone(), l.into(), nk.into(), hd.into()])?
+            .try_permute(&[0, 2, 3, 1])?; // (B, nk, hd, L)
         let v = x
             .linear()
             .weight(&self.v_weight)
             .bias(&self.v_bias)
-            .call()
-            .context(TensorSnafu)?
-            .view(&[b.clone(), l.into(), nk.into(), hd.into()])
-            .context(TensorSnafu)?
-            .try_transpose(2, 1)
-            .context(TensorSnafu)?; // (B, nk, L, hd)
+            .call()?
+            .view(&[b.clone(), l.into(), nk.into(), hd.into()])?
+            .try_transpose(2, 1)?; // (B, nk, L, hd)
 
         // =================================================================
         // Scaled dot-product attention (lines 461-472)
@@ -296,35 +275,31 @@ impl GatedRelPosAttention {
 
         // Py:461  weights = (self.scaling * q) @ k  # B, nH, L, L
         let scaling = (hd as f32).powf(-0.5);
-        let scaling_t = Tensor::const_(scaling, q.uop().dtype());
-        let weights = q.try_mul(&scaling_t).context(TensorSnafu)?.matmul(&k).context(TensorSnafu)?; // (B, nk, L, L)
+        let scaling_t = Tensor::const_(scaling, q.dtype());
+        let weights = q.try_mul(&scaling_t)?.matmul(&k)?; // (B, nk, L, L)
 
         // Py:463  weights += attention_mask
-        let weights = weights.try_add(&attn_mask).context(TensorSnafu)?;
+        let weights = weights.try_add(&attn_mask)?;
 
         // Py:467  weights = weights - weights.max(dim=-1, keepdim=True)[0]
         // Py:469  weights = torch.nn.functional.softmax(weights, dim=-1)
         // `softmax` subtracts the row max itself, and the reference's explicit
         // subtraction changes nothing bit-for-bit: the row max of `x - m` is
         // exactly 0, so it would only add a second (all-zero) reduce.
-        let weights = weights.softmax(-1).context(TensorSnafu)?;
+        let weights = weights.softmax(-1)?;
 
         // Py:472  output = weights @ v  # B, nH, L, Hd
-        let output = weights.matmul(&v).context(TensorSnafu)?; // (B, nk, L, hd)
+        let output = weights.matmul(&v)?; // (B, nk, L, hd)
 
         // =================================================================
         // Output projection (lines 478-480)
         // =================================================================
 
         // Py:478  output = output.transpose(2, 1).reshape(batch_size, length, nH * Hd)
-        let output = output
-            .try_transpose(2, 1)
-            .context(TensorSnafu)?
-            .view(&[b, l.into(), (nk * hd).into()])
-            .context(TensorSnafu)?;
+        let output = output.try_transpose(2, 1)?.view(&[b, l.into(), (nk * hd).into()])?;
 
         // Py:480  output = self.out_proj(output)
-        output.linear().weight(&self.out_weight).bias(&self.out_bias).call().context(TensorSnafu)
+        Ok(output.linear().weight(&self.out_weight).bias(&self.out_bias).call()?)
     }
 }
 

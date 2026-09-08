@@ -9,14 +9,14 @@
 //! directly instead of constructing a zeros index tensor — simpler and avoids
 //! a symbolic-shape dependency on the index.
 
-use snafu::{OptionExt, ResultExt};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::normalization::LayerNormWeights;
 use super::position_ids::position_ids_from_input_ids;
 
@@ -50,17 +50,16 @@ impl XlmRobertaEmbeddings {
 
     /// Forward. `input_ids`: `(B, L)` int → `(B, L, D)`.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let shape = input_ids.shape().context(TensorSnafu)?;
-        let _l: usize = shape[1].as_const().context(SymbolicShapeSnafu { what: "embeddings" })?;
+        let _l = input_ids.dim_const(1)?;
 
-        let word = self.word_embeddings.embedding(input_ids).context(TensorSnafu)?;
+        let word = self.word_embeddings.embedding(input_ids)?;
 
         let pos_ids = position_ids_from_input_ids(input_ids, self.pad_token_id)?;
-        let pos = self.position_embeddings.embedding(&pos_ids).context(TensorSnafu)?;
+        let pos = self.position_embeddings.embedding(&pos_ids)?;
 
-        let tok_type = self.token_type_embeddings.try_unsqueeze(0).context(TensorSnafu)?;
+        let tok_type = self.token_type_embeddings.try_unsqueeze(0)?;
 
-        let h = word.try_add(&pos).context(TensorSnafu)?.try_add(&tok_type).context(TensorSnafu)?;
+        let h = word.try_add(&pos)?.try_add(&tok_type)?;
         self.norm.apply(&h)
     }
 }
