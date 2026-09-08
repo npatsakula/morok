@@ -43,10 +43,10 @@ use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
-    let OnnxModel { mut outputs, .. } = importer.import("model.onnx", &[])?;
+    let OnnxModel { outputs, .. } = importer.import("model.onnx", &[])?;
 
     // 一次性调度所有输出，统一执行
-    let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    let outs: Vec<&Tensor> = outputs.values().collect();
     Tensor::realize_batch(outs)?;
 
     for (name, tensor) in &outputs {
@@ -66,7 +66,7 @@ use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
-    let OnnxModel { mut inputs, mut outputs, .. } = importer.import("model.onnx", &[])?;
+    let OnnxModel { mut inputs, outputs, .. } = importer.import("model.onnx", &[])?;
 
     // 分配输入数据（惰性——暂不分配内存）
     let input = inputs.remove("input").unwrap();
@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 一次性调度所有输出，统一执行
     //（内部自动解析输入的 assign——无需单独 realize）
-    let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    let outs: Vec<&Tensor> = outputs.values().collect();
     Tensor::realize_batch(outs)?;
     Ok(())
 }
@@ -125,14 +125,14 @@ x.conv()
     .call()?
 ```
 
-**多步分解** — BatchNormalization、Attention 和 Mod 等算子需要中间计算。例如，Python 风格的整数 `Mod` 被分解为截断取模 + 符号调整：
+**多步分解** — BatchNormalization、Attention 和 Mod 等算子需要中间计算。`Mod` 会根据 `fmod` 属性和输入 dtype 从四种分解中挑一种；浮点的 Python 风格分支是 `x - floor(x / y) * y`：
 
 ```rust
-let trunc_mod = x.try_mod(y)?;
-let signs_differ = trunc_mod.bitwise_xor(y)?.try_lt(&zero)?;
-let needs_adj = mod_ne_zero.bitwise_and(&signs_differ)?;
-trunc_mod.try_add(&y.where_(&needs_adj, &zero)?)?
+let div = x.try_div(y)?;
+x.try_sub(&div.floor().try_mul(y)?)?
 ```
+
+注意 `floor()` 后面没有 `?`。一元舍入操作（`floor`、`ceil`、`round`、`trunc`），以及 `cast`、`neg`、`abs`、`square` 和 `sign`，都不会失败，直接返回普通的 `Tensor`。`BitwiseAnd`/`Or`/`Xor` 和 `BitShift` 用到的位运算是 `try_bitand`、`try_bitor`、`try_bitxor`、`try_shl` 和 `try_shr`（也可以写成 `&`、`|`、`^`、`<<`、`>>`，它们返回 `Result<Tensor>`）。
 
 ### 属性验证
 
@@ -218,6 +218,8 @@ ONNX:    if condition { then_branch } else { else_branch }
 Svod:   then_result.where_(&condition, &else_result)
 ```
 
+`where_` 读作"在条件成立的地方保留 `self`"；`condition.select(&then_result, &else_result)` 是同一个操作从掩码一侧的写法，两个分支中的任意一个都可以是裸标量。
+
 这实现了**一次 trace，多次运行**——编译后的图在运行时可以处理任何条件值。但它有一个硬性约束：**两个分支必须产生相同的输出形状和 DType。** 形状多态的模型（即 then 分支产生 `[3, 4]` 而 else 分支产生 `[5, 6]`）无法 trace。
 
 在实践中，大多数带有 `If` 节点的 ONNX 模型都满足此约束，因为它们使用条件逻辑进行值选择，而非改变形状的控制流。
@@ -232,7 +234,7 @@ Svod:   then_result.where_(&condition, &else_result)
 
 ```rust
 // Realize all outputs at once (shares compilation and execution)
-let outputs: Vec<&mut Tensor> = model.outputs.values_mut().collect();
+let outputs: Vec<&Tensor> = model.outputs.values().collect();
 Tensor::realize_batch(outputs)?;
 ```
 
@@ -240,7 +242,7 @@ Tensor::realize_batch(outputs)?;
 `tensor/src/test/unit/variable.rs::test_prepare_execute_loop`）：
 
 ```rust
-let OnnxModel { mut inputs, mut outputs, variables } =
+let OnnxModel { mut inputs, outputs, variables } =
     importer.import("model.onnx", &[("batch", 1)])?;
 
 // 1. Assign initial data (lazy — no allocation yet)
@@ -248,7 +250,7 @@ let input = inputs.remove("audio").unwrap();
 input.assign(&Tensor::from_slice(&first_frame));
 
 // 2. Compile the execution plan (resolves assigns, allocates buffers)
-let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+let outs: Vec<&Tensor> = outputs.values().collect();
 let mut plan = Tensor::prepare_batch(outs)?;
 plan.execute()?;  // first run
 
@@ -274,7 +276,7 @@ plan.execute_with_vars(&[bound.as_var_val()])?;
 | 量化 | DequantizeLinear、QuantizeLinear | 需要 IR 中的量化 DType 支持 |
 | 序列操作 | SequenceConstruct、SequenceAt | 非张量类型不在 Svod 的类型系统中 |
 | 随机数 | RandomNormal、RandomUniform | 有状态 RNG 尚未实现 |
-| 信号处理 | DFT、STFT、MelWeightMatrix | 低优先级；小众用例 |
+| 信号处理 | DFT、STFT、MelWeightMatrix | 尚未接入导入器（tensor crate 自身提供了 `stft` / `istft`） |
 | 文本 | StringNormalizer、TfIdfVectorizer | 不支持字符串类型 |
 
 用到这些算子的模型，可以用 `ort`（ONNX Runtime 封装），它覆盖完整规范。
@@ -302,7 +304,8 @@ let model = importer.import("model.onnx", &[])?;
 
 println!("Inputs:");
 for (name, tensor) in &model.inputs {
-    println!("  {name}: {:?}", tensor.shape());
+    // Tensor's Debug prints shape, dtype, device and whether it is realized
+    println!("  {name}: {tensor:?}");
 }
 
 println!("Outputs: {:?}", model.outputs.keys().collect::<Vec<_>>());

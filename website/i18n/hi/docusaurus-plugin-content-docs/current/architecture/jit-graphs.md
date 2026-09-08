@@ -60,13 +60,50 @@ jit_wrapper! {
 |---|---|---|
 | `WrapperName(ModelType) { ... }` | generated struct का नाम और उस model का type जो build closure को मिलता है | हाँ |
 | `input_name: Tensor` lines | wrapper द्वारा expose किए गए हर input के लिए एक; `: Tensor` annotation केवल informational है | optional (आमतौर पर एक या ज़्यादा) |
+| `inputs { ... }` | वही slots एक block के अंदर, जहाँ `#[unbatched]` और `[Tensor; N]` भी allowed हैं | optional |
 | `vars { name: (min, max), ... }` | compile-time bounds के साथ symbolic shape variables | optional |
+| `batch_var name: (min, max)` | एक ऐसा var जो हर batched input के dim 0 को भी उसी तक सिकोड़ देता है | optional |
+| `state { name, ... }` | वे inputs जिनमें plan लिखता भी है, calls के बीच जगह पर ही recycle होते हैं | optional |
 | `outputs { name, ... }` | हर output के लिए एक नामित buffer accessor; तब `build` closure इसी क्रम में उतने ही tensors का tuple return करती है | optional |
 | `build(args...) { ... }` | closure जो inputs और vars से output tensor बनाती है; `model` scope में होता है | हाँ |
 
-`build` arguments में हर एक को या तो किसी input का या किसी declared var का नाम होना चाहिए (macro expansion time पर ऐसे नामों को reject कर देता है जो match नहीं होते)। Block के अंदर, हर input एक `&Tensor` होता है (macro `prepare()` चलने पर एक zero-initialized placeholder allocate करता है), हर var एक `svod_tensor::BoundVariable` होता है जो पहले से अपने upper bound से bound होता है — उसे आगे `&name` के रूप में pass करें — और `model` wrapper की owned model value का shared reference होता है। Closure किसी भी `E: std::error::Error + Send + Sync + 'static` के लिए `Result<Tensor, E>` return करती है; failures `JitError::Build` के रूप में सामने आती हैं।
+`build` arguments में हर एक को या तो किसी input का या किसी declared var का नाम होना चाहिए (macro expansion time पर ऐसे नामों को reject कर देता है जो match नहीं होते)। Block के अंदर, हर input एक `&Tensor` होता है — या array slot के लिए एक `[&Tensor; N]` — (macro `prepare()` चलने पर हर buffer के लिए एक zero-initialized placeholder allocate करता है), हर var एक `svod_tensor::BoundVariable` होता है जो पहले से अपने upper bound से bound होता है — उसे आगे `&name` के रूप में pass करें — और `model` wrapper की owned model value का shared reference होता है। Closure किसी भी `E: std::error::Error + Send + Sync + 'static` के लिए `Result<Tensor, E>` return करती है; failures `JitError::Build` के रूप में सामने आती हैं।
 
 `outputs` block के बिना closure एक अकेला `Tensor` return करती है, जो `output()` के ज़रिए पहुँच में होता है। एक `outputs` block के साथ वह ठीक उतने ही tensors का tuple return करती है और हर एक को declaration order के हिसाब से अपना नामित `&Buffer` accessor मिलता है। अगर scheduler ने उनमें से किसी को fuse या elide कर दिया होता तो positional accessors चुपचाप misalign हो जाते, इसलिए इसके बजाय `prepare()` `JitError::OutputCountMismatch` के साथ fail होता है।
+
+---
+
+## Array slots, batch variables और state
+
+Declaration के block form तीन ऐसी चीज़ें जोड़ते हैं जिनकी एक streaming model को ज़रूरत होती है। ये सब optional हैं; पुराने flat form के विरुद्ध लिखा गया wrapper बिना किसी बदलाव के काम करता रहता है।
+
+```rust
+jit_wrapper! {
+    StepJit(StepModel) {
+        inputs {
+            x: Tensor,
+            #[unbatched] bias: Tensor,
+            taps: [Tensor; 3],
+        }
+        batch_var b: (1, 4),
+        state { h: Tensor, tail: [Tensor; 2] }
+        outputs { emitted }
+
+        // returns (emitted, h, tail): declared outputs first, then state
+        build(x, bias, taps, h, tail) {
+            model.step(x, bias, taps, h, tail)
+        }
+    }
+}
+```
+
+**`[Tensor; N]` slots** एक ही नाम के पीछे N buffers रखते हैं: `prepare` `[InputSpec; N]` लेता है, build closure को `[&Tensor; N]` मिलता है, और generated accessors एक leaf index लेते हैं — `jit.taps_view_mut::<f32>(1)?`। Outputs भी arrays हो सकते हैं।
+
+**`batch_var b: (min, max)`** एक symbolic variable declare करता है *और* placeholders realize होते ही हर batched input के dim 0 को उस तक सिकोड़ देता है, ताकि एक ही plan batch sizes की एक range serve कर सके। `#[unbatched]` किसी input को इससे बाहर रखता है — एक shared bias, या ऐसी table जिसका leading axis batch नहीं है। उसे हर call पर generated `execute_bound(4)` से bind करें।
+
+**`state { ... }`** slots वे inputs हैं जिनमें plan लिखता भी है। Build tuple हर एक के लिए एक नई value लेकर आता है, macro उसे सीधे उसी slot के अपने device-local buffer में वापस assign कर देता है, और अगला `execute()` उसे वहीं से पढ़ता है — एक ऐसी recurrence जो कभी host तक round-trip नहीं करती। State slots outputs के रूप में expose नहीं होते; `reset()` नई sequence के लिए उन सबको zero कर देता है।
+
+Build tuple में हर declared output slot के लिए एक element होता है plus हर state slot के लिए एक — और जब उनमें से कुल एक ही हो तो कोई tuple होता ही नहीं।
 
 ---
 
@@ -86,10 +123,11 @@ jit_wrapper! {
 
 एक wider range एक ज़्यादा general kernel generate करती है जिसे range की हर shape handle करनी पड़ती है; एक tighter range optimizer को specialize करने देती है। जब value कभी नहीं बदलती तब `with_<name>_fixed` से var को pin करें, और जब कोई outer caller model की hard ceiling से छोटा maximum advertise करे तब upper bound को सिकोड़ें।
 
-Execute time पर, actual values `execute_with_vars` के माध्यम से pass करें:
+Execute time पर, actual values `execute_with_vars` के माध्यम से pass करें, या `execute_bound` के माध्यम से, जो हर declared variable के लिए declaration order में एक `i64` लेता है और उसे आगे forward कर देता है:
 
 ```rust
 jit.execute_with_vars(&[("b", batch as i64), ("t", time as i64)])?;
+jit.execute_bound(batch as i64, time as i64)?;   // same thing, positionally
 ```
 
 हर pair एक var bind करता है; जो vars listed नहीं हैं वे जो भी value रखते हैं उसे बनाए रखते हैं — उनका `prepare()`-time upper bound, या वह value जिस पर पिछला `execute_with_vars` उन्हें छोड़ गया था। Bindings sticky हैं, per-call नहीं। var की declared `[min, max]` से बाहर की value error नहीं बल्कि एक out-of-bounds access है: buffers `max` के हिसाब से allocate होते हैं।
@@ -106,9 +144,13 @@ Macro wrapper के life cycle के हर phase के लिए एक meth
 | `with_<var>_bound` / `with_<var>_min_bound` / `with_<var>_fixed` | `new` और `prepare` के बीच | shape envelope configure करें |
 | `prepare(input1: InputSpec, ...)` | one-time | graph build, patterns चलाएँ, kernels compile, buffers allocate; `PrepareConfig::from_env()` पढ़ता है |
 | `prepare_with_config(..., &PrepareConfig)` | one-time | `prepare` की तरह लेकिन explicit config के साथ |
-| `<input>_mut() -> Result<&mut Buffer>` | per step | हर declared input के लिए typed accessor |
+| `<input>_mut() -> Result<&mut Buffer>` | per step | हर declared input के लिए raw buffer |
+| `<input>_view_mut::<T>() -> Result<ArrayViewMutD<T>>` | per step | उस buffer पर typed write view, dtype-checked |
 | `output() -> Result<&Buffer>` | per step | prepared graph का output |
+| `<output>_shape() / _view::<T>() / _to_vec::<T>()` | per step | live output shape और reads, जो मौजूदा variable bindings के विरुद्ध resolve होते हैं |
+| `reset() -> Result<()>` | per step | हर `state` slot को zero करें |
 | `execute() -> Result<()>` | per step | मौजूदा input buffers के साथ replay |
+| `execute_bound(v1, v2, ...) -> Result<()>` | per step | replay, हर declared variable को positionally bind करते हुए |
 | `execute_with_vars(&[(name, value)]) -> Result<()>` | per step | replay और एक या ज़्यादा symbolic variables rebind |
 | `execute_profiled` / `execute_with_vars_profiled` | optional | non-profiled variants की तरह लेकिन `Vec<KernelProfile>` return |
 | `execute_profiled_static()` | optional | `ExecutionPlan::profile` के ज़रिए एक profiled run, जो last stage के kernels return करता है |
@@ -130,7 +172,9 @@ Macro wrapper के life cycle के हर phase के लिए एक meth
 
 ## `InputSpec`
 
-`prepare()` हर declared input के लिए एक `InputSpec` लेता है:
+`InputSpec`, `JitError` और वे buffer helpers जिनमें macro expand होता है, `svod_tensor::jit` में रहते हैं, इसलिए किसी `jit_wrapper!` को host करने वाले crate को केवल उसी dependency की ज़रूरत होती है (`svod_model::jit` पुराने paths के लिए उन्हें re-export करता है)।
+
+`prepare()` हर declared input के लिए एक `InputSpec` लेता है — या हर array slot के लिए एक `[InputSpec; N]`:
 
 ```rust
 pub struct InputSpec {
@@ -149,39 +193,30 @@ impl InputSpec {
 }
 ```
 
-Macro shape और dtype का उपयोग build closure invoke करने से पहले एक zero-initialized placeholder tensor allocate करने के लिए करता है। Callers ख़ुद `Tensor::zeros(...).realize()` placeholders नहीं बनाते। Shape अधिकतम input size बन जाती है; symbolic variables execute time पर इसे `try_shrink` जैसी operations के माध्यम से सिकोड़ते हैं — यह एक coding pattern है, wrapper द्वारा enforce किया गया runtime contract नहीं। `device_local()` उन inputs के लिए host mapping हटा देता है जिन्हें host केवल `copyin` से लिखता है या on-device refill करता है — वह recurrent state जिसे host को हर step पर देखने की ज़रूरत नहीं होती।
+Macro shape और dtype का उपयोग build closure invoke करने से पहले एक zero-initialized placeholder tensor allocate करने के लिए करता है। Callers ख़ुद `Tensor::zeros(...).realize()` placeholders नहीं बनाते। Shape अधिकतम input size बन जाती है; symbolic variables execute time पर इसे `try_shrink` जैसी operations के माध्यम से सिकोड़ते हैं — यह एक coding pattern है, wrapper द्वारा enforce किया गया runtime contract नहीं। `InputSpec::device_local()` उन inputs के लिए host mapping हटा देता है जिन्हें host केवल `copyin` से लिखता है या on-device refill करता है; `state` slots अपने आप उसी तरह allocate होते हैं। Output side पर, `PrepareConfig::device_local()` plan के outputs के लिए वही idea है — यह `device_local_outputs` set किया हुआ `from_env()` है।
 
 ---
 
 ## Recurrent execution
 
-Recurrent models calls के बीच एक host-side LSTM state reuse करते हैं। उस pattern के लिए wrapper है `JitRecurrent<J>`। यह एक `jit_wrapper!`-generated JIT लेता है जो `RecurrentJit` trait भी implement करता है, साथ ही एक initial `LstmState` और `f32` elements में head length:
+किसी recurrent model का state device पर ही रहता है: उसे `state { ... }` में declare करें और हर step एक `execute()` भर है, न कोई host round trip और न कोई packing helper।
 
 ```rust
-pub struct LstmState {
-    pub h: Vec<f32>,
-    pub c: Vec<f32>,
-}
-
-pub trait RecurrentJit {
-    fn pack_state(&mut self, state: &LstmState) -> Result<()>;
-    fn execute_step(&mut self) -> Result<()>;
-    fn output_buffer(&self) -> Result<&Buffer>;
+jit.reset()?;                                    // zero the state, new sequence
+for chunk in chunks {
+    for (slot, v) in jit.x_view_mut::<f32>()?.iter_mut().zip(chunk) {
+        *slot = v;                               // per-step input, written in place
+    }
+    jit.execute()?;                              // reads state, writes it back
+    let frame = jit.emitted_to_vec::<f32>()?;    // only the emitted head crosses
 }
 ```
 
-:::tip[Output layout contract]
-JIT का output buffer last axis के साथ `[head | h_flat | c_flat]` का एक flat `f32` block होना चाहिए, जहाँ `h_flat` और `c_flat` की length क्रमशः `state.h.len()` और `state.c.len()` होती है। `JitRecurrent::new` construction पर output buffer के size को एक बार declared head plus state size के विरुद्ध check करता है, और math match न हो तो `JitError::OutputLayoutMismatch` return करता है। यह build-closure drift को construction time पर पकड़ लेता है बजाय इसके कि एक silent mis-split downstream values को corrupt करे।
+:::tip[पहले पढ़ें, फिर लिखें — क्रम का नियम]
+हर state buffer जगह पर ही recycle होता है, इसलिए एक `build` के अंदर कोई slot किसी दूसरे slot की *नई* value पर निर्भर नहीं होना चाहिए: per-buffer ordering तभी असंदिग्ध है जब हर slot उन्हीं values से आगे बढ़े जिनके साथ step में entry हुई थी। नई values inputs और पुराने state से derive करें, फिर उन सबको build tuple में return करें।
 :::
 
-`step(|jit| pack_inputs(jit))` का हर call एक recurrent iteration चलाता है:
-
-1. Closure per-step non-state inputs (audio chunk, token id, encoder frame, ...) JIT के typed `*_mut` accessors के माध्यम से लिखती है।
-2. `RecurrentJit::pack_state` मौजूदा host state को JIT के state input buffers में copy करता है।
-3. `execute_step` plan replay करता है।
-4. Wrapper output buffer को head, नए `h`, नए `c` में split करता है, host state को in place update करता है, और head slice को `&[f32]` के रूप में return करता है।
-
-`reset()` JIT को छुए बिना host state को zero कर देता है, ready for a new sequence। `last_timing` profiling के लिए सबसे recent per-step `pack` / `exec` / `read` durations expose करता है।
+State buffers device-local allocate होते हैं, इसलिए उन्हें कुछ भी host पर map नहीं करता। सिर्फ़ वही वापस पढ़ें जो caller को असल में चाहिए — declared outputs — `<output>_to_vec` या `<output>_view` के ज़रिए।
 
 ---
 
@@ -200,14 +235,17 @@ jit_wrapper! {
             // Permute [B, d_model, T_sub] → [B, T_sub, d_model] on-device: the
             // RN-T decoder consumes frame-major rows, and doing it here turns
             // a host-side strided transpose into one contiguous copyout.
-            out.cast(svod_dtype::DType::Float32).context(TensorSnafu)?
-                .try_permute(&[0, 2, 1]).context(TensorSnafu)
+            Ok::<_, super::error::Error>(
+                out.cast(svod_dtype::DType::Float32).try_permute(&[0, 2, 1])?
+            )
         }
     }
 }
 ```
 
 Wrapper एक mel-spectrogram input और एक per-batch length vector लेता है और `[B, T_sub, d_model]` produce करता है। `GigaAmTranscriber` plan का size एक ही बार तय करता है: mel length को अगली power of two तक round up किया जाता है ताकि codegen को एक साफ़ factorisation दिखे, और उसे `config.max_mel_frames` पर clamp किया जाता है; batch को इतना cap किया जाता है कि live SDPA score tiles `max_scores_mib` के अंदर रहें। फिर हर chunk `execute()` के ज़रिए वही plan replay करता है।
+
+`cast` infallible है, इसलिए उसे `?` की ज़रूरत नहीं, और model का अपना error type tensor error को एक सादे `?` से सोख लेता है — build closure किसी भी `E: std::error::Error + Send + Sync + 'static` के लिए `Result<_, E>` return करती है।
 
 `out.cast(DType::Float32)` encoder और किसी भी downstream head के बीच fp32 boundary है। Encoder speed के लिए fp16 या bf16 में चल सकता है, लेकिन हर consumer (CTC log-softmax, RN-T predictor और joint) को एक uniform fp32 input दिखता है। Cast को JIT के अंदर रखने का मतलब है कि वह encoder के tail kernels में fuse हो जाता है।
 
@@ -235,9 +273,10 @@ Leading dimension एक var नहीं बल्कि एक fixed `FEATURE_
 
 ```rust
 let mut jit = SileroVadFeatureJit::new(vad);
-let mut config = svod_tensor::PrepareConfig::from_env();
-config.device_local_outputs = true;
-jit.prepare_with_config(InputSpec::f32(&[FEATURE_BATCH, CHUNK_LEN]), &config)?;
+jit.prepare_with_config(
+    InputSpec::f32(&[FEATURE_BATCH, CHUNK_LEN]),
+    &svod_tensor::PrepareConfig::device_local(),
+)?;
 ```
 
 फिर `VadInference::probs` waveform को `FEATURE_BATCH`-size के dispatches में चलती है — `chunks_mut()` में pack करें, `execute()`, valid rows को `copyout_prefix` — और gates को `VadHead::scan` को सौंपती है, जो host पर एक 8-lane `f32x8` LSTM plus sigmoid head है। इस split ने उस path की जगह ली जिसमें हर window पर एक tiny dispatch होता था और जिसकी round-trip latency पूरे model पर हावी थी।
@@ -248,9 +287,9 @@ jit.prepare_with_config(InputSpec::f32(&[FEATURE_BATCH, CHUNK_LEN]), &config)?;
 
 Wrapper graph को एक बार compile करता है और उसे कई बार replay करता है। यह तभी काम करता है जब graph topology `prepare()` time पर fixed हो। कुछ भी जो execute time पर बदल सकता है उसे या तो input buffers के माध्यम से (`*_mut` से) या symbolic vars के माध्यम से (`execute_with_vars` से) flow करना चाहिए। Build closure के अंदर tensor value पर एक branch graph को उस branch तक specialize कर देता है; यह एक build-time decision है, runtime नहीं।
 
-:::note[Pitfalls]
+:::note[सावधानियाँ]
 - Build closure के अंदर एक `Tensor::full(value).realize()` उस value को single prepared plan में bake कर देता है। किसी भी per-call variation के लिए `prepare()` को scratch से दोबारा चलाना पड़ता है — पूरा graph build plus kernel compile। उस per-step setup के लिए जिसे JIT को देखने की ज़रूरत नहीं है, host-side scratch buffers (उदाहरण के लिए `ndarray::Array3`) सही choice हैं।
-- JIT के अंदर dynamic shape handle करने का idiomatic तरीक़ा है एक maximum-sized input पर var-bound length के साथ `try_shrink`, साथ में call site पर `execute_with_vars`। ResNet और YOLO दोनों batch dimension को इसी तरह shrink करते हैं।
+- Dynamic batch handle करने का idiomatic तरीक़ा है `batch_var`, जो आपके लिए हर batched input के dim 0 को सिकोड़ देता है; उसे हर call पर `execute_bound` से bind करें। ResNet और YOLO दोनों एक `images` input, एक `batch_var b: (1, max_batch_size)` और एक output हैं। किसी भी दूसरे dynamic axis के लिए, maximum-sized input पर var-bound length के साथ `try_shrink` plus call site पर `execute_with_vars` इसका manual equivalent है।
 :::
 
 Contract का उल्लंघन दो failure modes में से एक produce करता है: ग़लत results, क्योंकि cached plan एक ऐसी value पर stale assumption के साथ replay होता है जो असल में vary करती निकली; या silent slowness, क्योंकि हर call recompile path में चली जाती है। इन्हें build closure फिर से पढ़कर diagnose करें; kernel output शायद ही मदद करता है।
@@ -270,8 +309,10 @@ Contract का उल्लंघन दो failure modes में से ए�
 | `Build` | build closure ने `Err` return किया; inner error `Box<dyn Error + Send + Sync>` के रूप में preserved है |
 | `Tensor` | `prepare` में या build closure में एक tensor operation fail हुआ |
 | `Device` | एक device या buffer operation fail हुआ |
-| `OutputLayoutMismatch` | `JitRecurrent::new` ने declared head plus state size से अलग output element count देखा |
-| `OutputCountMismatch` | एक multi-output wrapper ने N outputs declare किए लेकिन compiled plan ने अलग संख्या रखी |
+| `OutputCountMismatch` | एक wrapper ने N output plus state slots declare किए लेकिन compiled plan ने अलग संख्या रखी |
+| `DtypeMismatch` | किसी typed view या read ने ऐसा dtype माँगा जो buffer में नहीं है |
+| `ViewOutOfBounds` | किसी live output shape को अपने buffer में मौजूद elements से ज़्यादा चाहिए — bound variables उससे आगे निकल गए जिसके लिए plan compile हुआ था |
+| `InferredOutputDim` | किसी output shape में `-1` dimension था, जिसके लिए substitute करने को कोई live value नहीं है |
 | `Runtime` | kernel execution fail हुआ |
 
 Symbolic-variable setters (`with_<var>_*`) पर configuration mistakes error return करने के बजाय call site पर panic करती हैं, क्योंकि वे किसी plan के अस्तित्व में आने से पहले होती हैं।

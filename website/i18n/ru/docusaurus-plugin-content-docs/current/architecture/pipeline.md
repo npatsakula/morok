@@ -29,12 +29,11 @@ flowchart TD
 
 ```rust
 pub struct Tensor {
-    entry: Arc<TensorEntry>,      // Computation graph
-    buffer: Option<Arc<Buffer>>,  // Materialized data (if any)
+    entry: Arc<TensorEntry>,  // Computation graph + its realized buffer
 }
 ```
 
-`entry` содержит `TensorEntry` с UOp-графом — вычислением, которое этот тензор представляет. `buffer` опционален: у ленивых тензоров его нет, он появляется только после realize.
+`entry` содержит `TensorEntry` с UOp-графом — вычислением, которое этот тензор представляет, — и `OnceLock`-буфер, который заполняет реализация. У ленивого тензора буфера ещё нет, у реализованного он есть, а поскольку буфер живёт в общей записи, а не в хендле, клонирование тензора разделяет и его реализацию. Именно поэтому `realize()`, `prepare()` и `profile()` принимают `&self`.
 
 ### Три способа создать тензор
 
