@@ -77,7 +77,7 @@ fn test_tensor_from_proto_f32() {
     let tensor = make_tensor_proto(raw, vec![2, 3], 1); // FLOAT
 
     let result = tensor_from_proto(&tensor).unwrap();
-    let dims: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let dims = result.dims().unwrap();
     assert_eq!(dims, vec![2, 3]);
     assert_eq!(result.as_vec::<f32>().unwrap(), [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
 }

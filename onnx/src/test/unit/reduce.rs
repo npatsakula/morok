@@ -89,5 +89,5 @@ fn test_argmax_cast_int64() {
     let node = NodeProto::default();
 
     let result = registry.dispatch("ArgMax", "", &[x], &node).unwrap();
-    assert_eq!(result.uop().dtype(), DType::Int64, "ArgMax should always return Int64");
+    assert_eq!(result.dtype(), DType::Int64, "ArgMax should always return Int64");
 }

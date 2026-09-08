@@ -10,11 +10,7 @@ pub(crate) fn op_gather_elements(inputs: &[Option<Tensor>], attrs: &mut Attrs) -
     let x = inp(inputs, 0);
     let idx = inp(inputs, 1);
     let axis = attrs.int("axis", 0) as isize;
-    let x_shape = x.shape()?;
-    let ndim = x_shape.len();
-    let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
-    let dim_size = x_shape[norm_axis].as_const().unwrap() as i64;
-    let normalized_idx = idx.normalize_negative_indices(dim_size)?;
+    let normalized_idx = idx.normalize_negative_indices(x.dim_const(axis)? as i64)?;
     Ok(x.gather(axis, &normalized_idx)?)
 }
 
@@ -63,11 +59,7 @@ pub(crate) fn op_scatter_elements(inputs: &[Option<Tensor>], attrs: &mut Attrs) 
     let x = inp(inputs, 0);
     let idx = inp(inputs, 1);
     let updates = inp(inputs, 2);
-    let x_shape = x.shape()?;
-    let ndim = x_shape.len();
-    let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
-    let dim_size = x_shape[norm_axis].as_const().unwrap() as i64;
-    let norm_idx = idx.normalize_negative_indices(dim_size)?;
+    let norm_idx = idx.normalize_negative_indices(x.dim_const(axis)? as i64)?;
     Ok(match reduction.as_str() {
         "none" => x.scatter(axis, &norm_idx, updates)?,
         other => {

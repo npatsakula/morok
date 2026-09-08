@@ -650,14 +650,13 @@ impl OnnxImporter {
                 details: format!("If node output {i}: else_branch missing output"),
             })?;
 
-            if then_out.shape()? != else_out.shape()? || then_out.uop().dtype() != else_out.uop().dtype() {
+            let (then_shape, else_shape) = (then_out.shape()?, else_out.shape()?);
+            if then_shape != else_shape || then_out.dtype() != else_out.dtype() {
                 return Err(crate::Error::IrConstruction {
                     details: format!(
-                        "If node output {i}: incompatible branches: then={:?}/{:?}, else={:?}/{:?}",
-                        then_out.shape()?,
-                        then_out.uop().dtype(),
-                        else_out.shape()?,
-                        else_out.uop().dtype(),
+                        "If node output {i}: incompatible branches: then={then_shape:?}/{:?}, else={else_shape:?}/{:?}",
+                        then_out.dtype(),
+                        else_out.dtype(),
                     ),
                 });
             }
@@ -691,11 +690,8 @@ impl OnnxImporter {
             Ok(v) => v,
             Err(_) => return Ok(None), // fall back to normal path
         };
-        let idx_shape: Vec<usize> = match idx_tensor.shape().ok().and_then(|s| s.iter().map(|d| d.as_const()).collect())
-        {
-            Some(v) => v,
-            None => return Ok(None), // symbolic index shape, fall back to normal path
-        };
+        // Symbolic index shape falls back to the normal path.
+        let Ok(idx_shape) = idx_tensor.dims() else { return Ok(None) };
 
         let result = crate::registry::gather_const_fast_path(&data, &indices, &idx_shape, axis)?;
         Ok(Some(result))
@@ -778,7 +774,7 @@ fn const_fold_scalar(tensor: Tensor) -> Tensor {
         Some(b) => b,
         None => return tensor,
     };
-    let dtype = tensor.uop().dtype();
+    let dtype = tensor.dtype();
     let bytes_needed = dtype.bytes();
     let mut raw = vec![0u8; bytes_needed];
     if buf.copyout(&mut raw).is_err() {

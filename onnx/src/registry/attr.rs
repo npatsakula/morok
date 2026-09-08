@@ -159,7 +159,7 @@ pub(crate) fn tensor_to_f64_scalar(t: &Tensor) -> Result<f64> {
 /// happens here, so no f64 kernel is required of devices without `double`.
 fn host_f64_values(t: &Tensor, what: &str) -> Result<Vec<f64>> {
     let failed = |e: svod_tensor::error::Error| Error::IrConstruction { details: format!("{what}: {e}") };
-    let dtype = t.uop().dtype();
+    let dtype = t.dtype();
     if dtype.base() == svod_dtype::ScalarDType::Float64 {
         let mut realized = t.clone();
         realized.realize().map_err(failed)?;

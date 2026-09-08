@@ -168,10 +168,7 @@ pub(crate) fn op_slice(inputs: &[Option<Tensor>]) -> Result<Tensor> {
 pub(crate) fn op_split(inputs: &[Option<Tensor>], attrs: &mut Attrs, opset_version: i64) -> Result<Vec<Tensor>> {
     let axis = attrs.int("axis", 0) as isize;
     let data = inp(inputs, 0);
-    let shape = data.shape()?;
-    let ndim = shape.len();
-    let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
-    let dim_size = shape[norm_axis].as_const().unwrap();
+    let dim_size = data.dim_const(axis)?;
 
     // Opset ≤11: split is an attribute (INTS); opset 13+: split is an optional input tensor
     let split_sizes: Vec<usize> = if opset_version < 13 {

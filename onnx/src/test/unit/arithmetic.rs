@@ -163,10 +163,7 @@ svod_tensor::codegen_tests! {
 
             let mut result = registry.dispatch("Mod", "", &[x, y], &node).unwrap();
             result.realize_with(&config).unwrap();
-            assert_eq!(
-                result.uop().shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect::<Vec<_>>(),
-                vec![3, 4]
-            );
+            assert_eq!(result.dims().unwrap(), vec![3, 4]);
             let expected = xs
                 .iter()
                 .enumerate()

@@ -27,7 +27,7 @@ fn values(t: Tensor, config: &PrepareConfig) -> Vec<f32> {
 }
 
 fn dims(t: &Tensor) -> Vec<usize> {
-    t.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect()
+    t.dims().unwrap()
 }
 
 svod_tensor::codegen_tests! {

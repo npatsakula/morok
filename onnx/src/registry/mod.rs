@@ -92,7 +92,7 @@ impl OpRegistry {
             "Div" => {
                 let x = inp(inputs, 0);
                 let y = inp(inputs, 1);
-                vec![if x.uop().dtype().is_int() { x.try_cdiv(y)? } else { x.try_div(y)? }]
+                vec![if x.dtype().is_int() { x.try_cdiv(y)? } else { x.try_div(y)? }]
             }
             "Neg" => vec![inp(inputs, 0).try_neg()?],
             "Abs" => vec![inp(inputs, 0).try_abs()?],
@@ -103,14 +103,14 @@ impl OpRegistry {
                 let y = inp(inputs, 1);
                 vec![if fmod == 1 {
                     // fmod=1: C-style remainder (sign of dividend)
-                    if x.uop().dtype().is_int() {
+                    if x.dtype().is_int() {
                         x.try_cmod(y)?
                     } else {
                         // floats: x - trunc(x/y) * y (primitive MOD is integer-only)
                         let div = x.try_div(y)?;
                         x.try_sub(&div.trunc()?.try_mul(y)?)?
                     }
-                } else if x.uop().dtype().is_int() {
+                } else if x.dtype().is_int() {
                     // fmod=0 integers: Python-style modulo (sign of divisor)
                     x.try_mod(y)?
                 } else {
@@ -269,7 +269,7 @@ impl OpRegistry {
             }
             "CastLike" => {
                 let _saturate = attrs.int("saturate", 1);
-                vec![inp(inputs, 0).cast(inp(inputs, 1).uop().dtype())?]
+                vec![inp(inputs, 0).cast(inp(inputs, 1).dtype())?]
             }
             "BitCast" => {
                 let to = attrs.int("to", 1);
@@ -316,7 +316,7 @@ impl OpRegistry {
             }
             "Range" => {
                 let start_t = inp(inputs, 0);
-                let out_dtype = start_t.uop().dtype();
+                let out_dtype = start_t.dtype();
                 vec![if out_dtype.is_float() {
                     let start = tensor_to_f64_scalar(start_t)?;
                     let limit = tensor_to_f64_scalar(inp(inputs, 1))?;
@@ -342,7 +342,7 @@ impl OpRegistry {
                     .transpose()?
                     .unwrap_or_else(|| Tensor::const_(0.0f64, DType::Float32));
                 vec![if shape_i64.contains(&0) {
-                    Tensor::empty_zero(value.uop().dtype())
+                    Tensor::empty_zero(value.dtype())
                 } else {
                     let shape: Vec<isize> = shape_i64.iter().map(|&v| v as isize).collect();
                     let ones = vec![1isize; shape.len()];
@@ -358,30 +358,21 @@ impl OpRegistry {
                 let axis = attrs.int("axis", 0) as isize;
                 let data = inp(inputs, 0);
                 let idx = inp(inputs, 1);
-                let data_shape = data.shape()?;
-                let ndim = data_shape.len();
-                let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
-                let dim_size = data_shape[norm_axis].as_const().ok_or_else(|| Error::IrConstruction {
-                    details: format!("Gather requires concrete dimension on axis {norm_axis}"),
-                })? as i64;
+                let data_dims = data.dims()?;
+                let norm_axis = if axis < 0 { (data_dims.len() as isize + axis) as usize } else { axis as usize };
                 // Normalize negative indices
-                let idx = idx.normalize_negative_indices(dim_size)?;
+                let idx = idx.normalize_negative_indices(data.dim_const(axis)? as i64)?;
                 // Flatten indices → index_select → reshape to insert indices shape
-                let idx_shape = idx.shape()?;
-                let idx_shape_concrete: Vec<usize> = idx_shape.iter().map(|d| d.as_const().unwrap()).collect();
+                let idx_dims = idx.dims()?;
                 let flat_idx = idx.flatten()?;
                 let selected = data.index_select(norm_axis as isize, &flat_idx)?;
                 // Output shape: data[:axis] + idx_shape + data[axis+1:]
-                let mut out_shape: Vec<isize> = Vec::new();
-                for d in &data_shape[..norm_axis] {
-                    out_shape.push(d.as_const().unwrap() as isize);
-                }
-                for &d in &idx_shape_concrete {
-                    out_shape.push(d as isize);
-                }
-                for d in &data_shape[norm_axis + 1..] {
-                    out_shape.push(d.as_const().unwrap() as isize);
-                }
+                let out_shape: Vec<isize> = data_dims[..norm_axis]
+                    .iter()
+                    .chain(&idx_dims)
+                    .chain(&data_dims[norm_axis + 1..])
+                    .map(|&d| d as isize)
+                    .collect();
                 vec![selected.try_reshape(&out_shape)?]
             }
             "GatherElements" => vec![indexing::op_gather_elements(inputs, &mut attrs)?],
@@ -431,7 +422,7 @@ impl OpRegistry {
             "ReduceL2" => {
                 let (spec, kd) = reduce_attrs(&mut attrs, inputs, opset_version, op_type)?;
                 let x = inp(inputs, 0);
-                let orig_dtype = x.uop().dtype();
+                let orig_dtype = x.dtype();
                 let needs_upcast =
                     matches!(orig_dtype.scalar(), Some(ScalarDType::Float16) | Some(ScalarDType::BFloat16));
                 let x = if needs_upcast { x.cast(DType::Float32)? } else { x.clone() };
@@ -452,11 +443,7 @@ impl OpRegistry {
                 let select_last = attrs.int("select_last_index", 0) == 1;
                 let x = inp(inputs, 0);
                 vec![if select_last {
-                    let shape = x.shape()?;
-                    let na = if axis < 0 { shape.len() as isize + axis } else { axis } as usize;
-                    let ds = shape[na].as_const().ok_or_else(|| Error::IrConstruction {
-                        details: format!("ArgMax select_last_index needs concrete axis {na}"),
-                    })? as i64;
+                    let ds = x.dim_const(axis)? as i64;
                     Tensor::const_(ConstValue::Int(ds - 1), DType::Int64).try_sub(
                         &x.flip(&[axis])?
                             .argmax_with()
@@ -476,11 +463,7 @@ impl OpRegistry {
                 let x = inp(inputs, 0);
                 let neg_x = x.try_neg()?;
                 vec![if select_last {
-                    let shape = x.shape()?;
-                    let na = if axis < 0 { shape.len() as isize + axis } else { axis } as usize;
-                    let ds = shape[na].as_const().ok_or_else(|| Error::IrConstruction {
-                        details: format!("ArgMin select_last_index needs concrete axis {na}"),
-                    })? as i64;
+                    let ds = x.dim_const(axis)? as i64;
                     Tensor::const_(ConstValue::Int(ds - 1), DType::Int64).try_sub(
                         &neg_x
                             .flip(&[axis])?
@@ -588,9 +571,7 @@ impl OpRegistry {
             "GlobalLpPool" => {
                 let x = inp(inputs, 0);
                 let p = attrs.int("p", 2) as usize;
-                let shape = x.shape()?;
-                let kernel: Vec<usize> = shape[2..].iter().map(|s| s.as_const().unwrap()).collect();
-                vec![x.lp_pool().kernel_shape(&kernel).p(p).call()?]
+                vec![x.lp_pool().kernel_shape(&x.dims()?[2..]).p(p).call()?]
             }
             "GlobalMaxPool" => {
                 let x = inp(inputs, 0);
@@ -642,12 +623,12 @@ impl OpRegistry {
             "Binarizer" => {
                 let threshold = attrs.float("threshold", 0.0) as f64;
                 let x = inp(inputs, 0);
-                vec![x.try_gt(&Tensor::const_(threshold, x.uop().dtype()))?.cast(DType::Float32)?]
+                vec![x.try_gt(&Tensor::const_(threshold, x.dtype()))?.cast(DType::Float32)?]
             }
             "Swish" => {
                 let alpha = attrs.float("alpha", 1.0) as f64;
                 let x = inp(inputs, 0);
-                let alpha_t = Tensor::const_(alpha, x.uop().dtype());
+                let alpha_t = Tensor::const_(alpha, x.dtype());
                 vec![x.try_mul(&x.try_mul(&alpha_t)?.sigmoid()?)?]
             }
             "BiasGelu" => {
@@ -668,16 +649,10 @@ impl OpRegistry {
             }
             "EyeLike" => {
                 let x = inp(inputs, 0);
-                let x_shape = x.shape()?;
                 let dtype =
-                    if let Some(dt) = attrs.get("dtype") { convert_onnx_dtype(dt.i as i32)? } else { x.uop().dtype() };
+                    if let Some(dt) = attrs.get("dtype") { convert_onnx_dtype(dt.i as i32)? } else { x.dtype() };
                 let k = attrs.int("k", 0);
-                let h = x_shape[0]
-                    .as_const()
-                    .ok_or_else(|| Error::IrConstruction { details: "EyeLike requires concrete shape".into() })?;
-                let w = x_shape[1]
-                    .as_const()
-                    .ok_or_else(|| Error::IrConstruction { details: "EyeLike requires concrete shape".into() })?;
+                let (h, w) = (x.dim_const(0)?, x.dim_const(1)?);
                 let eye_size = h.min(w);
                 let mut eye = Tensor::eye(eye_size, eye_size, dtype)?;
                 if h != w || k != 0 {
@@ -754,14 +729,9 @@ pub(crate) fn gather_const_fast_path(
     idx_shape: &[usize],
     axis: isize,
 ) -> crate::Result<Tensor> {
-    let data_shape = data.shape().map_err(|e| crate::Error::IrConstruction { details: e.to_string() })?;
-    let ndim = data_shape.len();
-
     // All data dimensions must be concrete (symbolic batch dims not supported in fast path)
-    let concrete_shape: Vec<usize> =
-        data_shape.iter().map(|d| d.as_const()).collect::<Option<Vec<_>>>().ok_or_else(|| {
-            crate::Error::IrConstruction { details: "Gather fast path requires all-concrete data shape".into() }
-        })?;
+    let concrete_shape = data.dims()?;
+    let ndim = concrete_shape.len();
 
     let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
     let dim_size = concrete_shape[norm_axis] as i64;
@@ -786,7 +756,7 @@ pub(crate) fn gather_const_fast_path(
         out_dims.extend_from_slice(&concrete_shape[..norm_axis]);
         out_dims.extend_from_slice(idx_shape);
         out_dims.extend_from_slice(&concrete_shape[norm_axis + 1..]);
-        return Tensor::full(&out_dims, 0.0f32, data.uop().dtype())
+        return Tensor::full(&out_dims, 0.0f32, data.dtype())
             .map_err(|e| crate::Error::IrConstruction { details: e.to_string() });
     }
 

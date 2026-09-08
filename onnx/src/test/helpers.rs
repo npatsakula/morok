@@ -151,12 +151,7 @@ pub(crate) fn run_onnx_light_test(model_path: &str, output_pb_path: &str, config
 
     // 3. Assign deterministic inputs: arange(n)/n (matches ONNX backend test runner)
     for (name, input_tensor) in &result.inputs {
-        let shape: Vec<usize> = input_tensor
-            .shape()
-            .unwrap_or_else(|e| panic!("{test_name}: input '{name}' shape: {e}"))
-            .iter()
-            .map(|d| d.as_const().unwrap_or_else(|| panic!("{test_name}: dynamic dim in '{name}'")))
-            .collect();
+        let shape = input_tensor.dims().unwrap_or_else(|e| panic!("{test_name}: input '{name}' shape: {e}"));
         let n: usize = shape.iter().product();
         let data: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
         let bytes: &[u8] = bytemuck::cast_slice(&data);
@@ -239,13 +234,13 @@ macro_rules! assert_int_exact {
 }
 
 fn assert_tensors_close(actual: &mut Tensor, expected: &Tensor, label: &str, config: &PrepareConfig) {
-    let expected_dtype = expected.uop().dtype();
+    let expected_dtype = expected.dtype();
 
     // Cast actual to match expected dtype if they differ
     let mut actual_cast;
-    let actual: &mut Tensor = if actual.uop().dtype() != expected_dtype {
+    let actual: &mut Tensor = if actual.dtype() != expected_dtype {
         actual_cast = actual.cast(expected_dtype.clone()).unwrap_or_else(|e| {
-            panic!("Output '{label}': dtype cast failed ({:?} -> {expected_dtype:?}): {e}", actual.uop().dtype())
+            panic!("Output '{label}': dtype cast failed ({:?} -> {expected_dtype:?}): {e}", actual.dtype())
         });
         actual_cast.realize_with(config).unwrap_or_else(|e| panic!("Output '{label}': realize after cast failed: {e}"));
         &mut actual_cast

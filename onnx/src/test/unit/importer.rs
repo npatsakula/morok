@@ -277,8 +277,7 @@ fn test_trace_static_shapes() {
     assert!(result.inputs.contains_key("input"));
     assert!(result.outputs.contains_key("output"));
 
-    let input_shape: Vec<usize> =
-        result.inputs["input"].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let input_shape = result.inputs["input"].dims().unwrap();
     assert_eq!(input_shape, vec![2, 3]);
 }
 
@@ -582,7 +581,7 @@ fn test_import_model_static() {
     assert!(onnx_model.variables.is_empty());
 
     // Input has correct shape
-    let shape: Vec<usize> = onnx_model.inputs["x"].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let shape = onnx_model.inputs["x"].dims().unwrap();
     assert_eq!(shape, vec![2, 3]);
 }
 
@@ -657,7 +656,7 @@ fn test_skip_layer_norm_no_optionals() {
     let inputs = vec![Some(x), Some(skip), Some(gamma)];
     let result = registry.dispatch_multi("SkipLayerNormalization", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
     assert_eq!(result.len(), 4);
-    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let dims = result[0].dims().unwrap();
     assert_eq!(dims, [1, 3]);
 }
 
@@ -675,9 +674,9 @@ fn test_embed_layer_norm() {
     let inputs = vec![Some(input_ids), None, Some(word_emb), Some(pos_emb), None, Some(gamma), Some(beta)];
     let result = registry.dispatch_multi("EmbedLayerNormalization", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
     assert_eq!(result.len(), 3);
-    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let dims = result[0].dims().unwrap();
     assert_eq!(dims, [1, 3, 4]);
-    let sum_dims: Vec<usize> = result[2].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let sum_dims = result[2].dims().unwrap();
     assert_eq!(sum_dims, [1, 3, 4]);
 }
 
@@ -700,7 +699,7 @@ fn test_attention_contrib_basic() {
     let inputs = vec![Some(x), Some(weights), Some(bias)];
     let result = registry.dispatch_multi("Attention", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
     assert!(!result.is_empty());
-    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let dims = result[0].dims().unwrap();
     assert_eq!(dims, [1, 2, 4]);
 }
 
@@ -724,7 +723,7 @@ fn test_attention_contrib_causal() {
 
     let inputs = vec![Some(x), Some(weights), Some(bias)];
     let result = registry.dispatch_multi("Attention", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
-    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let dims = result[0].dims().unwrap();
     assert_eq!(dims, [1, 2, 2]);
 }
 
@@ -739,7 +738,7 @@ fn test_attention_onnx_basic() {
     let inputs = vec![Some(q), Some(k), Some(v)];
     let result = registry.dispatch_multi("Attention", "", &inputs, &node, i64::MAX).unwrap();
     assert_eq!(result.len(), 4);
-    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let dims = result[0].dims().unwrap();
     assert_eq!(dims, [1, 2, 2, 2]);
 }
 
@@ -774,7 +773,7 @@ fn test_depth_to_space_dcr() {
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_int("blocksize", 2));
     let result = registry.dispatch("DepthToSpace", "", &[x], &node).unwrap();
-    let shape: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let shape = result.dims().unwrap();
     assert_eq!(shape, vec![1, 2, 2, 2]);
 }
 
@@ -786,7 +785,7 @@ fn test_depth_to_space_crd() {
     node.attribute.push(make_attr_int("blocksize", 2));
     node.attribute.push(make_attr_string("mode", "CRD"));
     let result = registry.dispatch("DepthToSpace", "", &[x], &node).unwrap();
-    let shape: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let shape = result.dims().unwrap();
     assert_eq!(shape, vec![1, 2, 2, 2]);
 }
 
@@ -797,7 +796,7 @@ fn test_space_to_depth() {
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_int("blocksize", 2));
     let result = registry.dispatch("SpaceToDepth", "", &[x], &node).unwrap();
-    let shape: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let shape = result.dims().unwrap();
     assert_eq!(shape, vec![1, 4, 2, 2]);
 }
 
@@ -810,7 +809,7 @@ fn test_affine_grid() {
     node.attribute.push(make_attr_int("align_corners", 0));
     let inputs = vec![Some(theta), Some(size)];
     let result = registry.dispatch_multi("AffineGrid", "", &inputs, &node, i64::MAX).unwrap();
-    let shape: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let shape = result[0].dims().unwrap();
     assert_eq!(shape, vec![1, 2, 2, 2]);
 }
 
@@ -827,7 +826,7 @@ fn test_batch_norm_training() {
     let inputs = vec![Some(x), Some(scale), Some(bias), Some(mean), Some(var)];
     let result = registry.dispatch_multi("BatchNormalization", "", &inputs, &node, i64::MAX).unwrap();
     assert_eq!(result.len(), 3);
-    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let dims = result[0].dims().unwrap();
     assert_eq!(dims, [2, 2, 1, 1]);
 }
 
@@ -1175,7 +1174,7 @@ svod_tensor::codegen_tests! {
         let result = registry.dispatch_multi("RMSNormalization", "", &inputs, &node, i64::MAX).unwrap();
         let mut r = result[0].clone().contiguous();
         r.realize_with(&config).unwrap();
-        let dims: Vec<usize> = r.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let dims = r.dims().unwrap();
         assert_eq!(dims, [1, 4]);
         let view = r.array_view::<f32>().unwrap();
         let rms_inv = 1.0 / (7.5f32 + 1e-5).sqrt();
@@ -1215,7 +1214,7 @@ svod_tensor::codegen_tests! {
         let inputs = vec![Some(x), Some(skip), Some(gamma), Some(beta)];
         let result = registry.dispatch_multi("SkipLayerNormalization", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
         assert_eq!(result.len(), 4);
-        let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let dims = result[0].dims().unwrap();
         assert_eq!(dims, [1, 3]);
         let mut r0 = result[0].clone();
         r0.realize_with(&config).unwrap();
@@ -1243,7 +1242,7 @@ svod_tensor::codegen_tests! {
         let inputs = vec![Some(x), Some(pos_ids), Some(cos_cache), Some(sin_cache)];
         let result = registry.dispatch_multi("RotaryEmbedding", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
         assert_eq!(result.len(), 1);
-        let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let dims = result[0].dims().unwrap();
         assert_eq!(dims, [1, 1, 2, 4]);
         let mut r = result[0].clone();
         r.realize_with(&config).unwrap();
@@ -1265,7 +1264,7 @@ svod_tensor::codegen_tests! {
         let result = registry.dispatch_multi("Attention", "", &inputs, &node, i64::MAX).unwrap();
         let mut r = result[0].clone().contiguous();
         r.realize_with(&config).unwrap();
-        let dims: Vec<usize> = r.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let dims = r.dims().unwrap();
         assert_eq!(dims, [1, 1, 3, 4]);
         let view = r.array_view::<f32>().unwrap();
         assert!((view[[0, 0, 0, 0]] - 1.0).abs() < 1e-4);
@@ -1306,7 +1305,7 @@ svod_tensor::codegen_tests! {
         let x = Tensor::from_ndarray(&array![[[[3.0f32]], [[5.0]]]]);
         let node = NodeProto::default();
         let result = registry.dispatch("MeanVarianceNormalization", "", &[x], &node).unwrap();
-        let shape: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let shape = result.dims().unwrap();
         assert_eq!(shape, vec![1, 2, 1, 1]);
         let mut r = result.contiguous();
         r.realize_with(&config).unwrap();
@@ -1324,7 +1323,7 @@ svod_tensor::codegen_tests! {
         node.attribute.push(make_attr_float("beta", 0.75));
         node.attribute.push(make_attr_float("bias", 1.0));
         let mut result = registry.dispatch("LRN", "", &[x], &node).unwrap();
-        let shape: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let shape = result.dims().unwrap();
         assert_eq!(shape, vec![1, 3, 1, 1]);
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
@@ -1362,7 +1361,7 @@ svod_tensor::codegen_tests! {
         r.realize_with(&config).unwrap();
         let val = r.as_vec::<f32>().unwrap()[0];
         assert!(val > 0.0, "CE loss should be positive, got {val}");
-        let lp_shape: Vec<usize> = result[1].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let lp_shape = result[1].dims().unwrap();
         assert_eq!(lp_shape, vec![2, 3]);
     }
 
@@ -1374,7 +1373,7 @@ svod_tensor::codegen_tests! {
         node.attribute.push(make_attr_int("align_corners", 1));
         let inputs = vec![Some(theta), Some(size)];
         let result = registry.dispatch_multi("AffineGrid", "", &inputs, &node, i64::MAX).unwrap();
-        let shape: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let shape = result[0].dims().unwrap();
         assert_eq!(shape, vec![1, 3, 3, 2]);
         let mut r = result[0].clone().contiguous();
         r.realize_with(&config).unwrap();

@@ -26,7 +26,7 @@ svod_tensor::codegen_tests! {
         let result = registry.dispatch_multi("Conv", "", &inputs, &node, i64::MAX).unwrap();
         let mut result0 = result[0].contiguous();
         result0.realize_with(&config).unwrap();
-        let dims: Vec<usize> = result0.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let dims = result0.dims().unwrap();
         assert_eq!(dims, [1, 1, 2, 2]);
         let view = result0.array_view::<f32>().unwrap();
         assert!((view[[0, 0, 0, 0]] - 45.0).abs() < 1e-4);
@@ -43,7 +43,7 @@ svod_tensor::codegen_tests! {
         let result = registry.dispatch_multi("ConvTranspose", "", &inputs, &node, i64::MAX).unwrap();
         let mut result0 = result[0].contiguous();
         result0.realize_with(&config).unwrap();
-        let dims: Vec<usize> = result0.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let dims = result0.dims().unwrap();
         assert_eq!(dims, [1, 1, 2, 2]);
         let view = result0.array_view::<f32>().unwrap();
         assert!((view[[0, 0, 0, 0]] - 2.0).abs() < 1e-4);
@@ -61,7 +61,7 @@ svod_tensor::codegen_tests! {
         let result = registry.dispatch_multi("AveragePool", "", &inputs, &node, i64::MAX).unwrap();
         let mut result0 = result[0].contiguous();
         result0.realize_with(&config).unwrap();
-        let dims: Vec<usize> = result0.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let dims = result0.dims().unwrap();
         assert_eq!(dims, [1, 1, 2, 2]);
         let view = result0.array_view::<f32>().unwrap();
         assert!((view[[0, 0, 0, 0]] - 2.5).abs() < 1e-4);
@@ -79,7 +79,7 @@ svod_tensor::codegen_tests! {
         assert_eq!(result.len(), 2);
         let mut result0 = result[0].contiguous();
         result0.realize_with(&config).unwrap();
-        let dims: Vec<usize> = result0.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let dims = result0.dims().unwrap();
         assert_eq!(dims, [1, 1, 2, 2]);
         let view = result0.array_view::<f32>().unwrap();
         assert!((view[[0, 0, 0, 0]] - 5.0).abs() < 1e-4);
@@ -97,7 +97,7 @@ svod_tensor::codegen_tests! {
         assert_eq!(result.len(), 2);
         let mut result1 = result[1].contiguous();
         result1.realize_with(&config).unwrap();
-        let dims: Vec<usize> = result1.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let dims = result1.dims().unwrap();
         assert_eq!(dims, [1, 1, 2, 2]);
         let view = result1.array_view::<i64>().unwrap();
         assert_eq!(view[[0, 0, 0, 0]], 5);
@@ -112,7 +112,7 @@ svod_tensor::codegen_tests! {
         let result = registry.dispatch_multi("GlobalAveragePool", "", &inputs, &node, i64::MAX).unwrap();
         let mut result0 = result[0].contiguous();
         result0.realize_with(&config).unwrap();
-        let dims: Vec<usize> = result0.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let dims = result0.dims().unwrap();
         assert_eq!(dims, [1, 2, 1, 1]);
         let view = result0.array_view::<f32>().unwrap();
         assert!((view[[0, 0, 0, 0]] - 4.0).abs() < 1e-4);
@@ -128,7 +128,7 @@ svod_tensor::codegen_tests! {
         let result = registry.dispatch_multi("GlobalMaxPool", "", &inputs, &node, i64::MAX).unwrap();
         let mut result0 = result[0].contiguous();
         result0.realize_with(&config).unwrap();
-        let dims: Vec<usize> = result0.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let dims = result0.dims().unwrap();
         assert_eq!(dims, [1, 2, 1, 1]);
         let view = result0.array_view::<f32>().unwrap();
         assert!((view[[0, 0, 0, 0]] - 8.0).abs() < 1e-4);
@@ -148,7 +148,7 @@ svod_tensor::codegen_tests! {
         assert_eq!(result.len(), 3);
         let mut result0 = result[0].contiguous();
         result0.realize_with(&config).unwrap();
-        let dims: Vec<usize> = result0.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+        let dims = result0.dims().unwrap();
         assert_eq!(dims, [2, 4]);
         let view = result0.array_view::<f32>().unwrap();
         for row in 0..2 {
@@ -170,8 +170,7 @@ fn test_conv_auto_pad_same_upper() {
     node.attribute.push(make_attr_string("auto_pad", "SAME_UPPER"));
 
     let result = registry.dispatch_multi("Conv", "", &inputs, &node, i64::MAX).unwrap();
-    let s = result[0].shape().unwrap();
-    assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![1, 1, 3, 3]);
+    assert_eq!(result[0].dims().unwrap(), vec![1, 1, 3, 3]);
 }
 
 #[test]
@@ -185,8 +184,7 @@ fn test_average_pool_ceil() {
     node.attribute.push(make_attr_int("ceil_mode", 1));
 
     let result = registry.dispatch_multi("AveragePool", "", &inputs, &node, i64::MAX).unwrap();
-    let s = result[0].shape().unwrap();
-    assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![1, 1, 3, 3]);
+    assert_eq!(result[0].dims().unwrap(), vec![1, 1, 3, 3]);
 }
 
 #[test]
@@ -200,7 +198,7 @@ fn test_group_norm() {
     node.attribute.push(make_attr_int("num_groups", 2));
 
     let result = registry.dispatch_multi("GroupNormalization", "", &inputs, &node, i64::MAX).unwrap();
-    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let dims = result[0].dims().unwrap();
     assert_eq!(dims, [1, 4, 2, 2]);
 }
 
@@ -214,7 +212,7 @@ fn test_instance_norm() {
     let node = NodeProto::default();
 
     let result = registry.dispatch_multi("InstanceNormalization", "", &inputs, &node, i64::MAX).unwrap();
-    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let dims = result[0].dims().unwrap();
     assert_eq!(dims, [1, 2, 3, 3]);
 }
 
