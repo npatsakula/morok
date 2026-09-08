@@ -161,7 +161,7 @@ fn streaming_chunks_match_full_causal() {
     let feat_t =
         Tensor::from_slice(feat.clone()).try_reshape([1isize, n_frames as isize, N_MELS as isize]).expect("reshape");
     let caches = FireRedVadStream::zero_caches().expect("caches");
-    let (mut full, _) = model.forward_stream(&feat_t, &caches).expect("forward");
+    let (full, _) = model.forward_stream(&feat_t, &caches).expect("forward");
     full.realize().expect("realize");
     let want = full.as_vec::<f32>().expect("readout");
 
@@ -188,7 +188,7 @@ fn flush_tail_exactness() {
 
     let feat_t = Tensor::from_slice(feat).try_reshape([1isize, n_frames as isize, N_MELS as isize]).expect("reshape");
     let caches = FireRedVadStream::zero_caches().expect("caches");
-    let (mut full, _) = model.forward_stream(&feat_t, &caches).expect("forward");
+    let (full, _) = model.forward_stream(&feat_t, &caches).expect("forward");
     full.realize().expect("realize");
     let want = full.as_vec::<f32>().expect("readout");
 
@@ -221,7 +221,7 @@ fn stream_real_weights_match_golden() {
     let feat_t =
         Tensor::from_slice(feat.clone()).try_reshape([1isize, n_frames as isize, N_MELS as isize]).expect("reshape");
     let caches = FireRedVadStream::zero_caches().expect("caches");
-    let (mut full, _) = model.forward_stream(&feat_t, &caches).expect("forward");
+    let (full, _) = model.forward_stream(&feat_t, &caches).expect("forward");
     full.realize().expect("realize");
     let full_delta = max_abs_delta(&full.as_vec::<f32>().expect("readout"), &probs_full);
     assert!(full_delta < 1e-3, "full causal forward drifted from golden: max |delta| = {full_delta}");

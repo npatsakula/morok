@@ -87,7 +87,7 @@ fn head_forward_output_shape() {
     let hidden = Tensor::from_slice((0..(2 * 5 * d) as i32).map(|i| i as f32).collect::<Vec<_>>())
         .try_reshape([2, 5, d])
         .unwrap();
-    let mut logits = m.head.forward(&hidden).unwrap();
+    let logits = m.head.forward(&hidden).unwrap();
     logits.realize().unwrap();
     let vals = logits.as_vec::<f32>().unwrap();
     assert_eq!(vals.len(), 2 * 5 * v, "(B,L,V) = (2,5,{v})");
@@ -162,7 +162,7 @@ fn mlm_forward_output_shape() {
     let v = cfg.vocab_size;
     let m = ModernBertForMaskedLm::empty(cfg);
     let ids = Tensor::from_slice((0..10i64).collect::<Vec<_>>()).try_reshape([2isize, 5]).unwrap();
-    let mut logits = m.forward(&ids, None).unwrap();
+    let logits = m.forward(&ids, None).unwrap();
     logits.realize().unwrap();
     let vals = logits.as_vec::<f32>().unwrap();
     assert_eq!(vals.len(), 2 * 5 * v, "(B,L,V) = (2,5,{v})");
@@ -172,7 +172,7 @@ fn mlm_forward_output_shape() {
 }
 
 fn realize_vec_f32(t: &svod_tensor::Tensor) -> Vec<f32> {
-    let mut t = t.clone();
+    let t = t.clone();
     t.realize().unwrap();
     t.as_vec::<f32>().unwrap()
 }

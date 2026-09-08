@@ -42,7 +42,7 @@ impl Tensor {
     #[track_caller]
     pub fn sin(&self) -> Result<Tensor> {
         origin_call!("sin");
-        self.uop().try_sin().map(Self::new).context(UOpSnafu)
+        self.uop().try_sin().map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Cosine function: cos(x).
@@ -61,7 +61,7 @@ impl Tensor {
     #[track_caller]
     pub fn cos(&self) -> Result<Tensor> {
         origin_call!("cos");
-        self.uop().try_cos().map(Self::new).context(UOpSnafu)
+        self.uop().try_cos().map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Tangent function: tan(x).
@@ -80,7 +80,7 @@ impl Tensor {
     #[track_caller]
     pub fn tan(&self) -> Result<Tensor> {
         origin_call!("tan");
-        self.uop().try_tan().map(Self::new).context(UOpSnafu)
+        self.uop().try_tan().map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     // =========================================================================
@@ -171,7 +171,7 @@ impl Tensor {
     #[track_caller]
     pub fn erf(&self) -> Result<Tensor> {
         origin_call!("erf");
-        self.uop().erf().map(Self::new).context(UOpSnafu)
+        self.uop().erf().map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Reciprocal: 1/x.
@@ -186,7 +186,7 @@ impl Tensor {
     #[track_caller]
     pub fn reciprocal(&self) -> Result<Tensor> {
         origin_call!("reciprocal");
-        UOp::try_reciprocal(&self.uop()).map(Self::new).context(UOpSnafu)
+        UOp::try_reciprocal(&self.uop()).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Square: x².
@@ -440,7 +440,7 @@ impl Tensor {
             let batch: Vec<usize> = shape[..ndim - 2]
                 .iter()
                 .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "det" }))
-                .collect::<Result<_>>()?;
+                .collect::<KindResult<_>>()?;
             return if batch.is_empty() {
                 Ok(Tensor::const_(1.0, float_dt))
             } else {
@@ -589,13 +589,13 @@ impl Tensor {
             }
         );
         let cdim = |d: usize| {
-            shape[d].as_const().ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "qr".to_string() })
+            shape[d].as_const().ok_or_else(|| ErrorKind::SymbolicShapeUnsupported { operation: "qr".to_string() })
         };
         let (m, n) = (cdim(ndim - 2)?, cdim(ndim - 1)?);
         let batch: Vec<usize> = shape[..ndim - 2]
             .iter()
             .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "qr" }))
-            .collect::<Result<_>>()?;
+            .collect::<KindResult<_>>()?;
         let float_dt = if self.uop().dtype().is_float() { self.uop().dtype() } else { DType::Float32 };
 
         let mut r = to_float(self, &float_dt)?;
@@ -647,8 +647,9 @@ impl Tensor {
                 actual: format!("{ndim}-D")
             }
         );
-        let to_dim =
-            |d: usize| shape[d].as_const().ok_or_else(|| Error::SymbolicShapeUnsupported { operation: op.to_string() });
+        let to_dim = |d: usize| {
+            shape[d].as_const().ok_or_else(|| ErrorKind::SymbolicShapeUnsupported { operation: op.to_string() })
+        };
         let (m, n) = (to_dim(ndim - 2)?, to_dim(ndim - 1)?);
         snafu::ensure!(
             m == n,
@@ -661,7 +662,7 @@ impl Tensor {
         let dims: Vec<usize> = shape
             .iter()
             .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: op.to_string() }))
-            .collect::<Result<_>>()?;
+            .collect::<KindResult<_>>()?;
         let dtype = self.uop().dtype();
         let float_dt = if dtype.is_float() { dtype } else { DType::Float32 };
         Ok((dims, n, float_dt))

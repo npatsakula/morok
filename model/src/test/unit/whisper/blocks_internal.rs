@@ -6,7 +6,7 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 fn realized_f32(tensor: Tensor) -> Vec<f32> {
-    let mut tensor = tensor.cast(DType::Float32).unwrap();
+    let tensor = tensor.cast(DType::Float32).unwrap();
     tensor.realize().unwrap();
     tensor.as_vec::<f32>().unwrap()
 }

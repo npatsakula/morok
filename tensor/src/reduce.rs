@@ -9,7 +9,7 @@ use svod_dtype::{DType, ScalarDType};
 use svod_ir::{ReduceOp, SInt, UOp};
 
 use crate::{
-    Error, Result, Tensor,
+    ErrorKind, Result, Tensor,
     error::{SymbolicShapeUnsupportedSnafu, UOpSnafu},
 };
 
@@ -182,7 +182,7 @@ impl Tensor {
     ) -> Result<Self> {
         origin_call!("sum");
         if dtype.is_some() && promote == Some(true) {
-            return Err(Error::ConflictingReductionOptions);
+            return Err(ErrorKind::ConflictingReductionOptions.into());
         }
         let promote = promote.unwrap_or(dtype.is_none());
         reduce_internal(self, ReduceOp::Add, axes.into(), keepdim, dtype, promote)
@@ -465,8 +465,8 @@ impl Tensor {
         let shape = self.shape()?;
         let ndim = shape.len();
         let norm_axis = Self::normalize_axis(axis, ndim)?;
-        let axis_size = shape[norm_axis].as_const().ok_or_else(|| crate::error::Error::SymbolicShapeUnsupported {
-            operation: format!("hardmax axis {norm_axis}"),
+        let axis_size = shape[norm_axis].as_const().ok_or_else(|| {
+            crate::error::ErrorKind::SymbolicShapeUnsupported { operation: format!("hardmax axis {norm_axis}") }
         })?;
         self.argmax_with()
             .axis(Some(axis))
@@ -562,7 +562,7 @@ fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
     let normalized_axis = Tensor::normalize_axis(working_axis, shape.len())?;
     let axis_size = shape[normalized_axis]
         .as_const()
-        .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "argmax".to_string() })?;
+        .ok_or_else(|| ErrorKind::SymbolicShapeUnsupported { operation: "argmax".to_string() })?;
 
     // Convert shape to isize vec once for reuse in expand operations
     let shape_vec = svod_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
@@ -654,7 +654,7 @@ fn reduce_internal(
 ) -> Result<Tensor> {
     // Validate conflicting options
     if dtype.is_some() && promote {
-        return Err(Error::ConflictingReductionOptions);
+        return Err(ErrorKind::ConflictingReductionOptions.into());
     }
 
     let shape = tensor.shape()?;
@@ -717,7 +717,7 @@ fn mean_impl(tensor: &Tensor, axes: impl Into<AxisSpec>, keepdim: bool) -> Resul
         if let Some(dim_size) = shape[axis].as_const() {
             count *= dim_size as i64;
         } else {
-            return SymbolicShapeUnsupportedSnafu { operation: "mean" }.fail();
+            return SymbolicShapeUnsupportedSnafu { operation: "mean" }.fail().map_err(Into::into);
         }
     }
 
@@ -760,7 +760,7 @@ fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool, correction: i64
         if let Some(dim_size) = shape[axis].as_const() {
             count *= dim_size as i64;
         } else {
-            return SymbolicShapeUnsupportedSnafu { operation: "variance" }.fail();
+            return SymbolicShapeUnsupportedSnafu { operation: "variance" }.fail().map_err(Into::into);
         }
     }
 

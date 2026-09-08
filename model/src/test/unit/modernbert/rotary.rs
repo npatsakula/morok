@@ -9,7 +9,7 @@ fn rope_identity_at_position_zero() {
     // x shape (1, 1, 2, 4): batch=1, head=1, seq=2, head_dim=4.
     let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).try_reshape([1isize, 1, 2, 4]).unwrap();
     let table = RotaryTable::new(10_000.0, 2, 4, DType::Float32).unwrap();
-    let mut out = table.apply(&x).unwrap();
+    let out = table.apply(&x).unwrap();
     out.realize().unwrap();
     let v = out.as_vec::<f32>().unwrap();
     // Position 0 (first 4 elems) is unchanged.
@@ -26,9 +26,9 @@ fn rope_identity_at_position_zero() {
 fn global_vs_local_theta_differ() {
     let global = RotaryTable::new(160_000.0, 16, 64, DType::Float32).unwrap();
     let local = RotaryTable::new(10_000.0, 16, 64, DType::Float32).unwrap();
-    let mut gc = global.cos.clone();
+    let gc = global.cos.clone();
     gc.realize().unwrap();
-    let mut lc = local.cos.clone();
+    let lc = local.cos.clone();
     lc.realize().unwrap();
     let gv = gc.as_vec::<f32>().unwrap();
     let lv = lc.as_vec::<f32>().unwrap();

@@ -24,11 +24,10 @@ const EPS: f64 = 1e-8;
 pub fn tstp_forward(features: &Tensor, weights: &Tensor) -> Result<Tensor> {
     let shape = features.shape()?;
     if shape.len() != 4 {
-        return Err(super::error::Error::Tensor {
-            source: Box::new(svod_tensor::error::Error::IrConstruction {
-                details: format!("TSTP expects 4D features, got {}D", shape.len()),
-            }),
-        });
+        return Err(svod_tensor::error::Error::from(svod_tensor::error::ErrorKind::IrConstruction {
+            details: format!("TSTP expects 4D features, got {}D", shape.len()),
+        })
+        .into());
     }
     let t_back = features.dim_const(3)?;
 

@@ -165,7 +165,7 @@ fn features_r18_returns_512_channel_map() {
     let var = Variable::new("b", 1, max_batch as i64);
     let b1 = var.bind(1).unwrap();
 
-    let mut out = model.forward(&images, &b1).unwrap();
+    let out = model.forward(&images, &b1).unwrap();
     out.realize().unwrap();
 
     let shape = crate::test::max_dims(&out);
@@ -186,7 +186,7 @@ fn features_r50_returns_2048_channel_map() {
     let var = Variable::new("b", 1, max_batch as i64);
     let b1 = var.bind(1).unwrap();
 
-    let mut out = model.forward(&images, &b1).unwrap();
+    let out = model.forward(&images, &b1).unwrap();
     out.realize().unwrap();
 
     let shape = crate::test::max_dims(&out);

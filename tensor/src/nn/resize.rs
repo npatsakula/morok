@@ -6,6 +6,7 @@ use svod_ir::{ConstValue, SInt};
 
 use super::{AspectRatioPolicy, CoordinateTransformMode, NearestMode, ResizeMode};
 use crate::Tensor;
+use crate::error::KindResult;
 
 type Result<T> = crate::Result<T>;
 
@@ -25,7 +26,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
-    /// let mut y = x.resize().scales(&[1.0, 1.0, 2.0, 2.0]).call().unwrap();
+    /// let y = x.resize().scales(&[1.0, 1.0, 2.0, 2.0]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<usize> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 4, 4]);
@@ -38,7 +39,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
-    /// let mut y = x.resize().sizes(&[1, 1, 6, 6]).call().unwrap();
+    /// let y = x.resize().sizes(&[1, 1, 6, 6]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<usize> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 6, 6]);
@@ -52,7 +53,7 @@ impl Tensor {
     /// # use svod_tensor::nn::ResizeMode;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
-    /// let mut y = x.resize()
+    /// let y = x.resize()
     ///     .scales(&[1.0, 1.0, 2.0, 2.0])
     ///     .mode(ResizeMode::Linear)
     ///     .call()
@@ -143,11 +144,11 @@ impl Tensor {
         let input_shape: Vec<usize> = active_idx
             .iter()
             .map(|&i| {
-                x_shape[ndim - n_axes + i].as_const().ok_or_else(|| crate::error::Error::SymbolicShapeUnsupported {
+                x_shape[ndim - n_axes + i].as_const().ok_or_else(|| crate::error::ErrorKind::SymbolicShapeUnsupported {
                     operation: "resize on a symbolic spatial dim".to_string(),
                 })
             })
-            .collect::<Result<_>>()?;
+            .collect::<KindResult<_>>()?;
 
         let scales_active: Option<Vec<f64>> =
             scales_trimmed.as_ref().map(|sc| active_idx.iter().map(|&i| sc[i]).collect());
@@ -181,9 +182,10 @@ impl Tensor {
             let sz: Vec<usize> = sc.iter().zip(&input_shape).map(|(&s, &sh)| (s * sh as f64) as usize).collect();
             (sz, sc)
         } else {
-            return Err(crate::error::Error::IrConstruction {
+            return Err(crate::error::ErrorKind::IrConstruction {
                 details: "resize: either scales or sizes must be provided".into(),
-            });
+            }
+            .into());
         };
 
         // Early exit if no resize needed

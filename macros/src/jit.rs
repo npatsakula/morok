@@ -490,7 +490,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
             let (#(#output_names,)*) = #build_closure
                 .map_err(|e| svod_model::jit::JitError::Build { source: Box::new(e) as _ })?;
             let mut __jit_outputs: [svod_tensor::Tensor; #n_outputs] = [#(#output_names,)*];
-            let plan = svod_tensor::Tensor::prepare_batch_with(__jit_outputs.iter_mut(), config)
+            let plan = svod_tensor::Tensor::prepare_batch_with(__jit_outputs.iter(), config)
                 .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
             if plan.num_outputs() != #n_outputs {
                 return Err(svod_model::jit::JitError::OutputCountMismatch {
@@ -504,7 +504,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
             let output: svod_tensor::Tensor = #build_closure
                 .map_err(|e| svod_model::jit::JitError::Build { source: Box::new(e) as _ })?;
             let mut output = output;
-            let plan = svod_tensor::Tensor::prepare_batch_with(std::iter::once(&mut output), config)
+            let plan = svod_tensor::Tensor::prepare_batch_with(std::iter::once(&output), config)
                 .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
         }
     };

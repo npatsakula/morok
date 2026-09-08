@@ -30,7 +30,7 @@ fn forward_output_shape() {
     let ids = Tensor::from_slice([0i64, 1, 2, 3, 4, 5, 6, 7]).try_reshape([1isize, 8]).unwrap();
     let mask = Tensor::from_slice([1i64, 1, 1, 1, 1, 1, 1, 1]).try_reshape([1isize, 8]).unwrap();
 
-    let mut out = reranker.forward(&ids, &mask).unwrap();
+    let out = reranker.forward(&ids, &mask).unwrap();
     out.realize().unwrap();
     let s = out.dims().unwrap();
     // (B,) scalar score per row (after sigmoid)

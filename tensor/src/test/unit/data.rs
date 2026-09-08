@@ -10,7 +10,7 @@ crate::codegen_tests! {
     fn test_to_vec_computed(config) {
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([10.0f32, 20.0, 30.0]);
-        let mut c = &a + &b;
+        let c = &a + &b;
         c.realize_with(&config).unwrap();
         let v = c.as_vec::<f32>().unwrap();
         assert_eq!(v, vec![11.0, 22.0, 33.0]);
@@ -218,7 +218,10 @@ fn array_view_refuses_a_view_it_cannot_borrow_correctly() {
 fn as_vec_still_refuses_an_unrealized_graph() {
     let a = Tensor::from_slice([1.0f32, 2.0]);
     let lazy = &a + &a;
-    assert!(matches!(lazy.as_vec::<f32>(), Err(crate::error::Error::NoBuffer)));
+    assert!(matches!(
+        lazy.as_vec::<f32>().map_err(crate::error::Error::into_kind),
+        Err(crate::error::ErrorKind::NoBuffer)
+    ));
 }
 
 /// Random rank, extents, shrink window per axis and axis permutation.
@@ -277,4 +280,52 @@ proptest! {
 
         prop_assert_eq!(got, expected);
     }
+}
+
+// =========================================================================
+// Auto-realizing reads: to_vec / to_ndarray / item
+// =========================================================================
+
+/// Nothing upstream is realized, so each read has to run the graph itself.
+#[test_case::test_case(&[1.0f32, 2.0, 3.0], &[2.0, 4.0, 6.0]; "1d")]
+#[test_case::test_case(&[1.0f32, -2.0, 0.0, 4.0], &[2.0, -4.0, 0.0, 8.0]; "signs")]
+fn to_vec_realizes_a_lazy_graph(input: &[f32], expected: &[f32]) {
+    let a = Tensor::from_slice(input);
+    assert_eq!((&a + &a).to_vec::<f32>().unwrap(), expected);
+}
+
+#[test]
+fn to_ndarray_realizes_a_lazy_graph() {
+    let a = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
+    let doubled = (&a + &a).to_ndarray::<f32>().unwrap();
+    assert_eq!(doubled, array![[2.0f32, 4.0], [6.0, 8.0]].into_dyn());
+}
+
+/// `as_*` must stay non-realizing so callers that cannot afford compilation
+/// keep their guarantee, while `to_*` on the same graph succeeds.
+#[test]
+fn as_vec_refuses_what_to_vec_realizes() {
+    let a = Tensor::from_slice([1.0f32, 2.0]);
+    let lazy = &a + &a;
+    assert!(matches!(lazy.as_vec::<f32>().map_err(crate::error::Error::into_kind), Err(crate::ErrorKind::NoBuffer)));
+    assert_eq!(lazy.to_vec::<f32>().unwrap(), vec![2.0, 4.0]);
+    assert_eq!(lazy.as_vec::<f32>().unwrap(), vec![2.0, 4.0], "to_vec leaves the tensor realized");
+}
+
+#[test_case::test_case(&[3.0f32], 3.0; "already scalar")]
+#[test_case::test_case(&[1.0f32, 2.0, 3.0], 6.0; "reduced to scalar")]
+fn item_reads_a_single_element(input: &[f32], expected: f32) {
+    let a = Tensor::from_slice(input);
+    let scalar = if input.len() == 1 { a } else { a.sum(()).unwrap() };
+    assert_eq!(scalar.item::<f32>().unwrap(), expected);
+}
+
+#[test_case::test_case(&[1.0f32, 2.0], "2 elements"; "many")]
+#[test_case::test_case(&[] as &[f32], "0 elements"; "empty")]
+fn item_rejects_a_non_scalar(input: &[f32], actual: &str) {
+    let err = Tensor::from_slice(input).item::<f32>().unwrap_err();
+    assert!(
+        matches!(err.kind(), crate::ErrorKind::ShapeMismatch { context, actual: got, .. } if context == "item" && got == actual),
+        "{err:?}"
+    );
 }

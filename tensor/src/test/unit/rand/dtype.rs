@@ -12,7 +12,7 @@ const N: usize = 4096;
 const TOL: f64 = 0.05;
 
 fn realize_f32_via_cast(t: Tensor, config: &crate::PrepareConfig) -> Vec<f32> {
-    let mut casted = t.cast(DType::Float32).expect("cast to f32");
+    let casted = t.cast(DType::Float32).expect("cast to f32");
     casted.realize_with(config).expect("realize");
     casted.as_vec::<f32>().expect("read")
 }

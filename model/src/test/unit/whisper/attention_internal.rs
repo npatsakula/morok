@@ -19,7 +19,7 @@ fn padded_fa_policy_targets_long_untiled_self_attention() {
 
 fn encoder_shape_inputs() -> (Tensor, Tensor, Tensor) {
     let make = || {
-        let mut tensor = Tensor::randn(&[1, 1500, 2, 64]).unwrap().cast(DType::Float16).unwrap();
+        let tensor = Tensor::randn(&[1, 1500, 2, 64]).unwrap().cast(DType::Float16).unwrap();
         tensor.realize().unwrap();
         tensor
     };
@@ -37,7 +37,7 @@ fn padded_encoder_flash_attention_matches_unpadded_sdpa() {
     let padding = [(0, 0), (0, 36), (0, 0), (0, 0)];
     let (qp, kp, vp) = (q.try_pad(&padding).unwrap(), k.try_pad(&padding).unwrap(), v.try_pad(&padding).unwrap());
     let key_lens = Tensor::full(&[1], ConstValue::Int(1500), DType::Int32).unwrap().to(q.device());
-    let mut got =
+    let got =
         svod_tk::flash_attention_with(&qp, &kp, &vp, svod_tk::FaOpts { causal: false, key_lens: Some(&key_lens) })
             .expect("padded flash-attention")
             .expect("flash-attention target passed the support gate")
@@ -49,7 +49,7 @@ fn padded_encoder_flash_attention_matches_unpadded_sdpa() {
     got.realize().unwrap();
 
     let perm = |t: &Tensor| t.cast(DType::Float32).unwrap().try_permute(&[0, 2, 1, 3]).unwrap();
-    let mut reference = perm(&q)
+    let reference = perm(&q)
         .scaled_dot_product_attention()
         .key(&perm(&k))
         .value(&perm(&v))

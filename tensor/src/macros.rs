@@ -42,23 +42,21 @@ macro_rules! custom_kernel_check {
         $(#[$meta])*
         #[test]
         #[ignore]
-        // The kernel/reference closures surface upstream `Result`s whose `Err` may be
-        // large; immaterial in a one-shot `#[ignore]` correctness check.
-        #[allow(clippy::result_large_err)]
         fn $name() {
             let shape: &[usize] = &$shape;
             let mk = || {
                 let t = $crate::Tensor::randn(shape).expect("custom_kernel_check: randn input");
-                let mut t = t.cast($dt).expect("custom_kernel_check: cast input");
+                let t = t.cast($dt).expect("custom_kernel_check: cast input");
                 t.realize().expect("custom_kernel_check: realize input");
                 t
             };
             $( let $arg = mk(); )+
 
             let to_f32_vec = |t: $crate::Tensor| -> Vec<f32> {
-                let mut f = t.cast(::svod_dtype::DType::Float32).expect("custom_kernel_check: cast → f32");
-                f.realize().expect("custom_kernel_check: realize → f32");
-                f.as_vec::<f32>().expect("custom_kernel_check: read f32")
+                t.cast(::svod_dtype::DType::Float32)
+                    .expect("custom_kernel_check: cast → f32")
+                    .to_vec::<f32>()
+                    .expect("custom_kernel_check: read f32")
             };
 
             let run = $run;

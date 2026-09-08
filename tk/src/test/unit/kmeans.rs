@@ -113,12 +113,12 @@ fn test_kmeans_assign_amd() {
 
     for &(n, k, d) in cases {
         svod_tensor::rand::manual_seed(0x4B4D_0000 ^ (n * 131 + k * 17 + d * 7) as u64);
-        let mut x = Tensor::randn(&[n, d]).expect("randn x");
-        let mut c = Tensor::randn(&[k, d]).expect("randn c");
+        let x = Tensor::randn(&[n, d]).expect("randn x");
+        let c = Tensor::randn(&[k, d]).expect("randn c");
         x.realize().expect("realize x");
         c.realize().expect("realize c");
 
-        let (mut ids, mut dists) = crate::kmeans_assign(&x, &c).expect("kmeans builds").expect("Ok(Some) on AMD");
+        let (ids, dists) = crate::kmeans_assign(&x, &c).expect("kmeans builds").expect("Ok(Some) on AMD");
         ids.realize().expect("realize ids");
         dists.realize().expect("realize dists");
         let got_ids = ids.as_vec::<i32>().expect("read ids");
@@ -172,7 +172,7 @@ fn kmeans_naive(x: &svod_tensor::Tensor, c: &svod_tensor::Tensor) -> (Vec<i32>, 
     let cross = xf.matmul(&cf.try_permute(&[1, 0]).expect("cᵀ")).expect("x@cᵀ"); // [N,K]
     let two = svod_tensor::Tensor::from_slice([2.0f32]);
     let c_sq_row = c_sq.try_permute(&[1, 0]).expect("‖c‖²ᵀ"); // [1,K]
-    let mut dist = x_sq
+    let dist = x_sq
         .try_add(&c_sq_row)
         .expect("‖x‖²+‖c‖²")
         .try_sub(&cross.try_mul(&two).expect("2·cross"))
@@ -208,7 +208,7 @@ fn ref_dist_full(x: &svod_tensor::Tensor, c: &svod_tensor::Tensor, i: usize, j: 
     let xi = xf.try_shrink([(i as isize, (i + 1) as isize), (0, d as isize)]).expect("xi");
     let cj = cf.try_shrink([(j as isize, (j + 1) as isize), (0, d as isize)]).expect("cj");
     let diff = xi.try_sub(&cj).expect("diff");
-    let mut dist = diff.try_mul(&diff).expect("diff²").sum_with().axes(1isize).call().expect("Σ diff²");
+    let dist = diff.try_mul(&diff).expect("diff²").sum_with().axes(1isize).call().expect("Σ diff²");
     dist.realize().expect("realize ref dist_full");
     dist.as_vec::<f32>().expect("dist vec")[0]
 }
@@ -281,16 +281,16 @@ fn test_kmeans_update_vs_reference() {
     let ids = Tensor::from_slice(&ids_vec).cast(DType::Int32).expect("ids");
 
     let (new_c, shift) = crate::kmeans_update(&x, &ids, &c).expect("kmeans_update");
-    let mut nc = new_c;
-    let mut sh = shift;
+    let nc = new_c;
+    let sh = shift;
     nc.realize().expect("realize new_c");
     sh.realize().expect("realize shift");
     let got_c = nc.as_vec::<f32>().expect("new_c vec");
     let got_shift = sh.as_vec::<f32>().expect("shift vec");
 
     // Reference: per-cluster mean of assigned points, shift = ‖new − old‖.
-    let mut xf_t = x.cast(DType::Float32).expect("x→f32");
-    let mut cf_t = c.cast(DType::Float32).expect("c→f32");
+    let xf_t = x.cast(DType::Float32).expect("x→f32");
+    let cf_t = c.cast(DType::Float32).expect("c→f32");
     xf_t.realize().expect("realize xf");
     cf_t.realize().expect("realize cf");
     let xf = xf_t.as_vec::<f32>().expect("xf vec");
@@ -394,12 +394,12 @@ fn kmeans_generic_phi_dominance_mre() {
     // produces them) so the matmul + min-over-K fuse into one kernel — the regime
     // that exposed the tensor-core-tiled-reduce-axis phi-dominance.
     for k in [64usize, 256, 1024, 4096] {
-        let mut xb = Tensor::randn(&[n, d]).expect("x").cast(DType::BFloat16).expect("x→bf16");
-        let mut cb = Tensor::randn(&[k, d]).expect("c").cast(DType::BFloat16).expect("c→bf16");
+        let xb = Tensor::randn(&[n, d]).expect("x").cast(DType::BFloat16).expect("x→bf16");
+        let cb = Tensor::randn(&[k, d]).expect("c").cast(DType::BFloat16).expect("c→bf16");
         xb.realize().expect("realize xb");
         cb.realize().expect("realize cb");
 
-        let mut result = kmeans_generic_ref(&xb, &cb);
+        let result = kmeans_generic_ref(&xb, &cb);
         result.prepare().unwrap_or_else(|e| panic!("kmeans_generic prepare failed (K={k}): {e}"));
     }
 }

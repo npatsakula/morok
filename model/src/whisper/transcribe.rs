@@ -215,7 +215,7 @@ impl WhisperRecognizer {
         // Read positional embedding eagerly (static weight, reused every window).
         // Cast to fp32 — the host decode math (pos_embedding slicing in decode.rs)
         // operates on Vec<f32>, while the weight loads at dims.dtype (fp16).
-        let mut pe = model
+        let pe = model
             .decoder
             .positional_embedding
             .cast(svod_dtype::DType::Float32)

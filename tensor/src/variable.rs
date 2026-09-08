@@ -17,7 +17,7 @@
 //! let batch = Variable::new("batch", 1, 32);
 //! let bound = batch.bind(16)?;
 //!
-//! let mut x = Tensor::full_dynamic(&[bound.as_sint(), 784.into()], 0.0, DType::Float32)?;
+//! let x = Tensor::full_dynamic(&[bound.as_sint(), 784.into()], 0.0, DType::Float32)?;
 //! x.realize()?;
 //! ```
 
@@ -65,7 +65,7 @@ impl Variable {
     ///
     /// # Errors
     ///
-    /// Returns [`VariableOutOfRange`](crate::error::Error::VariableOutOfRange) if
+    /// Returns [`VariableOutOfRange`](crate::error::ErrorKind::VariableOutOfRange) if
     /// `val` is outside `[min_val, max_val]`.
     pub fn bind(&self, val: i64) -> Result<BoundVariable> {
         let (min, max) = self.bounds();

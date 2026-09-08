@@ -59,13 +59,13 @@ impl Tensor {
             let current_shape = self.shape()?;
             let total_elements =
                 current_shape.iter().try_fold(1usize, |acc, dim| dim.as_const().map(|v| acc * v)).ok_or_else(|| {
-                    Error::SymbolicShapeUnsupported { operation: "reshape with -1 inference".to_string() }
+                    ErrorKind::SymbolicShapeUnsupported { operation: "reshape with -1 inference".to_string() }
                 })?;
             let known_product: usize = dims
                 .iter()
                 .filter(|d| !d.is_infer())
                 .map(|d| d.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "reshape with -1 inference" }))
-                .product::<Result<usize>>()?;
+                .product::<KindResult<usize>>()?;
             snafu::ensure!(
                 known_product > 0 && total_elements % known_product == 0,
                 ReshapeSizeMismatchSnafu { operation: "reshape with inference".to_string() }
@@ -76,7 +76,7 @@ impl Tensor {
             dims.into()
         };
 
-        self.uop().try_reshape(&shape).map(Self::new).context(UOpSnafu)
+        self.uop().try_reshape(&shape).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Expand tensor to a new shape with mixed concrete/symbolic dimensions.
@@ -95,8 +95,8 @@ impl Tensor {
                 true => current_shape.get(i).cloned().context(AxisOutOfRangeSnafu { axis: i as isize, ndim }),
                 false => Ok(s),
             })
-            .collect::<Result<_>>()?;
-        self.uop().try_expand(&shape).map(Self::new).context(UOpSnafu)
+            .collect::<KindResult<_>>()?;
+        self.uop().try_expand(&shape).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Permute (reorder) tensor dimensions.
@@ -127,7 +127,7 @@ impl Tensor {
         // Normalize negative indices and validate
         let normalized_axes = self.normalize_axes(axes, ndim)?;
 
-        self.uop().try_permute(normalized_axes).map(Self::new).context(UOpSnafu)
+        self.uop().try_permute(normalized_axes).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Transpose two dimensions.
@@ -161,7 +161,7 @@ impl Tensor {
         let mut axes: Vec<usize> = (0..ndim).collect();
         axes.swap(d0, d1);
 
-        self.uop().try_permute(axes).map(Self::new).context(UOpSnafu)
+        self.uop().try_permute(axes).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Expand (broadcast) dimensions.
@@ -217,7 +217,7 @@ impl Tensor {
                 // Check if dimension is size 1
                 let dim_size = shape[normalized_axis]
                     .as_const()
-                    .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "squeeze".to_string() })?;
+                    .ok_or_else(|| ErrorKind::SymbolicShapeUnsupported { operation: "squeeze".to_string() })?;
 
                 snafu::ensure!(dim_size == 1, SqueezeDimensionNotOneSnafu { dim: normalized_axis, size: dim_size });
 
@@ -230,7 +230,7 @@ impl Tensor {
             }
         };
 
-        self.uop().try_reshape(&new_shape).map(Self::new).context(UOpSnafu)
+        self.uop().try_reshape(&new_shape).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Add a dimension of size 1.
@@ -273,7 +273,7 @@ impl Tensor {
         let mut new_shape = shape.clone();
         new_shape.insert(normalized_dim, SInt::Const(1));
 
-        self.uop().try_reshape(&new_shape).map(Self::new).context(UOpSnafu)
+        self.uop().try_reshape(&new_shape).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Reverse elements along specified axes.
@@ -292,7 +292,7 @@ impl Tensor {
         let ndim = shape.len();
         let flip_spec: Vec<bool> =
             (0..ndim).map(|d| axes.iter().any(|&a| Self::normalize_axis(a, ndim).is_ok_and(|na| na == d))).collect();
-        self.uop().try_flip(flip_spec).map(Self::new).context(UOpSnafu)
+        self.uop().try_flip(flip_spec).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Split tensor into chunks along a dimension.
@@ -500,7 +500,7 @@ impl Tensor {
         let padding_sint: Vec<(SInt, SInt)> =
             pos_padding.iter().map(|(begin, end)| (SInt::Const(*begin as usize), SInt::Const(*end as usize))).collect();
 
-        base.uop().try_pad(&padding_sint).map(Self::new).context(UOpSnafu)
+        base.uop().try_pad(&padding_sint).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Concatenate tensors along an axis.
@@ -525,7 +525,7 @@ impl Tensor {
     pub fn cat(tensors: &[&Tensor], dim: isize) -> Result<Tensor> {
         origin_call!("cat");
         if tensors.is_empty() {
-            return Err(IrConstructionSnafu { details: "cat requires at least one tensor".to_string() }.build());
+            return Err(IrConstructionSnafu { details: "cat requires at least one tensor".to_string() }.build().into());
         }
 
         let first = tensors[0];
@@ -715,7 +715,7 @@ impl Tensor {
 
         // Mixed concrete/symbolic: create scalar tensors and cat
         let shape_sint: smallvec::SmallVec<[SInt; 4]> = smallvec::smallvec![SInt::from(1usize)];
-        let scalars: Result<Vec<Tensor>> = shape
+        let scalars: KindResult<Vec<Tensor>> = shape
             .iter()
             .map(|d| {
                 let uop = d.to_uop(svod_dtype::DType::Int64);
@@ -771,7 +771,7 @@ impl Tensor {
                 ShrinkRange::Sint(begin, end) => Ok((begin, end)),
                 ShrinkRange::Isize(begin, end) => {
                     let (nb, ne) = if begin < 0 || end < 0 {
-                        let dim_size = shape[dim_idx].as_const().ok_or_else(|| Error::SymbolicShapeUnsupported {
+                        let dim_size = shape[dim_idx].as_const().ok_or_else(|| ErrorKind::SymbolicShapeUnsupported {
                             operation: "shrink with negative indices".to_string(),
                         })? as isize;
                         (if begin < 0 { dim_size + begin } else { begin }, if end < 0 { dim_size + end } else { end })
@@ -787,7 +787,7 @@ impl Tensor {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        self.uop().try_shrink(&ranges_sint).map(Self::new).context(UOpSnafu)
+        self.uop().try_shrink(&ranges_sint).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Center-crop or center-pad each specified axis to the target size.
@@ -828,7 +828,7 @@ impl Tensor {
 
     /// Get the concrete shape of this tensor.
     pub fn shape(&self) -> Result<Shape> {
-        self.uop().shape().context(UOpSnafu)?.cloned().ok_or(Error::ShapeUnknown)
+        self.uop().shape().context(UOpSnafu)?.cloned().ok_or(ErrorKind::ShapeUnknown.into())
     }
 
     /// Get the number of dimensions (rank).
@@ -838,9 +838,12 @@ impl Tensor {
 
     /// Total number of elements. Fails if any dimension is symbolic.
     pub fn numel(&self) -> Result<usize> {
-        self.shape()?.iter().try_fold(1usize, |acc, d| {
-            d.as_const().map(|v| acc * v).ok_or(Error::SymbolicShapeUnsupported { operation: "numel".into() })
-        })
+        self.shape()?
+            .iter()
+            .try_fold(1usize, |acc, d| {
+                d.as_const().map(|v| acc * v).ok_or(ErrorKind::SymbolicShapeUnsupported { operation: "numel".into() })
+            })
+            .map_err(Into::into)
     }
 
     /// Concrete dimensions of this tensor.
@@ -858,7 +861,7 @@ impl Tensor {
     /// assert_eq!(t.dims().unwrap(), vec![2, 3]);
     /// ```
     pub fn dims(&self) -> Result<Vec<usize>> {
-        svod_ir::shape::to_vec_usize(&self.shape()?).context(UOpSnafu)
+        svod_ir::shape::to_vec_usize(&self.shape()?).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Get the size of a specific dimension.
@@ -888,11 +891,11 @@ impl Tensor {
     ///
     /// # Errors
     ///
-    /// [`Error::AxisOutOfRange`] if `axis` is out of range,
-    /// [`Error::NonConstDim`] if the dimension is symbolic.
+    /// [`ErrorKind::AxisOutOfRange`] if `axis` is out of range,
+    /// [`ErrorKind::NonConstDim`] if the dimension is symbolic.
     pub fn dim_const(&self, axis: isize) -> Result<usize> {
         let dim = self.dim(axis)?;
-        dim.as_const().ok_or(Error::NonConstDim { axis, dim })
+        dim.as_const().ok_or(ErrorKind::NonConstDim { axis, dim }.into())
     }
 
     /// Normalize a single axis index (handle negative indices).
@@ -999,7 +1002,7 @@ impl Tensor {
         for (i, &axis) in axes.iter().enumerate() {
             let step = steps[i];
             if step == 0 {
-                return Err(crate::error::Error::IrConstruction { details: "Slice step cannot be 0".into() });
+                return Err(crate::error::ErrorKind::IrConstruction { details: "Slice step cannot be 0".into() }.into());
             }
 
             let d = match shape[axis].as_const() {
@@ -1008,9 +1011,10 @@ impl Tensor {
                     if starts[i] <= 0 && ends[i] > (i64::MAX / 2) {
                         continue;
                     }
-                    return Err(crate::error::Error::SymbolicShapeUnsupported {
+                    return Err(crate::error::ErrorKind::SymbolicShapeUnsupported {
                         operation: "slice_with on a symbolic dim".to_string(),
-                    });
+                    }
+                    .into());
                 }
             };
 
@@ -1048,7 +1052,7 @@ impl Tensor {
                 continue;
             }
             let cur = result.shape()?;
-            let size = cur[axis].as_const().ok_or_else(|| crate::error::Error::SymbolicShapeUnsupported {
+            let size = cur[axis].as_const().ok_or_else(|| crate::error::ErrorKind::SymbolicShapeUnsupported {
                 operation: "slice_with with step on a symbolic dim".to_string(),
             })?;
             let padded = size.div_ceil(abs_step) * abs_step;

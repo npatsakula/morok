@@ -4,12 +4,12 @@ use crate::{PrepareConfig, Tensor};
 
 /// Convenience extension for tests: realize in-place and return `&Self` for chaining reads.
 pub trait RealizeTestExt {
-    fn realize_with_and(&mut self, config: &PrepareConfig) -> &Self;
+    fn realize_with_and(&self, config: &PrepareConfig) -> &Self;
 }
 
 impl RealizeTestExt for Tensor {
     /// Realize with explicit config, panic on error, return `&self` for reading.
-    fn realize_with_and(&mut self, config: &PrepareConfig) -> &Self {
+    fn realize_with_and(&self, config: &PrepareConfig) -> &Self {
         self.realize_with(config).unwrap();
         self
     }

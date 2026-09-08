@@ -17,7 +17,7 @@ crate::codegen_tests! {
         let sum = &a + &b;
         let scaled = sum * Tensor::from_slice([0.1f32]);
 
-        let mut result = scaled;
+        let result = scaled;
         result.realize_with(&config).unwrap();
         let data = result.as_vec::<f32>().unwrap();
 
@@ -52,7 +52,7 @@ crate::codegen_tests! {
         assert_eq!(transposed.shape().unwrap()[1].as_const(), Some(2));
 
         // Verify transposition is correct: [[1,2,3],[4,5,6]] -> [[1,4],[2,5],[3,6]]
-        let mut result = transposed;
+        let result = transposed;
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         assert_close_f32(&vals, &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0], 1e-6);
@@ -66,7 +66,7 @@ crate::codegen_tests! {
         let bias = Tensor::from_ndarray(&array![[100.0f32, 200.0]]);
         let biased = &transposed + &bias;
 
-        let mut result = biased;
+        let result = biased;
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
 
@@ -104,7 +104,7 @@ crate::codegen_tests! {
         assert_eq!(shape[0].as_const(), Some(4));
         assert_eq!(shape[1].as_const(), Some(2));
 
-        let mut result = output;
+        let result = output;
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
 
@@ -148,7 +148,7 @@ crate::codegen_tests! {
         assert_eq!(shape[0].as_const(), Some(1));
         assert_eq!(shape[1].as_const(), Some(2));
 
-        let mut result = result_tensor;
+        let result = result_tensor;
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
 
@@ -197,7 +197,7 @@ crate::codegen_tests! {
         // Softmax
         let probs = logits.softmax(-1).unwrap();
 
-        let mut result = probs;
+        let result = probs;
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
 
@@ -217,7 +217,7 @@ crate::codegen_tests! {
 
         // Simple test: [1, 4] with clear argmax
         let input = Tensor::from_ndarray(&array![[0.1f32, 0.9, 0.3, 0.5]]);
-        let mut result = input.argmax(Some(-1)).unwrap();
+        let result = input.argmax(Some(-1)).unwrap();
 
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<i32>().unwrap();
@@ -253,7 +253,7 @@ crate::codegen_tests! {
         assert_eq!(shape.len(), 1);
         assert_eq!(shape[0].as_const(), Some(2));
 
-        let mut result = output;
+        let result = output;
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
 
@@ -293,7 +293,7 @@ crate::codegen_tests! {
         // Softmax
         let probs = logits.softmax(-1).unwrap();
 
-        let mut result = probs;
+        let result = probs;
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
 
@@ -328,7 +328,7 @@ crate::codegen_tests! {
 
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-        let mut c = &a + &b;
+        let c = &a + &b;
 
         let plan = c.prepare_with(&config).unwrap();
         assert!(plan.kernels().count() > 0, "should have at least 1 kernel");

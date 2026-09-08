@@ -143,10 +143,10 @@ crate::codegen_tests! {
     /// them at f32 and used to hand the f32 result straight to the consumer.
     fn test_float16_builtins_round_to_float16(config) {
         let x = Tensor::from_slice([0.5f32, 100.0]).cast(DType::Float16).unwrap();
-        let mut sqrt = x.try_sqrt().unwrap().cast(DType::Float32).unwrap();
+        let sqrt = x.try_sqrt().unwrap().cast(DType::Float32).unwrap();
         sqrt.realize_with(&config).unwrap();
         assert_eq!(sqrt.as_vec::<f32>().unwrap()[0], 0.70703125);
-        let mut exp2 = x.try_exp2().unwrap().cast(DType::Float32).unwrap();
+        let exp2 = x.try_exp2().unwrap().cast(DType::Float32).unwrap();
         exp2.realize_with(&config).unwrap();
         assert!(exp2.as_vec::<f32>().unwrap()[1].is_infinite(), "exp2(100) must overflow float16");
     }
@@ -234,7 +234,7 @@ crate::codegen_tests! {
     fn test_cholesky_2x2(config) {
         // A = [[4,2],[2,3]] → L = [[2,0],[1,√2]]
         let a = Tensor::from_slice([4.0f32, 2.0, 2.0, 3.0]).try_reshape([2, 2]).unwrap();
-        let mut l = a.cholesky().unwrap();
+        let l = a.cholesky().unwrap();
         assert_close_f32(
             &l.realize_with_and(&config).as_vec::<f32>().unwrap(),
             &[2.0, 0.0, 1.0, std::f32::consts::SQRT_2],
@@ -247,7 +247,7 @@ crate::codegen_tests! {
         let vals = [4.0f32, 2.0, 2.0, 2.0, 5.0, 3.0, 2.0, 3.0, 6.0];
         let a = Tensor::from_slice(vals).try_reshape([3, 3]).unwrap();
         let l = a.cholesky().unwrap();
-        let mut recon = l.matmul(&l.try_transpose(-2, -1).unwrap()).unwrap();
+        let recon = l.matmul(&l.try_transpose(-2, -1).unwrap()).unwrap();
         assert_close_f32(&recon.realize_with_and(&config).as_vec::<f32>().unwrap(), &vals, 1e-4);
     }
 
@@ -256,9 +256,9 @@ crate::codegen_tests! {
         let vals = [12.0f32, -51.0, 4.0, 6.0, 167.0, -68.0, -4.0, 24.0, -41.0];
         let a = Tensor::from_slice(vals).try_reshape([3, 3]).unwrap();
         let (q, r) = a.qr().unwrap();
-        let mut recon = q.matmul(&r).unwrap();
+        let recon = q.matmul(&r).unwrap();
         assert_close_f32(&recon.realize_with_and(&config).as_vec::<f32>().unwrap(), &vals, 1e-3);
-        let mut qtq = q.try_transpose(-2, -1).unwrap().matmul(&q).unwrap();
+        let qtq = q.try_transpose(-2, -1).unwrap().matmul(&q).unwrap();
         assert_close_f32(
             &qtq.realize_with_and(&config).as_vec::<f32>().unwrap(),
             &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
@@ -274,7 +274,7 @@ crate::codegen_tests! {
         ];
         let a = Tensor::from_slice(vals).try_reshape([2, 3, 3]).unwrap();
         let (q, r) = a.qr().unwrap();
-        let mut recon = q.matmul(&r).unwrap();
+        let recon = q.matmul(&r).unwrap();
         assert_close_f32(&recon.realize_with_and(&config).as_vec::<f32>().unwrap(), &vals, 1e-3);
     }
 }

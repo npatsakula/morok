@@ -44,14 +44,14 @@ fn pos_conv_weight_norm_reconstruction() {
     pe.load_state_dict(&sd, "pe").expect("load weight-norm pair");
 
     // Realize both sides and compare.
-    let mut got = pe.weight.clone();
+    let got = pe.weight.clone();
     got.realize().unwrap();
     let got_vec: Vec<f32> = got.as_vec::<f32>().unwrap();
     let got_shape = got.dims().unwrap();
     assert_eq!(got_shape, vec![embed_dim, in_per_group, kernel]);
 
     // Compute g * v / ||v||_dim01 manually.
-    let mut v_real = v.clone();
+    let v_real = v.clone();
     v_real.realize().unwrap();
     let v_vec: Vec<f32> = v_real.as_vec::<f32>().unwrap();
 

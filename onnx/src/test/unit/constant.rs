@@ -10,7 +10,7 @@ svod_tensor::codegen_tests! {
         };
 
         let result = registry.dispatch("Constant", "", &[], &node).unwrap();
-        let mut realized = result.contiguous();
+        let realized = result.contiguous();
         realized.realize_with(&config).unwrap();
         assert!(realized.buffer().is_some());
     }
@@ -23,7 +23,7 @@ svod_tensor::codegen_tests! {
             ..Default::default()
         };
 
-        let mut result = registry.dispatch("Constant", "", &[], &node).unwrap();
+        let result = registry.dispatch("Constant", "", &[], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
@@ -37,7 +37,7 @@ svod_tensor::codegen_tests! {
         };
 
         let result = registry.dispatch("Constant", "", &[], &node).unwrap();
-        let mut realized = result.contiguous();
+        let realized = result.contiguous();
         realized.realize_with(&config).unwrap();
         assert!(realized.buffer().is_some());
     }
@@ -50,7 +50,7 @@ svod_tensor::codegen_tests! {
             ..Default::default()
         };
 
-        let mut result = registry.dispatch("Constant", "", &[], &node).unwrap();
+        let result = registry.dispatch("Constant", "", &[], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
@@ -66,7 +66,7 @@ svod_tensor::codegen_tests! {
             ..Default::default()
         };
 
-        let mut result = registry.dispatch("Constant", "", &[], &node).unwrap();
+        let result = registry.dispatch("Constant", "", &[], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }

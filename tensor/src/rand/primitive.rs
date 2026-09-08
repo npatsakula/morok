@@ -21,7 +21,7 @@ use snafu::ResultExt;
 use svod_dtype::{DType, DeviceSpec, ScalarDType};
 use svod_ir::{ConstValue, UOp, shape::Shape, shape::to_vec_usize};
 
-use crate::{Error, Result, Tensor, UOpSnafu};
+use crate::{ErrorKind, Result, Tensor, UOpSnafu};
 
 use super::state;
 
@@ -44,15 +44,16 @@ impl Tensor {
     #[track_caller]
     pub fn rand_with(shape: &[usize], dtype: DType, device: DeviceSpec) -> Result<Tensor> {
         origin_call!("rand");
-        let scalar = dtype.scalar().ok_or_else(|| Error::SymbolicShapeUnsupported {
+        let scalar = dtype.scalar().ok_or_else(|| ErrorKind::SymbolicShapeUnsupported {
             operation: format!("Tensor::rand: non-scalar dtype {dtype:?}"),
         })?;
         if !scalar.is_float() {
-            return Err(Error::SymbolicShapeUnsupported {
+            return Err(ErrorKind::SymbolicShapeUnsupported {
                 operation: format!(
                     "Tensor::rand: float dtype required, got {scalar:?}; use Tensor::randint for integers"
                 ),
-            });
+            }
+            .into());
         }
         let numel: usize = shape.iter().product();
         if numel == 0 {

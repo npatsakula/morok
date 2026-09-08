@@ -5,7 +5,7 @@ use svod_dtype::DType;
 use svod_ir::SInt;
 use test_case::test_case;
 
-use crate::error::Error;
+use crate::error::ErrorKind;
 use crate::{Tensor, Variable};
 
 fn concrete() -> Tensor {
@@ -30,7 +30,7 @@ fn dims_returns_the_concrete_extents() {
 #[test]
 fn dims_rejects_a_symbolic_shape() {
     let err = symbolic().dims().unwrap_err();
-    assert!(matches!(err, Error::UOp { .. }), "{err:?}");
+    assert!(matches!(err.kind(), ErrorKind::UOp { .. }), "{err:?}");
 }
 
 // =========================================================================
@@ -52,7 +52,7 @@ fn dim_and_dim_const_agree_on_each_axis(axis: isize, expected: usize) {
 #[test_case(-3; "one before the first axis")]
 fn dim_const_rejects_an_out_of_range_axis(axis: isize) {
     let err = concrete().dim_const(axis).unwrap_err();
-    assert!(matches!(err, Error::AxisOutOfRange { ndim: 2, .. }), "{err:?}");
+    assert!(matches!(err.kind(), ErrorKind::AxisOutOfRange { ndim: 2, .. }), "{err:?}");
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn dim_const_rejects_a_symbolic_axis_that_dim_still_reports() {
     assert_eq!(t.dim_const(1).unwrap(), 4, "the concrete axis is still readable");
 
     let err = t.dim_const(0).unwrap_err();
-    assert!(matches!(err, Error::NonConstDim { axis: 0, .. }), "{err:?}");
+    assert!(matches!(err.kind(), ErrorKind::NonConstDim { axis: 0, .. }), "{err:?}");
     assert!(err.to_string().contains("dimension 0 is symbolic"), "{err}");
     // `dim` keeps the symbolic extent rather than failing.
     assert!(t.dim(0).unwrap().as_const().is_none());
@@ -125,7 +125,7 @@ fn index_select_rejects_a_symbolic_index_length() {
     let index = Tensor::empty_dynamic(&[Variable::new("k", 1, 4).as_sint()], DType::Int32);
 
     let err = src.index_select(0, &index).unwrap_err();
-    assert!(matches!(err, Error::NonConstDim { axis: 0, .. }), "{err:?}");
+    assert!(matches!(err.kind(), ErrorKind::NonConstDim { axis: 0, .. }), "{err:?}");
 }
 
 #[test]

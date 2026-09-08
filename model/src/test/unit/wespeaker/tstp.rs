@@ -43,7 +43,7 @@ fn forward_zero_weights_realize() {
     let var = svod_tensor::Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();
 
-    let mut out = model.forward(&feats, &weights, &b).unwrap();
+    let out = model.forward(&feats, &weights, &b).unwrap();
     out.realize().unwrap();
 
     let shape = crate::test::max_dims(&out);

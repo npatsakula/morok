@@ -24,8 +24,8 @@ fn count_kernels(model_path: &Path) -> usize {
     }
 
     let config = PrepareConfig::for_cpu_backend(CpuBackend::Clang);
-    let mut outputs: Vec<Tensor> = result.outputs.values().cloned().collect();
-    let plan = Tensor::prepare_batch_with(outputs.iter_mut(), &config).unwrap();
+    let outputs: Vec<Tensor> = result.outputs.values().cloned().collect();
+    let plan = Tensor::prepare_batch_with(outputs.iter(), &config).unwrap();
     plan.prepared_kernels().len()
 }
 

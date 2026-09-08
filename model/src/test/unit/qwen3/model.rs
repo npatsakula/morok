@@ -29,7 +29,7 @@ fn forward_output_shape() {
     let model = Qwen3Model::empty(tiny_cfg());
     let ids = Tensor::from_slice([0i64, 1, 2, 3, 4, 5, 6, 7]).try_reshape([1isize, 8]).unwrap();
 
-    let mut out = model.forward(&ids, None).unwrap();
+    let out = model.forward(&ids, None).unwrap();
     out.realize().unwrap();
     let s = out.dims().unwrap();
     assert_eq!(s[0], 1);
@@ -46,7 +46,7 @@ fn embedding_output_shape() {
     let ids = Tensor::from_slice([0i64, 1, 2, 3, 4, 5, 6, 7]).try_reshape([1isize, 8]).unwrap();
     let mask = Tensor::from_slice([1i64, 1, 1, 1, 1, 1, 1, 1]).try_reshape([1isize, 8]).unwrap();
 
-    let mut out = emb.encode(&ids, &mask).unwrap();
+    let out = emb.encode(&ids, &mask).unwrap();
     out.realize().unwrap();
     let s = out.dims().unwrap();
     assert_eq!(s[0], 1);

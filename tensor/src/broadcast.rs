@@ -110,7 +110,11 @@ impl Tensor {
 
         // Cannot broadcast to fewer dimensions
         if self_shape.len() > target_shape.len() {
-            return Err(Error::BroadcastFewerDimensions { from_dims: self_shape.len(), to_dims: target_shape.len() });
+            return Err(ErrorKind::BroadcastFewerDimensions {
+                from_dims: self_shape.len(),
+                to_dims: target_shape.len(),
+            }
+            .into());
         }
 
         // Pad shape with 1s on left if needed
@@ -130,7 +134,9 @@ impl Tensor {
                 && aligned_size != 1
                 && aligned_size != target_size
             {
-                return Err(Error::BroadcastIncompatible { dim: i, from_size: aligned_size, to_size: target_size });
+                return Err(
+                    ErrorKind::BroadcastIncompatible { dim: i, from_size: aligned_size, to_size: target_size }.into()
+                );
             }
             // For symbolic dimensions, conservatively assume they're compatible
         }
@@ -149,6 +155,6 @@ impl Tensor {
         }
 
         // Expand to target shape - call IR layer directly to support symbolic dimensions
-        reshaped.uop().try_expand(target_shape).map(Self::new).context(UOpSnafu)
+        reshaped.uop().try_expand(target_shape).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 }

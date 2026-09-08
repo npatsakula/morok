@@ -26,7 +26,7 @@ crate::codegen_tests! {
 
         let out = matrix.dot(&x).unwrap().try_reshape([n as isize]).unwrap();
 
-        let mut out = out;
+        let out = out;
         out.realize_with(&config).expect("realized matrix matmul");
         assert_eq!(out.as_vec::<f32>().unwrap().len(), n);
     }
@@ -43,7 +43,7 @@ crate::codegen_tests! {
 
         let out = matrix.dot(&x).unwrap().try_reshape([n as isize]).unwrap();
 
-        let mut out = out;
+        let out = out;
         out.realize_with(&config).expect("unary on buffer-rooted matmul");
         assert_eq!(out.as_vec::<f32>().unwrap().len(), n);
     }
@@ -55,7 +55,7 @@ crate::codegen_tests! {
 
         let out = t.cos().unwrap().try_add(&t.sin().unwrap()).unwrap();
 
-        let mut out = out;
+        let out = out;
         out.realize_with(&config).expect("diamond elementwise");
 
         let expected: Vec<f32> = [1.0f32, 2.0, 3.0, 4.0].iter().map(|x| x.cos() + x.sin()).collect();
@@ -76,7 +76,7 @@ crate::codegen_tests! {
 
         let out = matrix.dot(&x).unwrap().try_reshape([n as isize]).unwrap();
 
-        let mut out = out;
+        let out = out;
         out.realize_with(&config).expect("lazy outer product matmul");
         assert_eq!(out.as_vec::<f32>().unwrap().len(), n);
     }
@@ -95,7 +95,7 @@ crate::codegen_tests! {
 
         let out = matrix.dot(&x).unwrap().try_reshape([n as isize]).unwrap();
 
-        let mut out = out;
+        let out = out;
         out.realize_with(&config).expect("lazy outer product unary matmul");
         assert_eq!(out.as_vec::<f32>().unwrap().len(), n);
     }
@@ -117,7 +117,7 @@ crate::codegen_tests! {
 
         let out = cos_w.dot(&x).unwrap().try_add(&sin_w.dot(&x).unwrap()).unwrap().try_reshape([n as isize]).unwrap();
 
-        let mut out = out;
+        let out = out;
         out.realize_with(&config).expect("DFT pattern");
         assert_eq!(out.as_vec::<f32>().unwrap().len(), n);
     }

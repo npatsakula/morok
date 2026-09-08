@@ -308,9 +308,12 @@ impl TextDecoder {
             .into_iter()
             .map(|qk| {
                 qk.ok_or_else(|| super::error::Error::Tensor {
-                    source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
-                        operation: "alignment head layer out of range".into(),
-                    }),
+                    source: Box::new(
+                        svod_tensor::error::ErrorKind::SymbolicShapeUnsupported {
+                            operation: "alignment head layer out of range".into(),
+                        }
+                        .into(),
+                    ),
                 })
             })
             .collect::<Result<Vec<_>>>()?;

@@ -20,7 +20,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use svod_dtype::DType;
     /// let x = Tensor::from_slice([300.0f32, -10.0, 128.0]);
-    /// let mut y = x.clamp_cast(DType::UInt8).unwrap();
+    /// let y = x.clamp_cast(DType::UInt8).unwrap();
     /// y.realize().unwrap();
     /// let vals = y.as_vec::<u8>().unwrap();
     /// assert_eq!(vals, vec![255, 0, 128]);
@@ -52,22 +52,25 @@ impl Tensor {
         let output_dtype = self.uop().dtype();
         let quantized_dtype = weight.uop().dtype();
         if !output_dtype.is_float() {
-            return Err(crate::Error::FloatDTypeRequired { op: OP, arg: "input", dtype: output_dtype });
+            return Err(crate::ErrorKind::FloatDTypeRequired { op: OP, arg: "input", dtype: output_dtype }.into());
         }
         if !quantized_dtype.is_signed() {
-            return Err(crate::Error::SignedIntegerDTypeRequired { op: OP, arg: "weight", dtype: quantized_dtype });
+            return Err(
+                crate::ErrorKind::SignedIntegerDTypeRequired { op: OP, arg: "weight", dtype: quantized_dtype }.into()
+            );
         }
         if !weight_scale.uop().dtype().is_float() {
-            return Err(crate::Error::FloatDTypeRequired {
+            return Err(crate::ErrorKind::FloatDTypeRequired {
                 op: OP,
                 arg: "weight_scale",
                 dtype: weight_scale.uop().dtype(),
-            });
+            }
+            .into());
         }
         if let Some(bias) = bias
             && !bias.uop().dtype().is_float()
         {
-            return Err(crate::Error::FloatDTypeRequired { op: OP, arg: "bias", dtype: bias.uop().dtype() });
+            return Err(crate::ErrorKind::FloatDTypeRequired { op: OP, arg: "bias", dtype: bias.uop().dtype() }.into());
         }
 
         let input_shape = self.shape()?;
@@ -80,13 +83,14 @@ impl Tensor {
             && output_shape.as_deref() == Some(scale_shape.as_slice())
             && bias_shape.as_ref().is_none_or(|shape| output_shape.as_deref() == Some(shape.as_slice()));
         if !valid_shapes {
-            return Err(crate::Error::ShapeMismatch {
+            return Err(crate::ErrorKind::ShapeMismatch {
                 context: OP.to_string(),
                 expected: "input [..., in], weight [out, in], weight_scale [out], bias [out]".to_string(),
                 actual: format!(
                     "input {input_shape:?}, weight {weight_shape:?}, weight_scale {scale_shape:?}, bias {bias_shape:?}"
                 ),
-            });
+            }
+            .into());
         }
 
         let accumulation_dtype = Self::sum_acc_dtype(&quantized_dtype);

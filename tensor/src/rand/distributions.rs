@@ -14,7 +14,7 @@
 use svod_dtype::DType;
 use svod_ir::ConstValue;
 
-use crate::{Error, Result, Tensor};
+use crate::{ErrorKind, Result, Tensor};
 
 const TWO_PI: f64 = 2.0 * std::f64::consts::PI;
 
@@ -44,12 +44,13 @@ impl Tensor {
     pub fn uniform_with_dtype(shape: &[usize], low: f64, high: f64, dtype: DType) -> Result<Tensor> {
         origin_call!("uniform");
         if low >= high {
-            return Err(Error::ParamRange {
+            return Err(ErrorKind::ParamRange {
                 op: "Tensor::uniform",
                 param: "low/high",
                 value: format!("low={low}, high={high}"),
                 constraint: "low < high",
-            });
+            }
+            .into());
         }
         let u = Tensor::rand(shape)?;
         let scale = u.broadcast_scalar(ConstValue::Float(high - low))?;
@@ -97,12 +98,13 @@ impl Tensor {
     pub fn normal(shape: &[usize], mean: f64, std: f64) -> Result<Tensor> {
         origin_call!("normal");
         if std < 0.0 {
-            return Err(Error::ParamRange {
+            return Err(ErrorKind::ParamRange {
                 op: "Tensor::normal",
                 param: "std",
                 value: format!("{std}"),
                 constraint: ">= 0",
-            });
+            }
+            .into());
         }
         let z = Tensor::randn(shape)?;
         let std_t = z.broadcast_scalar(ConstValue::Float(std))?;
@@ -120,12 +122,13 @@ impl Tensor {
     pub fn randint(shape: &[usize], low: i64, high: i64) -> Result<Tensor> {
         origin_call!("randint");
         if low >= high {
-            return Err(Error::ParamRange {
+            return Err(ErrorKind::ParamRange {
                 op: "Tensor::randint",
                 param: "low/high",
                 value: format!("low={low}, high={high}"),
                 constraint: "low < high",
-            });
+            }
+            .into());
         }
         let scaled = Tensor::rand(shape)?;
         let range = scaled.broadcast_scalar(ConstValue::Float((high - low) as f64))?;
@@ -158,12 +161,13 @@ impl Tensor {
     pub fn glorot_uniform_with_dtype(shape: &[usize], dtype: DType) -> Result<Tensor> {
         origin_call!("glorot_uniform");
         if shape.is_empty() {
-            return Err(Error::ParamRange {
+            return Err(ErrorKind::ParamRange {
                 op: "Tensor::glorot_uniform",
                 param: "shape",
                 value: "[]".to_string(),
                 constraint: "at least 1D",
-            });
+            }
+            .into());
         }
         let fan_in_v = fan_in(shape);
         let fan_out_v = shape[0];
@@ -189,12 +193,13 @@ impl Tensor {
     pub fn kaiming_uniform_with_dtype(shape: &[usize], a: f64, dtype: DType) -> Result<Tensor> {
         origin_call!("kaiming_uniform");
         if shape.is_empty() {
-            return Err(Error::ParamRange {
+            return Err(ErrorKind::ParamRange {
                 op: "Tensor::kaiming_uniform",
                 param: "shape",
                 value: "[]".to_string(),
                 constraint: "at least 1D",
-            });
+            }
+            .into());
         }
         let bound = (6.0 / ((1.0 + a * a) * fan_in(shape) as f64)).sqrt();
         Self::uniform_with_dtype(shape, -bound, bound, dtype)
@@ -206,12 +211,13 @@ impl Tensor {
     pub fn kaiming_normal(shape: &[usize], a: f64) -> Result<Tensor> {
         origin_call!("kaiming_normal");
         if shape.is_empty() {
-            return Err(Error::ParamRange {
+            return Err(ErrorKind::ParamRange {
                 op: "Tensor::kaiming_normal",
                 param: "shape",
                 value: "[]".to_string(),
                 constraint: "at least 1D",
-            });
+            }
+            .into());
         }
         let std = (2.0 / ((1.0 + a * a) * fan_in(shape) as f64)).sqrt();
         let z = Tensor::randn(shape)?;

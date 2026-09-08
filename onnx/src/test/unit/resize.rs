@@ -21,7 +21,7 @@ fn resize(
 }
 
 fn values(t: Tensor, config: &PrepareConfig) -> Vec<f32> {
-    let mut t = t.contiguous();
+    let t = t.contiguous();
     t.realize_with(config).unwrap();
     t.as_vec::<f32>().unwrap()
 }

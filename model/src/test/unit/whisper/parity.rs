@@ -31,7 +31,7 @@ fn resolve_file(name: &str) -> PathBuf {
 }
 
 fn load_golden_vec<T: Clone + Default + svod_dtype::ext::HasDType>(sd: &StateDict, key: &str) -> Vec<T> {
-    let mut t = sd.get(key).unwrap_or_else(|| panic!("missing golden key: {key}")).clone();
+    let t = sd.get(key).unwrap_or_else(|| panic!("missing golden key: {key}")).clone();
     t.realize().unwrap();
     t.as_vec::<T>().unwrap()
 }
@@ -70,7 +70,7 @@ fn encoder_output_matches_pytorch() {
 
     let want: Vec<f32> = load_golden_vec(&golden, "encoder_output");
 
-    let mut out = model.encode(&mel).expect("encoder forward");
+    let out = model.encode(&mel).expect("encoder forward");
     out.realize().expect("realize output");
     let got = out.as_vec::<f32>().expect("output readout");
 
@@ -118,7 +118,7 @@ fn decoder_logits_match_pytorch() {
 
     let want: Vec<f32> = load_golden_vec(&golden, "logits");
 
-    let mut out = model.decode(&tokens, &audio_features, 0).expect("decoder forward");
+    let out = model.decode(&tokens, &audio_features, 0).expect("decoder forward");
     out.realize().expect("realize logits");
     let got = out.as_vec::<f32>().expect("logits readout");
 

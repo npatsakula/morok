@@ -70,7 +70,7 @@ impl Tensor {
         let x = self.try_shrink(shrink)?.try_unsqueeze(-1)?.try_transpose(-1, dim as isize)?;
 
         // The gather axis is materialized as an arange, so it must be concrete.
-        let dim_size = self_shape[dim].as_const().ok_or_else(|| crate::error::Error::SymbolicShapeUnsupported {
+        let dim_size = self_shape[dim].as_const().ok_or_else(|| crate::error::ErrorKind::SymbolicShapeUnsupported {
             operation: "gather along a symbolic dim".to_string(),
         })?;
         let arange_dtype = DType::Int64;
@@ -276,7 +276,7 @@ impl Tensor {
     pub fn masked_select(&self, mask: &Tensor) -> Result<Tensor> {
         origin_call!("masked_select");
         if mask.uop().dtype() != DType::Bool {
-            return TypeMismatchSnafu { expected: DType::Bool, actual: mask.uop().dtype() }.fail();
+            return TypeMismatchSnafu { expected: DType::Bool, actual: mask.uop().dtype() }.fail().map_err(Into::into);
         }
         let x = self.flatten()?;
         let mask_flat = mask.broadcast_to(&self.shape()?)?.flatten()?;
@@ -286,7 +286,7 @@ impl Tensor {
         if n == 0 {
             return Ok(Tensor::empty_zero(self.uop().dtype()).to(self.device()));
         }
-        let mut count_t = mask_cumsum.try_shrink([((n - 1) as isize, n as isize)])?;
+        let count_t = mask_cumsum.try_shrink([((n - 1) as isize, n as isize)])?;
         count_t.realize()?;
         let count_t = count_t.as_ndarray::<i64>()?;
         let count = count_t[[0]] as usize;
@@ -328,7 +328,7 @@ impl Tensor {
         let dim = Self::normalize_axis(dim, ndim)?;
         let orig_len = shape[dim]
             .as_const()
-            .ok_or_else(|| crate::error::Error::SymbolicShapeUnsupported { operation: "sort".into() })?;
+            .ok_or_else(|| crate::error::ErrorKind::SymbolicShapeUnsupported { operation: "sort".into() })?;
 
         if orig_len <= 1 {
             let idx = Tensor::full(&self.dims()?, ConstValue::Int(0), svod_dtype::DType::Int32)?;
@@ -716,9 +716,10 @@ impl Tensor {
             "max" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Amax, true)?,
             "min" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Amin, true)?,
             _ => {
-                return Err(crate::error::Error::IrConstruction {
+                return Err(crate::error::ErrorKind::IrConstruction {
                     details: format!("ScatterND: unsupported reduction '{reduction}'"),
-                });
+                }
+                .into());
             }
         };
         let out_shape: Vec<isize> = x_dims.iter().map(|&d| d as isize).collect();

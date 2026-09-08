@@ -41,7 +41,7 @@ fn forward_output_shape() {
     let rotary = RotaryTable::new(10000.0, 8, 32, DType::Float32).unwrap();
 
     let out = attn.forward(&x, &rotary, None).unwrap();
-    let mut out = out;
+    let out = out;
     out.realize().unwrap();
     let s = out.dims().unwrap();
     assert_eq!(s[0], 1);

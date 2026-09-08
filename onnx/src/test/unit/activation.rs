@@ -17,7 +17,7 @@ svod_tensor::codegen_tests! {
         let x = Tensor::from_slice([-2.0f32, -1.0, 0.0, 1.0, 2.0]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Relu", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Relu", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
@@ -27,7 +27,7 @@ svod_tensor::codegen_tests! {
         let x = Tensor::from_slice([-1.0f32, 0.0, 1.0]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Sigmoid", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Sigmoid", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
@@ -38,7 +38,7 @@ svod_tensor::codegen_tests! {
         let mut node = NodeProto::default();
         node.attribute.push(make_attr_string("approximate", "none"));
 
-        let mut result = registry.dispatch("Gelu", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Gelu", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         assert!((vals[0] - 0.0).abs() < 1e-4, "gelu(0) = {}", vals[0]);
@@ -52,7 +52,7 @@ svod_tensor::codegen_tests! {
         let mut node = NodeProto::default();
         node.attribute.push(make_attr_string("approximate", "tanh"));
 
-        let mut result = registry.dispatch("Gelu", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Gelu", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         assert!((vals[0] - 0.0).abs() < 1e-4, "gelu_tanh(0) = {}", vals[0]);
@@ -64,7 +64,7 @@ svod_tensor::codegen_tests! {
         let x = Tensor::from_slice([0.0f32, 1.0, -1.0]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Softplus", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Softplus", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         let expected = [std::f32::consts::LN_2, 1.3133, 0.3133];
@@ -78,7 +78,7 @@ svod_tensor::codegen_tests! {
         let x = Tensor::from_slice([0.0f32, 1.0, -1.0]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Mish", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Mish", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         let expected = [0.0f32, 0.8651, -0.3034];
@@ -92,7 +92,7 @@ svod_tensor::codegen_tests! {
         let x = Tensor::from_slice([-4.0f32, 0.0, 3.0, 4.0]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("HardSwish", "", &[x], &node).unwrap();
+        let result = registry.dispatch("HardSwish", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         let expected = [0.0f32, 0.0, 3.0, 4.0];
@@ -106,7 +106,7 @@ svod_tensor::codegen_tests! {
         let x = Tensor::from_slice([-2.0f32, 0.0, 2.0]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Softsign", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Softsign", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         let expected = [-0.6667f32, 0.0, 0.6667];
@@ -121,7 +121,7 @@ svod_tensor::codegen_tests! {
         let mut node = NodeProto::default();
         node.attribute.push(make_attr_float("alpha", 1.0));
 
-        let mut result = registry.dispatch("Celu", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Celu", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         let expected = [-0.6321f32, 0.0, 1.0];
@@ -136,7 +136,7 @@ svod_tensor::codegen_tests! {
         let mut node = NodeProto::default();
         node.attribute.push(make_attr_int("axis", -1));
 
-        let mut result = registry.dispatch("Hardmax", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Hardmax", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         let expected = [0.0f32, 1.0, 0.0, 1.0, 0.0, 0.0];
@@ -151,7 +151,7 @@ svod_tensor::codegen_tests! {
         let mut node = NodeProto::default();
         node.attribute.push(make_attr_float("threshold", 0.0));
 
-        let mut result = registry.dispatch("Binarizer", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Binarizer", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         let expected = [0.0f32, 0.0, 1.0, 1.0];
@@ -166,7 +166,7 @@ svod_tensor::codegen_tests! {
         let mut node = NodeProto::default();
         node.attribute.push(make_attr_float("alpha", 1.0));
 
-        let mut result = registry.dispatch("Swish", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Swish", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         let expected = [0.0f32, 0.7311];
@@ -181,7 +181,7 @@ svod_tensor::codegen_tests! {
         let bias = Tensor::from_slice([0.5f32, 0.5]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("BiasGelu", "", &[x, bias], &node).unwrap();
+        let result = registry.dispatch("BiasGelu", "", &[x, bias], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         assert_eq!(vals.len(), 2, "bias_gelu should produce 2 elements, got {}", vals.len());
@@ -192,7 +192,7 @@ svod_tensor::codegen_tests! {
         let x = Tensor::from_slice([0.0f32, 1.0]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("FastGelu", "", &[x], &node).unwrap();
+        let result = registry.dispatch("FastGelu", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         let expected = [0.0f32, 0.8412];

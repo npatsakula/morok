@@ -296,7 +296,7 @@ impl VadInference {
         let h = HIDDEN;
         // Pull the recurrent weights to host before `vad` moves into the JIT.
         let to_vec = |t: &Tensor| -> crate::jit::Result<Vec<f32>> {
-            let mut t = t.clone();
+            let t = t.clone();
             t.realize()?;
             Ok(t.as_vec::<f32>()?)
         };

@@ -87,7 +87,7 @@ fn test_clip_alias() {
 fn test_masked_fill_scalar() {
     let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
     let mask = Tensor::from_slice([true, false, true, false]);
-    let mut r = x.masked_fill(&mask, 0.0f32).unwrap();
+    let r = x.masked_fill(&mask, 0.0f32).unwrap();
     r.realize().unwrap();
     assert_eq!(r.as_vec::<f32>().unwrap(), vec![0.0, 2.0, 0.0, 4.0]);
 }
@@ -97,7 +97,7 @@ fn test_masked_fill_scalar_int_cast() {
     // Scalar arm must cast the const to self's dtype (Int32 here).
     let x = Tensor::from_slice([1i32, 2, 3, 4]);
     let mask = Tensor::from_slice([true, false, true, false]);
-    let mut r = x.masked_fill(&mask, 7i32).unwrap();
+    let r = x.masked_fill(&mask, 7i32).unwrap();
     assert_eq!(r.uop().dtype(), DType::Int32);
     r.realize().unwrap();
     assert_eq!(r.as_vec::<i32>().unwrap(), vec![7, 2, 7, 4]);
@@ -108,7 +108,7 @@ fn test_masked_fill_tensor() {
     let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
     let mask = Tensor::from_slice([true, false, true, false]);
     let fill = Tensor::from_slice([-1.0f32, -2.0, -3.0, -4.0]);
-    let mut r = x.masked_fill(&mask, &fill).unwrap();
+    let r = x.masked_fill(&mask, &fill).unwrap();
     r.realize().unwrap();
     assert_eq!(r.as_vec::<f32>().unwrap(), vec![-1.0, 2.0, -3.0, 4.0]);
 }
@@ -119,7 +119,7 @@ fn test_masked_fill_broadcast_mask() {
     // mask [[true],[false]] broadcasts to [[t,t,t],[f,f,f]]: row 0 filled, row 1 kept.
     let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape([2, 3]).unwrap();
     let mask = Tensor::from_slice([true, false]).try_reshape([2, 1]).unwrap();
-    let mut r = x.masked_fill(&mask, 0.0f32).unwrap();
+    let r = x.masked_fill(&mask, 0.0f32).unwrap();
     assert_eq!(r.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect::<Vec<_>>(), vec![2, 3]);
     r.realize().unwrap();
     assert_eq!(r.as_vec::<f32>().unwrap(), vec![0.0, 0.0, 0.0, 4.0, 5.0, 6.0]);

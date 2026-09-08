@@ -40,7 +40,8 @@ use svod_ir::SInt;
 
 use crate::Tensor;
 use crate::error::{
-    DivisibilitySnafu, NdimExactSnafu, NdimMinimumSnafu, ParamRangeSnafu, SymbolicShapeUnsupportedSnafu, UOpSnafu,
+    DivisibilitySnafu, KindResult, NdimExactSnafu, NdimMinimumSnafu, ParamRangeSnafu, SymbolicShapeUnsupportedSnafu,
+    UOpSnafu,
 };
 use crate::reduce::AxisSpec;
 
@@ -212,7 +213,7 @@ impl Tensor {
     /// # use ndarray::array;
     /// let logprobs = Tensor::from_ndarray(&array![[-0.5f32, -1.0, -2.0]]);
     /// let target = Tensor::from_slice([0i64]);
-    /// let mut loss = logprobs.nll_loss().target(&target).call().unwrap();
+    /// let loss = logprobs.nll_loss().target(&target).call().unwrap();
     /// loss.realize().unwrap();
     /// let val = loss.as_vec::<f32>().unwrap();
     /// // -(-0.5) = 0.5
@@ -227,7 +228,7 @@ impl Tensor {
     /// # use ndarray::array;
     /// let logprobs = Tensor::from_ndarray(&array![[-0.5f32, -1.0], [-2.0, -0.3]]);
     /// let target = Tensor::from_slice([0i64, 1]);
-    /// let mut loss = logprobs.nll_loss().target(&target).reduction(Reduction::Sum).call().unwrap();
+    /// let loss = logprobs.nll_loss().target(&target).reduction(Reduction::Sum).call().unwrap();
     /// loss.realize().unwrap();
     /// let val = loss.as_vec::<f32>().unwrap();
     /// // sum of 0.5 + 0.3 = 0.8
@@ -334,7 +335,7 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let mut y = x.conv().weight(&w).call().unwrap();
+    /// let y = x.conv().weight(&w).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 3, 3]);
@@ -349,7 +350,7 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let mut y = x.conv().weight(&w).pads(&[1, 1, 1, 1]).strides(&[2, 2]).call().unwrap();
+    /// let y = x.conv().weight(&w).pads(&[1, 1, 1, 1]).strides(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 3, 3]);
@@ -375,7 +376,7 @@ impl Tensor {
             None => w_shape[2..]
                 .iter()
                 .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv" }))
-                .collect::<Result<Vec<_>>>()?,
+                .collect::<KindResult<Vec<_>>>()?,
         };
         let n = kernel.len();
         let strides_u: Vec<usize> =
@@ -411,7 +412,7 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let mut y = x.conv_transpose().weight(&w).call().unwrap();
+    /// let y = x.conv_transpose().weight(&w).call().unwrap();
     /// y.realize().unwrap();
     /// let vals = y.as_vec::<f32>().unwrap();
     /// assert_eq!(vals.len(), 16); // 4x4 output
@@ -425,7 +426,7 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let mut y = x.conv_transpose().weight(&w).strides(&[2, 2]).call().unwrap();
+    /// let y = x.conv_transpose().weight(&w).strides(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let vals = y.as_vec::<f32>().unwrap();
     /// assert_eq!(vals.len(), 25); // 5x5 output
@@ -452,7 +453,7 @@ impl Tensor {
             None => w_shape[2..]
                 .iter()
                 .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv_transpose" }))
-                .collect::<Result<Vec<_>>>()?,
+                .collect::<KindResult<Vec<_>>>()?,
         };
         let n = kernel.len();
         let x_shape = self.shape()?;
@@ -470,7 +471,7 @@ impl Tensor {
         let input_spatial_c: Vec<usize> = input_spatial
             .iter()
             .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv_transpose" }))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KindResult<Vec<_>>>()?;
 
         // Path 1: output_shape provided → derive total pads, apply auto_pad
         if let Some(os) = output_shape {
@@ -533,7 +534,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let mut y = x.avg_pool().kernel_shape(&[2, 2]).call().unwrap();
+    /// let y = x.avg_pool().kernel_shape(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 3, 3]);
@@ -547,7 +548,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let mut y = x.avg_pool().kernel_shape(&[2, 2]).strides(&[2, 2]).call().unwrap();
+    /// let y = x.avg_pool().kernel_shape(&[2, 2]).strides(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 2, 2]);
@@ -603,7 +604,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let mut y = x.lp_pool().kernel_shape(&[2, 2]).call().unwrap();
+    /// let y = x.lp_pool().kernel_shape(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 3, 3]);
@@ -681,7 +682,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 4, 1, 1), 1.0f32));
-    /// let mut y = x.depth_to_space().blocksize(2).call().unwrap();
+    /// let y = x.depth_to_space().blocksize(2).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 2, 2]);
@@ -695,7 +696,7 @@ impl Tensor {
     /// # use svod_tensor::nn::DepthToSpaceMode;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 4, 1, 1), 1.0f32));
-    /// let mut y = x.depth_to_space().blocksize(2).mode(DepthToSpaceMode::Crd).call().unwrap();
+    /// let y = x.depth_to_space().blocksize(2).mode(DepthToSpaceMode::Crd).call().unwrap();
     /// y.realize().unwrap();
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 4]);
     /// ```
@@ -769,7 +770,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let mut y = x.space_to_depth(2).unwrap();
+    /// let y = x.space_to_depth(2).unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 4, 2, 2]);

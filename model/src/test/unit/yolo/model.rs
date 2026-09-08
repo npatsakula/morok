@@ -78,7 +78,7 @@ fn forward_realize_nano() {
     let var = Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();
 
-    let mut out = model.forward(&images, &b).unwrap();
+    let out = model.forward(&images, &b).unwrap();
     out.realize().unwrap();
 
     let shape = crate::test::max_dims(&out);

@@ -44,7 +44,7 @@ fn forward_output_shape() {
     let m = ModernBert::empty(cfg);
     // input_ids (B=2, L=5) int64.
     let ids = Tensor::from_slice((0..10i64).collect::<Vec<_>>()).try_reshape([2isize, 5]).unwrap();
-    let mut out = m.forward(&ids, None).unwrap();
+    let out = m.forward(&ids, None).unwrap();
     out.realize().unwrap();
     let v = out.as_vec::<f32>().unwrap();
     // (2, 5, 32) = 320 elements, all finite.

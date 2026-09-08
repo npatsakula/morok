@@ -44,7 +44,7 @@ fn padded_encoder_plan_has_one_flash_attention_per_block() {
     }
     let encoder = AudioEncoder::empty(&encoder_dims(32));
     let mel = Tensor::zeros(&[1, 4, 3000], DType::Float32).unwrap();
-    let mut out = encoder.forward(&mel).unwrap();
+    let out = encoder.forward(&mel).unwrap();
     assert_eq!(out.dims().unwrap(), [1, 1500, 128]);
 
     let plan = out.prepare().unwrap();

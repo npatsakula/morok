@@ -39,7 +39,7 @@ macro_rules! impl_tensor_ops {
                 let (lhs, rhs) = self.broadcast_for_binop(other)?;
 
                 // Now call UOp operation with matching shapes
-                lhs.uop().$bin_uop(&rhs.uop()).map(Self::new).context(UOpSnafu)
+                lhs.uop().$bin_uop(&rhs.uop()).map(Self::new).context(UOpSnafu).map_err(Into::into)
             }
         )*
 
@@ -57,7 +57,7 @@ macro_rules! impl_tensor_ops {
             #[track_caller]
             pub fn $fall_method(&self) -> Result<Tensor> {
                 let _origin = OriginScope::outer_call(op_name(stringify!($fall_method)), Location::caller());
-                self.uop().$fall_uop().map(Self::new).context(UOpSnafu)
+                self.uop().$fall_uop().map(Self::new).context(UOpSnafu).map_err(Into::into)
             }
         )*
     };
@@ -158,9 +158,10 @@ impl Tensor {
         // Verify dtype is integer
         let dtype = self.uop().dtype();
         if !dtype.is_int() {
-            return Err(Error::SymbolicShapeUnsupported {
+            return Err(ErrorKind::SymbolicShapeUnsupported {
                 operation: format!("bitwise_not on non-integer dtype {:?}", dtype),
-            });
+            }
+            .into());
         }
 
         // Bitwise NOT using two's complement: ~x = -x - 1

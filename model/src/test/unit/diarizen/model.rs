@@ -64,7 +64,7 @@ fn from_state_dict_via_remap() {
     // `running_var` and materialize so `fold_batchnorm` can read the bytes.
     let invstd_keys: Vec<String> = sd.keys().filter(|k| k.ends_with(".invstd")).cloned().collect();
     for key in invstd_keys {
-        let mut t = sd.remove(&key).unwrap();
+        let t = sd.remove(&key).unwrap();
         t.realize().expect("realize invstd");
         let var_key = key.replace(".invstd", ".running_var");
         sd.insert(var_key, t);

@@ -94,9 +94,9 @@ fn materialized_cross_kv_matches_reference_projection() {
         (0..2 * dims.n_audio_ctx * dims.n_text_state).map(|index| (index as f32 - 31.0) * 0.017).collect();
     let audio = Tensor::from_slice(audio_values).try_reshape([2usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
 
-    let (mut expected_k, mut expected_v) = reference_cross_kv_projection(&model, &audio);
-    let (mut actual_k, mut actual_v) = model.project_cross_kv(&audio).unwrap();
-    Tensor::realize_batch([&mut expected_k, &mut expected_v, &mut actual_k, &mut actual_v]).unwrap();
+    let (expected_k, expected_v) = reference_cross_kv_projection(&model, &audio);
+    let (actual_k, actual_v) = model.project_cross_kv(&audio).unwrap();
+    Tensor::realize_batch([&expected_k, &expected_v, &actual_k, &actual_v]).unwrap();
 
     let expected_shape = [2, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
     for (expected, actual) in [(&expected_k, &actual_k), (&expected_v, &actual_v)] {
@@ -120,18 +120,10 @@ fn low_precision_cross_projection_keeps_fp32_cache_storage() {
     let audio = Tensor::from_slice(audio_values).try_reshape([1usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
     let native_audio = audio.cast(DType::Float16).unwrap();
 
-    let (mut expected_k, mut expected_v) = reference_cross_kv_projection(&model, &native_audio);
-    let (mut legacy_k, mut legacy_v) = reference_cross_kv_projection(&model, &audio);
-    let (mut actual_k, mut actual_v) = model.project_cross_kv(&audio).unwrap();
-    Tensor::realize_batch([
-        &mut expected_k,
-        &mut expected_v,
-        &mut legacy_k,
-        &mut legacy_v,
-        &mut actual_k,
-        &mut actual_v,
-    ])
-    .unwrap();
+    let (expected_k, expected_v) = reference_cross_kv_projection(&model, &native_audio);
+    let (legacy_k, legacy_v) = reference_cross_kv_projection(&model, &audio);
+    let (actual_k, actual_v) = model.project_cross_kv(&audio).unwrap();
+    Tensor::realize_batch([&expected_k, &expected_v, &legacy_k, &legacy_v, &actual_k, &actual_v]).unwrap();
 
     for ((expected, legacy), actual) in
         [(&expected_k, &legacy_k), (&expected_v, &legacy_v)].into_iter().zip([&actual_k, &actual_v])
@@ -182,8 +174,8 @@ fn quantized_weight_scale_scales_output_channels() {
     sd.insert(format!("{key}.weight_scale"), Tensor::from_slice(scale.clone()));
 
     let model = Whisper::from_state_dict(&sd, dims).unwrap();
-    let mut loaded = model.decoder.blocks[0].mlp0_w.contiguous();
-    Tensor::realize_batch([&mut loaded]).unwrap();
+    let loaded = model.decoder.blocks[0].mlp0_w.contiguous();
+    Tensor::realize_batch([&loaded]).unwrap();
 
     assert_eq!(loaded.dims().unwrap(), [out, inp]);
     let expected: Vec<f32> = weight.iter().enumerate().map(|(index, value)| value * scale[index / inp]).collect();
@@ -206,11 +198,11 @@ fn low_precision_prefill_does_not_inherit_fp32_cache_storage_dtype() {
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
     assert_eq!(cross_k.dtype(), DType::Float32);
 
-    let (mut actual, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
-    let (mut expected, _, _) = model
+    let (actual, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
+    let (expected, _, _) = model
         .decode_prefill(&tokens, &cross_k.cast(DType::Float16).unwrap(), &cross_v.cast(DType::Float16).unwrap(), 0)
         .unwrap();
-    Tensor::realize_batch([&mut actual, &mut expected]).unwrap();
+    Tensor::realize_batch([&actual, &expected]).unwrap();
     assert_eq!(actual.as_vec::<f32>().unwrap(), expected.as_vec::<f32>().unwrap());
 }
 
@@ -279,9 +271,9 @@ fn prepared_cross_kv_prefill_matches_direct_decoder() {
     let audio = Tensor::from_slice(audio_values).try_reshape([1usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
     let tokens = Tensor::from_slice([1i32, 2, 3]).try_reshape([1usize, 3]).unwrap();
 
-    let mut direct = model.decode(&tokens, &audio, 0).unwrap();
+    let direct = model.decode(&tokens, &audio, 0).unwrap();
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
-    let (mut prepared, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
+    let (prepared, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
     direct.realize().unwrap();
     prepared.realize().unwrap();
     let direct = direct.as_vec::<f32>().unwrap();
@@ -303,8 +295,8 @@ fn cached_steps_match_teacher_forced_full_prefix() {
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
     let mut prefix = vec![1i32, 7, 3];
     let prefix_tensor = Tensor::from_slice(&prefix).try_reshape([1usize, prefix.len()]).unwrap();
-    let (_, mut prefill_k, mut prefill_v) = model.decode_prefill(&prefix_tensor, &cross_k, &cross_v, 0).unwrap();
-    Tensor::realize_batch([&mut prefill_k, &mut prefill_v]).unwrap();
+    let (_, prefill_k, prefill_v) = model.decode_prefill(&prefix_tensor, &cross_k, &cross_v, 0).unwrap();
+    Tensor::realize_batch([&prefill_k, &prefill_v]).unwrap();
 
     let mut cache_k = vec![0.0f32; cache_elements];
     let mut cache_v = vec![0.0f32; cache_elements];
@@ -329,12 +321,12 @@ fn cached_steps_match_teacher_forced_full_prefix() {
         let self_v = Tensor::from_slice(&cache_v).try_reshape([1usize, dims.n_text_ctx, layer_heads, d_head]).unwrap();
         let key_lens = Tensor::from_slice([pos as i32]);
 
-        let (mut step_logits, mut new_k, mut new_v) =
+        let (step_logits, new_k, new_v) =
             model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens).unwrap();
         prefix.push(next_token);
         let full_tokens = Tensor::from_slice(&prefix).try_reshape([1usize, prefix.len()]).unwrap();
-        let mut teacher = model.decode_with_cross_kv(&full_tokens, &cross_k, &cross_v).unwrap();
-        Tensor::realize_batch([&mut step_logits, &mut new_k, &mut new_v, &mut teacher]).unwrap();
+        let teacher = model.decode_with_cross_kv(&full_tokens, &cross_k, &cross_v).unwrap();
+        Tensor::realize_batch([&step_logits, &new_k, &new_v, &teacher]).unwrap();
 
         let step = step_logits.as_vec::<f32>().unwrap();
         let teacher = teacher.as_vec::<f32>().unwrap();
@@ -361,9 +353,9 @@ fn one_token_language_logits_match_full_context_sot_logits() {
     let full_tokens = Tensor::from_slice(padded_tokens).try_reshape([1usize, dims.n_text_ctx]).unwrap();
     let one_token = Tensor::from_slice([1i32]).try_reshape([1usize, 1]).unwrap();
 
-    let mut full = model.decode_with_cross_kv(&full_tokens, &cross_k, &cross_v).unwrap();
-    let mut one = model.decode_with_cross_kv(&one_token, &cross_k, &cross_v).unwrap();
-    Tensor::realize_batch([&mut full, &mut one]).unwrap();
+    let full = model.decode_with_cross_kv(&full_tokens, &cross_k, &cross_v).unwrap();
+    let one = model.decode_with_cross_kv(&one_token, &cross_k, &cross_v).unwrap();
+    Tensor::realize_batch([&full, &one]).unwrap();
     let full = full.as_vec::<f32>().unwrap();
     let one = one.as_vec::<f32>().unwrap();
     let max_delta = full[..dims.n_vocab].iter().zip(&one).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -489,11 +481,11 @@ fn alignment_compute_does_not_inherit_fp32_cache_storage_dtype() {
     let (cross_k, cross_v) = model.project_cross_kv(&features).unwrap();
     assert_eq!(cross_k.dtype(), DType::Float32);
 
-    let mut actual = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
+    let actual = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
     let low_k = cross_k.cast(DType::Float16).unwrap();
     let low_v = cross_v.cast(DType::Float16).unwrap();
-    let mut expected = model.align_with_cross_kv(&tokens, &low_k, &low_v, &heads).unwrap();
-    Tensor::realize_batch([&mut actual, &mut expected]).unwrap();
+    let expected = model.align_with_cross_kv(&tokens, &low_k, &low_v, &heads).unwrap();
+    Tensor::realize_batch([&actual, &expected]).unwrap();
 
     let actual = actual.as_vec::<f32>().unwrap();
     let expected = expected.as_vec::<f32>().unwrap();
@@ -553,9 +545,9 @@ fn cached_cross_alignment_matches_audio_feature_reference() {
     let tokens = Tensor::from_slice([1i32, 2, 3, 4, 4, 3, 2, 1]).try_reshape([2usize, 4]).unwrap();
     let heads = [(1, 1), (0, 0)];
 
-    let mut reference = eager_audio_feature_alignment_reference(&model, &tokens, &features, &heads);
+    let reference = eager_audio_feature_alignment_reference(&model, &tokens, &features, &heads);
     let (cross_k, cross_v) = model.project_cross_kv(&features).unwrap();
-    let mut cached = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
+    let cached = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
     reference.realize().unwrap();
     cached.realize().unwrap();
     let reference = reference.as_vec::<f32>().unwrap();

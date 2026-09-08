@@ -6,7 +6,7 @@ use svod_dtype::DType;
 use svod_ir::{ConstValue, SInt, UOp};
 
 use crate::Tensor;
-use crate::error::{DivisibilitySnafu, SymbolicShapeUnsupportedSnafu};
+use crate::error::{DivisibilitySnafu, KindResult, SymbolicShapeUnsupportedSnafu};
 use crate::reduce::AxisSpec;
 
 use super::pad::apply_ceil_mode;
@@ -30,19 +30,22 @@ impl Tensor {
         let n_batch = ndim - n_spatial;
 
         if ndim < n_spatial {
-            return Err(crate::error::Error::IrConstruction {
+            return Err(crate::error::ErrorKind::IrConstruction {
                 details: format!("can't pool {ndim}D with {n_spatial}D kernel"),
-            });
+            }
+            .into());
         }
         if kernel.len() != stride.len() {
-            return Err(crate::error::Error::IrConstruction {
+            return Err(crate::error::ErrorKind::IrConstruction {
                 details: format!("kernel/stride length mismatch: {} vs {}", kernel.len(), stride.len()),
-            });
+            }
+            .into());
         }
         if kernel.len() != dilation.len() {
-            return Err(crate::error::Error::IrConstruction {
+            return Err(crate::error::ErrorKind::IrConstruction {
                 details: format!("kernel/dilation length mismatch: {} vs {}", kernel.len(), dilation.len()),
-            });
+            }
+            .into());
         }
 
         // Spatial dims as SInt — works for both concrete and symbolic.
@@ -53,14 +56,15 @@ impl Tensor {
             if let Some(i) = i_[j].as_const()
                 && dilation[j] * (kernel[j] - 1) >= i
             {
-                return Err(crate::error::Error::IrConstruction {
+                return Err(crate::error::ErrorKind::IrConstruction {
                     details: format!(
                         "kernel size {} (dilated {}) > input size {}",
                         kernel[j],
                         dilation[j] * (kernel[j] - 1) + 1,
                         i
                     ),
-                });
+                }
+                .into());
             }
         }
 
@@ -167,7 +171,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let mut y = x.avg_pool2d().kernel_size(&[2, 2]).call().unwrap();
+    /// let y = x.avg_pool2d().kernel_size(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 2, 2]);
@@ -191,7 +195,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
-    /// let mut y = x.avg_pool2d()
+    /// let y = x.avg_pool2d()
     ///     .kernel_size(&[2, 2])
     ///     .stride(&[1, 1])
     ///     .padding(&[(1, 1), (1, 1)])
@@ -302,7 +306,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let mut y = x.max_pool2d().kernel_size(&[2, 2]).call().unwrap();
+    /// let y = x.max_pool2d().kernel_size(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 2, 2]);
@@ -315,7 +319,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let mut y = x.max_pool2d()
+    /// let y = x.max_pool2d()
     ///     .kernel_size(&[3, 3])
     ///     .stride(&[1, 1])
     ///     .padding(&[(1, 1), (1, 1)])
@@ -442,7 +446,7 @@ impl Tensor {
                     .as_const()
                     .context(SymbolicShapeUnsupportedSnafu { operation: "max_pool2d_with_indices" })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KindResult<Vec<_>>>()?;
         let spatial_sz: usize = spatial_dims_usize.iter().product();
 
         // Create reverse arange: spatial_sz, spatial_sz-1, ..., 1
@@ -524,7 +528,7 @@ impl Tensor {
 
         let spatial_shape: Vec<usize> = (0..n_spatial)
             .map(|j| shape[n_batch + j].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "max_unpool2d" }))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KindResult<Vec<_>>>()?;
 
         // Inferred shape from inverse pooling formula: o = (i-1)*s - (pB+pA) + k
         let stride = stride.unwrap_or(kernel_size);
@@ -540,7 +544,7 @@ impl Tensor {
         let inferred_numel: usize = inferred_spatial.iter().product();
         let batch_sizes: Vec<usize> = (0..n_batch)
             .map(|j| shape[j].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "max_unpool2d" }))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KindResult<Vec<_>>>()?;
         let bs: usize = batch_sizes.iter().product();
 
         // Flatten: (N, C, *spatial) → (N*C, 1, num_pooled)
@@ -599,7 +603,7 @@ impl Tensor {
     /// # use ndarray::Array3;
     /// // 1 batch, 1 channel, 2x2 block = 4 cols, 4 sliding positions
     /// let cols = Tensor::from_ndarray(&Array3::from_elem((1, 4, 4), 1.0f32));
-    /// let mut img = cols.col2im()
+    /// let img = cols.col2im()
     ///     .image_shape(&[4, 4])
     ///     .block_shape(&[2, 2])
     ///     .strides(&[2, 2])

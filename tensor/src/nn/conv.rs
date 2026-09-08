@@ -6,7 +6,7 @@ use snafu::OptionExt;
 use svod_ir::SInt;
 
 use crate::Tensor;
-use crate::error::SymbolicShapeUnsupportedSnafu;
+use crate::error::{KindResult, SymbolicShapeUnsupportedSnafu};
 use crate::reduce::AxisSpec;
 
 type Result<T> = crate::Result<T>;
@@ -28,7 +28,7 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let mut y = x.conv2d().weight(&w).call().unwrap();
+    /// let y = x.conv2d().weight(&w).call().unwrap();
     /// y.realize().unwrap();
     /// // 3x3 kernel of ones on input of ones => each output element is 9.0
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![9.0; 9]);
@@ -41,7 +41,7 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let mut y = x.conv2d().weight(&w).stride(&[2, 2]).call().unwrap();
+    /// let y = x.conv2d().weight(&w).stride(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 2, 2]);
@@ -56,7 +56,7 @@ impl Tensor {
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
     /// // padding=1 on each side: output matches input spatial dims
-    /// let mut y = x.conv2d().weight(&w).padding(&[(1, 1), (1, 1)]).call().unwrap();
+    /// let y = x.conv2d().weight(&w).padding(&[(1, 1), (1, 1)]).call().unwrap();
     /// y.realize().unwrap();
     /// let vals = y.as_vec::<f32>().unwrap();
     /// assert_eq!(vals.len(), 9); // 3x3 output
@@ -74,7 +74,7 @@ impl Tensor {
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
     /// let b = Tensor::from_slice([10.0f32]);
-    /// let mut y = x.conv2d().weight(&w).bias(&b).call().unwrap();
+    /// let y = x.conv2d().weight(&w).bias(&b).call().unwrap();
     /// y.realize().unwrap();
     /// // Each output element: 9.0 + 10.0 = 19.0
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![19.0]);
@@ -103,18 +103,20 @@ impl Tensor {
         let hw: Vec<usize> = w_shape[2..]
             .iter()
             .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv2d" }))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KindResult<Vec<_>>>()?;
         let n_spatial = hw.len();
 
         if x_shape.len() != w_shape.len() {
-            return Err(crate::error::Error::IrConstruction {
+            return Err(crate::error::ErrorKind::IrConstruction {
                 details: format!("input and weight must have same ndim, got {} and {}", x_shape.len(), w_shape.len()),
-            });
+            }
+            .into());
         }
         if groups * cin != cin_ {
-            return Err(crate::error::Error::IrConstruction {
+            return Err(crate::error::ErrorKind::IrConstruction {
                 details: format!("groups*cin/g ({}) != input channels ({cin_})", groups * cin),
-            });
+            }
+            .into());
         }
 
         let default_ones: Vec<usize> = vec![1; n_spatial];
@@ -208,7 +210,7 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let mut y = x.conv_transpose2d().weight(&w).call().unwrap();
+    /// let y = x.conv_transpose2d().weight(&w).call().unwrap();
     /// y.realize().unwrap();
     /// let vals = y.as_vec::<f32>().unwrap();
     /// assert_eq!(vals.len(), 16); // 4x4 output
@@ -223,7 +225,7 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let mut y = x.conv_transpose2d().weight(&w).stride(&[2, 2]).call().unwrap();
+    /// let y = x.conv_transpose2d().weight(&w).stride(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let vals = y.as_vec::<f32>().unwrap();
     /// assert_eq!(vals.len(), 25); // 5x5 output
@@ -236,7 +238,7 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let mut y = x.conv_transpose2d()
+    /// let y = x.conv_transpose2d()
     ///     .weight(&w)
     ///     .stride(&[2, 2])
     ///     .padding(&[(1, 1), (1, 1)])
@@ -264,7 +266,7 @@ impl Tensor {
         let hw: Vec<usize> = w_shape[2..]
             .iter()
             .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv_transpose2d" }))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KindResult<Vec<_>>>()?;
         let n_spatial = hw.len();
 
         let default_ones: Vec<usize> = vec![1; n_spatial];
@@ -306,7 +308,7 @@ impl Tensor {
             let spatial: Vec<usize> = x_shape[2..]
                 .iter()
                 .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv_transpose2d" }))
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<KindResult<Vec<_>>>()?;
 
             // Step 1: reshape (N,C,h,w) -> (N,C,h,1,w,1)
             let mut rshape: Vec<SInt> = vec![x_shape[0].clone(), x_shape[1].clone()];

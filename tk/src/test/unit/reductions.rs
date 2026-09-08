@@ -173,7 +173,7 @@ fn test_softmax_gpu() {
     let (n, block) = (64usize, 32usize);
 
     let a = Tensor::rand(&[1, 1, block, n]).expect("rand a");
-    let mut a = a.cast(DType::Float32).expect("cast a");
+    let a = a.cast(DType::Float32).expect("cast a");
     a.realize().expect("realize a");
     let mut out = Tensor::empty(&[1, 1, block, n], DType::Float32);
 
@@ -185,7 +185,7 @@ fn test_softmax_gpu() {
 
     let got = out.as_vec::<f32>().expect("read out");
 
-    let mut reference = a.softmax(3isize).expect("ref softmax");
+    let reference = a.softmax(3isize).expect("ref softmax");
     reference.realize().expect("realize reference");
     let expected = reference.as_vec::<f32>().expect("read reference");
 
@@ -211,7 +211,7 @@ fn test_softmax_unroll_gpu() {
     };
     for (n, block) in [(64usize, 16usize), (64, 32)] {
         let a = Tensor::rand(&[1, 1, block, n]).expect("rand a");
-        let mut a = a.cast(DType::Float32).expect("cast a");
+        let a = a.cast(DType::Float32).expect("cast a");
         a.realize().expect("realize a");
         let mut out = Tensor::empty(&[1, 1, block, n], DType::Float32);
 
@@ -223,7 +223,7 @@ fn test_softmax_unroll_gpu() {
         .expect("softmax_u launch");
 
         let got = out.as_vec::<f32>().expect("read out");
-        let mut reference = a.softmax(3isize).expect("ref softmax");
+        let reference = a.softmax(3isize).expect("ref softmax");
         reference.realize().expect("realize reference");
         let expected = reference.as_vec::<f32>().expect("read reference");
 
@@ -281,7 +281,7 @@ fn test_row_argmin_gpu() {
         expect[r] = best_j;
     }
 
-    let mut a = Tensor::from_slice(&m).try_reshape([1usize, 1, 16, 16]).expect("reshape a");
+    let a = Tensor::from_slice(&m).try_reshape([1usize, 1, 16, 16]).expect("reshape a");
     a.realize().expect("realize a");
     let mut vout = Tensor::empty(&[1, 1, 16, 16], DType::Float32);
     let mut iout = Tensor::empty(&[1, 1, 16, 16], DType::Int32);

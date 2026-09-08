@@ -15,7 +15,7 @@ fn powerset_decode_maps_winning_subset_to_speakers() {
     data[2 * k] = 10.0; // frame 2 → subset 0 = {} (no speakers)
     let logits = Tensor::from_slice(&data).try_reshape([1, 3, k]).unwrap();
 
-    let mut ml = powerset_to_multilabel(&logits, 4, 4).unwrap();
+    let ml = powerset_to_multilabel(&logits, 4, 4).unwrap();
     ml.realize().unwrap();
 
     // (1, 3, 4): {0,1}→[1,1,0,0], {0}→[1,0,0,0], {}→[0,0,0,0].

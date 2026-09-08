@@ -72,8 +72,8 @@ fn test_shape_mismatch_error() {
 
     // With broadcasting, this now gives a BroadcastShapeMismatch error
     // (dimension 0: cannot broadcast 3 to 2 or vice versa)
-    match result {
-        Err(Error::UOp { source: svod_ir::Error::BroadcastShapeMismatch { .. } }) => {
+    match result.map_err(crate::error::Error::into_kind) {
+        Err(ErrorKind::UOp { source: svod_ir::Error::BroadcastShapeMismatch { .. } }) => {
             // Expected - shapes [3] and [2] cannot be broadcasted
         }
         _ => panic!("Expected BroadcastShapeMismatch error"),

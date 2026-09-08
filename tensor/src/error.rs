@@ -1,9 +1,14 @@
 use snafu::Snafu;
 use svod_ir::shape::Shape;
 
+/// The cause of a tensor-API failure.
+///
+/// Carried indirectly by [`Error`], which is what [`Result`] and every public
+/// method surface; the snafu context selectors (`XSnafu`) build this type and
+/// `?` boxes it on the way out.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
-pub enum Error {
+pub enum ErrorKind {
     // =========================================================================
     // IR Layer Errors
     // =========================================================================
@@ -268,4 +273,64 @@ impl BeamWorker {
     }
 }
 
+/// A boxed [`ErrorKind`].
+///
+/// Tensor methods thread `Result<T>` through deeply nested builders, so the
+/// `Err` payload is kept pointer-sized instead of growing every `Result` in the
+/// crate to the size of the widest variant.
+pub struct Error(Box<ErrorKind>);
+
+impl Error {
+    /// The wrapped cause; also reachable through [`Deref`](std::ops::Deref).
+    pub fn kind(&self) -> &ErrorKind {
+        &self.0
+    }
+
+    /// Unwrap the boxed cause, e.g. to match it by value.
+    pub fn into_kind(self) -> ErrorKind {
+        *self.0
+    }
+}
+
+impl From<ErrorKind> for Error {
+    fn from(kind: ErrorKind) -> Self {
+        Self(Box::new(kind))
+    }
+}
+
+impl std::ops::Deref for Error {
+    type Target = ErrorKind;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// A [`Result`] carrying the cause unboxed, as the snafu context selectors
+/// produce it. Useful where an iterator adaptor has to name the error type
+/// explicitly; `?` boxes it into [`Error`].
+pub type KindResult<T> = std::result::Result<T, ErrorKind>;
+
+#[cfg(test)]
+#[path = "test/unit/error.rs"]
+mod tests;

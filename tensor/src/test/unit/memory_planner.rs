@@ -177,7 +177,7 @@ fn test_compute_item_levels_errors_on_cycle() {
     items[1].dependencies = vec![a];
 
     let err = compute_item_levels(&items).expect_err("cyclic schedule must error");
-    assert!(matches!(err, crate::error::Error::Execution { .. }), "unexpected error: {err:?}");
+    assert!(matches!(err.kind(), crate::error::ErrorKind::Execution { .. }), "unexpected error: {err:?}");
 }
 
 #[test]
@@ -188,7 +188,7 @@ fn test_compute_item_levels_errors_on_unresolved_dep() {
     items[0].dependencies = vec![999];
 
     let err = compute_item_levels(&items).expect_err("unresolved dep must error");
-    assert!(matches!(err, crate::error::Error::Execution { .. }), "unexpected error: {err:?}");
+    assert!(matches!(err.kind(), crate::error::ErrorKind::Execution { .. }), "unexpected error: {err:?}");
 }
 
 #[test]
@@ -615,7 +615,7 @@ fn test_real_numeric_result_matches_with_planner_disabled_and_arena() {
         let b = crate::Tensor::from_slice([0.5f32, 3.0, -1.5, 2.0]);
         let first = &a + &b;
         let second = &first * &a;
-        let mut output = &second + &b;
+        let output = &second + &b;
         let config = crate::PrepareConfig { planner_mode: mode, disable_schedule_cache: true, ..Default::default() };
         output.realize_with(&config).expect("realize numeric planner differential");
         output.as_vec::<f32>().expect("numeric output")

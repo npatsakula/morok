@@ -151,7 +151,7 @@ fn stitched_windows_match_full_forward() {
 
     let feat_t =
         Tensor::from_slice(feat.clone()).try_reshape([1isize, n_frames as isize, N_MELS as isize]).expect("reshape");
-    let mut full = model.forward(&feat_t, None).expect("forward");
+    let full = model.forward(&feat_t, None).expect("forward");
     full.realize().expect("realize");
     let want = full.as_vec::<f32>().expect("readout");
 
@@ -176,7 +176,7 @@ pub(super) fn real_file(name: &str) -> PathBuf {
 }
 
 pub(super) fn load_golden_vec(sd: &crate::state::StateDict, key: &str) -> Vec<f32> {
-    let mut t = sd.get(key).unwrap_or_else(|| panic!("golden key {key}")).clone();
+    let t = sd.get(key).unwrap_or_else(|| panic!("golden key {key}")).clone();
     t.realize().expect("realize golden");
     t.as_vec::<f32>().expect("golden readout")
 }

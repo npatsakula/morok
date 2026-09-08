@@ -58,7 +58,7 @@ fn concurrent_zeros_realizes_keep_coherent_identities() {
     let cfg = crate::PrepareConfig::default();
     // Warm the schedule cache so both threads race through apply_map together.
     {
-        let mut warm = crate::Tensor::zeros(&[3], DType::Float32).unwrap();
+        let warm = crate::Tensor::zeros(&[3], DType::Float32).unwrap();
         warm.realize_with(&cfg).unwrap();
     }
     for _ in 0..100 {
@@ -67,7 +67,7 @@ fn concurrent_zeros_realizes_keep_coherent_identities() {
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 let cfg = crate::PrepareConfig::default();
-                let mut t = crate::Tensor::zeros(&[3], DType::Float32).unwrap();
+                let t = crate::Tensor::zeros(&[3], DType::Float32).unwrap();
                 barrier.wait();
                 t.realize_with(&cfg).unwrap();
                 let local = t.buffer().expect("realized tensor has a buffer").id();
@@ -114,7 +114,7 @@ fn buffer_entry_expires_when_uop_drops() {
 #[test]
 fn realized_broadcast_skips_deviceless_receivers() {
     crate::test::helpers::test_setup();
-    let mut a = crate::Tensor::zeros(&[3], DType::Float32).unwrap().contiguous();
+    let a = crate::Tensor::zeros(&[3], DType::Float32).unwrap().contiguous();
     let b = crate::Tensor::zeros(&[3], DType::Float32).unwrap().contiguous();
     let shared = b.uop();
 
@@ -126,7 +126,7 @@ fn realized_broadcast_skips_deviceless_receivers() {
     );
 
     // ...and still realizes correctly on its own.
-    let mut b = b;
+    let b = b;
     b.realize().unwrap();
     let local = b.buffer().expect("own buffer").id();
     let via_uop = crate::tensor_registry::get_buffer(b.uop().base().id).expect("registry entry").id();

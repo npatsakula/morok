@@ -93,7 +93,7 @@ impl Tensor {
         let uop = buffer_uop.try_reshape(&ir_shape).expect("shape matches element count");
 
         let entry = tensor_registry::register_tensor_with_buffer(uop, buffer_arc.clone(), buffer_uop_id);
-        Self::with_buffer(entry, buffer_arc)
+        Self::with_entry(entry)
     }
 
     /// Weight-loading constructor: weights with the same checkpoint
@@ -105,9 +105,10 @@ impl Tensor {
         let numel: usize = key.shape.iter().product();
         let expected = numel * key.dtype.bytes();
         if bytes.len() != expected {
-            return Err(Error::IrConstruction {
+            return Err(ErrorKind::IrConstruction {
                 details: format!("from_shared_weight: data length {} != expected {expected}", bytes.len()),
-            });
+            }
+            .into());
         }
         let ir_shape = Shape::from_iter(key.shape.iter().map(|&d| SInt::Const(d)));
         let (device, dtype) = (key.device.clone(), key.dtype.clone());
@@ -116,7 +117,7 @@ impl Tensor {
         let buffer_uop_id = buffer_uop.id;
         let uop = buffer_uop.try_reshape(&ir_shape).expect("shape matches element count");
         let entry = tensor_registry::register_tensor_with_buffer(uop, buffer_arc.clone(), buffer_uop_id);
-        Ok(Self::with_buffer(entry, buffer_arc))
+        Ok(Self::with_entry(entry))
     }
 
     /// Create tensor from raw bytes with explicit dtype and shape.
@@ -128,7 +129,7 @@ impl Tensor {
         let numel: usize = shape.iter().product();
         let expected_bytes = numel * dtype.bytes();
         if data.len() != expected_bytes {
-            return Err(Error::IrConstruction {
+            return Err(ErrorKind::IrConstruction {
                 details: format!(
                     "from_raw_bytes: data length {} != expected {} ({} elements * {} bytes)",
                     data.len(),
@@ -136,7 +137,8 @@ impl Tensor {
                     numel,
                     dtype.bytes()
                 ),
-            });
+            }
+            .into());
         }
         Ok(Self::from_bytes_shaped(data, shape, dtype, default_device()))
     }
@@ -189,8 +191,8 @@ impl Tensor {
     /// Returns `None` for lazy tensors that haven't been realized yet.
     /// Returns `Some(buffer)` for input tensors and realized tensors.
     pub fn buffer(&self) -> Option<Buffer> {
-        // Check local field first, then entry, then global registry by base UOp ID.
-        if let Some(buf) = self.buffer.as_ref().or_else(|| self.entry.buffer()) {
+        // Check the entry first, then the global registry by base UOp ID.
+        if let Some(buf) = self.entry.buffer() {
             return Some((**buf).clone());
         }
         crate::tensor_registry::get_buffer_arc(self.uop().base().id).map(|arc| (*arc).clone())
@@ -212,14 +214,14 @@ impl Tensor {
         use ndarray::{ArrayD, IxDyn};
 
         let uop = self.uop();
-        let shape = uop.shape().context(UOpSnafu)?.ok_or(Error::NoShape)?;
+        let shape = uop.shape().context(UOpSnafu)?.ok_or(ErrorKind::NoShape)?;
 
         // Refuse symbolic shapes — matches Tinygrad: assert all_int(self.shape)
         snafu::ensure!(shape.iter().all(SInt::is_const), SymbolicShapeSnafu);
         let dims: Vec<usize> = shape.iter().filter_map(SInt::as_const).collect();
 
         let data = if dims.contains(&0) { vec![] } else { self.as_vec::<T>()? };
-        ArrayD::from_shape_vec(IxDyn(&dims), data).context(NdarrayShapeSnafu)
+        ArrayD::from_shape_vec(IxDyn(&dims), data).context(NdarrayShapeSnafu).map_err(Into::into)
     }
 
     /// The tensor whose buffer holds exactly this tensor's logical elements,
@@ -230,13 +232,13 @@ impl Tensor {
     /// directly it yields the wrong count in the wrong order. Anything that is
     /// not a buffer identity is therefore materialized through a contiguous
     /// copy. A tensor with nothing realized upstream is returned untouched so
-    /// the caller still reports [`Error::NoBuffer`] rather than realizing a
+    /// the caller still reports [`ErrorKind::NoBuffer`] rather than realizing a
     /// lazy graph behind the user's back.
     fn materialized(&self) -> Result<Self> {
         if self.uop().has_buffer_identity() || self.buffer().is_none() {
             return Ok(self.clone());
         }
-        let mut copy = self.contiguous();
+        let copy = self.contiguous();
         copy.realize()?;
         Ok(copy)
     }
@@ -263,10 +265,10 @@ impl Tensor {
         }
 
         let source = self.materialized()?;
-        let buffer = source.buffer().ok_or(Error::NoBuffer)?;
+        let buffer = source.buffer().ok_or(ErrorKind::NoBuffer)?;
 
         if buffer.dtype() != T::DTYPE {
-            return TypeMismatchSnafu { expected: T::DTYPE, actual: buffer.dtype() }.fail();
+            return TypeMismatchSnafu { expected: T::DTYPE, actual: buffer.dtype() }.fail().map_err(Into::into);
         }
 
         // The logical element count — the backing allocation may be larger
@@ -280,6 +282,67 @@ impl Tensor {
             .context(DeviceSnafu)?;
 
         Ok(data)
+    }
+
+    /// Realize the graph if nothing behind this tensor has run yet.
+    ///
+    /// A tensor that already resolves to a buffer — realized, or a view of a
+    /// realized base — is left alone, so a read never recompiles.
+    fn realized_for_read(&self) -> Result<()> {
+        if self.buffer().is_none() { self.realize() } else { Ok(()) }
+    }
+
+    /// Read this tensor as a flat `Vec<T>`, realizing it first if needed.
+    ///
+    /// The auto-realizing counterpart of [`as_vec`](Self::as_vec): use that one
+    /// where triggering compilation would be wrong.
+    ///
+    /// # Examples
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+    /// assert_eq!((&a + &a).to_vec::<f32>().unwrap(), vec![2.0, 4.0, 6.0]);
+    /// ```
+    pub fn to_vec<T: HasDType + Default + Clone>(&self) -> Result<Vec<T>> {
+        self.realized_for_read()?;
+        self.as_vec()
+    }
+
+    /// Read this tensor as an ndarray, realizing it first if needed.
+    ///
+    /// The auto-realizing counterpart of [`as_ndarray`](Self::as_ndarray).
+    ///
+    /// # Examples
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// # use ndarray::array;
+    /// let a = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
+    /// assert_eq!(a.matmul(&a).unwrap().to_ndarray::<f32>().unwrap(), array![[7.0f32, 10.0], [15.0, 22.0]].into_dyn());
+    /// ```
+    pub fn to_ndarray<T: HasDType + Default + Clone>(&self) -> Result<ndarray::ArrayD<T>> {
+        self.realized_for_read()?;
+        self.as_ndarray()
+    }
+
+    /// The single element of a one-element tensor, realizing it first if needed.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::ShapeMismatch`] unless the tensor holds exactly one element.
+    ///
+    /// # Examples
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+    /// assert_eq!(a.sum(()).unwrap().item::<f32>().unwrap(), 6.0);
+    /// ```
+    pub fn item<T: HasDType + Default + Clone>(&self) -> Result<T> {
+        let numel = self.numel()?;
+        snafu::ensure!(
+            numel == 1,
+            ShapeMismatchSnafu { context: "item", expected: "1 element", actual: format!("{numel} elements") }
+        );
+        Ok(self.to_vec::<T>()?.pop().expect("a one-element tensor reads back exactly one element"))
     }
 
     /// Typed immutable view into the buffer, shaped by the tensor's logical shape.
@@ -301,13 +364,16 @@ impl Tensor {
     /// viewable; use [`as_ndarray`](Self::as_ndarray) for anything else.
     pub fn array_view<T: HasDType>(&self) -> Result<ndarray::ArrayViewD<'_, T>> {
         snafu::ensure!(self.uop().has_buffer_identity(), NoBufferSnafu);
-        let buffer_arc = self.buffer.as_ref().or_else(|| self.entry.buffer()).ok_or(Error::NoBuffer)?;
+        let buffer_arc = self.entry.buffer().ok_or(ErrorKind::NoBuffer)?;
         let flat = buffer_arc.as_array::<T>().context(DeviceSnafu)?;
         // Reshape to tensor's logical shape if concrete
         if let Ok(shape) = self.shape() {
             let dims: Vec<usize> = shape.iter().filter_map(|d| d.as_const()).collect();
             if dims.len() == shape.len() {
-                return flat.into_shape_with_order(ndarray::IxDyn(&dims)).context(NdarrayShapeSnafu);
+                return flat
+                    .into_shape_with_order(ndarray::IxDyn(&dims))
+                    .context(NdarrayShapeSnafu)
+                    .map_err(Into::into);
             }
         }
         Ok(flat)
@@ -328,12 +394,15 @@ impl Tensor {
     /// values at the wrong offsets in the base buffer.
     pub fn array_view_mut<T: HasDType>(&self) -> Result<ndarray::ArrayViewMutD<'_, T>> {
         snafu::ensure!(self.uop().has_buffer_identity(), NoBufferSnafu);
-        let buffer_arc = self.buffer.as_ref().or_else(|| self.entry.buffer()).ok_or(Error::NoBuffer)?;
+        let buffer_arc = self.entry.buffer().ok_or(ErrorKind::NoBuffer)?;
         let flat = buffer_arc.as_array_mut::<T>().context(DeviceSnafu)?;
         if let Ok(shape) = self.shape() {
             let dims: Vec<usize> = shape.iter().filter_map(|d| d.as_const()).collect();
             if dims.len() == shape.len() {
-                return flat.into_shape_with_order(ndarray::IxDyn(&dims)).context(NdarrayShapeSnafu);
+                return flat
+                    .into_shape_with_order(ndarray::IxDyn(&dims))
+                    .context(NdarrayShapeSnafu)
+                    .map_err(Into::into);
             }
         }
         Ok(flat)

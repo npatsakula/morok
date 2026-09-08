@@ -12,7 +12,7 @@ fn masked_mean_excludes_padding() {
     let h = Tensor::from_slice([1.0f32, 1.0, 2.0, 2.0, 3.0, 3.0]).try_reshape([1isize, 3, 2]).unwrap();
     let mask = Tensor::from_slice([1.0f32, 1.0, 0.0]).try_reshape([1isize, 3]).unwrap().cast(DType::Bool).unwrap();
 
-    let mut out = masked_mean(&h, &mask).unwrap();
+    let out = masked_mean(&h, &mask).unwrap();
     out.realize().unwrap();
     let v = out.as_vec::<f32>().unwrap();
     assert_eq!(v.len(), 2, "(B, D) = (1, 2)");
@@ -26,7 +26,7 @@ fn masked_mean_all_real_is_plain_mean() {
     let h = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape([1isize, 3, 2]).unwrap();
     let mask = Tensor::from_slice([1.0f32, 1.0, 1.0]).try_reshape([1isize, 3]).unwrap().cast(DType::Bool).unwrap();
 
-    let mut out = masked_mean(&h, &mask).unwrap();
+    let out = masked_mean(&h, &mask).unwrap();
     out.realize().unwrap();
     let v = out.as_vec::<f32>().unwrap();
     // mean over (1,2),(3,4),(5,6) = (3.0, 4.0)
@@ -49,7 +49,7 @@ fn masked_mean_two_rows() {
         .cast(DType::Bool)
         .unwrap();
 
-    let mut out = masked_mean(&h, &mask).unwrap();
+    let out = masked_mean(&h, &mask).unwrap();
     out.realize().unwrap();
     let v = out.as_vec::<f32>().unwrap();
     assert_eq!(v.len(), 4, "(B, D) = (2, 2)");
@@ -65,7 +65,7 @@ fn masked_mean_two_rows() {
 #[test]
 fn cls_takes_first_token() {
     let h = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape([1isize, 3, 2]).unwrap();
-    let mut out = cls(&h).unwrap();
+    let out = cls(&h).unwrap();
     out.realize().unwrap();
     let v = out.as_vec::<f32>().unwrap();
     assert_eq!(v.len(), 2);

@@ -22,7 +22,7 @@ fn tiny_cfg() -> XlmRobertaConfig {
 fn forward_output_shape() {
     let model = XlmRobertaModel::empty(tiny_cfg());
     let ids = svod_tensor::Tensor::from_slice([0i64, 10, 20, 2, 1]).try_reshape([1isize, 5]).unwrap();
-    let mut out = model.forward(&ids, None).unwrap();
+    let out = model.forward(&ids, None).unwrap();
     out.realize().unwrap();
     let v = out.as_vec::<f32>().unwrap();
     assert_eq!(v.len(), 5 * 32);

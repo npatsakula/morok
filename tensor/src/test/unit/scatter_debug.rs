@@ -31,7 +31,7 @@ fn test_scatternd_debug() {
     let idx = Tensor::from_slice(&indices).try_reshape([2, 1]).unwrap();
     let upd = Tensor::from_slice(&updates).try_reshape([2, 4, 4]).unwrap();
 
-    let mut result = x.scatter_nd(&idx, &upd, "none").unwrap();
+    let result = x.scatter_nd(&idx, &upd, "none").unwrap();
     result.realize_with(&cfg).unwrap();
     let actual = result.as_vec::<f32>().unwrap();
     assert_eq!(actual, expected);

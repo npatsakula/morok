@@ -76,7 +76,7 @@ fn prepare_scaled_weights(sd: &mut StateDict, dtype: &DType) -> Result<()> {
         sd.remove(&scale_key);
         promoted.push((weight_key, dequantized.contiguous()));
     }
-    svod_tensor::Tensor::realize_batch(promoted.iter_mut().map(|(_, tensor)| tensor))?;
+    svod_tensor::Tensor::realize_batch(promoted.iter().map(|(_, tensor)| tensor))?;
     for (weight_key, tensor) in promoted {
         sd.insert(weight_key, tensor);
     }

@@ -33,7 +33,7 @@ fn real_file(name: &str) -> PathBuf {
 }
 
 fn load_golden_vec<T: svod_dtype::ext::HasDType + Default + Clone>(sd: &StateDict, key: &str) -> Vec<T> {
-    let mut t = sd.get(key).unwrap_or_else(|| panic!("golden key {key}")).clone();
+    let t = sd.get(key).unwrap_or_else(|| panic!("golden key {key}")).clone();
     t.realize().expect("realize golden");
     t.as_vec::<T>().expect("golden readout")
 }
@@ -59,7 +59,7 @@ fn load_fixture() -> (ModernBert, Tensor, Vec<i64>, Vec<f32>) {
         .unwrap_or_else(|| vec![1; input_ids.len()]);
     let (b, l) = match golden.get("input_ids_shape") {
         Some(t) => {
-            let mut t = t.clone();
+            let t = t.clone();
             t.realize().unwrap();
             let s = t.as_vec::<i64>().unwrap();
             (s[0] as usize, s[1] as usize)
@@ -73,7 +73,7 @@ fn load_fixture() -> (ModernBert, Tensor, Vec<i64>, Vec<f32>) {
 
 /// Run the model with `mask` (bool, true=real) and return the flat (B, L, D) f32 output.
 fn run_forward(model: &ModernBert, ids: &Tensor, mask: Option<&Tensor>) -> Vec<f32> {
-    let mut out = model.forward(ids, mask).expect("forward");
+    let out = model.forward(ids, mask).expect("forward");
     out.realize().expect("realize output");
     out.as_vec::<f32>().expect("output readout")
 }
@@ -158,7 +158,7 @@ fn load_mlm_fixture() -> (ModernBertForMaskedLm, Tensor, Vec<i64>, Vec<f32>) {
         .unwrap_or_else(|| vec![1; input_ids.len()]);
     let (b, l) = match golden.get("input_ids_shape") {
         Some(t) => {
-            let mut t = t.clone();
+            let t = t.clone();
             t.realize().unwrap();
             let s = t.as_vec::<i64>().unwrap();
             (s[0] as usize, s[1] as usize)
@@ -182,7 +182,7 @@ fn mlm_logits_match_pytorch() {
 
     let mask_t =
         Tensor::from_slice(mask.clone()).cast(DType::Bool).unwrap().try_reshape([1isize, mask.len() as isize]).unwrap();
-    let mut got = model.forward(&ids, Some(&mask_t)).expect("MLM forward");
+    let got = model.forward(&ids, Some(&mask_t)).expect("MLM forward");
     got.realize().expect("realize logits");
     let got = got.as_vec::<f32>().expect("logits readout");
 

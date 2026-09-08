@@ -24,7 +24,7 @@ fn bgem3_encode_dense_shape() {
     let model = BgeM3::empty(tiny_cfg());
     let ids = svod_tensor::Tensor::from_slice([0i64, 10, 20, 2]).try_reshape([1isize, 4]).unwrap();
     let mask = svod_tensor::Tensor::from_slice([1i64, 1, 1, 1]).try_reshape([1isize, 4]).unwrap();
-    let mut dense = model.encode_dense(&ids, &mask).unwrap();
+    let dense = model.encode_dense(&ids, &mask).unwrap();
     dense.realize().unwrap();
     let s = dense.dims().unwrap();
     assert_eq!(s[0], 1);
@@ -47,7 +47,7 @@ fn reranker_forward_shape() {
     let model = BgeRerankerV2M3::empty(tiny_cfg());
     let ids = svod_tensor::Tensor::from_slice([0i64, 10, 20, 2, 1]).try_reshape([1isize, 5]).unwrap();
     let mask = svod_tensor::Tensor::from_slice([1i64, 1, 1, 1, 0]).try_reshape([1isize, 5]).unwrap();
-    let mut out = model.forward(&ids, Some(&mask)).unwrap();
+    let out = model.forward(&ids, Some(&mask)).unwrap();
     out.realize().unwrap();
     let s = out.dims().unwrap();
     assert_eq!(s[0], 1);

@@ -18,7 +18,7 @@ crate::codegen_tests! {
         let result = idx.one_hot_along_dim(3, -1).unwrap();
         let shape = get_shape(&result);
         assert_eq!(shape, vec![3, 3]);
-        let mut realized = result.contiguous();
+        let realized = result.contiguous();
         realized.realize_with(&config).unwrap();
         let view = realized.array_view::<bool>().unwrap();
         // Row 0: [true, false, false]
@@ -44,7 +44,7 @@ crate::codegen_tests! {
         let x = Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0, 0.0]);
         let idx = Tensor::from_slice([1i32, 3, 0]);
         let src = Tensor::from_slice([10.0f32, 20.0, 30.0]);
-        let mut result = x.scatter(0, &idx, &src).unwrap().contiguous();
+        let result = x.scatter(0, &idx, &src).unwrap().contiguous();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view[[0]], 30.0); // index 0 got 30
@@ -56,7 +56,7 @@ crate::codegen_tests! {
         let x = Tensor::from_slice([0.0f32, 0.0, 0.0]);
         let idx = Tensor::from_slice([0i32, 0, 1]);
         let src = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-        let mut result = x
+        let result = x
             .scatter_reduce(0, &idx, &src, crate::indexing::ScatterReduction::Sum, true)
             .unwrap()
             .contiguous();
@@ -72,7 +72,7 @@ crate::codegen_tests! {
         let x = Tensor::from_ndarray(&ndarray::Array2::<f32>::zeros((3, 2)));
         let idx = Tensor::from_ndarray(&array![[0i32, 1]]);
         let src = Tensor::from_ndarray(&array![[10.0f32, 20.0]]);
-        let mut result = x.scatter(0, &idx, &src).unwrap().contiguous();
+        let result = x.scatter(0, &idx, &src).unwrap().contiguous();
         result.realize_with(&config).unwrap();
         assert_eq!(get_shape(&result), vec![3, 2]);
         let view = result.array_view::<f32>().unwrap();
@@ -88,9 +88,9 @@ crate::codegen_tests! {
         // 4 elements = n_stages=2 (power of 2) — larger sizes are very slow in debug builds
         let t = Tensor::from_slice([1.0f32, 4.0, 2.0, 3.0]);
         let (values, indices) = t.topk(2, -1, true).unwrap();
-        let mut values = values.contiguous();
+        let values = values.contiguous();
         values.realize_with(&config).unwrap();
-        let mut indices = indices;
+        let indices = indices;
         indices.realize_with(&config).unwrap();
         assert_eq!(get_shape(&values), vec![2]);
         assert_eq!(get_shape(&indices), vec![2]);
@@ -102,7 +102,7 @@ crate::codegen_tests! {
     fn test_topk_smallest(config) {
         let t = Tensor::from_slice([1.0f32, 4.0, 2.0, 3.0]);
         let (values, _) = t.topk(2, -1, false).unwrap();
-        let mut values = values.contiguous();
+        let values = values.contiguous();
         values.realize_with(&config).unwrap();
         let view = values.array_view::<f32>().unwrap();
         assert_eq!(view[[0]], 1.0);
@@ -116,7 +116,7 @@ crate::codegen_tests! {
     fn test_masked_select_basic(config) {
         let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]);
         let mask = Tensor::from_slice([true, false, true, false, true]);
-        let mut result = t.masked_select(&mask).unwrap();
+        let result = t.masked_select(&mask).unwrap();
         result.realize_with(&config).unwrap();
         assert_eq!(get_shape(&result), vec![3]);
         assert_eq!(result.as_vec::<f32>().unwrap(), [1.0, 3.0, 5.0]);
@@ -125,7 +125,10 @@ crate::codegen_tests! {
     fn test_masked_select_requires_bool(_config) {
         let tensor = Tensor::from_slice([1i32, 2]);
         let mask = Tensor::from_slice([1i32, 0]);
-        assert!(matches!(tensor.masked_select(&mask), Err(Error::TypeMismatch { expected, .. }) if expected == DType::Bool));
+        assert!(matches!(
+            tensor.masked_select(&mask).map_err(crate::error::Error::into_kind),
+            Err(ErrorKind::TypeMismatch { expected, .. }) if expected == DType::Bool
+        ));
     }
 
     // =========================================================================
@@ -134,7 +137,7 @@ crate::codegen_tests! {
 
     fn test_nonzero_1d(config) {
         let t = Tensor::from_slice([1i32, 0, 2, 0, 3]);
-        let mut result = t.nonzero().unwrap().contiguous();
+        let result = t.nonzero().unwrap().contiguous();
         result.realize_with(&config).unwrap();
         assert_eq!(get_shape(&result), vec![3, 1]);
         let view = result.array_view::<i32>().unwrap();
@@ -149,7 +152,7 @@ crate::codegen_tests! {
             (Tensor::const_(0i32, DType::Int32), vec![0, 0]),
             (Tensor::empty_zero(DType::Int32), vec![0, 1]),
         ] {
-            let mut result = tensor.nonzero().unwrap().contiguous();
+            let result = tensor.nonzero().unwrap().contiguous();
             result.realize_with(&config).unwrap();
             assert_eq!(get_shape(&result), expected_shape);
             assert!(result.as_vec::<i32>().unwrap().is_empty());
@@ -159,7 +162,7 @@ crate::codegen_tests! {
     fn test_nonzero_2d(config) {
         // [[1, 0], [1, 1]] — nonzero at (0,0), (1,0), (1,1)
         let t = Tensor::from_ndarray(&array![[1i32, 0], [1, 1]]);
-        let mut result = t.nonzero().unwrap().contiguous();
+        let result = t.nonzero().unwrap().contiguous();
         result.realize_with(&config).unwrap();
         assert_eq!(get_shape(&result), vec![3, 2]);
         let view = result.array_view::<i32>().unwrap();
@@ -178,7 +181,7 @@ crate::codegen_tests! {
             let numel: usize = dims.iter().product();
             let shape = dims.iter().map(|&d| d as isize).collect::<Vec<_>>();
             let t = Tensor::from_slice(vec![1i32; numel]).try_reshape(shape).unwrap();
-            let mut result = t.nonzero().unwrap().contiguous();
+            let result = t.nonzero().unwrap().contiguous();
             result.realize_with(&config).unwrap();
             assert_eq!(get_shape(&result), vec![numel, dims.len()]);
             let mut expected = Vec::new();
@@ -206,7 +209,7 @@ crate::codegen_tests! {
         ]); // [3, 4, 2]
         let head = Tensor::from_slice([0i64, 2, 3]);
 
-        let mut concrete = data.index_select(1, &head).unwrap().contiguous();
+        let concrete = data.index_select(1, &head).unwrap().contiguous();
         concrete.realize_with(&config).unwrap();
         let want = concrete.as_vec::<f32>().unwrap();
 
@@ -216,7 +219,7 @@ crate::codegen_tests! {
         // otherwise allocated to the variable's max).
         let b = Variable::new("isb", 1, 3).bind(3).unwrap();
         let sym = data.try_shrink([Some((SInt::Const(0), b.as_sint())), None, None]).unwrap();
-        let mut got = sym.index_select(1, &head).unwrap().contiguous();
+        let got = sym.index_select(1, &head).unwrap().contiguous();
         got.realize_with(&config).unwrap();
         // The result shape is still symbolic, so read the flat realized buffer.
         let got_flat: Vec<f32> = got.array_view::<f32>().unwrap().iter().copied().collect();
@@ -235,14 +238,14 @@ crate::codegen_tests! {
         ]); // [3, 5]
         let idx = Tensor::from_ndarray(&array![[0i64, 4], [1, 3], [2, 0]]); // [3, 2]
 
-        let mut concrete = data.gather(1, &idx).unwrap().contiguous();
+        let concrete = data.gather(1, &idx).unwrap().contiguous();
         concrete.realize_with(&config).unwrap();
         let want = concrete.as_vec::<f32>().unwrap(); // [10,14, 21,23, 32,30]
 
         let b = Variable::new("gsb", 1, 3).bind(3).unwrap();
         let data_sym = data.try_shrink([Some((SInt::Const(0), b.as_sint())), None]).unwrap();
         let idx_sym = idx.try_shrink([Some((SInt::Const(0), b.as_sint())), None]).unwrap();
-        let mut got = data_sym.gather(1, &idx_sym).unwrap().contiguous();
+        let got = data_sym.gather(1, &idx_sym).unwrap().contiguous();
         got.realize_with(&config).unwrap();
         let got_flat: Vec<f32> = got.array_view::<f32>().unwrap().iter().copied().collect();
 

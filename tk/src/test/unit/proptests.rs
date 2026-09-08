@@ -22,14 +22,14 @@ use super::device_supported;
 
 /// A realized random tensor of `dtype` on the env-selected device.
 fn randn_dt(shape: &[usize], dtype: DType) -> Tensor {
-    let mut t = Tensor::randn(shape).expect("randn").cast(dtype).expect("cast");
+    let t = Tensor::randn(shape).expect("randn").cast(dtype).expect("cast");
     t.realize().expect("realize");
     t
 }
 
 /// Realize, cast to f32, and read as a host `Vec<f32>` for comparison.
 fn to_f32_vec(t: Tensor) -> Vec<f32> {
-    let mut f = t.cast(DType::Float32).expect("→f32");
+    let f = t.cast(DType::Float32).expect("→f32");
     f.realize().expect("realize f32");
     f.as_vec::<f32>().expect("read f32")
 }
@@ -126,7 +126,7 @@ fn prop_fa_vs_sdpa_amd() {
             (0..bsz).map(|i| if i == 0 { mk(frac0) } else { mk(frac1) }).collect()
         });
         let lens_t = key_lens_vec.as_ref().map(|kl| {
-            let mut t = Tensor::from_slice(kl.as_slice());
+            let t = Tensor::from_slice(kl.as_slice());
             t.realize().expect("realize key_lens");
             t
         });
