@@ -7,6 +7,8 @@
 //! filterbank, VAD, speech enhancement) inside one JIT graph. The `[2F, 1,
 //! n_fft]` kernel is materialized before the convolution: left lazy it would
 //! fuse in and cost a `cos`/`sin` per multiply-add, 20-30× the convolution.
+//! Both operands are also zero-padded to extents the optimizer can tile
+//! ([`FRAME_ALIGN`], [`CHANNEL_ALIGN`]) and the surplus trimmed afterwards.
 //!
 //! ## Conventions
 //!
@@ -56,6 +58,19 @@ type Result<T> = crate::Result<T>;
 /// known after realization, the divisor is clamped to this floor, which drives
 /// those samples to zero instead of to infinity.
 const NOLA_EPS: f64 = 1e-11;
+
+/// Extents the [`Tensor::stft`] convolution is padded to: the frame axis `T`
+/// up to a multiple of `FRAME_ALIGN`, the kernel's `2F` channel axis up to a
+/// multiple of `CHANNEL_ALIGN`. The optimizer tiles a reduce only along axes
+/// it can split evenly, and the natural extents rarely are: Whisper's 30 s is
+/// `T = 3001` (prime) frames of `2F = 402 = 2·3·67` channels, which gets a 2×3
+/// register tile (25 ms on CPU); `3008 × 416` gets 16×4×4 (2.3 ms). Both
+/// padded operands are materialized before the convolution — a lazy pad
+/// fuses its bounds check into the multiply-add loop (+30% on CPU), and so is
+/// the convolution's result: a trim applied to it lazily would be pushed into
+/// the reduce and hand the natural extents back. The extra frames read zeros.
+const FRAME_ALIGN: usize = 8;
+const CHANNEL_ALIGN: usize = 16;
 
 /// Analysis window for [`Tensor::stft`] / [`Tensor::istft`].
 ///
@@ -438,6 +453,27 @@ impl Tensor {
         #[builder(default = false)] normalized: bool,
     ) -> Result<Tensor> {
         origin_call!("stft");
+        let (spec, frames) = self.stft_padded(n_fft, hop, win_length, &window, center, onesided, normalized)?;
+        let out = spec.narrow(2, 0_usize, frames)?;
+        if self.ndim()? == 1 { out.try_squeeze(Some(0)) } else { Ok(out) }
+    }
+
+    /// [`stft`](Tensor::stft) before the trailing frames are trimmed:
+    /// `[B, F, T', 2]` with `T'` the frame count rounded up to [`FRAME_ALIGN`]
+    /// (the batch axis kept even for a `[L]` input), plus the true `T`. The
+    /// extra frames are zero, so a consumer that reduces over `F` or maps
+    /// frames elementwise can keep the tileable extent and trim at the end.
+    #[allow(clippy::too_many_arguments)]
+    fn stft_padded(
+        &self,
+        n_fft: usize,
+        hop: Option<usize>,
+        win_length: Option<usize>,
+        window: &Window,
+        center: bool,
+        onesided: bool,
+        normalized: bool,
+    ) -> Result<(Tensor, usize)> {
         let (hop, win_length) = resolve("stft", n_fft, hop, win_length)?;
         let ndim = self.ndim()?;
         ensure!(ndim == 1 || ndim == 2, NdimExactSnafu { op: "stft", expected: 2_usize, actual: ndim });
@@ -451,16 +487,25 @@ impl Tensor {
             len >= n_fft,
             ParamRangeSnafu { op: "stft", param: "padded length", value: len.to_string(), constraint: ">= n_fft" }
         );
+        let frames = (len - n_fft) / hop + 1;
+        let padded_frames = frames.next_multiple_of(FRAME_ALIGN);
+        // Samples the padded frame count reads; the signal may already hold
+        // more (a tail shorter than `hop`), which the convolution ignores.
+        let padded_len = (padded_frames - 1) * hop + n_fft;
+        let x = if padded_len > len { x.try_pad(&[(0, 0), (0, (padded_len - len) as isize)])?.contiguous() } else { x };
 
         let n_bins = if onesided { n_fft / 2 + 1 } else { n_fft };
-        let win = framed_window(&window, n_fft, win_length, dtype.clone())?;
-        let kernel = analysis_kernel(n_fft, n_bins, &win, dtype)?.contiguous();
+        let channels = (2 * n_bins).next_multiple_of(CHANNEL_ALIGN);
+        let win = framed_window(window, n_fft, win_length, dtype.clone())?;
+        let kernel = analysis_kernel(n_fft, n_bins, &win, dtype)?
+            .try_pad(&[(0, (channels - 2 * n_bins) as isize), (0, 0), (0, 0)])?
+            .contiguous();
 
-        // [B, 1, L] -> [B, 2F, T] -> [B, 2, F, T] -> [B, F, T, 2].
-        let y = x.try_unsqueeze(1)?.conv1d().weight(&kernel).stride(hop).call()?;
+        // [B, 1, L'] -> [B, 2F', T'] -> [B, 2F, T'] -> [B, 2, F, T'] -> [B, F, T', 2].
+        let y = x.try_unsqueeze(1)?.conv1d().weight(&kernel).stride(hop).call()?.contiguous();
+        let y = y.narrow(1, 0_usize, 2 * n_bins)?;
         let y = if normalized { y.try_mul(1.0 / (n_fft as f64).sqrt())? } else { y };
-        let out = y.unflatten(1, &[2, n_bins as isize])?.try_permute(&[0, 2, 3, 1])?;
-        if ndim == 1 { out.try_squeeze(Some(0)) } else { Ok(out) }
+        Ok((y.unflatten(1, &[2, n_bins as isize])?.try_permute(&[0, 2, 3, 1])?, frames))
     }
 
     /// Inverse short-time Fourier transform of a `[B, F, T, 2]` (or `[F, T, 2]`)
@@ -590,14 +635,13 @@ impl Tensor {
             power > 0.0,
             ParamRangeSnafu { op: "mel_spectrogram", param: "power", value: power.to_string(), constraint: "> 0" }
         );
-        let spec = self
-            .stft()
-            .n_fft(n_fft)
-            .maybe_hop(hop)
-            .maybe_win_length(win_length)
-            .window(window)
-            .center(center)
-            .call()?;
+        // The STFT's padding frames ride through the filterbank contraction so
+        // it, too, gets a tileable frame axis. They hold zero power, which no
+        // log here lets past the true frames: `Ln` is elementwise, and the
+        // Whisper per-signal maximum floors every value at `log10(1e-10)`, the
+        // exact value of a zero frame, so those frames never exceed the real
+        // maximum.
+        let (spec, frames) = self.stft_padded(n_fft, hop, win_length, &window, center, true, false)?;
         let energy = spec.power()?;
         let energy = if power == 2.0 {
             energy
@@ -609,10 +653,12 @@ impl Tensor {
         let f_max = f_max.unwrap_or(sample_rate as f64 / 2.0);
         let fb = Tensor::mel_filterbank(sample_rate, n_fft, n_mels, f_min, f_max, mel_scale, norm, self.dtype())?;
         let mel = fb.matmul(&energy)?;
-        match log {
-            Some(log) => mel.mel_log(log),
-            None => Ok(mel),
-        }
+        let mel = match log {
+            Some(log) => mel.mel_log(log)?,
+            None => mel,
+        };
+        let mel = mel.narrow(-1, 0_usize, frames)?;
+        if self.ndim()? == 1 { mel.try_squeeze(Some(0)) } else { Ok(mel) }
     }
 }
 

@@ -521,17 +521,21 @@ fn count_kernels(t: &Tensor) -> usize {
     kernels.toposort_call_aware(false).iter().filter(|n| matches!(n.op(), Op::Call(..))).count()
 }
 
-/// The conv formulation: one launch builds the `[2F, 1, n_fft]` DFT kernel
-/// and one convolves with it — the framing and the window fold into those.
-/// Fusing the basis into the convolution instead would recompute `cos`/`sin`
-/// per multiply-add. The inverse pays its own kernel build and convolution
-/// plus one launch for the window-square overlap-add divisor.
+/// The conv formulation: one launch pads the framed signal to a tileable
+/// frame count, one builds the `[2F', 1, n_fft]` DFT kernel (the window and
+/// the channel padding fold into it), one convolves at the padded extents,
+/// and one trims the result for a consumer that wants it materialized —
+/// fusing the basis into the convolution instead would recompute `cos`/`sin`
+/// per multiply-add, and trimming the convolution lazily would hand the
+/// natural extents back to the reduce. The inverse reads the trim as a view,
+/// so it adds its own kernel build and convolution plus one launch for the
+/// window-square overlap-add divisor on top of the first three.
 #[test]
-fn stft_is_two_kernels_and_istft_is_five() {
+fn stft_is_four_kernels_and_istft_is_six() {
     let x = Tensor::empty(&[4, 16000], DType::Float32);
     let spec = x.stft().n_fft(512).hop(256).call().unwrap();
-    assert_eq!(count_kernels(&spec), 2);
-    assert_eq!(count_kernels(&spec.istft().n_fft(512).hop(256).call().unwrap()), 5);
+    let back = spec.istft().n_fft(512).hop(256).call().unwrap();
+    assert_eq!((count_kernels(&spec), count_kernels(&back)), (4, 6));
 }
 
 // =========================================================================
@@ -792,13 +796,15 @@ fn mel_spectrogram_rejects_bad_parameters() {
     assert!(matches!(err.kind(), ErrorKind::NdimMinimum { .. }), "got {err}");
 }
 
-/// A Whisper-sized front-end: the STFT kernel build and conv, the filterbank
-/// contraction and the two-pass Whisper log (reduce, then elementwise).
+/// A Whisper-sized front-end: the STFT's signal pad, kernel build and conv,
+/// then the filterbank contraction, which absorbs the trailing frame trim
+/// (its output is the trimmed `[B, n_mels, T]`), the `Ln` log and the
+/// three-pass Whisper log (reduce, floor, normalize).
 #[test]
 fn mel_spectrogram_kernel_count_stays_small() {
     let x = Tensor::empty(&[4, 16000 * 30], DType::Float32);
     let power = x.mel_spectrogram().sample_rate(16000).n_fft(400).hop(160).n_mels(80).call().unwrap();
     let whisper = power.mel_log(MelLog::Whisper).unwrap();
     let ln = power.mel_log(MelLog::Ln { min: 1e-9, max: 1e9 }).unwrap();
-    assert_eq!((count_kernels(&power), count_kernels(&ln), count_kernels(&whisper)), (3, 3, 6));
+    assert_eq!((count_kernels(&power), count_kernels(&ln), count_kernels(&whisper)), (4, 4, 7));
 }
