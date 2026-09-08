@@ -257,7 +257,7 @@ pub struct AmdDeviceCore {
     /// reaches its hardware cap rather than co-tenanting a mutable ring.
     queue_pool: crate::amd::connector::QueuePool,
     /// Max distinct KFD compute queues in the pool. Read once at open from
-    /// `SVOD_AMD_HW_QUEUES` (default 4, min 1). The per-process hardware budget
+    /// `SVOD_AMD_HW_QUEUES` (default 4 on multi-XCC, else 1; min 1). The per-process hardware budget
     /// is small (~24 user compute queues on CDNA; HIP's `GPU_MAX_HW_QUEUES`
     /// defaults to 4), so acquisition parks after reaching the cap.
     hw_queues: usize,
@@ -592,7 +592,8 @@ impl AmdDeviceCore {
         self.signal_pool.get()
     }
 
-    /// The bounded queue-pool size (`SVOD_AMD_HW_QUEUES`, default 4).
+    /// The bounded queue-pool size (`SVOD_AMD_HW_QUEUES`; default 4 on
+    /// multi-XCC hardware, 1 otherwise).
     #[inline]
     pub fn hw_queues(&self) -> usize {
         self.hw_queues
@@ -713,9 +714,9 @@ impl AmdDeviceCore {
     /// Non-blocking check: did the memory-fault or hw-exception event fire
     /// since the last consumption? Issues a `WAIT_EVENTS` with `timeout=0`.
     /// Returns `Some(Error::*)` if a fault is pending, `None` otherwise.
-    /// Used (a) from `AmdSignal::wait` on a 30 s timeout to attach the real
-    /// error to a stalled dispatch and (b) from the WAIT_EVENTS escalation
-    /// path to break out of polling early on a fault.
+    /// Used from `AmdSignal::wait` on a 30 s timeout to attach the real error
+    /// to a stalled dispatch. (The spin-escalation path also breaks out early
+    /// on a fault, but through a short blocking `wait_events`.)
     pub fn poll_faults_nonblocking(&self) -> Option<Error> {
         // Non-blocking poll = `wait_events` with timeout 0. Preserves the
         // pre-refactor contract: ioctl error / no fault → `None`; fault →

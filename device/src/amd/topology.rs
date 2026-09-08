@@ -63,7 +63,7 @@ fn topology_root() -> PathBuf {
 ///
 /// Returns `Ok(empty)` when no nodes are present (no `/dev/kfd`, container
 /// without sysfs, or only a CPU node) so callers can distinguish "no GPU" from
-/// hard failures. Errors propagate when sysfs is present but malformed.
+/// hard failures. Malformed or unreadable nodes are skipped, never fatal.
 pub fn enumerate() -> Vec<AmdNode> {
     let root = topology_root();
     let read = match fs::read_dir(&root) {

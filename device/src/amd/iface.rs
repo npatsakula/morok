@@ -34,8 +34,8 @@ const DOORBELL_PAGE_BYTES: usize = 0x2000;
 
 /// Backend seam for the AMD device. Every KFD ioctl that `AmdDeviceCore` (and
 /// its allocator / queue / connector helpers) needs is funnelled through one
-/// of these five methods, so a second backend (the userspace AM driver) can be
-/// dropped in without editing any call site.
+/// of these methods — five required, three defaulted — so a second backend
+/// (the userspace AM driver) can be dropped in without editing any call site.
 pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// Reserve a host VA, KFD-allocate `size` bytes per `kind`, optionally map
     /// host-visible, and bind it into the GPU page table. `zero` zero-fills the

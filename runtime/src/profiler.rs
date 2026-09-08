@@ -9,13 +9,18 @@
 //! - **Tier 2 — roofline.** Derived throughput: GFLOP/s and GB/s, computed from
 //!   the Tier-1 device time and the static work estimates in
 //!   [`KernelStaticInfo`].
-//! - **Tier 3 — static occupancy.** VGPR/SGPR/LDS/scratch usage and the
-//!   VGPR-limited occupancy, decoded from the compiled kernel descriptor without
-//!   running anything ([`KernelResources`]).
+//! - **Tier 3 — static occupancy.** Register/LDS/scratch usage and an occupancy
+//!   estimate, with no dispatch ([`KernelResources`]): on AMD decoded from the
+//!   compiled kernel descriptor (VGPR-limited, and only where the register-file
+//!   geometry is modeled), on CUDA read off the loaded function with
+//!   `cuFuncGetAttribute` plus the driver's own occupancy calculator.
 //! - **Tier 4 — hardware counters.** AMD SQ performance counters (busy cycles,
 //!   waves launched, VALU instructions issued) collected via PM4 perf-counter
-//!   programming. This needs a stable GPU power state; when that is unavailable
-//!   the run degrades to timing-only (Tiers 1–3).
+//!   programming, or the CUDA counters (SM active cycles, warps launched,
+//!   instructions, tensor-pipe cycles, DRAM bytes) collected through the CUPTI
+//!   range profiler. This needs a stable GPU power state on AMD, and a loadable
+//!   CUPTI with unrestricted profiling on CUDA; when that is unavailable the run
+//!   degrades to timing-only (Tiers 1–3).
 //!
 //! **Accumulate-and-min policy.** Repeated runs of the same plan are merged per
 //! kernel by keeping the minimum device time ([`RunProfile::merge_min`]), which

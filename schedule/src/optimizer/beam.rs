@@ -10,7 +10,7 @@
 //! 2. Generate all valid actions (OptOps applications)
 //! 3. Compile and time each candidate
 //! 4. Keep top K (beam width) by timing
-//! 5. Repeat until no improvement or timeout
+//! 5. Repeat until the best time stops improving by `min_progress`, or no candidate remains
 //!
 //! # Caching
 //!
@@ -35,7 +35,7 @@ use svod_ir::ops;
 // ACTION SPACE
 // ============================================================================
 
-/// Pre-computed action space for beam search (~500 actions).
+/// Pre-computed action space for beam search.
 pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
     let mut actions = Vec::with_capacity(600);
 

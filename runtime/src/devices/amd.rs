@@ -34,9 +34,9 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     let (renderer, compiler) = create_amd_codegen(device_id, arch)?;
     // Build the per-device process-shared state: the signal pool (singleton
     // per physical AMD:N, lives on AmdDeviceCore). Each `ExecutionPlan` /
-    // `AmdGraph` / per-call `Program::execute` leases or builds its OWN
-    // connector (own KFD ring + kernarg arena + scratch + timeline), so no
-    // compute-queue or arena is pre-built here.
+    // `AmdGraph` / per-call `Program::execute` leases a `PoolQueue` from the
+    // core's queue pool (own KFD ring + kernarg arena + scratch + timeline),
+    // so no compute-queue or arena is pre-built here.
     let amd_alloc = AmdAllocator::new(device_id)?;
     let device_handle = Arc::clone(&amd_alloc.dev);
     // Signal-pool sizing: per-op AQL dispatch needs only a few slots, but a
@@ -78,7 +78,7 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     if std::env::var("SVOD_PM4_GRAPH").as_deref() == Ok("1") {
         device_handle.core().set_pm4_graph(true);
     }
-    // No default connector: every dispatcher leases/owns its own connector
+    // No default queue: every dispatcher leases its own `PoolQueue`
     // (`Program::execute` leases per call; plans/graphs hold one for their
     // lifetime). The pool starts empty and warms on first lease.
     let runtime: RuntimeFactory = Arc::new(move |compiled: &CompiledSpec| -> Result<Box<dyn Program>> {

@@ -497,7 +497,6 @@ impl Op {
     /// Operations that end ranges:
     /// - STAGE: ranges start at index 1 (compute is 0, ranges are 1+)
     /// - REDUCE: ranges start at index 1 (src is 0, ranges are 1+)
-    /// - STORE: ranges start at index 2 (index=0, value=1, ranges=2+)
     /// - WMMA: ranges start at index 3 (a=0, b=1, c=2)
     /// - END: ranges start at index 1 (computation=0, ranges=1+)
     /// - CALL/FUNCTION: ranges start at index 1 (body=0, args=1+)

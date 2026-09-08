@@ -385,10 +385,10 @@ fn apply_post_optimization_configured_with_capture(
     print_stage("13-pm_add_loads", &with_loads);
 
     // ALU devectorization happens inside devectorize() Phase 1, alongside
-    // expand_index and full symbolic (including gep_pushing) — single combined
+    // expand_index and full symbolic (including the INDEX-over-STACK lane folds) — single combined
     // pass handles ALL devectorization including bool ALU (via
     // no_vectorized_alu). An earlier isolated pass that combined
-    // no_vectorized_alu + gep_pushing without load/store folding caused graph
+    // no_vectorized_alu + the lane folds without load/store folding caused graph
     // explosion on wide STACK nodes (for example, STACK with 135 sources).
     let t_stage = std::time::Instant::now();
     let renderer_ctx = renderer.clone();

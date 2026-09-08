@@ -2,10 +2,9 @@
 //!
 //! This module contains operations for memory access:
 //! - Indexing: index, getaddr, slice
-//! - Memory access: load, store (gate is on INDEX, not LOAD/STORE)
+//! - Memory access: load, store (the gate lives on LOAD/STORE, not on INDEX)
 //! - Device operations: copy, copy_to_device
 //! - Bufferization: stage, stage_global, stage_local
-//! - Memory definitions: define_local, define_reg
 
 use std::sync::Arc;
 
@@ -205,7 +204,7 @@ impl UOp {
     /// Stores a value at self (INDEX location).
     /// The buffer is accessed indirectly through the INDEX node.
     ///
-    /// For gated stores, use an INDEX with a gate (INDEX has optional gate field).
+    /// For gated stores, use [`Self::store_gated`]; the gate is a STORE field.
     pub fn store(self: &Arc<Self>, value: Arc<Self>) -> Arc<Self> {
         Self::new(Op::Store(ops::Store { index: self.clone(), value, gate: None }), DType::Void)
     }
