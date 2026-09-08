@@ -10,8 +10,9 @@ use svod_ir::origin::{self, OriginFrame};
 use svod_tensor::Tensor;
 
 use crate::gigaam::GigaAm;
-use crate::state::{HasStateDict, StateDict};
+use crate::state::StateDict;
 use crate::whisper::{ModelDimensions, Whisper, WhisperSize};
+use svod_tensor::nn::Module as _;
 
 use super::batch::test_config;
 
@@ -59,7 +60,7 @@ fn keys(state_dict: &StateDict) -> BTreeSet<String> {
 }
 
 /// The encoder's own state dict, composed the way `Encoder::from_state_dict`
-/// keys it (the encoder itself does not implement `HasStateDict`).
+/// keys it (the encoder itself does not implement `Module`).
 fn encoder_state_dict(model: &GigaAm) -> StateDict {
     let mut sd = model.encoder.subsampling.state_dict("subsampling");
     for (index, layer) in model.encoder.layers.iter().enumerate() {

@@ -16,7 +16,8 @@ use std::path::Path;
 
 use svod_dtype::DType;
 
-use crate::state::{self, HasStateDict, StateDict};
+use crate::state::{self, StateDict};
+use svod_tensor::nn::Module;
 
 use crate::gigaam::ctc::CTCHead;
 use crate::gigaam::encoder::Encoder;
@@ -66,11 +67,11 @@ fn prepare_scaled_weights(sd: &mut StateDict, dtype: &DType) -> Result<()> {
             });
         };
         let target_dtype = if encoder_weight { dtype.clone() } else { DType::Float32 };
-        let shape = weight.shape()?;
-        let mut scale_shape = vec![1isize; shape.len()];
-        scale_shape[0] = shape[0].as_const().ok_or_else(|| Error::CheckpointConfig {
+        let dims = weight.dims().map_err(|_| Error::CheckpointConfig {
             message: format!("quantized weight {weight_key} has symbolic output dimension"),
-        })? as isize;
+        })?;
+        let mut scale_shape = vec![1isize; dims.len()];
+        scale_shape[0] = dims[0] as isize;
         let dequantized =
             quantized.cast(target_dtype.clone()).try_mul(&scale.cast(target_dtype).try_reshape(scale_shape)?)?;
         sd.remove(&scale_key);
@@ -282,15 +283,11 @@ impl GigaAm {
             None => {
                 let mut h = CTCHead::empty(&config);
                 h.load_state_dict(sd, "head")?;
-                let weight_shape = h.weight.shape()?;
-                let bias_shape = h.bias.shape()?;
-                let expected_weight = [config.vocab_size, config.d_model, 1];
-                let expected_bias = [config.vocab_size];
-                let concrete =
-                    |shape: &[svod_ir::SInt]| shape.iter().map(svod_ir::SInt::as_const).collect::<Option<Vec<_>>>();
-                if concrete(&weight_shape).as_deref() != Some(expected_weight.as_slice())
-                    || concrete(&bias_shape).as_deref() != Some(expected_bias.as_slice())
-                {
+                let weight_shape = h.weight.dims().ok();
+                let bias_shape = h.bias.dims().ok();
+                let expected_weight = vec![config.vocab_size, config.d_model, 1];
+                let expected_bias = vec![config.vocab_size];
+                if weight_shape.as_ref() != Some(&expected_weight) || bias_shape.as_ref() != Some(&expected_bias) {
                     return Err(Error::CheckpointConfig {
                         message: format!(
                             "CTC head shapes weight={weight_shape:?}, bias={bias_shape:?} do not match config num_classes={} and d_model={} (expected weight={expected_weight:?}, bias={expected_bias:?})",

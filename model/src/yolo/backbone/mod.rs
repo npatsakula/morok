@@ -7,4 +7,4 @@ pub(crate) mod p6;
 pub(crate) mod standard;
 
 pub use p6::{YoloBackboneP6, p6_scaled_channels};
-pub use standard::{YoloBackbone, YoloBackboneCls, scaled_channels, upsample_nearest_2x};
+pub use standard::{YoloBackbone, YoloBackboneCls, scaled_channels};

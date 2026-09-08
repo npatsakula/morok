@@ -1,9 +1,8 @@
 use svod_tensor::Tensor;
+use svod_tensor::nn::{BatchNorm2d, Conv2d, Layer, Module};
 
-use crate::state::{self, HasStateDict, StateDict, prefixed};
-
-use super::batchnorm::BatchNormWeights;
-use super::conv::Conv2dWeights;
+use super::batchnorm::batchnorm2d;
+use super::conv::conv2d;
 use super::error::Result;
 
 /// Which residual block class a stage uses.
@@ -24,69 +23,46 @@ impl BlockKind {
     }
 }
 
-#[derive(Clone)]
+/// The 1×1 conv + BN projection on a residual shortcut that changes shape.
+pub(super) type Downsample = Option<(Conv2d, BatchNorm2d)>;
+
+/// Build the shortcut projection a block needs when it changes stride or width.
+pub(super) fn downsample(in_planes: usize, out_ch: usize, stride: usize) -> Downsample {
+    (stride != 1 || in_planes != out_ch).then(|| (conv2d(out_ch, in_planes, 1, stride, 0), batchnorm2d(out_ch)))
+}
+
+/// Run the shortcut branch: the projection when there is one, else identity.
+pub(super) fn shortcut(downsample: &Downsample, x: &Tensor) -> Result<Tensor> {
+    match downsample {
+        Some((conv, bn)) => Ok(bn.forward(&conv.forward(x)?)?),
+        None => Ok(x.clone()),
+    }
+}
+
+#[derive(Clone, Module)]
 pub struct BasicBlock {
-    pub conv1: Conv2dWeights,
-    pub bn1: BatchNormWeights,
-    pub conv2: Conv2dWeights,
-    pub bn2: BatchNormWeights,
-    pub downsample: Option<(Conv2dWeights, BatchNormWeights)>,
+    pub conv1: Conv2d,
+    pub bn1: BatchNorm2d,
+    pub conv2: Conv2d,
+    pub bn2: BatchNorm2d,
+    pub downsample: Downsample,
 }
 
 impl BasicBlock {
     pub fn empty(in_planes: usize, planes: usize, stride: usize) -> Self {
-        let expansion = BlockKind::Basic.expansion();
-        let downsample = if stride != 1 || in_planes != planes * expansion {
-            Some((
-                Conv2dWeights::empty(planes * expansion, in_planes, 1, stride, 0),
-                BatchNormWeights::empty(planes * expansion),
-            ))
-        } else {
-            None
-        };
+        let out_ch = planes * BlockKind::Basic.expansion();
         Self {
-            conv1: Conv2dWeights::empty(planes, in_planes, 3, stride, 1),
-            bn1: BatchNormWeights::empty(planes),
-            conv2: Conv2dWeights::empty(planes, planes, 3, 1, 1),
-            bn2: BatchNormWeights::empty(planes),
-            downsample,
+            conv1: conv2d(planes, in_planes, 3, stride, 1),
+            bn1: batchnorm2d(planes),
+            conv2: conv2d(planes, planes, 3, 1, 1),
+            bn2: batchnorm2d(planes),
+            downsample: downsample(in_planes, out_ch, stride),
         }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let out = self.bn1.forward(&self.conv1.forward(x)?)?;
-        let out = out.relu()?;
+        let out = self.bn1.forward(&self.conv1.forward(x)?)?.relu()?;
         let out = self.bn2.forward(&self.conv2.forward(&out)?)?;
-        let shortcut = match &self.downsample {
-            Some((c, b)) => b.forward(&c.forward(x)?)?,
-            None => x.clone(),
-        };
-        Ok(out.try_add(&shortcut)?.relu()?)
-    }
-}
-
-impl HasStateDict for BasicBlock {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.conv1.state_dict(&prefixed(prefix, "conv1"));
-        sd.extend(self.bn1.state_dict(&prefixed(prefix, "bn1")));
-        sd.extend(self.conv2.state_dict(&prefixed(prefix, "conv2")));
-        sd.extend(self.bn2.state_dict(&prefixed(prefix, "bn2")));
-        if let Some((c, b)) = &self.downsample {
-            sd.extend(c.state_dict(&prefixed(prefix, "downsample.0")));
-            sd.extend(b.state_dict(&prefixed(prefix, "downsample.1")));
-        }
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.conv1.load_state_dict(sd, &prefixed(prefix, "conv1"))?;
-        self.bn1.load_state_dict(sd, &prefixed(prefix, "bn1"))?;
-        self.conv2.load_state_dict(sd, &prefixed(prefix, "conv2"))?;
-        self.bn2.load_state_dict(sd, &prefixed(prefix, "bn2"))?;
-        if let Some((c, b)) = &mut self.downsample {
-            c.load_state_dict(sd, &prefixed(prefix, "downsample.0"))?;
-            b.load_state_dict(sd, &prefixed(prefix, "downsample.1"))?;
-        }
-        Ok(())
+        Ok(out.try_add(&shortcut(&self.downsample, x)?)?.relu()?)
     }
 }

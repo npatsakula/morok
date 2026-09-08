@@ -1,7 +1,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
-use crate::qwen3::{Qwen3Attention, RotaryTable, qwen3_embedding_0_6b};
+use crate::qwen3::{Qwen3Attention, qwen3_embedding_0_6b};
 
 fn tiny_attn() -> Qwen3Attention {
     Qwen3Attention::empty(64, 4, 2, 32, 1e-5, DType::Float32)
@@ -38,10 +38,9 @@ fn forward_output_shape() {
     let attn = tiny_attn();
 
     let x = Tensor::from_slice([0.5f32; 512]).try_reshape([1isize, 8, 64]).unwrap();
-    let rotary = RotaryTable::new(10000.0, 8, 32, DType::Float32).unwrap();
+    let rope = Tensor::rope_table(10000.0, 8, 32, DType::Float32).unwrap();
 
-    let out = attn.forward(&x, &rotary, None).unwrap();
-    let out = out;
+    let out = attn.forward(&x, &rope, None).unwrap();
     out.realize().unwrap();
     let s = out.dims().unwrap();
     assert_eq!(s[0], 1);

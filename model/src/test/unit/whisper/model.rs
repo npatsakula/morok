@@ -1,17 +1,20 @@
 //! Forward shape + state-dict round-trip tests for Whisper model.
 
+use std::collections::BTreeSet;
+
 use svod_dtype::DType;
 use svod_ir::{AxisType, ConstValue, Op};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
 use crate::jit::InputSpec;
-use crate::state::HasStateDict;
+use crate::whisper::blocks::linear_forward;
 use crate::whisper::{
     DecodeOptions, DecodeResult, DecodeStrategy, FallbackPolicy, ModelDimensions, Whisper, WhisperAlignmentJit,
     WhisperAlignmentModel, WhisperCrossKvJit, WhisperDecoderJit, WhisperPlan, WhisperPrefillJit, WhisperSize,
 };
 use svod_ir::ops;
+use svod_tensor::nn::{Layer, Module};
 
 fn make_dims() -> ModelDimensions {
     ModelDimensions::for_size(WhisperSize::Tiny)
@@ -74,10 +77,11 @@ fn reference_cross_kv_projection(model: &Whisper, audio: &Tensor) -> (Tensor, Te
     let mut keys = Vec::with_capacity(model.decoder.blocks.len());
     let mut values = Vec::with_capacity(model.decoder.blocks.len());
     for block in &model.decoder.blocks {
-        let key = block.cross_attn.key.forward(audio).unwrap();
-        let value = block.cross_attn.value.forward(audio).unwrap();
-        keys.push(block.cross_attn.split_heads(&key).unwrap().try_permute(&[0, 2, 1, 3]).unwrap());
-        values.push(block.cross_attn.split_heads(&value).unwrap().try_permute(&[0, 2, 1, 3]).unwrap());
+        let heads = block.cross_attn.n_head;
+        let key = linear_forward(&block.cross_attn.key, audio).unwrap();
+        let value = linear_forward(&block.cross_attn.value, audio).unwrap();
+        keys.push(key.split_heads(heads).unwrap().try_permute(&[0, 2, 1, 3]).unwrap());
+        values.push(value.split_heads(heads).unwrap().try_permute(&[0, 2, 1, 3]).unwrap());
     }
     let keys = Tensor::cat(&keys.iter().collect::<Vec<_>>(), 2).unwrap().cast(DType::Float32);
     let values = Tensor::cat(&values.iter().collect::<Vec<_>>(), 2).unwrap().cast(DType::Float32);
@@ -155,7 +159,7 @@ fn low_precision_load_preserves_openai_fp32_parameters(compute: DType) {
     assert_eq!(model.encoder.blocks[0].attn_ln.weight.dtype(), DType::Float32);
     assert_eq!(model.decoder.token_embedding.dtype(), DType::Float32);
     assert_eq!(model.decoder.positional_embedding.dtype(), DType::Float32);
-    assert_eq!(model.decoder.blocks[0].cross_attn_ln.bias.dtype(), DType::Float32);
+    assert_eq!(model.decoder.blocks[0].cross_attn_ln.bias.as_ref().unwrap().dtype(), DType::Float32);
     assert_eq!(model.decoder.ln.weight.dtype(), DType::Float32);
 }
 
@@ -174,12 +178,10 @@ fn quantized_weight_scale_scales_output_channels() {
     sd.insert(format!("{key}.weight_scale"), Tensor::from_slice(scale.clone()));
 
     let model = Whisper::from_state_dict(&sd, dims).unwrap();
-    let loaded = model.decoder.blocks[0].mlp0_w.contiguous();
-    Tensor::realize_batch([&loaded]).unwrap();
-
+    let loaded = model.decoder.blocks[0].mlp0.weight.contiguous();
     assert_eq!(loaded.dims().unwrap(), [out, inp]);
     let expected: Vec<f32> = weight.iter().enumerate().map(|(index, value)| value * scale[index / inp]).collect();
-    assert_eq!(loaded.as_vec::<f32>().unwrap(), expected);
+    assert_eq!(loaded.to_vec::<f32>().unwrap(), expected);
 }
 
 #[test]
@@ -273,8 +275,7 @@ fn prepared_cross_kv_prefill_matches_direct_decoder() {
     let direct = model.decode(&tokens, &audio, 0).unwrap();
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
     let (prepared, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
-    direct.realize().unwrap();
-    prepared.realize().unwrap();
+    Tensor::realize_batch([&direct, &prepared]).unwrap();
     let direct = direct.as_vec::<f32>().unwrap();
     let prepared = prepared.as_vec::<f32>().unwrap();
     let max_delta = direct.iter().zip(&prepared).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -502,31 +503,29 @@ fn eager_audio_feature_alignment_reference(
     let tok_emb = model.decoder.token_embedding.embedding(tokens).unwrap();
     let pos_emb = model.decoder.positional_embedding.try_shrink([Some((0isize, seq_len as isize)), None]).unwrap();
     let mut x = tok_emb.try_add(&pos_emb).unwrap().cast(features.dtype());
-    let mask = crate::whisper::causal_mask(seq_len, x.dtype().clone()).unwrap();
+    let mask = Tensor::causal_mask(seq_len, x.dtype()).unwrap();
     let mut selected: Vec<Option<Tensor>> = (0..alignment_heads.len()).map(|_| None).collect();
 
     for (layer, block) in model.decoder.blocks.iter().enumerate() {
-        let h = block.attn_ln.apply(&x).unwrap();
+        let heads = block.cross_attn.n_head;
+        let h = block.attn_ln.forward(&x).unwrap();
         x = x.try_add(block.attn.forward(&h, None, Some(&mask)).unwrap()).unwrap();
 
-        let h = block.cross_attn_ln.apply(&x).unwrap();
+        let h = block.cross_attn_ln.forward(&x).unwrap();
         x = x.try_add(block.cross_attn.forward(&h, Some(features), None).unwrap()).unwrap();
-        let q = block.cross_attn.split_heads(&block.cross_attn.query.forward(&h).unwrap()).unwrap();
-        let k = block.cross_attn.split_heads(&block.cross_attn.key.forward(features).unwrap()).unwrap();
+        let q = linear_forward(&block.cross_attn.query, &h).unwrap().split_heads(heads).unwrap();
+        let k = linear_forward(&block.cross_attn.key, features).unwrap().split_heads(heads).unwrap();
         for (index, &(_, head)) in alignment_heads.iter().enumerate().filter(|&(_, &(l, _))| l == layer) {
-            let q = q.try_shrink([None, Some((head as isize, head as isize + 1)), None, None]).unwrap();
-            let k = k.try_shrink([None, Some((head as isize, head as isize + 1)), None, None]).unwrap();
+            let q = q.narrow(1, head, 1usize).unwrap();
+            let k = k.narrow(1, head, 1usize).unwrap();
             let scores = q.matmul(&k.try_transpose(-1, -2).unwrap()).unwrap();
-            let scale = Tensor::const_(
-                ConstValue::Float(1.0 / ((model.decoder.n_state / model.decoder.n_head) as f64).sqrt()),
-                scores.dtype().clone(),
-            );
-            selected[index] = Some(scores.try_mul(&scale).unwrap());
+            let scale = ((model.decoder.n_state / model.decoder.n_head) as f64).sqrt().recip();
+            selected[index] = Some(scores.try_mul(scale).unwrap());
         }
 
-        let h = block.mlp_ln.apply(&x).unwrap();
-        let h = h.linear().weight(&block.mlp0_w).bias(&block.mlp0_b).call().unwrap().gelu_exact().unwrap();
-        let h = h.linear().weight(&block.mlp1_w).bias(&block.mlp1_b).call().unwrap();
+        let h = block.mlp_ln.forward(&x).unwrap();
+        let h = linear_forward(&block.mlp0, &h).unwrap().gelu_exact().unwrap();
+        let h = linear_forward(&block.mlp2, &h).unwrap();
         x = x.try_add(&h).unwrap();
     }
 
@@ -547,8 +546,7 @@ fn cached_cross_alignment_matches_audio_feature_reference() {
     let reference = eager_audio_feature_alignment_reference(&model, &tokens, &features, &heads);
     let (cross_k, cross_v) = model.project_cross_kv(&features).unwrap();
     let cached = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
-    reference.realize().unwrap();
-    cached.realize().unwrap();
+    Tensor::realize_batch([&reference, &cached]).unwrap();
     let reference = reference.as_vec::<f32>().unwrap();
     let cached = cached.as_vec::<f32>().unwrap();
     let max_delta = reference.iter().zip(&cached).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -637,6 +635,59 @@ fn state_dict_round_trip() {
     // Reload into a fresh model
     let mut model2 = Whisper::empty(dims);
     model2.load_state_dict(&sd, "").unwrap();
+}
+
+/// Key set of the hand-written `HasStateDict` impls the `#[derive(Module)]`
+/// migration replaced, at both the root and a nested prefix. Whisper loads at
+/// the empty prefix, so a stray leading dot would silently break every
+/// checkpoint.
+fn expected_state_dict_keys(dims: &ModelDimensions, prefix: &str) -> BTreeSet<String> {
+    let join = |a: &str, b: &str| if a.is_empty() { b.to_string() } else { format!("{a}.{b}") };
+    let mut keys = BTreeSet::new();
+    let mut push = |key: String| {
+        keys.insert(join(prefix, &key));
+    };
+    for (tower, layers) in [("encoder", dims.n_audio_layer), ("decoder", dims.n_text_layer)] {
+        push(format!("{tower}.positional_embedding"));
+        for index in 0..layers {
+            let block = format!("{tower}.blocks.{index}");
+            let attentions: &[&str] = if tower == "encoder" { &["attn"] } else { &["attn", "cross_attn"] };
+            for attn in attentions {
+                for projection in ["query", "value", "out"] {
+                    push(format!("{block}.{attn}.{projection}.weight"));
+                    push(format!("{block}.{attn}.{projection}.bias"));
+                }
+                push(format!("{block}.{attn}.key.weight"));
+                push(format!("{block}.{attn}_ln.weight"));
+                push(format!("{block}.{attn}_ln.bias"));
+            }
+            for mlp in ["mlp.0", "mlp.2"] {
+                push(format!("{block}.{mlp}.weight"));
+                push(format!("{block}.{mlp}.bias"));
+            }
+            push(format!("{block}.mlp_ln.weight"));
+            push(format!("{block}.mlp_ln.bias"));
+        }
+    }
+    for conv in ["encoder.conv1", "encoder.conv2"] {
+        push(format!("{conv}.weight"));
+        push(format!("{conv}.bias"));
+    }
+    for norm in ["encoder.ln_post", "decoder.ln"] {
+        push(format!("{norm}.weight"));
+        push(format!("{norm}.bias"));
+    }
+    push("decoder.token_embedding.weight".into());
+    keys
+}
+
+#[test_case(""; "root prefix")]
+#[test_case("m"; "nested prefix")]
+fn derived_state_dict_keys_match_the_hand_written_impls(prefix: &str) {
+    let dims = small_decoder_dims();
+    let model = Whisper::empty(dims.clone());
+    let keys: BTreeSet<String> = model.state_dict(prefix).into_keys().collect();
+    assert_eq!(keys, expected_state_dict_keys(&dims, prefix));
 }
 
 #[test]

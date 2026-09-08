@@ -5,10 +5,11 @@
 
 use svod_dtype::DType;
 use svod_ir::SInt;
+use svod_tensor::nn::{Layer, Linear, Module};
 use svod_tensor::{BoundVariable, Tensor};
 
 use crate::init::fan_in_uniform;
-use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
+use crate::state::StateDict;
 
 use super::backbone::YoloBackboneCls;
 use super::blocks::conv::YoloConv;
@@ -22,19 +23,20 @@ const HIDDEN: usize = 1280;
 /// Classification head: Conv(c4→1280, k1) → GAP → Linear(1280→nc).
 ///
 /// State-dict keys: `conv.{conv,bn}.*`, `linear.weight`, `linear.bias`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct ClassifyHead {
     pub conv: YoloConv,
-    pub linear_weight: Tensor,
-    pub linear_bias: Tensor,
+    pub linear: Linear,
 }
 
 impl ClassifyHead {
     pub fn empty(in_ch: usize, nc: usize) -> Self {
         Self {
             conv: YoloConv::empty(in_ch, HIDDEN, 1, 1, true),
-            linear_weight: fan_in_uniform(&[nc, HIDDEN], HIDDEN, DType::Float32),
-            linear_bias: fan_in_uniform(&[nc], HIDDEN, DType::Float32),
+            linear: Linear::new(
+                fan_in_uniform(&[nc, HIDDEN], HIDDEN, DType::Float32),
+                Some(fan_in_uniform(&[nc], HIDDEN, DType::Float32)),
+            ),
         }
     }
 
@@ -46,34 +48,20 @@ impl ClassifyHead {
         // Flatten: [B, 1280, 1, 1] → [B, 1280]
         let x = x.try_reshape([b, SInt::from(HIDDEN)])?;
         // Linear → softmax
-        let logits = x.linear().weight(&self.linear_weight).bias(&self.linear_bias).call()?;
-        Ok(logits.softmax(-1)?)
-    }
-}
-
-impl HasStateDict for ClassifyHead {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.conv.state_dict(&prefixed(prefix, "conv"));
-        sd.insert(prefixed(prefix, "linear.weight"), self.linear_weight.clone());
-        sd.insert(prefixed(prefix, "linear.bias"), self.linear_bias.clone());
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.conv.load_state_dict(sd, &prefixed(prefix, "conv"))?;
-        self.linear_weight = get_tensor(sd, &prefixed(prefix, "linear.weight"))?;
-        self.linear_bias = get_tensor(sd, &prefixed(prefix, "linear.bias"))?;
-        Ok(())
+        Ok(self.linear.forward(&x)?.softmax(-1)?)
     }
 }
 
 /// YOLO v26 classification model.
 ///
 /// Forward returns `[B, nc]` softmax probabilities.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Yolo26Classify {
+    #[module(skip)]
     pub config: YoloConfig,
+    #[module(key = "")]
     pub backbone: YoloBackboneCls,
+    #[module(key = "10")]
     pub head: ClassifyHead,
 }
 
@@ -113,19 +101,5 @@ impl Yolo26Classify {
         let x = loader::shrink_batch(images, batch)?;
         let feat = self.backbone.forward(&x)?;
         self.head.forward(&feat)
-    }
-}
-
-impl HasStateDict for Yolo26Classify {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.backbone.state_dict(prefix);
-        sd.extend(self.head.state_dict(&prefixed(prefix, "10")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.backbone.load_state_dict(sd, prefix)?;
-        self.head.load_state_dict(sd, &prefixed(prefix, "10"))?;
-        Ok(())
     }
 }

@@ -24,7 +24,7 @@ use super::firered_vad::{lcg, load_golden_vec, real_file, synthetic_waveform};
 // ---------------------------------------------------------------------------
 
 /// Streaming forward on a 16-frame chunk: probs `[1, 16]`, one updated
-/// `[1, P, 1, ORDER-1]` cache per FSMN layer. Catches axis/cat/shrink bugs
+/// `[1, P, ORDER-1]` cache per FSMN layer. Catches axis/cat/shrink bugs
 /// without any compile.
 #[test]
 fn stream_forward_shape() {
@@ -37,7 +37,7 @@ fn stream_forward_shape() {
     assert_eq!(shape(&probs), vec![1, 16]);
     assert_eq!(new_caches.len(), caches.len());
     for nc in &new_caches {
-        assert_eq!(shape(nc), vec![1, 128, 1, 19]);
+        assert_eq!(shape(nc), vec![1, 128, 19]);
     }
 }
 

@@ -2,8 +2,8 @@
 //!
 //! Supports the canonical depth schedules — 18, 34, 50, 101, 152 — via a single
 //! factory parameterised by [`ResNetDepth`]. Block type follows depth: shallow
-//! variants use [`BasicBlock`](crate::resnet::layers::BasicBlock), deeper ones
-//! use [`Bottleneck`](crate::resnet::layers::Bottleneck) with 4× channel
+//! variants use [`BasicBlock`](crate::blocks::BasicBlock), deeper ones
+//! use [`Bottleneck`](crate::blocks::Bottleneck) with 4× channel
 //! expansion. The v1.5 stride placement (3×3 conv of the bottleneck owns the
 //! downsample stride) is used everywhere — same as `timm`, `torchvision`, and
 //! NVIDIA DeepLearningExamples.

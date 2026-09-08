@@ -30,7 +30,7 @@ use svod_dtype::DType;
 use svod_macros::jit_wrapper;
 use svod_tensor::Tensor;
 
-use super::{FRAME_SHIFT, FireRedFbank, LAYERS, N_MELS, ORDER, PROJ, Result, hub_file};
+use super::{FRAME_SHIFT, FireRedFbank, LAYERS, N_MELS, ORDER, PROJ, Result, hub_file, time_filter};
 
 use crate::init::fan_in_uniform;
 use crate::jit::InputSpec;
@@ -43,28 +43,28 @@ pub(crate) const STREAM_CACHE: usize = ORDER - 1;
 const FRAMES_PER_SEC: f32 = 16_000.0 / FRAME_SHIFT as f32;
 
 /// Causal FSMN memory layer: depthwise lookback conv only (`N2 = 0`), state
-/// threaded explicitly as `[1, P, 1, STREAM_CACHE]`.
+/// threaded explicitly as `[1, P, STREAM_CACHE]`.
 #[derive(Clone)]
 struct FsmnStream {
     lookback: Tensor,
 }
 
 impl FsmnStream {
-    /// `x [1, T, P]`, `cache [1, P, 1, STREAM_CACHE]` ->
+    /// `x [1, T, P]`, `cache [1, P, STREAM_CACHE]` ->
     /// `(memory [1, T, P], new_cache)`. The cache is prepended on the time
     /// axis and the conv runs unpadded: kernel `ORDER` over
     /// `STREAM_CACHE + T` columns yields exactly `T` outputs, each summing
     /// frames `[t - ORDER + 1, t]` of the extended sequence — the reference's
     /// padded conv with the cache standing in for the left zero-pad.
     fn forward(&self, x: &Tensor, cache: &Tensor) -> Result<(Tensor, Tensor)> {
-        let len = x.dim_const(1)? as isize;
-        // [1,T,P] -> [1,P,1,T]: conv2d wants (N, C, *spatial).
-        let xt = x.try_transpose(-1, -2)?.try_unsqueeze(2)?;
+        let len = x.dim_const(1)?;
+        // [1,T,P] -> [1,P,T]: conv1d wants (N, C, L).
+        let xt = x.try_transpose(-1, -2)?;
         let ext = Tensor::cat(&[cache, &xt], -1)?;
-        let lookback = ext.conv2d().weight(&self.lookback).groups(PROJ).padding(&[(0, 0), (0, 0)]).call()?;
+        let lookback = ext.conv1d().weight(&self.lookback).groups(PROJ).call()?;
         let memory = xt.try_add(&lookback)?;
-        let new_cache = ext.try_shrink([None, None, None, Some((len, len + STREAM_CACHE as isize))])?;
-        Ok((memory.try_squeeze(Some(2))?.try_transpose(-1, -2)?, new_cache))
+        let new_cache = ext.narrow(-1, len, STREAM_CACHE)?;
+        Ok((memory.try_transpose(-1, -2)?, new_cache))
     }
 }
 
@@ -122,7 +122,7 @@ impl FireRedVadStream {
                     fc1_weight: get(&format!("blocks.{i}.fc1.weight"))?,
                     fc1_bias: get(&format!("blocks.{i}.fc1.bias"))?,
                     fc2_weight: get(&format!("blocks.{i}.fc2.weight"))?,
-                    fsmn: FsmnStream { lookback: get(&format!("blocks.{i}.lookback.weight"))? },
+                    fsmn: FsmnStream { lookback: time_filter(&get(&format!("blocks.{i}.lookback.weight"))?)? },
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -131,7 +131,7 @@ impl FireRedVadStream {
             fc1_bias: get("fc1.bias")?,
             fc2_weight: get("fc2.weight")?,
             fc2_bias: get("fc2.bias")?,
-            fsmn1: FsmnStream { lookback: get("fsmn1.lookback.weight")? },
+            fsmn1: FsmnStream { lookback: time_filter(&get("fsmn1.lookback.weight")?)? },
             blocks,
             dnn_weight: get("dnn.weight")?,
             dnn_bias: get("dnn.bias")?,
@@ -148,7 +148,7 @@ impl FireRedVadStream {
         let dt = DType::Float32;
         let lin = |out: usize, inp: usize| fan_in_uniform(&[out, inp], inp, dt.clone());
         let bias = |out: usize, fan_in: usize| fan_in_uniform(&[out], fan_in, dt.clone());
-        let fsmn = || FsmnStream { lookback: fan_in_uniform(&[PROJ, 1, 1, ORDER], ORDER, DType::Float32) };
+        let fsmn = || FsmnStream { lookback: fan_in_uniform(&[PROJ, 1, ORDER], ORDER, DType::Float32) };
         Self {
             fc1_weight: lin(super::HIDDEN, N_MELS),
             fc1_bias: bias(super::HIDDEN, N_MELS),
@@ -172,11 +172,11 @@ impl FireRedVadStream {
         }
     }
 
-    /// Zero caches (`LAYERS x [1, P, 1, STREAM_CACHE]`) — the cold-start
+    /// Zero caches (`LAYERS x [1, P, STREAM_CACHE]`) — the cold-start
     /// state, equivalent to conv zero-padding at a sequence start. With these,
     /// `forward_stream` over a whole sequence IS the full causal forward.
     pub fn zero_caches() -> Result<Vec<Tensor>> {
-        (0..LAYERS).map(|_| Ok(Tensor::zeros(&[1, PROJ, 1, STREAM_CACHE], DType::Float32))).collect()
+        (0..LAYERS).map(|_| Ok(Tensor::zeros(&[1, PROJ, STREAM_CACHE], DType::Float32))).collect()
     }
 
     /// Causal DFSMN forward over one chunk: pre-CMVN fbank `[1, T, N_MELS]` +
@@ -527,7 +527,7 @@ impl FireRedVadStreamer {
         let mut jit = FireRedVadStreamJit::new(model);
         let mut config = svod_tensor::PrepareConfig::from_env();
         config.device_local_outputs = true;
-        let cache = || InputSpec::f32(&[1, PROJ, 1, STREAM_CACHE]).device_local();
+        let cache = || InputSpec::f32(&[1, PROJ, STREAM_CACHE]).device_local();
         jit.prepare_with_config(
             InputSpec::f32(&[1, chunk_frames, N_MELS]),
             cache(),

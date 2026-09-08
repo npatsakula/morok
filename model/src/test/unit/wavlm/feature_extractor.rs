@@ -1,7 +1,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::Module;
 
-use crate::state::HasStateDict;
 use crate::wavlm::{FeatureExtractor, wavlm_base, wavlm_large_s80_md};
 
 /// On `(1, 256000)` waveform, the s80-md-v2 feature extractor produces

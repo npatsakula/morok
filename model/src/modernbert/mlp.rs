@@ -7,17 +7,19 @@
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::Module;
 
 use crate::init::fan_in_uniform;
-use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::error::Result;
 
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct ModernBertGlu {
     pub hidden_size: usize,
     pub intermediate_size: usize,
+    #[module(key = "Wi.weight")]
     pub wi_weight: Tensor,
+    #[module(key = "Wo.weight")]
     pub wo_weight: Tensor,
 }
 
@@ -30,28 +32,11 @@ impl ModernBertGlu {
 
     /// Forward. `x`: `(B, L, D)` → `(B, L, D)`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // (., 2I) → split into [input (., I), gate (., I)].
+        // (., 2I) → [input (., I) | gate (., I)].
         let h = x.linear().weight(&self.wi_weight).call()?;
-        let mut parts = h.chunk(2, -1)?;
-        let gate = parts.pop().expect("chunk(2) yields 2 parts");
-        let input = parts.pop().expect("chunk(2) yields 2 parts");
+        let i = self.intermediate_size;
         // GELU(input) * gate — exact (erf) GELU matches PyTorch's nn.GELU default.
-        let gated = input.gelu_exact()?.try_mul(&gate)?;
+        let gated = h.narrow(-1, 0usize, i)?.gelu_exact()?.try_mul(&h.narrow(-1, i, i)?)?;
         Ok(gated.linear().weight(&self.wo_weight).call()?)
-    }
-}
-
-impl HasStateDict for ModernBertGlu {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        sd.insert(prefixed(prefix, "Wi.weight"), self.wi_weight.clone());
-        sd.insert(prefixed(prefix, "Wo.weight"), self.wo_weight.clone());
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.wi_weight = get_tensor(sd, &prefixed(prefix, "Wi.weight"))?;
-        self.wo_weight = get_tensor(sd, &prefixed(prefix, "Wo.weight"))?;
-        Ok(())
     }
 }

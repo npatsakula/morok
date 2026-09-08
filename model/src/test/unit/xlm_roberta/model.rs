@@ -1,6 +1,7 @@
-use crate::state::HasStateDict;
-use crate::xlm_roberta::{XlmRobertaConfig, XlmRobertaModel};
 use svod_dtype::DType;
+use svod_tensor::nn::{Module, StateDict};
+
+use crate::xlm_roberta::{XlmRobertaConfig, XlmRobertaModel};
 
 fn tiny_cfg() -> XlmRobertaConfig {
     XlmRobertaConfig {
@@ -29,17 +30,64 @@ fn forward_output_shape() {
     assert!(v.iter().all(|x| x.is_finite()));
 }
 
+/// Every key a 2-layer tiny backbone emits, in the published `BAAI/bge-m3`
+/// naming — captured from the hand-written `HasStateDict` impl this model was
+/// migrated from. Drift here is a checkpoint-compatibility break. Norm biases
+/// are absent from a freshly-built model and loaded only when the checkpoint
+/// carries them.
+pub fn expected_keys() -> Vec<String> {
+    let mut keys: Vec<String> = ["word_embeddings", "position_embeddings", "token_type_embeddings"]
+        .iter()
+        .map(|t| format!("embeddings.{t}.weight"))
+        .collect();
+    keys.push("embeddings.LayerNorm.weight".to_string());
+    for i in 0..2 {
+        for k in [
+            "attention.self.query.weight",
+            "attention.self.query.bias",
+            "attention.self.key.weight",
+            "attention.self.key.bias",
+            "attention.self.value.weight",
+            "attention.self.value.bias",
+            "attention.output.dense.weight",
+            "attention.output.dense.bias",
+            "attention.output.LayerNorm.weight",
+            "intermediate.dense.weight",
+            "intermediate.dense.bias",
+            "output.dense.weight",
+            "output.dense.bias",
+            "output.LayerNorm.weight",
+        ] {
+            keys.push(format!("encoder.layer.{i}.{k}"));
+        }
+    }
+    keys.sort();
+    keys
+}
+
+pub fn sorted_keys(sd: &StateDict) -> Vec<String> {
+    let mut keys: Vec<String> = sd.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+/// The emitted key set is exactly the published layout, at the root and nested
+/// under a prefix (which must not grow a leading dot).
+#[test]
+fn state_dict_keys_match_published_layout() {
+    let model = XlmRobertaModel::empty(tiny_cfg());
+    let want = expected_keys();
+    assert_eq!(sorted_keys(&model.state_dict("")), want);
+
+    let want_nested: Vec<String> = want.iter().map(|k| format!("m.{k}")).collect();
+    assert_eq!(sorted_keys(&model.state_dict("m")), want_nested);
+}
+
 #[test]
 fn state_dict_round_trip() {
     let model = XlmRobertaModel::empty(tiny_cfg());
     let sd = model.state_dict("");
-    assert!(sd.contains_key("embeddings.word_embeddings.weight"));
-    assert!(sd.contains_key("encoder.layer.0.attention.self.query.weight"));
     let mut model2 = XlmRobertaModel::empty(tiny_cfg());
     model2.load_state_dict(&sd, "").unwrap();
-    let mut k1: Vec<String> = sd.keys().cloned().collect();
-    let mut k2: Vec<String> = model2.state_dict("").keys().cloned().collect();
-    k1.sort();
-    k2.sort();
-    assert_eq!(k1, k2);
+    assert_eq!(sorted_keys(&sd), sorted_keys(&model2.state_dict("")));
 }

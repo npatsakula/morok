@@ -1,55 +1,44 @@
 use svod_tensor::Tensor;
 
-use crate::blocks::remap::fold_batchnorm;
+use crate::blocks::remap::{fold_batchnorm, strip_metadata};
 use crate::state::StateDict;
 
-fn tensor_f32(values: &[f32]) -> Tensor {
-    Tensor::from_slice(values)
-}
-
-#[test]
-fn fold_replaces_running_var_with_invstd() {
+fn bn_dict(prefixes: &[&str], var: f32) -> StateDict {
     let mut sd = StateDict::new();
-    sd.insert("bn1.weight".into(), tensor_f32(&[1.0, 2.0]));
-    sd.insert("bn1.bias".into(), tensor_f32(&[0.0, 0.0]));
-    sd.insert("bn1.running_mean".into(), tensor_f32(&[0.0, 0.0]));
-    sd.insert("bn1.running_var".into(), tensor_f32(&[0.25, 1.0])); // var
-    sd.insert("bn1.num_batches_tracked".into(), tensor_f32(&[42.0]));
-
-    let folded = fold_batchnorm(sd).expect("fold");
-    assert!(!folded.contains_key("bn1.num_batches_tracked"), "num_batches_tracked must be dropped");
-    assert!(!folded.contains_key("bn1.running_var"), "running_var key must be renamed");
-    assert!(folded.contains_key("bn1.weight"), "non-BN-stats keys preserved");
-
-    let invstd = folded.get("bn1.invstd").expect("invstd key present after fold");
-    let invstd_vals = invstd.as_vec::<f32>().expect("read invstd");
-    // invstd = 1 / sqrt(var + 1e-5)
-    let expected = vec![1.0 / (0.25_f32 + 1e-5).sqrt(), 1.0 / (1.0_f32 + 1e-5).sqrt()];
-    assert!(
-        invstd_vals.iter().zip(&expected).all(|(a, b)| (a - b).abs() < 1e-6),
-        "got {:?}, expected {:?}",
-        invstd_vals,
-        expected
-    );
-}
-
-#[test]
-fn fold_handles_multiple_bn_layers() {
-    let mut sd = StateDict::new();
-    for prefix in ["bn1", "layer1.0.bn1", "layer4.2.downsample.1"] {
-        sd.insert(format!("{prefix}.weight"), tensor_f32(&[1.0]));
-        sd.insert(format!("{prefix}.bias"), tensor_f32(&[0.0]));
-        sd.insert(format!("{prefix}.running_mean"), tensor_f32(&[0.0]));
-        sd.insert(format!("{prefix}.running_var"), tensor_f32(&[1.0]));
-        sd.insert(format!("{prefix}.num_batches_tracked"), tensor_f32(&[1.0]));
+    for prefix in prefixes {
+        sd.insert(format!("{prefix}.weight"), Tensor::from_slice([1.0f32]));
+        sd.insert(format!("{prefix}.bias"), Tensor::from_slice([0.0f32]));
+        sd.insert(format!("{prefix}.running_mean"), Tensor::from_slice([0.0f32]));
+        sd.insert(format!("{prefix}.running_var"), Tensor::from_slice([var]));
+        sd.insert(format!("{prefix}.num_batches_tracked"), Tensor::from_slice([42.0f32]));
     }
-    let folded = fold_batchnorm(sd).expect("fold");
+    sd
+}
+
+/// The only entry no layer reads is dropped; everything a `BatchNorm2d` loads
+/// survives untouched.
+#[test]
+fn strip_metadata_drops_only_num_batches_tracked() {
+    let stripped = strip_metadata(bn_dict(&["bn1"], 0.25));
+
+    assert!(!stripped.contains_key("bn1.num_batches_tracked"));
+    for key in ["bn1.weight", "bn1.bias", "bn1.running_mean", "bn1.running_var"] {
+        assert!(stripped.contains_key(key), "missing key: {key}");
+    }
+}
+
+/// The `BatchNormWeights` compatibility shim adds `invstd` beside the variance
+/// it was computed from, so one dict feeds both layer types.
+#[test]
+fn fold_adds_invstd_and_keeps_running_var() {
+    let folded = fold_batchnorm(bn_dict(&["bn1", "layer1.0.bn1", "layer4.2.downsample.1"], 0.25)).expect("fold");
+
     for prefix in ["bn1", "layer1.0.bn1", "layer4.2.downsample.1"] {
         assert!(!folded.contains_key(&format!("{prefix}.num_batches_tracked")));
-        assert!(!folded.contains_key(&format!("{prefix}.running_var")), "running_var key renamed");
-        let invstd = folded.get(&format!("{prefix}.invstd")).unwrap();
-        let v = invstd.as_vec::<f32>().unwrap();
-        let expected = 1.0_f32 / (1.0_f32 + 1e-5).sqrt();
-        assert!((v[0] - expected).abs() < 1e-6);
+        assert!(folded.contains_key(&format!("{prefix}.running_var")), "running_var must survive the fold");
+
+        let invstd = folded[&format!("{prefix}.invstd")].to_vec::<f32>().expect("read invstd");
+        let expected = 1.0 / (0.25_f32 + 1e-5).sqrt();
+        assert!((invstd[0] - expected).abs() < 1e-6, "got {invstd:?}, expected {expected}");
     }
 }

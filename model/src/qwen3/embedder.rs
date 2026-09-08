@@ -15,17 +15,19 @@
 
 use std::path::Path;
 
-use svod_tensor::{BoundVariable, Tensor, s};
+use svod_tensor::nn::Module;
+use svod_tensor::{BoundVariable, Tensor};
 
-use crate::state::{self, HasStateDict, StateDict};
+use crate::state::{self, StateDict};
 
 use super::config::Qwen3Config;
 use super::error::Result;
 
 use super::model::Qwen3Model;
 
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Qwen3Embedding {
+    #[module(key = "")]
     pub model: Qwen3Model,
     pub normalize: bool,
 }
@@ -50,11 +52,8 @@ impl Qwen3Embedding {
     }
 
     fn pool_and_normalize(&self, hidden: &Tensor) -> Result<Tensor> {
-        let l = hidden.dim_const(1)?;
-
         // Last-token pooling: take position L-1 (requires left-padding).
-        let pooled = hidden.getitem(s![.., (l - 1) as i64, ..])?;
-
+        let pooled = hidden.take_index(1, -1)?;
         if self.normalize { Ok(pooled.lp_normalize(-1, 2)?) } else { Ok(pooled) }
     }
 
@@ -88,15 +87,5 @@ impl Qwen3Embedding {
         let mut model = Self::empty(config);
         model.load_state_dict(&state::cast_all(sd, dtype), "")?;
         Ok(model)
-    }
-}
-
-impl HasStateDict for Qwen3Embedding {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        self.model.state_dict(prefix)
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.model.load_state_dict(sd, prefix)
     }
 }

@@ -4,12 +4,13 @@
 //! rotated boxes via `dist2rbox`. Returns `[B, 4+nc+1, A]`.
 
 use svod_ir::SInt;
+use svod_tensor::nn::{Conv2d, Layer, Module};
 use svod_tensor::{BoundVariable, Tensor};
 
-use crate::state::{self, HasStateDict, StateDict, prefixed};
+use crate::state::StateDict;
 
 use super::backbone::YoloBackbone;
-use super::blocks::conv::{Conv2dBias, YoloConv};
+use super::blocks::conv::{YoloConv, conv2d_bias};
 use super::config::DETECT_STRIDES;
 use super::error::Result;
 
@@ -20,11 +21,14 @@ use super::neck::YoloNeck;
 /// Angle branch: Conv(k3) → Conv(k3) → Conv2d(k1, bias). Outputs 1 channel.
 ///
 /// State-dict keys: `0.*`, `1.*`, `2.weight`, `2.bias`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct AngleBranch {
+    #[module(key = "0")]
     pub conv0: YoloConv,
+    #[module(key = "1")]
     pub conv1: YoloConv,
-    pub conv2: Conv2dBias,
+    #[module(key = "2")]
+    pub conv2: Conv2d,
 }
 
 impl AngleBranch {
@@ -33,30 +37,14 @@ impl AngleBranch {
         Self {
             conv0: YoloConv::empty(in_ch, hidden, 3, 1, true),
             conv1: YoloConv::empty(hidden, hidden, 3, 1, true),
-            conv2: Conv2dBias::empty(hidden, ne, 1, 1),
+            conv2: conv2d_bias(hidden, ne, 1, 1),
         }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.conv0.forward(x)?;
         let x = self.conv1.forward(&x)?;
-        self.conv2.forward(&x)
-    }
-}
-
-impl HasStateDict for AngleBranch {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.conv0.state_dict(&prefixed(prefix, "0"));
-        sd.extend(self.conv1.state_dict(&prefixed(prefix, "1")));
-        sd.extend(self.conv2.state_dict(&prefixed(prefix, "2")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.conv0.load_state_dict(sd, &prefixed(prefix, "0"))?;
-        self.conv1.load_state_dict(sd, &prefixed(prefix, "1"))?;
-        self.conv2.load_state_dict(sd, &prefixed(prefix, "2"))?;
-        Ok(())
+        Ok(self.conv2.forward(&x)?)
     }
 }
 
@@ -64,10 +52,13 @@ impl HasStateDict for AngleBranch {
 ///
 /// Reuses Detect's box+cls branches and adds an angle branch.
 /// Forward returns `[B, 4+nc+ne, A]` — rotated boxes + scores + angles.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct OBB26 {
+    #[module(key = "one2one_cv2")]
     pub cv2: Vec<BoxBranch>,
+    #[module(key = "one2one_cv3")]
     pub cv3: Vec<ClsBranch>,
+    #[module(key = "one2one_cv4")]
     pub cv4: Vec<AngleBranch>,
     pub nc: usize,
     pub reg_max: usize,
@@ -122,7 +113,7 @@ impl OBB26 {
         let angles = Tensor::cat(&angle_refs, 2)?;
 
         let num_anchors: usize = feat_sizes.iter().map(|&(h, w)| h * w).sum();
-        let (anchors, strides) = make_anchors(&feat_sizes, &DETECT_STRIDES);
+        let (anchors, strides) = make_anchors(&feat_sizes, &DETECT_STRIDES)?;
 
         // dist2rbox decode (consumes angles for box rotation)
         let dbox = dist2rbox(&boxes, &angles, &anchors, &strides, num_anchors)?;
@@ -130,35 +121,6 @@ impl OBB26 {
 
         // Cat: [B, 4+nc+ne, A] = dbox + scores + raw_angles
         Ok(Tensor::cat(&[&dbox, &scores, &angles], 1)?)
-    }
-}
-
-impl HasStateDict for OBB26 {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        for (i, br) in self.cv2.iter().enumerate() {
-            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv2.{i}"))));
-        }
-        for (i, br) in self.cv3.iter().enumerate() {
-            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv3.{i}"))));
-        }
-        for (i, br) in self.cv4.iter().enumerate() {
-            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv4.{i}"))));
-        }
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        for (i, br) in self.cv2.iter_mut().enumerate() {
-            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv2.{i}")))?;
-        }
-        for (i, br) in self.cv3.iter_mut().enumerate() {
-            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv3.{i}")))?;
-        }
-        for (i, br) in self.cv4.iter_mut().enumerate() {
-            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv4.{i}")))?;
-        }
-        Ok(())
     }
 }
 
@@ -181,11 +143,8 @@ fn dist2rbox(
     // xf, yf = (rb - lt) / 2
     let diff = rb.try_sub(lt)?;
     let diff_halves = diff.split(&[1, 1], 1)?;
-    let xf = &diff_halves[0];
-    let yf = &diff_halves[1];
-    let half = Tensor::from_slice([0.5f32]);
-    let xf = xf.try_mul(&half)?;
-    let yf = yf.try_mul(&half)?;
+    let xf = diff_halves[0].try_mul(0.5)?;
+    let yf = diff_halves[1].try_mul(0.5)?;
 
     // x = xf*cos - yf*sin, y = xf*sin + yf*cos
     let x = xf.try_mul(&cos)?.try_sub(&yf.try_mul(&sin)?)?;
@@ -207,11 +166,15 @@ fn dist2rbox(
 /// YOLO v26 OBB model.
 ///
 /// Forward returns `[B, 4+nc+1, A]` — rotated boxes + scores + angle.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Yolo26Obb {
+    #[module(skip)]
     pub config: super::config::YoloConfig,
+    #[module(key = "")]
     pub backbone: YoloBackbone,
+    #[module(key = "")]
     pub neck: YoloNeck,
+    #[module(key = "23")]
     pub head: OBB26,
 }
 
@@ -252,21 +215,5 @@ impl Yolo26Obb {
         let (l4, l6, l10) = self.backbone.forward(&x)?;
         let (p3, p4, p5) = self.neck.forward(&l4, &l6, &l10)?;
         self.head.forward(&[p3, p4, p5])
-    }
-}
-
-impl HasStateDict for Yolo26Obb {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.backbone.state_dict(prefix);
-        sd.extend(self.neck.state_dict(prefix));
-        sd.extend(self.head.state_dict(&prefixed(prefix, "23")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.backbone.load_state_dict(sd, prefix)?;
-        self.neck.load_state_dict(sd, prefix)?;
-        self.head.load_state_dict(sd, &prefixed(prefix, "23"))?;
-        Ok(())
     }
 }

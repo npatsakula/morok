@@ -21,7 +21,6 @@ use std::path::Path;
 
 use snafu::Snafu;
 use svod_dtype::DType;
-use svod_ir::SInt;
 use svod_macros::jit_wrapper;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv1d, LSTMCell, Layer, PadMode};
@@ -140,18 +139,14 @@ impl SileroVad {
             .call()?
             .try_unsqueeze(1)?;
 
+        // `stft_conv` IS `Tensor::stft`'s `[2F, 1, n_fft]` analysis kernel with
+        // Silero's window baked in, and the reflect pad above is the (right-only)
+        // framing `center = false` wants — so the transform is that conv, and only
+        // the `[B, 2F, T] -> [B, F, T, 2]` regroup and the modulus come from the
+        // STFT helpers. Rebuilding the basis in-graph from `stft()` would discard
+        // the checkpoint's own kernel.
         let x = self.stft_conv.forward(&x)?;
-
-        // Keep the full (symbolic) batch dim (`None`); split STFT real/imag
-        // channels and the fixed 4 time frames.
-        let real =
-            x.try_shrink([None, Some((SInt::Const(0), SInt::Const(CUTOFF))), Some((SInt::Const(0), SInt::Const(4)))])?;
-        let imag = x.try_shrink([
-            None,
-            Some((SInt::Const(CUTOFF), SInt::Const(258))),
-            Some((SInt::Const(0), SInt::Const(4))),
-        ])?;
-        let x = real.square().try_add(imag.square())?.try_sqrt()?;
+        let x = x.unflatten(1, &[2, CUTOFF as isize])?.try_permute(&[0, 2, 3, 1])?.complex_abs()?;
 
         let x = self.conv1.forward(&x)?.relu()?;
         let x = self.conv2.forward(&x)?.relu()?;
@@ -295,11 +290,7 @@ impl VadInference {
 
         let h = HIDDEN;
         // Pull the recurrent weights to host before `vad` moves into the JIT.
-        let to_vec = |t: &Tensor| -> crate::jit::Result<Vec<f32>> {
-            let t = t.clone();
-            t.realize()?;
-            Ok(t.as_vec::<f32>()?)
-        };
+        let to_vec = |t: &Tensor| -> crate::jit::Result<Vec<f32>> { Ok(t.to_vec::<f32>()?) };
         let w_hh = ndarray::Array2::from_shape_vec((4 * h, h), to_vec(&vad.lstm.weight_hh)?).expect("w_hh shape");
         let final_w = ndarray::Array1::from_vec(to_vec(&vad.final_conv.weight)?); // [1,H,1] flat = H
         let final_b = match &vad.final_conv.bias {

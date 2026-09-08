@@ -1,7 +1,7 @@
 use svod_dtype::DType;
+use svod_tensor::nn::Module;
 use svod_tensor::{Tensor, Variable};
 
-use crate::state::HasStateDict;
 use crate::yolo::{Yolo26Classify, YoloConfig, YoloScale};
 
 #[test]

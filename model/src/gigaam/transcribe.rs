@@ -26,11 +26,11 @@ use svod_tensor::PrepareConfig;
 pub use svod_arch::rnnt::Word;
 
 use crate::audio::{EncoderBounds, MelConfig, MelSpectrogram};
-use crate::gigaam::SubsamplingMode;
 use crate::gigaam::ctc::GigaAmCtcJit;
 use crate::gigaam::jit::GigaAmEncoderJit;
 use crate::gigaam::model::{GigaAm, Head};
 use crate::gigaam::rnnt::RnntBlockBackend;
+use crate::gigaam::{SubsamplingMode, subsampled_len};
 use crate::jit::InputSpec;
 use crate::state::scoped;
 
@@ -302,7 +302,7 @@ impl GigaAmTranscriber {
                     SubsamplingMode::Conv1d => model.config.subs_kernel_size,
                     SubsamplingMode::Conv2d => 3,
                 };
-                let max_t_sub = subs_output_length(subs_kernel, max_t_mel);
+                let max_t_sub = subsampled_len(subs_kernel, max_t_mel);
                 let backend =
                     scoped("decode", || RnntBlockBackend::from_model(model.clone(), DECODE_LANES, max_t_sub))?;
                 let decoder = RnntDecoder::new(
@@ -349,7 +349,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
         let max_batch = self.max_batch;
         // The JIT runs at constant shape `[max_batch, *, max_t_mel]`, so the
         // encoder output buffer is always `[max_batch, max_t_sub, *]`.
-        let max_t_sub = subs_output_length(subs_kernel_size, max_t_mel);
+        let max_t_sub = subsampled_len(subs_kernel_size, max_t_mel);
 
         let mel_lens: Vec<usize> = windows.iter().map(|w| self.mel.num_frames(w.len())).collect();
         // A window longer than the JIT was sized for would overrun the mel
@@ -420,7 +420,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                     t_encoder += t_enc.elapsed();
                     let flat = logits.as_slice().expect("contiguous logits");
                     for (bi, mel_len) in chunk_lengths.iter().enumerate() {
-                        let actual_sub = subs_output_length(subs_kernel_size, *mel_len);
+                        let actual_sub = subsampled_len(subs_kernel_size, *mel_len);
                         // Frames span the decode window; frame_shift maps a frame
                         // index to window-relative seconds.
                         let window_len = windows[chunk_batch_start + bi].len();
@@ -464,7 +464,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                     // Lanes decouple from the encoder batch: collect every
                     // chunk's frames, decode them in one wide wave after the loop.
                     for (bi, mel_len) in chunk_lengths.iter().enumerate() {
-                        let actual_sub = subs_output_length(subs_kernel_size, *mel_len);
+                        let actual_sub = subsampled_len(subs_kernel_size, *mel_len);
                         let base = bi * item_stride;
                         all_frames.push(flat[base..base + actual_sub * d_model].to_vec());
                         all_valid.push(actual_sub);
@@ -574,18 +574,4 @@ fn pack_lengths_buffer(
         slice[i] = len as i32;
     }
     Ok(())
-}
-
-/// Compute the encoder's sub-sampled output frame count from the input
-/// mel-frame count. Mirrors the two-stage 2× stride conv stack used by
-/// GigaAM's subsampling (kernel `subs_kernel_size`, stride 2, applied twice).
-fn subs_output_length(kernel_size: usize, mel_frames: usize) -> usize {
-    let pad = (kernel_size - 1) / 2;
-    let mut len = mel_frames;
-    for _ in 0..2 {
-        // saturating: a degenerate `mel_frames < kernel_size - 2*pad` (only
-        // reachable for an empty/sub-frame window) must clamp to 0, not wrap.
-        len = (len + 2 * pad).saturating_sub(kernel_size) / 2 + 1;
-    }
-    len
 }

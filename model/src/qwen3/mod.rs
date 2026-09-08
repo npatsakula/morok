@@ -12,27 +12,21 @@ mod attention;
 mod config;
 mod decoder_layer;
 mod embedder;
-mod embeddings;
 mod error;
 mod feed_forward;
 mod jit;
 mod model;
 mod reranker;
-mod rms_norm;
-mod rotary;
 
 pub use attention::Qwen3Attention;
 pub use config::{Qwen3Config, qwen3_embedding_0_6b};
 pub use decoder_layer::Qwen3DecoderLayer;
 pub use embedder::Qwen3Embedding;
-pub use embeddings::Qwen3Embeddings;
 pub use error::{Error, Result};
 pub use feed_forward::Qwen3MLP;
 pub use jit::{Qwen3EmbeddingJit, Qwen3RerankerJit};
 pub use model::Qwen3Model;
 pub use reranker::Qwen3Reranker;
-pub use rms_norm::RmsNormWeights;
-pub use rotary::RotaryTable;
 
 use std::path::PathBuf;
 

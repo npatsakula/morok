@@ -15,7 +15,6 @@ use crate::xlm_roberta::config::XlmRobertaConfig;
 use crate::xlm_roberta::error::{MissingHeadSnafu, Result};
 
 use crate::xlm_roberta::model::XlmRobertaModel;
-use crate::xlm_roberta::pooling::cls;
 
 use super::colbert_head::ColbertHead;
 use super::sparse_head::SparseHead;
@@ -73,7 +72,7 @@ impl BgeM3 {
         let mut out = BgeM3Output::default();
 
         if opts.return_dense {
-            let dense = cls(&hidden)?;
+            let dense = hidden.take_index(1, 0)?;
             out.dense_vecs = Some(if self.normalize_dense { dense.lp_normalize(-1, 2)? } else { dense });
         }
         if opts.return_sparse {
@@ -90,14 +89,14 @@ impl BgeM3 {
     /// Dense-only forward (most common path). Returns `(B, D)`.
     pub fn encode_dense(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let hidden = self.model.forward(input_ids, Some(attention_mask))?;
-        let dense = cls(&hidden)?;
+        let dense = hidden.take_index(1, 0)?;
         if self.normalize_dense { Ok(dense.lp_normalize(-1, 2)?) } else { Ok(dense) }
     }
 
     /// JIT-path dense forward with rebindable batch. Returns `(B, D)`.
     pub fn encode_dense_batch(&self, input_ids: &Tensor, attention_mask: &Tensor, b: &BoundVariable) -> Result<Tensor> {
         let hidden = self.model.forward_batch(input_ids, Some(attention_mask), b)?;
-        let dense = cls(&hidden)?;
+        let dense = hidden.take_index(1, 0)?;
         if self.normalize_dense { Ok(dense.lp_normalize(-1, 2)?) } else { Ok(dense) }
     }
 

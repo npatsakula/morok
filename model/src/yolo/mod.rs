@@ -37,7 +37,7 @@ mod config;
 mod depth;
 mod detect;
 mod error;
-mod head;
+pub(crate) mod head;
 mod jit;
 mod loader;
 mod neck;
@@ -46,10 +46,9 @@ mod pose;
 mod segment;
 mod semseg;
 
-pub use backbone::{YoloBackbone, YoloBackboneCls, YoloBackboneP6, scaled_channels, upsample_nearest_2x};
+pub use backbone::{YoloBackbone, YoloBackboneCls, YoloBackboneP6, scaled_channels};
 pub use blocks::{
-    Attention, C2PSA, C2f, C3k, C3k2, C3k2Inner, Conv2dBias, ConvTranspose2dBias, PSABlock, Sppf, YoloBottleneck,
-    YoloConv,
+    Attention, C2PSA, C2f, C3k, C3k2, C3k2Inner, PSABlock, Sppf, YoloBottleneck, YoloConv, conv2d_bias, deconv2d_2x,
 };
 pub use classify::{ClassifyHead, Yolo26Classify};
 pub use config::{YoloConfig, YoloScale, make_depth, make_divisible, scale_channels};

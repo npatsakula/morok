@@ -7,6 +7,7 @@
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::{CoordinateTransformMode, NearestMode, ResizeMode};
 
 use crate::wespeaker::WeSpeakerResNet34;
 
@@ -48,4 +49,29 @@ fn forward_zero_weights_realize() {
 
     let shape = crate::test::max_dims(&out);
     assert_eq!(shape, vec![1, 256]);
+}
+
+/// The nearest-mode resample the TSTP head runs on the attention weights must
+/// reproduce `F.interpolate(..., mode="nearest")` index-for-index — an
+/// asymmetric coordinate transform with floor rounding, i.e. the one-hot map
+/// `src = floor(o * T_in / T_out)` this head used to build by hand.
+#[test]
+fn nearest_resample_matches_floor_index_map() {
+    let (t_in, t_out) = (799usize, 200usize);
+    let src: Vec<f32> = (0..t_in).map(|i| i as f32).collect();
+    let weights = Tensor::from_slice(&src).try_reshape([1, t_in as isize]).unwrap();
+
+    let resampled = weights
+        .resize()
+        .axes(&[1])
+        .sizes(&[t_out])
+        .mode(ResizeMode::Nearest)
+        .nearest_mode(NearestMode::Floor)
+        .coordinate_transformation_mode(CoordinateTransformMode::Asymmetric)
+        .call()
+        .unwrap();
+
+    // The ramp carries its own source index, so the output *is* the index map.
+    let expected: Vec<f32> = (0..t_out).map(|o| ((o * t_in) / t_out) as f32).collect();
+    assert_eq!(resampled.to_vec::<f32>().unwrap(), expected);
 }

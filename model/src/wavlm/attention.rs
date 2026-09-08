@@ -9,9 +9,9 @@
 //!   gating tensors and the shared `rel_attn_embed` table stay full-width and
 //!   are indexed at runtime.
 //! - **Bucketed relative positions** (`num_buckets=320`, `max_distance=800`):
-//!   sign-aware with logarithmic spacing past `num_buckets/2`. Implemented
-//!   eagerly in Rust as a small `Tensor` of `i64` bucket ids (cheap; L is
-//!   fixed per chunk).
+//!   sign-aware with logarithmic spacing past `num_buckets/2`. The bucket ids
+//!   depend only on `(L_q, L_k)`, so the table is built on the host as a small
+//!   constant `i64` tensor.
 //! - **Gating**: the gate is computed from the *raw input* `x` (NOT the
 //!   projected query) reshaped to per-head form. `gru_rel_pos_linear` maps
 //!   `head_dim → 8`; reshape to `(..., 2, 4)`, sum over the trailing axis,
@@ -23,11 +23,10 @@
 //!   gates and head-selects independently.
 
 use svod_dtype::DType;
-use svod_tensor::reduce::AxisSpec;
+use svod_tensor::nn::{Layer, Linear, Module};
 use svod_tensor::{Tensor, s};
 
 use crate::init::{fan_in_uniform, ones, zeros};
-use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::config::WavLmConfig;
 use super::error::Result;
@@ -76,8 +75,7 @@ pub fn bucket_index_tensor(
     max_distance: usize,
 ) -> Result<Tensor> {
     let buckets = compute_bucket_indices(query_length, key_length, num_buckets, max_distance);
-    let flat = Tensor::from_slice(&buckets);
-    Ok(flat.try_reshape([query_length as isize, key_length as isize])?)
+    Ok(Tensor::from_slice(&buckets).try_reshape([query_length as isize, key_length as isize])?)
 }
 
 /// Compute the un-gated position bias `(1, total_num_heads, L, L)` from the
@@ -92,12 +90,8 @@ pub fn compute_position_bias(
 ) -> Result<Tensor> {
     let idx = bucket_index_tensor(query_len, key_len, num_buckets, max_distance)?;
     // Embedding lookup: (L, L) indices into (num_buckets, total_num_heads) →
-    // (L, L, total_num_heads).
-    let bias = rel_attn_embed.embedding(&idx)?;
-    // → (total_num_heads, L, L)
-    let bias = bias.try_permute(&[2, 0, 1])?;
-    // → (1, total_num_heads, L, L) for broadcast against batch dim.
-    let bias = bias.try_unsqueeze(0)?;
+    // (L, L, total_num_heads) → (1, total_num_heads, L, L) for the batch dim.
+    let bias = rel_attn_embed.embedding(&idx)?.try_permute(&[2, 0, 1])?.try_unsqueeze(0)?;
     Ok(bias.contiguous())
 }
 
@@ -110,29 +104,28 @@ pub fn compute_position_bias(
 /// shape `(_, total_num_heads, L, L)` (broadcastable over batch).
 ///
 /// Output: `(B, L, embed_dim)`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct GatedRelPosAttention {
-    pub embed_dim: usize,
     pub total_num_heads: usize,
-    pub head_dim: usize,
     /// Surviving head indices (length = `num_kept`). Must be non-empty —
     /// callers should encode the empty-list case as `Option<Self>::None`.
     pub remaining_heads: Vec<usize>,
 
     // Q / K / V / O projections — physically sized for `num_kept * head_dim`.
-    pub q_weight: Tensor,
-    pub q_bias: Tensor,
-    pub k_weight: Tensor,
-    pub k_bias: Tensor,
-    pub v_weight: Tensor,
-    pub v_bias: Tensor,
-    pub out_weight: Tensor,
-    pub out_bias: Tensor,
+    #[module(key = "q_proj")]
+    pub q: Linear,
+    #[module(key = "k_proj")]
+    pub k: Linear,
+    #[module(key = "v_proj")]
+    pub v: Linear,
+    #[module(key = "out_proj")]
+    pub out: Linear,
 
     // Gating params — per-layer, full-width (NOT physically pruned).
-    pub gru_rel_pos_linear_weight: Tensor, // (8, head_dim)
-    pub gru_rel_pos_linear_bias: Tensor,   // (8,)
-    pub gru_rel_pos_const: Tensor,         // (1, total_num_heads, 1, 1)
+    /// `head_dim → 8`.
+    pub gru_rel_pos_linear: Linear,
+    /// `(1, total_num_heads, 1, 1)`.
+    pub gru_rel_pos_const: Tensor,
 }
 
 impl GatedRelPosAttention {
@@ -145,35 +138,19 @@ impl GatedRelPosAttention {
         assert!(num_kept > 0, "GatedRelPosAttention::empty requires non-empty remaining_heads");
 
         let proj_out = num_kept * head_dim;
-        let q_weight = fan_in_uniform(&[proj_out, embed_dim], embed_dim, DType::Float32);
-        let q_bias = zeros(&[proj_out], DType::Float32);
-        let k_weight = fan_in_uniform(&[proj_out, embed_dim], embed_dim, DType::Float32);
-        let k_bias = zeros(&[proj_out], DType::Float32);
-        let v_weight = fan_in_uniform(&[proj_out, embed_dim], embed_dim, DType::Float32);
-        let v_bias = zeros(&[proj_out], DType::Float32);
-        let out_weight = fan_in_uniform(&[embed_dim, proj_out], proj_out, DType::Float32);
-        let out_bias = zeros(&[embed_dim], DType::Float32);
-
-        let gru_rel_pos_linear_weight = fan_in_uniform(&[8, head_dim], head_dim, DType::Float32);
-        let gru_rel_pos_linear_bias = zeros(&[8], DType::Float32);
-        let gru_rel_pos_const = ones(&[1, total_num_heads, 1, 1], DType::Float32);
+        let linear = |out: usize, inp: usize| {
+            Linear::new(fan_in_uniform(&[out, inp], inp, DType::Float32), Some(zeros(&[out], DType::Float32)))
+        };
 
         Self {
-            embed_dim,
             total_num_heads,
-            head_dim,
             remaining_heads,
-            q_weight,
-            q_bias,
-            k_weight,
-            k_bias,
-            v_weight,
-            v_bias,
-            out_weight,
-            out_bias,
-            gru_rel_pos_linear_weight,
-            gru_rel_pos_linear_bias,
-            gru_rel_pos_const,
+            q: linear(proj_out, embed_dim),
+            k: linear(proj_out, embed_dim),
+            v: linear(proj_out, embed_dim),
+            out: linear(embed_dim, proj_out),
+            gru_rel_pos_linear: linear(8, head_dim),
+            gru_rel_pos_const: ones(&[1, total_num_heads, 1, 1], DType::Float32),
         }
     }
 
@@ -187,151 +164,35 @@ impl GatedRelPosAttention {
     /// Python ref: `WavLMSelfAttention.forward` (components.py:668-725)
     /// + `SelfAttention.forward` (components.py:429-486)
     pub fn forward(&self, x: &Tensor, position_bias: &Tensor) -> Result<Tensor> {
-        let bsz = x.dim(0)?;
-        let seq_len = x.dim_const(1)?;
-        let b = bsz.clone();
-        let l = seq_len;
-        let nk = self.num_kept();
-        let h = self.total_num_heads;
-        let hd = self.head_dim;
+        // Gate (lines 702-710). Py:703-704 reshape the *input* into per-head
+        // form: `x.view(bsz, seq_len, total_num_heads, -1).permute(0, 2, 1, 3)`.
+        let query_layer = x.split_heads(self.total_num_heads)?; // (B, h, L, hd)
 
-        // =================================================================
-        // Gate computation (WavLMSelfAttention.forward, lines 702-710)
-        // =================================================================
-
-        // Py:703  query_layer = query.view(bsz, seq_len, self.total_num_heads, -1)
-        // Py:704  query_layer = query_layer.permute(0, 2, 1, 3)
-        let query_layer = x.view(&[b.clone(), l.into(), h.into(), hd.into()])?.try_permute(&[0, 2, 1, 3])?; // (B, h, L, hd)
-
-        // Py:706-708  gate_a, gate_b = torch.sigmoid(
-        //   self.gru_rel_pos_linear(query_layer).view(bsz, h, seq_len, 2, 4).sum(-1)
+        // Py:706-708  gate_a, gate_b = sigmoid(
+        //   gru_rel_pos_linear(query_layer).view(B, h, L, 2, 4).sum(-1)
         // ).chunk(2, dim=-1)
-        let gate_raw = query_layer
-            .linear()
-            .weight(&self.gru_rel_pos_linear_weight)
-            .bias(&self.gru_rel_pos_linear_bias)
-            .call()?
-            // (B, h, L, 8)
-            .view(&[b.clone(), h.into(), l.into(), 2usize.into(), 4usize.into()])?
-            .sum_with()
-            .axes(AxisSpec::Single(-1))
-            .keepdim(false)
-            .call()?
-            // (B, h, L, 2)
-            .sigmoid()?;
-        let mut gate_chunks = gate_raw.chunk(2, -1)?;
-        let gate_b = gate_chunks.pop().expect("chunk(2) yields 2 parts");
-        let gate_a = gate_chunks.pop().expect("chunk(2) yields 2 parts");
+        let gate = self.gru_rel_pos_linear.forward(&query_layer)?; // (B, h, L, 8)
+        let shape = gate.shape()?;
+        let split = [shape[0].clone(), shape[1].clone(), shape[2].clone(), 2usize.into(), 4usize.into()];
+        let gate = gate.try_reshape(split)?.sum_with().axes(-1isize).call()?.sigmoid()?; // (B, h, L, 2)
+        let mut chunks = gate.chunk(2, -1)?;
+        let gate_b = chunks.pop().expect("chunk(2) yields 2 parts");
+        let gate_a = chunks.pop().expect("chunk(2) yields 2 parts");
 
-        // Py:709  gate_a_1 = gate_a * (gate_b * self.gru_rel_pos_const - 1.0) + 2.0
-        let one = Tensor::const_(1.0, gate_b.dtype());
-        let two = Tensor::const_(2.0, gate_b.dtype());
-        let gate_a_1 = gate_a.try_mul(&gate_b.try_mul(&self.gru_rel_pos_const)?.try_sub(&one)?)?.try_add(&two)?; // (B, h, L, 1)
+        // Py:709-713  attn_mask = (gate_a * (gate_b * const - 1) + 2) * position_bias,
+        // then keep only the surviving heads.
+        let gate = gate_a.try_mul(&gate_b.try_mul(&self.gru_rel_pos_const)?.try_sub(1.0)?)?.try_add(2.0)?;
+        let bias = gate.try_mul(position_bias)?.getitem(s![.., self.remaining_heads.clone(), .., ..])?;
 
-        // =================================================================
-        // Gated position bias (lines 710-713)
-        // =================================================================
+        // Q / K / V (lines 455-458) and the attention itself (461-472): the
+        // gated bias is the additive float `attn_mask`.
+        let nk = self.num_kept();
+        let q = self.q.forward(x)?.split_heads(nk)?;
+        let k = self.k.forward(x)?.split_heads(nk)?;
+        let v = self.v.forward(x)?.split_heads(nk)?;
+        let attended = q.scaled_dot_product_attention().key(&k).value(&v).attn_mask(&bias).call()?;
 
-        // Py:710  attn_mask_rel_pos = gate_a_1.view(bsz * h, -1, 1) * position_bias
-        let attn_mask_rel_pos = gate_a_1.try_mul(position_bias)?; // (B, h, L, L)
-
-        // Py:712  attn_mask_rel_pos = attn_mask_rel_pos.view((-1, seq_len, seq_len))
-        // Py:713  attn_mask_rel_pos = attn_mask_rel_pos.reshape(bsz, h, seq_len, seq_len)[:, self.remaining_heads, :, :]
-        let attn_mask = attn_mask_rel_pos.getitem(s![.., self.remaining_heads.clone(), .., ..])?; // (B, nk, L, L)
-
-        // =================================================================
-        // Q / K / V projections (SelfAttention.forward, lines 455-458)
-        // =================================================================
-
-        // Py:455  shape = (batch_size, length, self.num_heads, self.head_dim)
-        // Py:456  q = self.q_proj(x).view(*shape).transpose(2, 1)   # (B, nH, L, Hd)
-        // Py:457  k = self.k_proj(x).view(*shape).permute(0, 2, 3, 1)  # (B, nH, Hd, L)
-        // Py:458  v = self.v_proj(x).view(*shape).transpose(2, 1)   # (B, nH, L, Hd)
-        let q = x
-            .linear()
-            .weight(&self.q_weight)
-            .bias(&self.q_bias)
-            .call()?
-            .view(&[b.clone(), l.into(), nk.into(), hd.into()])?
-            .try_transpose(2, 1)?; // (B, nk, L, hd)
-        let k = x
-            .linear()
-            .weight(&self.k_weight)
-            .bias(&self.k_bias)
-            .call()?
-            .view(&[b.clone(), l.into(), nk.into(), hd.into()])?
-            .try_permute(&[0, 2, 3, 1])?; // (B, nk, hd, L)
-        let v = x
-            .linear()
-            .weight(&self.v_weight)
-            .bias(&self.v_bias)
-            .call()?
-            .view(&[b.clone(), l.into(), nk.into(), hd.into()])?
-            .try_transpose(2, 1)?; // (B, nk, L, hd)
-
-        // =================================================================
-        // Scaled dot-product attention (lines 461-472)
-        // =================================================================
-
-        // Py:461  weights = (self.scaling * q) @ k  # B, nH, L, L
-        let scaling = (hd as f32).powf(-0.5);
-        let scaling_t = Tensor::const_(scaling, q.dtype());
-        let weights = q.try_mul(&scaling_t)?.matmul(&k)?; // (B, nk, L, L)
-
-        // Py:463  weights += attention_mask
-        let weights = weights.try_add(&attn_mask)?;
-
-        // Py:467  weights = weights - weights.max(dim=-1, keepdim=True)[0]
-        // Py:469  weights = torch.nn.functional.softmax(weights, dim=-1)
-        // `softmax` subtracts the row max itself, and the reference's explicit
-        // subtraction changes nothing bit-for-bit: the row max of `x - m` is
-        // exactly 0, so it would only add a second (all-zero) reduce.
-        let weights = weights.softmax(-1)?;
-
-        // Py:472  output = weights @ v  # B, nH, L, Hd
-        let output = weights.matmul(&v)?; // (B, nk, L, hd)
-
-        // =================================================================
-        // Output projection (lines 478-480)
-        // =================================================================
-
-        // Py:478  output = output.transpose(2, 1).reshape(batch_size, length, nH * Hd)
-        let output = output.try_transpose(2, 1)?.view(&[b, l.into(), (nk * hd).into()])?;
-
-        // Py:480  output = self.out_proj(output)
-        Ok(output.linear().weight(&self.out_weight).bias(&self.out_bias).call()?)
-    }
-}
-
-impl HasStateDict for GatedRelPosAttention {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        sd.insert(prefixed(prefix, "q_proj.weight"), self.q_weight.clone());
-        sd.insert(prefixed(prefix, "q_proj.bias"), self.q_bias.clone());
-        sd.insert(prefixed(prefix, "k_proj.weight"), self.k_weight.clone());
-        sd.insert(prefixed(prefix, "k_proj.bias"), self.k_bias.clone());
-        sd.insert(prefixed(prefix, "v_proj.weight"), self.v_weight.clone());
-        sd.insert(prefixed(prefix, "v_proj.bias"), self.v_bias.clone());
-        sd.insert(prefixed(prefix, "out_proj.weight"), self.out_weight.clone());
-        sd.insert(prefixed(prefix, "out_proj.bias"), self.out_bias.clone());
-        sd.insert(prefixed(prefix, "gru_rel_pos_linear.weight"), self.gru_rel_pos_linear_weight.clone());
-        sd.insert(prefixed(prefix, "gru_rel_pos_linear.bias"), self.gru_rel_pos_linear_bias.clone());
-        sd.insert(prefixed(prefix, "gru_rel_pos_const"), self.gru_rel_pos_const.clone());
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.q_weight = get_tensor(sd, &prefixed(prefix, "q_proj.weight"))?;
-        self.q_bias = get_tensor(sd, &prefixed(prefix, "q_proj.bias"))?;
-        self.k_weight = get_tensor(sd, &prefixed(prefix, "k_proj.weight"))?;
-        self.k_bias = get_tensor(sd, &prefixed(prefix, "k_proj.bias"))?;
-        self.v_weight = get_tensor(sd, &prefixed(prefix, "v_proj.weight"))?;
-        self.v_bias = get_tensor(sd, &prefixed(prefix, "v_proj.bias"))?;
-        self.out_weight = get_tensor(sd, &prefixed(prefix, "out_proj.weight"))?;
-        self.out_bias = get_tensor(sd, &prefixed(prefix, "out_proj.bias"))?;
-        self.gru_rel_pos_linear_weight = get_tensor(sd, &prefixed(prefix, "gru_rel_pos_linear.weight"))?;
-        self.gru_rel_pos_linear_bias = get_tensor(sd, &prefixed(prefix, "gru_rel_pos_linear.bias"))?;
-        self.gru_rel_pos_const = get_tensor(sd, &prefixed(prefix, "gru_rel_pos_const"))?;
-        Ok(())
+        // Py:478-480  merge the heads back and project out.
+        Ok(self.out.forward(&attended.merge_heads()?)?)
     }
 }

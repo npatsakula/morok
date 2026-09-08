@@ -14,16 +14,10 @@ pub fn download_safetensors(model_id: &str, revision: &str) -> Result<std::path:
     Ok(repo.get("model.safetensors")?)
 }
 
-/// Load + fold BN + strip `model.` prefix, returning a clean state dict.
+/// Load a checkpoint and strip the `model.` prefix, returning a clean state
+/// dict. The layers read PyTorch's own keys, so nothing else is renamed.
 pub fn prepare_state_dict(path: &Path) -> Result<StateDict> {
-    let sd = state::load_safetensors(path)?;
-    prepare_state_dict_from_sd(&sd)
-}
-
-/// Same as [`prepare_state_dict`] but from a pre-loaded state dict.
-pub fn prepare_state_dict_from_sd(sd: &StateDict) -> Result<StateDict> {
-    let sd = crate::blocks::remap::fold_batchnorm(sd.clone()).map_err(super::error::Error::from)?;
-    Ok(strip_model_prefix(&sd))
+    Ok(strip_model_prefix(&state::load_safetensors(path)?))
 }
 
 /// Strip the `model.` prefix from all keys if present (Ultralytics wraps
@@ -43,6 +37,5 @@ pub fn strip_model_prefix(sd: &StateDict) -> StateDict {
 
 /// Shrink the batch dimension of a 4D NCHW tensor to a bound variable.
 pub fn shrink_batch(images: &Tensor, batch: &svod_tensor::BoundVariable) -> Result<Tensor> {
-    use svod_ir::SInt;
-    Ok(images.try_shrink([Some((SInt::Const(0), batch.as_sint())), None, None, None])?)
+    Ok(images.narrow(0, 0usize, batch.as_sint())?)
 }

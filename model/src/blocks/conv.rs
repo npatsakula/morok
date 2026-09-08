@@ -1,13 +1,37 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::Conv2d;
 
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::error::Result;
 
-/// Bias-less 2D convolution wrapper. `weight` has layout
-/// `[out_ch, in_ch / groups, kH, kW]` (same as PyTorch / timm).
+/// A bias-less `kernel×kernel` convolution with square stride and padding,
+/// weights drawn from the fan-in uniform distribution.
+pub fn conv2d(out_ch: usize, in_ch: usize, kernel: usize, stride: usize, padding: usize) -> Conv2d {
+    conv2d_grouped(out_ch, in_ch, kernel, stride, padding, 1)
+}
+
+/// [`conv2d`] split into `groups`; each filter sees `in_ch / groups` channels,
+/// so the weight is `[out_ch, in_ch / groups, kernel, kernel]`.
+pub fn conv2d_grouped(
+    out_ch: usize,
+    in_ch: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    groups: usize,
+) -> Conv2d {
+    let cin = in_ch / groups;
+    let weight = fan_in_uniform(&[out_ch, cin, kernel, kernel], cin * kernel * kernel, DType::Float32);
+    let p = padding as isize;
+    Conv2d::new(weight, None).with_stride((stride, stride)).with_padding(((p, p), (p, p))).with_groups(groups)
+}
+
+/// Compatibility shim for callers not yet ported to [`Conv2d`]; the blocks in
+/// this module use [`conv2d`] instead. Delete once `wespeaker`, `diarizen` and
+/// `gtcrn` are migrated.
 #[derive(Clone)]
 pub struct Conv2dWeights {
     pub weight: Tensor,
@@ -18,13 +42,9 @@ pub struct Conv2dWeights {
 
 impl Conv2dWeights {
     pub fn empty(out_ch: usize, in_ch: usize, kernel: usize, stride: usize, padding: usize) -> Self {
-        let fan_in = in_ch * kernel * kernel;
-        let weight = fan_in_uniform(&[out_ch, in_ch, kernel, kernel], fan_in, DType::Float32);
-        Self { weight, stride, padding, groups: 1 }
+        Self::empty_grouped(out_ch, in_ch, kernel, stride, padding, 1)
     }
 
-    /// Like [`empty`](Self::empty) but with grouped convolution. Weight shape
-    /// is `[out_ch, in_ch / groups, kernel, kernel]`.
     pub fn empty_grouped(
         out_ch: usize,
         in_ch: usize,
@@ -33,10 +53,8 @@ impl Conv2dWeights {
         padding: usize,
         groups: usize,
     ) -> Self {
-        let cin_per_g = in_ch / groups;
-        let fan_in = cin_per_g * kernel * kernel;
-        let weight = fan_in_uniform(&[out_ch, cin_per_g, kernel, kernel], fan_in, DType::Float32);
-        Self { weight, stride, padding, groups }
+        let conv = conv2d_grouped(out_ch, in_ch, kernel, stride, padding, groups);
+        Self { weight: conv.weight, stride, padding, groups }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {

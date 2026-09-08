@@ -5,9 +5,10 @@
 //! detection scales) and differ in backbone/neck depth.
 
 use svod_ir::SInt;
+use svod_tensor::nn::Module;
 use svod_tensor::{BoundVariable, Tensor};
 
-use crate::state::{self, HasStateDict, StateDict, prefixed};
+use crate::state::StateDict;
 
 use super::backbone::{YoloBackbone, scaled_channels};
 use super::config::{P2_STRIDES, P6_STRIDES, YoloConfig};
@@ -25,9 +26,11 @@ use super::loader;
 ///
 /// Forward returns a single tensor `[B, 4+nc, A]` — decoded boxes (xyxy in
 /// pixel space) concatenated with sigmoid'd class scores.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Detect {
+    #[module(key = "one2one_cv2")]
     pub cv2: Vec<BoxBranch>,
+    #[module(key = "one2one_cv3")]
     pub cv3: Vec<ClsBranch>,
     pub nc: usize,
     pub reg_max: usize,
@@ -83,35 +86,12 @@ impl Detect {
         let scores = Tensor::cat(&scores_refs, 2)?;
 
         let num_anchors: usize = feat_sizes.iter().map(|&(h, w)| h * w).sum();
-        let (anchors, strides) = make_anchors(&feat_sizes, &self.strides);
+        let (anchors, strides) = make_anchors(&feat_sizes, &self.strides)?;
 
         let dbox = dist2bbox(&boxes, &anchors, &strides, num_anchors)?;
         let scores = scores.sigmoid()?;
 
         Ok(Tensor::cat(&[&dbox, &scores], 1)?)
-    }
-}
-
-impl HasStateDict for Detect {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        for (i, br) in self.cv2.iter().enumerate() {
-            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv2.{i}"))));
-        }
-        for (i, br) in self.cv3.iter().enumerate() {
-            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv3.{i}"))));
-        }
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        for (i, br) in self.cv2.iter_mut().enumerate() {
-            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv2.{i}")))?;
-        }
-        for (i, br) in self.cv3.iter_mut().enumerate() {
-            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv3.{i}")))?;
-        }
-        Ok(())
     }
 }
 
@@ -122,11 +102,15 @@ impl HasStateDict for Detect {
 /// YOLO v26 object detection model (P3/8–P5/32).
 ///
 /// Forward returns `[B, 4+nc, A]` (decoded boxes + scores).
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Yolo26Detect {
+    #[module(skip)]
     pub config: YoloConfig,
+    #[module(key = "")]
     pub backbone: YoloBackbone,
+    #[module(key = "")]
     pub neck: super::neck::YoloNeck,
+    #[module(key = "23")]
     pub head: Detect,
 }
 
@@ -170,22 +154,6 @@ impl Yolo26Detect {
     }
 }
 
-impl HasStateDict for Yolo26Detect {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.backbone.state_dict(prefix);
-        sd.extend(self.neck.state_dict(prefix));
-        sd.extend(self.head.state_dict(&prefixed(prefix, "23")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.backbone.load_state_dict(sd, prefix)?;
-        self.neck.load_state_dict(sd, prefix)?;
-        self.head.load_state_dict(sd, &prefixed(prefix, "23"))?;
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Yolo26DetectP2 — P2/P3/P4/P5
 // ---------------------------------------------------------------------------
@@ -194,11 +162,15 @@ impl HasStateDict for Yolo26Detect {
 ///
 /// Uses the standard backbone (tapping P2/4) with an extended P2 neck,
 /// producing four detection feature maps at strides 4, 8, 16, 32.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Yolo26DetectP2 {
+    #[module(skip)]
     pub config: YoloConfig,
+    #[module(key = "")]
     pub backbone: YoloBackbone,
+    #[module(key = "")]
     pub neck: super::neck::YoloNeckP2,
+    #[module(key = "29")]
     pub head: Detect,
 }
 
@@ -243,22 +215,6 @@ impl Yolo26DetectP2 {
     }
 }
 
-impl HasStateDict for Yolo26DetectP2 {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.backbone.state_dict(prefix);
-        sd.extend(self.neck.state_dict(prefix));
-        sd.extend(self.head.state_dict(&prefixed(prefix, "29")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.backbone.load_state_dict(sd, prefix)?;
-        self.neck.load_state_dict(sd, prefix)?;
-        self.head.load_state_dict(sd, &prefixed(prefix, "29"))?;
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Yolo26DetectP6 — P3/P4/P5/P6
 // ---------------------------------------------------------------------------
@@ -267,11 +223,15 @@ impl HasStateDict for Yolo26DetectP2 {
 ///
 /// Uses the P6 backbone (deeper, P5=768ch, P6=1024ch) with a P6 neck,
 /// producing four detection feature maps at strides 8, 16, 32, 64.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Yolo26DetectP6 {
+    #[module(skip)]
     pub config: YoloConfig,
+    #[module(key = "")]
     pub backbone: super::backbone::YoloBackboneP6,
+    #[module(key = "")]
     pub neck: super::neck::YoloNeckP6,
+    #[module(key = "31")]
     pub head: Detect,
 }
 
@@ -312,21 +272,5 @@ impl Yolo26DetectP6 {
         let (l4, l6, l8, l12) = self.backbone.forward(&x)?;
         let (p3, p4, p5, p6) = self.neck.forward(&l4, &l6, &l8, &l12)?;
         self.head.forward(&[p3, p4, p5, p6])
-    }
-}
-
-impl HasStateDict for Yolo26DetectP6 {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.backbone.state_dict(prefix);
-        sd.extend(self.neck.state_dict(prefix));
-        sd.extend(self.head.state_dict(&prefixed(prefix, "31")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.backbone.load_state_dict(sd, prefix)?;
-        self.neck.load_state_dict(sd, prefix)?;
-        self.head.load_state_dict(sd, &prefixed(prefix, "31"))?;
-        Ok(())
     }
 }

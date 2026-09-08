@@ -1,7 +1,9 @@
-use crate::bgem3::{BgeM3, BgeRerankerV2M3, EncodeOpts};
-use crate::state::HasStateDict;
-use crate::xlm_roberta::XlmRobertaConfig;
 use svod_dtype::DType;
+use svod_tensor::nn::Module;
+
+use crate::bgem3::{BgeM3, BgeRerankerV2M3, EncodeOpts};
+use crate::test::unit::xlm_roberta::model::{expected_keys, sorted_keys};
+use crate::xlm_roberta::XlmRobertaConfig;
 
 fn tiny_cfg() -> XlmRobertaConfig {
     XlmRobertaConfig {
@@ -54,18 +56,27 @@ fn reranker_forward_shape() {
     assert_eq!(s[1], 1);
 }
 
+/// The reranker emits the published `BAAI/bge-reranker-v2-m3` layout: the
+/// backbone under `roberta.`, the classification head under `classifier.`.
+#[test]
+fn reranker_state_dict_keys_match_published_layout() {
+    let model = BgeRerankerV2M3::empty(tiny_cfg());
+    let mut want: Vec<String> = expected_keys().iter().map(|k| format!("roberta.{k}")).collect();
+    want.extend(
+        ["dense.weight", "dense.bias", "out_proj.weight", "out_proj.bias"].iter().map(|k| format!("classifier.{k}")),
+    );
+    want.sort();
+    assert_eq!(sorted_keys(&model.state_dict("")), want);
+
+    let want_nested: Vec<String> = want.iter().map(|k| format!("m.{k}")).collect();
+    assert_eq!(sorted_keys(&model.state_dict("m")), want_nested);
+}
+
 #[test]
 fn reranker_state_dict_round_trip() {
     let model = BgeRerankerV2M3::empty(tiny_cfg());
     let sd = model.state_dict("");
-    assert!(sd.contains_key("classifier.dense.weight"));
-    assert!(sd.contains_key("classifier.out_proj.weight"));
-    assert!(sd.contains_key("embeddings.word_embeddings.weight"));
     let mut model2 = BgeRerankerV2M3::empty(tiny_cfg());
     model2.load_state_dict(&sd, "").unwrap();
-    let mut k1: Vec<String> = sd.keys().cloned().collect();
-    let mut k2: Vec<String> = model2.state_dict("").keys().cloned().collect();
-    k1.sort();
-    k2.sort();
-    assert_eq!(k1, k2);
+    assert_eq!(sorted_keys(&sd), sorted_keys(&model2.state_dict("")));
 }

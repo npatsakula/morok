@@ -1,8 +1,9 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
+use svod_tensor::nn::{Module, StateDict};
+
 use crate::qwen3::{Qwen3Config, Qwen3Embedding, Qwen3Model};
-use crate::state::HasStateDict;
 
 fn tiny_cfg() -> Qwen3Config {
     Qwen3Config {
@@ -56,26 +57,65 @@ fn embedding_output_shape() {
     assert!(v.iter().all(|x| x.is_finite()));
 }
 
+/// Every key a 2-layer tiny backbone emits, in the published `Qwen3Model`
+/// naming — captured from the hand-written `HasStateDict` impl this model was
+/// migrated from. Drift here is a checkpoint-compatibility break.
+fn expected_keys() -> Vec<String> {
+    let mut keys = vec!["embed_tokens.weight".to_string(), "norm.weight".to_string()];
+    for i in 0..2 {
+        for k in [
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ] {
+            keys.push(format!("layers.{i}.{k}"));
+        }
+    }
+    keys.sort();
+    keys
+}
+
+fn sorted_keys(sd: &StateDict) -> Vec<String> {
+    let mut keys: Vec<String> = sd.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+/// The emitted key set is exactly the published layout, at the root and nested
+/// under a prefix (which must not grow a leading dot).
+#[test]
+fn state_dict_keys_match_published_layout() {
+    let model = Qwen3Model::empty(tiny_cfg());
+    let want = expected_keys();
+    assert_eq!(sorted_keys(&model.state_dict("")), want);
+
+    let want_nested: Vec<String> = want.iter().map(|k| format!("m.{k}")).collect();
+    assert_eq!(sorted_keys(&model.state_dict("m")), want_nested);
+}
+
+/// The embedding wrapper is transparent: it emits the backbone's keys verbatim.
+#[test]
+fn embedding_state_dict_is_transparent() {
+    let emb = Qwen3Embedding::empty(tiny_cfg());
+    assert_eq!(sorted_keys(&emb.state_dict("")), expected_keys());
+}
+
 #[test]
 fn state_dict_round_trip() {
     let model = Qwen3Model::empty(tiny_cfg());
     let sd = model.state_dict("");
 
-    assert!(sd.contains_key("embed_tokens.weight"));
-    assert!(sd.contains_key("norm.weight"));
-    assert!(sd.contains_key("layers.0.input_layernorm.weight"));
-    assert!(sd.contains_key("layers.0.self_attn.q_proj.weight"));
-    assert!(sd.contains_key("layers.0.self_attn.q_norm.weight"));
-    assert!(sd.contains_key("layers.0.mlp.gate_proj.weight"));
-
     let mut model2 = Qwen3Model::empty(tiny_cfg());
     model2.load_state_dict(&sd, "").unwrap();
-
-    let mut k1: Vec<String> = sd.keys().cloned().collect();
-    let mut k2: Vec<String> = model2.state_dict("").keys().cloned().collect();
-    k1.sort();
-    k2.sort();
-    assert_eq!(k1, k2);
+    assert_eq!(sorted_keys(&sd), sorted_keys(&model2.state_dict("")));
 }
 
 #[test]

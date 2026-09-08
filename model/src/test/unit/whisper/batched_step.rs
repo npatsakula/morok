@@ -39,19 +39,19 @@ fn forward_step_fixed_batch_keeps_batch_concrete() {
     assert_eq!(logits.dim_const(0).unwrap(), batch);
     assert_eq!(new_k.dim_const(0).unwrap(), batch);
     assert_eq!(new_v.dim_const(0).unwrap(), batch);
-    logits.realize().unwrap();
-    assert!(logits.as_vec::<f32>().unwrap().into_iter().all(f32::is_finite));
+    assert!(logits.to_vec::<f32>().unwrap().into_iter().all(f32::is_finite));
 }
 
+/// `true` = attend: the cached prefix each lane filled, plus the key this step
+/// appended at the end of the cache.
 #[test]
-fn cached_step_key_lengths_mask_only_prefix_and_appended_key() {
+fn cached_step_key_lengths_admit_only_prefix_and_appended_key() {
     let key_lens = Tensor::from_slice([0i32, 3]);
-    let mask = cached_step_mask(&key_lens, 2, 6).unwrap();
-    assert_eq!(mask.dims().unwrap(), [2, 1, 1, 6]);
-    mask.realize().unwrap();
+    let valid = cached_step_mask(&key_lens, 6).unwrap();
+    assert_eq!(valid.dims().unwrap(), [2, 6]);
     assert_eq!(
-        mask.as_vec::<bool>().unwrap(),
-        [true, true, true, true, true, false, false, false, false, true, true, false]
+        valid.to_vec::<bool>().unwrap(),
+        [false, false, false, false, false, true, true, true, true, false, false, true]
     );
 }
 

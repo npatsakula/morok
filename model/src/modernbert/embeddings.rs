@@ -4,52 +4,26 @@
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::{Embedding, Layer, LayerNorm, Module};
 
 use crate::init::fan_in_uniform;
-use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::error::Result;
 
-use super::normalization::LayerNormWeights;
-
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Embeddings {
-    pub vocab_size: usize,
-    pub hidden_size: usize,
-    pub tok_embeddings: Tensor,
-    pub norm: LayerNormWeights,
+    pub tok_embeddings: Embedding,
+    pub norm: LayerNorm,
 }
 
 impl Embeddings {
     pub fn empty(vocab_size: usize, hidden_size: usize, eps: f64, dtype: DType) -> Self {
-        Self {
-            vocab_size,
-            hidden_size,
-            tok_embeddings: fan_in_uniform(&[vocab_size, hidden_size], hidden_size, dtype.clone()),
-            norm: LayerNormWeights::with_eps(hidden_size, eps, dtype),
-        }
+        let weight = fan_in_uniform(&[vocab_size, hidden_size], hidden_size, dtype.clone());
+        Self { tok_embeddings: Embedding::new(weight), norm: LayerNorm::with_dims(hidden_size, false, eps, dtype) }
     }
 
     /// Forward. `input_ids`: `(B, L)` int64 → `(B, L, D)`.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        // The embedding op needs a concrete input shape to resolve the output.
-        let _l = input_ids.dim_const(1)?;
-        let x = self.tok_embeddings.embedding(input_ids)?;
-        self.norm.apply(&x)
-    }
-}
-
-impl HasStateDict for Embeddings {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        sd.insert(prefixed(prefix, "tok_embeddings.weight"), self.tok_embeddings.clone());
-        sd.extend(self.norm.state_dict(&format!("{prefix}.norm")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.tok_embeddings = get_tensor(sd, &prefixed(prefix, "tok_embeddings.weight"))?;
-        self.norm.load_state_dict(sd, &format!("{prefix}.norm"))?;
-        Ok(())
+        Ok(self.norm.forward(&self.tok_embeddings.forward(input_ids)?)?)
     }
 }

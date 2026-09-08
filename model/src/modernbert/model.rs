@@ -9,23 +9,26 @@
 use std::path::Path;
 
 use svod_ir::SInt;
+use svod_tensor::nn::{Layer, LayerNorm, Module};
 use svod_tensor::{BoundVariable, Tensor};
 
-use crate::state::{self, HasStateDict, StateDict};
+use crate::state::{self, StateDict};
 
 use super::config::ModernBertConfig;
 use super::embeddings::Embeddings;
 use super::encoder::Encoder;
 use super::error::Result;
 
-use super::normalization::LayerNormWeights;
-
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct ModernBert {
+    #[module(skip)]
     pub config: ModernBertConfig,
+    #[module(key = "model.embeddings")]
     pub embeddings: Embeddings,
+    #[module(key = "model.layers")]
     pub encoder: Encoder,
-    pub final_norm: LayerNormWeights,
+    #[module(key = "model.final_norm")]
+    pub final_norm: LayerNorm,
 }
 
 impl ModernBert {
@@ -34,7 +37,7 @@ impl ModernBert {
         let dtype = config.dtype.clone();
         let embeddings = Embeddings::empty(config.vocab_size, config.hidden_size, eps, dtype.clone());
         let encoder = Encoder::empty(&config);
-        let final_norm = LayerNormWeights::with_eps(config.hidden_size, eps, dtype);
+        let final_norm = LayerNorm::with_dims(config.hidden_size, false, eps, dtype);
         Self { config, embeddings, encoder, final_norm }
     }
 
@@ -43,7 +46,7 @@ impl ModernBert {
     pub fn forward(&self, input_ids: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
         let x = self.embeddings.forward(input_ids)?;
         let x = self.encoder.forward(&x, padding_mask)?;
-        self.final_norm.apply(&x)
+        Ok(self.final_norm.forward(&x)?)
     }
 
     /// JIT-path variant: `input_ids` / `padding_mask` are sized for the JIT
@@ -102,25 +105,4 @@ impl ModernBert {
         model.load_state_dict(&state::cast_all(sd, dtype), "")?;
         Ok(model)
     }
-}
-
-impl HasStateDict for ModernBert {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        sd.extend(self.embeddings.state_dict(&prefix_or(prefix, "model.embeddings")));
-        sd.extend(self.encoder.state_dict(&prefix_or(prefix, "model.layers")));
-        sd.extend(self.final_norm.state_dict(&prefix_or(prefix, "model.final_norm")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.embeddings.load_state_dict(sd, &prefix_or(prefix, "model.embeddings"))?;
-        self.encoder.load_state_dict(sd, &prefix_or(prefix, "model.layers"))?;
-        self.final_norm.load_state_dict(sd, &prefix_or(prefix, "model.final_norm"))?;
-        Ok(())
-    }
-}
-
-fn prefix_or(prefix: &str, suffix: &str) -> String {
-    if prefix.is_empty() { suffix.to_string() } else { format!("{prefix}.{suffix}") }
 }

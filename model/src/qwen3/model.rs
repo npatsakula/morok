@@ -8,61 +8,51 @@
 use std::path::Path;
 
 use svod_ir::SInt;
+use svod_tensor::nn::{Embedding, Layer, Module, RmsNorm};
 use svod_tensor::{BoundVariable, Tensor};
 
-use crate::state::{self, HasStateDict, StateDict};
+use crate::state::{self, StateDict};
 
 use super::config::Qwen3Config;
 use super::decoder_layer::Qwen3DecoderLayer;
-use super::embeddings::Qwen3Embeddings;
 use super::error::Result;
 
-use super::rms_norm::RmsNormWeights;
-use super::rotary::RotaryTable;
-
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Qwen3Model {
+    #[module(skip)]
     pub config: Qwen3Config,
-    pub embeddings: Qwen3Embeddings,
+    #[module(key = "embed_tokens")]
+    pub embeddings: Embedding,
     pub layers: Vec<Qwen3DecoderLayer>,
-    pub norm: RmsNormWeights,
+    pub norm: RmsNorm,
 }
 
 impl Qwen3Model {
     pub fn empty(config: Qwen3Config) -> Self {
         let dtype = config.dtype.clone();
-        let embeddings = Qwen3Embeddings::empty(config.vocab_size, config.hidden_size, dtype.clone());
+        let weight =
+            crate::init::fan_in_uniform(&[config.vocab_size, config.hidden_size], config.hidden_size, dtype.clone());
+        let embeddings = Embedding::new(weight);
         let layers = (0..config.num_hidden_layers).map(|_| Qwen3DecoderLayer::empty(&config)).collect();
-        let norm = RmsNormWeights::empty(config.hidden_size, config.rms_norm_eps, dtype);
+        let norm = RmsNorm::with_dims(config.hidden_size, config.rms_norm_eps, dtype);
         Self { config, embeddings, layers, norm }
     }
 
     /// Eager forward: `input_ids` `(B, L)` + optional `padding_mask` `(B, L)`
-    /// bool → last-hidden-state `(B, L, D)`.
+    /// bool (`true` = real token) → last-hidden-state `(B, L, D)`.
     pub fn forward(&self, input_ids: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
         let x = self.embeddings.forward(input_ids)?;
-        let b_dim = x.dim(0)?;
         let seq_len = x.dim_const(1)?;
 
         // Build the rotary table once — shared across all layers.
-        let rotary =
-            RotaryTable::new(self.config.rope_theta, seq_len, self.config.head_dim, self.config.dtype.clone())?;
-
-        // Build SDPA key-axis mask: bool (B,1,1,L), True = masked out.
-        let mask_4d = match padding_mask {
-            Some(m) => {
-                let m2 = m.try_reshape([b_dim.clone(), SInt::from(seq_len)])?;
-                let inverted = m2.logical_not()?;
-                Some(inverted.try_unsqueeze(1)?.try_unsqueeze(1)?)
-            }
-            None => None,
-        };
+        let rope =
+            Tensor::rope_table(self.config.rope_theta, seq_len, self.config.head_dim, self.config.dtype.clone())?;
 
         let mut h = x;
         for layer in &self.layers {
-            h = layer.forward(&h, &rotary, mask_4d.as_ref())?;
+            h = layer.forward(&h, &rope, padding_mask)?;
         }
-        self.norm.apply(&h)
+        Ok(self.norm.forward(&h)?)
     }
 
     /// JIT-path variant: shrinks the leading batch dim to the live value.
@@ -113,33 +103,4 @@ impl Qwen3Model {
         model.load_state_dict(&state::cast_all(sd, dtype), "")?;
         Ok(model)
     }
-}
-
-impl HasStateDict for Qwen3Model {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        sd.extend(self.embeddings.state_dict(&prefix_or(prefix, "embed_tokens")));
-        for (i, layer) in self.layers.iter().enumerate() {
-            sd.extend(layer.state_dict(&prefixed_index(prefix, "layers", i)));
-        }
-        sd.extend(self.norm.state_dict(&prefix_or(prefix, "norm")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.embeddings.load_state_dict(sd, &prefix_or(prefix, "embed_tokens"))?;
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            layer.load_state_dict(sd, &prefixed_index(prefix, "layers", i))?;
-        }
-        self.norm.load_state_dict(sd, &prefix_or(prefix, "norm"))?;
-        Ok(())
-    }
-}
-
-fn prefix_or(prefix: &str, suffix: &str) -> String {
-    if prefix.is_empty() { suffix.to_string() } else { format!("{prefix}.{suffix}") }
-}
-
-fn prefixed_index(prefix: &str, name: &str, i: usize) -> String {
-    if prefix.is_empty() { format!("{name}.{i}") } else { format!("{prefix}.{name}.{i}") }
 }

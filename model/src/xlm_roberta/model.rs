@@ -9,17 +9,19 @@ use std::path::Path;
 
 use snafu::ResultExt;
 use svod_ir::SInt;
+use svod_tensor::nn::Module;
 use svod_tensor::{BoundVariable, Tensor};
 
-use crate::state::{self, HasStateDict, StateDict};
+use crate::state::{self, StateDict};
 
 use super::config::XlmRobertaConfig;
 use super::embeddings::XlmRobertaEmbeddings;
 use super::encoder::XlmRobertaEncoder;
 use super::error::{PickleSnafu, Result};
 
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct XlmRobertaModel {
+    #[module(skip)]
     pub config: XlmRobertaConfig,
     pub embeddings: XlmRobertaEmbeddings,
     pub encoder: XlmRobertaEncoder,
@@ -98,23 +100,4 @@ impl XlmRobertaModel {
         model.load_state_dict(&state::cast_all(sd, dtype), "")?;
         Ok(model)
     }
-}
-
-impl HasStateDict for XlmRobertaModel {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        sd.extend(self.embeddings.state_dict(&prefix_or(prefix, "embeddings")));
-        sd.extend(self.encoder.state_dict(&prefix_or(prefix, "encoder")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.embeddings.load_state_dict(sd, &prefix_or(prefix, "embeddings"))?;
-        self.encoder.load_state_dict(sd, &prefix_or(prefix, "encoder"))?;
-        Ok(())
-    }
-}
-
-fn prefix_or(prefix: &str, suffix: &str) -> String {
-    if prefix.is_empty() { suffix.to_string() } else { format!("{prefix}.{suffix}") }
 }

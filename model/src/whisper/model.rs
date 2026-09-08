@@ -1,8 +1,9 @@
 //! Whisper model composite: encoder + decoder + dimensions.
 
 use svod_tensor::Tensor;
+use svod_tensor::nn::Module;
 
-use crate::state::{self, HasStateDict, StateDict, prefixed, scoped};
+use crate::state::scoped;
 
 use super::config::ModelDimensions;
 use super::decoder::TextDecoder;
@@ -10,8 +11,9 @@ use super::encoder::AudioEncoder;
 use super::error::Result;
 
 /// The Whisper model: encoder + decoder + alignment heads.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Whisper {
+    #[module(skip)]
     pub dims: ModelDimensions,
     pub encoder: AudioEncoder,
     pub decoder: TextDecoder,
@@ -89,20 +91,5 @@ impl Whisper {
 
     pub fn is_multilingual(&self) -> bool {
         self.dims.is_multilingual()
-    }
-}
-
-impl HasStateDict for Whisper {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        sd.extend(self.encoder.state_dict(&prefixed(prefix, "encoder")));
-        sd.extend(self.decoder.state_dict(&prefixed(prefix, "decoder")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.encoder.load_state_dict(sd, &prefixed(prefix, "encoder"))?;
-        self.decoder.load_state_dict(sd, &prefixed(prefix, "decoder"))?;
-        Ok(())
     }
 }

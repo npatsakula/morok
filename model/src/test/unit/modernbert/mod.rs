@@ -4,5 +4,3 @@ mod head;
 mod jit;
 mod model;
 mod parity;
-mod pooling;
-mod rotary;

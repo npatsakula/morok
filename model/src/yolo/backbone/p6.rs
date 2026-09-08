@@ -4,8 +4,7 @@
 //! P5/32, and P5 is narrowed to 768 channels. SPPF uses `shortcut=false`.
 
 use svod_tensor::Tensor;
-
-use crate::state::{self, HasStateDict, StateDict, prefixed};
+use svod_tensor::nn::Module;
 
 use crate::yolo::blocks::attention::C2PSA;
 use crate::yolo::blocks::conv::YoloConv;
@@ -25,20 +24,33 @@ pub fn p6_scaled_channels(scale: YoloScale) -> [usize; 6] {
 ///
 /// Forward returns four skip-connection outputs: `(l4, l6, l8, l12)`
 /// at strides 8, 16, 32, 64.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct YoloBackboneP6 {
+    #[module(key = "0")]
     pub conv0: YoloConv,
+    #[module(key = "1")]
     pub conv1: YoloConv,
+    #[module(key = "2")]
     pub c3k2_2: C3k2,
+    #[module(key = "3")]
     pub conv3: YoloConv,
+    #[module(key = "4")]
     pub c3k2_4: C3k2,
+    #[module(key = "5")]
     pub conv5: YoloConv,
+    #[module(key = "6")]
     pub c3k2_6: C3k2,
+    #[module(key = "7")]
     pub conv7: YoloConv,
+    #[module(key = "8")]
     pub c3k2_8: C3k2,
+    #[module(key = "9")]
     pub conv9: YoloConv,
+    #[module(key = "10")]
     pub c3k2_10: C3k2,
+    #[module(key = "11")]
     pub sppf11: Sppf,
+    #[module(key = "12")]
     pub c2psa12: C2PSA,
 }
 
@@ -79,43 +91,5 @@ impl YoloBackboneP6 {
         let x = self.sppf11.forward(&x)?;
         let l12 = self.c2psa12.forward(&x)?;
         Ok((l4, l6, l8, l12))
-    }
-}
-
-impl HasStateDict for YoloBackboneP6 {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let p = |i: usize| prefixed(prefix, &i.to_string());
-        let mut sd = self.conv0.state_dict(&p(0));
-        sd.extend(self.conv1.state_dict(&p(1)));
-        sd.extend(self.c3k2_2.state_dict(&p(2)));
-        sd.extend(self.conv3.state_dict(&p(3)));
-        sd.extend(self.c3k2_4.state_dict(&p(4)));
-        sd.extend(self.conv5.state_dict(&p(5)));
-        sd.extend(self.c3k2_6.state_dict(&p(6)));
-        sd.extend(self.conv7.state_dict(&p(7)));
-        sd.extend(self.c3k2_8.state_dict(&p(8)));
-        sd.extend(self.conv9.state_dict(&p(9)));
-        sd.extend(self.c3k2_10.state_dict(&p(10)));
-        sd.extend(self.sppf11.state_dict(&p(11)));
-        sd.extend(self.c2psa12.state_dict(&p(12)));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        let p = |i: usize| prefixed(prefix, &i.to_string());
-        self.conv0.load_state_dict(sd, &p(0))?;
-        self.conv1.load_state_dict(sd, &p(1))?;
-        self.c3k2_2.load_state_dict(sd, &p(2))?;
-        self.conv3.load_state_dict(sd, &p(3))?;
-        self.c3k2_4.load_state_dict(sd, &p(4))?;
-        self.conv5.load_state_dict(sd, &p(5))?;
-        self.c3k2_6.load_state_dict(sd, &p(6))?;
-        self.conv7.load_state_dict(sd, &p(7))?;
-        self.c3k2_8.load_state_dict(sd, &p(8))?;
-        self.conv9.load_state_dict(sd, &p(9))?;
-        self.c3k2_10.load_state_dict(sd, &p(10))?;
-        self.sppf11.load_state_dict(sd, &p(11))?;
-        self.c2psa12.load_state_dict(sd, &p(12))?;
-        Ok(())
     }
 }

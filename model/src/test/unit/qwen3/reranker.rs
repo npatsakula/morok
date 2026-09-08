@@ -1,5 +1,6 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::Module;
 
 use crate::qwen3::{Qwen3Config, Qwen3Reranker};
 
@@ -50,4 +51,32 @@ fn lm_head_tied_to_embeddings() {
     let lm_shape = reranker.lm_head_weight.dims().unwrap();
     assert_eq!(lm_shape[0], 100); // vocab_size
     assert_eq!(lm_shape[1], 64); // hidden_size
+}
+
+/// The reranker nests the backbone under `model.` — the published
+/// `Qwen3ForCausalLM` layout — and stores no LM head of its own (it is tied to
+/// `embed_tokens.weight` and resolved on load).
+#[test]
+fn state_dict_nests_backbone_under_model_prefix() {
+    let reranker = Qwen3Reranker::empty(tiny_cfg());
+    let sd = reranker.state_dict("");
+    assert!(sd.contains_key("model.embed_tokens.weight"));
+    assert!(sd.contains_key("model.layers.0.self_attn.q_proj.weight"));
+    assert!(sd.contains_key("model.norm.weight"));
+    assert!(!sd.contains_key("lm_head.weight"), "the LM head is tied, never stored");
+
+    // The tie is resolved on load: a fresh reranker picks the embedding table up.
+    let mut reloaded = Qwen3Reranker::empty(tiny_cfg());
+    reloaded.load_state_dict(&sd, "").unwrap();
+    let want = sd["model.embed_tokens.weight"].clone();
+    want.realize().unwrap();
+    reloaded.lm_head_weight.realize().unwrap();
+    assert_eq!(reloaded.lm_head_weight.as_vec::<f32>().unwrap(), want.as_vec::<f32>().unwrap());
+
+    // A non-empty prefix nests every key under it, with no leading dot.
+    let mut got: Vec<String> = reranker.state_dict("m").keys().cloned().collect();
+    let mut want: Vec<String> = sd.keys().map(|k| format!("m.{k}")).collect();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want);
 }

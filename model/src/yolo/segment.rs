@@ -4,13 +4,13 @@
 //! Forward returns `(predictions [B, 4+nc+nm, A], protos [B, nm, H/4, W/4])`.
 
 use svod_ir::SInt;
+use svod_tensor::nn::{Conv2d, ConvTranspose2d, Layer, Module, ResizeMode};
 use svod_tensor::{BoundVariable, Tensor};
 
-use crate::state::{self, HasStateDict, StateDict, prefixed};
+use crate::state::StateDict;
 
-use super::backbone::{YoloBackbone, upsample_nearest_2x};
-use super::blocks::conv::ConvTranspose2dBias;
-use super::blocks::conv::{Conv2dBias, YoloConv};
+use super::backbone::YoloBackbone;
+use super::blocks::conv::{YoloConv, conv2d_bias, deconv2d_2x};
 use super::config::DETECT_STRIDES;
 use super::error::Result;
 
@@ -22,11 +22,14 @@ use super::neck::YoloNeck;
 /// Outputs `nm` channels.
 ///
 /// State-dict keys: `0.*`, `1.*`, `2.weight`, `2.bias`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct MaskBranch {
+    #[module(key = "0")]
     pub conv0: YoloConv,
+    #[module(key = "1")]
     pub conv1: YoloConv,
-    pub conv2: Conv2dBias,
+    #[module(key = "2")]
+    pub conv2: Conv2d,
 }
 
 impl MaskBranch {
@@ -35,30 +38,14 @@ impl MaskBranch {
         Self {
             conv0: YoloConv::empty(in_ch, hidden, 3, 1, true),
             conv1: YoloConv::empty(hidden, hidden, 3, 1, true),
-            conv2: Conv2dBias::empty(hidden, nm, 1, 1),
+            conv2: conv2d_bias(hidden, nm, 1, 1),
         }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.conv0.forward(x)?;
         let x = self.conv1.forward(&x)?;
-        self.conv2.forward(&x)
-    }
-}
-
-impl HasStateDict for MaskBranch {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.conv0.state_dict(&prefixed(prefix, "0"));
-        sd.extend(self.conv1.state_dict(&prefixed(prefix, "1")));
-        sd.extend(self.conv2.state_dict(&prefixed(prefix, "2")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.conv0.load_state_dict(sd, &prefixed(prefix, "0"))?;
-        self.conv1.load_state_dict(sd, &prefixed(prefix, "1"))?;
-        self.conv2.load_state_dict(sd, &prefixed(prefix, "2"))?;
-        Ok(())
+        Ok(self.conv2.forward(&x)?)
     }
 }
 
@@ -71,12 +58,12 @@ impl HasStateDict for MaskBranch {
 /// - `upsample.weight`, `upsample.bias` — ConvTranspose2d
 /// - `cv2.*` — Proto parent cv2 (3×3 conv)
 /// - `cv3.*` — Proto parent cv3 (1×1 conv)
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Proto26 {
     pub feat_refine: Vec<YoloConv>,
     pub feat_fuse: YoloConv,
     pub cv1: YoloConv,
-    pub upsample: ConvTranspose2dBias,
+    pub upsample: ConvTranspose2d,
     pub cv2: YoloConv,
     pub cv3: YoloConv,
 }
@@ -88,7 +75,7 @@ impl Proto26 {
             feat_refine: ch[1..].iter().map(|&c| YoloConv::empty(c, p3_ch, 1, 1, true)).collect(),
             feat_fuse: YoloConv::empty(p3_ch, c_, 3, 1, true),
             cv1: YoloConv::empty(c_, c_, 3, 1, true),
-            upsample: ConvTranspose2dBias::empty(c_, c_, 2),
+            upsample: deconv2d_2x(c_, c_, 2),
             cv2: YoloConv::empty(c_, c_, 3, 1, true),
             cv3: YoloConv::empty(c_, nm, 1, 1, true),
         }
@@ -97,13 +84,10 @@ impl Proto26 {
     pub fn forward(&self, feats: &[Tensor]) -> Result<Tensor> {
         let mut feat = feats[0].clone();
         for (i, f) in self.feat_refine.iter().enumerate() {
-            let refined = f.forward(&feats[i + 1])?;
-            let mut upsampled = refined;
-            // Nearest upsample by 2^(i+1) via repeated 2× calls
-            for _ in 0..(i + 1) {
-                upsampled = upsample_nearest_2x(&upsampled)?;
-            }
-            feat = feat.try_add(&upsampled)?;
+            // Level `i + 1` sits `i + 1` strides below P3.
+            let scale = 1 << (i + 1);
+            let refined = f.forward(&feats[i + 1])?.upsample(&[scale, scale], ResizeMode::Nearest)?;
+            feat = feat.try_add(&refined)?;
         }
         let feat = self.feat_fuse.forward(&feat)?;
         // Proto parent: cv1 → ConvTranspose2d → cv2 → cv3
@@ -114,40 +98,16 @@ impl Proto26 {
     }
 }
 
-impl HasStateDict for Proto26 {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        for (i, f) in self.feat_refine.iter().enumerate() {
-            sd.extend(f.state_dict(&prefixed(prefix, &format!("feat_refine.{i}"))));
-        }
-        sd.extend(self.feat_fuse.state_dict(&prefixed(prefix, "feat_fuse")));
-        sd.extend(self.cv1.state_dict(&prefixed(prefix, "cv1")));
-        sd.extend(self.upsample.state_dict(&prefixed(prefix, "upsample")));
-        sd.extend(self.cv2.state_dict(&prefixed(prefix, "cv2")));
-        sd.extend(self.cv3.state_dict(&prefixed(prefix, "cv3")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        for (i, f) in self.feat_refine.iter_mut().enumerate() {
-            f.load_state_dict(sd, &prefixed(prefix, &format!("feat_refine.{i}")))?;
-        }
-        self.feat_fuse.load_state_dict(sd, &prefixed(prefix, "feat_fuse"))?;
-        self.cv1.load_state_dict(sd, &prefixed(prefix, "cv1"))?;
-        self.upsample.load_state_dict(sd, &prefixed(prefix, "upsample"))?;
-        self.cv2.load_state_dict(sd, &prefixed(prefix, "cv2"))?;
-        self.cv3.load_state_dict(sd, &prefixed(prefix, "cv3"))?;
-        Ok(())
-    }
-}
-
 /// Segment26 head: Detect box+cls + mask coefficients + Proto26.
 ///
 /// Forward returns `(predictions [B, 4+nc+nm, A], protos [B, nm, H/4, W/4])`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Segment26 {
+    #[module(key = "one2one_cv2")]
     pub cv2: Vec<BoxBranch>,
+    #[module(key = "one2one_cv3")]
     pub cv3: Vec<ClsBranch>,
+    #[module(key = "one2one_cv4")]
     pub cv4: Vec<MaskBranch>,
     pub proto: Proto26,
     pub nc: usize,
@@ -206,7 +166,7 @@ impl Segment26 {
         let masks = Tensor::cat(&mask_refs, 2)?;
 
         let num_anchors: usize = feat_sizes.iter().map(|&(h, w)| h * w).sum();
-        let (anchors, strides) = make_anchors(&feat_sizes, &DETECT_STRIDES);
+        let (anchors, strides) = make_anchors(&feat_sizes, &DETECT_STRIDES)?;
 
         let dbox = dist2bbox(&boxes, &anchors, &strides, num_anchors)?;
         let scores = scores.sigmoid()?;
@@ -216,45 +176,18 @@ impl Segment26 {
     }
 }
 
-impl HasStateDict for Segment26 {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        for (i, br) in self.cv2.iter().enumerate() {
-            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv2.{i}"))));
-        }
-        for (i, br) in self.cv3.iter().enumerate() {
-            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv3.{i}"))));
-        }
-        for (i, br) in self.cv4.iter().enumerate() {
-            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv4.{i}"))));
-        }
-        sd.extend(self.proto.state_dict(&prefixed(prefix, "proto")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        for (i, br) in self.cv2.iter_mut().enumerate() {
-            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv2.{i}")))?;
-        }
-        for (i, br) in self.cv3.iter_mut().enumerate() {
-            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv3.{i}")))?;
-        }
-        for (i, br) in self.cv4.iter_mut().enumerate() {
-            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv4.{i}")))?;
-        }
-        self.proto.load_state_dict(sd, &prefixed(prefix, "proto"))?;
-        Ok(())
-    }
-}
-
 /// YOLO v26 instance segmentation model.
 ///
 /// Forward returns `(predictions [B, 4+nc+nm, A], protos [B, nm, H/4, W/4])`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Yolo26Segment {
+    #[module(skip)]
     pub config: super::config::YoloConfig,
+    #[module(key = "")]
     pub backbone: YoloBackbone,
+    #[module(key = "")]
     pub neck: YoloNeck,
+    #[module(key = "23")]
     pub head: Segment26,
 }
 
@@ -295,21 +228,5 @@ impl Yolo26Segment {
         let (l4, l6, l10) = self.backbone.forward(&x)?;
         let (p3, p4, p5) = self.neck.forward(&l4, &l6, &l10)?;
         self.head.forward(&[p3, p4, p5])
-    }
-}
-
-impl HasStateDict for Yolo26Segment {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.backbone.state_dict(prefix);
-        sd.extend(self.neck.state_dict(prefix));
-        sd.extend(self.head.state_dict(&prefixed(prefix, "23")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.backbone.load_state_dict(sd, prefix)?;
-        self.neck.load_state_dict(sd, prefix)?;
-        self.head.load_state_dict(sd, &prefixed(prefix, "23"))?;
-        Ok(())
     }
 }

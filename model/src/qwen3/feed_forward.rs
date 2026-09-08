@@ -5,18 +5,21 @@
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::Module;
 
 use crate::init::fan_in_uniform;
-use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::error::Result;
 
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Qwen3MLP {
     pub hidden_size: usize,
     pub intermediate_size: usize,
+    #[module(key = "gate_proj.weight")]
     pub gate_weight: Tensor,
+    #[module(key = "up_proj.weight")]
     pub up_weight: Tensor,
+    #[module(key = "down_proj.weight")]
     pub down_weight: Tensor,
 }
 
@@ -33,22 +36,5 @@ impl Qwen3MLP {
         let up = x.linear().weight(&self.up_weight).call()?;
         let act = gate.silu()?.try_mul(&up)?;
         Ok(act.linear().weight(&self.down_weight).call()?)
-    }
-}
-
-impl HasStateDict for Qwen3MLP {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        sd.insert(prefixed(prefix, "gate_proj.weight"), self.gate_weight.clone());
-        sd.insert(prefixed(prefix, "up_proj.weight"), self.up_weight.clone());
-        sd.insert(prefixed(prefix, "down_proj.weight"), self.down_weight.clone());
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.gate_weight = get_tensor(sd, &prefixed(prefix, "gate_proj.weight"))?;
-        self.up_weight = get_tensor(sd, &prefixed(prefix, "up_proj.weight"))?;
-        self.down_weight = get_tensor(sd, &prefixed(prefix, "down_proj.weight"))?;
-        Ok(())
     }
 }

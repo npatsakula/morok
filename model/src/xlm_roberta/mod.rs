@@ -17,8 +17,6 @@ pub mod error;
 pub mod feed_forward;
 pub mod jit;
 pub mod model;
-pub mod normalization;
-pub mod pooling;
 pub mod position_ids;
 
 pub use attention::XlmRobertaAttention;
@@ -30,6 +28,4 @@ pub use error::{Error, Result};
 pub use feed_forward::FeedForwardWeights;
 pub use jit::XlmRobertaJit;
 pub use model::XlmRobertaModel;
-pub use normalization::LayerNormWeights;
-pub use pooling::cls;
 pub use position_ids::position_ids_from_input_ids;

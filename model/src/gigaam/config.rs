@@ -308,7 +308,14 @@ fn validate_encoder(encoder: &RawEncoder) -> Result<()> {
     Ok(())
 }
 
-fn subsampled_len(kernel_size: usize, mel_frames: usize) -> usize {
+/// Encoder frames produced by the two stride-2 subsampling convolutions
+/// (kernel `kernel_size`, `(kernel_size - 1) / 2` padding, applied twice).
+/// The single definition behind `StridingSubsampling::output_length`,
+/// `GigaAmConfig` validation and the transcriber's chunk bookkeeping.
+///
+/// Saturating: a degenerate `mel_frames < kernel_size - 2 * pad` (only
+/// reachable for an empty / sub-frame window) must clamp to 0, not wrap.
+pub(crate) fn subsampled_len(kernel_size: usize, mel_frames: usize) -> usize {
     let pad = (kernel_size - 1) / 2;
     let mut len = mel_frames;
     for _ in 0..2 {

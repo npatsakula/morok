@@ -22,17 +22,15 @@ use std::path::Path;
 use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_ir::SInt;
+use svod_tensor::nn::{Layer, LayerNorm, Linear, Module, StateDict};
 use svod_tensor::{BoundVariable, Tensor, s};
 
-use crate::init::{fan_in_uniform, zeros};
-use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
-use crate::wavlm::{LayerNormWeights, WavLm};
+use crate::init::{fan_in_uniform, ones, zeros};
+use crate::wavlm::{WavLm, drop_inert_keys};
 
 use super::config::DiariZenConfig;
 use super::conformer::ConformerEncoder;
-use super::error::{PickleSnafu, Result, WavLmSnafu};
-
-use super::remap::split_diarizen_state_dict;
+use super::error::{PickleSnafu, Result};
 
 /// Every intermediate tensor captured during a [`DiariZenSegmentationModel`]
 /// forward. Matches the keys saved by `scripts/diarizen_dump_reference.py`.
@@ -55,19 +53,22 @@ pub struct ForwardIntermediates {
     pub final_out: Tensor,
 }
 
-#[derive(Clone)]
+/// The published checkpoint nests the backbone under `wavlm_model.` (Python
+/// `Model.__init__` assigns `self.wavlm_model`), so that is the derived key.
+#[derive(Clone, Module)]
 pub struct DiariZenSegmentationModel {
+    #[module(skip)]
     pub config: DiariZenConfig,
+    #[module(key = "wavlm_model")]
     pub wavlm: WavLm,
     /// `(1, num_layers + 1)` — `Linear(layers + 1 → 1, bias=False)` applied
     /// along the last axis of the stacked WavLM intermediates.
-    pub weight_sum_weight: Tensor,
-    pub proj_weight: Tensor,
-    pub proj_bias: Tensor,
-    pub lnorm: LayerNormWeights,
+    #[module(key = "weight_sum.weight")]
+    pub weight_sum: Tensor,
+    pub proj: Linear,
+    pub lnorm: LayerNorm,
     pub conformer: ConformerEncoder,
-    pub classifier_weight: Tensor,
-    pub classifier_bias: Tensor,
+    pub classifier: Linear,
 }
 
 impl DiariZenSegmentationModel {
@@ -78,25 +79,23 @@ impl DiariZenSegmentationModel {
         let attn_in = config.attention_in;
         let k = config.powerset_class_count();
 
-        let weight_sum_weight = fan_in_uniform(&[1, lnum], lnum, DType::Float32);
-        let proj_weight = fan_in_uniform(&[attn_in, feat_dim], feat_dim, DType::Float32);
-        let proj_bias = zeros(&[attn_in], DType::Float32);
-        let lnorm = LayerNormWeights::empty(attn_in);
-        let conformer =
-            ConformerEncoder::empty(attn_in, config.ffn_hidden, config.num_head, config.num_layer, config.kernel_size);
-        let classifier_weight = fan_in_uniform(&[k, attn_in], attn_in, DType::Float32);
-        let classifier_bias = zeros(&[k], DType::Float32);
-
+        let linear = |out: usize, inp: usize| {
+            Linear::new(fan_in_uniform(&[out, inp], inp, DType::Float32), Some(zeros(&[out], DType::Float32)))
+        };
         Self {
-            config,
             wavlm,
-            weight_sum_weight,
-            proj_weight,
-            proj_bias,
-            lnorm,
-            conformer,
-            classifier_weight,
-            classifier_bias,
+            weight_sum: fan_in_uniform(&[1, lnum], lnum, DType::Float32),
+            proj: linear(attn_in, feat_dim),
+            lnorm: LayerNorm::new(ones(&[attn_in], DType::Float32), Some(zeros(&[attn_in], DType::Float32)), 1e-5),
+            conformer: ConformerEncoder::empty(
+                attn_in,
+                config.ffn_hidden,
+                config.num_head,
+                config.num_layer,
+                config.kernel_size,
+            ),
+            classifier: linear(k, attn_in),
+            config,
         }
     }
 
@@ -105,7 +104,7 @@ impl DiariZenSegmentationModel {
     /// `selected_channel` is hardcoded to 0 (matches the published config).
     pub fn forward(&self, waveforms: &Tensor) -> Result<Tensor> {
         let waveforms = self.select_channel(waveforms)?;
-        let stacked = self.wavlm.extract_features_stacked(&waveforms).context(WavLmSnafu)?;
+        let stacked = self.wavlm.extract_features_stacked(&waveforms)?;
         self.head_forward(&stacked)
     }
 
@@ -123,15 +122,15 @@ impl DiariZenSegmentationModel {
     }
 
     fn head_forward(&self, stacked: &Tensor) -> Result<Tensor> {
-        // weight_sum: Linear(L+1 → 1, bias=False) over last axis.
-        let summed = stacked.linear().weight(&self.weight_sum_weight).call()?;
-        let summed = summed.try_squeeze(Some(-1))?;
+        Ok(self.head_logits(stacked)?.log_softmax(-1)?)
+    }
 
-        let h = summed.linear().weight(&self.proj_weight).bias(&self.proj_bias).call()?;
-        let h = self.lnorm.apply(&h)?;
-        let h = self.conformer.forward(&h)?;
-        let logits = h.linear().weight(&self.classifier_weight).bias(&self.classifier_bias).call()?;
-        Ok(logits.log_softmax(-1)?)
+    /// The head up to (but not including) the final log-softmax.
+    fn head_logits(&self, stacked: &Tensor) -> Result<Tensor> {
+        // weight_sum: Linear(L+1 → 1, bias=False) over the last axis.
+        let summed = stacked.linear().weight(&self.weight_sum).call()?.try_squeeze(Some(-1))?;
+        let h = self.lnorm.forward(&self.proj.forward(&summed)?)?;
+        Ok(self.classifier.forward(&self.conformer.forward(&h)?)?)
     }
 
     /// Eager forward that returns every intermediate stage. Used by the
@@ -140,22 +139,18 @@ impl DiariZenSegmentationModel {
     pub fn forward_with_intermediates(&self, waveforms: &Tensor) -> Result<ForwardIntermediates> {
         let waveforms = self.select_channel(waveforms)?;
 
-        let wavlm_intermediates = self.wavlm.extract_features(&waveforms).context(WavLmSnafu)?;
+        let wavlm_intermediates = self.wavlm.extract_features(&waveforms)?;
         let unsq: Vec<Tensor> =
-            wavlm_intermediates.iter().map(|t| Ok(t.try_unsqueeze(-1)?)).collect::<Result<Vec<_>>>()?;
-        let refs: Vec<&Tensor> = unsq.iter().collect();
-        let stacked = Tensor::cat(&refs, -1)?;
+            wavlm_intermediates.iter().map(|t| t.try_unsqueeze(-1)).collect::<svod_tensor::error::Result<_>>()?;
+        let stacked = Tensor::cat(&unsq.iter().collect::<Vec<_>>(), -1)?;
 
-        let weighted_sum = stacked.linear().weight(&self.weight_sum_weight).call()?;
-        let weighted_sum = weighted_sum.try_squeeze(Some(-1))?;
-
-        let proj_out = weighted_sum.linear().weight(&self.proj_weight).bias(&self.proj_bias).call()?;
-        let lnorm_out = self.lnorm.apply(&proj_out)?;
+        let weighted_sum = stacked.linear().weight(&self.weight_sum).call()?.try_squeeze(Some(-1))?;
+        let proj_out = self.proj.forward(&weighted_sum)?;
+        let lnorm_out = self.lnorm.forward(&proj_out)?;
 
         let (conformer_out, conformer_blocks) = self.conformer.forward_with_block_outputs(&lnorm_out)?;
 
-        let classifier_logits =
-            conformer_out.linear().weight(&self.classifier_weight).bias(&self.classifier_bias).call()?;
+        let classifier_logits = self.classifier.forward(&conformer_out)?;
         let final_out = classifier_logits.log_softmax(-1)?;
 
         Ok(ForwardIntermediates {
@@ -173,13 +168,8 @@ impl DiariZenSegmentationModel {
     /// Useful for parity testing the classifier output directly.
     pub fn forward_logits(&self, waveforms: &Tensor) -> Result<Tensor> {
         let waveforms = self.select_channel(waveforms)?;
-        let stacked = self.wavlm.extract_features_stacked(&waveforms).context(WavLmSnafu)?;
-        let summed = stacked.linear().weight(&self.weight_sum_weight).call()?;
-        let summed = summed.try_squeeze(Some(-1))?;
-        let h = summed.linear().weight(&self.proj_weight).bias(&self.proj_bias).call()?;
-        let h = self.lnorm.apply(&h)?;
-        let h = self.conformer.forward(&h)?;
-        Ok(h.linear().weight(&self.classifier_weight).bias(&self.classifier_bias).call()?)
+        let stacked = self.wavlm.extract_features_stacked(&waveforms)?;
+        self.head_logits(&stacked)
     }
 
     /// Download the published DiariZen segmentation checkpoint and load it.
@@ -195,77 +185,16 @@ impl DiariZenSegmentationModel {
 
     /// Load from a local DiariZen `pytorch_model.bin`. The file is a torch
     /// pickle with a nested `{"state_dict": OrderedDict(...)}`; the pickle
-    /// loader returns the inner dict, and `split_diarizen_state_dict` peels
-    /// the `wavlm_model.` prefix for the backbone keys.
+    /// loader returns the inner dict, whose keys already carry the module
+    /// layout this model derives.
     pub fn from_pytorch_bin(path: &Path, config: DiariZenConfig) -> Result<Self> {
         let raw_sd = crate::wespeaker::pickle::load_flat_pytorch_bin(path, "").context(PickleSnafu)?;
         Self::from_state_dict(&raw_sd, config)
     }
 
     pub fn from_state_dict(sd: &StateDict, config: DiariZenConfig) -> Result<Self> {
-        let (wavlm_sd, head_sd) = split_diarizen_state_dict(sd.clone())?;
-        // PyTorch checkpoints carry raw `running_var`; fold to `invstd` (value
-        // transform + key rename) once at load. Round-tripped state dicts
-        // already use `invstd` keys and skip this call.
-        let head_sd = crate::blocks::remap::fold_batchnorm(head_sd)?;
         let mut model = Self::empty(config);
-        model.wavlm.load_state_dict(&wavlm_sd, "")?;
-        model.load_head_state_dict(&head_sd)?;
+        model.load_state_dict(&drop_inert_keys(sd), "")?;
         Ok(model)
-    }
-
-    fn load_head_state_dict(&mut self, sd: &StateDict) -> Result<()> {
-        self.weight_sum_weight = get_tensor(sd, "weight_sum.weight")?;
-        self.proj_weight = get_tensor(sd, "proj.weight")?;
-        self.proj_bias = get_tensor(sd, "proj.bias")?;
-        self.lnorm.load_state_dict(sd, "lnorm")?;
-        self.conformer.load_state_dict(sd, "conformer")?;
-        self.classifier_weight = get_tensor(sd, "classifier.weight")?;
-        self.classifier_bias = get_tensor(sd, "classifier.bias")?;
-        Ok(())
-    }
-}
-
-impl HasStateDict for DiariZenSegmentationModel {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        // Emit keys in the upstream DiariZen layout — including `wavlm_model.`
-        // prefix on the backbone — so round-trip mirrors what the published
-        // checkpoint stores.
-        let wavlm_prefix = if prefix.is_empty() { "wavlm_model".to_string() } else { format!("{prefix}.wavlm_model") };
-        let mut sd = self.wavlm.state_dict(&wavlm_prefix);
-        sd.insert(prefixed(prefix, "weight_sum.weight"), self.weight_sum_weight.clone());
-        sd.insert(prefixed(prefix, "proj.weight"), self.proj_weight.clone());
-        sd.insert(prefixed(prefix, "proj.bias"), self.proj_bias.clone());
-        sd.extend(self.lnorm.state_dict(&prefixed(prefix, "lnorm")));
-        sd.extend(self.conformer.state_dict(&prefixed(prefix, "conformer")));
-        sd.insert(prefixed(prefix, "classifier.weight"), self.classifier_weight.clone());
-        sd.insert(prefixed(prefix, "classifier.bias"), self.classifier_bias.clone());
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        // Split: wavlm-prefixed keys go to the backbone; the rest stay.
-        let wavlm_prefix =
-            if prefix.is_empty() { "wavlm_model.".to_string() } else { format!("{prefix}.wavlm_model.") };
-        let mut wavlm_sd = StateDict::new();
-        let mut head_sd = StateDict::new();
-        for (k, v) in sd {
-            if let Some(rest) = k.strip_prefix(&wavlm_prefix) {
-                wavlm_sd.insert(rest.to_string(), v.clone());
-            } else if prefix.is_empty() {
-                head_sd.insert(k.clone(), v.clone());
-            } else if let Some(rest) = k.strip_prefix(&format!("{prefix}.")) {
-                head_sd.insert(rest.to_string(), v.clone());
-            }
-        }
-        self.wavlm.load_state_dict(&wavlm_sd, "")?;
-        self.weight_sum_weight = get_tensor(&head_sd, "weight_sum.weight")?;
-        self.proj_weight = get_tensor(&head_sd, "proj.weight")?;
-        self.proj_bias = get_tensor(&head_sd, "proj.bias")?;
-        self.lnorm.load_state_dict(&head_sd, "lnorm")?;
-        self.conformer.load_state_dict(&head_sd, "conformer")?;
-        self.classifier_weight = get_tensor(&head_sd, "classifier.weight")?;
-        self.classifier_bias = get_tensor(&head_sd, "classifier.bias")?;
-        Ok(())
     }
 }

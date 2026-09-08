@@ -5,10 +5,8 @@
 //! maps at strides 4, 8, 16, 32.
 
 use svod_tensor::Tensor;
+use svod_tensor::nn::{Module, ResizeMode};
 
-use crate::state::{self, HasStateDict, StateDict, prefixed};
-
-use crate::yolo::backbone::upsample_nearest_2x;
 use crate::yolo::blocks::conv::YoloConv;
 use crate::yolo::blocks::csp::C3k2;
 use crate::yolo::config::{YoloScale, make_depth, scale_channels};
@@ -16,16 +14,25 @@ use crate::yolo::error::Result;
 
 /// P2 neck (layers 11–28). Takes four backbone features `(l2, l4, l6, l10)`
 /// and produces `(P2, P3, P4, P5)` at strides 4, 8, 16, 32.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct YoloNeckP2 {
+    #[module(key = "13")]
     pub c3k2_13: C3k2,
+    #[module(key = "16")]
     pub c3k2_16: C3k2,
+    #[module(key = "19")]
     pub c3k2_19: C3k2,
+    #[module(key = "20")]
     pub conv20: YoloConv,
+    #[module(key = "22")]
     pub c3k2_22: C3k2,
+    #[module(key = "23")]
     pub conv23: YoloConv,
+    #[module(key = "25")]
     pub c3k2_25: C3k2,
+    #[module(key = "26")]
     pub conv26: YoloConv,
+    #[module(key = "28")]
     pub c3k2_28: C3k2,
 }
 
@@ -68,15 +75,15 @@ impl YoloNeckP2 {
         l10: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         // FPN top-down: l10 → up → cat(l6) → c3k2_13 → up → cat(l4) → c3k2_16 → up → cat(l2) → c3k2_19
-        let up = upsample_nearest_2x(l10)?;
+        let up = l10.upsample(&[2, 2], ResizeMode::Nearest)?;
         let cat = Tensor::cat(&[&up, l6], 1)?;
         let l13 = self.c3k2_13.forward(&cat)?;
 
-        let up = upsample_nearest_2x(&l13)?;
+        let up = l13.upsample(&[2, 2], ResizeMode::Nearest)?;
         let cat = Tensor::cat(&[&up, l4], 1)?;
         let l16 = self.c3k2_16.forward(&cat)?;
 
-        let up = upsample_nearest_2x(&l16)?;
+        let up = l16.upsample(&[2, 2], ResizeMode::Nearest)?;
         let cat = Tensor::cat(&[&up, l2], 1)?;
         let l19 = self.c3k2_19.forward(&cat)?;
 
@@ -94,35 +101,5 @@ impl YoloNeckP2 {
         let l28 = self.c3k2_28.forward(&cat)?;
 
         Ok((l19, l22, l25, l28))
-    }
-}
-
-impl HasStateDict for YoloNeckP2 {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let p = |i: usize| prefixed(prefix, &i.to_string());
-        let mut sd = self.c3k2_13.state_dict(&p(13));
-        sd.extend(self.c3k2_16.state_dict(&p(16)));
-        sd.extend(self.c3k2_19.state_dict(&p(19)));
-        sd.extend(self.conv20.state_dict(&p(20)));
-        sd.extend(self.c3k2_22.state_dict(&p(22)));
-        sd.extend(self.conv23.state_dict(&p(23)));
-        sd.extend(self.c3k2_25.state_dict(&p(25)));
-        sd.extend(self.conv26.state_dict(&p(26)));
-        sd.extend(self.c3k2_28.state_dict(&p(28)));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        let p = |i: usize| prefixed(prefix, &i.to_string());
-        self.c3k2_13.load_state_dict(sd, &p(13))?;
-        self.c3k2_16.load_state_dict(sd, &p(16))?;
-        self.c3k2_19.load_state_dict(sd, &p(19))?;
-        self.conv20.load_state_dict(sd, &p(20))?;
-        self.c3k2_22.load_state_dict(sd, &p(22))?;
-        self.conv23.load_state_dict(sd, &p(23))?;
-        self.c3k2_25.load_state_dict(sd, &p(25))?;
-        self.conv26.load_state_dict(sd, &p(26))?;
-        self.c3k2_28.load_state_dict(sd, &p(28))?;
-        Ok(())
     }
 }

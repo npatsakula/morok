@@ -79,8 +79,9 @@ fn test_rope_cache_uses_pos_emb_max_len_as_base() {
     let angle = pos as f32 / (cfg.max_encoder_frames as f32).powf(2.0 * freq_idx as f32 / d_k as f32);
     let flat_idx = pos * half_d + freq_idx;
 
-    let cos = model.encoder.cos_cache.as_vec::<f32>().unwrap();
-    let sin = model.encoder.sin_cache.as_vec::<f32>().unwrap();
+    // The cache is a graph (`Tensor::rope_table`), not a host array: realize it.
+    let cos = model.encoder.cos_cache.to_vec::<f32>().unwrap();
+    let sin = model.encoder.sin_cache.to_vec::<f32>().unwrap();
 
     assert!((cos[flat_idx] - angle.cos()).abs() < 1e-6);
     assert!((sin[flat_idx] - angle.sin()).abs() < 1e-6);

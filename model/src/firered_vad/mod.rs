@@ -89,8 +89,14 @@ pub(crate) const CORE: usize = CHUNK_T - 2 * HALO;
 /// ignores the rest.
 pub(crate) const BATCH: usize = 8;
 
+/// The checkpoint stores each FSMN time filter as a `[P, 1, 1, ORDER]`
+/// conv2d kernel over a fake height axis; `conv1d` takes `[P, 1, ORDER]`.
+pub(crate) fn time_filter(weight: &Tensor) -> Result<Tensor> {
+    Ok(weight.try_reshape([PROJ as isize, 1, ORDER as isize])?)
+}
+
 /// One FSMN memory layer: depthwise lookback + lookahead filters over time
-/// (weights `[P, 1, 1, ORDER]`), residual added by the caller-side formula
+/// (weights `[P, 1, ORDER]`), residual added by the caller-side formula
 /// `memory = x + lookback + lookahead`.
 #[derive(Clone)]
 struct Fsmn {
@@ -104,24 +110,26 @@ impl Fsmn {
     /// `t` then sums frames `[t+1, t+ORDER]`, with `t = T-1` falling entirely
     /// in the zero pad (the reference's appended zero).
     ///
-    /// `valid` (`[N, 1, 1, T]`, `{0, 1}`) zeroes pad rows before the convs —
+    /// `valid` (`[N, 1, T]`, `{0, 1}`) zeroes pad rows before the convs —
     /// the reference's `masked_fill` batch-padding path. Pointwise layers turn
     /// zero-filled pad rows into bias activations, so without the mask the
     /// convs would leak them into real frames; masked, a pad row contributes
     /// exactly what conv zero-padding would.
     fn forward(&self, x: &Tensor, valid: Option<&Tensor>) -> Result<Tensor> {
-        let len = x.dim_const(1)? as isize;
+        let len = x.dim_const(1)?;
         let k = ORDER as isize;
-        // [N,T,P] -> [N,P,1,T]: conv2d wants (N, C, *spatial).
-        let mut xt = x.try_transpose(-1, -2)?.try_unsqueeze(2)?;
+        // [N,T,P] -> [N,P,T]: conv1d wants (N, C, L).
+        let mut xt = x.try_transpose(-1, -2)?;
         if let Some(valid) = valid {
             xt = xt.try_mul(valid)?;
         }
-        let lookback = xt.conv2d().weight(&self.lookback).groups(PROJ).padding(&[(0, 0), (k - 1, 0)]).call()?;
-        let lookahead = xt.conv2d().weight(&self.lookahead).groups(PROJ).padding(&[(0, 0), (0, k)]).call()?;
-        let lookahead = lookahead.try_shrink([None, None, None, Some((1, len + 1))])?;
+        let filter = |weight: &Tensor, padding: (isize, isize)| -> Result<Tensor> {
+            Ok(xt.conv1d().weight(weight).groups(PROJ).padding(padding).call()?)
+        };
+        let lookback = filter(&self.lookback, (k - 1, 0))?;
+        let lookahead = filter(&self.lookahead, (0, k))?.narrow(-1, 1usize, len)?;
         let memory = xt.try_add(&lookback)?.try_add(&lookahead)?;
-        Ok(memory.try_squeeze(Some(2))?.try_transpose(-1, -2)?)
+        Ok(memory.try_transpose(-1, -2)?)
     }
 }
 
@@ -179,8 +187,8 @@ impl FireRedVad {
         let get = |key: &str| -> Result<Tensor> { Ok(state::get_tensor(&sd, key)?) };
         let fsmn = |prefix: &str| -> Result<Fsmn> {
             Ok(Fsmn {
-                lookback: get(&format!("{prefix}.lookback.weight"))?,
-                lookahead: get(&format!("{prefix}.lookahead.weight"))?,
+                lookback: time_filter(&get(&format!("{prefix}.lookback.weight"))?)?,
+                lookahead: time_filter(&get(&format!("{prefix}.lookahead.weight"))?)?,
             })
         };
         let blocks = (0..BLOCKS)
@@ -217,8 +225,8 @@ impl FireRedVad {
         let lin = |out: usize, inp: usize| fan_in_uniform(&[out, inp], inp, dt.clone());
         let bias = |out: usize, fan_in: usize| fan_in_uniform(&[out], fan_in, dt.clone());
         let fsmn = || Fsmn {
-            lookback: fan_in_uniform(&[PROJ, 1, 1, ORDER], ORDER, dt.clone()),
-            lookahead: fan_in_uniform(&[PROJ, 1, 1, ORDER], ORDER, dt.clone()),
+            lookback: fan_in_uniform(&[PROJ, 1, ORDER], ORDER, dt.clone()),
+            lookahead: fan_in_uniform(&[PROJ, 1, ORDER], ORDER, dt.clone()),
         };
         Self {
             fc1_weight: lin(HIDDEN, N_MELS),
@@ -251,11 +259,8 @@ impl FireRedVad {
     /// garbage but the valid rows match a pad-free forward exactly. `None`
     /// means all rows are real.
     pub fn forward(&self, feat: &Tensor, valid: Option<&Tensor>) -> Result<Tensor> {
-        // [B,T,1] -> [B,1,1,T], broadcast over P in the convs' (N,C,1,T) layout.
-        let valid = match valid {
-            Some(v) => Some(v.try_transpose(-1, -2)?.try_unsqueeze(2)?),
-            None => None,
-        };
+        // [B,T,1] -> [B,1,T], broadcast over P in the convs' (N,C,L) layout.
+        let valid = valid.map(|v| v.try_transpose(-1, -2)).transpose()?;
         let x = feat.try_sub(&self.cmvn_means)?.try_mul(&self.cmvn_istd)?;
         let h = x.linear().weight(&self.fc1_weight).bias(&self.fc1_bias).call()?.relu()?;
         let mut m = h.linear().weight(&self.fc2_weight).bias(&self.fc2_bias).call()?.relu()?;

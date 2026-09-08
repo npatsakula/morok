@@ -1,20 +1,20 @@
 //! State-dict round-trip tests for GigaAM.
 //!
-//! Cheap — no `.realize()`, no JIT. Build the model via `with_random_weights`,
-//! emit its state dict via the per-component `HasStateDict` impls (Encoder
-//! itself doesn't implement the trait; we compose its sub-modules the same
-//! way `Encoder::from_state_dict` does at `gigaam/encoder.rs:764`), assert
-//! representative keys cover the encoder + head surface, then reload into a
-//! fresh model.
+//! Build the model via `with_random_weights`, emit its state dict via the
+//! per-component `Module` impls (Encoder itself doesn't implement the trait;
+//! we compose its sub-modules the same way `Encoder::from_state_dict` does),
+//! assert the keys cover the encoder + head surface, then reload into a fresh
+//! model. Only the BatchNorm-fold test realizes anything.
 //!
 //! Catches: a sub-module rename, a forgotten field in `state_dict()`, a
 //! prefix mismatch between emit and load. Mirrors mexus's WeSpeaker round-trip
 //! at `test/unit/wespeaker/model.rs`.
 
-use crate::gigaam::{GigaAm, GigaAmConfig, Head, TransducerConfig};
-use crate::state::{HasStateDict, StateDict};
+use crate::gigaam::{ConvNormType, GigaAm, GigaAmConfig, Head, TransducerConfig};
+use crate::state::StateDict;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::Module as _;
 
 use super::batch::test_config;
 
@@ -35,7 +35,7 @@ fn rnnt_test_config() -> GigaAmConfig {
     cfg
 }
 
-/// Compose the model's full state dict from its component-level `HasStateDict`
+/// Compose the model's full state dict from its component-level `Module`
 /// impls. The encoder itself doesn't implement the trait (only its
 /// sub-modules), so we mirror `Encoder::from_state_dict`'s key convention:
 /// `subsampling.*` and `layers.{i}.*` (no `encoder.` prefix on disk — the
@@ -130,6 +130,66 @@ fn gigaam_state_dict_round_trip_rnnt() {
     reload(&mut empty, &sd);
 }
 
+/// The exact key set every module emits, spelled out. The `#[derive(Module)]`
+/// migration must not move a single parameter, so this pins the checkpoint
+/// contract independently of the impls that produce it — and asserts that a
+/// non-empty prefix simply prepends `<prefix>.` (no leading dot, no drift).
+#[test]
+fn gigaam_state_dict_keys_are_exactly_the_checkpoint_contract() {
+    let cfg = rnnt_test_config();
+    let model = GigaAm::with_random_weights(cfg.clone());
+
+    let ffn = |slot: &str| {
+        ["norm.weight", "norm.bias", "linear1.weight", "linear1.bias", "linear2.weight", "linear2.bias"]
+            .map(|leaf| format!("{slot}.{leaf}"))
+            .to_vec()
+    };
+    let mut expected: Vec<String> = ["conv1_weight", "conv1_bias", "conv2_weight", "conv2_bias"]
+        .iter()
+        .map(|k| format!("subsampling.{k}"))
+        .collect();
+    for layer in 0..cfg.n_layers {
+        let mut leaves = ffn("ffn1");
+        leaves.extend(ffn("ffn2"));
+        leaves.extend(["norm.weight", "norm.bias"].map(|l| format!("mhsa.{l}")));
+        leaves.extend(["q", "k", "v", "out"].iter().flat_map(|p| [format!("mhsa.{p}_proj"), format!("mhsa.{p}_bias")]));
+        leaves.extend(
+            [
+                "norm.weight",
+                "norm.bias",
+                "conv_norm.weight",
+                "conv_norm.bias",
+                "pw1_weight",
+                "pw1_bias",
+                "dw_weight",
+                "dw_bias",
+                "pw2_weight",
+                "pw2_bias",
+            ]
+            .map(|l| format!("conv.{l}")),
+        );
+        leaves.extend(["final_norm.weight".to_string(), "final_norm.bias".to_string()]);
+        expected.extend(leaves.into_iter().map(|leaf| format!("layers.{layer}.{leaf}")));
+    }
+    expected.extend(
+        ["embed", "lstm.0.w_ih", "lstm.0.w_hh", "lstm.0.b_ih", "lstm.0.b_hh"].map(|k| format!("head.predictor.{k}")),
+    );
+    expected.extend(["enc_w", "enc_b", "pred_w", "pred_b", "out_w", "out_b"].map(|k| format!("head.joint.{k}")));
+    expected.sort();
+
+    let mut actual: Vec<String> = compose_state_dict(&model).into_keys().collect();
+    actual.sort();
+    assert_eq!(actual, expected);
+
+    // A non-empty prefix only prepends; the root prefix grows no leading dot.
+    let mut nested: Vec<String> = model.encoder.layers[0].state_dict("m").into_keys().collect();
+    nested.sort();
+    let mut bare: Vec<String> = model.encoder.layers[0].state_dict("").into_keys().map(|k| format!("m.{k}")).collect();
+    bare.sort();
+    assert_eq!(nested, bare);
+    assert!(bare.iter().all(|k| !k.starts_with("m..")), "empty-prefix keys grew a leading dot");
+}
+
 #[test]
 fn gigaam_encoder_dtype_conversion_leaves_head_fp32() {
     let cfg = test_config();
@@ -173,11 +233,58 @@ fn gigaam_quantization_scales_keep_checkpoint_dtype() {
     let mhsa = &model.encoder.layers[0].mhsa;
     let ffn1 = &model.encoder.layers[0].ffn1;
     for scale in [
-        &mhsa.q_quantization.as_ref().expect("q quantization").weight_scale,
-        &ffn1.linear1_quantization.as_ref().expect("linear1 quantization").weight_scale,
+        mhsa.q_weight_scale.as_ref().expect("q weight scale"),
+        ffn1.linear1_scale.as_ref().expect("linear1 weight scale"),
     ] {
         assert_eq!(scale.dtype(), DType::Float32);
     }
+}
+
+/// The Conformer BatchNorm collapses into the depthwise conv at load — the
+/// checkpoint carries `running_var`, and `1/sqrt(var + eps)` is computed in the
+/// graph (it used to be a host `as_vec` loop in `remap`). This pins the folded
+/// weights against the closed form and asserts the fold is one-shot: the
+/// reloaded model emits no BN keys, and re-loading its own dict is a no-op.
+#[test]
+fn gigaam_batchnorm_folds_into_the_depthwise_conv() {
+    const EPS: f32 = 1e-5;
+    let mut cfg = test_config();
+    cfg.conv_norm_type = ConvNormType::BatchNorm;
+    let model = GigaAm::with_random_weights(cfg.clone());
+    let sd = compose_state_dict(&model);
+
+    let conv = &model.encoder.layers[0].conv;
+    let host = |t: &Tensor| t.to_vec::<f32>().expect("realize");
+    let (dw_w, dw_b) = (host(&conv.dw_weight), host(&conv.dw_bias));
+    let param = |name: &str| host(&sd[&format!("layers.0.conv.{name}")]);
+    let (scale, bias, mean, var) = (param("bn_scale"), param("bn_bias"), param("bn_mean"), param("bn_var"));
+
+    let mut folded = GigaAm::with_random_weights(cfg.clone());
+    reload(&mut folded, &sd);
+    let folded_conv = &folded.encoder.layers[0].conv;
+    let (got_w, got_b) = (host(&folded_conv.dw_weight), host(&folded_conv.dw_bias));
+
+    let kernel = cfg.conv_kernel;
+    for channel in 0..cfg.d_model {
+        let s = scale[channel] / (var[channel] + EPS).sqrt();
+        for k in 0..kernel {
+            let (want, got) = (dw_w[channel * kernel + k] * s, got_w[channel * kernel + k]);
+            assert!((want - got).abs() < 1e-5, "channel {channel} tap {k}: want {want}, got {got}");
+        }
+        let want = dw_b[channel] * s + bias[channel] - mean[channel] * s;
+        assert!((want - got_b[channel]).abs() < 1e-5, "bias {channel}: want {want}, got {}", got_b[channel]);
+    }
+
+    // Folded: the BN parameters are gone from the dict, and a second load of
+    // that dict must not fold a second time.
+    let folded_sd = compose_state_dict(&folded);
+    for key in ["bn_scale", "bn_bias", "bn_mean", "bn_var"] {
+        assert!(!folded_sd.contains_key(&format!("layers.0.conv.{key}")), "folded model still emits {key}");
+    }
+    let mut again = folded.clone();
+    reload(&mut again, &folded_sd);
+    let twice = host(&again.encoder.layers[0].conv.dw_weight);
+    assert_eq!(twice, got_w, "re-loading a folded dict folded again");
 }
 
 #[test]

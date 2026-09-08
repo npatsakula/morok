@@ -1,7 +1,7 @@
 use svod_dtype::DType;
+use svod_tensor::nn::Module;
 use svod_tensor::{Tensor, Variable};
 
-use crate::state::HasStateDict;
 use crate::yolo::{Yolo26Detect, YoloConfig, YoloScale};
 
 /// State-dict round-trip: build a yolo26n, emit its state dict, verify
@@ -47,6 +47,21 @@ fn state_dict_round_trip_nano() {
 
     let mut empty = Yolo26Detect::with_zero_weights(cfg);
     empty.load_state_dict(&sd, "").expect("load round-trip");
+}
+
+/// A prefix must only prepend: `state_dict("m")` is `state_dict("")` with
+/// `m.` in front of every key, never a segment more or less. Catches a
+/// `#[module(key = "")]` flattening or an indexed child that drops the dot
+/// handling at the root.
+#[test]
+fn prefixed_state_dict_only_prepends() {
+    let model = Yolo26Detect::with_zero_weights(YoloConfig::new(YoloScale::Nano, 80));
+
+    let mut bare: Vec<String> = model.state_dict("").into_keys().map(|k| format!("m.{k}")).collect();
+    let mut nested: Vec<String> = model.state_dict("m").into_keys().collect();
+    bare.sort();
+    nested.sort();
+    assert_eq!(bare, nested);
 }
 
 /// Build the symbolic forward graph and check the output shape.

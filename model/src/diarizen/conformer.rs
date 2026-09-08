@@ -20,67 +20,53 @@
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::{BatchNorm2d, Conv1d, Layer, LayerNorm, Linear, Module};
 
-use crate::blocks::BatchNormWeights;
 use crate::init::{fan_in_uniform, zeros};
-use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
-use crate::wavlm::LayerNormWeights;
 
 use super::error::Result;
+
+/// PyTorch's `nn.BatchNorm1d` / `nn.LayerNorm` default epsilon.
+const EPS: f64 = 1e-5;
+
+fn linear(out: usize, inp: usize) -> Linear {
+    Linear::new(fan_in_uniform(&[out, inp], inp, DType::Float32), Some(zeros(&[out], DType::Float32)))
+}
+
+fn layer_norm(size: usize) -> LayerNorm {
+    LayerNorm::new(crate::init::ones(&[size], DType::Float32), Some(zeros(&[size], DType::Float32)), EPS)
+}
+
+/// `(out, in / groups, k)` conv with a zero bias, `SAME`-style padding applied
+/// by the caller.
+fn conv1d(out: usize, in_per_group: usize, kernel: usize) -> Conv1d {
+    let weight = fan_in_uniform(&[out, in_per_group, kernel], in_per_group * kernel, DType::Float32);
+    Conv1d::new(weight, Some(zeros(&[out], DType::Float32)))
+}
 
 // ---------------------------------------------------------------------------
 // PositionwiseFeedForward
 // ---------------------------------------------------------------------------
 
 /// Pre-norm FFN with 0.5-scaled residual — Conformer convention.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct PositionwiseFeedForward {
-    pub ln_norm: LayerNormWeights,
-    pub w1_weight: Tensor,
-    pub w1_bias: Tensor,
-    pub w2_weight: Tensor,
-    pub w2_bias: Tensor,
+    pub ln_norm: LayerNorm,
+    #[module(key = "w_1")]
+    pub w1: Linear,
+    #[module(key = "w_2")]
+    pub w2: Linear,
 }
 
 impl PositionwiseFeedForward {
     pub fn empty(in_size: usize, ffn_hidden: usize) -> Self {
-        Self {
-            ln_norm: LayerNormWeights::empty(in_size),
-            w1_weight: fan_in_uniform(&[ffn_hidden, in_size], in_size, DType::Float32),
-            w1_bias: zeros(&[ffn_hidden], DType::Float32),
-            w2_weight: fan_in_uniform(&[in_size, ffn_hidden], ffn_hidden, DType::Float32),
-            w2_bias: zeros(&[in_size], DType::Float32),
-        }
+        Self { ln_norm: layer_norm(in_size), w1: linear(ffn_hidden, in_size), w2: linear(in_size, ffn_hidden) }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let normed = self.ln_norm.apply(x)?;
-        let y = normed.linear().weight(&self.w1_weight).bias(&self.w1_bias).call()?;
-        let y = y.silu()?; // Python `Swish` == SiLU.
-        let y = y.linear().weight(&self.w2_weight).bias(&self.w2_bias).call()?;
-        let half = Tensor::const_(0.5f32, y.dtype());
-        let scaled = y.try_mul(&half)?;
-        Ok(x.try_add(&scaled)?)
-    }
-}
-
-impl HasStateDict for PositionwiseFeedForward {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.ln_norm.state_dict(&prefixed(prefix, "ln_norm"));
-        sd.insert(prefixed(prefix, "w_1.weight"), self.w1_weight.clone());
-        sd.insert(prefixed(prefix, "w_1.bias"), self.w1_bias.clone());
-        sd.insert(prefixed(prefix, "w_2.weight"), self.w2_weight.clone());
-        sd.insert(prefixed(prefix, "w_2.bias"), self.w2_bias.clone());
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.ln_norm.load_state_dict(sd, &prefixed(prefix, "ln_norm"))?;
-        self.w1_weight = get_tensor(sd, &prefixed(prefix, "w_1.weight"))?;
-        self.w1_bias = get_tensor(sd, &prefixed(prefix, "w_1.bias"))?;
-        self.w2_weight = get_tensor(sd, &prefixed(prefix, "w_2.weight"))?;
-        self.w2_bias = get_tensor(sd, &prefixed(prefix, "w_2.bias"))?;
-        Ok(())
+        // Python `Swish` == SiLU.
+        let y = self.w1.forward(&self.ln_norm.forward(x)?)?.silu()?;
+        Ok(x.try_add(&self.w2.forward(&y)?.try_mul(0.5)?)?)
     }
 }
 
@@ -88,93 +74,37 @@ impl HasStateDict for PositionwiseFeedForward {
 // Plain MultiHeadSelfAttention (no rel-pos; use_posi=False)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct PlainMultiHeadSelfAttention {
     pub n_heads: usize,
-    pub d_k: usize,
-    pub n_units: usize,
-    pub linear_q_weight: Tensor,
-    pub linear_q_bias: Tensor,
-    pub linear_k_weight: Tensor,
-    pub linear_k_bias: Tensor,
-    pub linear_v_weight: Tensor,
-    pub linear_v_bias: Tensor,
-    pub linear_o_weight: Tensor,
-    pub linear_o_bias: Tensor,
+    #[module(key = "linearQ")]
+    pub q: Linear,
+    #[module(key = "linearK")]
+    pub k: Linear,
+    #[module(key = "linearV")]
+    pub v: Linear,
+    #[module(key = "linearO")]
+    pub o: Linear,
 }
 
 impl PlainMultiHeadSelfAttention {
     pub fn empty(n_units: usize, n_heads: usize) -> Self {
         assert!(n_units.is_multiple_of(n_heads), "n_units must be divisible by n_heads");
-        let d_k = n_units / n_heads;
         Self {
             n_heads,
-            d_k,
-            n_units,
-            linear_q_weight: fan_in_uniform(&[n_units, n_units], n_units, DType::Float32),
-            linear_q_bias: zeros(&[n_units], DType::Float32),
-            linear_k_weight: fan_in_uniform(&[n_units, n_units], n_units, DType::Float32),
-            linear_k_bias: zeros(&[n_units], DType::Float32),
-            linear_v_weight: fan_in_uniform(&[n_units, n_units], n_units, DType::Float32),
-            linear_v_bias: zeros(&[n_units], DType::Float32),
-            linear_o_weight: fan_in_uniform(&[n_units, n_units], n_units, DType::Float32),
-            linear_o_bias: zeros(&[n_units], DType::Float32),
+            q: linear(n_units, n_units),
+            k: linear(n_units, n_units),
+            v: linear(n_units, n_units),
+            o: linear(n_units, n_units),
         }
     }
 
     /// Forward on `(B, L, n_units)` → `(B, L, n_units)`. Plain scaled-dot-product.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let b = x.dim(0)?;
-        let l = x.dim_const(1)?;
-
-        let project_and_split = |w: &Tensor, bias: &Tensor| -> Result<Tensor> {
-            let y = x.linear().weight(w).bias(bias).call()?;
-            Ok(y.try_reshape(&[b.clone(), l.into(), self.n_heads.into(), self.d_k.into()])?
-                .try_permute(&[0, 2, 1, 3])?)
-        };
-
-        let q = project_and_split(&self.linear_q_weight, &self.linear_q_bias)?; // (B, h, L, d_k)
-        let k = project_and_split(&self.linear_k_weight, &self.linear_k_bias)?;
-        let v = project_and_split(&self.linear_v_weight, &self.linear_v_bias)?;
-
-        let scaling = (self.d_k as f32).powf(-0.5);
-        let scaling_t = Tensor::full(&[1], scaling, DType::Float32);
-        let q_scaled = q.try_mul(&scaling_t)?;
-        let k_t = k.try_transpose(-2, -1)?; // (B, h, d_k, L)
-        let scores = q_scaled.matmul(&k_t)?; // (B, h, L, L)
-        let weights = scores.softmax(-1)?;
-        let attn_out = weights.matmul(&v)?; // (B, h, L, d_k)
-
-        let attn_out = attn_out.try_permute(&[0, 2, 1, 3])?.try_reshape(&[b, l.into(), self.n_units.into()])?;
-
-        Ok(attn_out.linear().weight(&self.linear_o_weight).bias(&self.linear_o_bias).call()?)
-    }
-}
-
-impl HasStateDict for PlainMultiHeadSelfAttention {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        sd.insert(prefixed(prefix, "linearQ.weight"), self.linear_q_weight.clone());
-        sd.insert(prefixed(prefix, "linearQ.bias"), self.linear_q_bias.clone());
-        sd.insert(prefixed(prefix, "linearK.weight"), self.linear_k_weight.clone());
-        sd.insert(prefixed(prefix, "linearK.bias"), self.linear_k_bias.clone());
-        sd.insert(prefixed(prefix, "linearV.weight"), self.linear_v_weight.clone());
-        sd.insert(prefixed(prefix, "linearV.bias"), self.linear_v_bias.clone());
-        sd.insert(prefixed(prefix, "linearO.weight"), self.linear_o_weight.clone());
-        sd.insert(prefixed(prefix, "linearO.bias"), self.linear_o_bias.clone());
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.linear_q_weight = get_tensor(sd, &prefixed(prefix, "linearQ.weight"))?;
-        self.linear_q_bias = get_tensor(sd, &prefixed(prefix, "linearQ.bias"))?;
-        self.linear_k_weight = get_tensor(sd, &prefixed(prefix, "linearK.weight"))?;
-        self.linear_k_bias = get_tensor(sd, &prefixed(prefix, "linearK.bias"))?;
-        self.linear_v_weight = get_tensor(sd, &prefixed(prefix, "linearV.weight"))?;
-        self.linear_v_bias = get_tensor(sd, &prefixed(prefix, "linearV.bias"))?;
-        self.linear_o_weight = get_tensor(sd, &prefixed(prefix, "linearO.weight"))?;
-        self.linear_o_bias = get_tensor(sd, &prefixed(prefix, "linearO.bias"))?;
-        Ok(())
+        let project = |l: &Linear| l.forward(x)?.split_heads(self.n_heads);
+        let (q, k, v) = (project(&self.q)?, project(&self.k)?, project(&self.v)?);
+        let attended = q.scaled_dot_product_attention().key(&k).value(&v).call()?;
+        Ok(self.o.forward(&attended.merge_heads()?)?)
     }
 }
 
@@ -182,35 +112,20 @@ impl HasStateDict for PlainMultiHeadSelfAttention {
 // ConformerMHA — pre-norm wrap + residual + dropout
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct ConformerMHA {
-    pub ln_norm: LayerNormWeights,
+    pub ln_norm: LayerNorm,
     pub mha: PlainMultiHeadSelfAttention,
 }
 
 impl ConformerMHA {
     pub fn empty(in_size: usize, num_head: usize) -> Self {
-        Self { ln_norm: LayerNormWeights::empty(in_size), mha: PlainMultiHeadSelfAttention::empty(in_size, num_head) }
+        Self { ln_norm: layer_norm(in_size), mha: PlainMultiHeadSelfAttention::empty(in_size, num_head) }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let normed = self.ln_norm.apply(x)?;
-        let delta = self.mha.forward(&normed)?;
+        let delta = self.mha.forward(&self.ln_norm.forward(x)?)?;
         Ok(x.try_add(&delta)?)
-    }
-}
-
-impl HasStateDict for ConformerMHA {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.ln_norm.state_dict(&prefixed(prefix, "ln_norm"));
-        sd.extend(self.mha.state_dict(&prefixed(prefix, "mha")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.ln_norm.load_state_dict(sd, &prefixed(prefix, "ln_norm"))?;
-        self.mha.load_state_dict(sd, &prefixed(prefix, "mha"))?;
-        Ok(())
     }
 }
 
@@ -218,111 +133,42 @@ impl HasStateDict for ConformerMHA {
 // ConvolutionModule
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct ConvolutionModule {
-    pub channels: usize,
-    pub kernel_size: usize,
-    pub ln_norm: LayerNormWeights,
+    pub ln_norm: LayerNorm,
     /// `(2C, C, 1)` 1×1 conv to 2× channels (split into GLU halves).
-    pub pointwise1_weight: Tensor,
-    pub pointwise1_bias: Tensor,
-    /// `(C, 1, k)` depthwise conv (groups = channels).
-    pub depthwise_weight: Tensor,
-    pub depthwise_bias: Tensor,
-    pub bn_norm: BatchNormWeights,
-    /// `(C, C, 1)` 1×1 conv back to channel count.
-    pub pointwise2_weight: Tensor,
-    pub pointwise2_bias: Tensor,
+    #[module(key = "pointwise_conv1")]
+    pub pointwise1: Conv1d,
+    /// `(C, 1, k)` depthwise conv (groups = channels) with SAME padding.
+    #[module(key = "depthwise_conv")]
+    pub depthwise: Conv1d,
+    pub bn_norm: BatchNorm2d,
+    /// `(C, C, 1)` 1×1 conv back to the channel count.
+    #[module(key = "pointwise_conv2")]
+    pub pointwise2: Conv1d,
 }
 
 impl ConvolutionModule {
     pub fn empty(channels: usize, kernel_size: usize) -> Self {
         assert!(!kernel_size.is_multiple_of(2), "kernel_size must be odd for SAME padding");
+        let pad = ((kernel_size - 1) / 2) as isize;
         Self {
-            channels,
-            kernel_size,
-            ln_norm: LayerNormWeights::empty(channels),
-            pointwise1_weight: fan_in_uniform(&[2 * channels, channels, 1], channels, DType::Float32),
-            pointwise1_bias: zeros(&[2 * channels], DType::Float32),
-            depthwise_weight: fan_in_uniform(&[channels, 1, kernel_size], kernel_size, DType::Float32),
-            depthwise_bias: zeros(&[channels], DType::Float32),
-            bn_norm: BatchNormWeights::empty(channels),
-            pointwise2_weight: fan_in_uniform(&[channels, channels, 1], channels, DType::Float32),
-            pointwise2_bias: zeros(&[channels], DType::Float32),
+            ln_norm: layer_norm(channels),
+            pointwise1: conv1d(2 * channels, channels, 1),
+            depthwise: conv1d(channels, 1, kernel_size).with_groups(channels).with_padding((pad, pad)),
+            bn_norm: BatchNorm2d::with_dims(channels, EPS, DType::Float32),
+            pointwise2: conv1d(channels, channels, 1),
         }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // x: (B, T, C)
-        let normed = self.ln_norm.apply(x)?;
-        // → (B, C, T)
-        let y = normed.try_permute(&[0, 2, 1])?;
-
-        // Pointwise conv1: (B, C, T) → (B, 2C, T)
-        let y = y
-            .conv2d()
-            .weight(&self.pointwise1_weight)
-            .bias(&self.pointwise1_bias)
-            .stride(&[1])
-            .padding(&[(0, 0)])
-            .call()?;
-
-        // GLU over channel dim (dim 1).
-        let y = y.glu(1)?; // (B, C, T)
-
-        // Depthwise conv with groups=channels and SAME padding.
-        let p = ((self.kernel_size - 1) / 2) as isize;
-        let y = y
-            .conv2d()
-            .weight(&self.depthwise_weight)
-            .bias(&self.depthwise_bias)
-            .groups(self.channels)
-            .stride(&[1])
-            .padding(&[(p, p)])
-            .call()?;
-
-        // BN over channel axis (axis 1 default works for NCT).
-        let y = self.bn_norm.forward(&y)?;
-        let y = y.silu()?;
-
-        // Pointwise conv2: (B, C, T) → (B, C, T)
-        let y = y
-            .conv2d()
-            .weight(&self.pointwise2_weight)
-            .bias(&self.pointwise2_bias)
-            .stride(&[1])
-            .padding(&[(0, 0)])
-            .call()?;
-
+        // (B, T, C) → (B, C, T), pointwise expand, GLU over the channel dim.
+        let y = self.ln_norm.forward(x)?.try_permute(&[0, 2, 1])?;
+        let y = self.pointwise1.forward(&y)?.glu(1)?;
+        // Depthwise + BN over the channel axis (axis 1, the NCT default) + Swish.
+        let y = self.bn_norm.forward(&self.depthwise.forward(&y)?)?.silu()?;
         // Back to (B, T, C) and residual.
-        let y = y.try_permute(&[0, 2, 1])?;
-        Ok(x.try_add(&y)?)
-    }
-}
-
-impl HasStateDict for ConvolutionModule {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.ln_norm.state_dict(&prefixed(prefix, "ln_norm"));
-        sd.insert(prefixed(prefix, "pointwise_conv1.weight"), self.pointwise1_weight.clone());
-        sd.insert(prefixed(prefix, "pointwise_conv1.bias"), self.pointwise1_bias.clone());
-        sd.insert(prefixed(prefix, "depthwise_conv.weight"), self.depthwise_weight.clone());
-        sd.insert(prefixed(prefix, "depthwise_conv.bias"), self.depthwise_bias.clone());
-        sd.extend(self.bn_norm.state_dict(&prefixed(prefix, "bn_norm")));
-        sd.insert(prefixed(prefix, "pointwise_conv2.weight"), self.pointwise2_weight.clone());
-        sd.insert(prefixed(prefix, "pointwise_conv2.bias"), self.pointwise2_bias.clone());
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.ln_norm.load_state_dict(sd, &prefixed(prefix, "ln_norm"))?;
-        self.pointwise1_weight = get_tensor(sd, &prefixed(prefix, "pointwise_conv1.weight"))?;
-        self.pointwise1_bias = get_tensor(sd, &prefixed(prefix, "pointwise_conv1.bias"))?;
-        self.depthwise_weight = get_tensor(sd, &prefixed(prefix, "depthwise_conv.weight"))?;
-        self.depthwise_bias = get_tensor(sd, &prefixed(prefix, "depthwise_conv.bias"))?;
-        self.bn_norm.load_state_dict(sd, &prefixed(prefix, "bn_norm"))?;
-        self.pointwise2_weight = get_tensor(sd, &prefixed(prefix, "pointwise_conv2.weight"))?;
-        self.pointwise2_bias = get_tensor(sd, &prefixed(prefix, "pointwise_conv2.bias"))?;
-        Ok(())
+        Ok(x.try_add(&self.pointwise2.forward(&y)?.try_permute(&[0, 2, 1])?)?)
     }
 }
 
@@ -330,13 +176,13 @@ impl HasStateDict for ConvolutionModule {
 // ConformerBlock and ConformerEncoder
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct ConformerBlock {
     pub ffn1: PositionwiseFeedForward,
     pub mha: ConformerMHA,
     pub conv: ConvolutionModule,
     pub ffn2: PositionwiseFeedForward,
-    pub ln_norm: LayerNormWeights,
+    pub ln_norm: LayerNorm,
 }
 
 impl ConformerBlock {
@@ -346,7 +192,7 @@ impl ConformerBlock {
             mha: ConformerMHA::empty(in_size, num_head),
             conv: ConvolutionModule::empty(in_size, kernel_size),
             ffn2: PositionwiseFeedForward::empty(in_size, ffn_hidden),
-            ln_norm: LayerNormWeights::empty(in_size),
+            ln_norm: layer_norm(in_size),
         }
     }
 
@@ -355,32 +201,13 @@ impl ConformerBlock {
         let x = self.mha.forward(&x)?;
         let x = self.conv.forward(&x)?;
         let x = self.ffn2.forward(&x)?;
-        Ok(self.ln_norm.apply(&x)?)
+        Ok(self.ln_norm.forward(&x)?)
     }
 }
 
-impl HasStateDict for ConformerBlock {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.ffn1.state_dict(&prefixed(prefix, "ffn1"));
-        sd.extend(self.mha.state_dict(&prefixed(prefix, "mha")));
-        sd.extend(self.conv.state_dict(&prefixed(prefix, "conv")));
-        sd.extend(self.ffn2.state_dict(&prefixed(prefix, "ffn2")));
-        sd.extend(self.ln_norm.state_dict(&prefixed(prefix, "ln_norm")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.ffn1.load_state_dict(sd, &prefixed(prefix, "ffn1"))?;
-        self.mha.load_state_dict(sd, &prefixed(prefix, "mha"))?;
-        self.conv.load_state_dict(sd, &prefixed(prefix, "conv"))?;
-        self.ffn2.load_state_dict(sd, &prefixed(prefix, "ffn2"))?;
-        self.ln_norm.load_state_dict(sd, &prefixed(prefix, "ln_norm"))?;
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct ConformerEncoder {
+    #[module(key = "conformer_layer")]
     pub layers: Vec<ConformerBlock>,
 }
 
@@ -400,11 +227,7 @@ impl ConformerEncoder {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let mut x = x.clone();
-        for layer in &self.layers {
-            x = layer.forward(&x)?;
-        }
-        Ok(x)
+        self.layers.iter().try_fold(x.clone(), |x, layer| layer.forward(&x))
     }
 
     /// Same as [`forward`](Self::forward) but also returns each block's
@@ -417,22 +240,5 @@ impl ConformerEncoder {
             outputs.push(x.clone());
         }
         Ok((x, outputs))
-    }
-}
-
-impl HasStateDict for ConformerEncoder {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        for (i, layer) in self.layers.iter().enumerate() {
-            sd.extend(layer.state_dict(&format!("{prefix}.conformer_layer.{i}")));
-        }
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            layer.load_state_dict(sd, &format!("{prefix}.conformer_layer.{i}"))?;
-        }
-        Ok(())
     }
 }

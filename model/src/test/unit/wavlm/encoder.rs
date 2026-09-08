@@ -1,7 +1,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::Module;
 
-use crate::state::HasStateDict;
 use crate::wavlm::{Encoder, EncoderLayer, WavLm, WavLmConfig, wavlm_large_s80_md};
 
 // ---------------------------------------------------------------------------

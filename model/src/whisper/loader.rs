@@ -6,7 +6,9 @@
 
 use std::path::Path;
 
-use crate::state::{self, HasStateDict, StateDict};
+use svod_tensor::nn::Module;
+
+use crate::state::{self, StateDict};
 
 use super::config::{ModelDimensions, WhisperSize};
 use super::error::{Error, Result};
@@ -51,7 +53,7 @@ impl Whisper {
             }
         }
         let mut model = Self::empty(dims);
-        model.load_state_dict(&sd, "").map_err(|e| Error::State { source: e })?;
+        model.load_state_dict(&sd, "")?;
         Ok(model)
     }
 

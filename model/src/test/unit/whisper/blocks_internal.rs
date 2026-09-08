@@ -1,14 +1,14 @@
 //! Whisper block internals: FP16 LayerNorm and Linear must keep their affine
 //! and bias epilogues in FP32 and round only once, at the final cast.
 
-use crate::whisper::blocks::{LayerNormWeights, linear_with_bias};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::{Layer, LayerNorm, Linear};
+
+use crate::whisper::blocks::linear_forward;
 
 fn realized_f32(tensor: Tensor) -> Vec<f32> {
-    let tensor = tensor.cast(DType::Float32);
-    tensor.realize().unwrap();
-    tensor.as_vec::<f32>().unwrap()
+    tensor.cast(DType::Float32).to_vec::<f32>().unwrap()
 }
 
 fn fp16(values: &[f32], shape: &[usize]) -> Tensor {
@@ -26,24 +26,22 @@ fn assert_rounds_once(actual: Tensor, reference: Tensor, legacy: Tensor, epilogu
 #[test]
 fn fp16_layernorm_keeps_affine_in_fp32_until_final_cast() {
     let x = fp16(&[0.1013, -0.2037, 0.3071, 1.913], &[1, 4]);
-    let layer = LayerNormWeights {
-        weight: fp16(&[17.25, -31.5, 47.75, -63.0], &[4]),
-        bias: fp16(&[0.03125, -0.0625, 0.09375, -0.125], &[4]),
-        eps: 1e-5,
-    };
+    let weight = fp16(&[17.25, -31.5, 47.75, -63.0], &[4]);
+    let bias = fp16(&[0.03125, -0.0625, 0.09375, -0.125], &[4]);
+    let layer = LayerNorm::new(weight.clone(), Some(bias.clone()), 1e-5);
     let f32_of = |t: &Tensor| t.cast(DType::Float32);
 
     let reference = f32_of(&x)
         .layernorm(-1, layer.eps)
         .unwrap()
-        .try_mul(f32_of(&layer.weight))
+        .try_mul(f32_of(&weight))
         .unwrap()
-        .try_add(f32_of(&layer.bias))
+        .try_add(f32_of(&bias))
         .unwrap()
         .cast(DType::Float16);
-    let legacy = x.layernorm(-1, layer.eps).unwrap().try_mul(&layer.weight).unwrap().try_add(&layer.bias).unwrap();
+    let legacy = x.layernorm(-1, layer.eps).unwrap().try_mul(&weight).unwrap().try_add(&bias).unwrap();
 
-    assert_rounds_once(layer.apply(&x).unwrap(), reference, legacy, "affine epilogue");
+    assert_rounds_once(layer.forward(&x).unwrap(), reference, legacy, "affine epilogue");
 }
 
 #[test]
@@ -63,5 +61,17 @@ fn fp16_linear_keeps_bias_epilogue_in_fp32_until_final_cast() {
         .cast(DType::Float16);
     let legacy = x.linear().weight(&weight).bias(&bias).call().unwrap();
 
-    assert_rounds_once(linear_with_bias(&x, &weight, &bias).unwrap(), reference, legacy, "bias addition");
+    let layer = Linear::new(weight, Some(bias));
+    assert_rounds_once(linear_forward(&layer, &x).unwrap(), reference, legacy, "bias addition");
+}
+
+/// The bias-less projection (Whisper's key) must stay on the plain path.
+#[test]
+fn biasless_linear_matches_the_plain_projection() {
+    let x = fp16(&[0.3333, -0.1428, 0.0909, 0.0769], &[1, 4]);
+    let weight = fp16(&[3.0, -5.0, 7.0, -11.0, -2.0, 4.0, -6.0, 8.0], &[2, 4]);
+    let layer = Linear::new(weight.clone(), None);
+
+    let expected = realized_f32(x.linear().weight(&weight).call().unwrap());
+    assert_eq!(realized_f32(linear_forward(&layer, &x).unwrap()), expected);
 }

@@ -1,9 +1,9 @@
 use svod_dtype::DType;
+use svod_tensor::nn::Module;
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
 use crate::resnet::{OutputMode, ResNet, ResNetConfig, ResNetDepth};
-use crate::state::HasStateDict;
 
 #[test]
 fn feature_channels_matches_depth_expansion() {
@@ -30,13 +30,13 @@ fn state_dict_round_trip_r18_classification() {
         "bn1.weight",
         "bn1.bias",
         "bn1.running_mean",
-        "bn1.invstd",
+        "bn1.running_var",
         "layer1.0.conv1.weight",
         "layer1.0.bn1.weight",
         "layer1.1.conv2.weight",
         "layer2.0.conv1.weight",
         "layer2.0.downsample.0.weight",
-        "layer2.0.downsample.1.invstd",
+        "layer2.0.downsample.1.running_var",
         "layer3.0.downsample.0.weight",
         "layer4.0.downsample.0.weight",
         "layer4.1.bn2.running_mean",
@@ -55,6 +55,20 @@ fn state_dict_round_trip_r18_classification() {
     empty.load_state_dict(&sd, "").expect("load round-trip");
 }
 
+/// A prefix must only prepend: `state_dict("m")` is `state_dict("")` with
+/// `m.` in front of every key, never a segment more or less.
+#[test]
+fn prefixed_state_dict_only_prepends() {
+    let cfg = ResNetConfig::new(ResNetDepth::R18, OutputMode::Classification { num_classes: 10 });
+    let model = ResNet::with_zero_weights(cfg);
+
+    let mut bare: Vec<String> = model.state_dict("").into_keys().map(|k| format!("m.{k}")).collect();
+    let mut nested: Vec<String> = model.state_dict("m").into_keys().collect();
+    bare.sort();
+    nested.sort();
+    assert_eq!(bare, nested);
+}
+
 /// State-dict round-trip on a Bottleneck-stack R50 in Features mode. Asserts
 /// the Bottleneck-specific `conv3`/`bn3` keys are present and the `fc.*` keys
 /// are absent (no head in Features mode).
@@ -70,7 +84,7 @@ fn state_dict_round_trip_r50_features() {
         "bn1.weight",
         "layer1.0.conv1.weight",
         "layer1.0.conv3.weight",
-        "layer1.0.bn3.invstd",
+        "layer1.0.bn3.running_var",
         "layer1.0.downsample.0.weight", // R50 stage1 downsamples (channel expansion).
         "layer2.0.downsample.0.weight",
         "layer4.2.conv3.weight",

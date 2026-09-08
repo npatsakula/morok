@@ -12,14 +12,16 @@
 //! 4. Score: `logits[:, yes_loc]` → `(B,)`
 //! 5. Optional sigmoid → `(B,)` normalized scores
 //!
-//! The checkpoint (`model.safetensors`) uses `model.` prefix on backbone keys
-//! (standard `Qwen3ForCausalLM` convention). The loader strips this prefix.
+//! The checkpoint (`model.safetensors`) uses the `model.` prefix on backbone
+//! keys (standard `Qwen3ForCausalLM` convention), which is exactly the prefix
+//! this module nests the backbone under — so the published dict loads as is.
 
 use std::path::Path;
 
-use svod_tensor::{BoundVariable, Tensor, s};
+use svod_tensor::nn::{Module, StateDict, get_tensor, prefixed};
+use svod_tensor::{BoundVariable, Tensor};
 
-use crate::state::{self, HasStateDict, StateDict};
+use crate::state;
 
 use super::config::Qwen3Config;
 use super::error::Result;
@@ -61,17 +63,13 @@ impl Qwen3Reranker {
     }
 
     fn score(&self, hidden: &Tensor) -> Result<Tensor> {
-        let l = hidden.dim_const(1)?;
-
         // Last-token hidden state: (B, D) — slice BEFORE the LM head to avoid
         // computing logits for all L positions when we only need one.
-        let last_hidden = hidden.getitem(s![.., (l - 1) as i64, ..])?;
+        let last_hidden = hidden.take_index(1, -1)?;
 
-        // LM head: (B, D) @ (D, V) → (B, V)
+        // LM head: (B, D) @ (D, V) → (B, V), then the "Yes" logit → (B,).
         let logits = last_hidden.linear().weight(&self.lm_head_weight).call()?;
-
-        // Extract the "Yes" logit: (B,)
-        let scores = logits.getitem(s![.., self.yes_loc as i64])?;
+        let scores = logits.take_index(-1, self.yes_loc as isize)?;
 
         if self.normalize { Ok(scores.sigmoid()?) } else { Ok(scores) }
     }
@@ -103,35 +101,24 @@ impl Qwen3Reranker {
 
     pub fn from_state_dict(sd: &StateDict, config: Qwen3Config) -> Result<Self> {
         let dtype = config.dtype.clone();
-        let stripped = strip_model_prefix(sd);
         let mut model = Self::empty(config);
-        model.load_state_dict(&state::cast_all(&stripped, dtype), "")?;
+        model.load_state_dict(&state::cast_all(sd, dtype), "")?;
         Ok(model)
     }
 }
 
-impl HasStateDict for Qwen3Reranker {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        self.model.state_dict(prefix)
+/// The backbone nests under `model.` (the `Qwen3ForCausalLM` layout) and the
+/// LM head is tied to `embed_tokens.weight`, so it is resolved on load rather
+/// than stored — hand-written for the tie; every child derives.
+impl Module for Qwen3Reranker {
+    fn write_state(&self, prefix: &str, out: &mut StateDict) {
+        self.model.write_state(&prefixed(prefix, "model"), out);
     }
 
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.model.load_state_dict(sd, prefix)?;
-        // Tie LM head to embed_tokens.weight.
-        let embed_key =
-            if prefix.is_empty() { "embed_tokens.weight".to_string() } else { format!("{prefix}.embed_tokens.weight") };
-        self.lm_head_weight =
-            sd.get(&embed_key).cloned().ok_or_else(|| state::Error::MissingKey { key: embed_key.clone() })?;
+    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> svod_tensor::error::Result<()> {
+        let backbone = prefixed(prefix, "model");
+        self.model.load_state_dict(sd, &backbone)?;
+        self.lm_head_weight = get_tensor(sd, &prefixed(&backbone, "embed_tokens.weight"))?;
         Ok(())
     }
-}
-
-/// Strip the `model.` prefix from checkpoint keys (standard CausalLM convention).
-fn strip_model_prefix(sd: &StateDict) -> StateDict {
-    sd.iter()
-        .map(|(k, v)| {
-            let stripped = k.strip_prefix("model.").unwrap_or(k);
-            (stripped.to_string(), v.clone())
-        })
-        .collect()
 }

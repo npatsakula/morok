@@ -4,9 +4,9 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
+use svod_tensor::nn::Module;
+
 use crate::init::fan_in_uniform;
-use crate::state::{self, HasStateDict, StateDict};
-use crate::{load_state_field, state_field};
 
 use crate::gigaam::Result;
 
@@ -15,7 +15,7 @@ use crate::gigaam::Result;
 /// All Linear weights stored PyTorch-style `[out_features, in_features]` so
 /// they plug straight into the `linear()` builder (which transposes
 /// internally).
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct RnntJoint {
     pub enc_w: Tensor,
     pub enc_b: Tensor,
@@ -74,18 +74,5 @@ impl RnntJoint {
         let activated = enc_proj_t.try_add(&pred_proj)?.relu()?;
         let logits = activated.linear().weight(&self.out_w).bias(&self.out_b).call()?;
         Ok(logits.argmax(-1isize)?)
-    }
-}
-
-impl HasStateDict for RnntJoint {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        state_field!(sd, prefix, self, [enc_w, enc_b, pred_w, pred_b, out_w, out_b]);
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        load_state_field!(self, sd, prefix, [enc_w, enc_b, pred_w, pred_b, out_w, out_b]);
-        Ok(())
     }
 }

@@ -22,7 +22,7 @@ use svod_tensor::Tensor;
 use zip::ZipArchive;
 use zip::result::ZipError;
 
-use crate::state::StateDict;
+use svod_tensor::nn::StateDict;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]

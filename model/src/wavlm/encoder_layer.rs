@@ -30,26 +30,23 @@
 //! `attention` and `feed_forward` sub-modules are optional.
 
 use svod_tensor::Tensor;
-
-use crate::state::{self, HasStateDict, StateDict};
+use svod_tensor::nn::{Layer, LayerNorm, Module};
 
 use super::attention::GatedRelPosAttention;
 use super::config::WavLmConfig;
 use super::error::Result;
+use super::feed_forward::FeedForward;
+use super::layer_norm;
 
-use super::feed_forward::FeedForwardWeights;
-use super::layer_norm::LayerNormWeights;
-
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct EncoderLayer {
-    pub embed_dim: usize,
     /// Runtime `layer_norm_first` flag — the *inverted* config value.
     /// `true` = pre-norm, `false` = post-norm.
     pub layer_norm_first: bool,
-    pub layer_norm: LayerNormWeights,
+    pub layer_norm: LayerNorm,
     pub attention: Option<GatedRelPosAttention>,
-    pub final_layer_norm: LayerNormWeights,
-    pub feed_forward: Option<FeedForwardWeights>,
+    pub final_layer_norm: LayerNorm,
+    pub feed_forward: Option<FeedForward>,
 }
 
 impl EncoderLayer {
@@ -57,16 +54,13 @@ impl EncoderLayer {
         let embed_dim = config.encoder_embed_dim;
         let use_attn =
             config.encoder_use_attention[layer_index] && !config.encoder_remaining_heads[layer_index].is_empty();
-        let attention = use_attn.then(|| GatedRelPosAttention::empty(config, layer_index));
-        let feed_forward = config.encoder_use_feed_forward[layer_index]
-            .then(|| FeedForwardWeights::empty(embed_dim, config.encoder_ff_interm_features[layer_index]));
         Self {
-            embed_dim,
             layer_norm_first: config.encoder_layer_norm_first,
-            layer_norm: LayerNormWeights::empty(embed_dim),
-            attention,
-            final_layer_norm: LayerNormWeights::empty(embed_dim),
-            feed_forward,
+            layer_norm: layer_norm(embed_dim),
+            attention: use_attn.then(|| GatedRelPosAttention::empty(config, layer_index)),
+            final_layer_norm: layer_norm(embed_dim),
+            feed_forward: config.encoder_use_feed_forward[layer_index]
+                .then(|| FeedForward::empty(embed_dim, config.encoder_ff_interm_features[layer_index])),
         }
     }
 
@@ -78,18 +72,19 @@ impl EncoderLayer {
         }
     }
 
+    fn attend(&self, x: &Tensor, position_bias: Option<&Tensor>) -> Result<Tensor> {
+        let attn = self.attention.as_ref().expect("caller checked `attention.is_some()`");
+        attn.forward(x, position_bias.expect("attention layer requires position_bias"))
+    }
+
     fn forward_pre_norm(&self, x: &Tensor, position_bias: Option<&Tensor>) -> Result<Tensor> {
         let mut x = x.clone();
-        if let Some(attn) = &self.attention {
-            let residual = x.clone();
-            let normed = self.layer_norm.apply(&x)?;
-            let bias = position_bias.expect("attention layer requires position_bias");
-            let delta = attn.forward(&normed, bias)?;
-            x = residual.try_add(&delta)?;
+        if self.attention.is_some() {
+            let delta = self.attend(&self.layer_norm.forward(&x)?, position_bias)?;
+            x = x.try_add(&delta)?;
         }
         if let Some(ff) = &self.feed_forward {
-            let normed = self.final_layer_norm.apply(&x)?;
-            let delta = ff.forward(&normed)?;
+            let delta = ff.forward(&self.final_layer_norm.forward(&x)?)?;
             x = x.try_add(&delta)?;
         }
         Ok(x)
@@ -97,45 +92,15 @@ impl EncoderLayer {
 
     fn forward_post_norm(&self, x: &Tensor, position_bias: Option<&Tensor>) -> Result<Tensor> {
         let mut x = x.clone();
-        if let Some(attn) = &self.attention {
-            let residual = x.clone();
-            let bias = position_bias.expect("attention layer requires position_bias");
-            let delta = attn.forward(&x, bias)?;
-            x = residual.try_add(&delta)?;
+        if self.attention.is_some() {
+            let delta = self.attend(&x, position_bias)?;
+            x = x.try_add(&delta)?;
         }
-        x = self.layer_norm.apply(&x)?;
+        x = self.layer_norm.forward(&x)?;
         if let Some(ff) = &self.feed_forward {
-            let residual = x.clone();
             let delta = ff.forward(&x)?;
-            x = residual.try_add(&delta)?;
+            x = x.try_add(&delta)?;
         }
-        x = self.final_layer_norm.apply(&x)?;
-        Ok(x)
-    }
-}
-
-impl HasStateDict for EncoderLayer {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.layer_norm.state_dict(&format!("{prefix}.layer_norm"));
-        if let Some(attn) = &self.attention {
-            sd.extend(attn.state_dict(&format!("{prefix}.attention")));
-        }
-        sd.extend(self.final_layer_norm.state_dict(&format!("{prefix}.final_layer_norm")));
-        if let Some(ff) = &self.feed_forward {
-            sd.extend(ff.state_dict(&format!("{prefix}.feed_forward")));
-        }
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.layer_norm.load_state_dict(sd, &format!("{prefix}.layer_norm"))?;
-        if let Some(attn) = self.attention.as_mut() {
-            attn.load_state_dict(sd, &format!("{prefix}.attention"))?;
-        }
-        self.final_layer_norm.load_state_dict(sd, &format!("{prefix}.final_layer_norm"))?;
-        if let Some(ff) = self.feed_forward.as_mut() {
-            ff.load_state_dict(sd, &format!("{prefix}.feed_forward"))?;
-        }
-        Ok(())
+        Ok(self.final_layer_norm.forward(&x)?)
     }
 }

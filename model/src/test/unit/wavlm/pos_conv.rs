@@ -1,8 +1,8 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
-use crate::state::{HasStateDict, StateDict};
 use crate::wavlm::ConvolutionalPositionalEmbedding;
+use svod_tensor::nn::{Module, StateDict};
 
 /// `(1, T, 1024) → (1, T, 1024)` after the trim-1 + GELU + add path. We only
 /// check shape preservation here; numerical parity is the parity-test's job.
@@ -29,11 +29,11 @@ fn pos_conv_weight_norm_reconstruction() {
 
     let pe_init = ConvolutionalPositionalEmbedding::empty(embed_dim, kernel, groups);
     // Use the initialized weight as a stand-in `v`; build `g` as all-ones.
-    let v = pe_init.weight.clone();
+    let v = pe_init.conv.weight.clone();
     let _ = v.shape().unwrap(); // ensure shape is usable downstream
 
     let g = Tensor::ones(&[1, 1, kernel], DType::Float32);
-    let bias = pe_init.bias.clone();
+    let bias = pe_init.conv.bias.clone().expect("pos-conv has a bias");
 
     let mut sd = StateDict::new();
     sd.insert("pe.conv.parametrizations.weight.original0".into(), g.clone());
@@ -44,7 +44,7 @@ fn pos_conv_weight_norm_reconstruction() {
     pe.load_state_dict(&sd, "pe").expect("load weight-norm pair");
 
     // Realize both sides and compare.
-    let got = pe.weight.clone();
+    let got = pe.conv.weight.clone();
     got.realize().unwrap();
     let got_vec: Vec<f32> = got.as_vec::<f32>().unwrap();
     let got_shape = got.dims().unwrap();
@@ -89,8 +89,8 @@ fn pos_conv_weight_norm_reconstruction() {
 #[test]
 fn pos_conv_flat_weight_load() {
     let pe_init = ConvolutionalPositionalEmbedding::empty(16, 8, 4);
-    let w = pe_init.weight.clone();
-    let b = pe_init.bias.clone();
+    let w = pe_init.conv.weight.clone();
+    let b = pe_init.conv.bias.clone().expect("pos-conv has a bias");
 
     let mut sd = StateDict::new();
     sd.insert("pe.conv.weight".into(), w);

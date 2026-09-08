@@ -32,8 +32,7 @@ fn resolve_file(name: &str) -> PathBuf {
 
 fn load_golden_vec<T: Clone + Default + svod_dtype::ext::HasDType>(sd: &StateDict, key: &str) -> Vec<T> {
     let t = sd.get(key).unwrap_or_else(|| panic!("missing golden key: {key}")).clone();
-    t.realize().unwrap();
-    t.as_vec::<T>().unwrap()
+    t.to_vec::<T>().unwrap()
 }
 
 fn max_abs_delta(got: &[f32], want: &[f32]) -> f32 {
@@ -70,9 +69,7 @@ fn encoder_output_matches_pytorch() {
 
     let want: Vec<f32> = load_golden_vec(&golden, "encoder_output");
 
-    let out = model.encode(&mel).expect("encoder forward");
-    out.realize().expect("realize output");
-    let got = out.as_vec::<f32>().expect("output readout");
+    let got = model.encode(&mel).expect("encoder forward").to_vec::<f32>().expect("output readout");
 
     assert_eq!(got.len(), want.len(), "encoder output length mismatch");
     let delta = max_abs_delta(&got, &want);
@@ -117,9 +114,8 @@ fn decoder_logits_match_pytorch() {
 
     let want: Vec<f32> = load_golden_vec(&golden, "logits");
 
-    let out = model.decode(&tokens, &audio_features, 0).expect("decoder forward");
-    out.realize().expect("realize logits");
-    let got = out.as_vec::<f32>().expect("logits readout");
+    let got =
+        model.decode(&tokens, &audio_features, 0).expect("decoder forward").to_vec::<f32>().expect("logits readout");
 
     assert_eq!(got.len(), want.len(), "logits length mismatch");
     let delta = max_abs_delta(&got, &want);
