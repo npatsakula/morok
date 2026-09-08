@@ -530,25 +530,28 @@ pub fn shape_to_uop(shape: &Shape) -> Arc<UOp> {
     UOp::stack(shape.iter().map(|dim| dim.to_uop(lane_dtype.clone())).collect())
 }
 
-/// Convert a vector of (begin, end) ranges to two UOps for Pad/Shrink operations.
+/// Transpose per-axis pairs into the two shape-argument UOps PAD and SHRINK
+/// carry, using the scalar/STACK encoding.
 ///
-/// Returns shape arguments using the scalar/STACK encoding.
+/// The pair means what the operation means: `(begin_pad, end_pad)` for PAD,
+/// `(offset, size)` for SHRINK (tinygrad `ops.py` `marg`: "SHRINK marg is
+/// (start, length)").
 ///
 /// # Panics
-/// Panics if `ranges` is empty; handle scalars at the callsite.
-pub fn ranges_to_uops(ranges: &[(SInt, SInt)]) -> (Arc<UOp>, Arc<UOp>) {
+/// Panics if `pairs` is empty; handle scalars at the callsite.
+pub fn ranges_to_uops(pairs: &[(SInt, SInt)]) -> (Arc<UOp>, Arc<UOp>) {
     use smallvec::SmallVec;
     use svod_dtype::DType;
 
-    assert!(!ranges.is_empty(), "ranges_to_uops does not support empty ranges (scalars); handle at callsite");
+    assert!(!pairs.is_empty(), "ranges_to_uops does not support empty ranges (scalars); handle at callsite");
 
-    let begins: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(begin, _)| begin.to_uop(DType::WeakInt)).collect();
-    let ends: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(_, end)| end.to_uop(DType::WeakInt)).collect();
+    let firsts: SmallVec<[Arc<UOp>; 4]> = pairs.iter().map(|(first, _)| first.to_uop(DType::WeakInt)).collect();
+    let seconds: SmallVec<[Arc<UOp>; 4]> = pairs.iter().map(|(_, second)| second.to_uop(DType::WeakInt)).collect();
 
     let encode = |values: SmallVec<[Arc<UOp>; 4]>| {
         if values.len() == 1 { values[0].clone() } else { UOp::stack(values) }
     };
-    (encode(begins), encode(ends))
+    (encode(firsts), encode(seconds))
 }
 
 // =========================================================================

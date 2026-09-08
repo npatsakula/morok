@@ -767,16 +767,22 @@ impl ExecutionPlan {
         // (below). Non-graphable plans (runtime vars, no graph factory, chains the
         // backend declines to capture, mixed devices) fall back to per-call via
         // the `Ok(None)` returns below.
-        let all_static_kernels = self.ops.iter().all(
-            |op| matches!(op, PreparedOp::CompiledProgram(k) if k.runtime_vars.is_empty() && k.device == self.device),
-        );
+        // "Static" means the dispatch arguments never change between executes.
+        // A variable pinned in `fixedvars` qualifies: `update_runtime_var_vals`
+        // refuses to overwrite it, so a schedule-loop counter bound to one slot
+        // is as constant as a literal — and without this a scan plan would pay
+        // per-kernel dispatch for every time step.
+        let all_static_kernels = self.ops.iter().all(|op| {
+            matches!(op, PreparedOp::CompiledProgram(k)
+                if k.device == self.device && k.runtime_vars.iter().all(|var| k.fixedvars.contains_key(&var.name)))
+        });
         if !all_static_kernels || self.ops.is_empty() {
             tracing::debug!(
                 target: "svod_runtime::graph",
                 ops = self.ops.len(),
                 compiled = self.ops.iter().filter(|o| matches!(o, PreparedOp::CompiledProgram(_))).count(),
-                with_runtime_vars =
-                    self.ops.iter().filter(|o| matches!(o, PreparedOp::CompiledProgram(k) if !k.runtime_vars.is_empty())).count(),
+                with_runtime_vars = self.ops.iter().filter(|o| matches!(o, PreparedOp::CompiledProgram(k)
+                    if k.runtime_vars.iter().any(|var| !k.fixedvars.contains_key(&var.name)))).count(),
                 custom = self.ops.iter().filter(|o| matches!(o, PreparedOp::CustomFunction(_))).count(),
                 copies = self.ops.iter().filter(|o| matches!(o, PreparedOp::BufferCopy(_))).count(),
                 "graph: per-call fallback (not all-static-compiled)"

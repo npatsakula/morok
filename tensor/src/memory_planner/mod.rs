@@ -350,15 +350,23 @@ fn exclusion_reason(
 /// Sharing one implementation guarantees these levels equal the runtime's
 /// per-op levels (so level-interval reuse decisions match real execution
 /// order), provided op emission stays 1:1 with schedule items — enforced by the
-/// the `op_count` assert in `prepare_execution_plan`.
+/// the `op_count` assert in `prepare_execution_plan`. `ScheduleItem::instance_dependencies`
+/// is fed in for the same reason it is fed to the executor.
 pub fn compute_item_levels(schedule: &Schedule) -> crate::Result<Vec<usize>> {
     let node_ids: Vec<u64> = schedule.iter().map(|it| it.kernel.id).collect();
     let callable_deps: Vec<Vec<u64>> = schedule.iter().map(|it| it.dependencies.clone()).collect();
 
-    // The planner injects zero ordering edges (level-interval reuse), so there
-    // are no index deps. Flatten the wave structure to a per-item scalar level.
-    let waves = svod_runtime::compute_topological_levels(&node_ids, &callable_deps, None)
-        .context(crate::error::ExecutionSnafu)?;
+    // Positional edges must be honoured exactly as the runtime honours them:
+    // a schedule loop replays one kernel id many times, so `callable_deps`
+    // alone collapses every iteration into one wave and the planner would
+    // retire a buffer the last iteration still reads.
+    let index_deps: Vec<Vec<usize>> = schedule.iter().map(|it| it.instance_dependencies.clone()).collect();
+    let waves = svod_runtime::compute_topological_levels(
+        &node_ids,
+        &callable_deps,
+        (!index_deps.is_empty()).then_some(index_deps.as_slice()),
+    )
+    .context(crate::error::ExecutionSnafu)?;
     let mut level_of = vec![0usize; schedule.len()];
     for (level_idx, wave) in waves.iter().enumerate() {
         for &node_idx in wave {

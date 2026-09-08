@@ -672,6 +672,7 @@ fn schedule_result_from_sink_with_cache(
                 svod_schedule::rangeify_with_map(normalization.normalized.clone()).context(RangeifySnafu)?;
             let (kernel_graph, _) =
                 svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(KernelGraphSnafu)?;
+            let kernel_graph = crate::scan::wrap_scan_loops(kernel_graph);
             let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph)?;
             let new_entry = Arc::new(crate::schedule_cache::CachedSchedule { pre_schedule: Arc::new(pre_schedule) });
             let guard = cache.guard();
@@ -701,6 +702,7 @@ fn schedule_result_from_sink_uncached(
     merge_var_vals_checked(&mut var_vals, &normalization.var_vals, "uncached schedule normalization")?;
     let rangeify_result = svod_schedule::rangeify_with_map(normalization.normalized.clone()).context(RangeifySnafu)?;
     let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(KernelGraphSnafu)?;
+    let kernel_graph = crate::scan::wrap_scan_loops(kernel_graph);
     let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph)?;
     let restored_pre_schedule = restore_post_schedule_pre_schedule(&pre_schedule, &normalization);
     let input_buffers = build_schedule_input_buffers(&restored_pre_schedule);

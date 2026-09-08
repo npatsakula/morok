@@ -652,28 +652,106 @@ fn count_kernels(t: &Tensor) -> (usize, usize) {
     (bodies.len(), distinct.len())
 }
 
-/// Host-unrolling a `T`-step GRU costs `1 + 2*T` kernels: one hoisted input
-/// projection over the whole sequence, then two per step (the `r`/`z` matmul
-/// and the `n` matmul, each fused with its elementwise tail).
-///
-/// The bodies are *not* deduped: every step's input slice carries a distinct
-/// constant time offset, so the `(ast_id, device)` kernel cache sees `2*T`
-/// different ASTs. Sharing one compiled step needs the schedule-level
-/// `END(CALL, [RANGE])` loop from the recurrence spike, which is out of scope
-/// for this phase. Pinned so a regression that stops hoisting the projection
-/// (or that starts emitting a third matmul per step) is visible.
-#[test]
-fn t8_gru_kernel_count() {
-    let x = Tensor::empty(&[8, 2, I], DType::Float32);
+fn gru_graph(t_len: usize, batch: usize) -> Tensor {
+    let x = Tensor::empty(&[t_len, batch, I], DType::Float32);
     let w_ih = Tensor::empty(&[3 * H, I], DType::Float32);
     let w_hh = Tensor::empty(&[3 * H, H], DType::Float32);
-    let out = x.gru().weight_ih(&w_ih).weight_hh(&w_hh).call().unwrap();
-    let (launches, distinct) = count_kernels(&out.output);
+    x.gru().weight_ih(&w_ih).weight_hh(&w_hh).call().unwrap().output
+}
+
+/// A `T`-step GRU costs a fixed five kernels whatever `T` is: the zeroed
+/// initial state, the hoisted input projection over the whole sequence, the
+/// two step kernels (the `r`/`z` matmul and the `n` matmul, each fused with
+/// its elementwise tail), and the copy that hands back the hidden history as
+/// the output sequence. The step pair is *one* compiled body each, re-launched
+/// per time slot by the schedule-level `END(CALL, [RANGE])` loop with the time
+/// index bound as a scalar kernel argument.
+///
+/// Pinned so a regression that stops hoisting the projection, that starts
+/// emitting a third step kernel (the WAR temp `self_read_misses_store` avoids),
+/// or that re-unrolls the loop is visible.
+#[test]
+fn t8_gru_kernel_count() {
+    // Pinned against the CPU splitter: how many kernels a device needs is the
+    // backend's business, but the loop structure is not.
+    let graph = svod_dtype::default_device::with_default_device(svod_dtype::DeviceSpec::Cpu, || gru_graph(8, 2));
+    let (launches, distinct) = count_kernels(&graph);
     assert_eq!((launches, distinct), T8_GRU_KERNELS, "T=8 GRU kernel count moved: {launches}/{distinct}");
 }
 
 /// Measured `(launches, distinct bodies)`; see [`t8_gru_kernel_count`].
-const T8_GRU_KERNELS: (usize, usize) = (17, 17);
+const T8_GRU_KERNELS: (usize, usize) = (5, 5);
+
+/// `(compiled programs, step kernels, per-step launch bindings)` for a GRU of
+/// `t_len` steps. The program count is device-dependent; its *independence*
+/// from `t_len` is not.
+fn scan_plan_shape(t_len: usize) -> (usize, usize, Vec<Vec<i64>>) {
+    let plan = gru_graph(t_len, 2).prepare().unwrap();
+    let launches = plan.prepared_kernels();
+    let programs: std::collections::HashSet<*const _> =
+        launches.iter().map(|k| std::sync::Arc::as_ptr(&k.kernel)).collect();
+
+    let mut slots: std::collections::BTreeMap<&str, Vec<i64>> = std::collections::BTreeMap::new();
+    for kernel in &launches {
+        let Some(value) = kernel.fixedvars.values().next() else { continue };
+        slots.entry(&kernel.kernel.entry_point).or_default().push(*value);
+    }
+    let mut bindings: Vec<Vec<i64>> = slots.into_values().collect();
+    for bound in &mut bindings {
+        bound.sort_unstable();
+    }
+    (programs.len(), bindings.len(), bindings)
+}
+
+/// The compiled inventory must not grow with the sequence length, and each
+/// step kernel must be launched once per time slot with a distinct binding.
+#[test]
+fn the_step_kernel_is_compiled_once_and_launched_per_slot() {
+    let (short_programs, short_steps, short_bindings) = scan_plan_shape(8);
+    let (long_programs, long_steps, long_bindings) = scan_plan_shape(19);
+
+    assert_eq!(short_programs, long_programs, "compiled programs grew with the sequence length");
+    assert_eq!((short_steps, long_steps), (2, 2), "expected exactly two looped step kernels");
+    for bound in &short_bindings {
+        assert_eq!(*bound, (0..8).collect::<Vec<i64>>(), "T=8 launch bindings");
+    }
+    for bound in &long_bindings {
+        assert_eq!(*bound, (0..19).collect::<Vec<i64>>(), "T=19 launch bindings");
+    }
+}
+
+/// The step kernel's rendered source must not mention the time slot: the only
+/// thing that changes between launches is the value of a scalar argument, so
+/// the source is byte-identical across sequence lengths.
+#[test]
+fn the_looped_step_source_carries_no_per_step_constant() {
+    // The entry point carries a process-wide dedup suffix; everything else in
+    // the rendering must match.
+    let step_sources = |t_len: usize| -> Vec<String> {
+        let plan = gru_graph(t_len, 2).prepare().unwrap();
+        let mut sources: Vec<String> = plan
+            .prepared_kernels()
+            .iter()
+            .filter(|k| !k.fixedvars.is_empty())
+            .map(|k| k.kernel.code.replace(&k.kernel.entry_point, "step"))
+            .collect();
+        sources.sort();
+        sources.dedup();
+        sources
+    };
+
+    let short = step_sources(8);
+    assert_eq!(short.len(), 2, "two distinct step kernels");
+    assert_eq!(short, step_sources(31), "step source changed with the sequence length");
+
+    // The bound time index reaches the kernel as a scalar argument, not a
+    // literal — that is what lets one program serve every slot.
+    let plan = gru_graph(8, 2).prepare().unwrap();
+    for kernel in plan.prepared_kernels().iter().filter(|k| !k.fixedvars.is_empty()) {
+        let name = kernel.fixedvars.keys().next().expect("a bound loop variable");
+        assert!(kernel.kernel.var_names.contains(name), "{name} is not a kernel argument");
+    }
+}
 
 // =========================================================================
 // Downstream call shapes
