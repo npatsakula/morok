@@ -21,7 +21,7 @@ use super::decode::{
     run_fixed_slot_decode, strategy_width,
 };
 use super::jit::{WhisperCrossKvJit, WhisperDecoderJit, WhisperDecoderStepJit, WhisperEncoderJit, WhisperPrefillJit};
-use super::mel::WhisperMel;
+use super::mel::{WhisperMel, WhisperMelJit};
 use super::model::Whisper;
 use super::plan::WhisperPlan;
 use super::profile::{CopyProfile, GraphProfile, begin_host_copy};
@@ -75,6 +75,13 @@ pub enum TranscribeError {
 /// word alignment is a separate [`WhisperAligner`] stage.
 pub struct WhisperRecognizer {
     mel: WhisperMel,
+    /// Graph front-end (see [`crate::audio::use_graph_mel`]); `None` runs
+    /// `realfft` on the host and packs through the encoder's host mapping.
+    mel_jit: Option<WhisperMelJit>,
+    /// Host staging for the mel JIT's device-local `[max_batch, framed_len]`
+    /// input: one `copyin` per batch instead of kernels reading pinned host
+    /// memory over the bus.
+    framed: Vec<f32>,
     encoder_jit: WhisperEncoderJit,
     decoder_jit: WhisperDecoderJit,
     cross_kv_jit: WhisperCrossKvJit,
@@ -148,15 +155,28 @@ impl WhisperRecognizer {
                 }),
             });
         }
-        let mel = WhisperMel::new(n_mels);
+        let mel = WhisperMel::new(n_mels)?;
 
         let max_batch = plan.encoder_batch;
 
         let prepare_config = PrepareConfig::from_env();
 
+        // Graph mel keeps the encoder's mel input device-local: it is only ever
+        // written by an on-device copy from the mel JIT's output.
+        let graph_mel = crate::audio::use_graph_mel();
+        let mel_jit = graph_mel
+            .then(|| {
+                let mut jit = WhisperMelJit::new(mel.clone());
+                let framed = InputSpec::f32(&[max_batch, mel.framed_len()]).device_local();
+                jit.prepare_with_config(framed, &PrepareConfig::device_local()).map(|()| jit)
+            })
+            .transpose()?;
+        let framed = vec![0.0f32; if graph_mel { max_batch * mel.framed_len() } else { 0 }];
+
         // Encoder JIT: [max_batch, n_mels, N_FRAMES], device-local output
         let mut encoder_jit = WhisperEncoderJit::new(model.clone());
         let mel_spec = InputSpec::f32(&[max_batch, n_mels, N_FRAMES]);
+        let mel_spec = if graph_mel { mel_spec.device_local() } else { mel_spec };
         encoder_jit.prepare_with_config(mel_spec, &PrepareConfig::device_local())?;
 
         let n_text_state = model.dims.n_text_state;
@@ -218,6 +238,8 @@ impl WhisperRecognizer {
 
         Ok(Self {
             mel,
+            mel_jit,
+            framed,
             encoder_jit,
             decoder_jit,
             cross_kv_jit,
@@ -468,8 +490,27 @@ impl WhisperRecognizer {
 
             // ── Mel: compute + pack into [b, n_mels, N_FRAMES] ──────────────
             let t = Instant::now();
-            let batch_mels: Vec<Vec<f32>> = (0..b).map(|bi| self.compute_mel(windows[batch_start + bi])).collect();
-            {
+            if let Some(mel_jit) = &mut self.mel_jit {
+                // Graph path: frame the windows, upload them to the mel JIT's
+                // device-local input, run it, and copy its output across on-device.
+                let framed_len = self.mel.framed_len();
+                for (bi, row) in self.framed.chunks_mut(framed_len).enumerate() {
+                    match windows.get(batch_start + bi).filter(|_| bi < b) {
+                        Some(window) => self.mel.frame_into(window, row),
+                        None => row.fill(0.0),
+                    }
+                }
+                let src_bytes: &[u8] = bytemuck::cast_slice(&self.framed);
+                let copy_started = begin_host_copy(profile, mel_jit.framed_mut()?)
+                    .map_err(|source| TranscribeError::Model { source: Box::new(source) })?;
+                mel_jit.framed_mut()?.copyin(src_bytes)?;
+                if let Some(started) = copy_started {
+                    copies.h2d("mel_input", 1, src_bytes.len(), started.elapsed());
+                }
+                mel_jit.execute()?;
+                self.encoder_jit.mel_mut()?.copy_from(mel_jit.output()?)?;
+            } else {
+                let batch_mels: Vec<Vec<f32>> = (0..b).map(|bi| self.compute_mel(windows[batch_start + bi])).collect();
                 let mel_buf = self.encoder_jit.mel_mut()?;
                 let mut packed = vec![0f32; max_batch * mel_stride];
                 for bi in 0..b {

@@ -11,4 +11,4 @@ pub(crate) mod mel;
 
 pub(crate) use bounds::ChunkerKnobs;
 pub use bounds::{AudioChunk, EncoderBounds};
-pub use mel::{MelConfig, MelScale, MelSpectrogram};
+pub use mel::{MelConfig, MelJit, MelScale, MelSpectrogram, use_graph_mel};

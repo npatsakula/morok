@@ -10,7 +10,7 @@ use svod_ir::SInt;
 use test_case::test_case;
 
 use crate::error::ErrorKind;
-use crate::nn::Window;
+use crate::nn::{MelLog, MelNorm, MelScale, Window};
 use crate::{Tensor, Variable};
 
 // =========================================================================
@@ -521,13 +521,284 @@ fn count_kernels(t: &Tensor) -> usize {
     kernels.toposort_call_aware(false).iter().filter(|n| matches!(n.op(), Op::Call(..))).count()
 }
 
-/// The whole point of the conv formulation: the DFT basis, the window and the
-/// framing fuse into the convolution, so a forward transform is one launch.
-/// The inverse pays two more for the window-square overlap-add divisor.
+/// The conv formulation: one launch builds the `[2F, 1, n_fft]` DFT kernel
+/// and one convolves with it — the framing and the window fold into those.
+/// Fusing the basis into the convolution instead would recompute `cos`/`sin`
+/// per multiply-add. The inverse pays its own kernel build and convolution
+/// plus one launch for the window-square overlap-add divisor.
 #[test]
-fn stft_is_one_kernel_and_istft_is_three() {
+fn stft_is_two_kernels_and_istft_is_five() {
     let x = Tensor::empty(&[4, 16000], DType::Float32);
     let spec = x.stft().n_fft(512).hop(256).call().unwrap();
-    assert_eq!(count_kernels(&spec), 1);
-    assert_eq!(count_kernels(&spec.istft().n_fft(512).hop(256).call().unwrap()), 3);
+    assert_eq!(count_kernels(&spec), 2);
+    assert_eq!(count_kernels(&spec.istft().n_fft(512).hop(256).call().unwrap()), 5);
+}
+
+// =========================================================================
+// Mel filterbank and mel spectrogram
+// =========================================================================
+
+/// `librosa.hz_to_mel` for both scales, written out independently of the op.
+fn ref_hz_to_mel(hz: f64, scale: MelScale) -> f64 {
+    match scale {
+        MelScale::Htk => 2595.0 * (1.0 + hz / 700.0).log10(),
+        MelScale::Slaney => {
+            let f_sp = 200.0 / 3.0;
+            let min_log_mel = 1000.0 / f_sp;
+            let logstep = 6.4f64.ln() / 27.0;
+            if hz >= 1000.0 { min_log_mel + (hz / 1000.0).ln() / logstep } else { hz / f_sp }
+        }
+    }
+}
+
+fn ref_mel_to_hz(mel: f64, scale: MelScale) -> f64 {
+    match scale {
+        MelScale::Htk => 700.0 * (10f64.powf(mel / 2595.0) - 1.0),
+        MelScale::Slaney => {
+            let f_sp = 200.0 / 3.0;
+            let min_log_mel = 1000.0 / f_sp;
+            let logstep = 6.4f64.ln() / 27.0;
+            if mel >= min_log_mel { 1000.0 * ((mel - min_log_mel) * logstep).exp() } else { mel * f_sp }
+        }
+    }
+}
+
+/// `librosa.filters.mel` / `torchaudio.functional.melscale_fbanks`, flat
+/// `[n_mels, n_fft / 2 + 1]`, using the ramp intersection rather than the
+/// op's `min(up, down)` form.
+fn ref_mel_filterbank(
+    sr: usize,
+    n_fft: usize,
+    n_mels: usize,
+    f_min: f64,
+    f_max: f64,
+    scale: MelScale,
+    norm: Option<MelNorm>,
+) -> Vec<f64> {
+    let n_bins = n_fft / 2 + 1;
+    let (m_lo, m_hi) = (ref_hz_to_mel(f_min, scale), ref_hz_to_mel(f_max, scale));
+    let hz: Vec<f64> =
+        (0..n_mels + 2).map(|i| ref_mel_to_hz(m_lo + (m_hi - m_lo) * i as f64 / (n_mels + 1) as f64, scale)).collect();
+    let mut fb = vec![0.0; n_mels * n_bins];
+    for m in 0..n_mels {
+        let (lo, mid, hi) = (hz[m], hz[m + 1], hz[m + 2]);
+        let enorm = match norm {
+            Some(MelNorm::Slaney) => 2.0 / (hi - lo),
+            None => 1.0,
+        };
+        for k in 0..n_bins {
+            let f = k as f64 * sr as f64 / n_fft as f64;
+            let w = if f >= lo && f <= mid {
+                (f - lo) / (mid - lo)
+            } else if f > mid && f <= hi {
+                (hi - f) / (hi - mid)
+            } else {
+                0.0
+            };
+            fb[m * n_bins + k] = w * enorm;
+        }
+    }
+    fb
+}
+
+#[test_case(16000, 400, 80, 0.0, 8000.0, MelScale::Slaney, Some(MelNorm::Slaney); "whisper slaney normalized")]
+#[test_case(16000, 400, 64, 0.0, 8000.0, MelScale::Htk, None; "gigaam htk")]
+#[test_case(16000, 512, 80, 20.0, 7600.0, MelScale::Htk, Some(MelNorm::Slaney); "htk normalized band-limited")]
+#[test_case(8000, 64, 10, 50.0, 3500.0, MelScale::Slaney, None; "small slaney unnormalized")]
+fn mel_filterbank_matches_host_reference(
+    sr: usize,
+    n_fft: usize,
+    n_mels: usize,
+    f_min: f64,
+    f_max: f64,
+    scale: MelScale,
+    norm: Option<MelNorm>,
+) {
+    let expected = ref_mel_filterbank(sr, n_fft, n_mels, f_min, f_max, scale, norm);
+    let fb = Tensor::mel_filterbank(sr, n_fft, n_mels, f_min, f_max, scale, norm, DType::Float32).unwrap();
+    assert_eq!(fb.dims().unwrap(), vec![n_mels, n_fft / 2 + 1]);
+    let got = fb.to_vec::<f32>().unwrap();
+    assert_close(&got, &expected, 1e-6);
+    // Every filter has support, and adjacent filters overlap: the ramps tile the band.
+    let n_bins = n_fft / 2 + 1;
+    for row in got.chunks(n_bins) {
+        assert!(row.iter().any(|&w| w > 0.0), "empty filter");
+    }
+    // Unnormalized triangles peak at one; normalized ones integrate to two.
+    if norm.is_none() {
+        assert!(got.iter().cloned().fold(0.0f32, f32::max) <= 1.0 + 1e-6);
+    }
+}
+
+#[test]
+fn mel_filterbank_honours_dtype_and_rejects_bad_parameters() {
+    let fb = Tensor::mel_filterbank(16000, 64, 8, 0.0, 8000.0, MelScale::Htk, None, DType::Float16).unwrap();
+    assert_eq!(fb.dtype(), DType::Float16);
+    let bad = [
+        Tensor::mel_filterbank(0, 64, 8, 0.0, 8000.0, MelScale::Htk, None, DType::Float32),
+        Tensor::mel_filterbank(16000, 0, 8, 0.0, 8000.0, MelScale::Htk, None, DType::Float32),
+        Tensor::mel_filterbank(16000, 64, 0, 0.0, 8000.0, MelScale::Htk, None, DType::Float32),
+        Tensor::mel_filterbank(16000, 64, 8, -1.0, 8000.0, MelScale::Htk, None, DType::Float32),
+        Tensor::mel_filterbank(16000, 64, 8, 4000.0, 4000.0, MelScale::Htk, None, DType::Float32),
+    ];
+    for err in bad {
+        assert!(matches!(err.unwrap_err().kind(), ErrorKind::ParamRange { .. }));
+    }
+    let err = Tensor::mel_filterbank(16000, 64, 8, 0.0, 8000.0, MelScale::Htk, None, DType::Int32).unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::FloatDTypeRequired { .. }), "got {err}");
+}
+
+/// Host log-mel pipeline: naive STFT → `|X|^power` → filterbank → log.
+#[allow(clippy::too_many_arguments)]
+fn ref_mel_spectrogram(
+    x: &[f64],
+    sr: usize,
+    n_fft: usize,
+    hop: usize,
+    n_mels: usize,
+    scale: MelScale,
+    norm: Option<MelNorm>,
+    power: f64,
+    log: Option<MelLog>,
+) -> Vec<f64> {
+    let win = host_window(&Window::Hann, n_fft);
+    let spec = ref_stft(x, n_fft, hop, &win, true, true, false);
+    let bins = n_fft / 2 + 1;
+    let frames = spec.len() / (bins * 2);
+    let energy: Vec<f64> = spec.chunks(2).map(|c| (c[0] * c[0] + c[1] * c[1]).powf(power / 2.0)).collect();
+    let fb = ref_mel_filterbank(sr, n_fft, n_mels, 0.0, sr as f64 / 2.0, scale, norm);
+    let mut mel = vec![0.0; n_mels * frames];
+    for m in 0..n_mels {
+        for t in 0..frames {
+            mel[m * frames + t] = (0..bins).map(|k| fb[m * bins + k] * energy[k * frames + t]).sum();
+        }
+    }
+    match log {
+        None => mel,
+        Some(MelLog::Ln { min, max }) => mel.iter().map(|v| v.clamp(min, max).ln()).collect(),
+        Some(MelLog::Whisper) => {
+            let logged: Vec<f64> = mel.iter().map(|v| v.max(1e-10).log10()).collect();
+            let floor = logged.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - 8.0;
+            logged.iter().map(|v| (v.max(floor) + 4.0) / 4.0).collect()
+        }
+    }
+}
+
+#[test_case(MelScale::Htk, None, 2.0, None; "torchaudio power")]
+#[test_case(MelScale::Htk, None, 1.0, None; "torchaudio magnitude")]
+#[test_case(MelScale::Htk, None, 2.0, Some(MelLog::Ln { min: 1e-9, max: 1e9 }); "gigaam log")]
+#[test_case(MelScale::Slaney, Some(MelNorm::Slaney), 2.0, Some(MelLog::Whisper); "whisper log")]
+#[test_case(MelScale::Slaney, Some(MelNorm::Slaney), 3.0, None; "fractional power")]
+fn mel_spectrogram_matches_naive_host_pipeline(
+    scale: MelScale,
+    norm: Option<MelNorm>,
+    power: f64,
+    log: Option<MelLog>,
+) {
+    let (sr, n_fft, hop, n_mels, len) = (8000usize, 64usize, 16usize, 12usize, 256usize);
+    let x = signal(len, 0.35);
+    let expected = ref_mel_spectrogram(&x, sr, n_fft, hop, n_mels, scale, norm, power, log);
+
+    let input = Tensor::from_slice(x.iter().map(|&v| v as f32).collect::<Vec<_>>());
+    let mel = input
+        .mel_spectrogram()
+        .sample_rate(sr)
+        .n_fft(n_fft)
+        .hop(hop)
+        .n_mels(n_mels)
+        .mel_scale(scale)
+        .maybe_norm(norm)
+        .power(power)
+        .maybe_log(log)
+        .call()
+        .unwrap();
+    assert_eq!(mel.dims().unwrap(), vec![n_mels, len / hop + 1]);
+    let tol = if log.is_some() { 1e-3 } else { 2e-3 };
+    assert_close(&mel.to_vec::<f32>().unwrap(), &expected, tol);
+}
+
+/// The Whisper floor is `max - 8` of each signal, not of the batch: a quiet
+/// row next to a loud one keeps its own dynamic range.
+#[test]
+fn mel_spectrogram_whisper_log_floors_each_signal_separately() {
+    let (sr, n_fft, hop, n_mels, len) = (8000usize, 64usize, 16usize, 12usize, 256usize);
+    let loud = signal(len, 0.35);
+    let quiet: Vec<f64> = loud.iter().map(|v| v * 1e-3).collect();
+    let rows = [loud.clone(), quiet.clone()];
+    let expected: Vec<f64> = rows
+        .iter()
+        .flat_map(|r| {
+            ref_mel_spectrogram(
+                r,
+                sr,
+                n_fft,
+                hop,
+                n_mels,
+                MelScale::Slaney,
+                Some(MelNorm::Slaney),
+                2.0,
+                Some(MelLog::Whisper),
+            )
+        })
+        .collect();
+
+    let flat: Vec<f32> = rows.iter().flatten().map(|&v| v as f32).collect();
+    let input = Tensor::from_slice(flat).try_reshape([2, len as isize]).unwrap();
+    let mel = input
+        .mel_spectrogram()
+        .sample_rate(sr)
+        .n_fft(n_fft)
+        .hop(hop)
+        .n_mels(n_mels)
+        .mel_scale(MelScale::Slaney)
+        .norm(MelNorm::Slaney)
+        .log(MelLog::Whisper)
+        .call()
+        .unwrap();
+    assert_eq!(mel.dims().unwrap(), vec![2, n_mels, len / hop + 1]);
+    let got = mel.to_vec::<f32>().unwrap();
+    assert_close(&got, &expected, 1e-3);
+    // In normalized units the floor is `row_max - 2` (`(x - 8 + 4) / 4`).
+    // Each row honours its own; a batch-wide floor would have lifted the
+    // quiet row above the loud row's.
+    let per_row = n_mels * (len / hop + 1);
+    let (loud_row, quiet_row) = got.split_at(per_row);
+    let bounds = |row: &[f32]| {
+        (row.iter().cloned().fold(f32::INFINITY, f32::min), row.iter().cloned().fold(f32::NEG_INFINITY, f32::max))
+    };
+    let (loud_min, loud_max) = bounds(loud_row);
+    let (quiet_min, quiet_max) = bounds(quiet_row);
+    assert!(loud_min >= loud_max - 2.0 - 1e-5 && quiet_min >= quiet_max - 2.0 - 1e-5);
+    assert!(
+        (loud_max - quiet_max - 1.5).abs() < 1e-3,
+        "1e-3 in amplitude is 1e-6 in power, -1.5 normalized: {loud_max} vs {quiet_max}"
+    );
+    assert!(quiet_min < loud_max - 2.0, "quiet row floored against the loud row's maximum");
+}
+
+#[test]
+fn mel_spectrogram_rejects_bad_parameters() {
+    let x = Tensor::from_slice(vec![0.1f32; 256]);
+    let err = x.mel_spectrogram().sample_rate(8000).n_fft(64).n_mels(8).power(0.0).call().unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::ParamRange { .. }), "got {err}");
+    let err = x.mel_spectrogram().sample_rate(8000).n_fft(64).n_mels(0).call().unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::ParamRange { .. }), "got {err}");
+    let err = x.mel_spectrogram().sample_rate(8000).n_fft(64).n_mels(8).f_min(5000.0).call().unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::ParamRange { .. }), "got {err}");
+    let ints = Tensor::from_slice(vec![1i32; 256]);
+    let err = ints.mel_spectrogram().sample_rate(8000).n_fft(64).n_mels(8).call().unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::FloatDTypeRequired { .. }), "got {err}");
+    let err = Tensor::from_slice(vec![0.1f32; 8]).mel_log(MelLog::Whisper).unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::NdimMinimum { .. }), "got {err}");
+}
+
+/// A Whisper-sized front-end: the STFT kernel build and conv, the filterbank
+/// contraction and the two-pass Whisper log (reduce, then elementwise).
+#[test]
+fn mel_spectrogram_kernel_count_stays_small() {
+    let x = Tensor::empty(&[4, 16000 * 30], DType::Float32);
+    let power = x.mel_spectrogram().sample_rate(16000).n_fft(400).hop(160).n_mels(80).call().unwrap();
+    let whisper = power.mel_log(MelLog::Whisper).unwrap();
+    let ln = power.mel_log(MelLog::Ln { min: 1e-9, max: 1e9 }).unwrap();
+    assert_eq!((count_kernels(&power), count_kernels(&ln), count_kernels(&whisper)), (3, 3, 6));
 }

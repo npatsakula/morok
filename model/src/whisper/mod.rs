@@ -51,7 +51,7 @@ pub use jit::{
     WhisperAlignmentJit, WhisperAlignmentModel, WhisperCrossKvJit, WhisperDecoderJit, WhisperDecoderStepJit,
     WhisperEncoderJit, WhisperPrefillJit,
 };
-pub use mel::WhisperMel;
+pub use mel::{WhisperMel, WhisperMelJit};
 pub use model::Whisper;
 pub use plan::WhisperPlan;
 pub use tokenizer::WhisperTokenizer;

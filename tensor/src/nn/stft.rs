@@ -2,9 +2,11 @@
 //!
 //! [`Tensor::stft`] and [`Tensor::istft`] are graph ops: the DFT basis, the
 //! analysis window and the overlap-add normalization are all built from
-//! `arange`/`cos`/`sin`, so a transform is a single convolution against a
-//! constant kernel rather than a host-side FFT. That keeps an audio front-end
-//! (mel filterbank, VAD, speech enhancement) inside one JIT graph.
+//! `arange`/`cos`/`sin`, so a transform is a convolution against a constant
+//! kernel rather than a host-side FFT. That keeps an audio front-end (mel
+//! filterbank, VAD, speech enhancement) inside one JIT graph. The `[2F, 1,
+//! n_fft]` kernel is materialized before the convolution: left lazy it would
+//! fuse in and cost a `cos`/`sin` per multiply-add, 20-30× the convolution.
 //!
 //! ## Conventions
 //!
@@ -24,8 +26,16 @@
 //! [`power`](Tensor::power), [`complex_mul`](Tensor::complex_mul), …) operate
 //! on that same trailing-2 layout, so a spectrogram never has to be split into
 //! two tensors by hand.
+//!
+//! [`Tensor::mel_spectrogram`] chains `stft → power → mel_filterbank → log`
+//! into `[B, n_mels, T]`, following `torchaudio.transforms.MelSpectrogram`
+//! (HTK scale, no filter normalization) or `librosa.filters.mel` (Slaney scale
+//! and area normalization — Whisper's `mel_filters.npz`). The filterbank is a
+//! constant `[n_mels, F]` table built on the host in f64 and uploaded once: it
+//! is at most a few tens of kilobytes, and building it in-graph would only add
+//! kernels for the piecewise Slaney conversions with no precision to gain.
 
-use std::f64::consts::TAU;
+use std::f64::consts::{LOG10_2, TAU};
 
 use bon::bon;
 use snafu::ensure;
@@ -127,6 +137,164 @@ impl Tensor {
                 let k = Tensor::arange_f64(0.0, n as f64, 1.0, DType::Float32)?;
                 let phase = k.try_mul(TAU / denom as f64)?;
                 Ok(phase.cos()?.try_mul(-a1)?.try_add(a0)?.cast(dtype))
+            }
+        }
+    }
+}
+
+/// Frequency warping of [`Tensor::mel_filterbank`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MelScale {
+    /// `2595·log10(1 + f/700)` — torchaudio's default (`mel_scale="htk"`).
+    #[default]
+    Htk,
+    /// librosa's default: linear (200/3 Hz per mel) below 1 kHz, logarithmic
+    /// above (`mel_scale="slaney"`, `librosa.hz_to_mel(htk=False)`).
+    Slaney,
+}
+
+/// Filter normalization of [`Tensor::mel_filterbank`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MelNorm {
+    /// Each triangle scaled by `2 / (f_right - f_left)` so it has unit area in
+    /// Hz — `librosa.filters.mel(norm="slaney")`, `melscale_fbanks(norm="slaney")`.
+    Slaney,
+}
+
+/// Log compression applied by [`Tensor::mel_spectrogram`] / [`Tensor::mel_log`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MelLog {
+    /// `ln(clamp(x, min, max))` — GigaAM's `torch.log(x.clamp(1e-9, 1e9))`.
+    Ln { min: f64, max: f64 },
+    /// Whisper's `log_mel_spectrogram` tail: `log10(max(x, 1e-10))`, floored
+    /// at 8 below the maximum of each `[n_mels, T]` signal, then `(x + 4) / 4`.
+    Whisper,
+}
+
+/// Hz per mel on the linear part of the Slaney scale, and its log step above
+/// 1 kHz (`ln(6.4) / 27`): `librosa.hz_to_mel(htk=False)`.
+const SLANEY_F_SP: f64 = 200.0 / 3.0;
+const SLANEY_MIN_LOG_HZ: f64 = 1000.0;
+const SLANEY_MIN_LOG_MEL: f64 = SLANEY_MIN_LOG_HZ / SLANEY_F_SP;
+
+impl MelScale {
+    fn hz_to_mel(self, hz: f64) -> f64 {
+        match self {
+            Self::Htk => 2595.0 * (1.0 + hz / 700.0).log10(),
+            Self::Slaney if hz >= SLANEY_MIN_LOG_HZ => {
+                SLANEY_MIN_LOG_MEL + (hz / SLANEY_MIN_LOG_HZ).ln() / (6.4f64.ln() / 27.0)
+            }
+            Self::Slaney => hz / SLANEY_F_SP,
+        }
+    }
+
+    fn mel_to_hz(self, mel: f64) -> f64 {
+        match self {
+            Self::Htk => 700.0 * (10f64.powf(mel / 2595.0) - 1.0),
+            Self::Slaney if mel >= SLANEY_MIN_LOG_MEL => {
+                SLANEY_MIN_LOG_HZ * ((mel - SLANEY_MIN_LOG_MEL) * (6.4f64.ln() / 27.0)).exp()
+            }
+            Self::Slaney => mel * SLANEY_F_SP,
+        }
+    }
+}
+
+/// `[n_mels, n_fft / 2 + 1]` triangular filters, row-major, in f64 host math.
+///
+/// `n_mels + 2` points are spaced evenly on the mel axis between `f_min` and
+/// `f_max`; filter `m` ramps up from point `m` to `m + 1` and down to `m + 2`
+/// over the FFT bin frequencies `k · sample_rate / n_fft` — the
+/// `max(0, min(up, down))` form of `torchaudio.functional.melscale_fbanks`.
+fn mel_table(
+    sample_rate: usize,
+    n_fft: usize,
+    n_mels: usize,
+    f_min: f64,
+    f_max: f64,
+    scale: MelScale,
+    norm: Option<MelNorm>,
+) -> Vec<f32> {
+    let n_bins = n_fft / 2 + 1;
+    let (m_lo, m_hi) = (scale.hz_to_mel(f_min), scale.hz_to_mel(f_max));
+    let points: Vec<f64> =
+        (0..n_mels + 2).map(|i| scale.mel_to_hz(m_lo + (m_hi - m_lo) * i as f64 / (n_mels + 1) as f64)).collect();
+    let mut table = vec![0f32; n_mels * n_bins];
+    for (row, edges) in table.chunks_mut(n_bins).zip(points.windows(3)) {
+        let (lo, mid, hi) = (edges[0], edges[1], edges[2]);
+        let gain = match norm {
+            Some(MelNorm::Slaney) => 2.0 / (hi - lo),
+            None => 1.0,
+        };
+        for (k, w) in row.iter_mut().enumerate() {
+            let f = k as f64 * sample_rate as f64 / n_fft as f64;
+            let up = (f - lo) / (mid - lo);
+            let down = (hi - f) / (hi - mid);
+            *w = (up.min(down).max(0.0) * gain) as f32;
+        }
+    }
+    table
+}
+
+impl Tensor {
+    /// `[n_mels, n_fft / 2 + 1]` mel filterbank — `melscale_fbanks` /
+    /// `librosa.filters.mel` — as a constant tensor; `power @ fb.T` (or
+    /// `fb @ power` on a `[F, T]` spectrogram) yields mel energies.
+    ///
+    /// The table is built on the host in f64 and uploaded once; see the
+    /// module docs for why it is not assembled in-graph.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// # use svod_tensor::nn::{MelNorm, MelScale};
+    /// # use svod_dtype::DType;
+    /// let fb = Tensor::mel_filterbank(16000, 400, 80, 0.0, 8000.0, MelScale::Slaney, Some(MelNorm::Slaney), DType::Float32).unwrap();
+    /// assert_eq!(fb.dims().unwrap(), vec![80, 201]);
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    #[track_caller]
+    pub fn mel_filterbank(
+        sample_rate: usize,
+        n_fft: usize,
+        n_mels: usize,
+        f_min: f64,
+        f_max: f64,
+        scale: MelScale,
+        norm: Option<MelNorm>,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        origin_call!("mel_filterbank");
+        let op = "mel_filterbank";
+        ensure!(
+            sample_rate > 0,
+            ParamRangeSnafu { op, param: "sample_rate", value: sample_rate.to_string(), constraint: "> 0" }
+        );
+        ensure!(n_fft > 0, ParamRangeSnafu { op, param: "n_fft", value: n_fft.to_string(), constraint: "> 0" });
+        ensure!(n_mels > 0, ParamRangeSnafu { op, param: "n_mels", value: n_mels.to_string(), constraint: "> 0" });
+        ensure!(f_min >= 0.0, ParamRangeSnafu { op, param: "f_min", value: f_min.to_string(), constraint: ">= 0" });
+        ensure!(f_max > f_min, ParamRangeSnafu { op, param: "f_max", value: f_max.to_string(), constraint: "> f_min" });
+        ensure!(dtype.is_float(), FloatDTypeRequiredSnafu { op, arg: "dtype", dtype: dtype.clone() });
+        let table = mel_table(sample_rate, n_fft, n_mels, f_min, f_max, scale, norm);
+        let array = ndarray::Array2::from_shape_vec((n_mels, n_fft / 2 + 1), table).expect("table matches its shape");
+        let fb = Tensor::from_ndarray(&array);
+        Ok(if dtype == DType::Float32 { fb } else { fb.cast(dtype) })
+    }
+
+    /// The log compression of [`mel_spectrogram`](Tensor::mel_spectrogram) on
+    /// its own, for a caller that trims frames first (Whisper keeps
+    /// `T - 1` of the `center` frames before taking the per-signal maximum).
+    #[track_caller]
+    pub fn mel_log(&self, log: MelLog) -> Result<Tensor> {
+        origin_call!("mel_log");
+        match log {
+            MelLog::Ln { min, max } => self.clamp().min(min).max(max).call()?.try_log(),
+            MelLog::Whisper => {
+                let ndim = self.ndim()?;
+                ensure!(ndim >= 2, NdimMinimumSnafu { op: "mel_log", min: 2_usize, actual: ndim });
+                let x = self.maximum(1e-10)?.try_log2()?.try_mul(LOG10_2)?;
+                let floor = x.max_with().axes(&[-2isize, -1][..]).keepdim(true).call()?.try_sub(8.0)?;
+                x.maximum(&floor)?.try_add(4.0)?.try_div(4.0)
             }
         }
     }
@@ -240,9 +408,10 @@ impl Tensor {
     /// Short-time Fourier transform of a `[B, L]` (or `[L]`) real signal,
     /// returning `[B, F, T, 2]` (or `[F, T, 2]`) with `(real, imag)` trailing.
     ///
-    /// Mirrors `torch.stft(..., return_complex=false)`. Implemented as a single
-    /// `conv1d` against a `[2F, 1, n_fft]` windowed DFT kernel, so the whole
-    /// transform stays in the graph and the batch axis may be symbolic.
+    /// Mirrors `torch.stft(..., return_complex=false)`. Implemented as one
+    /// `conv1d` against a materialized `[2F, 1, n_fft]` windowed DFT kernel,
+    /// so the whole transform stays in the graph and the batch axis may be
+    /// symbolic.
     ///
     /// Defaults: `hop = n_fft / 4`, `win_length = n_fft`, periodic Hann window,
     /// `center`, `onesided`, no normalization.
@@ -285,7 +454,7 @@ impl Tensor {
 
         let n_bins = if onesided { n_fft / 2 + 1 } else { n_fft };
         let win = framed_window(&window, n_fft, win_length, dtype.clone())?;
-        let kernel = analysis_kernel(n_fft, n_bins, &win, dtype)?;
+        let kernel = analysis_kernel(n_fft, n_bins, &win, dtype)?.contiguous();
 
         // [B, 1, L] -> [B, 2F, T] -> [B, 2, F, T] -> [B, F, T, 2].
         let y = x.try_unsqueeze(1)?.conv1d().weight(&kernel).stride(hop).call()?;
@@ -354,7 +523,7 @@ impl Tensor {
         );
 
         let win = framed_window(&window, n_fft, win_length, dtype.clone())?;
-        let kernel = synthesis_kernel(n_fft, n_bins, onesided, &win, dtype.clone())?;
+        let kernel = synthesis_kernel(n_fft, n_bins, onesided, &win, dtype.clone())?.contiguous();
 
         // [B, F, T, 2] -> [B, 2, F, T] -> [B, 2F, T]; the batch stays symbolic.
         let z = x.try_permute(&[0, 3, 1, 2])?.try_reshape([
@@ -378,6 +547,72 @@ impl Tensor {
         let y = y.narrow(-1, start, take)?;
         let y = if take < keep { y.try_pad(&[(0, 0), (0, (keep - take) as isize)])? } else { y };
         if ndim == 3 { y.try_squeeze(Some(0)) } else { Ok(y) }
+    }
+
+    /// Mel spectrogram of a `[B, L]` (or `[L]`) signal: `[B, n_mels, T]` (or
+    /// `[n_mels, T]`), with `T` as [`stft`](Tensor::stft) counts frames.
+    ///
+    /// `stft` (its `hop`, `win_length`, `window`, `center` defaults) → `|X|^power`
+    /// → [`mel_filterbank`](Tensor::mel_filterbank) → optional
+    /// [`mel_log`](Tensor::mel_log). With the defaults this is
+    /// `torchaudio.transforms.MelSpectrogram` (HTK scale, no normalization,
+    /// power 2, `f_max = sample_rate / 2`); `MelScale::Slaney` with
+    /// `MelNorm::Slaney` is `librosa.feature.melspectrogram`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// let x = Tensor::from_slice(vec![0.25f32; 1600]);
+    /// let mel = x.mel_spectrogram().sample_rate(16000).n_fft(400).hop(160).n_mels(64).call().unwrap();
+    /// assert_eq!(mel.dims().unwrap(), vec![64, 11]);
+    /// ```
+    #[builder]
+    #[track_caller]
+    pub fn mel_spectrogram(
+        &self,
+        sample_rate: usize,
+        n_fft: usize,
+        hop: Option<usize>,
+        win_length: Option<usize>,
+        #[builder(default)] window: Window,
+        #[builder(default = true)] center: bool,
+        n_mels: usize,
+        #[builder(default = 0.0)] f_min: f64,
+        f_max: Option<f64>,
+        #[builder(default)] mel_scale: MelScale,
+        norm: Option<MelNorm>,
+        #[builder(default = 2.0)] power: f64,
+        log: Option<MelLog>,
+    ) -> Result<Tensor> {
+        origin_call!("mel_spectrogram");
+        ensure!(
+            power > 0.0,
+            ParamRangeSnafu { op: "mel_spectrogram", param: "power", value: power.to_string(), constraint: "> 0" }
+        );
+        let spec = self
+            .stft()
+            .n_fft(n_fft)
+            .maybe_hop(hop)
+            .maybe_win_length(win_length)
+            .window(window)
+            .center(center)
+            .call()?;
+        let energy = spec.power()?;
+        let energy = if power == 2.0 {
+            energy
+        } else if power == 1.0 {
+            energy.try_sqrt()?
+        } else {
+            energy.try_pow(power / 2.0)?
+        };
+        let f_max = f_max.unwrap_or(sample_rate as f64 / 2.0);
+        let fb = Tensor::mel_filterbank(sample_rate, n_fft, n_mels, f_min, f_max, mel_scale, norm, self.dtype())?;
+        let mel = fb.matmul(&energy)?;
+        match log {
+            Some(log) => mel.mel_log(log),
+            None => Ok(mel),
+        }
     }
 }
 

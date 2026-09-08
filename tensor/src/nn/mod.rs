@@ -25,7 +25,7 @@ pub use rnn::{
     GruCell, GruDirection, GruOutput, LinearBeforeReset, LstmOutput, RecurrentCell, RnnCell, RnnDirection, RnnLayout,
     RnnOutput, RnnStack,
 };
-pub use stft::Window;
+pub use stft::{MelLog, MelNorm, MelScale, Window};
 /// Derive [`Module`](trait@Module): the trait lives in the type namespace and
 /// this derive in the macro namespace, so one name serves both.
 pub use svod_macros::Module;
