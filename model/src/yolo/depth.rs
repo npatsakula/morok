@@ -4,8 +4,8 @@
 //! level to `c_mid` channels, progressively upsamples+fuses from P5→P3,
 //! then runs Conv→ConvTranspose2d→Conv→Conv2d to produce `[B, 1, H/4, W/4]`.
 
+use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv2d, ConvTranspose2d, CoordinateTransformMode, Layer, Module, ResizeMode};
-use svod_tensor::{BoundVariable, Tensor};
 
 use crate::state::StateDict;
 
@@ -148,9 +148,8 @@ impl Yolo26Depth {
         Ok(model)
     }
 
-    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        let x = loader::shrink_batch(images, batch)?;
-        let (l4, l6, l10) = self.backbone.forward(&x)?;
+    pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let (l4, l6, l10) = self.backbone.forward(images)?;
         let (p3, p4, p5) = self.neck.forward(&l4, &l6, &l10)?;
         self.head.forward(&[p3, p4, p5])
     }

@@ -1,8 +1,7 @@
 //! Device-block RNN-T backend ([`svod_arch::rnnt::BatchBlockStep`]):
 //! [`super::block::forward_block`] unrolled to a single graph-captured plan. The
-//! five carried states recycle in place inside `execute()` (the plan stores them
-//! back into its own input buffers); per block the host only reads back three
-//! small tapes + one flag.
+//! five carried states are `state { .. }` slots, so they recycle in place inside
+//! `execute()`; per block the host only reads back three small tapes + one flag.
 
 use snafu::ResultExt;
 use svod_arch::rnnt::{BatchBlockStep, BlockTapes};
@@ -13,16 +12,6 @@ use super::block::BLOCK_STEPS;
 use super::jit::{RnntBlockJit, RnntEncProjJit};
 use crate::gigaam::model::GigaAm;
 
-/// Read-back output positions of `RnntBlockJit`. The remaining outputs
-/// (`time/prev/symbols/h/c`, positions 4-8) are in-place writes back into the
-/// JIT's own input buffers (`forward_block` ends each carried state with
-/// `assign`), so the block recycles state on-device with no copy — those
-/// positions are never read out here.
-const TAPE_OUT: usize = 0;
-const EMIT_OUT: usize = 1;
-const FRAME_OUT: usize = 2;
-const ANY_OUT: usize = 3;
-
 pub struct RnntBlockBackend {
     jit: RnntBlockJit,
     /// Per-wave encoder projection `[B, T, E] -> [B, T, J]` — one MFMA matmul
@@ -31,7 +20,6 @@ pub struct RnntBlockBackend {
     lanes: usize,
     max_t: usize,
     enc_hidden: usize,
-    state_bytes: usize,
     blank_id: usize,
 
     // Host-side tape staging (read once per block).
@@ -68,22 +56,20 @@ impl RnntBlockBackend {
         let enc_hidden = model.config.d_model;
         let blank_id = head.predictor.blank_id;
 
+        let config = svod_tensor::PrepareConfig::device_local();
         let mut proj = RnntEncProjJit::new(model.clone());
-        let mut proj_config = svod_tensor::PrepareConfig::from_env();
-        proj_config.device_local_outputs = true;
-        proj.prepare_with_config(InputSpec::f32(&[lanes, max_t, enc_hidden]).device_local(), &proj_config)?;
+        proj.prepare_with_config(InputSpec::f32(&[lanes, max_t, enc_hidden]).device_local(), &config)?;
 
+        // Inputs first, then the `state { .. }` slots (always device-local).
         let mut jit = RnntBlockJit::new(model);
-        let mut config = svod_tensor::PrepareConfig::from_env();
-        config.device_local_outputs = true;
         jit.prepare_with_config(
             InputSpec::f32(&[lanes, max_t, joint_hidden]).device_local(),
-            InputSpec::i64(&[lanes, 1]).device_local(),
-            InputSpec::i64(&[lanes, 1]).device_local(),
-            InputSpec::i32(&[lanes, 1]).device_local(),
             InputSpec::i32(&[lanes, 1]),
-            InputSpec::f32(&[layers, lanes, p]).device_local(),
-            InputSpec::f32(&[layers, lanes, p]).device_local(),
+            InputSpec::i64(&[lanes, 1]),
+            InputSpec::i64(&[lanes, 1]),
+            InputSpec::i32(&[lanes, 1]),
+            InputSpec::f32(&[layers, lanes, p]),
+            InputSpec::f32(&[layers, lanes, p]),
             &config,
         )?;
 
@@ -93,7 +79,6 @@ impl RnntBlockBackend {
             lanes,
             max_t,
             enc_hidden,
-            state_bytes: layers * lanes * p * 4,
             blank_id,
             tokens: vec![0; lanes * BLOCK_STEPS],
             emit: vec![0; lanes * BLOCK_STEPS],
@@ -114,17 +99,16 @@ impl RnntBlockBackend {
         self.proj.enc_mut()?.copyin(bytemuck::cast_slice(&staged))?;
         self.proj.execute()?;
         // Projected rows -> block input, device->device (drains the proj exec).
-        let proj_out = self.proj.output_buffers()?[0].clone();
+        let proj_out = self.proj.output()?;
         let bytes = proj_out.size();
-        self.jit.enc_mut()?.copy_region_from(0, &proj_out, 0, bytes)?;
+        self.jit.enc_mut()?.copy_region_from(0, proj_out, 0, bytes)?;
 
-        let mut v = vec![0i32; self.lanes];
-        for (i, &n) in valid.iter().enumerate() {
-            v[i] = n as i32;
+        let mut view = self.jit.valid_view_mut::<i32>()?;
+        let slice = view.as_slice_mut().expect("contiguous valid");
+        slice.fill(0);
+        for (dst, &n) in slice.iter_mut().zip(valid) {
+            *dst = n as i32;
         }
-        let buf = self.jit.valid_mut()?;
-        let mut view = buf.as_array_mut::<i32>()?;
-        view.as_slice_mut().expect("contiguous valid").copy_from_slice(&v);
         Ok(())
     }
 }
@@ -142,36 +126,31 @@ impl BatchBlockStep for RnntBlockBackend {
 
     fn run_block(&mut self) -> Result<BlockTapes<'_>, Self::Error> {
         let t0 = std::time::Instant::now();
-        // `execute()` recycles carried state in place: the plan's `time/prev/
-        // symbols/h/c` outputs `assign` back into its own input buffers, so the
-        // next block reads updated state with no host-issued copy.
+        // `execute()` recycles the `time/prev/symbols/h/c` state slots in place,
+        // so the next block reads updated state with no host-issued copy.
         self.jit.execute()?;
         let t1 = std::time::Instant::now();
 
-        let outs = self.jit.output_buffers()?;
-        let mut any = [0i32; 1];
-        outs[TAPE_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut self.tokens))?;
-        outs[EMIT_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut self.emit))?;
-        outs[FRAME_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut self.frames_tape))?;
-        outs[ANY_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut any))?;
+        self.jit.tape()?.copyout_prefix(bytemuck::cast_slice_mut(&mut self.tokens))?;
+        self.jit.emit()?.copyout_prefix(bytemuck::cast_slice_mut(&mut self.emit))?;
+        self.jit.frame()?.copyout_prefix(bytemuck::cast_slice_mut(&mut self.frames_tape))?;
+        let active_any = self.jit.active_any_to_vec::<i32>()?[0] != 0;
         let t2 = std::time::Instant::now();
 
         self.stats.n_blocks += 1;
         self.stats.steps_emitted += self.emit.iter().filter(|&&e| e != 0).count() as u64;
         self.stats.t_exec += t1 - t0;
         self.stats.t_read += t2 - t1;
-        Ok(BlockTapes { tokens: &self.tokens, emit: &self.emit, frames: &self.frames_tape, active_any: any[0] != 0 })
+        Ok(BlockTapes { tokens: &self.tokens, emit: &self.emit, frames: &self.frames_tape, active_any })
     }
 
+    /// Cold start: zero every carried state, then seed `prev` with the blank id
+    /// (the predictor's start-of-sequence token — the only slot whose reset
+    /// value is not zero).
     fn reset(&mut self) -> Result<(), Self::Error> {
-        let zeros64 = vec![0u8; self.lanes * 8];
+        self.jit.reset()?;
         let blanks: Vec<i64> = vec![self.blank_id as i64; self.lanes];
-        self.jit.time_mut()?.copyin(&zeros64)?;
         self.jit.prev_mut()?.copyin(bytemuck::cast_slice(&blanks))?;
-        self.jit.symbols_mut()?.copyin(&zeros64[..self.lanes * 4])?;
-        let zstate = vec![0u8; self.state_bytes];
-        self.jit.h_in_mut()?.copyin(&zstate)?;
-        self.jit.c_in_mut()?.copyin(&zstate)?;
         Ok(())
     }
 }

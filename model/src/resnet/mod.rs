@@ -22,8 +22,8 @@
 //! jit.prepare(InputSpec::f32(&[max_batch, 3, 224, 224]))?;
 //!
 //! // copy NCHW fp32 image batch into `jit.images_mut()?`, then:
-//! jit.execute_with_vars(&[("b", 1)])?;
-//! let _logits = jit.output()?;
+//! jit.execute_bound(1)?;
+//! let _logits = jit.logits_to_vec::<f32>()?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!

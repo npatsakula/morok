@@ -109,10 +109,8 @@ fn forward_zero_weights_shape_check(depth: ResNetDepth, output: OutputMode, expe
     let model = ResNet::with_zero_weights(cfg);
 
     let images = Tensor::zeros(&[1, 3, 32, 32], DType::Float32);
-    let var = Variable::new("b", 1, 1);
-    let b = var.bind(1).unwrap();
 
-    let out = model.forward(&images, &b).unwrap();
+    let out = model.forward(&images).unwrap();
     let shape = crate::test::max_dims(&out);
     assert_eq!(shape, expected);
 }
@@ -137,6 +135,24 @@ fn forward_shape_r50_classification() {
 #[test]
 fn forward_shape_r50_features() {
     forward_zero_weights_shape_check(ResNetDepth::R50, OutputMode::Features, &[1, 2048, 1, 1]);
+}
+
+/// The batch dimension is symbolic again once the JIT's `batch_var` shrink is
+/// applied to the input: `forward` itself no longer takes a `BoundVariable`,
+/// so this checks that the shrunk extent still propagates end-to-end.
+#[test]
+fn symbolic_batch_propagates_through_the_graph() {
+    let cfg =
+        ResNetConfig::new(ResNetDepth::R18, OutputMode::Classification { num_classes: 10 }).with_max_batch_size(8);
+    let model = ResNet::with_zero_weights(cfg);
+
+    let images = Tensor::zeros(&[8, 3, 32, 32], DType::Float32);
+    let b = Variable::new("b", 1, 8).bind(3).unwrap();
+    let shrunk = svod_tensor::jit::shrink_batch(&images, &b).unwrap();
+
+    let out = model.forward(&shrunk).unwrap();
+    assert_eq!(crate::test::max_dims(&out), vec![8, 10]);
+    assert_eq!(out.shape().unwrap()[0].as_const(), None, "batch dim stayed symbolic");
 }
 
 /// `fc.weight` is `[num_classes, 512 * expansion]`. Catches off-by-one in the
@@ -169,17 +185,15 @@ fn head_dimensions_per_depth(depth: ResNetDepth, expected_in: usize) {
 #[ignore = "heavy: full ResNet-18 graph compile through the CPU backend"]
 fn features_r18_returns_512_channel_map() {
     use svod_dtype::DType;
-    use svod_tensor::{Tensor, Variable};
+    use svod_tensor::Tensor;
 
     let max_batch = 1;
     let config = ResNetConfig::new(ResNetDepth::R18, OutputMode::Features).with_max_batch_size(max_batch);
     let model = ResNet::with_zero_weights(config);
 
     let images = Tensor::zeros(&[max_batch, 3, 32, 32], DType::Float32);
-    let var = Variable::new("b", 1, max_batch as i64);
-    let b1 = var.bind(1).unwrap();
 
-    let out = model.forward(&images, &b1).unwrap();
+    let out = model.forward(&images).unwrap();
     out.realize().unwrap();
 
     let shape = crate::test::max_dims(&out);
@@ -190,17 +204,15 @@ fn features_r18_returns_512_channel_map() {
 #[ignore = "heavy: full ResNet-50 graph compile through the CPU backend"]
 fn features_r50_returns_2048_channel_map() {
     use svod_dtype::DType;
-    use svod_tensor::{Tensor, Variable};
+    use svod_tensor::Tensor;
 
     let max_batch = 1;
     let config = ResNetConfig::new(ResNetDepth::R50, OutputMode::Features).with_max_batch_size(max_batch);
     let model = ResNet::with_zero_weights(config);
 
     let images = Tensor::zeros(&[max_batch, 3, 32, 32], DType::Float32);
-    let var = Variable::new("b", 1, max_batch as i64);
-    let b1 = var.bind(1).unwrap();
 
-    let out = model.forward(&images, &b1).unwrap();
+    let out = model.forward(&images).unwrap();
     out.realize().unwrap();
 
     let shape = crate::test::max_dims(&out);

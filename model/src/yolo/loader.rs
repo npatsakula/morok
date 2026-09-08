@@ -2,8 +2,6 @@
 
 use std::path::Path;
 
-use svod_tensor::Tensor;
-
 use crate::state::{self, StateDict};
 
 use super::error::Result;
@@ -33,9 +31,4 @@ pub fn strip_model_prefix(sd: &StateDict) -> StateDict {
     } else {
         sd.clone()
     }
-}
-
-/// Shrink the batch dimension of a 4D NCHW tensor to a bound variable.
-pub fn shrink_batch(images: &Tensor, batch: &svod_tensor::BoundVariable) -> Result<Tensor> {
-    Ok(images.narrow(0, 0usize, batch.as_sint())?)
 }

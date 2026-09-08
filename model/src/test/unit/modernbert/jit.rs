@@ -75,36 +75,27 @@ fn jit_rebinds_batch_without_reprepare() {
     let ids: Vec<i64> = (1..=(max_batch * seq_len) as i64).collect();
     let mask = vec![1i64; max_batch * seq_len];
 
-    // The output buffer is sized for `max_batch` (the plan bakes the upper
-    // bound); rebinding `b` computes the live rows without resizing. So the
-    // buffer length is constant — what matters is that each batch size
-    // executes and produces finite output.
+    // The output buffer stays sized for `max_batch` (the plan bakes the upper
+    // bound), but the declared output's live shape follows `b`, so the read-back
+    // is exactly the `(b, L, D)` rows the plan computed.
     let d = cfg.hidden_size;
-    let buf_len = max_batch * seq_len * d;
     for b in [1, 2, max_batch] {
         let out = run(&mut jit, &ids, &mask, b);
-        assert_eq!(out.len(), buf_len, "output buffer should be max_batch-sized, not b={b}-sized");
-        // The first b*seq*d elements are the live rows; verify they're finite.
-        let live = b * seq_len * d;
-        assert!(out[..live].iter().all(|v| v.is_finite()), "non-finite output for b={b}");
+        assert_eq!(jit.hidden_shape().expect("live shape"), vec![b, seq_len, d], "live shape must follow b={b}");
+        assert_eq!(out.len(), b * seq_len * d);
+        assert!(out.iter().all(|v| v.is_finite()), "non-finite output for b={b}");
     }
 }
 
 /// Write inputs and execute with batch rebindable to `b`. Returns the live
 /// `(b, L, D)` output (only `b` rows read back).
 fn run(jit: &mut ModernBertJit, ids: &[i64], mask: &[i64], b: usize) -> Vec<f32> {
-    {
-        let buf = jit.input_ids_mut().expect("input_ids buffer");
-        let mut view = buf.as_array_mut::<i64>().expect("input_ids view");
-        view.as_slice_mut().expect("contiguous").copy_from_slice(ids);
-    }
-    {
-        let buf = jit.attention_mask_mut().expect("attention_mask buffer");
-        let mut view = buf.as_array_mut::<i64>().expect("attention_mask view");
-        view.as_slice_mut().expect("contiguous").copy_from_slice(mask);
-    }
-    jit.execute_with_vars(&[("b", b as i64)]).expect("execute");
-    let out = jit.output().expect("output buffer");
-    let view = out.as_array::<f32>().expect("output view");
-    view.as_slice().expect("contiguous").to_vec()
+    jit.input_ids_view_mut::<i64>().expect("input_ids view").as_slice_mut().expect("contiguous").copy_from_slice(ids);
+    jit.attention_mask_view_mut::<i64>()
+        .expect("attention_mask view")
+        .as_slice_mut()
+        .expect("contiguous")
+        .copy_from_slice(mask);
+    jit.execute_bound(b as i64).expect("execute");
+    jit.hidden_to_vec::<f32>().expect("output read")
 }

@@ -11,8 +11,6 @@
 //! suitable for long-form ASR — see the `svod-arch::vad` module for
 //! tunable knobs (min/max chunk duration, alignment, padding, etc.).
 
-extern crate self as svod_model;
-
 mod splitter;
 
 pub use splitter::{SileroVadSplitter, SileroVadSplitterError};
@@ -303,9 +301,10 @@ impl VadInference {
         // Device-local output: the [FEATURE_BATCH, 4*HIDDEN] gates readback
         // (8 MiB per dispatch) goes over the SDMA copy queue instead of the
         // ~21 MB/s host-mapped BAR — same pattern as the encoder output.
-        let mut config = svod_tensor::PrepareConfig::from_env();
-        config.device_local_outputs = true;
-        jit.prepare_with_config(InputSpec::f32(&[FEATURE_BATCH, CHUNK_LEN]), &config)?;
+        jit.prepare_with_config(
+            InputSpec::f32(&[FEATURE_BATCH, CHUNK_LEN]),
+            &svod_tensor::PrepareConfig::device_local(),
+        )?;
         Ok(Self { jit, head })
     }
 
@@ -336,8 +335,7 @@ impl VadInference {
         while done < n_chunks {
             let b = (n_chunks - done).min(FEATURE_BATCH);
             {
-                let buf = self.jit.chunks_mut()?;
-                let mut view = buf.as_array_mut::<f32>()?;
+                let mut view = self.jit.chunks_view_mut::<f32>()?;
                 let slice = view.as_slice_mut().expect("contiguous chunks");
                 for i in 0..b {
                     let start = (done + i) * NUM_SAMPLES;

@@ -15,8 +15,8 @@
 
 use std::path::Path;
 
+use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
-use svod_tensor::{BoundVariable, Tensor};
 
 use crate::state::{self, StateDict};
 
@@ -42,12 +42,6 @@ impl Qwen3Embedding {
     /// embeddings `(B, D)`.
     pub fn encode(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let hidden = self.model.forward(input_ids, Some(attention_mask))?;
-        self.pool_and_normalize(&hidden)
-    }
-
-    /// JIT-path variant with rebindable batch. Returns `(B, D)`.
-    pub fn encode_batch(&self, input_ids: &Tensor, attention_mask: &Tensor, b: &BoundVariable) -> Result<Tensor> {
-        let hidden = self.model.forward_batch(input_ids, Some(attention_mask), b)?;
         self.pool_and_normalize(&hidden)
     }
 

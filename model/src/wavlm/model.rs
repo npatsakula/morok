@@ -5,9 +5,8 @@
 use std::path::Path;
 
 use snafu::ResultExt;
-use svod_ir::SInt;
+use svod_tensor::Tensor;
 use svod_tensor::nn::{Module, StateDict};
-use svod_tensor::{BoundVariable, Tensor};
 
 use super::config::WavLmConfig;
 use super::encoder::Encoder;
@@ -33,9 +32,8 @@ impl WavLm {
     /// return all `num_layers + 1` intermediate tensors (see
     /// [`Encoder::extract_features`] for layer-0 / final-LN semantics).
     ///
-    /// Eager path: `waveform` is `(B, samples)` with whatever concrete batch
-    /// dim the caller already shaped. Use [`extract_features_batch`] for the
-    /// JIT path where the batch dim is a symbolic [`BoundVariable`].
+    /// `waveform` is `(B, samples)`. On the JIT path the batch dim is the
+    /// wrapper's `batch_var`, already shrunk to its live value.
     pub fn extract_features(&self, waveform: &Tensor) -> Result<Vec<Tensor>> {
         let normed = if self.config.normalize_waveform { waveform.layernorm(-1, 1e-5)? } else { waveform.clone() };
         let features = self.feature_extractor.forward(&normed)?;
@@ -47,19 +45,6 @@ impl WavLm {
     /// downstream heads.
     pub fn extract_features_stacked(&self, waveform: &Tensor) -> Result<Tensor> {
         stack_last(self.extract_features(waveform)?)
-    }
-
-    /// JIT-path variant of [`extract_features`]. `waveform` is sized for the
-    /// JIT plan's `max_batch`; `batch` shrinks the leading dim to the live
-    /// value at execute time. Mirrors gigaam's `forward_batch` pattern.
-    pub fn extract_features_batch(&self, waveform: &Tensor, batch: &BoundVariable) -> Result<Vec<Tensor>> {
-        let waveform = waveform.try_shrink([Some((SInt::Const(0), batch.as_sint())), None])?;
-        self.extract_features(&waveform)
-    }
-
-    /// JIT-path variant of [`extract_features_stacked`].
-    pub fn extract_features_stacked_batch(&self, waveform: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        stack_last(self.extract_features_batch(waveform, batch)?)
     }
 
     /// Download `pytorch_model.bin` from a HuggingFace Hub repository and

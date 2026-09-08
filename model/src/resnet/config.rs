@@ -53,8 +53,8 @@ pub struct ResNetConfig {
     pub output: OutputMode,
     /// Upper bound on the symbolic `b` variable exposed by the JIT wrapper.
     /// The prepared plan's image buffer is allocated to `max_batch_size`; the
-    /// per-call `execute_with_vars(&[("b", actual)])` shrinks the batch dim to
-    /// the live size.
+    /// per-call `execute_bound(actual)` shrinks the batch dim to the live
+    /// size.
     pub max_batch_size: usize,
 }
 

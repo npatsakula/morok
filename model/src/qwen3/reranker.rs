@@ -18,8 +18,8 @@
 
 use std::path::Path;
 
+use svod_tensor::Tensor;
 use svod_tensor::nn::{Module, StateDict, get_tensor, prefixed};
-use svod_tensor::{BoundVariable, Tensor};
 
 use crate::state;
 
@@ -53,12 +53,6 @@ impl Qwen3Reranker {
     /// Eager forward: returns `(B,)` relevance scores.
     pub fn forward(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let hidden = self.model.forward(input_ids, Some(attention_mask))?;
-        self.score(&hidden)
-    }
-
-    /// JIT-path variant with rebindable batch. Returns `(B,)`.
-    pub fn forward_batch(&self, input_ids: &Tensor, attention_mask: &Tensor, b: &BoundVariable) -> Result<Tensor> {
-        let hidden = self.model.forward_batch(input_ids, Some(attention_mask), b)?;
         self.score(&hidden)
     }
 

@@ -4,8 +4,8 @@
 //! rotated boxes via `dist2rbox`. Returns `[B, 4+nc+1, A]`.
 
 use svod_ir::SInt;
+use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv2d, Layer, Module};
-use svod_tensor::{BoundVariable, Tensor};
 
 use crate::state::StateDict;
 
@@ -210,9 +210,8 @@ impl Yolo26Obb {
         Ok(model)
     }
 
-    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        let x = loader::shrink_batch(images, batch)?;
-        let (l4, l6, l10) = self.backbone.forward(&x)?;
+    pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let (l4, l6, l10) = self.backbone.forward(images)?;
         let (p3, p4, p5) = self.neck.forward(&l4, &l6, &l10)?;
         self.head.forward(&[p3, p4, p5])
     }

@@ -2,7 +2,7 @@
 //! `prepare()` time with the fbank time/freq dims and the weight time dim
 //! baked, and replays it per call with the batch dimension bound to the live
 //! value of `b` through
-//! [`execute_with_vars`](WeSpeakerResNet34Jit::execute_with_vars).
+//! [`execute_bound`](WeSpeakerResNet34Jit::execute_bound).
 //!
 //! Shape contract:
 //! - `prepare(InputSpec::f32(&[max_b, 1598, 80]), InputSpec::f32(&[max_b, 799]))`
@@ -10,8 +10,6 @@
 //! - `b` is rebindable on every call; values are clamped to
 //!   `[1, max_batch_size]` by the macro-generated setters.
 //! - Output is `[B, 256]` speaker embeddings.
-
-extern crate self as svod_model;
 
 use svod_macros::jit_wrapper;
 
@@ -22,12 +20,11 @@ jit_wrapper! {
         feats: Tensor,
         weights: Tensor,
 
-        vars {
-            b: (1, model.config.max_batch_size),
-        }
+        batch_var b: (1, model.config.max_batch_size),
+        outputs { embeddings }
 
-        build(feats, weights, b) {
-            model.forward(feats, weights, &b)
+        build(feats, weights) {
+            model.forward(feats, weights)
         }
     }
 }

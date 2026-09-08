@@ -5,8 +5,8 @@
 //! detection scales) and differ in backbone/neck depth.
 
 use svod_ir::SInt;
+use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
-use svod_tensor::{BoundVariable, Tensor};
 
 use crate::state::StateDict;
 
@@ -146,9 +146,8 @@ impl Yolo26Detect {
         Ok(model)
     }
 
-    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        let x = loader::shrink_batch(images, batch)?;
-        let (l4, l6, l10) = self.backbone.forward(&x)?;
+    pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let (l4, l6, l10) = self.backbone.forward(images)?;
         let (p3, p4, p5) = self.neck.forward(&l4, &l6, &l10)?;
         self.head.forward(&[p3, p4, p5])
     }
@@ -207,9 +206,8 @@ impl Yolo26DetectP2 {
         Ok(model)
     }
 
-    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        let x = loader::shrink_batch(images, batch)?;
-        let (l2, l4, l6, l10) = self.backbone.forward_with_p2(&x)?;
+    pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let (l2, l4, l6, l10) = self.backbone.forward_with_p2(images)?;
         let (p2, p3, p4, p5) = self.neck.forward(&l2, &l4, &l6, &l10)?;
         self.head.forward(&[p2, p3, p4, p5])
     }
@@ -267,9 +265,8 @@ impl Yolo26DetectP6 {
         Ok(model)
     }
 
-    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        let x = loader::shrink_batch(images, batch)?;
-        let (l4, l6, l8, l12) = self.backbone.forward(&x)?;
+    pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let (l4, l6, l8, l12) = self.backbone.forward(images)?;
         let (p3, p4, p5, p6) = self.neck.forward(&l4, &l6, &l8, &l12)?;
         self.head.forward(&[p3, p4, p5, p6])
     }

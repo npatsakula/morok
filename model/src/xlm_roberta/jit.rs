@@ -1,7 +1,5 @@
 //! JIT wrapper for [`super::model::XlmRobertaModel`].
 
-extern crate self as svod_model;
-
 use svod_macros::jit_wrapper;
 
 use super::model::XlmRobertaModel;
@@ -11,12 +9,11 @@ jit_wrapper! {
         input_ids: Tensor,
         attention_mask: Tensor,
 
-        vars {
-            b: (1, model.config.max_batch_size),
-        }
+        batch_var b: (1, model.config.max_batch_size),
+        outputs { hidden }
 
-        build(input_ids, attention_mask, b) {
-            model.forward_batch(input_ids, Some(attention_mask), &b)
+        build(input_ids, attention_mask) {
+            model.forward(input_ids, Some(attention_mask))
         }
     }
 }

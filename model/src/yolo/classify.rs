@@ -5,8 +5,8 @@
 
 use svod_dtype::DType;
 use svod_ir::SInt;
+use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, Linear, Module};
-use svod_tensor::{BoundVariable, Tensor};
 
 use crate::init::fan_in_uniform;
 use crate::state::StateDict;
@@ -97,9 +97,8 @@ impl Yolo26Classify {
     }
 
     /// Run the full network. Returns `[B, nc]` softmax probabilities.
-    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        let x = loader::shrink_batch(images, batch)?;
-        let feat = self.backbone.forward(&x)?;
+    pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let feat = self.backbone.forward(images)?;
         self.head.forward(&feat)
     }
 }

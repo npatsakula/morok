@@ -143,16 +143,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     jit.images_mut()?.copyin(bytemuck::cast_slice(&input))?;
 
     let t_exec = Instant::now();
-    jit.execute_with_vars(&[("b", 1)])?;
+    jit.execute_bound(1)?;
     println!("Execute: {:.2}s", t_exec.elapsed().as_secs_f64());
 
-    let out = jit.output()?;
-    let n_floats = out.size() / std::mem::size_of::<f32>();
-    let mut result = vec![0.0f32; n_floats];
-    out.copyout(bytemuck::cast_slice_mut(&mut result))?;
+    let result = jit.logits_to_vec::<f32>()?;
 
     if args.features {
-        println!("Feature map: {n_floats} floats");
+        println!("Feature map: {:?}", jit.logits_shape()?);
         println!("  first 8 values: {:?}", &result[..result.len().min(8)]);
     } else {
         let mut indexed: Vec<(usize, f32)> = result.iter().enumerate().map(|(i, &v)| (i, v)).collect();

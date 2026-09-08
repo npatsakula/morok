@@ -406,8 +406,7 @@ fn prepared_cross_kv_graph_reuses_device_local_outputs() {
     let dims = small_decoder_dims();
     let model = Whisper::empty(dims.clone());
     let cache_shape = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
-    let mut config = svod_tensor::PrepareConfig::from_env();
-    config.device_local_outputs = true;
+    let config = svod_tensor::PrepareConfig::device_local();
 
     let mut cross = WhisperCrossKvJit::new(model.clone());
     cross.prepare_with_config(InputSpec::f32(&[1, dims.n_audio_ctx, dims.n_text_state]), &config).unwrap();
@@ -559,8 +558,7 @@ fn recognition_cross_kv_seeds_prefill_and_alignment_device_locally() {
     let dims = small_decoder_dims();
     let model = Whisper::empty(dims.clone());
     let cache_shape = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
-    let mut config = svod_tensor::PrepareConfig::from_env();
-    config.device_local_outputs = true;
+    let config = svod_tensor::PrepareConfig::device_local();
 
     let mut cross = WhisperCrossKvJit::new(model.clone());
     cross.prepare_with_config(InputSpec::f32(&[1, dims.n_audio_ctx, dims.n_text_state]), &config).unwrap();

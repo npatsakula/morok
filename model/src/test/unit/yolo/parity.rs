@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use svod_tensor::{Tensor, Variable};
+use svod_tensor::Tensor;
 
 use crate::state::StateDict;
 use crate::state::load_safetensors;
@@ -61,9 +61,7 @@ fn detect_output_matches_pytorch() {
         .try_reshape(image_shape.iter().map(|&d| d as isize).collect::<Vec<_>>())
         .unwrap();
 
-    let var = Variable::new("b", 1, 1);
-    let b = var.bind(1).unwrap();
-    let out = model.forward(&images, &b).expect("forward");
+    let out = model.forward(&images).expect("forward");
     out.realize().unwrap();
 
     let got = out.as_vec::<f32>().unwrap();

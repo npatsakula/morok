@@ -21,9 +21,8 @@ use std::path::Path;
 
 use snafu::ResultExt;
 use svod_dtype::DType;
-use svod_ir::SInt;
 use svod_tensor::nn::{Layer, LayerNorm, Linear, Module, StateDict};
-use svod_tensor::{BoundVariable, Tensor, s};
+use svod_tensor::{Tensor, s};
 
 use crate::init::{fan_in_uniform, ones, zeros};
 use crate::wavlm::{WavLm, drop_inert_keys};
@@ -106,14 +105,6 @@ impl DiariZenSegmentationModel {
         let waveforms = self.select_channel(waveforms)?;
         let stacked = self.wavlm.extract_features_stacked(&waveforms)?;
         self.head_forward(&stacked)
-    }
-
-    /// JIT-path variant of [`forward`]. `waveforms` is sized for the JIT
-    /// plan's `max_batch`; `batch` shrinks the leading dim at execute time.
-    pub fn forward_batch(&self, waveforms: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        let b = batch.as_sint();
-        let waveforms = waveforms.try_shrink([Some((SInt::Const(0), b)), None, None])?;
-        self.forward(&waveforms)
     }
 
     fn select_channel(&self, waveforms: &Tensor) -> Result<Tensor> {

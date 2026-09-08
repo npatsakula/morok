@@ -64,22 +64,35 @@ fn prefixed_state_dict_only_prepends() {
     assert_eq!(bare, nested);
 }
 
-/// Build the symbolic forward graph and check the output shape.
-/// Verifies symbolic batch `b` propagates through the full FPN+PAN DAG.
+/// Build the forward graph and check the output shape.
 #[test]
 fn forward_shape_nano() {
     let cfg = YoloConfig::new(YoloScale::Nano, 80);
     let model = Yolo26Detect::with_zero_weights(cfg);
 
     let images = Tensor::zeros(&[1, 3, 320, 320], DType::Float32);
-    let var = Variable::new("b", 1, 1);
-    let b = var.bind(1).unwrap();
-
-    let out = model.forward(&images, &b).unwrap();
+    let out = model.forward(&images).unwrap();
     let shape = crate::test::max_dims(&out);
 
     // 320×320: P3=40×40, P4=20×20, P5=10×10 → A=2100; out=[1, 84, 2100]
     assert_eq!(shape, vec![1, 84, 2100]);
+}
+
+/// `forward` no longer takes a `BoundVariable` — the JIT's `batch_var b`
+/// shrinks `images` on dim 0 before the backbone. Feed a shrunk input and
+/// check the symbolic extent still reaches the decoded predictions.
+#[test]
+fn symbolic_batch_propagates_through_the_fpn_pan_dag() {
+    let cfg = YoloConfig::new(YoloScale::Nano, 80).with_max_batch_size(4);
+    let model = Yolo26Detect::with_zero_weights(cfg);
+
+    let images = Tensor::zeros(&[4, 3, 320, 320], DType::Float32);
+    let b = Variable::new("b", 1, 4).bind(2).unwrap();
+    let shrunk = svod_tensor::jit::shrink_batch(&images, &b).unwrap();
+
+    let out = model.forward(&shrunk).unwrap();
+    assert_eq!(crate::test::max_dims(&out), vec![4, 84, 2100]);
+    assert_eq!(out.shape().unwrap()[0].as_const(), None, "batch dim stayed symbolic");
 }
 
 /// Heavy: realize the full forward through zero weights.
@@ -90,10 +103,7 @@ fn forward_realize_nano() {
     let model = Yolo26Detect::with_zero_weights(cfg);
 
     let images = Tensor::zeros(&[1, 3, 320, 320], DType::Float32);
-    let var = Variable::new("b", 1, 1);
-    let b = var.bind(1).unwrap();
-
-    let out = model.forward(&images, &b).unwrap();
+    let out = model.forward(&images).unwrap();
     out.realize().unwrap();
 
     let shape = crate::test::max_dims(&out);

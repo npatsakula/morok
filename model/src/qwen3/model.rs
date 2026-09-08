@@ -7,9 +7,8 @@
 
 use std::path::Path;
 
-use svod_ir::SInt;
+use svod_tensor::Tensor;
 use svod_tensor::nn::{Embedding, Layer, Module, RmsNorm};
-use svod_tensor::{BoundVariable, Tensor};
 
 use crate::state::{self, StateDict};
 
@@ -53,22 +52,6 @@ impl Qwen3Model {
             h = layer.forward(&h, &rope, padding_mask)?;
         }
         Ok(self.norm.forward(&h)?)
-    }
-
-    /// JIT-path variant: shrinks the leading batch dim to the live value.
-    pub fn forward_batch(
-        &self,
-        input_ids: &Tensor,
-        padding_mask: Option<&Tensor>,
-        b: &BoundVariable,
-    ) -> Result<Tensor> {
-        let bv = b.as_sint();
-        let input_ids = input_ids.try_shrink([Some((SInt::Const(0), bv.clone())), None])?;
-        let padding_mask = match padding_mask {
-            Some(m) => Some(m.try_shrink([Some((SInt::Const(0), bv)), None])?),
-            None => None,
-        };
-        self.forward(&input_ids, padding_mask.as_ref())
     }
 
     pub fn from_hub(model_id: &str, mut config: Qwen3Config) -> Result<Self> {

@@ -11,8 +11,8 @@
 //! `roberta.` prefix this module nests the backbone under.
 
 use svod_dtype::DType;
+use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
-use svod_tensor::{BoundVariable, Tensor};
 
 use crate::init::{fan_in_uniform, zeros};
 use crate::state::{StateDict, cast_all};
@@ -77,17 +77,6 @@ impl BgeRerankerV2M3 {
     pub fn compute_score(&self, input_ids: &Tensor, attention_mask: &Tensor, normalize: bool) -> Result<Tensor> {
         let logits = self.forward(input_ids, Some(attention_mask))?;
         if normalize { Ok(logits.sigmoid()?) } else { Ok(logits) }
-    }
-
-    /// JIT-path forward with rebindable batch. Returns `(B, 1)`.
-    pub fn forward_batch(
-        &self,
-        input_ids: &Tensor,
-        attention_mask: Option<&Tensor>,
-        b: &BoundVariable,
-    ) -> Result<Tensor> {
-        let hidden = self.model.forward_batch(input_ids, attention_mask, b)?;
-        self.classifier.forward(&hidden)
     }
 
     /// Download from HuggingFace Hub and load.

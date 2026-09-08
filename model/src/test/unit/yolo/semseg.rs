@@ -1,6 +1,6 @@
 use svod_dtype::DType;
+use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
-use svod_tensor::{Tensor, Variable};
 
 use crate::yolo::{Yolo26SemSeg, YoloConfig, YoloScale};
 
@@ -33,10 +33,7 @@ fn forward_shape_semseg() {
     let model = Yolo26SemSeg::with_zero_weights(cfg);
 
     let images = Tensor::zeros(&[1, 3, 320, 320], DType::Float32);
-    let var = Variable::new("b", 1, 1);
-    let b = var.bind(1).unwrap();
-
-    let out = model.forward(&images, &b).unwrap();
+    let out = model.forward(&images).unwrap();
     let shape = crate::test::max_dims(&out);
 
     // 320×320 → P3 at stride 8 → 40×40, nc=19

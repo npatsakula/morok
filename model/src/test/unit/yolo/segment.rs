@@ -1,6 +1,6 @@
 use svod_dtype::DType;
+use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
-use svod_tensor::{Tensor, Variable};
 
 use crate::yolo::{Yolo26Segment, YoloConfig, YoloScale};
 
@@ -27,9 +27,7 @@ fn forward_shape_segment() {
     let cfg = YoloConfig::new(YoloScale::Nano, 80);
     let model = Yolo26Segment::with_zero_weights(cfg);
     let images = Tensor::zeros(&[1, 3, 320, 320], DType::Float32);
-    let var = Variable::new("b", 1, 1);
-    let b = var.bind(1).unwrap();
-    let (preds, protos) = model.forward(&images, &b).unwrap();
+    let (preds, protos) = model.forward(&images).unwrap();
     let ps = crate::test::max_dims(&preds);
     // 4 + 80 + 32 = 116 channels, 2100 anchors
     assert_eq!(ps, vec![1, 116, 2100]);

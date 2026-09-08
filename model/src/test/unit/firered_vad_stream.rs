@@ -173,6 +173,31 @@ fn streaming_chunks_match_full_causal() {
     assert!(max_abs < 1e-4, "streamed probs drifted from full causal forward: max |delta| = {max_abs}");
 }
 
+/// `reset()` zeros the JIT's `state { caches: [..] }` slots, so a second pass
+/// over the same features must reproduce the first bit for bit — the cold
+/// start is the zero cache, not a fresh `prepare`.
+#[test]
+#[ignore = "heavy: streaming JIT compile + execute on random weights"]
+fn reset_restores_the_cold_start_caches() {
+    let model = FireRedVadStream::with_random_weights();
+    let n_frames = 2 * 16 + 7;
+    let mut seed = 0xd15ea5e;
+    let feat: Vec<f32> = (0..n_frames * N_MELS).map(|_| lcg(&mut seed)).collect();
+
+    let mut streamer = FireRedVadStreamer::builder().model(model).build().expect("prepare");
+    streamer.push_feat(&feat).expect("push");
+    streamer.flush().expect("flush");
+    let first = streamer.raw_probs().to_vec();
+
+    // Flush poisons the caches with the zero-padded tail; reset must undo it.
+    streamer.reset().expect("reset");
+    assert!(streamer.raw_probs().is_empty(), "reset must clear the prob history");
+    streamer.push_feat(&feat).expect("push after reset");
+    streamer.flush().expect("flush after reset");
+
+    assert_eq!(streamer.raw_probs(), first.as_slice(), "reset run diverged from the cold start");
+}
+
 /// Sample-path exactness: pushing audio in awkward block sizes (framing
 /// remainder + pending-row buffering + zero-filled flush tail all in play)
 /// must reproduce the whole-waveform fbank -> full causal forward.

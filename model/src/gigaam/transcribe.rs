@@ -289,8 +289,7 @@ impl GigaAmTranscriber {
                 // BAR (the old first-execute hang was tied to per-execute
                 // schedule re-instantiation under runtime vars; the plan is
                 // all-static now).
-                let mut enc_config = prepare_config.clone();
-                enc_config.device_local_outputs = true;
+                let enc_config = PrepareConfig::device_local();
                 scoped("encoder", || enc.prepare_with_config(mel_spec, lengths_spec, &enc_config))?;
                 encoder_jit = Some(enc);
                 // Decode lanes are independent of the encoder batch: wider
@@ -399,8 +398,8 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
             match &mut self.head_decoder {
                 HeadDecoder::Ctc { jit, decoder } => {
                     let t_pack = Instant::now();
-                    pack_mel_buffer(jit.mel_mut()?, &batch_mels, &chunk_lengths, n_mels, max_t_mel)?;
-                    pack_lengths_buffer(jit.lengths_mut()?, &chunk_lengths)?;
+                    pack_mel_buffer(jit.mel_view_mut::<f32>()?, &batch_mels, &chunk_lengths, n_mels, max_t_mel);
+                    pack_lengths_buffer(jit.lengths_view_mut::<i32>()?, &chunk_lengths);
                     t_mel += t_pack.elapsed();
 
                     let t_enc = Instant::now();
@@ -414,11 +413,10 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                     }
                     let total_vocab = decoder.total_vocab();
                     let item_stride = max_t_sub * total_vocab;
-                    let logits_buf = jit.output()?;
-                    let logits = logits_buf.as_array::<f32>()?;
-                    // `as_array` drains the async fused encoder+head dispatch.
+                    // The typed view drains the async fused encoder+head dispatch.
+                    let logits = jit.log_probs_view::<f32>()?;
                     t_encoder += t_enc.elapsed();
-                    let flat = logits.as_slice().expect("contiguous logits");
+                    let flat = logits.to_slice().expect("contiguous logits");
                     for (bi, mel_len) in chunk_lengths.iter().enumerate() {
                         let actual_sub = subsampled_len(subs_kernel_size, *mel_len);
                         // Frames span the decode window; frame_shift maps a frame
@@ -440,8 +438,8 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                 HeadDecoder::Rnnt { .. } => {
                     let enc_jit = self.encoder_jit.as_mut().expect("RN-T path has a standalone encoder JIT");
                     let t_pack = Instant::now();
-                    pack_mel_buffer(enc_jit.mel_mut()?, &batch_mels, &chunk_lengths, n_mels, max_t_mel)?;
-                    pack_lengths_buffer(enc_jit.lengths_mut()?, &chunk_lengths)?;
+                    pack_mel_buffer(enc_jit.mel_view_mut::<f32>()?, &batch_mels, &chunk_lengths, n_mels, max_t_mel);
+                    pack_lengths_buffer(enc_jit.lengths_view_mut::<i32>()?, &chunk_lengths);
                     t_mel += t_pack.elapsed();
 
                     let t_enc = Instant::now();
@@ -456,9 +454,8 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                     let item_stride = max_t_sub * d_model;
                     // Frame-major [B, max_t_sub, d_model]: one contiguous prefix
                     // copyout drains the dispatch and skips inactive lanes.
-                    let enc_buf = enc_jit.output()?;
                     let mut raw = vec![0f32; b * item_stride];
-                    enc_buf.copyout_prefix(bytemuck::cast_slice_mut(&mut raw))?;
+                    enc_jit.frames()?.copyout_prefix(bytemuck::cast_slice_mut(&mut raw))?;
                     t_encoder += t_enc.elapsed();
                     let flat: &[f32] = &raw;
                     // Lanes decouple from the encoder batch: collect every
@@ -537,17 +534,17 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
     }
 }
 
-/// Pack per-chunk mel features into a JIT mel input buffer
+/// Pack per-chunk mel features into a JIT mel input view
 /// `[max_batch, n_mels, max_t_mel]`, zero-padding unused rows/columns.
-/// `batch_mels[bi]` is a tight `[n_mels, chunk_lengths[bi]]` block.
+/// `batch_mels[bi]` is a tight `[n_mels, chunk_lengths[bi]]` block; the row
+/// stride differs between source and destination, so the copy stays explicit.
 fn pack_mel_buffer(
-    buf: &mut svod_device::Buffer,
+    mut view: ndarray::ArrayViewMutD<'_, f32>,
     batch_mels: &[Vec<f32>],
     chunk_lengths: &[usize],
     n_mels: usize,
     max_t_mel: usize,
-) -> Result<(), svod_device::error::Error> {
-    let mut view = buf.as_array_mut::<f32>()?;
+) {
     let slice = view.as_slice_mut().expect("contiguous mel buffer");
     slice.fill(0.0);
     for (bi, &valid) in chunk_lengths.iter().enumerate() {
@@ -558,20 +555,14 @@ fn pack_mel_buffer(
             slice[dst..dst + valid].copy_from_slice(&chunk_mel[src..src + valid]);
         }
     }
-    Ok(())
 }
 
-/// Pack per-chunk mel-frame counts into a JIT lengths buffer `[max_batch]`,
+/// Pack per-chunk mel-frame counts into a JIT lengths input view `[max_batch]`,
 /// zero-padding unused entries.
-fn pack_lengths_buffer(
-    buf: &mut svod_device::Buffer,
-    chunk_lengths: &[usize],
-) -> Result<(), svod_device::error::Error> {
-    let mut view = buf.as_array_mut::<i32>()?;
+fn pack_lengths_buffer(mut view: ndarray::ArrayViewMutD<'_, i32>, chunk_lengths: &[usize]) {
     let slice = view.as_slice_mut().expect("contiguous lengths buffer");
     slice.fill(0);
-    for (i, &len) in chunk_lengths.iter().enumerate() {
-        slice[i] = len as i32;
+    for (dst, &len) in slice.iter_mut().zip(chunk_lengths) {
+        *dst = len as i32;
     }
-    Ok(())
 }

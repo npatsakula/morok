@@ -16,8 +16,7 @@ fn prepare_and_execute_at_max_batch() {
     let max_batch = 1;
     let mut jit = build_jit(max_batch);
     jit.prepare(InputSpec::f32(&[max_batch, 1598, 80]), InputSpec::f32(&[max_batch, 799])).unwrap();
-    jit.execute_with_vars(&[("b", max_batch as i64)]).unwrap();
-    let out = jit.output().unwrap();
-    // [B, 256] = 1 * 256 = 256 f32 elements
-    assert_eq!(out.size(), max_batch * 256 * std::mem::size_of::<f32>());
+    jit.execute_bound(max_batch as i64).unwrap();
+    assert_eq!(jit.embeddings_shape().unwrap(), vec![max_batch, 256]);
+    assert_eq!(jit.embeddings_to_vec::<f32>().unwrap().len(), max_batch * 256);
 }

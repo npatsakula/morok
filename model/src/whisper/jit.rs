@@ -5,8 +5,6 @@
 //! language detection, token prefill, fixed-slot decoder steps, and alignment.
 #![allow(clippy::too_many_arguments)]
 
-extern crate self as svod_model;
-
 use svod_macros::jit_wrapper;
 
 use super::model::Whisper;

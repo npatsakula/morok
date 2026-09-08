@@ -22,9 +22,8 @@ use std::path::Path;
 
 use snafu::ResultExt;
 use svod_dtype::DType;
-use svod_ir::SInt;
+use svod_tensor::Tensor;
 use svod_tensor::nn::{BatchNorm2d, Conv2d, Layer, Linear, Module, StateDict};
-use svod_tensor::{BoundVariable, Tensor};
 
 use crate::blocks::{BlockKind, ResidualStage, batchnorm2d, conv2d, remap};
 
@@ -151,16 +150,9 @@ impl WeSpeakerResNet34 {
     // Forward
     // -----------------------------------------------------------------------
 
-    /// Run the full network on `feats` `[max_b, 1598, 80]` and `weights`
-    /// `[max_b, 799]`, shrunk to `batch` before the stem. Returns
-    /// `[B, 256]` embeddings.
-    pub fn forward(&self, feats: &Tensor, weights: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        let b = batch.as_sint();
-
-        // Shrink batch dim to live value
-        let feats = feats.try_shrink([Some((SInt::Const(0), b.clone())), None, None])?;
-        let weights = weights.try_shrink([Some((SInt::Const(0), b)), None])?;
-
+    /// Run the full network on `feats` `[B, 1598, 80]` and `weights`
+    /// `[B, 799]`. Returns `[B, 256]` embeddings.
+    pub fn forward(&self, feats: &Tensor, weights: &Tensor) -> Result<Tensor> {
         // (B, T=1598, F=80) -> (B, F, T) -> (B, 1, F, T)
         let x = feats.try_permute(&[0, 2, 1])?;
         let x = x.try_unsqueeze(1)?;
@@ -176,7 +168,7 @@ impl WeSpeakerResNet34 {
         // x is now (B, 256, 10, T_back) with T_back determined by the strided convs.
 
         // TSTP head: (B, C, H, T) + (B, T_w) -> (B, 2*C*H = 5120)
-        let stats = tstp_forward(&x, &weights)?;
+        let stats = tstp_forward(&x, weights)?;
 
         // seg_1: Linear(5120 -> 256)
         Ok(self.seg_1.forward(&stats)?)

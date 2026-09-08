@@ -3,8 +3,8 @@
 //! Full backbone (layers 0–10) + partial FPN top-down (layers 11–16) +
 //! Conv→Conv2d classifier on P3. Forward returns `[B, nc, H/8, W/8]` logits.
 
+use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv2d, Layer, Module, ResizeMode};
-use svod_tensor::{BoundVariable, Tensor};
 
 use crate::state::StateDict;
 
@@ -91,9 +91,8 @@ impl Yolo26SemSeg {
     }
 
     /// Run the full network. Returns `[B, nc, H/8, W/8]` per-pixel logits.
-    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        let x = loader::shrink_batch(images, batch)?;
-        let (l4, l6, l10) = self.backbone.forward(&x)?;
+    pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let (l4, l6, l10) = self.backbone.forward(images)?;
 
         // Partial FPN top-down (layers 11–16)
         let up = l10.upsample(&[2, 2], ResizeMode::Nearest)?;

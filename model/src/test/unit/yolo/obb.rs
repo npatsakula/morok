@@ -1,6 +1,6 @@
 use svod_dtype::DType;
+use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
-use svod_tensor::{Tensor, Variable};
 
 use crate::yolo::{Yolo26Obb, YoloConfig, YoloScale};
 
@@ -27,9 +27,7 @@ fn forward_shape_obb() {
     let cfg = YoloConfig::new(YoloScale::Nano, 80);
     let model = Yolo26Obb::with_zero_weights(cfg);
     let images = Tensor::zeros(&[1, 3, 320, 320], DType::Float32);
-    let var = Variable::new("b", 1, 1);
-    let b = var.bind(1).unwrap();
-    let out = model.forward(&images, &b).unwrap();
+    let out = model.forward(&images).unwrap();
     let shape = crate::test::max_dims(&out);
     // 4 + 80 + 1 = 85 channels, 2100 anchors
     assert_eq!(shape, vec![1, 85, 2100]);

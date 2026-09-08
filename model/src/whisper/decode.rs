@@ -1159,14 +1159,16 @@ pub(crate) fn copy_device_cache_row(
 }
 
 /// Read one lane's logits row `[n_vocab]` from the batched JIT output.
-fn read_logits_row(jit: &mut WhisperDecoderStepJit, row: usize, n_vocab: usize) -> Result<Vec<f32>> {
-    let buf = jit.logits()?;
-    let src = buf.as_host_bytes()?;
-    let row_bytes = n_vocab.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| decode_err("logits row overflow"))?;
-    let off = row.checked_mul(row_bytes).ok_or_else(|| decode_err("logits offset overflow"))?;
-    let end = off.checked_add(row_bytes).ok_or_else(|| decode_err("logits end overflow"))?;
-    let logits = src.get(off..end).ok_or_else(|| decode_err("logits row is out of bounds"))?;
-    Ok(bytemuck::cast_slice(logits).to_vec())
+fn read_logits_row(jit: &WhisperDecoderStepJit, row: usize, n_vocab: usize) -> Result<Vec<f32>> {
+    let logits = jit.logits_view::<f32>()?;
+    if row >= logits.shape()[0] {
+        return Err(decode_err("logits row is out of bounds"));
+    }
+    let logits = logits.index_axis(ndarray::Axis(0), row);
+    if logits.len() != n_vocab {
+        return Err(decode_err("logits row width does not match the vocabulary"));
+    }
+    Ok(logits.iter().copied().collect())
 }
 
 // ─── Cached beam search ─────────────────────────────────────────────────────
@@ -1386,10 +1388,7 @@ fn execute_prefill(
 
     // Read logits from output 0
     let started = begin_host_copy(copies.is_some(), prefill_jit.logits()?)?;
-    let prefill_logits = {
-        let buf = prefill_jit.logits()?;
-        read_buf(buf, buf.size() / std::mem::size_of::<f32>())?
-    };
+    let prefill_logits = prefill_jit.logits_to_vec::<f32>()?;
     if let (Some(copies), Some(started)) = (copies, started) {
         copies.d2h("prefill_logits", 1, prefill_logits.len() * std::mem::size_of::<f32>(), started.elapsed());
     }

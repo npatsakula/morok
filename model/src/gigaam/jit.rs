@@ -2,11 +2,6 @@
 //! the head-side path (CTC log-probs computed by `CtcHeadJit`, RN-T frames
 //! consumed by the predictor/joint step JITs) sees a uniform dtype regardless
 //! of whether the encoder ran in fp16, bf16, or fp32.
-//!
-//! The `jit_wrapper!` macro expands to `svod_model::jit::*` paths, so this
-//! file needs the `extern crate self as svod_model;` binding in scope.
-
-extern crate self as svod_model;
 
 use svod_macros::jit_wrapper;
 
@@ -16,6 +11,8 @@ jit_wrapper! {
     GigaAmEncoderJit(GigaAm) {
         mel: Tensor,
         lengths: Tensor,
+
+        outputs { frames },
 
         build(mel, lengths) {
             let out = model.encoder.forward_batch(mel, lengths)?;

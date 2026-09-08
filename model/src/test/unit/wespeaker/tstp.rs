@@ -21,10 +21,7 @@ fn forward_zero_weights_shape() {
     let feats = Tensor::zeros(&[1, 1598, 80], DType::Float32);
     let weights = Tensor::ones(&[1, 799], DType::Float32);
 
-    let var = svod_tensor::Variable::new("b", 1, 1);
-    let b = var.bind(1).unwrap();
-
-    let out = model.forward(&feats, &weights, &b).unwrap();
+    let out = model.forward(&feats, &weights).unwrap();
 
     let shape = crate::test::max_dims(&out);
     assert_eq!(shape, vec![1, 256]);
@@ -41,10 +38,7 @@ fn forward_zero_weights_realize() {
     let feats = Tensor::zeros(&[1, 1598, 80], DType::Float32);
     let weights = Tensor::ones(&[1, 799], DType::Float32);
 
-    let var = svod_tensor::Variable::new("b", 1, 1);
-    let b = var.bind(1).unwrap();
-
-    let out = model.forward(&feats, &weights, &b).unwrap();
+    let out = model.forward(&feats, &weights).unwrap();
     out.realize().unwrap();
 
     let shape = crate::test::max_dims(&out);

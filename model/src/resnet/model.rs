@@ -18,8 +18,8 @@
 use std::path::Path;
 
 use svod_dtype::DType;
+use svod_tensor::Tensor;
 use svod_tensor::nn::{BatchNorm2d, Conv2d, Layer, Linear, Module};
-use svod_tensor::{BoundVariable, Tensor};
 
 use crate::blocks::{ResidualStage, batchnorm2d, conv2d};
 use crate::init::fan_in_uniform;
@@ -141,16 +141,11 @@ impl ResNet {
     // Forward
     // -----------------------------------------------------------------------
 
-    /// Run the full network on `images` `[max_b, 3, H, W]`, shrunk to the
-    /// `batch` variable's bound value before the stem. Returns either
+    /// Run the full network on `images` `[B, 3, H, W]`. Returns either
     /// classification logits `[B, num_classes]` or the final feature map
-    /// `[B, 512*exp, H/32, W/32]`, depending on
-    /// [`ResNetConfig::output`].
-    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        let b = batch.as_sint();
-
-        let x = images.narrow(0, 0usize, b)?;
-        let x = self.stem_bn.forward(&self.stem_conv.forward(&x)?)?.relu()?;
+    /// `[B, 512*exp, H/32, W/32]`, depending on [`ResNetConfig::output`].
+    pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let x = self.stem_bn.forward(&self.stem_conv.forward(images)?)?.relu()?;
         let x = x.max_pool2d().kernel_size(&[3, 3]).stride(&[2, 2]).padding(&[(1, 1), (1, 1)]).call()?;
 
         let x = self.stage1.forward(&x)?;

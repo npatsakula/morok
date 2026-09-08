@@ -19,8 +19,6 @@
 //! field (±`HALO`) of real context and the stitched output equals a
 //! single full-length forward up to float reassociation.
 
-extern crate self as svod_model;
-
 mod fbank;
 mod splitter;
 mod stream;
@@ -297,12 +295,10 @@ impl FireRedVadInference {
     pub fn new(model: FireRedVad) -> crate::jit::Result<Self> {
         use crate::jit::InputSpec;
         let mut jit = FireRedVadJit::new(model);
-        let mut config = svod_tensor::PrepareConfig::from_env();
-        config.device_local_outputs = true;
         jit.prepare_with_config(
             InputSpec::f32(&[BATCH, CHUNK_T, N_MELS]),
             InputSpec::f32(&[BATCH, CHUNK_T, 1]),
-            &config,
+            &svod_tensor::PrepareConfig::device_local(),
         )?;
         Ok(Self { jit })
     }
@@ -336,8 +332,7 @@ impl FireRedVadInference {
                 (src_lo, src_hi, (src_lo as isize - start) as usize)
             };
             {
-                let buf = self.jit.feat_mut()?;
-                let mut view = buf.as_array_mut::<f32>()?;
+                let mut view = self.jit.feat_view_mut::<f32>()?;
                 let slice = view.as_slice_mut().expect("contiguous feat");
                 slice[..b * CHUNK_T * N_MELS].fill(0.0);
                 for i in 0..b {
@@ -348,8 +343,7 @@ impl FireRedVadInference {
                 }
             }
             {
-                let buf = self.jit.valid_mut()?;
-                let mut view = buf.as_array_mut::<f32>()?;
+                let mut view = self.jit.valid_view_mut::<f32>()?;
                 let slice = view.as_slice_mut().expect("contiguous valid");
                 slice[..b * CHUNK_T].fill(0.0);
                 for i in 0..b {

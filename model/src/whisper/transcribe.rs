@@ -157,9 +157,7 @@ impl WhisperRecognizer {
         // Encoder JIT: [max_batch, n_mels, N_FRAMES], device-local output
         let mut encoder_jit = WhisperEncoderJit::new(model.clone());
         let mel_spec = InputSpec::f32(&[max_batch, n_mels, N_FRAMES]);
-        let mut enc_config = prepare_config.clone();
-        enc_config.device_local_outputs = true;
-        encoder_jit.prepare_with_config(mel_spec, &enc_config)?;
+        encoder_jit.prepare_with_config(mel_spec, &PrepareConfig::device_local())?;
 
         let n_text_state = model.dims.n_text_state;
         let n_text_layer = model.dims.n_text_layer;
@@ -179,9 +177,10 @@ impl WhisperRecognizer {
         // Cross-attention K/V projection is token-independent. Compile it once
         // and execute it once per encoder window, before any fallback attempts.
         let mut cross_kv_jit = WhisperCrossKvJit::new(model.clone());
-        let mut cross_config = prepare_config.clone();
-        cross_config.device_local_outputs = true;
-        cross_kv_jit.prepare_with_config(InputSpec::f32(&[1, N_AUDIO_CTX, model.dims.n_text_state]), &cross_config)?;
+        cross_kv_jit.prepare_with_config(
+            InputSpec::f32(&[1, N_AUDIO_CTX, model.dims.n_text_state]),
+            &PrepareConfig::device_local(),
+        )?;
 
         // Timestamp-enabled prefill has a structural, model-specific prefix:
         // multilingual [SOT, language, task], English-only [SOT].

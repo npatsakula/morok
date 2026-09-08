@@ -11,11 +11,6 @@
 //! The RN-T path still uses the standalone [`crate::gigaam::GigaAmEncoderJit`]
 //! — it shares the encoder with per-step predictor/joint JITs, so the encoder
 //! output genuinely *is* a reused boundary there.
-//!
-//! The `jit_wrapper!` macro expands to `svod_model::jit::*` paths, so this
-//! file needs the `extern crate self as svod_model;` binding in scope.
-
-extern crate self as svod_model;
 
 use svod_macros::jit_wrapper;
 
@@ -25,6 +20,8 @@ jit_wrapper! {
     GigaAmCtcJit(GigaAm) {
         mel: Tensor,
         lengths: Tensor,
+
+        outputs { log_probs },
 
         build(mel, lengths) {
             let out = model.encoder.forward_batch(mel, lengths)?;

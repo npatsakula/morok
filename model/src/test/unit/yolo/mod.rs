@@ -4,6 +4,7 @@ mod depth;
 mod detect_p2;
 mod detect_p6;
 mod head;
+mod jit;
 mod model;
 mod obb;
 mod parity;

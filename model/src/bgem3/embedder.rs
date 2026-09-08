@@ -9,7 +9,7 @@
 //! + `sparse_linear.pt` + `colbert_linear.pt` (heads).
 
 use snafu::OptionExt;
-use svod_tensor::{BoundVariable, Tensor};
+use svod_tensor::Tensor;
 
 use crate::xlm_roberta::config::XlmRobertaConfig;
 use crate::xlm_roberta::error::{MissingHeadSnafu, Result};
@@ -93,21 +93,9 @@ impl BgeM3 {
         if self.normalize_dense { Ok(dense.lp_normalize(-1, 2)?) } else { Ok(dense) }
     }
 
-    /// JIT-path dense forward with rebindable batch. Returns `(B, D)`.
-    pub fn encode_dense_batch(&self, input_ids: &Tensor, attention_mask: &Tensor, b: &BoundVariable) -> Result<Tensor> {
-        let hidden = self.model.forward_batch(input_ids, Some(attention_mask), b)?;
-        let dense = hidden.take_index(1, 0)?;
-        if self.normalize_dense { Ok(dense.lp_normalize(-1, 2)?) } else { Ok(dense) }
-    }
-
-    /// JIT-path ColBERT forward with rebindable batch. Returns `(B, L-1, Dc)`.
-    pub fn encode_colbert_batch(
-        &self,
-        input_ids: &Tensor,
-        attention_mask: &Tensor,
-        b: &BoundVariable,
-    ) -> Result<Tensor> {
-        let hidden = self.model.forward_batch(input_ids, Some(attention_mask), b)?;
+    /// ColBERT-only forward. Returns `(B, L-1, Dc)`.
+    pub fn encode_colbert(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+        let hidden = self.model.forward(input_ids, Some(attention_mask))?;
         let head = self.colbert_head.as_ref().context(MissingHeadSnafu { head: "colbert" })?;
         head.forward(&hidden, Some(attention_mask))
     }

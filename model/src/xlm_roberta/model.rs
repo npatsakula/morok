@@ -8,9 +8,8 @@
 use std::path::Path;
 
 use snafu::ResultExt;
-use svod_ir::SInt;
+use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
-use svod_tensor::{BoundVariable, Tensor};
 
 use crate::state::{self, StateDict};
 
@@ -49,24 +48,6 @@ impl XlmRobertaModel {
     pub fn forward(&self, input_ids: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
         let x = self.embeddings.forward(input_ids)?;
         self.encoder.forward(&x, padding_mask)
-    }
-
-    /// JIT-path variant: `input_ids` / `padding_mask` are sized for the JIT
-    /// plan's `max_batch`; `b` shrinks the leading batch dim to the live value
-    /// at execute time.
-    pub fn forward_batch(
-        &self,
-        input_ids: &Tensor,
-        padding_mask: Option<&Tensor>,
-        b: &BoundVariable,
-    ) -> Result<Tensor> {
-        let bv = b.as_sint();
-        let input_ids = input_ids.try_shrink([Some((SInt::Const(0), bv.clone())), None])?;
-        let padding_mask = match padding_mask {
-            Some(m) => Some(m.try_shrink([Some((SInt::Const(0), bv)), None])?),
-            None => None,
-        };
-        self.forward(&input_ids, padding_mask.as_ref())
     }
 
     /// Download `config.json` + `pytorch_model.bin` from a HuggingFace Hub

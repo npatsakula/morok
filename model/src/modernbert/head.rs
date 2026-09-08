@@ -17,8 +17,8 @@
 
 use std::path::Path;
 
+use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, LayerNorm, Module, StateDict, get_tensor, prefixed};
-use svod_tensor::{BoundVariable, Tensor};
 
 use crate::init::{fan_in_uniform, zeros};
 use crate::state;
@@ -130,18 +130,6 @@ impl ModernBertForMaskedLm {
     /// bool → logits `(B, L, V)`.
     pub fn forward(&self, input_ids: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
         let hidden = self.bert.forward(input_ids, padding_mask)?;
-        self.head.forward(&hidden)
-    }
-
-    /// JIT-path variant: shrinks the leading batch dim to the live value at
-    /// execute time. See [`ModernBert::forward_batch`].
-    pub fn forward_batch(
-        &self,
-        input_ids: &Tensor,
-        padding_mask: Option<&Tensor>,
-        b: &BoundVariable,
-    ) -> Result<Tensor> {
-        let hidden = self.bert.forward_batch(input_ids, padding_mask, b)?;
         self.head.forward(&hidden)
     }
 
