@@ -25,7 +25,7 @@ For architecture details, see the [documentation site](https://npatsakula.github
 | [ir](ir/) | UOp graph IR: 80+ ops, symbolic integers, origins |
 | [device](device/) | Buffer management: lazy alloc, zero-copy views, LRU caching |
 | [schedule](schedule/) | Optimization engine: 20+ passes, RANGEIFY, Z3 verification |
-| [codegen](codegen/) | Code generation: Clang (default), LLVM JIT |
+| [codegen](codegen/) | Code generation: LLVM IR (default), Clang C |
 | [runtime](runtime/) | JIT compilation and kernel execution |
 | [tensor](tensor/) | High-level lazy tensor API |
 | [onnx](onnx/) | ONNX model importer |
@@ -43,14 +43,15 @@ let a = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
 let b = Tensor::from_ndarray(&array![[5.0f32, 6.0], [7.0, 8.0]]);
 
 // Lazy — nothing executes yet
-let c = &a + &b;
+let mut c = &a + &b;
 
-// Compile, execute, extract as ndarray
-let result = c.to_ndarray::<f32>()?;
+// Compile and execute, then extract as ndarray
+c.realize()?;
+let result = c.as_ndarray::<f32>()?;
 assert_eq!(result, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
 
 // Or extract as flat Vec
-let flat = c.to_vec::<f32>()?;
+let flat = c.as_vec::<f32>()?;
 assert_eq!(flat, vec![6.0, 8.0, 10.0, 12.0]);
 ```
 
@@ -92,16 +93,16 @@ nix fmt # Format source files
 
 | Dependency | Version | Required | Description |
 |------------|---------|----------|-------------|
-| Rust | 1.85+ | yes | Edition 2024 |
-| LLVM | 21.x | yes | CPU code generation backend |
-| Clang | - | yes | C compiler for LLVM builds |
+| Rust | 1.88+ | yes | Edition 2024, let-chains |
+| LLVM | >=16 | yes | CPU code generation backend: `libLLVM` loaded at runtime (Nix pins 22.x) |
+| Clang | - | yes | C backend, and the object fallback when `libLLVM` is absent |
 | pkgconf | - | yes | Build configuration tool |
 | protobuf | - | yes | ONNX proto compilation |
 | zlib | >=1.3 | yes | Compression library |
 | libffi | >=3.4 | yes | Foreign function interface |
 | libxml2 | >=2.13 | yes | XML parsing |
 | Z3 | >=4.15 | no | SMT solver for optimization verification |
-| NVIDIA driver | CUDA >=12.8 (R570) | no | `libcuda.so.1` for the CUDA backend, loaded at runtime; no toolkit needed |
+| NVIDIA driver | CUDA >=12.0 (R525) | no | `libcuda.so.1` for the CUDA backend, loaded at runtime; no toolkit needed |
 | Clang NVPTX / AMDGPU targets | - | no | GPU kernel compilation (`clang --print-targets`) |
 
 ### Threads

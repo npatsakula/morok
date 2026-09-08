@@ -29,7 +29,7 @@ ML-компилятор на Rust, вдохновлённый [Tinygrad](https:/
 | [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp-граф IR: 80+ операций, символьные целые, происхождение ядер |
 | [device](https://github.com/npatsakula/svod/tree/main/device/) | Управление буферами: ленивое выделение, zero-copy view, LRU-кэширование |
 | [schedule](https://github.com/npatsakula/svod/tree/main/schedule/) | Движок оптимизаций: 20+ проходов, RANGEIFY, Z3-верификация |
-| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | Кодогенерация: Clang (по умолчанию), LLVM JIT |
+| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | Кодогенерация: LLVM IR (по умолчанию), Clang C |
 | [runtime](https://github.com/npatsakula/svod/tree/main/runtime/) | JIT-компиляция и выполнение ядер |
 | [tensor](https://github.com/npatsakula/svod/tree/main/tensor/) | Высокоуровневый API ленивых тензоров |
 | [onnx](https://github.com/npatsakula/svod/tree/main/onnx/) | Импортер ONNX-моделей |
@@ -48,11 +48,15 @@ let b = Tensor::from_ndarray(&array![[5.0f32, 6.0], [7.0, 8.0]]);
 
 // Lazy — nothing executes yet
 let mut c = &a + &b;
-c.realize()?;
 
-// Zero-copy view into the result
-let view = c.array_view::<f32>()?;
-assert_eq!(view, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
+// Compile and execute, then extract as ndarray
+c.realize()?;
+let result = c.as_ndarray::<f32>()?;
+assert_eq!(result, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
+
+// Or extract as flat Vec
+let flat = c.as_vec::<f32>()?;
+assert_eq!(flat, vec![6.0, 8.0, 10.0, 12.0]);
 ```
 
 ## Пример DSL паттернов
@@ -93,17 +97,24 @@ nix fmt # Format source files
 
 | Зависимость | Версия | Обязательна | Описание |
 |-------------|--------|-------------|----------|
-| Rust | 1.85+ | да | Edition 2024 |
-| LLVM | 22.x | да | Backend кодогенерации для CPU |
-| Clang | - | да | C-компилятор для сборки LLVM |
+| Rust | 1.88+ | да | Edition 2024, let-chains |
+| LLVM | >=16 | да | Backend кодогенерации для CPU: `libLLVM` загружается во время выполнения (в Nix зафиксирована 22.x) |
+| Clang | - | да | Clang-бэкенд и запасной путь получения объектных файлов, когда `libLLVM` недоступна |
 | pkgconf | - | да | Инструмент конфигурации сборки |
 | protobuf | - | да | Компиляция ONNX proto |
 | zlib | >=1.3 | да | Библиотека сжатия |
 | libffi | >=3.4 | да | Foreign function interface |
 | libxml2 | >=2.13 | да | Парсинг XML |
 | Z3 | >=4.15 | нет | SMT-решатель для верификации оптимизаций |
-| Драйвер NVIDIA | CUDA >=12.8 (R570) | нет | `libcuda.so.1` для CUDA-бэкенда, загружается во время выполнения; тулкит не нужен |
+| Драйвер NVIDIA | CUDA >=12.0 (R525) | нет | `libcuda.so.1` для CUDA-бэкенда, загружается во время выполнения; тулкит не нужен |
 | Таргеты Clang NVPTX / AMDGPU | - | нет | Компиляция GPU-ядер (`clang --print-targets`) |
+
+### Потоки
+
+`SVOD_THREADS` (по умолчанию: параллелизм хоста) — единый бюджет потоков: он
+задаёт размер пула, который компилирует ядра и выполняет CPU-ядра, а также
+служит разбиением CPU-ядер по `core_id` по умолчанию. `RAYON_NUM_THREADS` не
+учитывается.
 
 ## Тестирование
 

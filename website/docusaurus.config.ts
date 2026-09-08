@@ -7,6 +7,9 @@ const config: Config = {
   tagline: "Rust-based ML compiler with UOp IR",
   favicon: "img/favicon.ico",
 
+  // `v4` turns off every MDX v1 compatibility shim, `mdx1Compat.admonitions`
+  // among them, so admonition titles must use the directive-label form
+  // (`:::tip[Title]`); the legacy `:::tip Title` renders its title as body text.
   future: {
     v4: true,
   },

@@ -19,7 +19,7 @@ ONNX-импортёр Svod — рекомендуемый способ инфе�
 
 **Сравнение с другими фреймворками**
 
-Среди чистых Rust-фреймворков у Svod самое широкое покрытие операторов ONNX — 162 оператора, 1361 пройденный conformance-тест на двух бэкендах (Clang + LLVM). У `candle` и `burn` операторов меньше, а тестовых наборов сопоставимого масштаба нет. Если же нужна максимальная совместимость с продакшн-моделями ONNX — используйте `ort`, Rust-обёртку вокруг C++ ONNX Runtime, которая покрывает полную спецификацию.
+Среди чистых Rust-фреймворков у Svod самое широкое покрытие операторов ONNX — 162 оператора, 1357 пройденный conformance-тест на обоих CPU-бэкендах (Clang и LLVM); тот же набор запускается и на устройствах AMD и CUDA, когда их выбирает `SVOD_DEVICE`. У `candle` и `burn` операторов меньше, а тестовых наборов сопоставимого масштаба нет. Если же нужна максимальная совместимость с продакшн-моделями ONNX — используйте `ort`, Rust-обёртку вокруг C++ ONNX Runtime, которая покрывает полную спецификацию.
 
 ---
 
@@ -46,8 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let OnnxModel { mut outputs, .. } = importer.import("model.onnx", &[])?;
 
     // Подготавливаем все выходы вместе, выполняем за один проход
-    let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
-    Tensor::realize_batch(&mut outs)?;
+    let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    Tensor::realize_batch(outs)?;
 
     for (name, tensor) in &outputs {
         println!("{name}: {:?}", tensor.as_ndarray::<f32>()?);
@@ -74,8 +74,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Подготавливаем все выходы вместе, выполняем за один проход
     // (внутренне резолвит assign входов — отдельный realize не нужен)
-    let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
-    Tensor::realize_batch(&mut outs)?;
+    let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    Tensor::realize_batch(outs)?;
     Ok(())
 }
 ```
@@ -175,15 +175,21 @@ for (name, spec) in &graph.inputs {
 }
 ```
 
-### Внешние веса
+### Внешние веса и готовые входы
 
-Некоторые ONNX-модели хранят веса в отдельных файлах. Чтобы передать их, используйте `import_model_with_inputs()`:
+Веса, лежащие вне файла `.onnx` (`data_location = EXTERNAL`), не требуют
+отдельного вызова: `import()` находит их относительно каталога самой модели.
+
+Чтобы передать импортёру входные тензоры самостоятельно — например, конкретные
+значения, которые операторы читают во время трассировки, — используйте
+`import_model_with_inputs()` с уже распарсенным `ModelProto`:
 
 ```rust
+let model_proto = ModelProto::decode(bytes)?;
 let model = importer.import_model_with_inputs(
-    "model.onnx",
+    model_proto,
+    inputs,  // HashMap<String, Tensor>
     &[],
-    external_weights,  // HashMap<String, Tensor>
 )?;
 ```
 
@@ -230,8 +236,8 @@ Svod:   then_result.where_(&condition, &else_result)
 
 ```rust
 // Realize all outputs at once (shares compilation and execution)
-let mut outputs: Vec<&mut Tensor> = model.outputs.values_mut().collect();
-Tensor::realize_batch(&mut outputs)?;
+let outputs: Vec<&mut Tensor> = model.outputs.values_mut().collect();
+Tensor::realize_batch(outputs)?;
 ```
 
 Для повторного инференса используйте паттерн prepare/execute (тестируется в
@@ -246,8 +252,8 @@ let input = inputs.remove("audio").unwrap();
 input.assign(&Tensor::from_slice(&first_frame));
 
 // 2. Compile the execution plan (resolves assigns, allocates buffers)
-let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
-let mut plan = Tensor::prepare_batch(&mut outs)?;
+let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+let mut plan = Tensor::prepare_batch(outs)?;
 plan.execute()?;  // first run
 
 // 3. Fast loop: zero-copy writes via array_view_mut, no recompilation
@@ -317,8 +323,8 @@ println!("Variables: {:?}", model.variables.keys().collect::<Vec<_>>());
 | **Простой импорт** | `importer.import("model.onnx", &[])?` |
 | **Динамические размерности** | `importer.import(path, &[("batch", 4)])?` |
 | **Операторы** | 162 / 200 ([полная таблица паритета](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)) |
-| **Проверенные модели** | ResNet50, DenseNet121, VGG19, Inception, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
-| **Бэкенды** | Clang + LLVM (идентичные результаты) |
+| **Проверенные модели** | ResNet50, DenseNet121, VGG19, Inception v1/v2, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
+| **Бэкенды** | Clang + LLVM на CPU (идентичные результаты); AMD и CUDA, когда `SVOD_DEVICE` выбирает GPU |
 | **Расширения** | com.microsoft Attention, RotaryEmbedding, SkipLayerNorm, EmbedLayerNorm |
 | **Ограничения** | Нет обучения, нет Loop/Scan, shape-полиморфный If |
 

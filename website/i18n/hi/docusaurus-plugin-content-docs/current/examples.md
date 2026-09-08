@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 4. `as_ndarray()` रिज़ल्ट को `ndarray::ArrayD` के रूप में निकालता है ताकि आप देख सकें।
 
-**यह करके देखें:** `realize()` कॉल हटा दें। कोड तब भी चलेगा, लेकिन `data` खाली होगा — कुछ भी कम्प्यूट नहीं हुआ।
+**यह करके देखें:** `realize()` कॉल हटा दें। तब `as_ndarray()` "no buffer" एरर के साथ फ़ेल होगा — कुछ भी कम्प्यूट नहीं हुआ, इसलिए पढ़ने के लिए कोई रिज़ल्ट ही नहीं है।
 
 ---
 
@@ -70,6 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 न्यूरल नेटवर्क लगातार डेटा को reshape करते हैं। चलिए बेसिक्स सीखते हैं।
 
 ```rust
+use svod_tensor::Tensor;
 use ndarray::array;
 
 fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,7 +80,7 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Reshape to a 2x3 matrix (or create directly with from_ndarray)
     let matrix = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-    println!("Matrix shape: {:?}", matrix.shape());  // [2, 3]
+    println!("Matrix shape: {:?}", matrix.shape()?);  // [2, 3]
     // [[1, 2, 3],
     //  [4, 5, 6]]
 
@@ -133,6 +134,7 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
 मैट्रिक्स मल्टिप्लिकेशन न्यूरल नेटवर्क का वर्कहॉर्स है। हर लेयर इसे इस्तेमाल करती है।
 
 ```rust
+use svod_tensor::Tensor;
 use ndarray::array;
 
 fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
@@ -156,7 +158,7 @@ fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
 
     output.realize()?;
     println!("Output shape: {:?}", output.shape()?);  // [4, 2]
-    println!("{:?}", biased.as_ndarray::<f32>()?);
+    println!("{:?}", output.as_ndarray::<f32>()?);
     // Each row: weighted sum of that sample's features
 
     Ok(())
@@ -194,7 +196,7 @@ fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
     let mut output = layer.forward(&input)?;
 
     output.realize()?;
-    println!("Output: {:?}", biased.as_ndarray::<f32>()?);
+    println!("Output: {:?}", output.as_ndarray::<f32>()?);
 
     Ok(())
 }
@@ -236,12 +238,12 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get results
     probs.realize()?;
-    println!("Probabilities: {:?}", probs_biased.as_ndarray::<f32>()?);
+    println!("Probabilities: {:?}", probs.as_ndarray::<f32>()?);
 
     // Get predicted class
     let mut prediction = logits.argmax(Some(-1))?;
     prediction.realize()?;
-    println!("Predicted digit: {:?}", pred_output.as_ndarray::<i32>()?);
+    println!("Predicted digit: {:?}", prediction.as_ndarray::<i32>()?);
 
     Ok(())
 }
@@ -263,9 +265,11 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ## उदाहरण 6: अंदर की बात
 
-जानना चाहते हैं कि Svod क्या जनरेट करता है? IR और जनरेटेड कोड कैसे देखें, यह रहा।
+जानना चाहते हैं कि Svod क्या जनरेट करता है? IR और कम्पाइल किए गए कर्नेल कैसे देखें, यह रहा।
 
 ```rust
+use svod_tensor::Tensor;
+
 fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
     let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
     let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
@@ -290,7 +294,7 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 1. **IR Graph:** UOp tree `BUFFER`, `LOAD`, `ADD`, `STORE` जैसे ऑपरेशन दिखाता है। यह ऑप्टिमाइज़ेशन से पहले Svod का इंटरमीडिएट रिप्रेज़ेंटेशन है।
 
-2. **जनरेटेड कोड:** वास्तविक LLVM IR या GPU कोड जो रन होता है। ध्यान दें कि Svod loads और add को एक सिंगल कर्नेल में फ़्यूज़ करता है — कोई इंटरमीडिएट बफ़र नहीं चाहिए।
+2. **एक्ज़ीक्यूशन प्लान:** `prepare()` कम्पाइल किए गए कर्नेल लौटाता है। ध्यान दें कि Svod दोनों loads और add को एक ही कर्नेल में फ़्यूज़ करता है — कोई इंटरमीडिएट बफ़र नहीं चाहिए।
 
 **डीबगिंग टिप:** अगर कुछ स्लो या गलत लगे, तो IR tree प्रिंट करें। देखें:
 - अनएक्सपेक्टेड ऑपरेशन (रिडंडेंट reshapes, एक्स्ट्रा कॉपीज़)
@@ -314,8 +318,8 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 | लेयर चेन करें | `x.sequential(&[&fc1, &Relu, &fc2])?` |
 | एक्टिवेशन | `t.relu()?`, `t.softmax(-1)?` |
 | एक्ज़ीक्यूट करें | `t.realize()?` |
-| बैच realize | `Tensor::realize_batch(&mut [&mut a, &mut b])?` |
-| डेटा निकालें | `biased.as_ndarray::<f32>()?` |
+| बैच realize | `Tensor::realize_batch([&mut a, &mut b])?` |
+| डेटा निकालें | `t.as_ndarray::<f32>()?` |
 
 **Lazy evaluation पैटर्न:**
 
