@@ -34,6 +34,7 @@ sidebar_label: ओवरव्यू
   - Local: एक वर्कग्रुप के अंदर पैरेलल
   - Reduce: Accumulator (sum, max, आदि)
   - Loop: सीक्वेंशियल इटरेशन
+  - Upcast / Unroll: expander इन्हें lanes में एक्सपैंड कर देता है
 
 **स्टेज**
 - कोड पर एक ट्रांसफ़ॉर्मेशन पास
@@ -73,11 +74,12 @@ flowchart TD
 
 कई पास नंबर्ड स्टेजों के बीच चलते हैं और उनका अपना स्टेज नंबर नहीं होता:
 
-| पास | कौन से स्टेजों के बीच | उद्देश्य |
-|-----|----------------------|----------|
-| `linearize_multi_index` | Stage 8 से पहले | मल्टी-डायमेंशनल indices को लीनियर offsets में फ़्लैटन करें |
-| `pm_bool_devectorize` | 14-15 | Boolean वेक्टर patterns हैंडल करें |
-| `pm_reduce_devectorize` | 14-15 | वेक्टर reductions हैंडल करें (K-vec, bool, horizontal) |
-| `merge_sibling_ends` | 14-15 | साथ वाले END ऑपरेशन मर्ज करें |
-| `pm_float_decomp` | Post-opt | फ़्लोटिंग-पॉइंट ऑपरेशन डीकम्पोज़ करें |
-| `bool_storage_patterns` | Post-opt | मेमोरी ऑपरेशन के लिए bool ↔ uint8 कन्वर्ट करें |
+| पास | कहाँ चलता है | उद्देश्य |
+|-----|--------------|----------|
+| `bool_storage_patterns` | Stage 14 के अंदर | मेमोरी ऑपरेशन के लिए bool ↔ uint8 कन्वर्ट करें |
+| `indexing_simplify` | Stage 14 और 15 के अंदर | scalarization से खुलने वाला addressing arithmetic फ़ोल्ड करें |
+| `sym()` (early symbolic) | 14-15 | ग्राफ़ scalar हो जाने के बाद पूरा symbolic सिम्प्लिफ़िकेशन |
+| `memory_coalescing` | 14-15 | पड़ोसी accesses को चौड़े accesses में मर्ज करें |
+| `pm_simplify_add_image` | 14-15 (bottom-up) | Image dtype की address सिम्प्लिफ़िकेशन |
+| `pm_float_decomp` / `pm_long_decomp` | Stage 18 के अंदर | टारगेट में मौजूद न होने वाले dtypes एमुलेट करें (FP8/BF16, 64-बिट ints) |
+| `pm_move_gates_from_index` | 18-19 | index validity को LOAD/STORE के `gate` फ़ील्ड पर ले जाएँ |

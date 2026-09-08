@@ -4,7 +4,7 @@ sidebar_label: JIT ग्राफ़
 
 # JIT ग्राफ़
 
-एक streaming ASR pipeline वही encoder सैकड़ों बार call करती है। हर call पर tensor graph बनाना, उसे optimize करना, kernel source generate करना, उसे [clang](../backends/jit-loader.md) से compile करना, और device buffers allocate करना — यह सब वह काम है जो input पर निर्भर नहीं है, और हर बार दोहराना बर्बादी है।
+एक streaming ASR pipeline वही encoder सैकड़ों बार call करती है। हर call पर tensor graph बनाना, उसे optimize करना, kernel source generate करना, उसे backend के [JIT loader](../backends/jit-loader.md) के ज़रिए compile करना, और device buffers allocate करना — यह सब वह काम है जो input पर निर्भर नहीं है, और हर बार दोहराना बर्बादी है।
 
 `jit_wrapper!` macro और `model::jit` runtime layer उस build-once / run-many pattern को **एक typed Rust struct** में बदल देते हैं। आप inputs और graph declare करते हैं; macro एक wrapper generate करता है जो `prepare()` के दौरान graph को एक बार compile करता है और हर `execute()` पर device buffers को जगह पर रखते हुए उसे replay करता है।
 
@@ -13,14 +13,14 @@ flowchart TD
   subgraph WO["Without the wrapper (every call)"]
     WO1["build graph"] --> WO2["optimize patterns"]
     WO2 --> WO3["generate kernels"]
-    WO3 --> WO4["compile (clang)"]
+    WO3 --> WO4["compile kernels"]
     WO4 --> WO5["alloc buffers"]
     WO5 --> WO6["execute"]
   end
   subgraph WP["With the wrapper (prepare() once)"]
     WP1["build graph"] --> WP2["optimize patterns"]
     WP2 --> WP3["generate kernels"]
-    WP3 --> WP4["compile (clang)"]
+    WP3 --> WP4["compile kernels"]
     WP4 --> WP5["alloc buffers"]
   end
   subgraph WS["Every step"]
@@ -59,11 +59,14 @@ jit_wrapper! {
 | Section | मतलब | ज़रूरी |
 |---|---|---|
 | `WrapperName(ModelType) { ... }` | generated struct का नाम और उस model का type जो build closure को मिलता है | हाँ |
-| `input_name: Tensor` lines | wrapper द्वारा expose किए गए हर input के लिए एक; `: Tensor` annotation केवल informational है | एक या ज़्यादा |
+| `input_name: Tensor` lines | wrapper द्वारा expose किए गए हर input के लिए एक; `: Tensor` annotation केवल informational है | optional (आमतौर पर एक या ज़्यादा) |
 | `vars { name: (min, max), ... }` | compile-time bounds के साथ symbolic shape variables | optional |
+| `outputs { name, ... }` | हर output के लिए एक नामित buffer accessor; तब `build` closure इसी क्रम में उतने ही tensors का tuple return करती है | optional |
 | `build(args...) { ... }` | closure जो inputs और vars से output tensor बनाती है; `model` scope में होता है | हाँ |
 
-`build` arguments में हर एक को या तो किसी input का या किसी declared var का नाम होना चाहिए (macro expansion time पर ऐसे नामों को reject कर देता है जो match नहीं होते)। Block के अंदर, हर input एक `&Tensor` होता है (macro `prepare()` चलने पर एक zero-initialized placeholder allocate करता है), हर var एक `svod_tensor::Variable` होता है जो पहले से अपने upper bound से bound होता है, और `model` wrapper की owned model value का shared reference होता है। Closure किसी भी `E: std::error::Error + Send + Sync + 'static` के लिए `Result<Tensor, E>` return करती है; failures `JitError::Build` के रूप में सामने आती हैं।
+`build` arguments में हर एक को या तो किसी input का या किसी declared var का नाम होना चाहिए (macro expansion time पर ऐसे नामों को reject कर देता है जो match नहीं होते)। Block के अंदर, हर input एक `&Tensor` होता है (macro `prepare()` चलने पर एक zero-initialized placeholder allocate करता है), हर var एक `svod_tensor::BoundVariable` होता है जो पहले से अपने upper bound से bound होता है — उसे आगे `&name` के रूप में pass करें — और `model` wrapper की owned model value का shared reference होता है। Closure किसी भी `E: std::error::Error + Send + Sync + 'static` के लिए `Result<Tensor, E>` return करती है; failures `JitError::Build` के रूप में सामने आती हैं।
+
+`outputs` block के बिना closure एक अकेला `Tensor` return करती है, जो `output()` के ज़रिए पहुँच में होता है। एक `outputs` block के साथ वह ठीक उतने ही tensors का tuple return करती है और हर एक को declaration order के हिसाब से अपना नामित `&Buffer` accessor मिलता है। अगर scheduler ने उनमें से किसी को fuse या elide कर दिया होता तो positional accessors चुपचाप misalign हो जाते, इसलिए इसके बजाय `prepare()` `JitError::OutputCountMismatch` के साथ fail होता है।
 
 ---
 
@@ -89,7 +92,7 @@ Execute time पर, actual values `execute_with_vars` के माध्यम
 jit.execute_with_vars(&[("b", batch as i64), ("t", time as i64)])?;
 ```
 
-हर pair एक var bind करता है; जो vars listed नहीं हैं वे उस value को बनाए रखते हैं जिससे वे `prepare()` पर bound थे (उनका upper bound)।
+हर pair एक var bind करता है; जो vars listed नहीं हैं वे जो भी value रखते हैं उसे बनाए रखते हैं — उनका `prepare()`-time upper bound, या वह value जिस पर पिछला `execute_with_vars` उन्हें छोड़ गया था। Bindings sticky हैं, per-call नहीं। var की declared `[min, max]` से बाहर की value error नहीं बल्कि एक out-of-bounds access है: buffers `max` के हिसाब से allocate होते हैं।
 
 ---
 
@@ -108,6 +111,9 @@ Macro wrapper के life cycle के हर phase के लिए एक meth
 | `execute() -> Result<()>` | per step | मौजूदा input buffers के साथ replay |
 | `execute_with_vars(&[(name, value)]) -> Result<()>` | per step | replay और एक या ज़्यादा symbolic variables rebind |
 | `execute_profiled` / `execute_with_vars_profiled` | optional | non-profiled variants की तरह लेकिन `Vec<KernelProfile>` return |
+| `execute_profiled_static()` | optional | `ExecutionPlan::profile` के ज़रिए एक profiled run, जो last stage के kernels return करता है |
+| `copy_output_to_<input>(out_pos, dst_off, src_off, len)` | per step | किसी output region की on-device copy वापस एक input buffer में; कोई host round-trip नहीं |
+| `replicate() -> Result<Self>` | optional | concurrent execution के लिए एक prepared JIT की deep-copy: forked buffers, shared model और kernels, अपनी queue |
 
 चार lower-level accessors tooling के लिए plan details expose करते हैं:
 
@@ -130,6 +136,8 @@ Macro wrapper के life cycle के हर phase के लिए एक meth
 pub struct InputSpec {
     pub shape: Vec<usize>,
     pub dtype: DType,
+    /// Allocate the input device-local (no host mapping).
+    pub device_local: bool,
 }
 
 impl InputSpec {
@@ -137,10 +145,11 @@ impl InputSpec {
     pub fn f32(shape: &[usize]) -> Self { ... }
     pub fn i32(shape: &[usize]) -> Self { ... }
     pub fn i64(shape: &[usize]) -> Self { ... }
+    pub fn device_local(mut self) -> Self { ... }
 }
 ```
 
-Macro shape और dtype का उपयोग build closure invoke करने से पहले एक zero-initialized placeholder tensor allocate करने के लिए करता है। Callers ख़ुद `Tensor::zeros(...).realize()` placeholders नहीं बनाते। Shape अधिकतम input size बन जाती है; symbolic variables execute time पर इसे `try_shrink` जैसी operations के माध्यम से सिकोड़ते हैं — यह एक coding pattern है, wrapper द्वारा enforce किया गया runtime contract नहीं।
+Macro shape और dtype का उपयोग build closure invoke करने से पहले एक zero-initialized placeholder tensor allocate करने के लिए करता है। Callers ख़ुद `Tensor::zeros(...).realize()` placeholders नहीं बनाते। Shape अधिकतम input size बन जाती है; symbolic variables execute time पर इसे `try_shrink` जैसी operations के माध्यम से सिकोड़ते हैं — यह एक coding pattern है, wrapper द्वारा enforce किया गया runtime contract नहीं। `device_local()` उन inputs के लिए host mapping हटा देता है जिन्हें host केवल `copyin` से लिखता है या on-device refill करता है — वह recurrent state जिसे host को हर step पर देखने की ज़रूरत नहीं होती।
 
 ---
 
@@ -161,8 +170,8 @@ pub trait RecurrentJit {
 }
 ```
 
-:::tip Output layout contract
-JIT का output buffer last axis के साथ `[head | h_flat | c_flat]` का एक flat `f32` block होना चाहिए, जहाँ `h_flat` और `c_flat` की length क्रमशः `state.h.len()` और `state.c.len()` होती है। `JitRecurrent::new` construction पर output buffer एक बार पढ़ता है, element count को declared head plus state size के विरुद्ध check करता है, और math match न हो तो `JitError::OutputLayoutMismatch` return करता है। यह build-closure drift को construction time पर पकड़ लेता है बजाय इसके कि एक silent mis-split downstream values को corrupt करे।
+:::tip[Output layout contract]
+JIT का output buffer last axis के साथ `[head | h_flat | c_flat]` का एक flat `f32` block होना चाहिए, जहाँ `h_flat` और `c_flat` की length क्रमशः `state.h.len()` और `state.c.len()` होती है। `JitRecurrent::new` construction पर output buffer के size को एक बार declared head plus state size के विरुद्ध check करता है, और math match न हो तो `JitError::OutputLayoutMismatch` return करता है। यह build-closure drift को construction time पर पकड़ लेता है बजाय इसके कि एक silent mis-split downstream values को corrupt करे।
 :::
 
 `step(|jit| pack_inputs(jit))` का हर call एक recurrent iteration चलाता है:
@@ -178,7 +187,7 @@ JIT का output buffer last axis के साथ `[head | h_flat | c_flat]` �
 
 ## उदाहरण: GigaAM encoder
 
-GigaAM Conformer encoder variable batch size और time length पर चलता है। दोनों bounds symbolic हैं ताकि एक single prepared plan हर audio chunk को serve करे:
+GigaAM Conformer encoder constant shape पर prepare किया जाता है। Batch और mel-frame bounds construction पर एक बार compute होकर plan में bake कर दिए जाते हैं; छोटे chunks उन्हीं buffers में zero-pad कर दिए जाते हैं:
 
 ```rust
 jit_wrapper! {
@@ -186,76 +195,52 @@ jit_wrapper! {
         mel: Tensor,
         lengths: Tensor,
 
-        vars {
-            b: (1, model.config.max_batch_size),
-            t: (1, model.config.max_mel_frames),
-        }
-
-        build(mel, lengths, b, t) {
-            let out = model.encoder.forward_batch(mel, lengths, &b, &t)?;
-            out.cast(svod_dtype::DType::Float32).context(TensorSnafu)
+        build(mel, lengths) {
+            let out = model.encoder.forward_batch(mel, lengths)?;
+            // Permute [B, d_model, T_sub] → [B, T_sub, d_model] on-device: the
+            // RN-T decoder consumes frame-major rows, and doing it here turns
+            // a host-side strided transpose into one contiguous copyout.
+            out.cast(svod_dtype::DType::Float32).context(TensorSnafu)?
+                .try_permute(&[0, 2, 1]).context(TensorSnafu)
         }
     }
 }
 ```
 
-Wrapper एक mel-spectrogram input और एक per-batch length vector लेता है और encoded output tensor `[B, d_model, T_sub]` produce करता है। `b` और `t` vars `prepare()` पर अपने upper bounds से bound होते हैं, फिर हर batch के लिए `execute_with_vars(&[("b", batch_size as i64), ("t", mel_frames as i64)])` के माध्यम से rebound किए जाते हैं।
+Wrapper एक mel-spectrogram input और एक per-batch length vector लेता है और `[B, T_sub, d_model]` produce करता है। `GigaAmTranscriber` plan का size एक ही बार तय करता है: mel length को अगली power of two तक round up किया जाता है ताकि codegen को एक साफ़ factorisation दिखे, और उसे `config.max_mel_frames` पर clamp किया जाता है; batch को इतना cap किया जाता है कि live SDPA score tiles `max_scores_mib` के अंदर रहें। फिर हर chunk `execute()` के ज़रिए वही plan replay करता है।
 
-अंत में आने वाला `out.cast(DType::Float32)` encoder और किसी भी downstream head के बीच fp32 boundary है। Encoder speed के लिए fp16 या bf16 में चल सकता है, लेकिन हर consumer (CTC log-softmax, RN-T predictor और joint) को एक uniform fp32 input दिखता है। Cast को JIT के अंदर रखने का मतलब है कि वह encoder के tail kernels में fuse हो जाता है।
+`out.cast(DType::Float32)` encoder और किसी भी downstream head के बीच fp32 boundary है। Encoder speed के लिए fp16 या bf16 में चल सकता है, लेकिन हर consumer (CTC log-softmax, RN-T predictor और joint) को एक uniform fp32 input दिखता है। Cast को JIT के अंदर रखने का मतलब है कि वह encoder के tail kernels में fuse हो जाता है।
 
 ---
 
 ## उदाहरण: Silero VAD
 
-Silero VAD model एक recurrent network है जो हर chunk पर एक speech probability और एक updated LSTM state emit करता है। JIT audio chunk और दो state tensors को inputs के रूप में expose करता है और `[prob | new_h | new_c]` को अपने output के रूप में concatenate करता है:
+Silero V5 एक recurrent network है, लेकिन उसकी recurrence इतनी छोटी है कि हर window पर एक launch चुकाना घाटे का सौदा है। इसलिए JIT केवल batched conv front-end और LSTM input projection को cover करता है; scan ख़ुद host पर रहता है:
 
 ```rust
 jit_wrapper! {
-    SileroVadJit(SileroVad) {
-        chunk: Tensor,
-        state_h: Tensor,
-        state_c: Tensor,
+    SileroVadFeatureJit(SileroVad) {
+        chunks: Tensor,
 
-        build(chunk, state_h, state_c) {
-            model.forward_chunk(chunk, state_h, state_c)
+        build(chunks) {
+            // [FEATURE_BATCH, CHUNK_LEN] -> [FEATURE_BATCH, 4*HIDDEN] LSTM gate
+            // pre-activations (conv features + input projection, biases folded).
+            model.forward_gates(chunks)
         }
     }
 }
 ```
 
-`forward_chunk` `Tensor::cat(&[&prob, &new_h, &new_c], 1)` से ख़त्म होता है, वह layout जिसकी recurrent wrapper को उम्मीद होती है। `RecurrentJit` impl trait methods को सीधे macro-generated accessors पर map करता है:
+Leading dimension एक var नहीं बल्कि एक fixed `FEATURE_BATCH` (4096) है: front-end row-independent है, इसलिए एक partial batch बस कम rows भरता है, और एक symbolic leading dim reflect-pad lowering को गड़बड़ा देता है। Preparation एक device-local output माँगती है, क्योंकि 8 MiB का gate readback host mapping के बजाय copy engine पर होना चाहिए:
 
 ```rust
-impl RecurrentJit for SileroVadJit {
-    fn pack_state(&mut self, s: &LstmState) -> Result<()> {
-        // copy s.h into state_h_mut, s.c into state_c_mut
-    }
-    fn execute_step(&mut self) -> Result<()> { self.execute() }
-    fn output_buffer(&self) -> Result<&Buffer> { self.output() }
-}
+let mut jit = SileroVadFeatureJit::new(vad);
+let mut config = svod_tensor::PrepareConfig::from_env();
+config.device_local_outputs = true;
+jit.prepare_with_config(InputSpec::f32(&[FEATURE_BATCH, CHUNK_LEN]), &config)?;
 ```
 
-Construction JIT को एक बार prepare करता है और उसे host state के साथ wrap करता है:
-
-```rust
-let mut jit = SileroVadJit::new(vad);
-jit.prepare(
-    InputSpec::f32(&[1, CHUNK_LEN]),
-    InputSpec::f32(&[1, HIDDEN]),
-    InputSpec::f32(&[1, HIDDEN]),
-)?;
-let inner = JitRecurrent::new(jit, LstmState::zeros(HIDDEN), 1)?;
-```
-
-`1` head length वह single speech-probability scalar है। `LstmState::zeros(HIDDEN)` `HIDDEN` length के `h` और `c` allocate करता है, इसलिए output layout check verify करता है कि JIT output ठीक-ठीक `1 + HIDDEN + HIDDEN` `f32` elements है। फिर per-chunk processing बन जाती है:
-
-```rust
-let prob = inner.step(|jit| {
-    let buf = jit.chunk_mut()?;
-    // copy audio samples into buf
-    Ok(())
-})?;
-```
+फिर `VadInference::probs` waveform को `FEATURE_BATCH`-size के dispatches में चलती है — `chunks_mut()` में pack करें, `execute()`, valid rows को `copyout_prefix` — और gates को `VadHead::scan` को सौंपती है, जो host पर एक 8-lane `f32x8` LSTM plus sigmoid head है। इस split ने उस path की जगह ली जिसमें हर window पर एक tiny dispatch होता था और जिसकी round-trip latency पूरे model पर हावी थी।
 
 ---
 
@@ -263,9 +248,9 @@ let prob = inner.step(|jit| {
 
 Wrapper graph को एक बार compile करता है और उसे कई बार replay करता है। यह तभी काम करता है जब graph topology `prepare()` time पर fixed हो। कुछ भी जो execute time पर बदल सकता है उसे या तो input buffers के माध्यम से (`*_mut` से) या symbolic vars के माध्यम से (`execute_with_vars` से) flow करना चाहिए। Build closure के अंदर tensor value पर एक branch graph को उस branch तक specialize कर देता है; यह एक build-time decision है, runtime नहीं।
 
-:::note Pitfalls
+:::note[Pitfalls]
 - Build closure के अंदर एक `Tensor::full(value).realize()` उस value को single prepared plan में bake कर देता है। किसी भी per-call variation के लिए `prepare()` को scratch से दोबारा चलाना पड़ता है — पूरा graph build plus kernel compile। उस per-step setup के लिए जिसे JIT को देखने की ज़रूरत नहीं है, host-side scratch buffers (उदाहरण के लिए `ndarray::Array3`) सही choice हैं।
-- JIT के अंदर dynamic shape handle करने का idiomatic तरीक़ा है एक maximum-sized input पर var-bound length के साथ `try_shrink`, साथ में call site पर `execute_with_vars`। CTC head और encoder दोनों यही pattern इस्तेमाल करते हैं।
+- JIT के अंदर dynamic shape handle करने का idiomatic तरीक़ा है एक maximum-sized input पर var-bound length के साथ `try_shrink`, साथ में call site पर `execute_with_vars`। ResNet और YOLO दोनों batch dimension को इसी तरह shrink करते हैं।
 :::
 
 Contract का उल्लंघन दो failure modes में से एक produce करता है: ग़लत results, क्योंकि cached plan एक ऐसी value पर stale assumption के साथ replay होता है जो असल में vary करती निकली; या silent slowness, क्योंकि हर call recompile path में चली जाती है। इन्हें build closure फिर से पढ़कर diagnose करें; kernel output शायद ही मदद करता है।
@@ -281,10 +266,12 @@ Contract का उल्लंघन दो failure modes में से ए�
 | `NotPrepared` | `prepare` से पहले per-step method call की गई, या output buffer उपलब्ध नहीं |
 | `InputBufferNotFound` | prepared plan के अंदर input index resolution fail हुआ |
 | `DuplicateInputBuffer` | दो declared inputs `prepare` time पर एक ही device buffer पर map हो गए |
-| `Build` | build closure ने `Err` return किया; inner error `Box<dyn Error>` के रूप में preserved है |
+| `InputAliased` | एक input किसी foreign plan buffer पर resolve हुआ — एक concurrent `prepare` ने उसकी graph identity corrupt कर दी |
+| `Build` | build closure ने `Err` return किया; inner error `Box<dyn Error + Send + Sync>` के रूप में preserved है |
 | `Tensor` | `prepare` में या build closure में एक tensor operation fail हुआ |
 | `Device` | एक device या buffer operation fail हुआ |
 | `OutputLayoutMismatch` | `JitRecurrent::new` ने declared head plus state size से अलग output element count देखा |
+| `OutputCountMismatch` | एक multi-output wrapper ने N outputs declare किए लेकिन compiled plan ने अलग संख्या रखी |
 | `Runtime` | kernel execution fail हुआ |
 
 Symbolic-variable setters (`with_<var>_*`) पर configuration mistakes error return करने के बजाय call site पर panic करती हैं, क्योंकि वे किसी plan के अस्तित्व में आने से पहले होती हैं।
@@ -293,7 +280,7 @@ Symbolic-variable setters (`with_<var>_*`) पर configuration mistakes error r
 
 ## यह क्यों ज़रूरी है
 
-**Lifecycle typed है।** `prepare` ही prepared state में जाने का एकमात्र तरीक़ा है; per-step accessors ही बाहर निकलने का एकमात्र तरीक़ा हैं। Order को compiler enforce करता है।
+**Lifecycle explicit है।** `prepare` ही prepared state में जाने का एकमात्र रास्ता है, और हर per-step accessor उसी से होकर गुज़रता है। Wrapper plan को एक `Option` के पीछे रखता है, इसलिए order से बाहर call करना किसी half-built plan को पढ़ने के बजाय तुरंत `JitError::NotPrepared` के साथ fail होता है।
 
 **Replay सस्ता है।** एक graph build, एक kernel compile, allocations का एक set — एक बार चुकाया गया। हर बाद की call buffer writes plus एक `execute` है।
 

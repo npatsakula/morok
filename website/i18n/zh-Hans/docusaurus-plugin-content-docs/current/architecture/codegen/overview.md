@@ -34,6 +34,7 @@ sidebar_label: 概览
   - Local：工作组内的并行
   - Reduce：累加器（求和、求最大值等）
   - Loop：顺序迭代
+  - Upcast / Unroll：被 expander 展开成一条条 lane
 
 **Stage（阶段）**
 - 对代码的一次变换 pass
@@ -73,11 +74,12 @@ flowchart TD
 
 有几个 pass 在编号阶段之间运行，没有自己的阶段编号：
 
-| Pass | 位于阶段之间 | 用途 |
-|------|-------------|------|
-| `linearize_multi_index` | Stage 8 之前 | 将多维索引展平为线性偏移 |
-| `pm_bool_devectorize` | 14–15 | 处理布尔向量模式 |
-| `pm_reduce_devectorize` | 14–15 | 处理向量规约（K-vec、布尔、水平） |
-| `merge_sibling_ends` | 14–15 | 合并相邻的 END 操作 |
-| `pm_float_decomp` | 优化后 | 分解浮点操作 |
-| `bool_storage_patterns` | 优化后 | bool 与 uint8 之间的内存操作转换 |
+| Pass | 运行位置 | 用途 |
+|------|---------------|------|
+| `bool_storage_patterns` | Stage 14 内部 | 为内存操作在 bool 与 uint8 之间转换 |
+| `indexing_simplify` | Stage 14 和 15 内部 | 折叠标量化暴露出来的寻址运算 |
+| `sym()`（早期符号化） | 14–15 | 图变成标量之后做完整的符号化简 |
+| `memory_coalescing` | 14–15 | 把相邻访问合并成更宽的访问 |
+| `pm_simplify_add_image` | 14–15（自底向上） | image 数据类型的地址化简 |
+| `pm_float_decomp` / `pm_long_decomp` | Stage 18 内部 | 模拟目标平台缺失的数据类型（FP8/BF16、64 位整数） |
+| `pm_move_gates_from_index` | 18–19 | 把索引有效性移到 LOAD/STORE 的 `gate` 字段上 |

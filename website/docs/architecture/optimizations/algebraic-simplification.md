@@ -8,12 +8,12 @@ Svod's symbolic simplifier rewrites UOp computation graphs using 140+ algebraic 
 
 | Where | Matcher | Context |
 |-------|---------|---------|
-| Pre-optimization | `symbolic()` | After rangeify + range splitting, before kernel optimization |
-| Post-opt (Stage 8) | `symbolic()` | After optimization actions, before expansion |
-| Post-index (Stage 16) | `symbolic()` | After index dtype lowering, final cleanup |
-| Decomp+Render (Stage 18-19) | `symbolic_simple()` | Combined with late rewrites and render patterns |
+| Pre-optimization | `sym()` | After rangeify + range splitting, before kernel optimization |
+| Post-opt (Stage 8) | `sym()` + `pm_move_where_on_load` | After optimization actions, before expansion |
+| Post-index (Stage 16) | `sym()` + `indexing_simplify()` | After index dtype lowering, final cleanup |
+| Decomp+Render (Stage 18-19) | `symbolic_simple()` | Combined with late rewrites and the renderer's own matchers |
 
-`symbolic()` = `symbolic_simple()` + GEP pushing patterns. All stages except the final decomp+render pass run the full `symbolic()` set.
+The matchers come in three tiers: `symbolic_simple()` is the tier-1 base (identities, constant folding, the size-1 RANGE collapse), `symbolic()` adds the tier-2 groups (canonicalization, comparisons, div/mod against range bounds), and `sym()` adds tier 3 (`pm_simplify_valid`, ALU/STACK reordering, opinionated term combining). Only the final decomp+render pass runs the tier-1 set on its own.
 
 **Range analysis**: Each UOp tracks the minimum (`vmin`) and maximum (`vmax`) values it can take at runtime, computed eagerly during node construction from its inputs' bounds. Many patterns use these bounds to prove conditions at compile time (e.g., "x is always non-negative" or "x < n for all values").
 
@@ -64,35 +64,44 @@ The rewrite engine applies patterns bottom-up: children simplify first, then the
 
 ## Pattern Ordering
 
-The `symbolic_simple()` matcher composes pattern groups in a specific order. Within a group, patterns are tried sequentially until one matches. Groups are concatenated with the `+` operator:
+Each matcher composes pattern groups in a specific order — the order is load-bearing, since a group can expose matches for a later one. Within a group, patterns are tried sequentially until one matches. Groups are concatenated with the `+` operator:
 
 ```text
-propagate_invalid          -- MUST be first (before x*0=0)
-fold_invalid_load_store
-constant_folding_dsl_patterns
-vconst_folding_patterns
-identity_and_zero_patterns
-commutative_canonicalization
-self_folding_dsl_patterns
-zero_folding_dsl_patterns
-division_dsl_patterns
-cast_dsl_patterns
-cast_where_dsl_patterns
-term_combining_dsl_patterns
-alu_folding_dsl_patterns
-advanced_division_dsl_patterns
-div_mod_recombine_dsl_patterns
-comparison_dsl_patterns
-boolean_dsl_patterns
-minmax_dsl_patterns
-where_bound_patterns
-power_dsl_patterns
-negation_dsl_patterns
-range_based_mod_div_patterns
-dce_dsl_patterns
-dead_loop_patterns
-after_simplification_patterns
-pm_move_where_on_load       -- WHERE->INDEX embedding for masked loads
+symbolic_simple() = symbolic_simple_base() + dead_loop_patterns()
+
+symbolic_simple_base()          -- tier 1
+  propagate_invalid             -- MUST be first (before x*0=0)
+  fold_invalid_load_store
+  constant_folding_dsl_patterns
+  vconst_folding_patterns
+  bool_arithmetic_patterns
+  identity_and_zero_patterns
+  self_folding_dsl_patterns
+  zero_folding_dsl_patterns
+  division_dsl_patterns
+  cast_dsl_patterns
+  uint_pack_dsl_patterns
+  div_mod_recombine_dsl_patterns
+  power_dsl_patterns
+  boolean_dsl_simple_patterns
+  dce_dsl_simple_patterns
+
+symbolic() = symbolic_simple() + tier 2
+  commutative_canonicalization
+  boolean_dsl_patterns
+  term_combining_dsl_patterns
+  dce_dsl_patterns
+  where_alu_combining_patterns
+  vmin_vmax_collapse_patterns
+  minmax_dsl_patterns
+  alu_folding_dsl_patterns
+  comparison_dsl_patterns
+  range_based_mod_div_patterns
+  advanced_division_dsl_patterns
+  range_based_cast_patterns
+  long_to_int_narrowing_patterns
+  after_simplification_patterns
+  where_bound_patterns
 ```
 
 ---
@@ -140,7 +149,7 @@ VConst folding covers 11 binary ops (excludes Pow and Fdiv) and all 7 unary ops.
 | `MUL[x, 0]` | `0` | Only when NOT float |
 | `AND[_, 0]` | `0` | Commutative |
 
-:::caution IEEE 754: MUL by zero
+:::caution[IEEE 754: MUL by zero]
 `MUL[x, 0]` is **not** simplified for floats because IEEE 754 requires:
 - `NaN * 0 = NaN`
 - `Inf * 0 = NaN`
@@ -184,7 +193,7 @@ Patterns where the same operand appears on both sides. Uses `Arc::ptr_eq` checks
 | `FDIV(MUL(x, y), y)` | `x` | Cancellation (float) |
 | `IDIV(MUL(x, y), y)` | `x` | Cancellation (integer) |
 
-:::caution Pattern priority
+:::caution[Pattern priority]
 `FDIV(0, 0) -> NaN` must come before `FDIV(x, x) -> 1` in the matcher to take priority. The ordering within `division_dsl_patterns()` ensures this.
 :::
 
@@ -202,7 +211,7 @@ Patterns where the same operand appears on both sides. Uses `Arc::ptr_eq` checks
 
 The `can_safe_cast(to, from)` function determines whether an intermediate type can hold all values. It checks bit widths, signedness, and float/int categories.
 
-:::caution Truncation kills round-trips
+:::caution[Truncation kills round-trips]
 `CAST(CAST(x, i8), i64)` is NOT collapsed to `x` when `x` is `i64`. The intermediate `i8` truncates values -- `can_safe_cast(i64, i8)` returns `false` because `i8` cannot hold all `i64` values.
 
 Safe example: `CAST(CAST(x, i32), bool)` -> `CAST(x, bool)` when `x` is `bool`, because `i32` can represent both `true` and `false`.
@@ -282,7 +291,7 @@ All patterns using `[]` are commutative (both operand orderings are tried).
 | `LT(x, x)`, `GT(x, x)`, `NE(x, x)` | `false` |
 | `LE(x, x)`, `GE(x, x)`, `EQ(x, x)` | `true` |
 
-:::caution Float self-comparison
+:::caution[Float self-comparison]
 Self-comparison patterns are guarded by `!x.dtype().is_float()`. For floats, `NaN != NaN` is `true` and `NaN == NaN` is `false`, so these identities do not hold.
 :::
 
@@ -342,7 +351,7 @@ Uses `VminVmaxProperty` for range analysis. No separate `MIN` patterns -- Svod l
 | `WHERE(NOT(cond), t, f)` | `WHERE(cond, f, t)` | Condition flip |
 | `WHERE(a, WHERE(b, c, d), d)` | `WHERE(AND(a, b), c, d)` | Branch merging (ptr_eq on `d`) |
 
-:::caution Invalid guard on condition flip
+:::caution[Invalid guard on condition flip]
 `WHERE(NOT(cond), t, f) -> WHERE(cond, f, t)` is **not** applied when `f` contains `Invalid`. Padding creates `WHERE(valid, idx, Invalid)` structures, and swapping would move `Invalid` to the true branch where downstream patterns cannot match it. Both scalar `Invalid` and vectorized `VECTORIZE(Invalid, ...)` are checked.
 
 Tinygrad has the same guard: `symbolic.py:201-202`.
@@ -445,57 +454,46 @@ No dependencies means no ordering constraint.
 
 ---
 
-## 16. GEP Pushing
+## 16. Lane Folds — INDEX over a STACK
 
-GEP (Get Element Pointer) extracts elements from vectors. These patterns push GEP through other operations to reach the vector source, enabling scalar simplification after devectorization.
+Svod has no GEP op: a shaped value is a `STACK` of lanes, and `INDEX` selects a lane from it exactly as it selects an address from a buffer. Tinygrad's `gep_pushing` therefore has no direct counterpart. What Svod has instead are folds that collapse `INDEX`/`STACK` structure so the devectorizer sees scalars.
 
-Only included in `symbolic()` (Stage 4), not `symbolic_simple()` (Stages 8, 16).
+Most of these folds are structural and live in the devectorizer's movement cleanup (`schedule/src/devectorize.rs`), not in `symbolic_simple()`. The one symbolic-tier rule is `alu_vectorize_reorder_patterns`, which belongs to tier-3 `sym()`.
 
-### Composition and Extraction
+### Lane Selection and Collapse
 
 | Pattern | Result | Notes |
 |---------|--------|-------|
-| `GEP(GEP(x, inner), outer)` | `GEP(x, inner[outer])` | Compose nested |
-| `GEP(VECTORIZE(x,x,x,x), [i])` | `x` | Through broadcast (all ptr_eq) |
-| `GEP(VECTORIZE(elems), [i])` | `elems[i]` | Through VECTORIZE |
-| `GEP(scalar, [i])` | `scalar` | Scalar identity (vcount == 1) |
-| `GEP(VCONST(vals), [i])` | `CONST(vals[i])` | Through VConst |
-| `GEP(x, [0,1,...,n-1])` | `x` | Identity removal |
+| `INDEX(STACK([a, b, c]), 2)` | `c` | Constant lane index folds to the stacked source |
+| `INDEX(STACK([...]), c0, rest...)` | `INDEX(sources[c0], rest...)` | Leading constant peels one STACK level, recursively |
+| `STACK([INDEX(b, 0), INDEX(b, 1), ...])` | `b` | Sequential lane reads rebuild the source |
+| `INDEX(INDEX(b, i), j)` | `INDEX(b, i, j)` | Compose scalar index chains |
+| `INDEX(AFTER(STACK([...]), deps), c)` | selected lane, `deps` re-attached | Register-stack lane selection preserves ordering |
 
-### Pushing Through Operations
+`const_index_into_stack` recurses: an index list whose leading entries are constants peels one `STACK` level per entry.
+
+### ALU over STACK
 
 | Pattern | Result | Guard |
 |---------|--------|-------|
-| `GEP(op(a, b), idx)` | `op(GEP(a, idx), GEP(b, idx))` | Binary, Index dtype only |
-| `GEP(unary(x), idx)` | `unary(GEP(x, idx))` | Unary, Index dtype only |
-| `GEP(WHERE(c, t, f), idx)` | `WHERE(GEP(c, idx), GEP(t, idx), GEP(f, idx))` | Index dtype only |
-| `GEP(MULACC(a, b, c), idx)` | `MULACC(GEP(a, idx), GEP(b, idx), GEP(c, idx))` | Index dtype only |
+| `op(STACK(x,x,x,x), STACK(y,y,y,y))` | `STACK(op(x,y), op(x,y), ...)` | Both operands broadcast (all lanes `ptr_eq`), equal length > 1 |
 
-:::caution Index dtype guard prevents graph explosion
-GEP pushing through ALU ops is restricted to `Index` dtype (Tinygrad: `symbolic.py:167`). Without this guard, combining GEP pushing with `no_vectorized_alu` causes exponential graph blowup on high-dimensional kernels.
+Applies to eighteen binary ops — Add, Mul, Sub, FloorMod, Max, FloorDiv, Fdiv, Pow, And, Or, Xor, Shl, Shr and the six comparisons. Collapsing to a `STACK` of one scalar operation exposes the operands to constant folding and scalar simplification.
+
+:::caution[Tier-3 only]
+`alu_vectorize_reorder_patterns` is part of `sym()`, not of `symbolic()` or `symbolic_simple()`. It fires at the stages that run `sym()` — pre-optimization, Stage 8 and the devectorizer — so by the final decomp+render pass the reordering has already happened.
 :::
 
-### Pushing Through Structural Ops
+### Movement Cleanup Around STACK
 
 | Pattern | Result |
 |---------|--------|
-| `INDEX(STACK([a, b]), 1)` | `b` |
-| `GEP(CAST(x, dtype), idx)` | `CAST(GEP(x, idx), scalar_dtype)` |
-| `GEP(BITCAST(x, dtype), idx)` | `BITCAST(GEP(x, idx), scalar_dtype)` |
-| `GEP(WMMA(a, b, c), idx)` | `WMMA(GEP(a, ...), GEP(b, ...), GEP(c, ...))` |
-| `GEP(void_node, _)` | `void_node` |
+| `RESHAPE(STACK([x]))` | `x` — when the shapes already agree |
+| `RESHAPE(x)` adding leading 1-dims | one `STACK([x])` wrapper per added dimension |
+| `EXPAND(STACK([x]))` | `STACK([x, x, ..., x])` — materialize the broadcast |
+| `PERMUTE(PERMUTE(x, a), b)` | `PERMUTE(x, a∘b)`; identity permutes drop out |
 
-The WMMA pattern maps tile indices through upcast axes to extract corresponding input subgroups.
-
-### Re-collection
-
-| Pattern | Result |
-|---------|--------|
-| `VECTORIZE(GEP(x,[0]), GEP(x,[1]), ..., GEP(x,[N-1]))` | `GEP(x, [0,1,...,N-1])` |
-
-This collapses VECTORIZE structures created by `no_vectorized_alu` back into a single GEP, which the identity pattern then removes.
-
----
+These live in `movement_cleanup_patterns()` / `mop_cleanup_patterns()`, which the devectorizer applies before scalarization. WMMA lanes are handled there too, by `stack_wmma_sources` and `broadcast_and_devec_wmma`, rather than by any symbolic pattern.
 
 ## 17. WHERE on LOAD (Stage 8 only)
 
@@ -553,17 +551,18 @@ Only applied to Index dtype to avoid breaking vector math merging. Tinygrad: `sy
 
 ### Unified Div-Mod Engine (`fold_divmod_general`)
 
-For IDIV and MOD on Index dtype, a unified engine tries simplification rules in priority order. Based on Tinygrad's `fold_divmod_general` (`divandmod.py:8-93`).
+For IDIV and MOD on Index dtype, a unified engine tries simplification rules in priority order. Based on Tinygrad's `fold_divmod_general` (`divandmod.py:8-96`).
 
 | Priority | Rule | Description |
 |----------|------|-------------|
 | 1 | cancel_divmod | Range lies in single denominator interval |
-| 2 | remove_nested_mod | `(a%4 + b)%2 -> (a+b)%2` when `2 | 4` |
-| 3 | fold_binary_numerator | Single term with range of 2 |
+| 2 | nested_div | `(a % (k*c)) // c -> (a // c) % k` |
+| 3 | remove_nested_mod | `(a%4 + b)%2 -> (a+b)%2` when `2 | 4` |
 | 4 | fold_divmod_congruence | Factor congruence modular arithmetic |
 | 5 | gcd_with_remainder | Factor out common GCD from numerator |
-| 6 | divide_by_gcd | Variable denominator GCD factoring |
-| 7 | factor_remainder | `(d*x+y)//d -> x + y//d` (last resort) |
+| 6 | nest_div_by_smallest_factor | Recursive split by the smallest shared factor |
+| 7 | divide_by_gcd | Variable denominator GCD factoring (any denominator) |
+| 8 | factor_remainder | `(d*x+y)//d -> x + y//d` (last resort) |
 
 ### Div-Mod Recombination
 

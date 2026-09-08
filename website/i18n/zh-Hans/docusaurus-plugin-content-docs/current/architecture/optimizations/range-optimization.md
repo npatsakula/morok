@@ -28,7 +28,7 @@ flowchart TD
 
 **原因**：分割后，内层范围可以向量化（UPCAST 到 SIMD 宽度），外层范围可以并行化（GPU 块、CPU 线程）。不分割的话，取模会阻止这两种优化。
 
-**机制**：`pm_split_ranges` 模式匹配器收集带取模用法的范围但**不立即变换**。它等到看到 SINK 节点时再一次性执行所有替换（避免不一致的局部重写）。新范围被分配新的 `axis_id`。
+**机制**：`pm_split_ranges` 模式匹配器收集带取模用法的范围但**不立即变换**。它等到看到 SINK 节点时再一次性执行所有替换（避免不一致的局部重写）。外层和内层范围在原有轴路径后分别追加 `0` 和 `1`，与 Tinygrad 一致，不分配全局范围 ID。
 
 **守卫**：仅当 `end % c == 0`（精确整除）时触发。不可整除的情况保持不变。
 
@@ -136,57 +136,54 @@ Tinygrad：`simplify.py:82-142`。Svod：`pm_reduce_simplify()` + `reduce_collap
 
 ## 缓冲区移除（部分连续）
 
-**功能**：决定是否将中间结果物化到缓冲区还是内联计算。在代码库中通常称为"pcontig"（partial contiguous 的缩写——通过替换范围变量来内联 BUFFERIZE 节点的优化）。
+**功能**：通过把被缓冲的范围替换为读取方索引所用的范围，决定是否将中间结果物化到缓冲区还是内联计算。
 
-当 rangeify pass 创建 `BUFFERIZE` 节点（标记"这需要一个缓冲区"）时，缓冲区移除 pass 评估实际分配内存是否值得。`BUFFERIZE` 是 Svod 在"这需要一个缓冲区"和最终 `STORE`+`BUFFER`+`AFTER` 之间的中间表示——它让这个 pass 决定物化是否真正必要。如果计算足够廉价，它替换范围变量并直接内联表达式。
+当 rangeify pass 创建 `STAGE` 节点（标记"这需要一个缓冲区"）时，缓冲区移除 pass 评估实际分配内存是否值得。`STAGE` 是 Svod 在"这需要一个缓冲区"和最终 `STORE`+`BUFFER`+`AFTER` 之间的中间表示——它让这个 pass 决定物化是否真正必要。如果计算足够廉价，它替换范围变量并直接内联表达式。
 
 ### 决策树
 
 ```mermaid
 flowchart TD
-  Q1["Is this an always-run op (CONTIGUOUS, COPY)?"]
+  Q1["Always-run op (CONTIGUOUS, COPY), or a non-removable STAGE?"]
   Q1 -->|"YES"| K1["Keep buffer (always materialized)"]
-  Q1 -->|"NO"| Q2["Does inlining exceed the buffer limit?"]
+  Q1 -->|"NO"| Q2["More than 3 distinct buffers accessed?"]
   Q2 -->|"YES"| K2["Keep buffer"]
-  Q2 -->|"NO"| Q3["Is there a reduce in scope?"]
-  Q3 -->|"NO"| I1["Inline (cheap: just substitute ranges)"]
-  Q3 -->|"YES"| Q4["Is pcontig level (less than or equal to) 2?"]
-  Q4 -->|"YES"| K3["Keep buffer (reduce recomputation too expensive)"]
-  Q4 -->|"NO"| Q5["Check input/output ratio"]
-  Q5 -->|"Ratio low (output small relative to input)"| K4["Keep buffer"]
-  Q5 -->|"Ratio high (output much greater than input)"| I2["Partial inline"]
+  Q2 -->|"NO"| Q3["Does a REDUCE in the body read a buffer?"]
+  Q3 -->|"YES"| K3["Keep buffer (reduce recomputation too expensive)"]
+  Q3 -->|"NO"| I1["Inline: substitute the STAGE ranges with the INDEX ranges"]
 ```
 
-:::caution 规约上下文中的一元操作
-一元操作（如取反）在规约作用域内**不会**被内联，即使它们很廉价。原因：如果 `argmax(-x)` 内联取反，它会为每次规约迭代重新计算 `-x`——N 次额外取反而不是一次缓冲区读取。
+:::caution[规约内部的缓冲区读取]
+这条规约守卫看的不是操作有多廉价——只要函数体中任何 REDUCE 读取了缓冲区（`Param`、`Buffer` 或 `Stage`），它就会触发。原因：如果 `argmax(-x)` 内联取反，`-x` 会在每次规约迭代中被重新计算——N 次额外的读取和取反，而不是一次缓冲区读取。若规约所涉及的值不接触任何缓冲区，它仍然可以被内联。
 :::
 
 ### 相关模式
 
 | 模式 | 说明 |
 |---------|------|
-| 缓冲区折叠 | `BUFFERIZE(CONST)` -> `CONST`——常量的缓冲区就是常量本身 |
+| STAGE 折叠 | `STAGE(CONST)` -> `CONST`——常量的 stage 就是常量本身 |
 | 索引折叠 | `INDEX(CONST)` -> `CONST`——索引常量就是常量 |
-| 恒等折叠 | `INDEX(BUFFERIZE(compute, ranges), ranges)` -> `compute`——相同范围消去 |
-| 嵌套展平 | `BUFFERIZE(BUFFERIZE(...))`——展平嵌套缓冲化 |
+| COPY 折叠 | `COPY(CONST)` -> `CONST`——常量的拷贝就是常量本身 |
+| MSTACK 折叠 | `INDEX(MSTACK([CONST, ...]))` -> `CONST`——常量的多设备堆叠 |
+| 恒等折叠 | `INDEX(STAGE(compute, ranges), ranges)` -> `compute`——相同范围消去 |
 
-Svod：`rangeify/patterns.rs` 中的 `buffer_removal_with_pcontig()`。
+Svod：`rangeify/patterns.rs` 中的 `pm_remove_bufferize()` 和 `buffer_folding()`。
 
 ---
 
 ## 死轴移除
 
-**功能**：从 BUFFERIZE 操作中移除未使用的维度。
+**功能**：从 STAGE 操作中移除未使用的维度。
 
 维度为"死"的条件：
 - 大小为 1（不贡献任何东西）
 - 在索引中以常量出现（不是变量）
 - 计算表达式不引用它
 
-死轴从 BUFFERIZE 中移除，然后通过 RESHAPE（插入大小为 1 的维度）和 EXPAND（广播到原始大小）恢复形状。这减少了缓冲区分配的维度数。
+死轴从 STAGE 中移除，然后通过 RESHAPE（插入大小为 1 的维度）和 EXPAND（广播到原始大小）恢复形状。这减少了缓冲区分配的维度数。
 
-:::caution 标量情况
-即使所有范围都为死（标量输出），BUFFERIZE 也必须以空范围保留——完全移除会导致 `NoKernelsFound`，因为内核分割期间不会创建 STORE。
+:::caution[标量情况]
+即使所有范围都为死（标量输出），STAGE 也必须以空范围保留——完全移除会导致 `NoKernelsFound`，因为内核分割期间不会创建 STORE。
 :::
 
 Svod：`rangeify/patterns.rs` 中的 `dead_axis_removal()`。

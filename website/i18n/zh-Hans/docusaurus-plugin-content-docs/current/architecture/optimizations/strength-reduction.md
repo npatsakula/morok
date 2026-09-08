@@ -11,7 +11,7 @@ Svod 源码：`schedule/src/rangeify/patterns.rs`（晚期分解组）+ `schedul
 
 *本页所有周期估算为现代 x86-64 的近似值。实际延迟因微架构和流水线状态而异。*
 
-所有模式被组合到一个不动点重写 pass（`PM_FINAL`）中，与 `symbolic_simple()`（代数清理）和 `pm_render()`（CONST 向量化、CAT 到 VECTORIZE）一起运行。
+所有模式被组合到一个不动点重写 pass（`PM_FINAL`）中，与 `symbolic_simple()`（代数清理）一起运行。
 
 ---
 
@@ -29,7 +29,7 @@ Svod 源码：`schedule/src/rangeify/patterns.rs`（晚期分解组）+ `schedul
 
 Tinygrad：`decompositions.py:448-454`。Svod：`rangeify/patterns.rs` 中的 `pm_mod_to_and`、`pm_mul_to_shl`、`pm_div_to_shr`。
 
-:::caution 有符号除法
+:::caution[有符号除法]
 对于有符号整数，`x // 2^n` **不是**简单的 `x >> n`。算术右移向负无穷取整，但整数除法向零取整。
 
 修正：`(x + (x < 0 ? 2^n - 1 : 0)) >> n`
@@ -89,7 +89,7 @@ int result = x >> 3;
 3. 对 `s` 从 0 到 `2 * nbits`：
    - 如果 `2^s > nc * (d - 1 - (2^s - 1) mod d)`：找到有效移位
    - 计算 `M = ceil((2^s + d - 1 - (2^s - 1) mod d) / d)`
-4. 返回 `(M, s)`——最小的有效 `(乘数, 移位)` 对
+4. 返回 `(M, s)`——最小的有效 `(multiplier, shift)` 对
 
 循环找到产生有效魔术数的最小 `s`。更小的 `s` 意味着更小的 `M`，这对于在窄整数类型中容纳中间乘积 `x * M` 至关重要。
 
@@ -167,7 +167,7 @@ float result = x * 0.31831f;  // 1/pi
 
 **为何晚期应用**：早期 pass 需要看到 `Add(Mul(a, b), c)` 结构进行代数化简。如果过早融合，`(x*2 + x*3)` 这样的模式无法化简为 `x*5`，因为 `Mul` 节点会被埋入 MULACC 内。
 
-**移位-加法融合（仅 Tinygrad）**：Tinygrad 还将 `(x << n) + c` 融合为 `MULACC(x, 2^n, c)`，捕获在同一不动点 pass 中 MUL 转 SHL 先运行的情况。此模式尚未移植到 Svod。
+**移位-加法融合**：`(x << n) + c` 同样会融合为 `MULACC(x, 2^n, c)`，捕获在同一不动点 pass 中 MUL 转 SHL 先运行的情况。当渲染器同时支持 `MulAcc` 和 `Shl` 时，Svod 会把 `pm_shl_add_to_mulacc` 与 `pm_fma_decomposition` 一起加入。
 
 **守卫**：仅当三个操作数（`a`、`b`、`c`）共享相同的浮点 dtype 时匹配。整数 FMA 不做融合，因为硬件 FMA 指令仅支持浮点。
 
@@ -199,7 +199,7 @@ NEG 是单条指令（浮点通过 `xorps` 翻转符号位，整数通过 `neg` 
 
 范围压缩（第 3 行）特别有价值。当开区间 `(c1, c2)` 恰好包含一个整数值时，两次比较和一个逻辑 AND 折叠为单次相等检查。这在分块索引计算中自然出现，范围变量恰好选择一个分块。
 
-:::caution 常量中的整数溢出
+:::caution[常量中的整数溢出]
 取反模式防范溢出：`!(x < c)` 变为 `(c-1) < x` 仅当 `c-1` 不下溢时，`!(c < x)` 变为 `x < (c+1)` 仅当 `c+1` 不上溢时。两者都使用 `checked_sub` / `checked_add`，溢出时返回 `None`（不做变换）。
 :::
 
@@ -247,24 +247,27 @@ Svod：`rangeify/patterns.rs` 中的 `pm_erf_decomposition`。
 所有强度削减模式被组合为单个 `PM_FINAL` 匹配器，作为不动点图重写运行：
 
 ```
-PM_FINAL = symbolic_simple() + get_late_rewrite_patterns() + pm_render()
+PM_FINAL = pm_commit_weak() + pm_cast_weak() + pm_decomp
+         + renderer.extra_matcher()   -- optional, per-backend
+         + pm_split_ends()
 ```
 
-其中 `get_late_rewrite_patterns()` 组合了：
+其中 `pm_decomp` 串联了早期分解（它本身从 `symbolic_simple()` 开始）、超越函数分解，以及 `get_late_rewrite_patterns()`：
 
 ```
-Stage 18-19 (PM_FINAL fixed-point rewrite):
+Stage 18-19（PM_FINAL 不动点重写）：
   symbolic_simple()              -- 代数清理（恒等式、常量折叠）
-  + pm_fma_decomposition         -- a*b+c -> MULACC(a,b,c)
   + pm_erf_decomposition         -- erf(x) -> 多项式近似
   + pm_mod_to_and                -- x % 2^n -> x & (2^n-1)
+  + pm_demorgan                  -- !a & !b -> !(a | b)
   + pm_mul_to_shl                -- x * 2^n -> x << n
   + pm_div_to_shr                -- x // 2^n -> x >> n
-  + pm_fdiv_to_mul               -- x / c -> x * (1/c)
-  + pm_neg_from_mul              -- x * -1 -> NEG(x)
-  + pm_comparison_negations      -- !(x<c) -> (c-1)<x, etc.
   + fast_division_patterns       -- x // d -> (x * M) >> S
-  + pm_render()                  -- CONST 向量化、CAT->VECTORIZE
+  + pm_neg_from_mul              -- x * -1 -> NEG(x)
+  + pm_comparison_negations      -- !(x<c) -> (c-1)<x 等
+  + pm_fma_decomposition         -- a*b+c -> MULACC(a,b,c)
+  + pm_shl_add_to_mulacc         -- (x<<n)+c -> MULACC(x, 2^n, c)
+  + pm_fdiv_to_mul               -- x / c -> x * (1/c)
 ```
 
 由于重写器运行到不动点，模式可以相互馈送。例如：
@@ -273,6 +276,6 @@ Stage 18-19 (PM_FINAL fixed-point rewrite):
 2. 下一次迭代中，`pm_fma_decomposition` 将 `(x << 2) + c` 融合为 `MULACC(x, 4, c)`
 3. `symbolic_simple()` 清理变换创建的任何恒等式
 
-不动点 pass 完成后，`merge_sibling_ends` 运行以合并重写可能创建的新的兄弟 END 节点。
+`pm_mod_to_and` 之后的每一项都是有条件的：只有当渲染器声明支持该模式所产生的操作时，`get_late_rewrite_patterns()` 才会加入它（移位重写需要 `Shl`，FMA 融合需要 `MulAcc`，倒数重写需要 `Fdiv`）。`pm_split_ends` 在同一个不动点内运行，为线性化器把多范围 END 拆成嵌套的单范围 END；最后由 `pm_remove_invalid()` 重写清除残留的 Invalid 标记。
 
 交叉引用：[代码生成流水线概览](../codegen/overview.md)，完整阶段列表。

@@ -8,12 +8,12 @@ Svod 的符号化简器使用 `schedule/src/symbolic/patterns.rs` 中定义的 1
 
 | 位置 | 匹配器 | 上下文 |
 |-------|---------|---------|
-| 预优化 | `symbolic()` | rangeify + 范围分割之后，内核优化之前 |
-| 后优化（阶段 8） | `symbolic()` | 优化动作之后，展开之前 |
-| 索引后处理（阶段 16） | `symbolic()` | 索引 dtype 降级之后，最终清理 |
-| 分解+渲染（阶段 18-19） | `symbolic_simple()` | 与晚期重写和渲染模式组合 |
+| 预优化 | `sym()` | rangeify + 范围分割之后，内核优化之前 |
+| 后优化（阶段 8） | `sym()` + `pm_move_where_on_load` | 优化动作之后，展开之前 |
+| 索引后处理（阶段 16） | `sym()` + `indexing_simplify()` | 索引 dtype 降级之后，最终清理 |
+| 分解+渲染（阶段 18-19） | `symbolic_simple()` | 与晚期重写和渲染器自带的匹配器组合 |
 
-`symbolic()` = `symbolic_simple()` + GEP 推送模式。除最终分解+渲染 pass 外，所有阶段运行完整的 `symbolic()` 集合。
+匹配器分为三层：`symbolic_simple()` 是第 1 层基础（恒等式、常量折叠、size-1 RANGE 折叠），`symbolic()` 在其上加入第 2 层分组（规范化、比较、按范围边界化简 div/mod），`sym()` 再加入第 3 层（`pm_simplify_valid`、ALU/STACK 重排、带取向的同类项合并）。只有最终的分解+渲染 pass 单独运行第 1 层集合。
 
 **范围分析**：每个 UOp 跟踪它在运行时可取的最小值（`vmin`）和最大值（`vmax`），在节点构造时从输入的边界急切地计算。许多模式使用这些边界在编译期证明条件（例如"x 始终非负"或"x < n 对所有值成立"）。
 
@@ -64,35 +64,44 @@ flowchart TD
 
 ## 模式排序
 
-`symbolic_simple()` 匹配器按特定顺序组合模式组。在组内，模式按顺序尝试直到有一个匹配。组通过 `+` 运算符串联：
+每个匹配器都按特定顺序组合模式组——顺序是关键的，因为一个组可能为后面的组暴露出新的匹配。在组内，模式按顺序尝试直到有一个匹配。组通过 `+` 运算符串联：
 
 ```text
-propagate_invalid          -- MUST be first (before x*0=0)
-fold_invalid_load_store
-constant_folding_dsl_patterns
-vconst_folding_patterns
-identity_and_zero_patterns
-commutative_canonicalization
-self_folding_dsl_patterns
-zero_folding_dsl_patterns
-division_dsl_patterns
-cast_dsl_patterns
-cast_where_dsl_patterns
-term_combining_dsl_patterns
-alu_folding_dsl_patterns
-advanced_division_dsl_patterns
-div_mod_recombine_dsl_patterns
-comparison_dsl_patterns
-boolean_dsl_patterns
-minmax_dsl_patterns
-where_bound_patterns
-power_dsl_patterns
-negation_dsl_patterns
-range_based_mod_div_patterns
-dce_dsl_patterns
-dead_loop_patterns
-after_simplification_patterns
-pm_move_where_on_load       -- WHERE->INDEX embedding for masked loads
+symbolic_simple() = symbolic_simple_base() + dead_loop_patterns()
+
+symbolic_simple_base()          -- tier 1
+  propagate_invalid             -- MUST be first (before x*0=0)
+  fold_invalid_load_store
+  constant_folding_dsl_patterns
+  vconst_folding_patterns
+  bool_arithmetic_patterns
+  identity_and_zero_patterns
+  self_folding_dsl_patterns
+  zero_folding_dsl_patterns
+  division_dsl_patterns
+  cast_dsl_patterns
+  uint_pack_dsl_patterns
+  div_mod_recombine_dsl_patterns
+  power_dsl_patterns
+  boolean_dsl_simple_patterns
+  dce_dsl_simple_patterns
+
+symbolic() = symbolic_simple() + tier 2
+  commutative_canonicalization
+  boolean_dsl_patterns
+  term_combining_dsl_patterns
+  dce_dsl_patterns
+  where_alu_combining_patterns
+  vmin_vmax_collapse_patterns
+  minmax_dsl_patterns
+  alu_folding_dsl_patterns
+  comparison_dsl_patterns
+  range_based_mod_div_patterns
+  advanced_division_dsl_patterns
+  range_based_cast_patterns
+  long_to_int_narrowing_patterns
+  after_simplification_patterns
+  where_bound_patterns
 ```
 
 ---
@@ -140,7 +149,7 @@ VConst 折叠覆盖 11 个二元操作（不含 Pow 和 Fdiv）以及全部 7 �
 | `MUL[x, 0]` | `0` | 仅非浮点数 |
 | `AND[_, 0]` | `0` | 交换律 |
 
-:::caution IEEE 754：乘以零
+:::caution[IEEE 754：乘以零]
 `MUL[x, 0]` 对浮点数**不做**化简，因为 IEEE 754 要求：
 - `NaN * 0 = NaN`
 - `Inf * 0 = NaN`
@@ -184,7 +193,7 @@ VConst 折叠覆盖 11 个二元操作（不含 Pow 和 Fdiv）以及全部 7 �
 | `FDIV(MUL(x, y), y)` | `x` | 消去（浮点） |
 | `IDIV(MUL(x, y), y)` | `x` | 消去（整数） |
 
-:::caution 模式优先级
+:::caution[模式优先级]
 `FDIV(0, 0) -> NaN` 必须在匹配器中排在 `FDIV(x, x) -> 1` 之前以获得优先权。`division_dsl_patterns()` 中的排序保证了这一点。
 :::
 
@@ -202,7 +211,7 @@ VConst 折叠覆盖 11 个二元操作（不含 Pow 和 Fdiv）以及全部 7 �
 
 `can_safe_cast(to, from)` 函数判断中间类型是否能容纳所有值。它检查位宽、符号性以及浮点/整数类别。
 
-:::caution 截断破坏往返
+:::caution[截断破坏往返]
 `CAST(CAST(x, i8), i64)` 当 `x` 为 `i64` 时**不会**折叠为 `x`。中间的 `i8` 截断值——`can_safe_cast(i64, i8)` 返回 `false`，因为 `i8` 无法容纳所有 `i64` 值。
 
 安全示例：`CAST(CAST(x, i32), bool)` -> `CAST(x, bool)`，当 `x` 为 `bool` 时，因为 `i32` 能表示 `true` 和 `false`。
@@ -242,7 +251,7 @@ VConst 折叠覆盖 11 个二元操作（不含 Pow 和 Fdiv）以及全部 7 �
 |---------|--------|-------|
 | `ADD[ADD[x, c], y]` | `ADD(ADD(x, y), c)` | 将常量推向外层；`y` 不能是常量 |
 
-常量外推对索引提取至关重要。它确保常量冒泡到最外层，使下游模式（如 div-mod 化简）能看到干净的 `变量 + 偏移` 形式。
+常量外推对索引提取至关重要。它确保常量冒泡到最外层，使下游模式（如 div-mod 化简）能看到干净的 `variable + offset` 形式。
 
 ### Sub 规范化
 
@@ -282,7 +291,7 @@ Svod 保留 `SUB` 作为一等 IR 操作（不同于 Tinygrad 将 `a-b` 规范�
 | `LT(x, x)`, `GT(x, x)`, `NE(x, x)` | `false` |
 | `LE(x, x)`, `GE(x, x)`, `EQ(x, x)` | `true` |
 
-:::caution 浮点自比较
+:::caution[浮点自比较]
 自比较模式受 `!x.dtype().is_float()` 守卫。对于浮点数，`NaN != NaN` 为 `true`，`NaN == NaN` 为 `false`，因此这些恒等式不成立。
 :::
 
@@ -342,7 +351,7 @@ Svod 保留 `SUB` 作为一等 IR 操作（不同于 Tinygrad 将 `a-b` 规范�
 | `WHERE(NOT(cond), t, f)` | `WHERE(cond, f, t)` | 条件翻转 |
 | `WHERE(a, WHERE(b, c, d), d)` | `WHERE(AND(a, b), c, d)` | 分支合并（`d` 上使用 ptr_eq） |
 
-:::caution 条件翻转的 Invalid 守卫
+:::caution[条件翻转的 Invalid 守卫]
 `WHERE(NOT(cond), t, f) -> WHERE(cond, f, t)` 当 `f` 包含 `Invalid` 时**不会**应用。填充操作创建 `WHERE(valid, idx, Invalid)` 结构，交换后会将 `Invalid` 移到真分支，使下游模式无法匹配。标量 `Invalid` 和向量化 `VECTORIZE(Invalid, ...)` 都会被检查。
 
 Tinygrad 有相同的守卫：`symbolic.py:201-202`。
@@ -445,59 +454,46 @@ Tinygrad 对齐：`symbolic.py:37`。右侧位置的裸 Invalid **不会**传播
 
 ---
 
-## 16. GEP 推送
+## 16. 通道折叠——INDEX 作用于 STACK
 
-GEP（Get Element Pointer）从向量中提取元素。这些模式将 GEP 推过其他操作以到达向量源，在反向量化之后实现标量化简。
+Svod 没有 GEP 操作：带形状的值就是一个由通道组成的 `STACK`，而 `INDEX` 从中选取通道，方式与它从 buffer 中选取地址完全一致。因此 Tinygrad 的 `gep_pushing` 在这里没有直接对应物。Svod 拥有的是一组折叠规则，用来把 `INDEX`/`STACK` 结构塌缩掉，好让去向量化器只看到标量。
 
-仅包含在 `symbolic()`（阶段 4）中，不包含在 `symbolic_simple()`（阶段 8、16）中。
+这些折叠大多是结构性的，位于去向量化器的 movement 清理中（`schedule/src/devectorize.rs`），而不在 `symbolic_simple()` 里。唯一属于符号层的规则是 `alu_vectorize_reorder_patterns`，它属于第 3 层的 `sym()`。
 
-### 组合与提取
+### 通道选取与塌缩
 
 | 模式 | 结果 | 说明 |
-|---------|--------|-------|
-| `GEP(GEP(x, inner), outer)` | `GEP(x, inner[outer])` | 组合嵌套 |
-| `GEP(VECTORIZE(x,x,x,x), [i])` | `x` | 穿过广播（全部 ptr_eq） |
-| `GEP(VECTORIZE(elems), [i])` | `elems[i]` | 穿过 VECTORIZE |
-| `GEP(scalar, [i])` | `scalar` | 标量恒等（vcount == 1） |
-| `GEP(VCONST(vals), [i])` | `CONST(vals[i])` | 穿过 VConst |
-| `GEP(x, [0,1,...,n-1])` | `x` | 恒等移除 |
+|------|------|------|
+| `INDEX(STACK([a, b, c]), 2)` | `c` | 常量通道下标直接折叠到被堆叠的源 |
+| `INDEX(STACK([...]), c0, rest...)` | `INDEX(sources[c0], rest...)` | 前导常量递归地剥掉一层 STACK |
+| `STACK([INDEX(b, 0), INDEX(b, 1), ...])` | `b` | 顺序的通道读取重建出源 |
+| `INDEX(INDEX(b, i), j)` | `INDEX(b, i, j)` | 组合标量索引链 |
+| `INDEX(AFTER(STACK([...]), deps), c)` | 选中的通道，并重新挂回 `deps` | 寄存器栈的通道选取保留顺序依赖 |
 
-### 推过操作
+`const_index_into_stack` 是递归的：索引列表中前导的每个常量都会剥掉一层 `STACK`。
+
+### 作用于 STACK 的 ALU
 
 | 模式 | 结果 | 守卫 |
-|---------|--------|-------|
-| `GEP(op(a, b), idx)` | `op(GEP(a, idx), GEP(b, idx))` | 二元，仅 Index dtype |
-| `GEP(unary(x), idx)` | `unary(GEP(x, idx))` | 一元，仅 Index dtype |
-| `GEP(WHERE(c, t, f), idx)` | `WHERE(GEP(c, idx), GEP(t, idx), GEP(f, idx))` | 仅 Index dtype |
-| `GEP(MULACC(a, b, c), idx)` | `MULACC(GEP(a, idx), GEP(b, idx), GEP(c, idx))` | 仅 Index dtype |
+|------|------|------|
+| `op(STACK(x,x,x,x), STACK(y,y,y,y))` | `STACK(op(x,y), op(x,y), ...)` | 两个操作数都是广播（所有通道 `ptr_eq`），长度相等且 > 1 |
 
-:::caution Index dtype 守卫防止图爆炸
-GEP 推过 ALU 操作被限制为 `Index` dtype（Tinygrad：`symbolic.py:167`）。没有此守卫，GEP 推送与 `no_vectorized_alu` 的组合会在高维内核上导致指数级图膨胀。
+适用于十八个二元操作——Add、Mul、Sub、FloorMod、Max、FloorDiv、Fdiv、Pow、And、Or、Xor、Shl、Shr 以及六个比较操作。塌缩为「单个标量操作的 `STACK`」之后，操作数就暴露给常量折叠和标量化简了。
+
+:::caution[仅第 3 层]
+`alu_vectorize_reorder_patterns` 属于 `sym()`，不属于 `symbolic()` 或 `symbolic_simple()`。它在运行 `sym()` 的那些阶段触发——预优化、阶段 8 和去向量化器——所以到最终的分解+渲染 pass 时，重排已经发生过了。
 :::
 
-### 推过结构操作
+### STACK 周边的 Movement 清理
 
 | 模式 | 结果 |
-|---------|--------|
-| `GEP(CAT([a<4>, b<4>]), [5])` | `GEP(b, [1])` |
-| `GEP(PTRCAT([a, b, c]), [1, 2])` | `PTRCAT([b, c])` |
-| `GEP(CAST(x, dtype), idx)` | `CAST(GEP(x, idx), scalar_dtype)` |
-| `GEP(BITCAST(x, dtype), idx)` | `BITCAST(GEP(x, idx), scalar_dtype)` |
-| `GEP(WMMA(a, b, c), idx)` | `WMMA(GEP(a, ...), GEP(b, ...), GEP(c, ...))` |
-| `GEP(UNROLL(x, ...), idx)` | `GEP(x, idx)` |
-| `GEP(void_node, _)` | `void_node` |
+|------|------|
+| `RESHAPE(STACK([x]))` | `x`——当形状本就一致时 |
+| 添加前导 1 维的 `RESHAPE(x)` | 每增加一维就套一层 `STACK([x])` |
+| `EXPAND(STACK([x]))` | `STACK([x, x, ..., x])`——物化该广播 |
+| `PERMUTE(PERMUTE(x, a), b)` | `PERMUTE(x, a∘b)`；恒等置换被消掉 |
 
-WMMA 模式通过 upcast 轴映射 tile 索引以提取对应的输入子组。
-
-### 重收集
-
-| 模式 | 结果 |
-|---------|--------|
-| `VECTORIZE(GEP(x,[0]), GEP(x,[1]), ..., GEP(x,[N-1]))` | `GEP(x, [0,1,...,N-1])` |
-
-这将 `no_vectorized_alu` 创建的 VECTORIZE 结构折叠回单个 GEP，然后恒等模式将其移除。
-
----
+这些规则位于 `movement_cleanup_patterns()` / `mop_cleanup_patterns()`，由去向量化器在标量化之前应用。WMMA 的通道同样在那里处理，由 `stack_wmma_sources` 和 `broadcast_and_devec_wmma` 负责，而不是由任何符号模式负责。
 
 ## 17. LOAD 上的 WHERE（仅阶段 8）
 
@@ -555,17 +551,18 @@ After:   INDEX(buf, WHERE(combined_cond, idx, Invalid))
 
 ### 统一 Div-Mod 引擎（`fold_divmod_general`）
 
-对于 Index dtype 上的 IDIV 和 MOD，统一引擎按优先级顺序尝试化简规则。基于 Tinygrad 的 `fold_divmod_general`（`divandmod.py:8-93`）。
+对于 Index dtype 上的 IDIV 和 MOD，统一引擎按优先级顺序尝试化简规则。基于 Tinygrad 的 `fold_divmod_general`（`divandmod.py:8-96`）。
 
 | 优先级 | 规则 | 描述 |
 |----------|------|-------------|
 | 1 | cancel_divmod | 范围位于单个除数区间内 |
-| 2 | remove_nested_mod | `(a%4 + b)%2 -> (a+b)%2`，当 `2 | 4` |
-| 3 | fold_binary_numerator | 范围恰好为 2 的单项 |
+| 2 | nested_div | `(a % (k*c)) // c -> (a // c) % k` |
+| 3 | remove_nested_mod | `(a%4 + b)%2 -> (a+b)%2`，当 `2 | 4` |
 | 4 | fold_divmod_congruence | 因子同余模算术 |
 | 5 | gcd_with_remainder | 从分子中提取公共 GCD |
-| 6 | divide_by_gcd | 变量分母 GCD 分解 |
-| 7 | factor_remainder | `(d*x+y)//d -> x + y//d`（最后手段） |
+| 6 | nest_div_by_smallest_factor | 按最小公共因子递归拆分 |
+| 7 | divide_by_gcd | 任意分母的 GCD 分解 |
+| 8 | factor_remainder | `(d*x+y)//d -> x + y//d`（最后手段） |
 
 ### Div-Mod 重组合
 

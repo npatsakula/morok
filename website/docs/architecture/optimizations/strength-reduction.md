@@ -29,7 +29,7 @@ The modulo optimization works because `2^n - 1` is a bitmask of the lower n bits
 
 Tinygrad: `decompositions.py:448-454`. Svod: `pm_mod_to_and`, `pm_mul_to_shl`, `pm_div_to_shr` in `rangeify/patterns.rs`.
 
-:::caution Signed Division
+:::caution[Signed Division]
 For signed integers, `x // 2^n` is NOT simply `x >> n`. Arithmetic right shift rounds toward negative infinity, but integer division rounds toward zero.
 
 Fix: `(x + (x < 0 ? 2^n - 1 : 0)) >> n`
@@ -167,7 +167,7 @@ This maps to hardware FMA instructions (`vfmadd` on x86 AVX, `fmadd` on ARM NEON
 
 **Why applied late**: Earlier passes need to see `Add(Mul(a, b), c)` structure for algebraic simplification. If fused early, patterns like `(x*2 + x*3)` could not simplify to `x*5` because the `Mul` nodes would be buried inside MULACC.
 
-**Shift-add fusion (Tinygrad only)**: Tinygrad also fuses `(x << n) + c` to `MULACC(x, 2^n, c)`, catching cases where MUL-to-SHL ran first in the same fixed-point pass. This pattern is not yet ported to Svod.
+**Shift-add fusion**: `(x << n) + c` is also fused to `MULACC(x, 2^n, c)`, catching cases where MUL-to-SHL ran first in the same fixed-point pass. Svod's `pm_shl_add_to_mulacc` is added alongside `pm_fma_decomposition` whenever the renderer supports both `MulAcc` and `Shl`.
 
 **Guards**: Only matches when all three operands (`a`, `b`, `c`) share the same float dtype. Integer FMA is not fused because hardware FMA instructions are float-only.
 
@@ -199,7 +199,7 @@ Late rewrites for negated and compound comparisons on integers. These patterns s
 
 The range compression (row 3) is particularly valuable. When the open interval `(c1, c2)` contains exactly one integer value, two comparisons and a logical AND collapse to a single equality check. This arises naturally in tiled index calculations where a range variable selects exactly one tile.
 
-:::caution Integer Overflow in Constants
+:::caution[Integer Overflow in Constants]
 The negation patterns guard against overflow: `!(x < c)` becomes `(c-1) < x` only if `c-1` does not underflow, and `!(c < x)` becomes `x < (c+1)` only if `c+1` does not overflow. Both use `checked_sub` / `checked_add` and return `None` (no transformation) on overflow.
 :::
 
@@ -247,23 +247,27 @@ Svod: `pm_erf_decomposition` in `rangeify/patterns.rs`.
 All strength reduction patterns are composed into a single `PM_FINAL` matcher that runs as a fixed-point graph rewrite:
 
 ```
-PM_FINAL = symbolic_simple() + get_late_rewrite_patterns() + pm_render()
+PM_FINAL = pm_commit_weak() + pm_cast_weak() + pm_decomp
+         + renderer.extra_matcher()   -- optional, per-backend
+         + pm_split_ends()
 ```
 
-Where `get_late_rewrite_patterns()` combines:
+Where `pm_decomp` chains the early decompositions (which start from `symbolic_simple()`), the transcendental decompositions, and `get_late_rewrite_patterns()`:
 
 ```
 Stage 18-19 (PM_FINAL fixed-point rewrite):
   symbolic_simple()              -- algebraic cleanup (identities, constant folding)
-  + pm_fma_decomposition         -- a*b+c -> MULACC(a,b,c)
   + pm_erf_decomposition         -- erf(x) -> polynomial approx
   + pm_mod_to_and                -- x % 2^n -> x & (2^n-1)
+  + pm_demorgan                  -- !a & !b -> !(a | b)
   + pm_mul_to_shl                -- x * 2^n -> x << n
   + pm_div_to_shr                -- x // 2^n -> x >> n
-  + pm_fdiv_to_mul               -- x / c -> x * (1/c)
+  + fast_division_patterns       -- x // d -> (x * M) >> S
   + pm_neg_from_mul              -- x * -1 -> NEG(x)
   + pm_comparison_negations      -- !(x<c) -> (c-1)<x, etc.
-  + fast_division_patterns       -- x // d -> (x * M) >> S
+  + pm_fma_decomposition         -- a*b+c -> MULACC(a,b,c)
+  + pm_shl_add_to_mulacc         -- (x<<n)+c -> MULACC(x, 2^n, c)
+  + pm_fdiv_to_mul               -- x / c -> x * (1/c)
 ```
 
 Because the rewriter runs to a fixed point, patterns can feed into each other. For example:
@@ -272,6 +276,6 @@ Because the rewriter runs to a fixed point, patterns can feed into each other. F
 2. On the next iteration, `pm_fma_decomposition` fuses `(x << 2) + c` into `MULACC(x, 4, c)`
 3. `symbolic_simple()` cleans up any identities created by the transformations
 
-After the fixed-point pass completes, `merge_sibling_ends` runs to merge any new sibling END nodes that the rewriting may have created.
+Every entry below `pm_mod_to_and` is conditional: `get_late_rewrite_patterns()` adds it only when the renderer declares support for the ops it produces (`Shl` for the shift rewrites, `MulAcc` for the FMA fusions, `Fdiv` for the reciprocal rewrite). `pm_split_ends` runs inside the same fixed point, splitting multi-range ENDs into nested single-range ENDs for the linearizer; a final `pm_remove_invalid()` rewrite then clears any leftover Invalid markers.
 
 Cross-reference: [Codegen Pipeline Overview](../codegen/overview.md) for the full stage listing.

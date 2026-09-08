@@ -20,19 +20,17 @@ sidebar_label: Phase 1 — Rangeify
 
 **यह क्यों ज़रूरी है**: Movement ऑपरेशन (RESHAPE, PERMUTE, आदि) सुविधाजनक abstractions हैं, लेकिन हार्डवेयर को कॉन्क्रीट index कैलकुलेशन चाहिए। इन्हें जल्दी साफ़ करने से बाद के स्टेजों में patterns सही से मैच होते हैं।
 
-**Pattern**: `pm_mops + pm_syntactic_sugar` (bottom-up)
+**Pattern**: `movement_op_patterns()` (bottom-up)
 
 | Pattern | ट्रांसफ़ॉर्मेशन | विज़ुअल | लोकेशन |
 |---------|----------------|--------|---------|
 | INDEX पर Movement | Index एक्सप्रेशन पर movement अप्लाई करें | `INDEX(PERMUTE(arr), [i, j]) → INDEX(arr, [j, i])` | `movement_op_patterns()` |
-| AFTER के ज़रिए Movement | RESHAPE को टाइमिंग wrapper से बाहर निकालें (Tinygrad-स्पेसिफ़िक) | `AFTER(RESHAPE(x, arg), [dep1, dep2]) → RESHAPE(AFTER(x, [dep2]), arg)` | केवल Tinygrad |
-| END के ज़रिए Movement | END wrapper से movement हटाएँ (Tinygrad-स्पेसिफ़िक) | `END(RESHAPE(x), ranges) → END(x, ranges)` | केवल Tinygrad |
-| Nested INDEX सिम्प्लीफ़िकेशन | रिडंडेंट nested INDEX हटाएँ (Svod) | `INDEX(INDEX(ptr, [i]), [i]) → INDEX(ptr, [i])` | `movement_op_patterns()` |
-| Nested INDEX कॉन्कैट | PtrDType के लिए nested INDEX फ़्लैटन करें | `INDEX(INDEX(ptr, i), j) → INDEX(ptr, i, j)` | `pm_syntactic_sugar` |
+| AFTER के ज़रिए Movement | Movement (या INDEX) को टाइमिंग wrapper से गुज़ारें, हर dep बरक़रार रखते हुए | `AFTER(RESHAPE(x, arg), deps) → RESHAPE(AFTER(x, deps), arg)` | `movement_op_patterns()` |
+| END के ज़रिए Movement | END wrapper से movement हटाएँ | `END(RESHAPE(x), ranges) → END(x, ranges)` | `movement_op_patterns()` |
 
 **Bottom-up क्यों?** चाइल्ड नोड्स पहले साफ़ होने चाहिए ताकि parents मैच कर सकें। Movement ops गहराई में नेस्ट होते हैं; नीचे से साफ़ करने से मिस्ड patterns नहीं होते।
 
-**नोट**: Tinygrad और Svod का अप्रोच अलग है। Tinygrad movement ops को wrappers (AFTER, END) से गुज़ारता है क्योंकि bufferization के दौरान movement ops दोबारा अप्लाई होते हैं। Svod bufferization के दौरान indices ट्रांसफ़ॉर्म करके movement ops पूरी तरह हटा देता है, इसलिए AFTER/END patterns की ज़रूरत नहीं।
+**नोट**: `is_movement()` में ठीक RESHAPE, PERMUTE, EXPAND, PAD, SHRINK और FLIP आते हैं। Nested INDEX फ़्लैटनिंग (`INDEX(INDEX(ptr, i), j) → INDEX(ptr, i, j)`) इस स्टेज का हिस्सा *नहीं* है; वह `mop_cleanup_patterns()` में रहती है और Stage 9 expander व devectorizer के साथ चलती है।
 
 **Svod**: `movement_op_patterns()` in `rangeify/patterns.rs`
 
@@ -62,11 +60,11 @@ count = clamp(64 - length, 0, 64)
 
 यह मैकेनिज़्म इस तरह काम करता है:
 1. ऐसे subexpressions पहचानें जो REDUCE range पर डिपेंड नहीं करते
-2. उन subexpressions के लिए DEFINE_VAR बनाएँ (loop-invariant ट्रीट करें)
-3. Range को DEFINE_VAR से substitute करें और symbolic सिम्प्लीफ़िकेशन चलाएँ
-4. अगर simplified एक्सप्रेशन में कोई range नहीं बची, तो REDUCE एलिमिनेट हो गया
+2. उन external inputs को synthetic scalar PARAM वेरिएबल से बदलें, जो अपने proven vmin/vmax साथ रखते हैं
+3. Substituted body को उसी range पर एक synthetic REDUCE में लपेटें और reduce-collapse matcher चलाएँ
+4. अगर simplified एक्सप्रेशन में कोई range नहीं बची, तो REDUCE एलिमिनेट हो गया (और अस्थायी PARAMs वापस substitute हो जाते हैं)
 
-**नोट**: INDEX पर WHERE मूवमेंट (`pm_move_where_on_load`) एक अलग ऑप्टिमाइज़ेशन है जो मेमोरी एक्सेस स्किप करने के लिए loads से पहले conditionals लगाता है, लेकिन यह REDUCE ऑपरेशन एलिमिनेट नहीं करता।
+**नोट**: INDEX पर WHERE मूवमेंट (`pm_move_where_on_load`) एक अलग ऑप्टिमाइज़ेशन है जो Stage 8 पर चलता है और कंडीशन को `INDEX.indices[0]` में `WHERE(cond, idx, Invalid)` के रूप में एम्बेड करता है। यह REDUCE ऑपरेशन एलिमिनेट नहीं करता।
 
 **Svod**: `pm_load_collapse()` in `rangeify/patterns.rs`
 
@@ -97,11 +95,11 @@ flowchart TD
 - Inner ranges SIMD से वेक्टराइज़ हो सकती हैं
 - Outer ranges GPU blocks / CPU threads से पैरेलाइज़ हो सकती हैं
 
-`pm_flatten_range` प्रॉफ़िटेबल होने पर REDUCE/STORE/END पर nested ranges मर्ज करता है।
+`pm_flatten_range` REDUCE और END नोड्स की range operand लिस्ट को उन RANGE नोड्स से दोबारा बनाता है जो अब भी उनके sources के ज़रिए पहुँच में हैं। (Ranges मर्ज करना Stage 5 का काम है।)
 
-**कॉन्टेक्स्ट**: SINK पर substitutions ट्रैक करने के लिए dictionary context (`ctx={}`) चाहिए।
+**कॉन्टेक्स्ट**: एक `SplitRangesContext` हर `RANGE % const` जगह को मार्क करता है; divmod substitution एक बार, SINK पर होती है।
 
-**नोट**: स्प्लिट तभी अप्लाई होता है जब `end % mod == 0` (divisibility check)।
+**नोट**: स्प्लिट तभी अप्लाई होता है जब `end % mod == 0` (divisibility check)। Warp और Device ranges कभी स्प्लिट नहीं होतीं, और जिन ranges को कोई image STORE index करता है वे स्प्लिटिंग से पिन कर दी जाती हैं।
 
 **Svod**: `pm_split_ranges()` + `pm_flatten_range()` in `rangeify/transforms.rs`
 
@@ -119,9 +117,9 @@ flowchart TD
 
 **यह क्यों ज़रूरी है**: कंप्यूटर सिंपल मैथ में फ़ास्ट हैं। Division और remainder स्लो ऑपरेशन हैं। यह स्टेज अलजेब्रा नियमों से जहाँ भी हो सके स्लो ऑपरेशन एलिमिनेट करता है।
 
-**Pattern**: `symbolic() + pm_flatten_range`
+**Pattern**: `sym() + pm_fold_cast_const() + pm_flatten_range()`
 
-नोट: `symbolic()`, Stage 8 पर इस्तेमाल होने वाले `sym` का एक सबसेट है। इसमें algebraic नियम शामिल हैं लेकिन बाद के स्टेज के patterns नहीं।
+नोट: `symbolic()` (tier 2), `sym()` (tier 3) का सख़्त सबसेट है; वही `sym` Stage 8 पर दोबारा चलता है।
 
 **Constant folding**:
 ```text
@@ -147,11 +145,11 @@ NOT(NOT(x)) → x
 - Identity removal (self-folding, रिडंडेंट ऑपरेशन)
 - Comparison सिम्प्लीफ़िकेशन
 - Cast ऑप्टिमाइज़ेशन
-- GEP pushing (ALUs से address कैलकुलेशन गुज़ारना)
+- ALU/STACK रीऑर्डरिंग (`ALU(STACK, STACK) → STACK(ALU)`)
 - Where folding (एक ही condition वाले WHERE कम्बाइन करना)
 - Reduce mul chain (reduce से बाहर multiplications ले जाना)
 
-**Svod**: `symbolic()` in `symbolic/patterns.rs`
+**Svod**: `sym()` in `symbolic/patterns.rs`
 
 ---
 
@@ -177,6 +175,8 @@ RANGE(0..4), RANGE(0..8)
 RANGE(0..32)
 ```
 
+`pm_simplify_ranges` उन ranges को भी सँकरा करता है जो हर INDEX validity gate से bounded साबित होती हैं।
+
 मर्ज के मापदंड:
 1. Axis types कम्पैटिबल होने चाहिए (दोनों output, दोनों reduce, आदि)
 2. REDUCE स्कोप कंसिस्टेंट रहना चाहिए
@@ -200,11 +200,11 @@ RANGE(0..32)
 
 **यह क्यों ज़रूरी है**: Bufferization के बाद, ग्राफ़ में कई STORE ऑपरेशन हो सकते हैं। हर STORE अपना कर्नेल बनता है — अपने बफ़र, ranges, और डिपेंडेंसी के साथ।
 
-**फ़ंक्शन**: `run_kernel_split_pipeline()` in `schedule/src/rangeify/kernel.rs`
+**फ़ंक्शन**: `try_get_kernel_graph()` in `schedule/src/rangeify/kernel.rs`
 
-Splitting से पहले, `pm_flatten_range` pre-pass **पूरे ग्राफ़ पर एक बार** चलता है (bottom-up)। यह सभी kernels के nested ranges को एक ही traversal में merge करता है, overlapping subgraphs पर redundant काम से बचता है। यह pre-pass compilation speed की एक key optimization है — इसके बिना, हर kernel का `split_store` shared subgraphs को independently re-traverse करता।
+`kernel_graph_pre_cut` के अंदर, STAGE नोड्स के STORE बन जाने के बाद, `pm_flatten_range` pre-pass **पूरे ग्राफ़ पर एक बार** चलता है (bottom-up)। यह सभी kernels की range लिस्ट एक ही traversal में दोबारा बनाता है, overlapping subgraphs पर redundant काम से बचता है। यह pre-pass compilation speed की एक key optimization है — इसके बिना, हर kernel का `split_store` shared subgraphs को independently re-traverse करता।
 
-Pre-pass के बाद, `split_all_stores` STORE boundaries पर split करता है, और `fix_assign` buffer numbering (`LocalAddBufferContext.dg` counter से) और dependency tracking handle करता है।
+Pre-pass के बाद, `split_all_stores` STORE boundaries पर split करता है — हर kernel अपने PARAM slots `LocalAddBufferContext::param_slot` से नंबर करता है — और फिर `fix_assign` inter-kernel dependencies जोड़ता है, dependency cycles को रिजेक्ट करते हुए।
 
 ---
 
@@ -220,21 +220,21 @@ Pre-pass के बाद, `split_all_stores` STORE boundaries पर split क�
 
 **यह क्यों ज़रूरी है**: कम्पाइलर ऑप्टिमाइज़ेशन के अलग-अलग कॉम्बिनेशन (यहाँ vectorize? वहाँ unroll?) ट्राई करता है और सबसे फ़ास्ट चुनता है। सही कॉम्बिनेशन ढूँढने से कोड 10x तेज़ हो सकता है।
 
-**फ़ंक्शन**: `apply_opts(sink, renderer)`
+**फ़ंक्शन**: `optimize_kernel(ast, renderer)`
 
 **ऑप्टिमाइज़ेशन एक्शन**:
 
 | एक्शन | इफ़ेक्ट | हार्डवेयर टारगेट |
 |--------|--------|-----------------|
-| TC | Tensor core यूज़ सक्षम करें | NVIDIA GPUs |
+| TC | Tensor core यूज़ सक्षम करें | NVIDIA, AMD, Apple Metal और Intel GPUs |
 | UPCAST | एक डायमेंशन वेक्टराइज़ करें | सभी (SIMD) |
-| LOCAL | लोकल/shared मेमोरी इस्तेमाल करें | GPU (LDS) / CPU (L1) |
+| LOCAL | लोकल/shared मेमोरी इस्तेमाल करें | केवल GPU (`has_local` ज़रूरी) |
 | UNROLL | एक लूप डायमेंशन अनरोल करें | सभी (लूप ओवरहेड से बचें) |
-| GROUP | कैश के लिए ऑपरेशन ग्रुप करें | सभी |
-| GROUPTOP | Reduce ops के लिए ग्रुप | GPU tensor cores |
+| GROUP | Grouped reduce का inner split | GPU (shared memory; TC लगने पर रिजेक्ट) |
+| GROUPTOP | Grouped reduce का outer split | GPU (shared memory; TC लगने पर रिजेक्ट) |
 | THREAD | Thread-बेस्ड पैरेललिज़्म | CPU |
 | NOLOCALS | लोकल मेमोरी यूज़ बंद करें | सभी (constraint, आगे LOCAL एक्शन रोकता है) |
-| SWAP | Range असाइनमेंट स्वैप करें | सभी (अलग tiling ट्राई करें) |
+| SWAP | दो Global range असाइनमेंट स्वैप करें | GPU/CPU global axes (अलग tiling ट्राई करें) |
 | PADTO | अलाइनमेंट के लिए पैड | सभी (मेमोरी अलाइनमेंट) |
 
 **ऑप्टिमाइज़ेशन सर्च कैसे काम करता है**:
@@ -247,13 +247,13 @@ Pre-pass के बाद, `split_all_stores` STORE boundaries पर split क�
 flowchart TD
   S["Optimization Search"] --> H["Heuristic mode (BEAM=0): Hand-coded optimizations"]
   S --> B["Beam search (BEAM≥1)"]
-  B --> B1["Generate all possible actions (~162 base actions, workload-dependent)"]
+  B --> B1["Generate all possible actions (193 fixed base actions; 200 with BEAM_PADTO)"]
   B --> B2["Apply to all top-K candidates in parallel"]
   B --> B3["Filter based on constraints"]
   B --> B4["Compile and run each candidate, measure actual time"]
   B --> B5["Pick fastest"]
 ```
 
-**नोट**: NOLOCALS एक constraint है जो `dont_use_locals = True` सेट करता है, जिससे आगे LOCAL एक्शन और shared memory यूज़ डिसीज़न प्रभावित होते हैं।
+**नोट**: NOLOCALS एक constraint है जो `dont_use_locals = true` सेट करता है, जिससे आगे LOCAL एक्शन और shared memory यूज़ डिसीज़न प्रभावित होते हैं। यह base action लिस्ट का हिस्सा नहीं है — enabled होने पर हर candidate के साथ जोड़ा जाता है।
 
 **Svod**: `optimizer/mod.rs`, `optimizer/opts.rs`

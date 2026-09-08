@@ -27,9 +27,9 @@ Tinygrad 源码：`tinygrad/codegen/opt/`。Svod 源码：`schedule/src/optimize
 | SWAP(axis1, axis2) | 重排全局维度 | 全部 |
 | PADTO(axis, amount) | 对齐填充 | 全部 |
 | NOLOCALS | 禁用本地内存 | 全部（约束） |
-| TC | 启用 tensor core | NVIDIA GPU |
+| TC | 启用 tensor core | NVIDIA、AMD、Metal、Intel GPU（WMMA/MFMA） |
 
-总动作空间约 162 个基础动作（随内核结构和可用并行度变化）。
+`BEAM_ACTIONS` 中有 193 个基础动作（`BEAM_PADTO=1` 时为 200 个）；每个内核最终保留多少，取决于内核结构和可用并行度。NOLOCALS 不在这个列表里——只有设置了 `NOLOCALS`/`SVOD_NOLOCALS` 时，`generate_actions` 才会追加它。
 
 ---
 
@@ -72,36 +72,35 @@ fn hand_coded_optimizations(scheduler: &mut Scheduler) {
 
 ```rust
 // Pseudocode — simplified from optimizer/beam.rs
-// Actual API: beam_search_cached(scheduler, config, compile_and_time) -> Result<BeamResult>
-fn beam_search(scheduler: Scheduler, config: BeamConfig) -> Scheduler {
-    let mut beam = vec![scheduler];
-    let deadline = Instant::now() + config.time_limit;
+// Actual API: beam_search_cached_remote(scheduler, config, compiler_identity,
+//                                       behavior_fingerprint, compile_wave, benchmark)
+fn beam_search(scheduler: Scheduler, config: &BeamConfig) -> Scheduler {
+    let mut beam = vec![(scheduler, Duration::MAX)];
 
-    while Instant::now() < deadline {
-        let mut candidates = vec![];
+    loop {
+        // EXPAND: every applicable action on every beam member
+        let candidates: Vec<Scheduler> = beam.iter()
+            .flat_map(|(state, _)| generate_actions(state))
+            .collect();
 
-        for state in &beam {
-            for action in generate_actions(state) {
-                if let Ok(next) = state.apply(action) {
-                    candidates.push(next);
-                }
-            }
+        // COMPILE in helper worker processes, then time config.num_runs each
+        let mut timed = vec![];
+        for (candidate, compiled) in compile_wave(&candidates) {
+            if !seen_binary.insert(compiled.binary_key) { continue; }  // identical code
+            if bloated(&mut least_compute_ops, compiled.compute_ops) { continue; }
+            timed.push((candidate, benchmark(&compiled)));
         }
 
-        // Compile and time each candidate
-        let timed: Vec<_> = candidates.par_iter()
-            .map(|c| (c, measure_kernel_time(c)))
-            .collect();
-
         // Keep top K by execution time
-        beam = timed.into_iter()
-            .sorted_by_key(|(_, time)| *time)
-            .take(config.beam_width)
-            .map(|(c, _)| c)
-            .collect();
+        timed.sort_by_key(|(_, time)| *time);
+        timed.truncate(config.beam_width);
+
+        // Stop when the best candidate no longer improves by min_progress_ns
+        if best(&beam) - best(&timed) < config.min_progress_ns { break; }
+        beam = timed;
     }
 
-    beam.into_iter().next().unwrap()
+    beam.into_iter().next().unwrap().0
 }
 ```
 
@@ -124,11 +123,13 @@ BEAM=8 cargo run
 或通过代码配置：
 
 ```rust
-let config = PrepareConfig::builder()
-    .strategy(OptStrategy::Beam { width: 8 })
-    .build();
+let config = PrepareConfig::from(
+    OptimizerConfig::builder()
+        .strategy(OptStrategy::Beam { width: 8 })
+        .build()
+);
 
-tensor.realize_with(config)?;
+tensor.realize_with(&config)?;
 ```
 
 ---

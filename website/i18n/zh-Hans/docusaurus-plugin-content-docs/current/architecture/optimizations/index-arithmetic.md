@@ -100,7 +100,7 @@ Idiv(Add[Idiv(a, c1 @const(c1_val)), _c2 @const(c2_val)], _c3 @const(c3_val))
 
 ## 3. `fold_divmod_general` 算法
 
-Index dtype 上 `Idiv` 和 `Mod` 的兜底算法。按优先级顺序实现 Tinygrad `divandmod.py:8-93` 的全部 8 条规则，包括递归的 `nest_div_by_smallest_factor`。每条规则按顺序尝试；第一个匹配的获胜。
+Index dtype 上 `Idiv` 和 `Mod` 的兜底算法。按优先级顺序实现 Tinygrad `divandmod.py:8-96` 的规则。每条规则按顺序尝试；第一个匹配的获胜。规则 1-6 需要常量分母，递归的 `nest_div_by_smallest_factor` 收尾这一半；紧随其后的 `divide_by_gcd` 和 `factor_remainder` 是与分母无关的兜底。
 
 入口：当 `Idiv(x, y)` 或 `Mod(x, y)` 的 `dtype == Index` 时，模式委托给 `fold_divmod_general(op, x, y)`。
 
@@ -124,18 +124,17 @@ Index dtype 上 `Idiv` 和 `Mod` 的兜底算法。按优先级顺序实现 Tiny
 
 **示例**：`(RANGE(8) % 4 + RANGE(2)) % 2` -> `(RANGE(8) + RANGE(2)) % 2`
 
-### 规则 3——fold_binary_numerator
+### 规则 3——nested_div
 
-当单个非常量项恰好有 2 个值（`vmax - vmin == 1`）时，结果是线性插值：`(y2 - y1) * (v - v_min) + y1`。
+当 `k > 0` 时，`(a % (k*c)) // c` -> `(a // c) % k`。模数是除数的倍数时，外层除法就变成内层商的取模。
 
-**守卫**：分解后恰好一个非常量项，且该项的范围恰好跨 2 个值。
+**守卫**：`op == Idiv`，分子是 `Mod(inner, modulus)`，`modulus` 能被分母 `c` 整除，且得到的 `k` 满足 `vmin > 0`。
 
-**行为**：在两个端点求值 div/mod，构造它们之间的线性映射。这完全避免了除法。
+**行为**：把「取模再相除」改写为「相除再取模」，去掉一层嵌套。
 
-**示例**：对 `(v * 3 + 2) % 5`，其中 `v` 在 `{0, 1}` 内：
-- `v=0`：`(0 + 2) % 5 = 2`
-- `v=1`：`(3 + 2) % 5 = 0`
-- 结果：`(0 - 2) * (v - 0) + 2 = -2*v + 2`
+**示例**：`(R % 12) // 4` -> `(R // 4) % 3`
+
+恰好跨两个值的分子改由规则 4 处理：`fold_divmod_congruence` 会同时搜索两种余数符号，正是为了让跨越一个周期的二值分子仍然能够折叠。
 
 ### 规则 4——fold_divmod_congruence
 
@@ -157,25 +156,7 @@ Index dtype 上 `Idiv` 和 `Mod` 的兜底算法。按优先级顺序实现 Tiny
 
 **示例**：`(6*a + 4*b) // 8`，`GCD(6, 4, 8) = 2` -> `(3*a + 2*b) // 4`
 
-### 规则 6——divide_by_gcd
-
-规则 5 的变量分母版本。计算 `GCD(所有项..., y)` 包括分子和分母，然后两边除以。不同于规则 5，分母不需要是常量。
-
-**守卫**：GCD 非平凡（不为 1），且 `x` 和 `y` 都能被 GCD 整除。
-
-**示例**：`(4*a) // (2*b)` -> `(2*a) // b`
-
-### 规则 7——factor_remainder
-
-最后手段。将项分为可整除（商）和余数。
-
-**守卫**：`x_min >= 0` 且 `y_min >= 0`，且至少一项能整除 `y`。
-
-**行为**：对 `Idiv`：`quo_sum + rem // y`。对 `Mod`：`rem % y`（常量 `y` 时进行系数化简）。
-
-**示例**：`(8*a + 3*b) // 8` -> `a + (3*b) // 8`
-
-### 规则 8——nest_div_by_smallest_factor
+### 规则 6——nest_div_by_smallest_factor
 
 常量除数的递归分解。找到除数和任何项的系数之间共享的最小因子，两边除以它，然后递归。
 
@@ -186,6 +167,24 @@ Index dtype 上 `Idiv` 和 `Mod` 的兜底算法。按优先级顺序实现 Tiny
 **示例**：`(6*a + 4*b) // 12` -> `((6*a + 4*b) // 2) // 6` -> `(3*a + 2*b) // 6` -> `(3*a + 2*b) // 6`（然后规则 7 完成）。
 
 Tinygrad：`divandmod.py:62-67`。Svod：`fold_divmod_general` 中的 `nest_div_by_smallest_factor`。
+
+### 规则 7——divide_by_gcd
+
+规则 5 的变量分母版本。计算 `GCD(all_terms..., y)` 包括分子和分母，然后两边除以。不同于规则 5，分母不需要是常量。
+
+**守卫**：GCD 非平凡（不为 1），且 `x` 和 `y` 都能被 GCD 整除。
+
+**示例**：`(4*a) // (2*b)` -> `(2*a) // b`
+
+### 规则 8——factor_remainder
+
+最后手段。将项分为可整除（商）和余数。
+
+**守卫**：`x_min >= 0` 且 `y_min >= 0`，且至少一项能整除 `y`。
+
+**行为**：对 `Idiv`：`quo_sum + rem // y`。对 `Mod`：`rem % y`（常量 `y` 时进行系数化简）。
+
+**示例**：`(8*a + 3*b) // 8` -> `a + (3*b) // 8`
 
 :::caution
 规则 5-8 要求分子非负（`x_min >= 0`）。负操作数的地板除法有不同的取整语义（Python/Tinygrad 中向负无穷取整，硬件中向零取整）。实现对负范围返回 `None`，交由后续 pass 处理。
@@ -278,7 +277,7 @@ op(a, b) -> op(b, a)   when b.id < a.id
 **为何不应用于非 Index 类型**：对浮点/整数算术应用规范化会重排 VECTORIZE 元素，破坏后续 pass 中的向量数学合并。Tinygrad 做了相同的选择（`symbolic.py:178-182`）。
 
 :::caution
-规范化与重写引擎的不动点迭代有交互。如果两个模式在操作数顺序上不一致（一个规范化，另一个产生非规范输出），引擎可能振荡。所有索引生成模式必须遵守规范顺序，否则 1000 次迭代安全限制会触发。
+规范化与重写引擎的不动点迭代有交互。如果两个模式在操作数顺序上不一致（一个规范化，另一个产生非规范输出），引擎可能振荡。所有索引生成模式必须遵守规范顺序，否则会触发重写引擎 500,000 条栈项的安全上限（`REWRITE_STACK_LIMIT`）。
 :::
 
 ---

@@ -39,7 +39,9 @@ Range {
 | टाइप | प्रायोरिटी | GPU मैपिंग | उद्देश्य |
 |------|-----------|------------|----------|
 | `Placeholder` | -3 | — | RESHAPE कैशिंग के दौरान इस्तेमाल होने वाला अस्थायी कैनोनिकल range |
-| `Loop` | -1 | `for` लूप | rangeify का डिफ़ॉल्ट range; schedule-स्तर के रैपर `END(Call)` पेयर के ज़रिए स्ट्रक्चरली पहचाने जाते हैं |
+| `Device` | -2 | — | डिवाइस-चयन डायमेंशन, launch पर हर डिवाइस के लिए bind होता है |
+| `Weak` | -1 | `for` लूप | rangeify द्वारा उत्पन्न अनपैरेललाइज़्ड range |
+| `Loop` | -1 | `for` लूप | एक्सप्लिसिट रेगुलर लूप; schedule-स्तर के रैपर `END(Call)` पेयर के ज़रिए स्ट्रक्चरली पहचाने जाते हैं |
 | `Global` | 0 | `blockIdx` | ग्रिड पैरेललिज़्म |
 | `Thread` | 0 | thread pool | CPU पैरेललिज़्म |
 | `Warp` | 1 | warp/wavefront | सब-ग्रुप पैरेललिज़्म |
@@ -109,6 +111,7 @@ Reduce {
     src: Arc<UOp>,                      // value to accumulate
     ranges: SmallVec<[Arc<UOp>; 4]>,    // ranges being reduced
     reduce_op: ReduceOp,                // Add, Mul, Max, Min
+    num_axes: usize,                    // reduced axes of the shaped source
 }
 ```
 
@@ -140,7 +143,7 @@ flowchart TD
 ```rust
 AllReduce {
     src: Arc<UOp>,           // local partial result
-    device: Arc<UOp>,        // device specification
+    device: DeviceSpec,      // device specification
     reduce_op: ReduceOp,     // reduction operation
 }
 ```
@@ -155,21 +158,20 @@ AllReduce {
 
 ```rust
 Buffer {
-    unique: Arc<UOp>,        // UNIQUE op for identity
-    device: Arc<UOp>,        // DEVICE op
-    size: usize,             // total element count
+    shape: Arc<UOp>,         // flat storage shape (one element count)
+    arg: Box<ParamArg>,      // slot, dtype, address space, device
 }
 ```
 
-Tensor स्टोरेज के लिए बफ़र डिक्लेयर करता है। `unique` फ़ील्ड यह सुनिश्चित करती है कि समान size/device होने पर भी बफ़र अलग रहें।
+Tensor स्टोरेज के लिए बफ़र डिक्लेयर करता है। `arg.slot` फ़ील्ड यह सुनिश्चित करती है कि समान size/device होने पर भी बफ़र अलग रहें। `arg.addrspace` तय करती है कि बफ़र किस मेमोरी में रहेगा: डिवाइस मेमोरी के लिए `Global`, GPU shared memory (LDS) के लिए `Local`, और रजिस्टर/scratch एलोकेशन के लिए `Reg`।
 
-### BUFFERIZE — मटेरियलाइज़ेशन मार्कर
+### STAGE — मटेरियलाइज़ेशन मार्कर
 
 ```rust
-Bufferize {
+Stage {
     compute: Arc<UOp>,                  // computation to materialize
     ranges: SmallVec<[Arc<UOp>; 4]>,    // output dimensions
-    opts: BufferizeOpts,                // address space, device
+    opts: Box<BufferizeOpts>,           // address space, device
 }
 ```
 
@@ -180,13 +182,14 @@ Bufferize {
 | फ़ील्ड | टाइप | उद्देश्य |
 |--------|------|----------|
 | `device` | `Option<DeviceSpec>` | टारगेट डिवाइस, लोकल के लिए `None` |
+| `local_axis` | `Option<AxisId>` | वह `GroupReduce` ऐक्सिस जो एक LOCAL स्टेजिंग बफ़र का मालिक है |
 | `addrspace` | `AddrSpace` | `Global` (डिवाइस) या `Local` (shared) |
-| `removable` | `bool` | `false` होने पर `buffer_removal` को इस BUFFERIZE को इनलाइन करने की अनुमति नहीं — मल्टी-कंज़्यूमर realize बाउंड्री पर इस्तेमाल होता है ताकि बफ़र मेगा-pass फ़िक्सपॉइंट इटरेशन के बीच टिका रहे |
+| `removable` | `bool` | `false` होने पर `buffer_removal` को इस STAGE को इनलाइन करने की अनुमति नहीं — मल्टी-कंज़्यूमर realize बाउंड्री पर इस्तेमाल होता है ताकि बफ़र मेगा-pass फ़िक्सपॉइंट इटरेशन के बीच टिका रहे |
 
 **उदाहरण:**
 ```mermaid
 flowchart TD
-  BZ["BUFFERIZE(opts=(addrspace=Global))"] -->|"computation"| RED["REDUCE(Add, ...)"]
+  BZ["STAGE(opts=(addrspace=Global))"] -->|"computation"| RED["REDUCE(Add, ...)"]
   BZ -->|"output dim 0"| R0["RANGE(R0, Global)"]
   BZ -->|"output dim 1"| R1["RANGE(R1, Global)"]
 ```
@@ -195,13 +198,12 @@ flowchart TD
 
 ```rust
 Index {
-    buffer: Arc<UOp>,                   // BUFFER or PARAM
+    buffer: Arc<UOp>,                   // BUFFER, PARAM or STACK
     indices: SmallVec<[Arc<UOp>; 4]>,   // index per dimension
-    gate: Option<Arc<UOp>>,             // optional predicate
 }
 ```
 
-मल्टी-डायमेंशनल indices से मेमोरी एड्रेस कैलकुलेट करता है। एलिमेंट dtype रिटर्न करता है (पॉइंटर नहीं)।
+मल्टी-डायमेंशनल indices से मेमोरी एड्रेस कैलकुलेट करता है। एलिमेंट dtype रिटर्न करता है (पॉइंटर नहीं)। किसी index को `idx.valid(cond)` से कंडीशनल बनाया जा सकता है, जो उसे `WHERE(cond, idx, INVALID)` में रैप कर देता है। किसी `STACK` पर INDEX एड्रेस के बजाय एक lane चुनता है: कॉन्स्टेंट स्केलर index सीधे stacked source में फ़ोल्ड हो जाता है।
 
 **उदाहरण:**
 ```mermaid
@@ -212,37 +214,23 @@ flowchart TD
   IDX -->|"index for dim 2"| M["MUL(...)"]
 ```
 
-### POINTER_INDEX — लो-लेवल पॉइंटर अरिथमेटिक
-
-```rust
-PointerIndex {
-    ptr: Arc<UOp>,           // base pointer
-    offset: Arc<UOp>,        // byte offset
-}
-```
-
-डायरेक्ट पॉइंटर अरिथमेटिक। लीनियराइज़ेशन के बाद जब indices फ़्लैटन हो जाते हैं तब इस्तेमाल होता है।
-
-> **कम्पैटिबिलिटी:** Tinygrad अलग ऑपरेशन के बजाय `INDEX` में `ptr=True` फ़्लैग इस्तेमाल करता है।
-
 ### LOAD — मेमोरी रीड
 
 ```rust
 Load {
-    buffer: Arc<UOp>,        // buffer or pointer
-    index: Arc<UOp>,         // INDEX op
+    index: Arc<UOp>,         // INDEX op (buffer accessed via the INDEX)
     alt: Option<Arc<UOp>>,   // alternative value for gated loads
+    gate: Option<Arc<UOp>>,  // predicate for gated loads
 }
 ```
 
-बफ़र से index पर वैल्यू रीड करता है। गेटेड loads के लिए, `alt` फ़ील्ड INDEX की `gate` false होने पर एक वैल्यू प्रदान करती है (मेमोरी एक्सेस पूरी तरह स्किप हो जाती है)।
+बफ़र से index पर वैल्यू रीड करता है; अलग `buffer` फ़ील्ड नहीं है, बफ़र तक INDEX नोड के ज़रिए पहुँचा जाता है। गेटेड loads के लिए, `gate` false होने पर `alt` वह वैल्यू देती है (और मेमोरी एक्सेस पूरी तरह टल जाता है)। `alt` और `gate` हमेशा साथ सेट होते हैं: कोई load या तो दोनों रखता है या एक भी नहीं। रेंडरर सिंगल-ऐक्सिस `INDEX` की माँग करते हैं, इसलिए मल्टी-इंडेक्स एक्सेस को load के कोड जनरेशन तक पहुँचने से पहले rangeify के दौरान फ़्लैटन कर देना ज़रूरी है।
 
 **उदाहरण:**
 ```mermaid
 flowchart TD
-  L["LOAD : Float32"] --> P1["PARAM(1)"]
-  L --> IDX["INDEX"]
-  IDX --> P1b["PARAM(1)"]
+  L["LOAD : Float32"] --> IDX["INDEX"]
+  IDX --> P1["PARAM(1)"]
   IDX --> R0["RANGE(R0)"]
   IDX --> R2["RANGE(R2)"]
 ```
@@ -253,23 +241,23 @@ flowchart TD
 Store {
     index: Arc<UOp>,                    // INDEX op (buffer accessed via index.src[0])
     value: Arc<UOp>,                    // value to write
-    ranges: SmallVec<[Arc<UOp>; 4]>,    // ranges being closed
+    gate: Option<Arc<UOp>>,             // predicate for gated stores
 }
 ```
 
-बफ़र में वैल्यू लिखता है। बफ़र INDEX नोड के ज़रिए एक्सेस होता है (`index.src[0]` से), अलग फ़ील्ड से नहीं। STORE स्पेसिफ़ाइड ranges बंद करता है, जो आउटपुट इटरेशन डायमेंशन दर्शाती हैं। ranges फ़ील्ड आउटपुट अपकास्टिंग के लिए इस्तेमाल होती है: जब `Range(Upcast)` शामिल हो, तो expansion के दौरान यह `UNROLL` बनती है, फिर `CONTRACT` से कॉन्ट्रैक्ट होती है।
+बफ़र में वैल्यू लिखता है। बफ़र INDEX नोड के ज़रिए एक्सेस होता है (`index.src[0]` से), अलग फ़ील्ड से नहीं। expansion के दौरान `UPCAST` और `UNROLL` range ऐक्सिस वर्गीकरण ही बने रहते हैं।
 
-गेटेड stores के लिए, gate वाला INDEX इस्तेमाल करें (INDEX में एक ऑप्शनल `gate` फ़ील्ड होती है)।
+गेटेड stores के लिए `store_gated` `gate` सेट करता है; `pm_move_gates_from_index` ही वह है जो gate को address expression से उठाकर LOAD/STORE पर रख देता है।
 
-> **कम्पैटिबिलिटी:** Svod के STORE में अलग `buffer` फ़ील्ड नहीं है — sources हैं: index=0, value=1, ranges=2+ (range_start=2)। Tinygrad का लेआउट भी ऐसा ही है।
+> **कम्पैटिबिलिटी:** Svod के STORE में अलग `buffer` फ़ील्ड नहीं है — sources हैं: index=0, value=1। किसी STAGE या REDUCE के उलट, STORE कोई ranges बंद नहीं करता।
 
 **उदाहरण:**
 ```mermaid
 flowchart TD
   ST["STORE"] -->|"write address (buffer via index.src[0])"| IDX["INDEX[R0, R1]"]
   ST -->|"value"| RED["REDUCE(Add, ...)"]
-  ST -->|"output dim 0 (closed)"| R0["RANGE(R0, Global)"]
-  ST -->|"output dim 1 (closed)"| R1["RANGE(R1, Global)"]
+  IDX --> R0["RANGE(R0, Global)"]
+  IDX --> R1["RANGE(R1, Global)"]
 ```
 
 ---
@@ -289,7 +277,7 @@ Schedule-स्तर का काम एक कॉलेबल IR के ज�
 Call {
     body: Arc<UOp>,                     // FUNCTION (या उसकी बॉडी)
     args: SmallVec<[Arc<UOp>; 4]>,      // कंक्रीट आर्ग्युमेंट वैल्यूज़
-    info: CallInfo,                     // ऐनोटेशन (name, origin, …)
+    info: Box<CallInfo>,                // ऐनोटेशन (name, origin, …)
 }
 ```
 
@@ -316,7 +304,7 @@ Call {
 Function {
     body: Arc<UOp>,                     // कंप्यूटेशन
     args: SmallVec<[Arc<UOp>; 4]>,      // फ़ॉर्मल पैरामीटर
-    info: CallInfo,
+    info: Box<CallInfo>,
 }
 ```
 
@@ -341,7 +329,7 @@ Void फ़ंक्शन बाउंड्री से कई आउटप�
 ```rust
 Program {
     sink: Arc<UOp>,                     // रूट SINK
-    device: Arc<UOp>,                   // DEVICE
+    info: Box<ProgramInfo>,             // नाम, launch dims, ABI slots, target
     linear: Option<Arc<UOp>>,           // LINEAR (linearize के बाद)
     source: Option<Arc<UOp>>,           // SOURCE (render के बाद)
     binary: Option<Arc<UOp>>,           // PROGRAM_BINARY (compile के बाद)
@@ -353,8 +341,9 @@ Program {
 `do_compile`/`get_program`) से कर्नेल को गुज़ारता है। हर स्टेज अगला
 फ़ील्ड भरती है। C/LLVM रेंडरर `Op::Linear` इनपुट की उम्मीद रखते हैं
 और panic के बजाय per-context `pending_error` के ज़रिए
-`Error::InvalidGraph` रिपोर्ट करते हैं; render से पहले मल्टी-इंडेक्स
-`INDEX` को `pm_linearize_multi_index` से लो-कर लेना चाहिए।
+`Error::InvalidGraph` रिपोर्ट करते हैं; रेंडरर तक पहुँचने वाला
+मल्टी-इंडेक्स `INDEX` भी इसी तरह अस्वीकार होता है, इसलिए indices को पहले
+ही एक सिंगल ऐक्सिस तक फ़्लैटन कर देना चाहिए।
 
 ### LINEAR — लीनियराइज़्ड ऑप स्ट्रीम
 
@@ -368,18 +357,23 @@ Linear { ops: SmallVec<[Arc<UOp>; 8]> }
 ### SOURCE / PROGRAM_BINARY — कंपाइलेशन आर्टिफ़ैक्ट्स
 
 ```rust
-Source { code: String }              // रेंडर्ड सोर्स (C / LLVM-IR)
-ProgramBinary { bytes: Vec<u8> }     // कंपाइल्ड आर्टिफ़ैक्ट
+Source { code: String, identity: Option<Box<SourceStageIdentity>> }
+ProgramBinary { bytes: Vec<u8>, identity: Option<Box<BinaryStageIdentity>> }
 ```
 
 प्रोग्राम पाइपलाइन की टर्मिनल स्टेजेज़। दोनों लीफ़ हैं (कोई चाइल्ड नहीं)।
+ऑप्शनल `identity` वह सिमैंटिक प्रूफ़ है जो एक स्टेज को ठीक उससे पहले वाली
+स्टेज से बाँधती है (`SourceStageIdentity` ABI, target, entry नाम और
+LINEAR/SOURCE digests रखती है; `BinaryStageIdentity` उसे compiler key और
+binary digest के साथ लपेटती है), ताकि कोई कैश्ड आर्टिफ़ैक्ट बदले हुए ग्राफ़
+पर दोबारा इस्तेमाल न हो सके।
 
 ### SINK — मल्टीपल रूट कलेक्टर
 
 ```rust
 Sink {
     sources: SmallVec<[Arc<UOp>; 4]>,
-    info: Option<KernelInfo>,           // कर्नेल AST के लिए स्ट्रक्चरल मार्कर
+    info: Option<Box<KernelInfo>>,      // कर्नेल AST के लिए स्ट्रक्चरल मार्कर
 }
 ```
 
@@ -431,42 +425,39 @@ GPU वर्कग्रुप सिंक्रोनाइज़ेशन।
 
 ## वेक्टर ऑपरेशन
 
-### VECTORIZE — स्केलर्स से वेक्टर बनाएँ
+### STACK — lanes से एक shaped वैल्यू बनाएँ
 
 ```rust
-Vectorize {
-    elements: SmallVec<[Arc<UOp>; 4]>,
+Stack {
+    sources: SmallVec<[Arc<UOp>; 4]>,
 }
 ```
 
-N स्केलर वैल्यूज़ को साइज़ N के वेक्टर में जोड़ता है। सभी एलिमेंट्स का बेस dtype एक ही होना चाहिए।
+N वैल्यूज़ को N lanes वाली एक shaped वैल्यू में जोड़ता है। एलिमेंट dtype
+स्केलर ही रहता है — lane count dtype को चौड़ा करके नहीं, बल्कि ख़ुद STACK
+द्वारा ढोया जाता है — और sources कंस्ट्रक्शन पर promoted dtype में कास्ट कर
+दिए जाते हैं।
 
 **उदाहरण:**
 ```mermaid
 flowchart TD
-  V["VECTORIZE : 4 x Float32"] --> C1["CONST(1.0)"]
+  V["STACK(len=4) : Float32"] --> C1["CONST(1.0)"]
   V --> C2["CONST(2.0)"]
   V --> C3["CONST(3.0)"]
   V --> C4["CONST(4.0)"]
 ```
 
-### GEP — Get Element Pointer (वेक्टर एक्सट्रैक्ट)
+### Lane सिलेक्शन — STACK पर INDEX
 
-```rust
-Gep {
-    vector: Arc<UOp>,        // source vector
-    indices: Vec<usize>,     // positions to extract
-}
-```
-
-वेक्टर से एलिमेंट्स निकालता है:
-- सिंगल index → स्केलर
-- मल्टीपल indices → छोटा वेक्टर
+कोई अलग extract ऑपरेशन नहीं है। `INDEX` किसी `STACK` से एक lane ठीक उसी
+तरह चुनता है जैसे वह किसी बफ़र से एड्रेस चुनता है, और कॉन्स्टेंट index
+कंस्ट्रक्शन के समय ही सीधे stacked source में फ़ोल्ड हो जाता है।
 
 **उदाहरण:**
 ```mermaid
 flowchart TD
-  G["GEP([0, 2]) : 2 x Float32"] --> V["VECTORIZE : 4 x Float32"]
+  G["INDEX : Float32"] --> V["STACK(len=4) : Float32"]
+  G --> C["CONST(2) : Index"]
   V --> E["..."]
 ```
 
@@ -478,71 +469,12 @@ VConst {
 }
 ```
 
-कम्पाइल-टाइम कॉन्स्टेंट्स का वेक्टर। `CONST` नोड्स के `VECTORIZE` से ज़्यादा एफ़िशिएंट।
+कम्पाइल-टाइम कॉन्स्टेंट्स का वेक्टर। `CONST` नोड्स के `STACK` से ज़्यादा एफ़िशिएंट।
 
-### CAT — वेक्टर्स को कॉन्कैटनेट करें
-
-```rust
-Cat {
-    sources: SmallVec<[Arc<UOp>; 4]>,
-}
-```
-
-वेक्टर्स को एक बड़े वेक्टर में जोड़ता है। आउटपुट `vcount` = इनपुट `vcount` का योग।
-
-**उदाहरण:**
-```mermaid
-flowchart TD
-  CAT["CAT : 8 x Float32"] --> V1["VECTORIZE : 4 x Float32"]
-  CAT --> V2["VECTORIZE : 4 x Float32"]
-```
-
-### PtrCat — पॉइंटर्स को कॉन्कैटनेट करें
-
-```rust
-PtrCat {
-    sources: SmallVec<[Arc<UOp>; 4]>,
-}
-```
-
-वेक्टराइज़्ड load/store के लिए मेमोरी एक्सेस को ग्रुप करता है। Devectorizer पास द्वारा इस्तेमाल होता है।
-
----
-
-## Expansion: UNROLL और CONTRACT
-
-### UNROLL — इटरेशन के अनुसार कम्प्यूटेशन एक्सपैंड करें
-
-```rust
-Unroll {
-    src: Arc<UOp>,                       // computation to expand
-    unroll_axes: Vec<(usize, usize)>,    // (axis_index, factor) pairs
-}
-```
-
-अलग-अलग इटरेशन वैल्यूज़ के लिए कम्प्यूटेशन के कई वर्शन बनाता है। लूप अनरोलिंग ऑप्टिमाइज़ेशन के लिए इस्तेमाल होता है।
-
-**उदाहरण:** `UNROLL(unroll_axes=[(0, 4)])` कम्प्यूटेशन को अलग-अलग index वैल्यूज़ के साथ 4 बार एक्सपैंड करता है।
-
-### CONTRACT — अनरोल्ड वैल्यूज़ को वेक्टर में कॉलैप्स करें
-
-```rust
-Contract {
-    src: Arc<UOp>,                       // unrolled computation
-    upcast_ranges: Vec<(usize, usize)>,  // (axis_index, factor) pairs
-}
-```
-
-UNROLL का उल्टा — एक्सपैंडेड स्केलर वैल्यूज़ को वेक्टर में कलेक्ट करता है। आउटपुट वेक्टर साइज़ = factors का गुणनफल।
-
-**उदाहरण:**
-```mermaid
-flowchart TD
-  CT["CONTRACT(upcast_ranges=[(0, 4)]) : 4 x Float32"] --> U["UNROLL(unroll_axes=[(0, 4)])"]
-  U --> L["LOAD(...)"]
-```
-
-यह पैटर्न एक load को वेक्टराइज़ करता है: 4 इटरेशन एक्सपैंड करो, फिर रिज़ल्ट को 4-एलिमेंट वेक्टर में पैक करो।
+Lane aggregation के लिए `STACK` इस्तेमाल होता है; lane और address selection
+के लिए `INDEX`। लूप अनरोलिंग को `AxisType::Unroll` वाले `Range` से दर्शाया
+जाता है, किसी अलग ऑपरेशन से नहीं। Tensor-core expansion axes `WmmaMetadata`
+में रहते हैं।
 
 ---
 
@@ -554,8 +486,8 @@ flowchart TD
 Wmma {
     a: Arc<UOp>,             // matrix A fragment
     b: Arc<UOp>,             // matrix B fragment
-    c: Arc<UOp>,             // accumulator C fragment
-    metadata: WmmaMetadata,  // hardware configuration
+    c: Arc<UOp>,                 // accumulator C fragment
+    metadata: Box<WmmaMetadata>, // hardware configuration
 }
 ```
 
@@ -571,8 +503,8 @@ Wmma {
 | `dtype_out` | `DType` | आउटपुट प्रिसिज़न (जैसे, `Float32`) |
 | `device` | `RendererDevice` | इस WMMA को उत्पन्न करने वाला रेंडरर / TC बैकएंड |
 | `threads` | `usize` | प्रति warp threads (आमतौर पर 32) |
-| `upcast_axes` | `WmmaUpcastAxes` | प्रति-ऑपरेंड वेक्टराइज़ेशन (फ़ील्ड्स: `a`, `b`, `c`) |
-| `reduce_axes` | `Vec<(usize, usize)>` | कॉन्ट्रैक्शन axes |
+| `upcast_axes` | `Option<WmmaUpcastAxes>` | प्रति-source expansion axes (फ़ील्ड्स: `a`, `b`, `c`); `expander2` द्वारा sources और आउटपुट को shape दे देने के बाद क्लियर कर दी जाती हैं |
+| `reduce_axes` | `Vec<AxisId>` | TC reduce ऐक्सिस IDs, expansion के दौरान `exclude_args` के रूप में इस्तेमाल |
 
 **उदाहरण:**
 ```mermaid
@@ -617,21 +549,22 @@ flowchart TD
 ### PARAM — बफ़र पैरामीटर
 
 ```rust
-Param { slot: usize, size: usize, device: Option<Arc<UOp>> }
+Param { shape: Arc<UOp>, arg: Box<ParamArg> }
 ```
 
 नॉर्मलाइज़्ड बफ़र पैरामीटर — इनपुट/आउटपुट बफ़र का पोज़िशनल रेफ़रेंस।
 प्री-शेड्यूल नॉर्मलाइज़ेशन (BUFFER→PARAM) द्वारा बनाया जाता है ताकि बफ़र आइडेंटिटी हटाकर
 आइडेंटिकल कम्प्यूटेशन का स्ट्रक्चरल डीडुप्लिकेशन हो सके।
-`slot` कर्नेल आर्ग्युमेंट लिस्ट में पोज़िशन है, `size` एलिमेंट काउंट है।
+`arg.slot` कर्नेल आर्ग्युमेंट लिस्ट में पोज़िशन है, और `shape` एलिमेंट काउंट
+ढोता है। `ParamArg` स्केलर पैरामीटर (`UOp::scalar_param`) भी कवर करता है, जो
+एड्रेस स्पेस के बजाय एक नाम और वैल्यू bounds रखते हैं।
 
-### DEFINE_LOCAL — Shared मेमोरी एलोकेशन
+### Shared मेमोरी और रजिस्टर
 
-```rust
-DefineLocal(usize)           // local memory index
-```
-
-GPU shared memory (LDS) एलोकेशन। एक वर्कग्रुप के अंदर विज़िबल।
+कोई समर्पित `DefineLocal` या `DefineReg` ऑपरेशन नहीं है। GPU shared memory
+(LDS) और रजिस्टर/scratch एलोकेशन ऐसे `Buffer` नोड हैं जिनकी `arg.addrspace`
+`AddrSpace::Local` या `AddrSpace::Reg` होती है; वे कोई डिवाइस नहीं ढोते और
+सिर्फ़ एक वर्कग्रुप (LOCAL) या एक thread (REG) के अंदर विज़िबल होते हैं।
 
 ### DEFINE_VAR — सिम्बॉलिक रनटाइम वेरिएबल
 
@@ -649,17 +582,6 @@ DefineVar {
 ```text
 DEFINE_VAR(name="batch_size", min=1, max=128) : Index
 ```
-
-### DEFINE_REG — रजिस्टर एलोकेशन
-
-```rust
-DefineReg {
-    size: usize,             // register size
-    id: usize,               // unique accumulator ID
-}
-```
-
-इंटरमीडिएट स्टोरेज के लिए रजिस्टर एलोकेट करता है। `id` फ़ील्ड एक ही dtype के रजिस्टर्स को अलग करती है — इसके बिना, दो same-dtype reduces hash consing से एक DEFINE_REG शेयर करेंगे। कोड जनरेशन में इस्तेमाल होता है।
 
 ### BIND — वेरिएबल बाइंडिंग
 
@@ -706,13 +628,9 @@ LUnique(usize)               // लोकल-स्कोप आइडेंट�
 ग्लोबल काउंटर से टकराए — इससे कॉलेबल बॉडीज़ को कॉल साइट से स्वतंत्र
 रूप से हैश-कॉन्स किया जा सकता है।
 
-### DEVICE — डिवाइस स्पेसिफ़िकेशन
-
-```rust
-Device(DeviceSpec)           // device specification
-```
-
-कम्प्यूटेशन के लिए टारगेट डिवाइस स्पेसिफ़ाई करता है।
+डिवाइस अपना कोई अलग नोड नहीं हैं: टारगेट उन ऑपरेशनों पर एक `DeviceSpec`
+फ़ील्ड है जिन्हें उसकी ज़रूरत होती है (`Copy`, `GetAddr`, `AllReduce`,
+`ParamArg.device`, `BufferizeOpts.device`, `ProgramInfo.target`)।
 
 ---
 
@@ -726,7 +644,7 @@ Device(DeviceSpec)           // device specification
 | `Permute` | `{ src, axes: Vec<usize> }` | ट्रांसपोज़/रीऑर्डर axes |
 | `Expand` | `{ src, new_shape }` | बड़ी शेप में ब्रॉडकास्ट |
 | `Pad` | `{ src, begin_pads, end_pads }` | पैडिंग जोड़ें |
-| `Shrink` | `{ src, begins, ends }` | सब-रीजन निकालें |
+| `Shrink` | `{ src, offsets, sizes }` | सब-रीजन निकालें |
 | `Flip` | `{ src, axes: Vec<bool> }` | axes के अनुसार रिवर्स |
 
 **उदाहरण:** RESHAPE
@@ -744,18 +662,21 @@ flowchart TD
 
 | ऑपरेशन | उद्देश्य |
 |---------|----------|
-| `Copy` | एक वैल्यू की एक्सप्लिसिट कॉपी |
+| `Copy` | `{ src, device }` — किसी वैल्यू की दूसरे डिवाइस पर एक्सप्लिसिट कॉपी |
 | `Slice` | `{ buffer, offset, size }` — buffer पर contiguous typed slice metadata |
-| `MStack` | मेमोरी स्टैक एलोकेशन |
-| `MSelect` | मेमोरी सिलेक्ट (कंडीशनल मेमोरी एक्सेस) |
-| `Multi` | मल्टी-आउटपुट ऑपरेशन |
+| `GetAddr` | `{ src, device }` — किसी buffer-जैसे source का `UInt64` एड्रेस |
+| `MStack` | `{ buffers }` — किसी मल्टी-डिवाइस tensor के प्रति-डिवाइस बफ़र |
+| `MSelect` | `{ buffer, device_index }` — मल्टी-डिवाइस tensor में से एक डिवाइस का बफ़र |
+| `Multi` | `{ src, axis }` — shard मार्कर: वह ऐक्सिस जिस पर मल्टी-डिवाइस tensor बँटा हुआ है |
 | `Group` | शेड्यूलिंग के लिए ऑपरेशन ग्रुप करें |
+| `Noop` | बिना ऑपरेंड और बिना किसी असर वाला प्लेसहोल्डर |
 | `Detach` | ग्राफ़ से डिटैच (ऑप्टिमाइज़ेशन रोकें) |
 | `Contiguous` | कॉन्टिग्यूअस डेटा का हिंट |
 | `ContiguousBackward` | कॉन्टिग्यूअस हिंट का बैकवर्ड पास |
 | `Precast` | टाइप कन्वर्शन के लिए प्री-कास्ट |
 | `Custom` / `CustomI` | इनलाइन कस्टम ऑपरेशन एक्सटेंसिबिलिटी (`Custom` केवल C बैकएंड पर) |
-| `CustomFunction` | रनटाइम कस्टम-फ़ंक्शन हुक (kinds: `EncDec`, `Graph`) |
+| `CustomFunction` | रनटाइम कस्टम-फ़ंक्शन हुक (kinds: `EncDec`, `Graph`, `AllReduce`) |
+| `Ins` | `{ sources, arg }` — किसी ISA रेंडरर द्वारा चुना गया target instruction |
 
 ---
 
@@ -767,13 +688,13 @@ flowchart TD
 |---------|--------|
 | **लूप कंट्रोल** | `RANGE`, `END` |
 | **रिडक्शन** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **मेमोरी** | `BUFFER`, `SLICE`, `STAGE`, `INDEX`, `LOAD`, `STORE` |
+| **मेमोरी** | `BUFFER`, `SLICE`, `STAGE`, `INDEX`, `LOAD`, `STORE`, `GETADDR` |
 | **कर्नेल और कॉलेबल** | `SINK`, `CALL`, `FUNCTION`, `TUPLE`, `GET_TUPLE`, `PROGRAM`, `LINEAR`, `SOURCE`, `PROGRAM_BINARY`, `AFTER`, `BARRIER` |
-| **वेक्टर** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
-| **Expansion** | `UNROLL`, `CONTRACT` |
+| **वेक्टर** | `STACK`, `INDEX`, `VCONST` |
+| **Expansion** | `AxisType::Upcast` या `AxisType::Unroll` वाला `RANGE` |
 | **हार्डवेयर** | `WMMA`, `SPECIAL` |
 | **कंट्रोल** | `IF`, `ENDIF` |
-| **डेफ़िनिशन** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `LUNIQUE`, `DEVICE` |
+| **डेफ़िनिशन** | `PARAM`, `DEFINE_VAR`, `BIND`, `UNIQUE`, `LUNIQUE` |
 | **मूवमेंट** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 
@@ -783,21 +704,20 @@ flowchart TD
 
 | ऑपरेशन | Range स्टार्ट Index |
 |---------|-------------------|
-| `BUFFERIZE` | 1 (compute=0, ranges=1+) |
+| `STAGE` | 1 (compute=0, ranges=1+) |
 | `REDUCE` | 1 (src=0, ranges=1+) |
-| `STORE` | 2 (index=0, value=1, ranges=2+) |
 | `WMMA` | 3 (a=0, b=1, c=2) |
 | `END` | 1 (computation=0, ranges=1+) |
 | `CALL` / `FUNCTION` | 1 (body=0, args=1+) |
 
 ### Expandable ऑपरेशन
 
-वे ऑपरेशन जो UNROLL को कम्प्यूटेशन ग्राफ़ में प्रोपेगेट करते हैं:
+वे ऑपरेशन जो expanded lanes को कम्प्यूटेशन ग्राफ़ में प्रोपेगेट करते हैं:
 
 - ALU: `Unary`, `Binary`, `Ternary`
 - Type: `Cast`, `BitCast`
-- Vector: `Gep`, `Vectorize`
-- Memory: `Load`, `Store`, `Index`, `PointerIndex`
+- Shaped values: `Stack`
+- Memory: `Load`, `Store`, `Index`
 - Control: `Reduce`, `End`, `After`
-- Buffer: `Bufferize`
+- Buffer: `Stage`
 - Hardware: `Wmma`

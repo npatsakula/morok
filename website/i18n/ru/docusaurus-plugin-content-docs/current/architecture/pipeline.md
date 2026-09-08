@@ -66,7 +66,7 @@ Reshape, permute и подобные операции создают новые 
 
 ### Глобальный реестр
 
-Svod поддерживает три глобальных словаря (lock-free, потокобезопасные):
+Svod поддерживает два глобальных словаря (lock-free, потокобезопасные):
 
 | Словарь | Ключ → Значение | Назначение |
 |---------|-----------------|------------|
@@ -159,18 +159,18 @@ flowchart TD
 
 Граф вычислений может иметь несколько выходов или промежуточные значения, требующие материализации. **Разделение на ядра** определяет эти границы и создаёт отдельные ядра.
 
-Точка входа — `run_kernel_split_pipeline()` в `schedule/src/rangeify/kernel.rs`.
+Точка входа — `try_get_kernel_graph()` в `schedule/src/rangeify/kernel.rs`.
 
 ### Пайплайн разделения на ядра
 
 Разделение проходит через несколько скоординированных шагов:
 
-**Шаг 1: BUFFERIZE → STORE**
+**Шаг 1: STAGE → STORE**
 
-Узлы `BUFFERIZE` отмечают, где значения должны материализоваться. `pm_add_buffers_patterns()` конвертирует их в явные `STORE`-операции:
+Узлы `STAGE` отмечают, где значения должны материализоваться. `pm_add_buffers_patterns()` конвертирует их в явные `STORE`-операции:
 
 ```text
-Before: BUFFERIZE(computation, ranges)
+Before: STAGE(computation, ranges)
 After:  END(STORE(INDEX(...), computation), ranges)
 ```
 
@@ -178,7 +178,7 @@ After:  END(STORE(INDEX(...), computation), ranges)
 
 **Шаг 2: Разделение store на ядра**
 
-`split_all_stores()` и `split_store()` разбивают граф по границам STORE, создавая отдельные ядра. Нумерация буферов назначается через счётчик `LocalAddBufferContext.dg` во время разделения.
+`split_all_stores()` и `split_store()` разбивают граф по границам STORE, создавая отдельные ядра. Нумерация буферов назначается через счётчик `LocalAddBufferContext.param_slot` во время разделения.
 
 ```text
 Before: END(STORE(...), ranges)
@@ -203,7 +203,7 @@ After:  KERNEL(SINK(STORE(...)), ranges, buffer_list)
 
 ### Нумерация буферов
 
-Нумерация буферов управляется счётчиком `LocalAddBufferContext.dg` в `split_store()`. Индексы DEFINE_GLOBAL назначаются во время разделения в порядке срабатывания паттернов — отдельного прохода перенумерации не требуется.
+Нумерация буферов управляется счётчиком `LocalAddBufferContext.param_slot` в `split_store()`. Каждый аргумент ядра становится `PARAM(slot=N)`, и слоты назначаются во время разделения в порядке срабатывания паттернов — отдельного прохода перенумерации не требуется.
 
 ---
 
@@ -215,15 +215,14 @@ After:  KERNEL(SINK(STORE(...)), ranges, buffer_list)
 
 ```rust
 pub struct ScheduleItem {
-    pub kernel: Arc<UOp>,              // KERNEL wrapper
+    pub kernel: Arc<UOp>,              // Callable (CALL) wrapper: dependency identity
     pub ast: Arc<UOp>,                 // Inner computation (for codegen)
     pub buffers: Vec<Buffer>,          // Device buffers
     pub buffer_uop_ids: Vec<u64>,      // UOp IDs for registry cleanup
     pub fixedvars: HashMap<String, i64>,  // Bound iteration variables
-    pub bound_ranges: Vec<BoundRange>,    // Ranges needing expansion
-    pub source_buffers: HashMap<u64, Arc<UOp>>,  // DEFINE_GLOBAL -> BUFFER mapping
-    pub dependencies: Vec<u64>,        // Producer kernel IDs
-    pub alias_registered_ids: Vec<u64>, // Alias UOp IDs for cleanup
+    pub loop_var_names: HashSet<String>,  // fixedvars fed by schedule-loop counters
+    pub dependencies: Vec<u64>,        // Producer callable UOp IDs
+    pub instance_dependencies: Vec<usize>, // Producer schedule-item indices
 }
 ```
 
@@ -256,11 +255,14 @@ flowchart TD
 
 ## Кодогенерация: от UOp до LLVM IR
 
-С готовым расписанием ядер генерируем реальный код. Сейчас Svod поддерживает LLVM-бэкенд:
+С готовым расписанием ядер генерируем реальный код. У Svod два рендерера, и какой из них запустится, решает бэкенд устройства:
 
-| Бэкенд | Скорость компиляции | Качество кода | Применение |
-|--------|---------------------|---------------|------------|
-| **LLVM** | Медленнее | Высокооптимизированный | Продакшн |
+| Бэкенд устройства | Рендерер | Выход |
+|-------------------|----------|-------|
+| **CPU** | LLVM text (по умолчанию) или C | LLVM IR либо исходник на C |
+| **CUDA** | LLVM text, целевая платформа NVPTX | LLVM IR (`ptx_kernel`) |
+| **AMD** | LLVM text, целевая платформа AMDGPU | LLVM IR (`amdgpu_kernel`) |
+| **Metal** | C, диалект Metal | Metal Shading Language |
 
 Трейт `Renderer` абстрагирует кодогенерацию:
 
@@ -306,7 +308,7 @@ exit:
 | `devectorize` | Группировка последовательных обращений к памяти |
 | `pm_reduce_devectorize` | Обработка векторных редукций (K-vec, bool, горизонтальные) |
 | `pm_bool_devectorize` | Обработка паттернов булевых векторов |
-| `merge_sibling_ends` | Слияние соседних END-операций |
+| `pm_split_ends` | Разбиение многодиапазонных END на вложенные однодиапазонные |
 | `pm_fma_decomposition` | Преобразование `a*b+c` в fused multiply-add (для поддерживающих бэкендов) |
 | `pm_float_decomp` | Декомпозиция операций с плавающей точкой |
 | `bool_storage_patterns` | Преобразование bool ↔ uint8 для операций с памятью |
@@ -315,29 +317,33 @@ exit:
 
 ### Поддержка бэкендов
 
-Svod поддерживает несколько бэкендов кодогенерации:
+Два рендерера покрывают четыре бэкенда устройств:
 
-| Бэкенд | Выход | Статус |
-|--------|-------|--------|
-| **LLVM** | Нативный машинный код | Основной (CPU) |
-| **C** | Исходный код на C | Доступен |
+| Рендерер | Выход | Кто использует |
+|----------|-------|----------------|
+| **LLVM text** | LLVM IR для целевых платформ CPU, AMDGPU и NVPTX | CPU (по умолчанию), AMD, CUDA |
+| **C** | Исходник на C либо Metal Shading Language | CPU (`SVOD_CPU_BACKEND=clang`), Metal |
 
 ---
 
 ## Выполнение: запуск ядер
 
-Кодогенерация порождает строки LLVM IR. Выполнение включает JIT-компиляцию и запуск ядер.
+Кодогенерация порождает строки исходного кода — LLVM IR, C или Metal Shading Language. Выполнение включает их компиляцию во время работы программы и запуск ядер.
 
 ### ExecutionPlan
 
-`prepare()` (один тензор) или `prepare_batch()` (несколько тензоров) строит `ExecutionPlan`:
+`prepare()` (один тензор) или `prepare_batch()` (несколько тензоров) строит `ExecutionPlan` (`runtime/src/execution_plan.rs`):
 
 ```rust
 pub struct ExecutionPlan {
-    kernels: Vec<PreparedKernel>,       // Compiled kernels (topological order)
+    ops: Vec<PreparedOp>,               // Compiled kernels and buffer copies
+    op_order: Vec<usize>,               // Topological execution order
+    op_levels: Vec<Vec<usize>>,         // Parallel groups (Kahn levels)
     buffers: Vec<Buffer>,
     ast_to_buffer: HashMap<u64, usize>, // AST id -> buffer index mapping
     output_buffer_indices: Vec<usize>,  // Indices of output buffers (multi-output)
+    device: DeviceSpec,
+    // ... graph/queue state elided
 }
 ```
 
@@ -355,20 +361,18 @@ pub struct ExecutionPlan {
 
 ### JIT-компиляция
 
-LLVM-рантайм (`runtime/src/llvm.rs`) компилирует IR в машинный код:
+LLVM-рантайм (`runtime/src/llvm.rs`) компилирует IR в машинный код. Никакого LLVM `ExecutionEngine` нет: IR превращается в перемещаемый объектный файл, который загружает и релоцирует внутрипроцессный ELF-загрузчик.
 
-1. **Парсинг** строки LLVM IR в модуль
-2. **Верификация** корректности модуля
-3. **Оптимизация** через LLVM O3 pass pipeline
-4. **JIT-компиляция** в нативный машинный код
-5. **Кэширование** по (AST ID, device) для повторного использования
+1. **Компиляция** текста IR в перемещаемый объектный файл с `-O2` — внутри процесса через подгруженную по `dlopen` libLLVM, либо, если её нет, через `clang -x ir -c -O2`
+2. **Переиспользование** объектного файла из дискового кэша по ключу «дайджест исходника + идентичность компилятора»
+3. **Загрузка** ELF-загрузчиком: секции в анонимный mmap, применение релокаций
+4. **Кэширование** полученной функции по (AST ID, device) для повторного использования
 
 ```rust
-// Simplified JIT flow
-let module = Module::parse_ir(context, ir_string)?;
-module.verify()?;
-pass_manager.run(&module);  // O3 optimization
-let function = execution_engine.get_function::<KernelFn>(&name)?;
+// Simplified compile flow
+let object = producer.compile_object(ir_string)?;  // libLLVM in-process, or `clang -x ir -c -O2`
+validate_relocatable_object(&object, &entry_point)?;
+let (fn_ptr, _mmap) = jit_load(&object, &entry_point)?;  // ELF loader, no linker
 // Cache: (ast_id, device) → function
 ```
 

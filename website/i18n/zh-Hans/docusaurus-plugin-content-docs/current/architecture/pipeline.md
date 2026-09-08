@@ -66,7 +66,7 @@ Reshape、permute 等操作创建的是现有数据的新*视图*。buffer 是�
 
 ### 全局注册表
 
-Svod 维护着三个全局映射（无锁，线程安全）：
+Svod 维护着两个全局映射（无锁，线程安全）：
 
 | 映射 | 键 → 值 | 用途 |
 |-----|-------------|---------|
@@ -159,18 +159,18 @@ flowchart TD
 
 一个计算图可能有多个输出，或者需要物化的中间值。**Kernel 拆分**识别这些边界并创建独立的 kernel。
 
-入口点是 `schedule/src/rangeify/kernel.rs` 中的 `run_kernel_split_pipeline()`。
+入口点是 `schedule/src/rangeify/kernel.rs` 中的 `try_get_kernel_graph()`。
 
 ### Kernel 拆分流水线
 
 拆分过程包含几个协调的步骤：
 
-**步骤 1：BUFFERIZE → STORE**
+**步骤 1：STAGE → STORE**
 
-`BUFFERIZE` 节点标记值应该物化的位置。`pm_add_buffers_patterns()` 将它们转换为显式的 `STORE` 操作：
+`STAGE` 节点标记值应该物化的位置。`pm_add_buffers_patterns()` 将它们转换为显式的 `STORE` 操作：
 
 ```text
-Before: BUFFERIZE(computation, ranges)
+Before: STAGE(computation, ranges)
 After:  END(STORE(INDEX(...), computation), ranges)
 ```
 
@@ -178,7 +178,7 @@ After:  END(STORE(INDEX(...), computation), ranges)
 
 **步骤 2：将 store 拆分为 kernel**
 
-`split_all_stores()` 和 `split_store()` 在 STORE 边界处拆分图，创建独立的 kernel。Buffer 编号在拆分过程中通过 `LocalAddBufferContext.dg` 计数器分配。
+`split_all_stores()` 和 `split_store()` 在 STORE 边界处拆分图，创建独立的 kernel。Buffer 编号在拆分过程中通过 `LocalAddBufferContext.param_slot` 计数器分配。
 
 ```text
 Before: END(STORE(...), ranges)
@@ -203,7 +203,7 @@ After:  KERNEL(SINK(STORE(...)), ranges, buffer_list)
 
 ### Buffer 编号
 
-Buffer 编号由 `split_store()` 中的 `LocalAddBufferContext.dg` 计数器处理。DEFINE_GLOBAL 索引在拆分过程中按模式匹配顺序分配——不需要单独的重编号 pass。
+Buffer 编号由 `split_store()` 中的 `LocalAddBufferContext.param_slot` 计数器处理。每个 kernel 参数都成为一个 `PARAM(slot=N)`，这些 slot 在拆分过程中按模式匹配顺序分配——不需要单独的重编号 pass。
 
 ---
 
@@ -215,15 +215,14 @@ kernel 拆分完成后，需要**调度**它们：确定执行顺序、分配 bu
 
 ```rust
 pub struct ScheduleItem {
-    pub kernel: Arc<UOp>,              // KERNEL wrapper
+    pub kernel: Arc<UOp>,              // Callable (CALL) wrapper: dependency identity
     pub ast: Arc<UOp>,                 // Inner computation (for codegen)
     pub buffers: Vec<Buffer>,          // Device buffers
     pub buffer_uop_ids: Vec<u64>,      // UOp IDs for registry cleanup
     pub fixedvars: HashMap<String, i64>,  // Bound iteration variables
-    pub bound_ranges: Vec<BoundRange>,    // Ranges needing expansion
-    pub source_buffers: HashMap<u64, Arc<UOp>>,  // DEFINE_GLOBAL -> BUFFER mapping
-    pub dependencies: Vec<u64>,        // Producer kernel IDs
-    pub alias_registered_ids: Vec<u64>, // Alias UOp IDs for cleanup
+    pub loop_var_names: HashSet<String>,  // fixedvars fed by schedule-loop counters
+    pub dependencies: Vec<u64>,        // Producer callable UOp IDs
+    pub instance_dependencies: Vec<usize>, // Producer schedule-item indices
 }
 ```
 
@@ -256,11 +255,14 @@ flowchart TD
 
 ## 代码生成：从 UOp 到 LLVM IR
 
-kernel 调度完成后，开始生成实际代码。Svod 目前支持 LLVM 后端：
+kernel 调度完成后，开始生成实际代码。Svod 有两个渲染器，由设备后端决定运行哪一个：
 
-| 后端 | 编译速度 | 输出质量 | 使用场景 |
-|---------|---------------|----------------|----------|
-| **LLVM** | 较慢 | 高度优化 | 生产环境 |
+| 设备后端 | 渲染器 | 输出 |
+|----------|--------|------|
+| **CPU** | LLVM text（默认）或 C | LLVM IR，或 C 源代码 |
+| **CUDA** | LLVM text，NVPTX 目标 | LLVM IR（`ptx_kernel`） |
+| **AMD** | LLVM text，AMDGPU 目标 | LLVM IR（`amdgpu_kernel`） |
+| **Metal** | C，Metal 方言 | Metal Shading Language |
 
 `Renderer` trait 抽象了代码生成：
 
@@ -306,7 +308,7 @@ exit:
 | `devectorize` | 组合连续内存访问 |
 | `pm_reduce_devectorize` | 处理向量 reduce（K-vec、bool、水平） |
 | `pm_bool_devectorize` | 处理布尔向量模式 |
-| `merge_sibling_ends` | 合并相邻的 END 操作 |
+| `pm_split_ends` | 将多范围 END 拆分为嵌套的单范围 END |
 | `pm_fma_decomposition` | 将 `a*b+c` 转换为融合乘加（支持的后端） |
 | `pm_float_decomp` | 分解浮点操作 |
 | `bool_storage_patterns` | 在内存操作中转换 bool ↔ uint8 |
@@ -315,29 +317,33 @@ exit:
 
 ### 后端支持
 
-Svod 支持多个代码生成后端：
+两个渲染器覆盖四个设备后端：
 
-| 后端 | 输出 | 状态 |
-|---------|--------|--------|
-| **LLVM** | 原生机器码 | 主要（CPU） |
-| **C** | C 源代码 | 可用 |
+| 渲染器 | 输出 | 使用者 |
+|--------|------|--------|
+| **LLVM text** | 面向 CPU、AMDGPU 和 NVPTX 目标的 LLVM IR | CPU（默认）、AMD、CUDA |
+| **C** | C 源代码，或 Metal Shading Language | CPU（`SVOD_CPU_BACKEND=clang`）、Metal |
 
 ---
 
 ## 执行：运行 Kernel
 
-代码生成产生 LLVM IR 字符串。执行阶段涉及 JIT 编译和 kernel 启动。
+代码生成产生源代码字符串——LLVM IR、C 或 Metal Shading Language。执行阶段在运行时编译它们并启动 kernel。
 
 ### ExecutionPlan
 
-`prepare()`（单张量）或 `prepare_batch()`（多张量）构建 `ExecutionPlan`：
+`prepare()`（单张量）或 `prepare_batch()`（多张量）构建 `ExecutionPlan`（`runtime/src/execution_plan.rs`）：
 
 ```rust
 pub struct ExecutionPlan {
-    kernels: Vec<PreparedKernel>,       // Compiled kernels (topological order)
+    ops: Vec<PreparedOp>,               // Compiled kernels and buffer copies
+    op_order: Vec<usize>,               // Topological execution order
+    op_levels: Vec<Vec<usize>>,         // Parallel groups (Kahn levels)
     buffers: Vec<Buffer>,
     ast_to_buffer: HashMap<u64, usize>, // AST id -> buffer index mapping
     output_buffer_indices: Vec<usize>,  // Indices of output buffers (multi-output)
+    device: DeviceSpec,
+    // ... graph/queue state elided
 }
 ```
 
@@ -355,20 +361,18 @@ pub struct ExecutionPlan {
 
 ### JIT 编译
 
-LLVM 运行时（`runtime/src/llvm.rs`）将 IR 编译为机器码：
+LLVM 运行时（`runtime/src/llvm.rs`）将 IR 编译为机器码。这里没有 LLVM `ExecutionEngine`：IR 先变成可重定位目标文件，再由进程内的 ELF 加载器映射并重定位。
 
-1. **解析** LLVM IR 字符串为 module
-2. **验证** module 格式正确
-3. **优化**，使用 LLVM 的 O3 pass pipeline
-4. **JIT 编译**为原生机器码
-5. **缓存**，按 (AST ID, device) 复用
+1. 以 `-O2` 将 IR 文本**编译**为可重定位目标文件——可用时通过 `dlopen` 加载的 libLLVM 在进程内完成，否则回退到 `clang -x ir -c -O2`
+2. 按「源码摘要 + 编译器标识」为键，从磁盘缓存中**复用**目标文件
+3. 用 ELF 加载器**加载**：把各段写入匿名 mmap，并施加重定位
+4. 按 (AST ID, device) **缓存**得到的函数以便复用
 
 ```rust
-// Simplified JIT flow
-let module = Module::parse_ir(context, ir_string)?;
-module.verify()?;
-pass_manager.run(&module);  // O3 optimization
-let function = execution_engine.get_function::<KernelFn>(&name)?;
+// Simplified compile flow
+let object = producer.compile_object(ir_string)?;  // libLLVM in-process, or `clang -x ir -c -O2`
+validate_relocatable_object(&object, &entry_point)?;
+let (fn_ptr, _mmap) = jit_load(&object, &entry_point)?;  // ELF loader, no linker
 // Cache: (ast_id, device) → function
 ```
 

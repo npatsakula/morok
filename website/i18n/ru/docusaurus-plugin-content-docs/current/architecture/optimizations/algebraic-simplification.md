@@ -8,12 +8,12 @@ sidebar_label: Алгебраическое упрощение
 
 | Где | Матчер | Контекст |
 |-----|--------|----------|
-| Пре-оптимизация | `symbolic()` | После rangeify + range splitting, перед оптимизацией ядра |
-| Пост-оптимизация (Стадия 8) | `symbolic()` | После оптимизационных действий, перед раскрытием |
-| Пост-индекс (Стадия 16) | `symbolic()` | После снижения типа индексов, финальная очистка |
-| Декомпозиция+Рендер (Стадия 18-19) | `symbolic_simple()` | Совместно с поздними перезаписями и паттернами рендера |
+| Пре-оптимизация | `sym()` | После rangeify + range splitting, перед оптимизацией ядра |
+| Пост-оптимизация (Стадия 8) | `sym()` + `pm_move_where_on_load` | После оптимизационных действий, перед раскрытием |
+| Пост-индекс (Стадия 16) | `sym()` + `indexing_simplify()` | После снижения типа индексов, финальная очистка |
+| Декомпозиция+Рендер (Стадия 18-19) | `symbolic_simple()` | Совместно с поздними перезаписями и собственными матчерами рендерера |
 
-`symbolic()` = `symbolic_simple()` + паттерны проталкивания GEP. Все стадии, кроме финального прохода декомпозиция+рендер, запускают полный набор `symbolic()`.
+Матчеры образуют три уровня: `symbolic_simple()` — база уровня 1 (тождества, свёртка констант, схлопывание RANGE размера 1), `symbolic()` добавляет группы уровня 2 (канонизация, сравнения, div/mod по границам диапазона), а `sym()` добавляет уровень 3 (`pm_simplify_valid`, переупорядочивание ALU/STACK, «опинионированное» объединение слагаемых). Только финальный проход декомпозиция+рендер запускает набор уровня 1 сам по себе.
 
 **Анализ диапазонов**: Каждый UOp отслеживает минимальное (`vmin`) и максимальное (`vmax`) значения, которые он может принять во время выполнения. Эти границы вычисляются жадно при создании узла на основе границ входов. Многие паттерны используют эти границы для доказательства условий на этапе компиляции (например, «x всегда неотрицателен» или «x < n для всех значений»).
 
@@ -64,35 +64,44 @@ flowchart TD
 
 ## Порядок паттернов
 
-Матчер `symbolic_simple()` компонует группы паттернов в определённом порядке. Внутри группы паттерны пробуются последовательно до первого совпадения. Группы конкатенируются оператором `+`:
+Каждый матчер компонует группы паттернов в определённом порядке — порядок несущий, поскольку одна группа может открыть совпадения для следующей. Внутри группы паттерны пробуются последовательно до первого совпадения. Группы конкатенируются оператором `+`:
 
 ```text
-propagate_invalid          -- MUST be first (before x*0=0)
-fold_invalid_load_store
-constant_folding_dsl_patterns
-vconst_folding_patterns
-identity_and_zero_patterns
-commutative_canonicalization
-self_folding_dsl_patterns
-zero_folding_dsl_patterns
-division_dsl_patterns
-cast_dsl_patterns
-cast_where_dsl_patterns
-term_combining_dsl_patterns
-alu_folding_dsl_patterns
-advanced_division_dsl_patterns
-div_mod_recombine_dsl_patterns
-comparison_dsl_patterns
-boolean_dsl_patterns
-minmax_dsl_patterns
-where_bound_patterns
-power_dsl_patterns
-negation_dsl_patterns
-range_based_mod_div_patterns
-dce_dsl_patterns
-dead_loop_patterns
-after_simplification_patterns
-pm_move_where_on_load       -- WHERE->INDEX embedding for masked loads
+symbolic_simple() = symbolic_simple_base() + dead_loop_patterns()
+
+symbolic_simple_base()          -- tier 1
+  propagate_invalid             -- MUST be first (before x*0=0)
+  fold_invalid_load_store
+  constant_folding_dsl_patterns
+  vconst_folding_patterns
+  bool_arithmetic_patterns
+  identity_and_zero_patterns
+  self_folding_dsl_patterns
+  zero_folding_dsl_patterns
+  division_dsl_patterns
+  cast_dsl_patterns
+  uint_pack_dsl_patterns
+  div_mod_recombine_dsl_patterns
+  power_dsl_patterns
+  boolean_dsl_simple_patterns
+  dce_dsl_simple_patterns
+
+symbolic() = symbolic_simple() + tier 2
+  commutative_canonicalization
+  boolean_dsl_patterns
+  term_combining_dsl_patterns
+  dce_dsl_patterns
+  where_alu_combining_patterns
+  vmin_vmax_collapse_patterns
+  minmax_dsl_patterns
+  alu_folding_dsl_patterns
+  comparison_dsl_patterns
+  range_based_mod_div_patterns
+  advanced_division_dsl_patterns
+  range_based_cast_patterns
+  long_to_int_narrowing_patterns
+  after_simplification_patterns
+  where_bound_patterns
 ```
 
 ---
@@ -140,7 +149,7 @@ pm_move_where_on_load       -- WHERE->INDEX embedding for masked loads
 | `MUL[x, 0]` | `0` | Только когда НЕ float |
 | `AND[_, 0]` | `0` | Коммутативно |
 
-:::caution IEEE 754: MUL на ноль
+:::caution[IEEE 754: MUL на ноль]
 `MUL[x, 0]` **не** упрощается для чисел с плавающей точкой, поскольку IEEE 754 требует:
 - `NaN * 0 = NaN`
 - `Inf * 0 = NaN`
@@ -184,7 +193,7 @@ pm_move_where_on_load       -- WHERE->INDEX embedding for masked loads
 | `FDIV(MUL(x, y), y)` | `x` | Сокращение (float) |
 | `IDIV(MUL(x, y), y)` | `x` | Сокращение (целочисленное) |
 
-:::caution Приоритет паттернов
+:::caution[Приоритет паттернов]
 `FDIV(0, 0) -> NaN` должен стоять перед `FDIV(x, x) -> 1` в матчере для получения приоритета. Порядок внутри `division_dsl_patterns()` это гарантирует.
 :::
 
@@ -202,7 +211,7 @@ pm_move_where_on_load       -- WHERE->INDEX embedding for masked loads
 
 Функция `can_safe_cast(to, from)` определяет, может ли промежуточный тип вместить все значения. Проверяются разрядность, знаковость и категория float/int.
 
-:::caution Усечение ломает обратные преобразования
+:::caution[Усечение ломает обратные преобразования]
 `CAST(CAST(x, i8), i64)` НЕ сворачивается до `x`, когда `x` имеет тип `i64`. Промежуточный `i8` усекает значения — `can_safe_cast(i64, i8)` возвращает `false`, потому что `i8` не может вместить все значения `i64`.
 
 Безопасный пример: `CAST(CAST(x, i32), bool)` -> `CAST(x, bool)`, когда `x` имеет тип `bool`, поскольку `i32` может представить и `true`, и `false`.
@@ -282,7 +291,7 @@ Svod сохраняет `SUB` как полноценную операцию IR 
 | `LT(x, x)`, `GT(x, x)`, `NE(x, x)` | `false` |
 | `LE(x, x)`, `GE(x, x)`, `EQ(x, x)` | `true` |
 
-:::caution Самосравнение для float
+:::caution[Самосравнение для float]
 Паттерны самосравнения защищены проверкой `!x.dtype().is_float()`. Для чисел с плавающей точкой `NaN != NaN` даёт `true`, а `NaN == NaN` даёт `false`, поэтому эти тождества не выполняются.
 :::
 
@@ -342,7 +351,7 @@ Svod сохраняет `SUB` как полноценную операцию IR 
 | `WHERE(NOT(cond), t, f)` | `WHERE(cond, f, t)` | Инверсия условия |
 | `WHERE(a, WHERE(b, c, d), d)` | `WHERE(AND(a, b), c, d)` | Слияние ветвей (ptr_eq на `d`) |
 
-:::caution Защита от Invalid при инверсии условия
+:::caution[Защита от Invalid при инверсии условия]
 `WHERE(NOT(cond), t, f) -> WHERE(cond, f, t)` **не** применяется, когда `f` содержит `Invalid`. Паддинг создаёт структуры `WHERE(valid, idx, Invalid)`, и перестановка переместила бы `Invalid` в ветвь true, где нижестоящие паттерны не смогут его сопоставить. Проверяются как скалярный `Invalid`, так и векторизованный `VECTORIZE(Invalid, ...)`.
 
 У Tinygrad та же защита: `symbolic.py:201-202`.
@@ -445,59 +454,46 @@ With ordering:     MUL(0, WHERE(cond, x, Invalid))
 
 ---
 
-## 16. Проталкивание GEP
+## 16. Свёртки полос — INDEX над STACK
 
-GEP (Get Element Pointer) извлекает элементы из векторов. Эти паттерны проталкивают GEP через другие операции, чтобы достичь источника вектора, позволяя скалярное упрощение после девекторизации.
+В Svod нет операции GEP: значение с формой — это `STACK` полос, а `INDEX` выбирает из него полосу ровно так же, как выбирает адрес в буфере. Поэтому у `gep_pushing` из Tinygrad здесь нет прямого аналога. Вместо этого в Svod есть свёртки, схлопывающие структуру `INDEX`/`STACK`, чтобы девекторизатор видел скаляры.
 
-Включены только в `symbolic()` (Стадия 4), но не в `symbolic_simple()` (Стадии 8, 16).
+Большинство таких свёрток структурные и живут в очистке movement-операций девекторизатора (`schedule/src/devectorize.rs`), а не в `symbolic_simple()`. Единственное правило символьного уровня — `alu_vectorize_reorder_patterns`, относящееся к уровню 3, `sym()`.
 
-### Композиция и извлечение
+### Выбор и схлопывание полос
 
-| Паттерн | Результат | Примечание |
+| Паттерн | Результат | Примечания |
 |---------|-----------|------------|
-| `GEP(GEP(x, inner), outer)` | `GEP(x, inner[outer])` | Композиция вложенных |
-| `GEP(VECTORIZE(x,x,x,x), [i])` | `x` | Через broadcast (все ptr_eq) |
-| `GEP(VECTORIZE(elems), [i])` | `elems[i]` | Через VECTORIZE |
-| `GEP(scalar, [i])` | `scalar` | Тождество для скаляра (vcount == 1) |
-| `GEP(VCONST(vals), [i])` | `CONST(vals[i])` | Через VConst |
-| `GEP(x, [0,1,...,n-1])` | `x` | Удаление тождества |
+| `INDEX(STACK([a, b, c]), 2)` | `c` | Константный индекс полосы сворачивается к соответствующему источнику |
+| `INDEX(STACK([...]), c0, rest...)` | `INDEX(sources[c0], rest...)` | Ведущая константа рекурсивно снимает один уровень STACK |
+| `STACK([INDEX(b, 0), INDEX(b, 1), ...])` | `b` | Последовательные чтения полос восстанавливают источник |
+| `INDEX(INDEX(b, i), j)` | `INDEX(b, i, j)` | Композиция цепочек скалярной индексации |
+| `INDEX(AFTER(STACK([...]), deps), c)` | выбранная полоса с переприсоединёнными `deps` | Выбор полосы из регистрового стека сохраняет порядок |
 
-### Проталкивание через операции
+`const_index_into_stack` работает рекурсивно: список индексов, ведущие элементы которого — константы, снимает по одному уровню `STACK` на элемент.
+
+### ALU над STACK
 
 | Паттерн | Результат | Защита |
 |---------|-----------|--------|
-| `GEP(op(a, b), idx)` | `op(GEP(a, idx), GEP(b, idx))` | Бинарные, только Index dtype |
-| `GEP(unary(x), idx)` | `unary(GEP(x, idx))` | Унарные, только Index dtype |
-| `GEP(WHERE(c, t, f), idx)` | `WHERE(GEP(c, idx), GEP(t, idx), GEP(f, idx))` | Только Index dtype |
-| `GEP(MULACC(a, b, c), idx)` | `MULACC(GEP(a, idx), GEP(b, idx), GEP(c, idx))` | Только Index dtype |
+| `op(STACK(x,x,x,x), STACK(y,y,y,y))` | `STACK(op(x,y), op(x,y), ...)` | Оба операнда — broadcast (все полосы `ptr_eq`), одинаковая длина > 1 |
 
-:::caution Защита по Index dtype предотвращает взрыв графа
-Проталкивание GEP через ALU-операции ограничено `Index` dtype (Tinygrad: `symbolic.py:167`). Без этой защиты комбинация проталкивания GEP с `no_vectorized_alu` вызывает экспоненциальный рост графа на многомерных ядрах.
+Применяется к восемнадцати бинарным операциям — Add, Mul, Sub, FloorMod, Max, FloorDiv, Fdiv, Pow, And, Or, Xor, Shl, Shr и шести сравнениям. Схлопывание к `STACK` из одной скалярной операции открывает операнды для свёртки констант и скалярных упрощений.
+
+:::caution[Только уровень 3]
+`alu_vectorize_reorder_patterns` входит в `sym()`, а не в `symbolic()` или `symbolic_simple()`. Правило срабатывает на стадиях, где запускается `sym()` — пред-оптимизация, Стадия 8 и девекторизатор, — так что к финальному проходу декомпозиция+рендер переупорядочивание уже произошло.
 :::
 
-### Проталкивание через структурные операции
+### Очистка movement-операций вокруг STACK
 
 | Паттерн | Результат |
 |---------|-----------|
-| `GEP(CAT([a<4>, b<4>]), [5])` | `GEP(b, [1])` |
-| `GEP(PTRCAT([a, b, c]), [1, 2])` | `PTRCAT([b, c])` |
-| `GEP(CAST(x, dtype), idx)` | `CAST(GEP(x, idx), scalar_dtype)` |
-| `GEP(BITCAST(x, dtype), idx)` | `BITCAST(GEP(x, idx), scalar_dtype)` |
-| `GEP(WMMA(a, b, c), idx)` | `WMMA(GEP(a, ...), GEP(b, ...), GEP(c, ...))` |
-| `GEP(UNROLL(x, ...), idx)` | `GEP(x, idx)` |
-| `GEP(void_node, _)` | `void_node` |
+| `RESHAPE(STACK([x]))` | `x` — когда формы уже совпадают |
+| `RESHAPE(x)`, добавляющий ведущие единичные измерения | по одной обёртке `STACK([x])` на каждое добавленное измерение |
+| `EXPAND(STACK([x]))` | `STACK([x, x, ..., x])` — материализация broadcast |
+| `PERMUTE(PERMUTE(x, a), b)` | `PERMUTE(x, a∘b)`; тождественные перестановки исчезают |
 
-Паттерн WMMA отображает тайловые индексы через оси upcast для извлечения соответствующих подгрупп входных данных.
-
-### Обратная сборка
-
-| Паттерн | Результат |
-|---------|-----------|
-| `VECTORIZE(GEP(x,[0]), GEP(x,[1]), ..., GEP(x,[N-1]))` | `GEP(x, [0,1,...,N-1])` |
-
-Это сворачивает структуры VECTORIZE, созданные `no_vectorized_alu`, обратно в один GEP, который затем удаляется паттерном тождества.
-
----
+Эти правила живут в `movement_cleanup_patterns()` / `mop_cleanup_patterns()`, которые девекторизатор применяет перед скаляризацией. Полосы WMMA обрабатываются там же — функциями `stack_wmma_sources` и `broadcast_and_devec_wmma`, а не каким-либо символьным паттерном.
 
 ## 17. WHERE на LOAD (только Стадия 8)
 
@@ -555,17 +551,18 @@ After:   INDEX(buf, WHERE(combined_cond, idx, Invalid))
 
 ### Унифицированный движок Div-Mod (`fold_divmod_general`)
 
-Для IDIV и MOD над Index dtype унифицированный движок пробует правила упрощения в порядке приоритета. Основан на `fold_divmod_general` из Tinygrad (`divandmod.py:8-93`).
+Для IDIV и MOD над Index dtype унифицированный движок пробует правила упрощения в порядке приоритета. Основан на `fold_divmod_general` из Tinygrad (`divandmod.py:8-96`).
 
 | Приоритет | Правило | Описание |
 |-----------|---------|----------|
 | 1 | cancel_divmod | Диапазон лежит в одном интервале знаменателя |
-| 2 | remove_nested_mod | `(a%4 + b)%2 -> (a+b)%2` когда `2 | 4` |
-| 3 | fold_binary_numerator | Единственный терм с диапазоном из 2 значений |
+| 2 | nested_div | `(a % (k*c)) // c -> (a // c) % k` |
+| 3 | remove_nested_mod | `(a%4 + b)%2 -> (a+b)%2` когда `2 | 4` |
 | 4 | fold_divmod_congruence | Модулярная арифметика конгруэнтности множителей |
 | 5 | gcd_with_remainder | Вынос общего GCD из числителя |
-| 6 | divide_by_gcd | GCD-факторизация с переменным знаменателем |
-| 7 | factor_remainder | `(d*x+y)//d -> x + y//d` (крайний вариант) |
+| 6 | nest_div_by_smallest_factor | Рекурсивное расщепление по наименьшему общему множителю |
+| 7 | divide_by_gcd | GCD-факторизация при любом знаменателе |
+| 8 | factor_remainder | `(d*x+y)//d -> x + y//d` (крайний вариант) |
 
 ### Рекомбинация Div-Mod
 

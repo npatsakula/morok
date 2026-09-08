@@ -102,9 +102,9 @@ patterns! {
 组合不同上下文类型的匹配器时，使用 `.with_context()`：
 
 ```rust
-let mega_pass = symbolic().with_context::<PcontigConfig>()
-    + reduction_simplify_patterns().with_context()
-    + buffer_removal_with_pcontig();
+let pm_add_images = symbolic_simple().clone().with_context::<AddImageContext>()
+    + no_vectorized_alu().clone().with_context()
+    + pm_simplify_add_image();
 ```
 
 ---
@@ -201,7 +201,7 @@ flowchart TD
 ### 安全限制
 
 为防止无限循环：
-- 总计最多 **500,000 次迭代**
+- 重写栈最多 **500,000 条栈项**（`REWRITE_STACK_LIMIT`）
 - 超限时 panic 并输出诊断信息
 
 在实践中，良好的模式能快速收敛。

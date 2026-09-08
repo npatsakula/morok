@@ -66,7 +66,7 @@ Reshape, permute, and similar operations create new *views* of existing data. Th
 
 ### The Global Registry
 
-Svod maintains three global maps (lock-free, thread-safe):
+Svod maintains two global maps (lock-free, thread-safe):
 
 | Map | Key → Value | Purpose |
 |-----|-------------|---------|
@@ -159,18 +159,18 @@ After rangeify, there are no more movement ops—just arithmetic operations on i
 
 A computation graph might have multiple outputs, or intermediate values that need materialization. **Kernel splitting** identifies these boundaries and creates separate kernels.
 
-The entry point is `run_kernel_split_pipeline()` in `schedule/src/rangeify/kernel.rs`.
+The entry point is `try_get_kernel_graph()` in `schedule/src/rangeify/kernel.rs`.
 
 ### Kernel Splitting Pipeline
 
 The splitting proceeds through several coordinated steps:
 
-**Step 1: BUFFERIZE → STORE**
+**Step 1: STAGE → STORE**
 
-`BUFFERIZE` nodes mark where values should materialize. `pm_add_buffers_patterns()` converts them to explicit `STORE` operations:
+`STAGE` nodes mark where values should materialize. `pm_add_buffers_patterns()` converts them to explicit `STORE` operations:
 
 ```text
-Before: BUFFERIZE(computation, ranges)
+Before: STAGE(computation, ranges)
 After:  END(STORE(INDEX(...), computation), ranges)
 ```
 
@@ -178,7 +178,7 @@ The `END` wrapper captures which ranges scope this store. Buffers are allocated 
 
 **Step 2: Split stores into kernels**
 
-`split_all_stores()` and `split_store()` split the graph at STORE boundaries, creating separate kernels. Buffer numbering is assigned via `LocalAddBufferContext.dg` counter during splitting.
+`split_all_stores()` and `split_store()` split the graph at STORE boundaries, creating separate kernels. Buffer numbering is assigned via `LocalAddBufferContext.param_slot` counter during splitting.
 
 ```text
 Before: END(STORE(...), ranges)
@@ -203,7 +203,7 @@ Dependencies appear as `AFTER` nodes in the IR, ensuring kernels execute in vali
 
 ### Buffer Numbering
 
-Buffer numbering is handled by `LocalAddBufferContext.dg` counter in `split_store()`. DEFINE_GLOBAL indices are assigned during the split process in pattern-match order—no separate renumbering pass is needed.
+Buffer numbering is handled by the `LocalAddBufferContext.param_slot` counter in `split_store()`. Each kernel argument becomes a `PARAM(slot=N)`, and the slots are assigned during the split process in pattern-match order—no separate renumbering pass is needed.
 
 ---
 
@@ -215,15 +215,14 @@ Once kernels are split, we need to **schedule** them: determine execution order,
 
 ```rust
 pub struct ScheduleItem {
-    pub kernel: Arc<UOp>,              // KERNEL wrapper
+    pub kernel: Arc<UOp>,              // Callable (CALL) wrapper: dependency identity
     pub ast: Arc<UOp>,                 // Inner computation (for codegen)
     pub buffers: Vec<Buffer>,          // Device buffers
     pub buffer_uop_ids: Vec<u64>,      // UOp IDs for registry cleanup
     pub fixedvars: HashMap<String, i64>,  // Bound iteration variables
-    pub bound_ranges: Vec<BoundRange>,    // Ranges needing expansion
-    pub source_buffers: HashMap<u64, Arc<UOp>>,  // DEFINE_GLOBAL -> BUFFER mapping
-    pub dependencies: Vec<u64>,        // Producer kernel IDs
-    pub alias_registered_ids: Vec<u64>, // Alias UOp IDs for cleanup
+    pub loop_var_names: HashSet<String>,  // fixedvars fed by schedule-loop counters
+    pub dependencies: Vec<u64>,        // Producer callable UOp IDs
+    pub instance_dependencies: Vec<usize>, // Producer schedule-item indices
 }
 ```
 
@@ -256,11 +255,14 @@ Each group's kernels execute in parallel, then the next group starts.
 
 ## Code Generation: From UOp to LLVM IR
 
-With kernels scheduled, we generate actual code. Svod currently supports the LLVM backend:
+With kernels scheduled, we generate actual code. Svod has two renderers, and the device backend decides which one runs:
 
-| Backend | Compile Speed | Output Quality | Use Case |
-|---------|---------------|----------------|----------|
-| **LLVM** | Slower | Highly optimized | Production |
+| Device backend | Renderer | Output |
+|----------------|----------|--------|
+| **CPU** | LLVM text (default) or C | LLVM IR, or C source |
+| **CUDA** | LLVM text, NVPTX target | LLVM IR (`ptx_kernel`) |
+| **AMD** | LLVM text, AMDGPU target | LLVM IR (`amdgpu_kernel`) |
+| **Metal** | C, Metal dialect | Metal Shading Language |
 
 The `Renderer` trait abstracts code generation:
 
@@ -306,7 +308,7 @@ Before code generation, ~15 pattern-based passes clean up the IR:
 | `devectorize` | Group contiguous memory accesses |
 | `pm_reduce_devectorize` | Handle vector reductions (K-vec, bool, horizontal) |
 | `pm_bool_devectorize` | Handle boolean vector patterns |
-| `merge_sibling_ends` | Merge adjacent END operations |
+| `pm_split_ends` | Split multi-range ENDs into nested single-range ENDs |
 | `pm_fma_decomposition` | Convert `a*b+c` to fused multiply-add (for backends that support it) |
 | `pm_float_decomp` | Decompose floating-point operations |
 | `bool_storage_patterns` | Convert bool ↔ uint8 for memory operations |
@@ -315,29 +317,33 @@ These passes transform the optimized AST into a form suitable for code generatio
 
 ### Backend Support
 
-Svod supports multiple code generation backends:
+Two renderers cover the four device backends:
 
-| Backend | Output | Status |
-|---------|--------|--------|
-| **LLVM** | Native machine code | Primary (CPU) |
-| **C** | C source code | Available |
+| Renderer | Output | Used by |
+|----------|--------|---------|
+| **LLVM text** | LLVM IR for the CPU, AMDGPU and NVPTX targets | CPU (default), AMD, CUDA |
+| **C** | C source, or Metal Shading Language | CPU (`SVOD_CPU_BACKEND=clang`), Metal |
 
 ---
 
 ## Execution: Running the Kernels
 
-Code generation produces LLVM IR strings. Execution involves JIT compilation and kernel launch.
+Code generation produces source strings — LLVM IR, C, or Metal Shading Language. Execution involves compiling them at runtime and launching the kernels.
 
 ### The ExecutionPlan
 
-`prepare()` (single tensor) or `prepare_batch()` (multiple tensors) builds an `ExecutionPlan`:
+`prepare()` (single tensor) or `prepare_batch()` (multiple tensors) builds an `ExecutionPlan` (`runtime/src/execution_plan.rs`):
 
 ```rust
 pub struct ExecutionPlan {
-    kernels: Vec<PreparedKernel>,       // Compiled kernels (topological order)
+    ops: Vec<PreparedOp>,               // Compiled kernels and buffer copies
+    op_order: Vec<usize>,               // Topological execution order
+    op_levels: Vec<Vec<usize>>,         // Parallel groups (Kahn levels)
     buffers: Vec<Buffer>,
     ast_to_buffer: HashMap<u64, usize>, // AST id -> buffer index mapping
     output_buffer_indices: Vec<usize>,  // Indices of output buffers (multi-output)
+    device: DeviceSpec,
+    // ... graph/queue state elided
 }
 ```
 
@@ -355,20 +361,18 @@ The plan is **reusable**: compile once, execute many times with different data.
 
 ### JIT Compilation
 
-The LLVM runtime (`runtime/src/llvm.rs`) compiles IR to machine code:
+The LLVM runtime (`runtime/src/llvm.rs`) compiles IR to machine code. There is no LLVM `ExecutionEngine`: the IR becomes a relocatable object, which an in-process ELF loader maps and relocates.
 
-1. **Parse** the LLVM IR string into a module
-2. **Verify** the module is well-formed
-3. **Optimize** with LLVM's O3 pass pipeline
-4. **JIT compile** to native machine code
-5. **Cache** by (AST ID, device) for reuse
+1. **Compile** the IR text to a relocatable object at `-O2` — in-process through a `dlopen`ed libLLVM when one is available, otherwise `clang -x ir -c -O2`
+2. **Reuse** the object from the on-disk cache, keyed by the source digest plus compiler identity
+3. **Load** it with the ELF loader: sections into an anonymous mmap, relocations applied
+4. **Cache** the resulting function by (AST ID, device) for reuse
 
 ```rust
-// Simplified JIT flow
-let module = Module::parse_ir(context, ir_string)?;
-module.verify()?;
-pass_manager.run(&module);  // O3 optimization
-let function = execution_engine.get_function::<KernelFn>(&name)?;
+// Simplified compile flow
+let object = producer.compile_object(ir_string)?;  // libLLVM in-process, or `clang -x ir -c -O2`
+validate_relocatable_object(&object, &entry_point)?;
+let (fn_ptr, _mmap) = jit_load(&object, &entry_point)?;  // ELF loader, no linker
 // Cache: (ast_id, device) → function
 ```
 

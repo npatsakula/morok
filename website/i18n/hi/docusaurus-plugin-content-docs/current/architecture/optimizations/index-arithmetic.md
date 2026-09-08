@@ -100,7 +100,7 @@ Value range analysis (`vmin`/`vmax`) ऐसी simplifications enable करत�
 
 ## 3. `fold_divmod_general` एल्गोरिदम
 
-Index-dtype `Idiv` और `Mod` के लिए catch-all। Tinygrad के `divandmod.py:8-93` के सभी 8 rules priority order में implement करता है, recursive `nest_div_by_smallest_factor` सहित। हर rule sequence में try होता है; पहला match जीतता है।
+Index-dtype `Idiv` और `Mod` के लिए catch-all। Tinygrad के `divandmod.py:8-96` के rules priority order में implement करता है। हर rule sequence में try होता है; पहला match जीतता है। Rules 1-6 को constant denominator चाहिए, और recursive `nest_div_by_smallest_factor` उस आधे हिस्से को ख़त्म करता है; उसके बाद `divide_by_gcd` और `factor_remainder` denominator-agnostic fallback हैं।
 
 Entry point: जब `Idiv(x, y)` या `Mod(x, y)` का `dtype == Index` हो, पैटर्न `fold_divmod_general(op, x, y)` को delegate करता है।
 
@@ -124,18 +124,17 @@ Entry point: जब `Idiv(x, y)` या `Mod(x, y)` का `dtype == Index` ह�
 
 **Example**: `(RANGE(8) % 4 + RANGE(2)) % 2` -> `(RANGE(8) + RANGE(2)) % 2`
 
-### Rule 3 -- fold_binary_numerator
+### Rule 3 -- nested_div
 
-जब single non-constant term के exactly 2 values हों (`vmax - vmin == 1`), result एक linear interpolation है: `(y2 - y1) * (v - v_min) + y1`।
+`k > 0` होने पर `(a % (k*c)) // c` -> `(a // c) % k`। जब modulus divisor का गुणज हो, बाहरी division भीतरी quotient का modulo बन जाता है।
 
-**गार्ड**: Decomposition के बाद exactly एक non-constant term, और उस term की range exactly 2 values span करती है।
+**गार्ड**: `op == Idiv`, numerator एक `Mod(inner, modulus)` है, `modulus` denominator `c` से पूरी तरह divisible है, और निकले हुए `k` का `vmin > 0` है।
 
-**क्या करता है**: Div/mod को दोनों endpoints पर evaluate करता है और उनके बीच linear map construct करता है। यह division पूरी तरह avoid करता है।
+**क्या करता है**: Modulo के division को division के modulo में rewrite करता है, एक nesting level हटाकर।
 
-**Example**: `(v * 3 + 2) % 5` जहाँ `v` `{0, 1}` में है:
-- `v=0`: `(0 + 2) % 5 = 2`
-- `v=1`: `(3 + 2) % 5 = 0`
-- Result: `(0 - 2) * (v - 0) + 2 = -2*v + 2`
+**Example**: `(R % 12) // 4` -> `(R // 4) % 3`
+
+ठीक दो values span करने वाला numerator इसके बजाय Rule 4 में हैंडल होता है: `fold_divmod_congruence` दोनों remainder signs खोजता है, ठीक इसीलिए कि एक period पार करने वाला binary numerator भी fold हो सके।
 
 ### Rule 4 -- fold_divmod_congruence
 
@@ -157,7 +156,19 @@ Entry point: जब `Idiv(x, y)` या `Mod(x, y)` का `dtype == Index` ह�
 
 **Example**: `(6*a + 4*b) // 8` जहाँ `GCD(6, 4, 8) = 2` -> `(3*a + 2*b) // 4`
 
-### Rule 6 -- divide_by_gcd
+### Rule 6 -- nest_div_by_smallest_factor
+
+Constant divisors के लिए recursive decomposition। Divisor और किसी term के coefficient के बीच shared smallest factor ढूँढता है, दोनों को उससे divide करता है, फिर recurse करता है।
+
+**गार्ड**: `x_min >= 0`, constant `y > 1`, और कम से कम एक non-constant term में factor `f > 1` है जहाँ `y % f == 0`।
+
+**क्या करता है**: Qualifying factors में `div = min(|f|)` pick करता है, `x // y` को `(x // div) // (y / div)` में rewrite करता है। हर step `y` reduce करता है, rules 1-7 की तरफ़ converge करता है।
+
+**Example**: `(6*a + 4*b) // 12` → `((6*a + 4*b) // 2) // 6` → `(3*a + 2*b) // 6` → `(3*a + 2*b) // 6` (फिर rule 8 finish करता है)।
+
+Tinygrad: `divandmod.py:62-67`। Svod: `nest_div_by_smallest_factor` in `fold_divmod_general`।
+
+### Rule 7 -- divide_by_gcd
 
 Rule 5 का variable denominator version। `GCD(all_terms..., y)` compute करता है numerator और denominator दोनों include करके, फिर दोनों sides divide करता है। Rule 5 से अलग, यह तब काम करता है जब denominator constant नहीं है।
 
@@ -165,7 +176,7 @@ Rule 5 का variable denominator version। `GCD(all_terms..., y)` compute क
 
 **Example**: `(4*a) // (2*b)` -> `(2*a) // b`
 
-### Rule 7 -- factor_remainder
+### Rule 8 -- factor_remainder
 
 Last resort। Terms को exactly-divisible (quotient) और remainder में partition करता है।
 
@@ -174,18 +185,6 @@ Last resort। Terms को exactly-divisible (quotient) और remainder मे
 **क्या करता है**: `Idiv` के लिए: `quo_sum + rem // y`। `Mod` के लिए: `rem % y` (constant `y` के लिए coefficient reduction)।
 
 **Example**: `(8*a + 3*b) // 8` -> `a + (3*b) // 8`
-
-### Rule 8 -- nest_div_by_smallest_factor
-
-Constant divisors के लिए recursive decomposition। Divisor और किसी term के coefficient के बीच shared smallest factor ढूँढता है, दोनों को उससे divide करता है, फिर recurse करता है।
-
-**गार्ड**: `x_min >= 0`, constant `y > 1`, और कम से कम एक non-constant term में factor `f > 1` है जहाँ `y % f == 0`।
-
-**क्या करता है**: Qualifying factors में `div = min(|f|)` pick करता है, `x // y` को `(x // div) // (y / div)` में rewrite करता है। हर step `y` reduce करता है, rules 1-7 की तरफ़ converge करता है।
-
-**Example**: `(6*a + 4*b) // 12` → `((6*a + 4*b) // 2) // 6` → `(3*a + 2*b) // 6` → `(3*a + 2*b) // 6` (फिर rule 7 finish करता है)।
-
-Tinygrad: `divandmod.py:62-67`। Svod: `nest_div_by_smallest_factor` in `fold_divmod_general`।
 
 :::caution
 Rules 5-8 को non-negative numerators चाहिए (`x_min >= 0`)। Negative operands के साथ floor division की rounding semantics अलग होती है (Python/Tinygrad में negative infinity की तरफ़, hardware में zero की तरफ़)। Implementation negative ranges के लिए `None` return करता है, बाद के passes को expression handle करने देता है।
@@ -278,7 +277,7 @@ op(a, b) -> op(b, a)   when b.id < a.id
 **Non-Index types पर apply क्यों नहीं**: Float/int arithmetic पर canonicalization apply करने से VECTORIZE elements reorder होते और बाद के passes में vector math merging टूट जाती। Tinygrad भी यही choice करता है (`symbolic.py:178-182`)।
 
 :::caution
-Canonicalization rewrite engine के fixed-point iteration से interact करता है। अगर दो पैटर्न operand order पर disagree करें (एक canonicalize करे, दूसरा non-canonical output produce करे), तो engine oscillate कर सकता है। सभी index-producing पैटर्न canonical order respect करने चाहिए, वरना 1000-iteration safety limit trigger होगी।
+Canonicalization rewrite engine के fixed-point iteration से interact करता है। अगर दो पैटर्न operand order पर disagree करें (एक canonicalize करे, दूसरा non-canonical output produce करे), तो engine oscillate कर सकता है। सभी index-producing पैटर्न canonical order respect करने चाहिए, वरना rewrite engine की 500,000-entry stack limit (`REWRITE_STACK_LIMIT`) trigger होगी।
 :::
 
 ---

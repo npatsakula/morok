@@ -28,7 +28,7 @@ flowchart TD
 
 **क्यों**: Splitting के बाद, inner range vectorize हो सकता है (UPCAST to SIMD width) जबकि outer range parallelize हो सकता है (GPU blocks, CPU threads)। Splitting के बिना, modulo दोनों optimizations रोकता है।
 
-**Mechanism**: `pm_split_ranges` pattern matcher ranges collect करता है जिनमें modulo usage है लेकिन तुरंत transform **नहीं** करता। SINK node देखने तक wait करता है, फिर सभी substitutions एक साथ करता है (inconsistent partial rewrites से बचता है)। नई ranges को fresh `axis_id` assign होते हैं।
+**Mechanism**: `pm_split_ranges` pattern matcher ranges collect करता है जिनमें modulo usage है लेकिन तुरंत transform **नहीं** करता। SINK node देखने तक wait करता है, फिर सभी substitutions एक साथ करता है (inconsistent partial rewrites से बचता है)। Outer और inner ranges मूल axis path के आगे `0` और `1` जोड़ते हैं — Tinygrad की तरह, बिना कोई global range ID allocate किए।
 
 **गार्ड**: सिर्फ़ तब fire करता है जब `end % c == 0` (exact divisibility)। Non-divisible cases जैसे हैं वैसे रहते हैं।
 
@@ -136,57 +136,54 @@ Tinygrad: `simplify.py:82-142`। Svod: `pm_reduce_simplify()` + `reduce_collaps
 
 ## Buffer Removal (Partial Contiguous)
 
-**क्या**: Decide करना कि intermediate result को buffer में materialize करें या computation inline करें। Codebase में अक्सर "pcontig" कहलाता है (short for partial contiguous — वो optimization जो BUFFERIZE nodes को range variables substitute करके inline करता है)।
+**क्या**: बफ़र की गई ranges की जगह वे ranges रखकर — जिनसे reader index करता है — decide करना कि intermediate result को buffer में materialize करें या computation inline करें।
 
-जब rangeify pass `BUFFERIZE` node बनाता है ("इसे buffer चाहिए" mark करता है), buffer removal pass evaluate करता है कि actually memory allocate करना worth है या नहीं। `BUFFERIZE` Svod का intermediate representation है "इसे buffer चाहिए" और final `STORE`+`BUFFER`+`AFTER` के बीच — यह इस pass को decide करने देता है कि materialization actually ज़रूरी है या नहीं। अगर computation काफ़ी cheap है, तो range variables substitute करके expression directly inline कर देता है।
+जब rangeify pass `STAGE` node बनाता है ("इसे buffer चाहिए" mark करता है), buffer removal pass evaluate करता है कि actually memory allocate करना worth है या नहीं। `STAGE` Svod का intermediate representation है "इसे buffer चाहिए" और final `STORE`+`BUFFER`+`AFTER` के बीच — यह इस pass को decide करने देता है कि materialization actually ज़रूरी है या नहीं। अगर computation काफ़ी cheap है, तो range variables substitute करके expression directly inline कर देता है।
 
 ### Decision Tree
 
 ```mermaid
 flowchart TD
-  Q1["Is this an always-run op (CONTIGUOUS, COPY)?"]
+  Q1["Always-run op (CONTIGUOUS, COPY), or a non-removable STAGE?"]
   Q1 -->|"YES"| K1["Keep buffer (always materialized)"]
-  Q1 -->|"NO"| Q2["Does inlining exceed the buffer limit?"]
+  Q1 -->|"NO"| Q2["More than 3 distinct buffers accessed?"]
   Q2 -->|"YES"| K2["Keep buffer"]
-  Q2 -->|"NO"| Q3["Is there a reduce in scope?"]
-  Q3 -->|"NO"| I1["Inline (cheap: just substitute ranges)"]
-  Q3 -->|"YES"| Q4["Is pcontig level (less than or equal to) 2?"]
-  Q4 -->|"YES"| K3["Keep buffer (reduce recomputation too expensive)"]
-  Q4 -->|"NO"| Q5["Check input/output ratio"]
-  Q5 -->|"Ratio low (output small relative to input)"| K4["Keep buffer"]
-  Q5 -->|"Ratio high (output much greater than input)"| I2["Partial inline"]
+  Q2 -->|"NO"| Q3["Does a REDUCE in the body read a buffer?"]
+  Q3 -->|"YES"| K3["Keep buffer (reduce recomputation too expensive)"]
+  Q3 -->|"NO"| I1["Inline: substitute the STAGE ranges with the INDEX ranges"]
 ```
 
-:::caution Reduce Context में Unary Ops
-Unary operations (जैसे negation) reduce scope में होने पर inline **नहीं** होतीं, भले ही cheap हों। कारण: अगर `argmax(-x)` negation inline करे, तो हर reduction iteration के लिए `-x` recompute होता है — एक buffer read की जगह N extra negations।
+:::caution[Reduce के अंदर Buffer Reads]
+Reduce गार्ड इस बात पर नहीं है कि operation कितनी सस्ती है — यह तब fire करता है जब body का कोई भी REDUCE किसी buffer (`Param`, `Buffer` या `Stage`) को पढ़ता है। कारण: अगर `argmax(-x)` negation inline करे, तो हर reduction iteration पर `-x` recompute होता है — एक buffer read की जगह N extra loads और negations। जो reduce किसी buffer को छूता ही नहीं, वह अब भी inline हो सकता है।
 :::
 
 ### Related Patterns
 
 | पैटर्न | क्या |
 |--------|-----|
-| Buffer folding | `BUFFERIZE(CONST) → CONST` — constant का buffer बस constant है |
+| STAGE folding | `STAGE(CONST) → CONST` — constant का stage बस constant है |
 | Index folding | `INDEX(CONST) → CONST` — constant में indexing बस constant है |
-| Identity fold | `INDEX(BUFFERIZE(compute, ranges), ranges) → compute` — same ranges cancel |
-| Nested flatten | `BUFFERIZE(BUFFERIZE(...))` — nested bufferization flatten |
+| COPY folding | `COPY(CONST) → CONST` — constant की copy बस constant है |
+| MSTACK folding | `INDEX(MSTACK([CONST, ...])) → CONST` — constants का multi-device stack |
+| Identity fold | `INDEX(STAGE(compute, ranges), ranges) → compute` — same ranges cancel |
 
-Svod: `buffer_removal_with_pcontig()` in `rangeify/patterns.rs`।
+Svod: `rangeify/patterns.rs` में `pm_remove_bufferize()` और `buffer_folding()`।
 
 ---
 
 ## Dead Axis Removal
 
-**क्या**: BUFFERIZE operations से unused dimensions remove करना।
+**क्या**: STAGE operations से unused dimensions remove करना।
 
 एक dimension "dead" है जब:
 - Size 1 हो (कुछ contribute नहीं करता)
 - Index में constant के रूप में दिखे (variable नहीं)
 - Compute expression reference न करे
 
-Dead axes BUFFERIZE से remove होते हैं, फिर shape RESHAPE (size-1 dims insert) और EXPAND (original size में broadcast) से restore होता है। यह buffer allocation की dimensionality कम करता है।
+Dead axes STAGE से remove होते हैं, फिर shape RESHAPE (size-1 dims insert) और EXPAND (original size में broadcast) से restore होता है। यह buffer allocation की dimensionality कम करता है।
 
-:::caution Scalar Case
-जब सभी ranges dead हों (scalar output), BUFFERIZE empty ranges के साथ रखना ज़रूरी — इसे पूरी तरह remove करने से `NoKernelsFound` होता है क्योंकि kernel splitting के दौरान कोई STORE नहीं बनता।
+:::caution[Scalar Case]
+जब सभी ranges dead हों (scalar output), STAGE empty ranges के साथ रखना ज़रूरी — इसे पूरी तरह remove करने से `NoKernelsFound` होता है क्योंकि kernel splitting के दौरान कोई STORE नहीं बनता।
 :::
 
 Svod: `dead_axis_removal()` in `rangeify/patterns.rs`।

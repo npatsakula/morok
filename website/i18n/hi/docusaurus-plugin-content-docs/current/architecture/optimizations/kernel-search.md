@@ -27,9 +27,9 @@ Tinygrad source: `tinygrad/codegen/opt/`। Svod source: `schedule/src/optimizer
 | SWAP(axis1, axis2) | Global dimensions reorder करे | सभी |
 | PADTO(axis, amount) | Alignment के लिए pad करे | सभी |
 | NOLOCALS | Local memory disable करे | सभी (constraint) |
-| TC | Tensor core usage enable करे | NVIDIA GPUs |
+| TC | Tensor core usage enable करे | NVIDIA, AMD, Metal, Intel GPUs (WMMA/MFMA) |
 
-Total action space ~162 base actions है (kernel structure और available parallelism के अनुसार अलग-अलग)।
+`BEAM_ACTIONS` में 193 base actions हैं (`BEAM_PADTO=1` के साथ 200); हर kernel में इनमें से कितने बचते हैं, यह kernel structure और available parallelism पर निर्भर करता है। NOLOCALS इस list में नहीं है — `generate_actions` उसे तभी जोड़ता है जब `NOLOCALS`/`SVOD_NOLOCALS` सेट हो।
 
 ---
 
@@ -72,36 +72,35 @@ fn hand_coded_optimizations(scheduler: &mut Scheduler) {
 
 ```rust
 // Pseudocode — simplified from optimizer/beam.rs
-// Actual API: beam_search_cached(scheduler, config, compile_and_time) -> Result<BeamResult>
-fn beam_search(scheduler: Scheduler, config: BeamConfig) -> Scheduler {
-    let mut beam = vec![scheduler];
-    let deadline = Instant::now() + config.time_limit;
+// Actual API: beam_search_cached_remote(scheduler, config, compiler_identity,
+//                                       behavior_fingerprint, compile_wave, benchmark)
+fn beam_search(scheduler: Scheduler, config: &BeamConfig) -> Scheduler {
+    let mut beam = vec![(scheduler, Duration::MAX)];
 
-    while Instant::now() < deadline {
-        let mut candidates = vec![];
+    loop {
+        // EXPAND: every applicable action on every beam member
+        let candidates: Vec<Scheduler> = beam.iter()
+            .flat_map(|(state, _)| generate_actions(state))
+            .collect();
 
-        for state in &beam {
-            for action in generate_actions(state) {
-                if let Ok(next) = state.apply(action) {
-                    candidates.push(next);
-                }
-            }
+        // COMPILE in helper worker processes, then time config.num_runs each
+        let mut timed = vec![];
+        for (candidate, compiled) in compile_wave(&candidates) {
+            if !seen_binary.insert(compiled.binary_key) { continue; }  // identical code
+            if bloated(&mut least_compute_ops, compiled.compute_ops) { continue; }
+            timed.push((candidate, benchmark(&compiled)));
         }
 
-        // Compile and time each candidate
-        let timed: Vec<_> = candidates.par_iter()
-            .map(|c| (c, measure_kernel_time(c)))
-            .collect();
-
         // Keep top K by execution time
-        beam = timed.into_iter()
-            .sorted_by_key(|(_, time)| *time)
-            .take(config.beam_width)
-            .map(|(c, _)| c)
-            .collect();
+        timed.sort_by_key(|(_, time)| *time);
+        timed.truncate(config.beam_width);
+
+        // Stop when the best candidate no longer improves by min_progress_ns
+        if best(&beam) - best(&timed) < config.min_progress_ns { break; }
+        beam = timed;
     }
 
-    beam.into_iter().next().unwrap()
+    beam.into_iter().next().unwrap().0
 }
 ```
 
@@ -124,11 +123,13 @@ BEAM=8 cargo run
 या प्रोग्रामैटिकली:
 
 ```rust
-let config = PrepareConfig::builder()
-    .strategy(OptStrategy::Beam { width: 8 })
-    .build();
+let config = PrepareConfig::from(
+    OptimizerConfig::builder()
+        .strategy(OptStrategy::Beam { width: 8 })
+        .build()
+);
 
-tensor.realize_with(config)?;
+tensor.realize_with(&config)?;
 ```
 
 ---

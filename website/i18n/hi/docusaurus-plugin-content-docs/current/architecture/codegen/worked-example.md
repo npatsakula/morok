@@ -44,21 +44,23 @@ flowchart TD
 कोई बदलाव नहीं — symbolic पहले से साफ़ है।
 
 ### Stage 9 के बाद: Expander
-UPCAST → UNROLL → CONTRACT (सिम्प्लीफ़ाइड — असल IR में CONTRACT wrapper होता है):
+UPCAST expansion सीधे STACK/INDEX स्ट्रक्चर से दिखाई जाती है:
 ```mermaid
 flowchart TD
-  V["VECTORIZE"] --> ADD["ADD"]
+  V["STACK"] --> ADD["ADD"]
   ADD --> LA["LOAD(a)"]
   ADD --> LB["LOAD(b)"]
   LA --> IA["INDEX"]
   LB --> IB["INDEX"]
   IA --> BA["BUFFER(a)"]
   IA --> RG["RANGE(i, Global, 0..100)"]
-  IA --> UN["UNROLL(VCONST([0,1,2,3]))"]
+  IA --> UN["RANGE(j, Upcast, 0..4)"]
   IB --> BB["BUFFER(b)"]
   IB --> RG
   IB --> UN
 ```
+
+नोट: साझा ranges और index एक्सप्रेशन hash consing से deduplicate हो जाते हैं।
 
 ### Stage 10 के बाद: Add Local Buffers
 (अगर LOCAL opt चुना गया हो)
@@ -68,7 +70,7 @@ flowchart TD
 
 ### Stage 12 के बाद: Add GPU Dims
 ```
-[SPECIAL(gidx0)] : Index  // replaces RANGE(i)
+[SPECIAL(gidx0)] : WeakInt  // replaces RANGE(i)
 ```
 
 ### Stage 13 के बाद: Add Loads
@@ -78,7 +80,7 @@ flowchart TD
 Devectorize के बाद वेक्टर स्ट्रक्चर (इफ़ेक्ट दिखाता है, exact UOp स्ट्रक्चर नहीं):
 ```mermaid
 flowchart TD
-  V["VECTORIZE : (4 x Float32)"] --> A0["ADD(a[0], b[0])"]
+  V["STACK : 4 lanes of Float32"] --> A0["ADD(a[0], b[0])"]
   V --> A1["ADD(a[1], b[1])"]
   V --> A2["ADD(a[2], b[2])"]
   V --> A3["ADD(a[3], b[3])"]
@@ -107,9 +109,9 @@ flowchart TD
 ### Stage 21 के बाद: Linearize
 लीनियर इंस्ट्रक्शन सीक्वेंस (सिम्प्लीफ़ाइड):
 ```
-1. DEFINE_GLOBAL(0)  // Output buffer c
-2. DEFINE_GLOBAL(1)  // Input buffer a
-3. DEFINE_GLOBAL(2)  // Input buffer b
+1. PARAM(0)  // Output buffer c
+2. PARAM(1)  // Input buffer a
+3. PARAM(2)  // Input buffer b
 4. RANGE(i, 0..100, Global)  // gidx0
 5. LOAD(a, i*4+0..i*4+3)  // Vector load (vec4)
 6. LOAD(b, i*4+0..i*4+3)  // Vector load (vec4)
@@ -141,11 +143,14 @@ flowchart TD
 
 ## पाइपलाइन डीबगिंग
 
-जब कोई कर्नेल गलत रिज़ल्ट देता है, तो बग इन 22 स्टेजों में से किसी एक में होता है। Environment variables इस्तेमाल करके हर स्टेज पर IR निकालें:
+जब कोई कर्नेल गलत रिज़ल्ट देता है, तो बग इन 22 स्टेजों में से किसी एक में होता है। हर स्टेज अपना UOp ट्री `tracing` से लॉग करता है; `scripts/extract-ir.sh` उन लॉग्स को पढ़ने लायक डंप में बदल देता है:
 
 ```bash
 # See IR after each transformation
-SVOD_DEBUG=ir cargo test failing_test
+./scripts/extract-ir.sh failing_test -p svod-tensor -o /tmp/ir.txt
+
+# Or dump a single stage straight to stderr (no tracing subscriber needed)
+SVOD_PER_STAGE_UOPS=1 SVOD_DUMP_STAGE=09 cargo test failing_test -- --nocapture
 ```
 
 ### क्विक रेफ़रेंस
@@ -190,7 +195,7 @@ SVOD_DEBUG=ir cargo test failing_test
 
 | स्टेज | Tinygrad | Svod | नोट्स |
 |-------|----------|-------|-------|
-| 1: Early Movement Ops | 3 स्पेसिफ़िक patterns (INDEX, AFTER, END से movement) से movement ops को wrappers से गुज़ारता है | Bufferization के दौरान movement ops हटाता है | दोनों अप्रोच functionally equivalent हैं; Svod का ज़्यादा क्लीन है |
+| 17: Pre-Matcher | बैकएंड hooks एक ही `Renderer` क्लास पर रहते हैं | दो traits में बँटे: `svod_codegen::traits::Renderer` रेंडर करता है, `svod_device::device::Renderer` में `decompositor()`, `extra_matcher()`, `pre_isel_matcher()`, `isel_matcher()` हैं | Hooks वही हैं, मालिकाना अलग है |
 
 ### Aligned स्टेज (पहले अलग थे)
 
@@ -198,9 +203,9 @@ SVOD_DEBUG=ir cargo test failing_test
 
 | स्टेज | क्या बदला |
 |-------|----------|
-| 15: Index Dtype Lowering | Svod में अब `pm_lower_index_dtype()` है पूर्ण pattern coverage के साथ: Binary ops, CONST, WHERE, VECTORIZE, SPECIAL, DEFINE_VAR, RANGE, CAST cleanup |
-| 18: Decompositions | जोड़ा: `fast_division_patterns()`, `pm_div_to_shr()`, `pm_fdiv_to_mul()`, `pm_comparison_negations()`, De Morgan's laws |
-| 19: Final Rewrite | `pm_render()` codegen से Stage 19 में schedule पाइपलाइन में मूव किया |
+| 15: Index Dtype Lowering | Svod में अब `pm_lower_index_dtype()` है पूर्ण pattern coverage के साथ: Binary ops, CONST/VCONST, WHERE, STACK, SPECIAL, PARAM, RANGE, double weak CAST |
+| 18: Decompositions | जोड़ा: `fast_division_patterns()`, `pm_div_to_shr()`, `pm_fdiv_to_mul()`, `pm_comparison_negations()`, De Morgan's law |
+| 19: Final Rewrite | `renderer.extra_matcher()` और `pm_split_ends()` अब codegen के बजाय schedule पाइपलाइन के final rewrite में जुड़ते हैं |
 
 ### केवल Tinygrad के Patterns
 
@@ -208,8 +213,7 @@ Svod जानबूझकर इन Tinygrad-स्पेसिफ़िक pat
 
 | Pattern | उद्देश्य | Svod को क्यों नहीं चाहिए |
 |---------|----------|---------------------------|
-| `to_bufferview` | DISK/TINYFS डिवाइसों के लिए डिस्क बफ़र कॉपी से बचें | Svod DISK/TINYFS सपोर्ट नहीं करता; in-memory बैकएंड को इसकी ज़रूरत नहीं |
-| AFTER/END movement patterns | Movement ops को टाइमिंग wrappers से गुज़ारें | Svod bufferization के दौरान movement ops हटाता है |
+| `pm_regalloc_rewrite` | ISA बैकएंड के लिए linear-scan रजिस्टर एलोकेशन | Svod LLVM IR / सोर्स एमिट करता है, इसलिए रजिस्टर एलोकेशन बैकएंड कम्पाइलर का काम है |
 
 ### Svod एनहैंसमेंट
 
@@ -217,11 +221,8 @@ Svod में कुछ patterns/एनहैंसमेंट हैं ज�
 
 | एनहैंसमेंट | लोकेशन | उद्देश्य |
 |------------|--------|----------|
-| Nested INDEX flattening (identical indices के साथ) | `movement_op_patterns()` | रिडंडेंट `INDEX(INDEX(ptr, [i]), [i])` हटाता है |
-| CAT → VECTORIZE | `pm_render` | CAT को एक्सप्लिसिट VECTORIZE में बदलता है (CAT डायरेक्ट render नहीं हो सकता) |
-| PTRCAT([x]) unwrap | `pm_render` | सिंगल-एलिमेंट PTRCAT wrappers हटाता है |
-| CAST/BITCAST से GEP | `gep_pushing_patterns()` | बेहतर ऑप्टिमाइज़ेशन के लिए type casts से GEP गुज़ारता है |
-| Image dtype guard | `pm_add_loads()` | Image dtype के लिए LOAD wrapping स्किप करता है (codegen में हैंडल होता है) |
+| `uint8` के ज़रिए bool storage | `bool_storage_patterns()` in `devectorize.rs` | LLVM का `i1` ऊपरी bits में कचरा रख सकता है, इसलिए bool LOAD/STORE `uint8` से होकर जाते हैं |
+| Wide-float demotion | `demote_unsupported_floats()` in `late/dtype.rs` | जिन renderers में wide float नहीं (Metal, WebGPU) वे internal f64 को f32 में कम्प्यूट करते हैं |
 
 ---
 
@@ -234,13 +235,12 @@ Svod में कुछ patterns/एनहैंसमेंट हैं ज�
 | **AxisType** | लूप कैसे एक्ज़ीक्यूट होता है | Global=पैरेलल, Reduce=accumulate |
 | **Buffer** | डेटा रखने वाली एलोकेटेड मेमोरी | Tensor का डेटा बफ़र में रहता है |
 | **Bufferize** | ऑन-डिमांड कम्प्यूट के बजाय रिज़ल्ट मेमोरी में स्टोर करें | इंटरमीडिएट वैल्यू मटेरियलाइज़ करें |
-| **CONTRACT** | कई वैल्यूज़ को एक वेक्टर में जोड़ें | `[a, b, c, d] → vec4(a,b,c,d)` |
 | **Devectorize** | हार्डवेयर मैच करने के लिए वेक्टर स्प्लिट करें | `vec8 → vec4, vec4` |
 | **Divmod** | Division और remainder ऑपरेशन | `x // 7, x % 7` |
 | **Fixpoint** | जब patterns अप्लाई करने से कुछ न बदले | Patterns fixpoint तक चलते हैं |
-| **GEP** | Get Element Pointer — indices से address कैलकुलेट करें | `arr[i][j] → base + i*stride + j` |
+| **STACK** | Lanes को एक shaped वैल्यू में इकट्ठा करें (Tinygrad का VECTORIZE) | `STACK(a, b, c, d)` |
 | **Hash consing** | identical एक्सप्रेशन रीयूज़ करें | `ADD(x, 0) + ADD(x, 0)` मेमोरी शेयर करता है |
-| **Index** | Array indices के लिए integer type | i32 या i64, डिवाइस पर निर्भर |
+| **WeakInt** | Indices के लिए abstract integer type, Stage 15 पर लोअर होता है | i32 या i64, proven bounds पर निर्भर |
 | **Load** | मेमोरी से रीड | `value = arr[i]` |
 | **Pattern** | कोड के लिए find-and-replace नियम | `ADD(x, 0) → x` |
 | **Predicated store** | कंडीशनली मेमोरी में लिखें | valid हो तो लिखो वरना स्किप |
@@ -248,9 +248,9 @@ Svod में कुछ patterns/एनहैंसमेंट हैं ज�
 | **Reduction** | कई वैल्यूज़ को एक में जोड़ें | Sum, max, min |
 | **Store** | मेमोरी में लिखें | `arr[i] = value` |
 | **Symbolic** | अलजेब्रा नियमों से सिम्प्लीफ़ाई करें | `(x/4)*4 → x` (जब `x%4=0`) |
-| **Tensor core** | फ़ास्ट मैट्रिक्स मल्टीप्लाई के लिए हार्डवेयर | केवल NVIDIA GPUs |
+| **Tensor core** | फ़ास्ट मैट्रिक्स मल्टीप्लाई के लिए हार्डवेयर | NVIDIA, AMD, Apple Metal, Intel Xe |
 | **Topological sort** | डिपेंडेंसी respect करते हुए नोड्स ऑर्डर करें | A, B से पहले अगर B को A का रिज़ल्ट चाहिए |
-| **UNROLL** | एक op को कई पोज़िशन में एक्सपैंड करें | `x → [x_0, x_1, x_2, x_3]` |
-| **UPCAST** | वेक्टराइज़ करने का इंटेंट मार्क करें | `RANGE(0..4, UPCAST)` |
+| **UNROLL** | Axis type जो लूप को अनरोल करने का निशान है | `RANGE(0..4, Unroll)` |
+| **UPCAST** | Axis type जो वेक्टराइज़ करने का इंटेंट मार्क करता है | `RANGE(0..4, Upcast)` |
 | **Vectorize** | कई वैल्यूज़ को एक साथ प्रोसेस करें | SIMD: एक बार में 4 नंबर जोड़ें |
-| **WHERE** | कंडीशनल सिलेक्शन | `WHERE(cond, x, y) = cond true हो तो x वरना y` |
+| **WHERE** | कंडीशनल सिलेक्शन | `WHERE(cond, x, y) = x if cond else y` |

@@ -56,9 +56,9 @@ pub enum Op {
     Range { end: Arc<UOp>, axis_id: AxisId, axis_type: AxisType, deps: SmallVec<[Arc<UOp>; 2]> },
     End { computation: Arc<UOp>, ranges: SmallVec<[Arc<UOp>; 4]> },
 
-    // Memory operations
-    Load { buffer: Arc<UOp>, index: Arc<UOp>, alt: Option<Arc<UOp>> },
-    Store { index: Arc<UOp>, value: Arc<UOp>, ranges: SmallVec<[Arc<UOp>; 4]> },
+    // Memory operations (the buffer is reached through the INDEX, not a field)
+    Load { index: Arc<UOp>, alt: Option<Arc<UOp>>, gate: Option<Arc<UOp>> },
+    Store { index: Arc<UOp>, value: Arc<UOp>, gate: Option<Arc<UOp>> },
 
     // ALU operations (grouped enums with many individual values)
     Binary(BinaryOp, Arc<UOp>, Arc<UOp>),  // Add, Mul, etc.
@@ -76,20 +76,20 @@ Enum содержит ~60 вариантов Op, организованных п
 | **Control** | `RANGE`, `END`, `IF`, `BARRIER` | Структуры циклов и ветвлений |
 | **Memory** | `LOAD`, `STORE`, `INDEX`, `BUFFER` | Доступ к аппаратной памяти |
 | **ALU** | `ADD`, `MUL`, `SQRT`, `EXP`, `WHERE` | Инструкции CPU/GPU |
-| **Advanced** | `WMMA`, `CONTRACT`, `UNROLL` | Tensor cores, векторизация |
+| **Advanced** | `WMMA` | Tensor cores и метаданные их расширения |
 
 При печати UOp-графа видна его древовидная структура:
 
 ```mermaid
 flowchart TD
-  N42["[42] STORE : Void"] --> N35["[35] INDEX : Ptr(Float32)"]
-  N42 --> N40["[40] REDUCE(Add) : Float32"]
-  N42 --> N30["[30] RANGE(axis=0, Reduce) : Index"]
-  N35 --> N10["[10] DEFINE_GLOBAL(0) : Ptr(Float32)"]
-  N35 --> N30
-  N30 --> N5["[5] CONST(4) : Index"]
+  N42["[42] STORE : Void"] --> N35["[35] INDEX : Float32"]
+  N42 --> N40["[40] REDUCE(Add, num_axes=1) : Float32"]
+  N35 --> N10["[10] PARAM(slot=0) : Float32"]
+  N35 --> N31["[31] RANGE(R0, Global) : Index"]
+  N31 --> N5["[5] CONST(4) : Index"]
   N40 --> N38["[38] MUL : Float32"]
-  N40 --> N30
+  N40 --> N30["[30] RANGE(R1, Reduce) : Index"]
+  N30 --> N5
   N38 --> N36["[36] LOAD : Float32"]
   N38 --> N37["[37] LOAD : Float32"]
 ```
@@ -103,13 +103,13 @@ flowchart TD
 Когда вы создаёте одно и то же выражение дважды в Svod, вы получаете *тот же указатель*. Не равные значения — один и тот же адрес в памяти.
 
 ```rust
-let a = UOp::binary(Add, x.clone(), y.clone());
-let b = UOp::binary(Add, x.clone(), y.clone());
+let a = x.try_add(&y)?;
+let b = x.try_add(&y)?;
 
 assert!(Arc::ptr_eq(&a, &b));  // Same pointer!
 ```
 
-:::note Происхождение — часть идентичности узла
+:::note[Происхождение — часть идентичности узла]
 При `SVOD_ORIGIN=1` узел дополнительно несёт `OriginScope`, в котором его построили, и это
 происхождение входит в его content-хеш. Два идентичных подграфа, построенных в разных
 скоупах, оказываются *разными* узлами и не склеиваются, пока разрез на ядра не снимет
@@ -179,7 +179,8 @@ flowchart TD
 
 | AxisType | CPU | CUDA | Смысл |
 |----------|-----|------|-------|
-| **Loop** | `for`-цикл | `for`-цикл | Последовательная итерация; default после rangeify |
+| **Weak** | `for`-цикл | `for`-цикл | Непараллелизованный range; default после rangeify |
+| **Loop** | `for`-цикл | `for`-цикл | Явный обычный цикл |
 | **Global** | Thread pool | `blockIdx` | Внешняя параллельная размерность |
 | **Thread** | Thread pool | — | CPU-параллелизм |
 | **Warp** | (N/A) | warp/wavefront | Субгрупповой параллелизм |
@@ -189,7 +190,7 @@ flowchart TD
 | **Reduce** | Аккумулятор | Warp reduce | Размерность редукции |
 | **Unroll** | Развёрнутый | Развёрнутый | Развёртка цикла |
 
-Иерархия AxisType (Loop → Global/Thread → Warp → Local/GroupReduce → Upcast → Reduce → Unroll) отображается на аппаратные модели выполнения — у внешних циклов меньший приоритет. `RANGE` с `AxisType::Global` становится `blockIdx.x` в CUDA. `RANGE` с `AxisType::Local` становится `threadIdx.x`.
+Иерархия AxisType (Weak/Loop → Global/Thread → Warp → Local/GroupReduce → Upcast → Reduce → Unroll) отображается на аппаратные модели выполнения — у внешних циклов меньший приоритет. `RANGE` с `AxisType::Global` становится `blockIdx.x` в CUDA. `RANGE` с `AxisType::Local` становится `threadIdx.x`.
 
 Почему явные циклы важны:
 
@@ -216,8 +217,8 @@ patterns! {
     Add(a @const(a_val), _b @const(b_val))
         => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 
-    // Self-folding: x / x → 1
-    Idiv(x, x) => UOp::one(x.dtype()),
+    // Self-folding: x // x → 1
+    FloorDiv(x, x) => 1.into_uop(x.dtype()),
 
     // Dead code: if(true) { x } else { y } → x
     Where(Const(ConstValue::Bool(true)), t, _f) => t,
@@ -280,11 +281,9 @@ flowchart TD
 flowchart TD
   STORE["STORE"] --> IDXC["INDEX"]
   STORE --> RED["REDUCE(Add)"]
-  STORE --> RJ["RANGE(j, Global) j in [0, 4)"]
-  STORE --> RI["RANGE(i, Global) i in [0, 4)"]
-  IDXC --> DG["DEFINE_GLOBAL(C)"]
-  IDXC --> RI
-  IDXC --> RJ
+  IDXC --> DG["PARAM(C)"]
+  IDXC --> RI["RANGE(i, Global) i in [0, 4)"]
+  IDXC --> RJ["RANGE(j, Global) j in [0, 4)"]
   RED --> MUL["MUL"]
   RED --> RK["RANGE(k, Reduce) k in [0, 4)"]
   MUL --> LA["LOAD(A)"]

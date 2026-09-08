@@ -11,7 +11,7 @@ Svod source: `schedule/src/rangeify/patterns.rs` (late decomposition group) + `s
 
 *इस पेज में cycle estimates approximate हैं modern x86-64 के लिए। Actual latencies microarchitecture और pipeline state से vary करती हैं।*
 
-सभी पैटर्न `symbolic_simple()` (algebraic cleanup) और `pm_render()` (CONST vectorization, CAT-to-VECTORIZE) के साथ single fixed-point rewrite pass (`PM_FINAL`) में combine होते हैं।
+सभी पैटर्न `symbolic_simple()` (algebraic cleanup) के साथ single fixed-point rewrite pass (`PM_FINAL`) में combine होते हैं।
 
 ---
 
@@ -29,7 +29,7 @@ Modulo optimization काम करता है क्योंकि `2^n - 1
 
 Tinygrad: `decompositions.py:448-454`। Svod: `pm_mod_to_and`, `pm_mul_to_shl`, `pm_div_to_shr` in `rangeify/patterns.rs`।
 
-:::caution Signed Division
+:::caution[Signed Division]
 Signed integers के लिए, `x // 2^n` simply `x >> n` **नहीं** है। Arithmetic right shift negative infinity की तरफ़ round करता है, लेकिन integer division zero की तरफ़।
 
 Fix: `(x + (x < 0 ? 2^n - 1 : 0)) >> n`
@@ -167,7 +167,7 @@ float result = x * 0.31831f;  // 1/pi
 
 **Late apply क्यों**: Earlier passes को `Add(Mul(a, b), c)` structure algebraic simplification के लिए देखना चाहिए। अगर early fuse हो तो `(x*2 + x*3)` जैसे पैटर्न `x*5` में simplify नहीं कर पाते क्योंकि `Mul` nodes MULACC के अंदर buried हो जाते।
 
-**Shift-add fusion (सिर्फ़ Tinygrad)**: Tinygrad `(x << n) + c` को भी `MULACC(x, 2^n, c)` में fuse करता है, ऐसे cases पकड़ता है जहाँ MUL-to-SHL same fixed-point pass में पहले चल गया। यह पैटर्न Svod में अभी port नहीं हुआ।
+**Shift-add fusion**: `(x << n) + c` भी `MULACC(x, 2^n, c)` में fuse होता है, ऐसे cases पकड़ता है जहाँ MUL-to-SHL same fixed-point pass में पहले चल गया। जब renderer `MulAcc` और `Shl` दोनों सपोर्ट करता है, Svod `pm_shl_add_to_mulacc` को `pm_fma_decomposition` के साथ जोड़ देता है।
 
 **Guards**: सिर्फ़ तभी match जब तीनों operands (`a`, `b`, `c`) same float dtype share करें। Integer FMA fuse नहीं होता क्योंकि hardware FMA instructions सिर्फ़ float हैं।
 
@@ -199,7 +199,7 @@ Integers पर negated और compound comparisons के late rewrites। य�
 
 Range compression (row 3) particularly valuable है। जब open interval `(c1, c2)` exactly एक integer value contain करे, दो comparisons और logical AND single equality check में collapse हों। यह tiled index calculations में naturally arise होता है जहाँ range variable exactly एक tile select करता है।
 
-:::caution Constants में Integer Overflow
+:::caution[Constants में Integer Overflow]
 Negation patterns overflow guard करते हैं: `!(x < c)` बनता है `(c-1) < x` सिर्फ़ अगर `c-1` underflow न करे, और `!(c < x)` बनता है `x < (c+1)` सिर्फ़ अगर `c+1` overflow न करे। दोनों `checked_sub` / `checked_add` इस्तेमाल करते हैं और overflow पर `None` (कोई transformation नहीं) return करते हैं।
 :::
 
@@ -247,24 +247,27 @@ Svod: `pm_erf_decomposition` in `rangeify/patterns.rs`।
 सभी strength reduction patterns single `PM_FINAL` matcher में compose होते हैं जो fixed-point graph rewrite के रूप में चलता है:
 
 ```
-PM_FINAL = symbolic_simple() + get_late_rewrite_patterns() + pm_render()
+PM_FINAL = pm_commit_weak() + pm_cast_weak() + pm_decomp
+         + renderer.extra_matcher()   -- optional, per-backend
+         + pm_split_ends()
 ```
 
-जहाँ `get_late_rewrite_patterns()` combine करता है:
+जहाँ `pm_decomp` early decompositions (जो खुद `symbolic_simple()` से शुरू होती हैं), transcendental decompositions और `get_late_rewrite_patterns()` को जोड़ता है:
 
 ```
 Stage 18-19 (PM_FINAL fixed-point rewrite):
   symbolic_simple()              -- algebraic cleanup (identities, constant folding)
-  + pm_fma_decomposition         -- a*b+c -> MULACC(a,b,c)
   + pm_erf_decomposition         -- erf(x) -> polynomial approx
   + pm_mod_to_and                -- x % 2^n -> x & (2^n-1)
+  + pm_demorgan                  -- !a & !b -> !(a | b)
   + pm_mul_to_shl                -- x * 2^n -> x << n
   + pm_div_to_shr                -- x // 2^n -> x >> n
-  + pm_fdiv_to_mul               -- x / c -> x * (1/c)
-  + pm_neg_from_mul              -- x * -1 -> NEG(x)
-  + pm_comparison_negations      -- !(x<c) -> (c-1)<x, etc.
   + fast_division_patterns       -- x // d -> (x * M) >> S
-  + pm_render()                  -- CONST vectorization, CAT->VECTORIZE
+  + pm_neg_from_mul              -- x * -1 -> NEG(x)
+  + pm_comparison_negations      -- !(x<c) -> (c-1)<x, आदि
+  + pm_fma_decomposition         -- a*b+c -> MULACC(a,b,c)
+  + pm_shl_add_to_mulacc         -- (x<<n)+c -> MULACC(x, 2^n, c)
+  + pm_fdiv_to_mul               -- x / c -> x * (1/c)
 ```
 
 क्योंकि rewriter fixed point तक चलता है, पैटर्न एक दूसरे को feed कर सकते हैं। जैसे:
@@ -273,6 +276,6 @@ Stage 18-19 (PM_FINAL fixed-point rewrite):
 2. अगली iteration में, `pm_fma_decomposition` `(x << 2) + c` को `MULACC(x, 4, c)` में fuse करता है
 3. `symbolic_simple()` transformations से बनी identities clean up करता है
 
-Fixed-point pass complete होने के बाद, `merge_sibling_ends` चलता है rewriting से बने नए sibling END nodes merge करने के लिए।
+`pm_mod_to_and` के नीचे की हर entry conditional है: `get_late_rewrite_patterns()` उसे तभी जोड़ता है जब renderer उन ops का सपोर्ट declare करे जो वह पैटर्न पैदा करता है (shift rewrites के लिए `Shl`, FMA fusions के लिए `MulAcc`, reciprocal rewrite के लिए `Fdiv`)। `pm_split_ends` उसी fixed point के अंदर चलता है और linearizer के लिए मल्टी-रेंज END को nested सिंगल-रेंज END में बाँटता है; इसके बाद आख़िरी `pm_remove_invalid()` rewrite बचे हुए Invalid markers हटा देता है।
 
 Cross-reference: [Codegen Pipeline Overview](../codegen/overview.md) full stage listing के लिए।

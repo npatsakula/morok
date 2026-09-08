@@ -5,9 +5,9 @@ sidebar_label: JIT Graphs
 # JIT Graphs
 
 A streaming ASR pipeline calls the same encoder hundreds of times. Building
-the tensor graph, optimizing it, generating kernel source, compiling it with
-[clang](../backends/jit-loader.md), and allocating device buffers on every call wastes
-work that does not depend on the input.
+the tensor graph, optimizing it, generating kernel source, compiling it through
+the backend's [JIT loader](../backends/jit-loader.md), and allocating device buffers on
+every call wastes work that does not depend on the input.
 
 The `jit_wrapper!` macro and the `model::jit` runtime layer turn that
 build-once / run-many pattern into **a typed Rust struct**. You declare the
@@ -20,14 +20,14 @@ flowchart TD
   subgraph WO["Without the wrapper (every call)"]
     WO1["build graph"] --> WO2["optimize patterns"]
     WO2 --> WO3["generate kernels"]
-    WO3 --> WO4["compile (clang)"]
+    WO3 --> WO4["compile kernels"]
     WO4 --> WO5["alloc buffers"]
     WO5 --> WO6["execute"]
   end
   subgraph WP["With the wrapper (prepare() once)"]
     WP1["build graph"] --> WP2["optimize patterns"]
     WP2 --> WP3["generate kernels"]
-    WP3 --> WP4["compile (clang)"]
+    WP3 --> WP4["compile kernels"]
     WP4 --> WP5["alloc buffers"]
   end
   subgraph WS["Every step"]
@@ -71,18 +71,26 @@ jit_wrapper! {
 | Section | Meaning | Required |
 |---|---|---|
 | `WrapperName(ModelType) { ... }` | name of the generated struct and the type of the model the build closure receives | yes |
-| `input_name: Tensor` lines | one per input the wrapper exposes; the `: Tensor` annotation is informational | one or more |
+| `input_name: Tensor` lines | one per input the wrapper exposes; the `: Tensor` annotation is informational | optional (usually one or more) |
 | `vars { name: (min, max), ... }` | symbolic shape variables with compile-time bounds | optional |
+| `outputs { name, ... }` | one named buffer accessor per output; the `build` closure then returns a tuple of that many tensors, in this order | optional |
 | `build(args...) { ... }` | closure that builds the output tensor from inputs and vars; `model` is in scope | yes |
 
 The `build` arguments must each name either an input or a declared var (the
 macro rejects names that don't match at expansion time). Inside the block,
 each input is a `&Tensor` (the macro allocates a zero-initialized placeholder
-when `prepare()` runs), each var is a `svod_tensor::Variable` already bound
-to its upper bound, and `model` is a shared reference to the wrapper's owned
-model value. The closure returns `Result<Tensor, E>` for any
-`E: std::error::Error + Send + Sync + 'static`; failures surface as
-`JitError::Build`.
+when `prepare()` runs), each var is a `svod_tensor::BoundVariable` already
+bound to its upper bound — pass it on as `&name` — and `model` is a shared
+reference to the wrapper's owned model value. The closure returns
+`Result<Tensor, E>` for any `E: std::error::Error + Send + Sync + 'static`;
+failures surface as `JitError::Build`.
+
+Without an `outputs` block the closure returns a single `Tensor`, reachable
+through `output()`. With one, it returns a tuple of exactly that many tensors
+and each gets its own named `&Buffer` accessor, positioned by declaration
+order. If the scheduler fused or elided one of them the positional accessors
+would silently misalign, so `prepare()` fails with
+`JitError::OutputCountMismatch` instead.
 
 ---
 
@@ -116,8 +124,11 @@ At execute time, pass actual values through `execute_with_vars`:
 jit.execute_with_vars(&[("b", batch as i64), ("t", time as i64)])?;
 ```
 
-Each pair binds one var; vars not listed keep the value they were bound to at
-`prepare()` (their upper bound).
+Each pair binds one var; vars not listed keep whatever they hold — their
+`prepare()`-time upper bound, or the value a previous `execute_with_vars` left
+them at. Bindings are sticky, not per-call. A value outside the var's declared
+`[min, max]` is an out-of-bounds access rather than an error: buffers are
+allocated to `max`.
 
 ---
 
@@ -136,6 +147,9 @@ The macro emits one method group per phase of the wrapper's life cycle:
 | `execute() -> Result<()>` | per step | replay with current input buffers |
 | `execute_with_vars(&[(name, value)]) -> Result<()>` | per step | replay and rebind one or more symbolic variables |
 | `execute_profiled` / `execute_with_vars_profiled` | optional | same as the non-profiled variants but return `Vec<KernelProfile>` |
+| `execute_profiled_static()` | optional | one profiled run through `ExecutionPlan::profile`, returning the last stage's kernels |
+| `copy_output_to_<input>(out_pos, dst_off, src_off, len)` | per step | on-device copy of an output region back into an input buffer; no host round-trip |
+| `replicate() -> Result<Self>` | optional | deep-copy a prepared JIT for concurrent execution: forked buffers, shared model and kernels, its own queue |
 
 Four lower-level accessors expose plan details for tooling:
 
@@ -159,6 +173,8 @@ returns `JitError::NotPrepared`.
 pub struct InputSpec {
     pub shape: Vec<usize>,
     pub dtype: DType,
+    /// Allocate the input device-local (no host mapping).
+    pub device_local: bool,
 }
 
 impl InputSpec {
@@ -166,6 +182,7 @@ impl InputSpec {
     pub fn f32(shape: &[usize]) -> Self { ... }
     pub fn i32(shape: &[usize]) -> Self { ... }
     pub fn i64(shape: &[usize]) -> Self { ... }
+    pub fn device_local(mut self) -> Self { ... }
 }
 ```
 
@@ -174,7 +191,9 @@ tensor before invoking the build closure. Callers do not construct
 `Tensor::zeros(...).realize()` placeholders themselves. The shape becomes the
 maximum input size; symbolic variables shrink it at execute time through
 operations like `try_shrink` — a coding pattern, not a runtime contract
-enforced by the wrapper.
+enforced by the wrapper. `device_local()` drops the host mapping for inputs the
+host only writes through `copyin` or refills on-device — recurrent state the
+host never needs to observe per step.
 
 ---
 
@@ -198,12 +217,12 @@ pub trait RecurrentJit {
 }
 ```
 
-:::tip Output layout contract
+:::tip[Output layout contract]
 The JIT's output buffer must be a flat `f32` block of `[head | h_flat | c_flat]`
 along the last axis, where `h_flat` and `c_flat` each have length
-`state.h.len()` and `state.c.len()` respectively. `JitRecurrent::new` reads
-the output buffer once at construction, checks the element count against the
-declared head plus state size, and returns `JitError::OutputLayoutMismatch`
+`state.h.len()` and `state.c.len()` respectively. `JitRecurrent::new` checks
+the output buffer's size once at construction against the declared head plus
+state size, and returns `JitError::OutputLayoutMismatch`
 if the math does not match. This catches build-closure drift at construction
 time rather than letting a silent mis-split corrupt downstream values.
 :::
@@ -226,8 +245,9 @@ sequence. `last_timing` exposes the most recent per-step `pack` / `exec` /
 
 ## Example: GigaAM encoder
 
-The GigaAM Conformer encoder runs at variable batch size and time length.
-Both bounds are symbolic so a single prepared plan serves every audio chunk:
+The GigaAM Conformer encoder is prepared at constant shape. The batch and
+mel-frame bounds are computed once at construction and baked into the plan;
+shorter chunks are zero-padded into the same buffers:
 
 ```rust
 jit_wrapper! {
@@ -235,26 +255,26 @@ jit_wrapper! {
         mel: Tensor,
         lengths: Tensor,
 
-        vars {
-            b: (1, model.config.max_batch_size),
-            t: (1, model.config.max_mel_frames),
-        }
-
-        build(mel, lengths, b, t) {
-            let out = model.encoder.forward_batch(mel, lengths, &b, &t)?;
-            out.cast(svod_dtype::DType::Float32).context(TensorSnafu)
+        build(mel, lengths) {
+            let out = model.encoder.forward_batch(mel, lengths)?;
+            // Permute [B, d_model, T_sub] → [B, T_sub, d_model] on-device: the
+            // RN-T decoder consumes frame-major rows, and doing it here turns
+            // a host-side strided transpose into one contiguous copyout.
+            out.cast(svod_dtype::DType::Float32).context(TensorSnafu)?
+                .try_permute(&[0, 2, 1]).context(TensorSnafu)
         }
     }
 }
 ```
 
 The wrapper takes a mel-spectrogram input and a per-batch length vector and
-produces the encoded output tensor `[B, d_model, T_sub]`. The `b` and `t`
-vars are bound to their upper bounds at `prepare()`, then rebound per batch
-through `execute_with_vars(&[("b", batch_size as i64), ("t", mel_frames as
-i64)])`.
+produces `[B, T_sub, d_model]`. `GigaAmTranscriber` sizes the plan once: the
+mel length is rounded up to the next power of two so codegen sees a clean
+factorisation and clamped to `config.max_mel_frames`, and the batch is capped so
+the live SDPA score tiles stay inside `max_scores_mib`. Every chunk then
+replays the same plan through `execute()`.
 
-The trailing `out.cast(DType::Float32)` is the fp32 boundary between the
+The `out.cast(DType::Float32)` is the fp32 boundary between the
 encoder and any downstream head. The encoder may run in fp16 or bf16 for
 speed, but every consumer (CTC log-softmax, RN-T predictor and joint) sees a
 uniform fp32 input. Placing the cast inside the JIT lets it fuse into the
@@ -264,63 +284,42 @@ encoder's tail kernels.
 
 ## Example: Silero VAD
 
-The Silero VAD model is a recurrent network that emits one speech probability
-per chunk and an updated LSTM state. The JIT exposes the audio chunk plus the
-two state tensors as inputs and concatenates `[prob | new_h | new_c]` as its
-output:
+Silero V5 is a recurrent network, but its recurrence is far too small to pay
+for a launch per window. The JIT therefore covers only the batched conv
+front-end plus the LSTM input projection; the scan itself stays on the host:
 
 ```rust
 jit_wrapper! {
-    SileroVadJit(SileroVad) {
-        chunk: Tensor,
-        state_h: Tensor,
-        state_c: Tensor,
+    SileroVadFeatureJit(SileroVad) {
+        chunks: Tensor,
 
-        build(chunk, state_h, state_c) {
-            model.forward_chunk(chunk, state_h, state_c)
+        build(chunks) {
+            // [FEATURE_BATCH, CHUNK_LEN] -> [FEATURE_BATCH, 4*HIDDEN] LSTM gate
+            // pre-activations (conv features + input projection, biases folded).
+            model.forward_gates(chunks)
         }
     }
 }
 ```
 
-`forward_chunk` ends with `Tensor::cat(&[&prob, &new_h, &new_c], 1)`, the
-layout the recurrent wrapper expects. The `RecurrentJit` impl maps the trait
-methods directly onto the macro-generated accessors:
+The leading dimension is a fixed `FEATURE_BATCH` (4096) rather than a var: the
+front-end is row-independent, so a partial batch simply fills fewer rows, and a
+symbolic leading dim trips the reflect-pad lowering. Preparation asks for a
+device-local output, because the 8 MiB gate readback belongs on the copy engine
+rather than the host mapping:
 
 ```rust
-impl RecurrentJit for SileroVadJit {
-    fn pack_state(&mut self, s: &LstmState) -> Result<()> {
-        // copy s.h into state_h_mut, s.c into state_c_mut
-    }
-    fn execute_step(&mut self) -> Result<()> { self.execute() }
-    fn output_buffer(&self) -> Result<&Buffer> { self.output() }
-}
+let mut jit = SileroVadFeatureJit::new(vad);
+let mut config = svod_tensor::PrepareConfig::from_env();
+config.device_local_outputs = true;
+jit.prepare_with_config(InputSpec::f32(&[FEATURE_BATCH, CHUNK_LEN]), &config)?;
 ```
 
-Construction prepares the JIT once and wraps it together with the host state:
-
-```rust
-let mut jit = SileroVadJit::new(vad);
-jit.prepare(
-    InputSpec::f32(&[1, CHUNK_LEN]),
-    InputSpec::f32(&[1, HIDDEN]),
-    InputSpec::f32(&[1, HIDDEN]),
-)?;
-let inner = JitRecurrent::new(jit, LstmState::zeros(HIDDEN), 1)?;
-```
-
-The `1` head length is the single speech-probability scalar. The
-`LstmState::zeros(HIDDEN)` allocates `h` and `c` of length `HIDDEN`, so the
-output layout check verifies the JIT output is exactly `1 + HIDDEN + HIDDEN`
-`f32` elements. Per-chunk processing then becomes:
-
-```rust
-let prob = inner.step(|jit| {
-    let buf = jit.chunk_mut()?;
-    // copy audio samples into buf
-    Ok(())
-})?;
-```
+`VadInference::probs` then walks the waveform in `FEATURE_BATCH`-sized
+dispatches — pack `chunks_mut()`, `execute()`, `copyout_prefix` the valid rows
+— and hands the gates to `VadHead::scan`, an 8-lane `f32x8` LSTM plus sigmoid
+head on the host. That split replaced a one-tiny-dispatch-per-window path whose
+round-trip latency dominated the whole model.
 
 ---
 
@@ -333,7 +332,7 @@ symbolic vars (via `execute_with_vars`). A branch on a tensor value inside
 the build closure specializes the graph to that branch; this is a build-time
 decision, not a runtime one.
 
-:::note Pitfalls
+:::note[Pitfalls]
 - A `Tensor::full(value).realize()` inside the build closure bakes that value
   into the single prepared plan. Any per-call variation requires re-running
   `prepare()` from scratch — full graph build plus kernel compile. Host-side
@@ -341,8 +340,8 @@ decision, not a runtime one.
   per-step setup that the JIT does not need to see.
 - The idiomatic way to handle dynamic shape inside the JIT is `try_shrink`
   on a maximum-sized input with a var-bound length, paired with
-  `execute_with_vars` at the call site. The CTC head and the encoder both
-  use this pattern.
+  `execute_with_vars` at the call site. ResNet and YOLO both shrink the batch
+  dimension this way.
 :::
 
 Violating the contract produces one of two failure modes: wrong results,
@@ -363,10 +362,12 @@ unrecoverable and indicate a usage bug rather than a transient condition.
 | `NotPrepared` | per-step method called before `prepare`, or output buffer unavailable |
 | `InputBufferNotFound` | input index resolution failed inside the prepared plan |
 | `DuplicateInputBuffer` | two declared inputs map to the same device buffer at `prepare` time |
-| `Build` | the build closure returned `Err`; the inner error is preserved as `Box<dyn Error>` |
+| `InputAliased` | an input resolved to a foreign plan buffer — a concurrent `prepare` corrupted its graph identity |
+| `Build` | the build closure returned `Err`; the inner error is preserved as `Box<dyn Error + Send + Sync>` |
 | `Tensor` | tensor op failed during `prepare` or in the build closure |
 | `Device` | a device or buffer operation failed |
 | `OutputLayoutMismatch` | `JitRecurrent::new` saw an output element count different from the declared head plus state size |
+| `OutputCountMismatch` | a multi-output wrapper declared N outputs but the compiled plan kept a different number |
 | `Runtime` | kernel execution failed |
 
 Configuration mistakes on the symbolic-variable setters (`with_<var>_*`)
@@ -377,9 +378,10 @@ before any plan exists.
 
 ## Why this matters
 
-**Lifecycle is typed.** `prepare` is the only way to move into the prepared
-state; the per-step accessors are the only way out. The compiler enforces
-the order.
+**Lifecycle is explicit.** `prepare` is the only way into the prepared state,
+and every per-step accessor goes through it. The wrapper holds the plan behind
+an `Option`, so calling out of order fails immediately with
+`JitError::NotPrepared` rather than reading a half-built plan.
 
 **Replay is cheap.** One graph build, one kernel compile, one set of
 allocations — paid once. Every subsequent call is buffer writes plus an
