@@ -39,7 +39,9 @@ Range {
 | Тип | Приоритет | GPU-маппинг | Назначение |
 |-----|-----------|-------------|------------|
 | `Placeholder` | -3 | — | Временный канонический range, используемый при кэшировании RESHAPE |
-| `Loop` | -1 | цикл `for` | Range по умолчанию после rangeify; обёртки уровня schedule структурно соединены парой `END(Call)` |
+| `Device` | -2 | — | Ось выбора устройства, привязывается по устройству при запуске |
+| `Weak` | -1 | цикл `for` | Непараллелизованный range, порождаемый rangeify |
+| `Loop` | -1 | цикл `for` | Явный обычный цикл; обёртки уровня schedule структурно соединены парой `END(Call)` |
 | `Global` | 0 | `blockIdx` | Параллелизм по гриду |
 | `Thread` | 0 | пул потоков | CPU-параллелизм |
 | `Warp` | 1 | warp/wavefront | Субгрупповой параллелизм |
@@ -109,6 +111,7 @@ Reduce {
     src: Arc<UOp>,                      // value to accumulate
     ranges: SmallVec<[Arc<UOp>; 4]>,    // ranges being reduced
     reduce_op: ReduceOp,                // Add, Mul, Max, Min
+    num_axes: usize,                    // reduced axes of the shaped source
 }
 ```
 
@@ -140,7 +143,7 @@ flowchart TD
 ```rust
 AllReduce {
     src: Arc<UOp>,           // local partial result
-    device: Arc<UOp>,        // device specification
+    device: DeviceSpec,      // device specification
     reduce_op: ReduceOp,     // reduction operation
 }
 ```
@@ -155,21 +158,20 @@ AllReduce {
 
 ```rust
 Buffer {
-    unique: Arc<UOp>,        // UNIQUE op for identity
-    device: Arc<UOp>,        // DEVICE op
-    size: usize,             // total element count
+    shape: Arc<UOp>,         // flat storage shape (one element count)
+    arg: Box<ParamArg>,      // slot, dtype, address space, device
 }
 ```
 
-Объявляет буфер для хранения данных тензора. Поле `unique` гарантирует различимость буферов даже при одинаковых размере и устройстве.
+Объявляет буфер для хранения данных тензора. Поле `arg.slot` гарантирует различимость буферов даже при одинаковых размере и устройстве. Поле `arg.addrspace` выбирает память, в которой живёт буфер: `Global` — память устройства, `Local` — разделяемая память GPU (LDS), `Reg` — регистровая/скретч-аллокация.
 
-### BUFFERIZE — маркер материализации
+### STAGE — маркер материализации
 
 ```rust
-Bufferize {
+Stage {
     compute: Arc<UOp>,                  // computation to materialize
     ranges: SmallVec<[Arc<UOp>; 4]>,    // output dimensions
-    opts: BufferizeOpts,                // address space, device
+    opts: Box<BufferizeOpts>,           // address space, device
 }
 ```
 
@@ -180,13 +182,14 @@ Bufferize {
 | Поле | Тип | Назначение |
 |------|-----|------------|
 | `device` | `Option<DeviceSpec>` | Целевое устройство, `None` для локального |
+| `local_axis` | `Option<AxisId>` | Ось `GroupReduce`, которой принадлежит LOCAL-буфер стадирования |
 | `addrspace` | `AddrSpace` | `Global` (устройство) или `Local` (shared) |
-| `removable` | `bool` | При `false` `buffer_removal` не имеет права инлайнить эту BUFFERIZE — используется на границах realize с несколькими потребителями, чтобы буфер сохранялся между итерациями фикспоинта мега-прохода |
+| `removable` | `bool` | При `false` `buffer_removal` не имеет права инлайнить эту STAGE — используется на границах realize с несколькими потребителями, чтобы буфер сохранялся между итерациями фикспоинта мега-прохода |
 
 **Пример:**
 ```mermaid
 flowchart TD
-  BZ["BUFFERIZE(opts=(addrspace=Global))"] -->|"computation"| RED["REDUCE(Add, ...)"]
+  BZ["STAGE(opts=(addrspace=Global))"] -->|"computation"| RED["REDUCE(Add, ...)"]
   BZ -->|"output dim 0"| R0["RANGE(R0, Global)"]
   BZ -->|"output dim 1"| R1["RANGE(R1, Global)"]
 ```
@@ -195,13 +198,12 @@ flowchart TD
 
 ```rust
 Index {
-    buffer: Arc<UOp>,                   // BUFFER or PARAM
+    buffer: Arc<UOp>,                   // BUFFER, PARAM or STACK
     indices: SmallVec<[Arc<UOp>; 4]>,   // index per dimension
-    gate: Option<Arc<UOp>>,             // optional predicate
 }
 ```
 
-Вычисляет адрес в памяти из многомерных индексов. Возвращает DType элемента (не указатель).
+Вычисляет адрес в памяти из многомерных индексов. Возвращает DType элемента (не указатель). Индекс можно сделать условным через `idx.valid(cond)`, что оборачивает его в `WHERE(cond, idx, INVALID)`. INDEX над `STACK` выбирает не адрес, а полосу: константный скалярный индекс сворачивается прямо в соответствующий источник стека.
 
 **Пример:**
 ```mermaid
@@ -212,37 +214,23 @@ flowchart TD
   IDX -->|"index for dim 2"| M["MUL(...)"]
 ```
 
-### POINTER_INDEX — низкоуровневая арифметика указателей
-
-```rust
-PointerIndex {
-    ptr: Arc<UOp>,           // base pointer
-    offset: Arc<UOp>,        // byte offset
-}
-```
-
-Прямая арифметика указателей. Используется после линеаризации, когда индексы уже свёрнуты в линейные.
-
-> **Совместимость:** Tinygrad использует `INDEX` с флагом `ptr=True` вместо отдельной операции.
-
 ### LOAD — чтение из памяти
 
 ```rust
 Load {
-    buffer: Arc<UOp>,        // buffer or pointer
-    index: Arc<UOp>,         // INDEX op
+    index: Arc<UOp>,         // INDEX op (buffer accessed via the INDEX)
     alt: Option<Arc<UOp>>,   // alternative value for gated loads
+    gate: Option<Arc<UOp>>,  // predicate for gated loads
 }
 ```
 
-Читает значение из буфера по индексу. Для gated loads поле `alt` задаёт значение при ложном условии INDEX-а (позволяет полностью избежать обращения к памяти).
+Читает значение из буфера по индексу; отдельного поля `buffer` нет, до буфера добираются через узел INDEX. Для gated loads поле `alt` задаёт значение, когда `gate` ложен (позволяя полностью избежать обращения к памяти). `alt` и `gate` всегда задаются вместе: загрузка несёт либо оба, либо ни одного. Рендерерам нужен одноосевой `INDEX`, поэтому многоиндексные обращения должны быть свёрнуты в один индекс ещё во время rangeify, до того как загрузка дойдёт до кодогенерации.
 
 **Пример:**
 ```mermaid
 flowchart TD
-  L["LOAD : Float32"] --> P1["PARAM(1)"]
-  L --> IDX["INDEX"]
-  IDX --> P1b["PARAM(1)"]
+  L["LOAD : Float32"] --> IDX["INDEX"]
+  IDX --> P1["PARAM(1)"]
   IDX --> R0["RANGE(R0)"]
   IDX --> R2["RANGE(R2)"]
 ```
@@ -253,23 +241,23 @@ flowchart TD
 Store {
     index: Arc<UOp>,                    // INDEX op (buffer accessed via index.src[0])
     value: Arc<UOp>,                    // value to write
-    ranges: SmallVec<[Arc<UOp>; 4]>,    // ranges being closed
+    gate: Option<Arc<UOp>>,             // predicate for gated stores
 }
 ```
 
-Записывает значение в буфер. Буфер доступен через INDEX-узел (через `index.src[0]`), а не через отдельное поле. STORE закрывает указанные RANGE, которые представляют выходные измерения итерации. Поле ranges используется для output upcasting: когда включён `Range(Upcast)`, он становится `UNROLL` при расширении, а затем сжимается через `CONTRACT`.
+Записывает значение в буфер. Буфер доступен через INDEX-узел (через `index.src[0]`), а не через отдельное поле. `UPCAST` и `UNROLL` остаются классификациями осей RANGE во время расширения.
 
-Для условной записи используйте INDEX с gate (у INDEX есть опциональное поле `gate`).
+Для условной записи `store_gated` проставляет `gate`; поднимает gate с адресного выражения на LOAD/STORE именно `pm_move_gates_from_index`.
 
-> **Совместимость:** У STORE в Svod нет отдельного поля `buffer` — источники: index=0, value=1, ranges=2+ (range_start=2). Устройство Tinygrad аналогично.
+> **Совместимость:** У STORE в Svod нет отдельного поля `buffer` — источники: index=0, value=1. В отличие от STAGE или REDUCE, STORE не закрывает RANGE.
 
 **Пример:**
 ```mermaid
 flowchart TD
   ST["STORE"] -->|"write address (buffer via index.src[0])"| IDX["INDEX[R0, R1]"]
   ST -->|"value"| RED["REDUCE(Add, ...)"]
-  ST -->|"output dim 0 (closed)"| R0["RANGE(R0, Global)"]
-  ST -->|"output dim 1 (closed)"| R1["RANGE(R1, Global)"]
+  IDX --> R0["RANGE(R0, Global)"]
+  IDX --> R1["RANGE(R1, Global)"]
 ```
 
 ---
@@ -288,7 +276,7 @@ flowchart TD
 Call {
     body: Arc<UOp>,                     // FUNCTION (или его тело)
     args: SmallVec<[Arc<UOp>; 4]>,      // конкретные значения аргументов
-    info: CallInfo,                     // аннотации (name, origin, ...)
+    info: Box<CallInfo>,                // аннотации (name, origin, ...)
 }
 ```
 
@@ -314,7 +302,7 @@ Call {
 Function {
     body: Arc<UOp>,                     // вычисление
     args: SmallVec<[Arc<UOp>; 4]>,      // формальные параметры
-    info: CallInfo,
+    info: Box<CallInfo>,
 }
 ```
 
@@ -339,7 +327,7 @@ GetTuple { src: Arc<UOp>, index: usize }
 ```rust
 Program {
     sink: Arc<UOp>,                     // корневой SINK
-    device: Arc<UOp>,                   // DEVICE
+    info: Box<ProgramInfo>,             // имя, размеры запуска, слоты ABI, таргет
     linear: Option<Arc<UOp>>,           // LINEAR (после линеаризации)
     source: Option<Arc<UOp>>,           // SOURCE (после рендера)
     binary: Option<Arc<UOp>>,           // PROGRAM_BINARY (после компиляции)
@@ -351,8 +339,8 @@ Program {
 (`do_linearize`/`do_render`/`do_compile`/`get_program`). Каждая стадия
 заполняет следующее поле. Рендерeры C/LLVM ожидают вход `Op::Linear`
 и сообщают `Error::InvalidGraph` через `pending_error` контекста, не падая
-с panic; многоиндексные `INDEX` должны быть приведены к одноиндексным
-через `pm_linearize_multi_index` до рендера.
+с panic; многоиндексный `INDEX`, дошедший до рендерера, отвергается тем же
+способом, так что индексы должны быть заранее свёрнуты в одну ось.
 
 ### LINEAR — линеаризованный поток операций
 
@@ -366,18 +354,23 @@ Linear { ops: SmallVec<[Arc<UOp>; 8]> }
 ### SOURCE / PROGRAM_BINARY — артефакты компиляции
 
 ```rust
-Source { code: String }              // отрендеренный исходник (C / LLVM-IR)
-ProgramBinary { bytes: Vec<u8> }     // скомпилированный артефакт
+Source { code: String, identity: Option<Box<SourceStageIdentity>> }
+ProgramBinary { bytes: Vec<u8>, identity: Option<Box<BinaryStageIdentity>> }
 ```
 
-Терминальные стадии конвейера. Оба — листья (без потомков).
+Терминальные стадии конвейера. Оба — листья (без потомков). Опциональное
+поле `identity` — семантическое доказательство, привязывающее стадию ровно к
+предшествующей ей (`SourceStageIdentity` несёт ABI, таргет, имя точки входа и
+дайджесты LINEAR/SOURCE; `BinaryStageIdentity` оборачивает его ключом
+компилятора и дайджестом бинарника), поэтому закешированный артефакт нельзя
+переиспользовать для изменившегося графа.
 
 ### SINK — коллектор нескольких корней
 
 ```rust
 Sink {
     sources: SmallVec<[Arc<UOp>; 4]>,
-    info: Option<KernelInfo>,           // структурный маркер для AST ядер
+    info: Option<Box<KernelInfo>>,      // структурный маркер для AST ядер
 }
 ```
 
@@ -429,42 +422,38 @@ Barrier {
 
 ## Векторные операции
 
-### VECTORIZE — создание вектора из скаляров
+### STACK — сборка shaped-значения из полос
 
 ```rust
-Vectorize {
-    elements: SmallVec<[Arc<UOp>; 4]>,
+Stack {
+    sources: SmallVec<[Arc<UOp>; 4]>,
 }
 ```
 
-Комбинирует N скалярных значений в вектор размера N. Все элементы должны иметь одинаковый базовый DType.
+Комбинирует N значений в одно shaped-значение из N полос. DType элемента
+остаётся скалярным — число полос несёт сам STACK, а не расширенный DType, —
+а источники приводятся к продвинутому DType при конструировании.
 
 **Пример:**
 ```mermaid
 flowchart TD
-  V["VECTORIZE : 4 x Float32"] --> C1["CONST(1.0)"]
+  V["STACK(len=4) : Float32"] --> C1["CONST(1.0)"]
   V --> C2["CONST(2.0)"]
   V --> C3["CONST(3.0)"]
   V --> C4["CONST(4.0)"]
 ```
 
-### GEP — Get Element Pointer (извлечение из вектора)
+### Выбор полосы — INDEX над STACK
 
-```rust
-Gep {
-    vector: Arc<UOp>,        // source vector
-    indices: Vec<usize>,     // positions to extract
-}
-```
-
-Извлекает элементы из вектора:
-- Один индекс — скаляр
-- Несколько индексов — вектор меньшего размера
+Отдельной операции извлечения нет. `INDEX` выбирает полосу из `STACK` ровно
+так же, как выбирает адрес в буфере, а константный индекс сворачивается
+прямо в соответствующий источник стека при конструировании.
 
 **Пример:**
 ```mermaid
 flowchart TD
-  G["GEP([0, 2]) : 2 x Float32"] --> V["VECTORIZE : 4 x Float32"]
+  G["INDEX : Float32"] --> V["STACK(len=4) : Float32"]
+  G --> C["CONST(2) : Index"]
   V --> E["..."]
 ```
 
@@ -476,71 +465,11 @@ VConst {
 }
 ```
 
-Вектор констант, известных на этапе компиляции. Эффективнее, чем `VECTORIZE` из `CONST`-узлов.
+Вектор констант, известных на этапе компиляции. Эффективнее, чем `STACK` из `CONST`-узлов.
 
-### CAT — конкатенация векторов
-
-```rust
-Cat {
-    sources: SmallVec<[Arc<UOp>; 4]>,
-}
-```
-
-Конкатенирует векторы в вектор большего размера. `vcount` на выходе = сумма `vcount` входов.
-
-**Пример:**
-```mermaid
-flowchart TD
-  CAT["CAT : 8 x Float32"] --> V1["VECTORIZE : 4 x Float32"]
-  CAT --> V2["VECTORIZE : 4 x Float32"]
-```
-
-### PtrCat — конкатенация указателей
-
-```rust
-PtrCat {
-    sources: SmallVec<[Arc<UOp>; 4]>,
-}
-```
-
-Группирует обращения к памяти для векторизованного load/store. Используется проходом devectorizer.
-
----
-
-## Расширение: UNROLL и CONTRACT
-
-### UNROLL — расширение вычисления по итерациям
-
-```rust
-Unroll {
-    src: Arc<UOp>,                       // computation to expand
-    unroll_axes: Vec<(usize, usize)>,    // (axis_index, factor) pairs
-}
-```
-
-Создаёт несколько версий вычисления для разных значений итерации. Используется для оптимизации развёртки циклов.
-
-**Пример:** `UNROLL(unroll_axes=[(0, 4)])` расширяет вычисление 4 раза с разными значениями индекса.
-
-### CONTRACT — свёртка развёрнутых значений в вектор
-
-```rust
-Contract {
-    src: Arc<UOp>,                       // unrolled computation
-    upcast_ranges: Vec<(usize, usize)>,  // (axis_index, factor) pairs
-}
-```
-
-Обратная операция к UNROLL — собирает расширенные скалярные значения в вектор. Размер выходного вектора = произведение множителей.
-
-**Пример:**
-```mermaid
-flowchart TD
-  CT["CONTRACT(upcast_ranges=[(0, 4)]) : 4 x Float32"] --> U["UNROLL(unroll_axes=[(0, 4)])"]
-  U --> L["LOAD(...)"]
-```
-
-Этот паттерн векторизует загрузку: расширить 4 итерации, затем упаковать результаты в 4-элементный вектор.
+Агрегация полос делается через `STACK`; выбор полосы и адреса — через `INDEX`.
+Развёртка цикла представлена `Range` с `AxisType::Unroll`, а не отдельной
+операцией. Оси расширения тензорных ядер живут в `WmmaMetadata`.
 
 ---
 
@@ -552,8 +481,8 @@ flowchart TD
 Wmma {
     a: Arc<UOp>,             // matrix A fragment
     b: Arc<UOp>,             // matrix B fragment
-    c: Arc<UOp>,             // accumulator C fragment
-    metadata: WmmaMetadata,  // hardware configuration
+    c: Arc<UOp>,                 // accumulator C fragment
+    metadata: Box<WmmaMetadata>, // hardware configuration
 }
 ```
 
@@ -569,8 +498,8 @@ Wmma {
 | `dtype_out` | `DType` | Точность выхода (например, `Float32`) |
 | `device` | `RendererDevice` | Рендерер / TC-бэкенд, породивший эту WMMA |
 | `threads` | `usize` | Потоков на warp (обычно 32) |
-| `upcast_axes` | `WmmaUpcastAxes` | Векторизация для каждого операнда (поля: `a`, `b`, `c`) |
-| `reduce_axes` | `Vec<(usize, usize)>` | Оси свёртки |
+| `upcast_axes` | `Option<WmmaUpcastAxes>` | Оси расширения по источникам (поля: `a`, `b`, `c`); очищаются, как только `expander2` придал форму источникам и выходу |
+| `reduce_axes` | `Vec<AxisId>` | Идентификаторы TC-осей редукции, используются как `exclude_args` при расширении |
 
 **Пример:**
 ```mermaid
@@ -615,21 +544,23 @@ flowchart TD
 ### PARAM — параметр буфера
 
 ```rust
-Param { slot: usize, size: usize, device: Option<Arc<UOp>> }
+Param { shape: Arc<UOp>, arg: Box<ParamArg> }
 ```
 
 Нормализованный параметр буфера — позиционная ссылка на входной/выходной буфер.
 Создаётся при предварительной нормализации расписания (BUFFER->PARAM) для стирания идентичности буфера,
 что позволяет структурную дедупликацию идентичных вычислений на разных буферах.
-`slot` — позиция в списке аргументов ядра, `size` — количество элементов.
+`arg.slot` — позиция в списке аргументов ядра, `shape` несёт количество
+элементов. `ParamArg` покрывает также скалярные параметры
+(`UOp::scalar_param`), которые вместо адресного пространства несут имя и
+границы значения.
 
-### DEFINE_LOCAL — аллокация shared-памяти
+### Разделяемая память и регистры
 
-```rust
-DefineLocal(usize)           // local memory index
-```
-
-Аллокация GPU shared memory (LDS). Видна внутри воркгруппы.
+Отдельных операций `DefineLocal` или `DefineReg` нет. Разделяемая память GPU
+(LDS) и регистровые/скретч-аллокации — это узлы `Buffer`, у которых
+`arg.addrspace` равен `AddrSpace::Local` или `AddrSpace::Reg`; они не несут
+устройства и видны только внутри воркгруппы (LOCAL) или потока (REG).
 
 ### DEFINE_VAR — символическая рантайм-переменная
 
@@ -647,17 +578,6 @@ DefineVar {
 ```text
 DEFINE_VAR(name="batch_size", min=1, max=128) : Index
 ```
-
-### DEFINE_REG — аллокация регистра
-
-```rust
-DefineReg {
-    size: usize,             // register size
-    id: usize,               // unique accumulator ID
-}
-```
-
-Аллоцирует регистр для промежуточного хранения. Поле `id` различает регистры одного DType — без него два reduce с одинаковым DType разделили бы один DEFINE_REG через hash consing. Используется в кодогенерации.
 
 ### BIND — привязка переменной
 
@@ -705,13 +625,9 @@ LUnique(usize)               // счётчик идентичности лока
 счётчиком, — благодаря этому тела callable можно хеш-консолидировать
 независимо от точек вызова.
 
-### DEVICE — спецификация устройства
-
-```rust
-Device(DeviceSpec)           // device specification
-```
-
-Указывает целевое устройство для вычисления.
+Устройство — не отдельный узел: таргет задаётся полем `DeviceSpec` у тех
+операций, которым он нужен (`Copy`, `GetAddr`, `AllReduce`, `ParamArg.device`,
+`BufferizeOpts.device`, `ProgramInfo.target`).
 
 ---
 
@@ -725,7 +641,7 @@ Device(DeviceSpec)           // device specification
 | `Permute` | `{ src, axes: Vec<usize> }` | Транспонирование / перестановка осей |
 | `Expand` | `{ src, new_shape }` | Бродкаст до большей формы |
 | `Pad` | `{ src, begin_pads, end_pads }` | Добавить паддинг |
-| `Shrink` | `{ src, begins, ends }` | Извлечь подобласть |
+| `Shrink` | `{ src, offsets, sizes }` | Извлечь подобласть |
 | `Flip` | `{ src, axes: Vec<bool> }` | Развернуть по осям |
 
 **Пример:** RESHAPE
@@ -743,18 +659,21 @@ flowchart TD
 
 | Операция | Назначение |
 |----------|------------|
-| `Copy` | Явное копирование значения |
+| `Copy` | `{ src, device }` — явное копирование значения на другое устройство |
 | `Slice` | `{ buffer, offset, size }` — метаданные непрерывного типизированного среза буфера |
-| `MStack` | Аллокация стека в памяти |
-| `MSelect` | Выбор в памяти (условный доступ) |
-| `Multi` | Операция с множественными выходами |
+| `GetAddr` | `{ src, device }` — адрес `UInt64` источника, похожего на буфер |
+| `MStack` | `{ buffers }` — побуферные копии мультиустройственного тензора по устройствам |
+| `MSelect` | `{ buffer, device_index }` — буфер одного устройства из мультиустройственного тензора |
+| `Multi` | `{ src, axis }` — маркер шардирования: ось, по которой разрезан мультиустройственный тензор |
 | `Group` | Группировка операций для планирования |
+| `Noop` | Заглушка без операндов и без эффекта |
 | `Detach` | Отсоединение от графа (запрет оптимизации через узел) |
 | `Contiguous` | Хинт, что данные непрерывны |
 | `ContiguousBackward` | Обратный проход для хинта contiguous |
 | `Precast` | Предварительное приведение типа |
 | `Custom` / `CustomI` | Инлайновое расширение пользовательскими операциями (`Custom` поддерживает только C) |
-| `CustomFunction` | Хук пользовательской функции уровня runtime (виды: `EncDec`, `Graph`) |
+| `CustomFunction` | Хук пользовательской функции уровня runtime (виды: `EncDec`, `Graph`, `AllReduce`) |
+| `Ins` | `{ sources, arg }` — целевая инструкция, выбранная ISA-рендерером |
 
 ---
 
@@ -766,13 +685,13 @@ flowchart TD
 |-----------|----------|
 | **Управление циклами** | `RANGE`, `END` |
 | **Редукция** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **Память** | `BUFFER`, `SLICE`, `STAGE`, `INDEX`, `LOAD`, `STORE` |
+| **Память** | `BUFFER`, `SLICE`, `STAGE`, `INDEX`, `LOAD`, `STORE`, `GETADDR` |
 | **Ядро и callable** | `SINK`, `CALL`, `FUNCTION`, `TUPLE`, `GET_TUPLE`, `PROGRAM`, `LINEAR`, `SOURCE`, `PROGRAM_BINARY`, `AFTER`, `BARRIER` |
-| **Векторные** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
-| **Расширение** | `UNROLL`, `CONTRACT` |
+| **Векторные** | `STACK`, `INDEX`, `VCONST` |
+| **Расширение** | `RANGE` с `AxisType::Upcast` или `AxisType::Unroll` |
 | **Аппаратные** | `WMMA`, `SPECIAL` |
 | **Управление** | `IF`, `ENDIF` |
-| **Определение** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `LUNIQUE`, `DEVICE` |
+| **Определение** | `PARAM`, `DEFINE_VAR`, `BIND`, `UNIQUE`, `LUNIQUE` |
 | **Перемещение** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 
@@ -782,21 +701,20 @@ flowchart TD
 
 | Операция | Начальный индекс RANGE |
 |----------|------------------------|
-| `BUFFERIZE` | 1 (compute=0, ranges=1+) |
+| `STAGE` | 1 (compute=0, ranges=1+) |
 | `REDUCE` | 1 (src=0, ranges=1+) |
-| `STORE` | 2 (index=0, value=1, ranges=2+) |
 | `WMMA` | 3 (a=0, b=1, c=2) |
 | `END` | 1 (computation=0, ranges=1+) |
 | `CALL` / `FUNCTION` | 1 (body=0, args=1+) |
 
 ### Расширяемые операции
 
-Операции, через которые UNROLL пропагируется по графу вычислений:
+Операции, через которые расширенные полосы пропагируются по графу вычислений:
 
 - ALU: `Unary`, `Binary`, `Ternary`
 - Типы: `Cast`, `BitCast`
-- Векторные: `Gep`, `Vectorize`
-- Память: `Load`, `Store`, `Index`, `PointerIndex`
+- Shaped-значения: `Stack`
+- Память: `Load`, `Store`, `Index`
 - Управление: `Reduce`, `End`, `After`
-- Буферы: `Bufferize`
+- Буферы: `Stage`
 - Аппаратные: `Wmma`

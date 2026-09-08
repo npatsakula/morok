@@ -20,19 +20,17 @@ sidebar_label: Phase 1 — Rangeify
 
 **Why This Matters**: Movement operations (RESHAPE, PERMUTE, etc.) are convenient abstractions, but the hardware needs concrete index calculations. By cleaning them up early, we ensure patterns in later stages can match correctly.
 
-**Pattern**: `pm_mops + pm_syntactic_sugar` (bottom-up)
+**Pattern**: `movement_op_patterns()` (bottom-up)
 
 | Pattern | Transformation | Visual | Location |
 |----------|---------------|--------|----------|
 | Movement on INDEX | Apply movement to index expressions | `INDEX(PERMUTE(arr), [i, j]) → INDEX(arr, [j, i])` | `movement_op_patterns()` |
-| Movement through AFTER | Move RESHAPE through timing wrapper (Tinygrad-specific) | `AFTER(RESHAPE(x, arg), [dep1, dep2]) → RESHAPE(AFTER(x, [dep2]), arg)` | Tinygrad only |
-| Movement through END | Unwrap movement from END wrapper (Tinygrad-specific) | `END(RESHAPE(x), ranges) → END(x, ranges)` | Tinygrad only |
-| Nested INDEX simplification | Remove redundant nested INDEX (Svod) | `INDEX(INDEX(ptr, [i]), [i]) → INDEX(ptr, [i])` | `movement_op_patterns()` |
-| Nested INDEX concat | Flatten nested INDEX for PtrDType | `INDEX(INDEX(ptr, i), j) → INDEX(ptr, i, j)` | `pm_syntactic_sugar` |
+| Movement through AFTER | Push movement (or INDEX) through the timing wrapper, keeping every dep | `AFTER(RESHAPE(x, arg), deps) → RESHAPE(AFTER(x, deps), arg)` | `movement_op_patterns()` |
+| Movement through END | Unwrap movement from END wrapper | `END(RESHAPE(x), ranges) → END(x, ranges)` | `movement_op_patterns()` |
 
 **Why bottom-up?** Child nodes must be clean before parents can match. Movement ops nest deeply; cleaning from bottom prevents missed patterns.
 
-**Note**: Tinygrad and Svod have different approaches here. Tinygrad moves movement ops through wrappers (AFTER, END) because it re-applies movement ops during bufferization. Svod removes movement ops entirely by transforming indices during bufferization, so AFTER/END patterns are not needed.
+**Note**: `is_movement()` covers exactly RESHAPE, PERMUTE, EXPAND, PAD, SHRINK and FLIP. Nested INDEX flattening (`INDEX(INDEX(ptr, i), j) → INDEX(ptr, i, j)`) is *not* part of this stage; it lives in `mop_cleanup_patterns()` and runs with the Stage 9 expander and the devectorizer.
 
 **Svod**: `movement_op_patterns()` in `rangeify/patterns.rs`
 
@@ -62,11 +60,11 @@ count = clamp(64 - length, 0, 64)
 
 The mechanism works by:
 1. Identifying subexpressions that don't depend on the REDUCE range
-2. Creating DEFINE_VAR for those subexpressions (treats as loop-invariant)
-3. Substituting the range with DEFINE_VAR and running symbolic simplification
-4. If the simplified expression has no more ranges, the REDUCE is eliminated
+2. Replacing those external inputs with synthetic scalar PARAM variables carrying their proven vmin/vmax
+3. Wrapping the substituted body in a synthetic REDUCE over the same range and running the reduce-collapse matcher
+4. If the simplified expression has no more ranges, the REDUCE is eliminated (and the temporary PARAMs are substituted back)
 
-**Note**: WHERE movement through INDEX (`pm_move_where_on_load`) is a separate optimization that places conditionals before loads to skip memory accesses, but it doesn't eliminate REDUCE operations.
+**Note**: WHERE movement through INDEX (`pm_move_where_on_load`) is a separate optimization that runs at Stage 8, embedding the condition into `INDEX.indices[0]` as `WHERE(cond, idx, Invalid)`. It doesn't eliminate REDUCE operations.
 
 **Svod**: `pm_load_collapse()` in `rangeify/patterns.rs`
 
@@ -97,11 +95,11 @@ This enables:
 - Inner ranges can vectorize (SIMD)
 - Outer ranges can parallelize (GPU blocks / CPU threads)
 
-`pm_flatten_range` merges nested ranges on REDUCE/STORE/END when beneficial.
+`pm_flatten_range` re-derives the range operand list of REDUCE and END nodes from the RANGE nodes still reachable through their sources. (Merging ranges is Stage 5's job.)
 
-**Context**: Requires dictionary context (`ctx={}`) to track substitutions at SINK.
+**Context**: A `SplitRangesContext` marks each `RANGE % const` site; the divmod substitution is performed once, at the SINK.
 
-**Note**: The split only applies when `end % mod == 0` (divisibility check).
+**Note**: The split only applies when `end % mod == 0` (divisibility check). Warp and Device ranges are never split, and every range an image STORE indexes is pinned against splitting.
 
 **Svod**: `pm_split_ranges()` + `pm_flatten_range()` in `rangeify/transforms.rs`
 
@@ -119,9 +117,9 @@ This enables:
 
 **Why This Matters**: Computers are fast at simple math. Dividing and taking remainders are slow operations. This stage uses algebra rules to eliminate slow operations whenever possible.
 
-**Pattern**: `symbolic() + pm_flatten_range`
+**Pattern**: `sym() + pm_fold_cast_const() + pm_flatten_range()`
 
-Note: `symbolic()` is a subset of `sym` used at Stage 8. It includes algebraic rules but omits later-stage patterns.
+Note: `symbolic()` (tier 2) is a strict subset of `sym()` (tier 3); the same `sym` runs again at Stage 8.
 
 **Constant folding**:
 ```text
@@ -147,11 +145,11 @@ NOT(NOT(x)) → x
 - Identity removal (self-folding, redundant operations)
 - Comparison simplification
 - Cast optimization
-- GEP pushing (move address calculations through ALUs)
+- ALU/STACK reordering (`ALU(STACK, STACK) → STACK(ALU)`)
 - Where folding (combine WHERE with same conditions)
 - Reduce mul chain (move multiplications outside reduce)
 
-**Svod**: `symbolic()` in `symbolic/patterns.rs`
+**Svod**: `sym()` in `symbolic/patterns.rs`
 
 ---
 
@@ -177,6 +175,8 @@ RANGE(0..4), RANGE(0..8)
 RANGE(0..32)
 ```
 
+`pm_simplify_ranges` also narrows ranges proven bounded by every INDEX validity gate.
+
 Merge criteria:
 1. Axis types must be compatible (both output, both reduce, etc.)
 2. REDUCE scope must remain consistent
@@ -200,11 +200,11 @@ The compiler only merges if it saves operations. Merging might require division/
 
 **Why This Matters**: After bufferization, the graph may contain multiple STORE operations. Each STORE becomes its own kernel with its own set of buffers, ranges, and dependencies.
 
-**Function**: `run_kernel_split_pipeline()` in `schedule/src/rangeify/kernel.rs`
+**Function**: `try_get_kernel_graph()` in `schedule/src/rangeify/kernel.rs`
 
-Before splitting, a `pm_flatten_range` pre-pass runs on the **full graph once** (bottom-up). This merges nested ranges across all kernels in a single traversal, avoiding redundant per-kernel work on overlapping subgraphs. The pre-pass is a key compilation speed optimization — without it, each kernel's `split_store` would re-traverse shared subgraphs independently.
+Inside `kernel_graph_pre_cut`, after STAGE nodes have become STOREs, a `pm_flatten_range` pre-pass runs on the **full graph once** (bottom-up). This re-derives the range lists across all kernels in a single traversal, avoiding redundant per-kernel work on overlapping subgraphs. The pre-pass is a key compilation speed optimization — without it, each kernel's `split_store` would re-traverse shared subgraphs independently.
 
-After the pre-pass, `split_all_stores` splits at STORE boundaries, then `fix_assign` handles buffer numbering (via `LocalAddBufferContext.dg` counter) and dependency tracking.
+After the pre-pass, `split_all_stores` splits at STORE boundaries — each kernel numbering its own PARAM slots through `LocalAddBufferContext::param_slot` — and then `fix_assign` wires the inter-kernel dependencies, rejecting dependency cycles.
 
 ---
 
@@ -220,21 +220,21 @@ After the pre-pass, `split_all_stores` splits at STORE boundaries, then `fix_ass
 
 **Why This Matters**: The compiler tries different combinations of optimizations (vectorize here? unroll there?) and picks the fastest. Finding the right combination can make code 10x faster.
 
-**Function**: `apply_opts(sink, renderer)`
+**Function**: `optimize_kernel(ast, renderer)`
 
 **Optimization actions**:
 
 | Action | Effect | Hardware Target |
 |--------|--------|-----------------|
-| TC | Enable tensor core usage | NVIDIA & AMD GPUs (WMMA/MFMA) |
+| TC | Enable tensor core usage | NVIDIA, AMD, Apple Metal & Intel GPUs |
 | UPCAST | Vectorize a dimension | All (SIMD) |
-| LOCAL | Use local/shared memory | GPU (LDS) / CPU (L1) |
+| LOCAL | Use local/shared memory | GPU only (requires `has_local`) |
 | UNROLL | Unroll a loop dimension | All (avoid loop overhead) |
-| GROUP | Group operations for cache | All |
-| GROUPTOP | Group for reduce ops | GPU tensor cores |
+| GROUP | Inner split of a grouped reduce | GPU (shared memory; rejected once TC is applied) |
+| GROUPTOP | Outer split of a grouped reduce | GPU (shared memory; rejected once TC is applied) |
 | THREAD | Thread-based parallelism | CPU |
 | NOLOCALS | Disable local memory usage | All (constraint, prevents further LOCAL actions) |
-| SWAP | Swap range assignments | All (try different tiling) |
+| SWAP | Swap two Global range assignments | GPU/CPU global axes (try different tiling) |
 | PADTO | Pad for alignment | All (memory alignment) |
 
 **Optimization Search Explained**:
@@ -247,13 +247,13 @@ The compiler searches for the best combination:
 flowchart TD
   S["Optimization Search"] --> H["Heuristic mode (BEAM=0): Hand-coded optimizations"]
   S --> B["Beam search (BEAM≥1)"]
-  B --> B1["Generate all possible actions (~162 base actions, workload-dependent)"]
+  B --> B1["Generate all possible actions (193 fixed base actions; 200 with BEAM_PADTO)"]
   B --> B2["Apply to all top-K candidates in parallel"]
   B --> B3["Filter based on constraints"]
   B --> B4["Compile and run each candidate, measure actual time"]
   B --> B5["Pick fastest"]
 ```
 
-**Note**: NOLOCALS is a constraint that sets `dont_use_locals = True`, preventing further LOCAL actions and affecting shared memory usage decisions.
+**Note**: NOLOCALS is a constraint that sets `dont_use_locals = true`, preventing further LOCAL actions and affecting shared memory usage decisions. It is not part of the base action list — it is appended per candidate when enabled.
 
 **Svod**: `optimizer/mod.rs`, `optimizer/opts.rs`

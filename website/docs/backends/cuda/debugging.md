@@ -15,12 +15,17 @@ error.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SVOD_DEVICE` | `CPU` | `CUDA:N` (aliases `NV`, `GPU`) selects the default tensor device |
+| `SVOD_DEVICE` | `CPU` | `CUDA:N` (alias `GPU`) selects the default tensor device; `NV` is *not* an alias, it stays reserved for a userspace driver |
 | `SVOD_DUMP_NVPTX_IR` | unset | Directory receiving each kernel's NVPTX LLVM IR as `sm_XY_<kernel>.ll` |
-| `SVOD_OBJECT_CACHE` | on | `0` disables the on-disk PTX cache |
+| `SVOD_CUDA_PTXAS` | on | `0` skips the `ptxas` pre-assembly and hands PTX text to the driver JIT |
+| `SVOD_CUDA_SCOPED_SYNC` | on | `0` replaces every scoped wait with a full `cuCtxSynchronize` and makes copies synchronous ([Architecture](./architecture.md)) |
+| `SVOD_CUDA_CUPTI` | on | `0` skips loading `libcupti.so.13`, so there are no hardware counters |
+| `SVOD_PMC` | unset | `1` for the backend's default counter set, or a comma-separated token list, see [Profiling](./profiling.md) |
+| `SVOD_OBJECT_CACHE` | on | `0` disables the on-disk cache of compiled objects |
 | `SVOD_OBJECT_CACHE_DIR` | `$XDG_CACHE_HOME` / `~/.cache` | Relocates the cache |
+| `CUDA_PATH` | unset | Last place searched for `ptxas` (`$CUDA_PATH/bin`) and CUPTI (`$CUDA_PATH/lib64`) |
 | `SVOD_PROFILE_ITERS`, `SVOD_ORIGIN`, `SVOD_ORIGIN_DEPTH` | | Profiler knobs, see [Profiling](./profiling.md) |
-| `RUST_LOG` | unset | `svod_device=debug` shows the device open line, PTX JIT info logs, graph capture and replay fallbacks; `svod_runtime=debug` shows each clang invocation |
+| `RUST_LOG` | unset | `svod_device=info` carries the device open line; `svod_device=debug` adds the JIT info log, graph capture and replay fallbacks; `svod_runtime=debug` logs each kernel's clang invocation |
 
 There is no CUDA-specific dispatch dump; the driver JIT log and `tracing` cover
 what `SVOD_DEBUG_DISPATCH` does on AMD.
@@ -57,7 +62,9 @@ ptxas application ptx input, line 27; error   : ...
 ISA of the module (the pin follows the compute capability: 7.8 up to sm_88, 8.4 on sm_89
 and sm_90, 8.6 to 8.8 across Blackwell), see the
 [requirements](./overview.md). The info log (warnings, register spills) is
-logged at `debug` level under `svod_device`.
+logged at `debug` level under `svod_device`. When `ptxas` pre-assembled the
+kernel there is no driver JIT and the same diagnostic arrives from `ptxas`
+itself, as the message of a failed compile.
 
 Two errors come from Svod's own validator before the driver sees anything:
 
@@ -72,19 +79,25 @@ not a clang error, it becomes an external call. The fix is in
 `codegen/src/llvm/nvptx/` or the intrinsic declaration table in
 `codegen/src/llvm/text/mod.rs`.
 
+A cubin entry is checked instead by `validate_cubin` (a little-endian ELF64
+for `EM_CUDA` defining the entry as code), and its `.param` list is checked
+against the ABI on the PTX text before assembly, since a cubin does not
+carry one.
+
 ---
 
 ## Offline checks with the toolkit
 
-Nothing at run time needs the CUDA toolkit, but if it is installed its tools
-work on the dumped IR:
+Nothing at run time *requires* the CUDA toolkit — `ptxas` is used to
+pre-assemble kernels when it happens to be installed — and if it is there its
+tools also work on the dumped IR:
 
 ```bash
 SVOD_DUMP_NVPTX_IR=/tmp/nvptx SVOD_DEVICE=CUDA:0 cargo test -p svod-tensor -- some_test
 
 # Reproduce the exact compile, then assemble with ptxas to see the real diagnostics
-clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 -Wno-override-module \
-      /tmp/nvptx/sm_86_r_64_32.ll -o r_64_32.ptx
+clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx78 \
+      -Wno-override-module /tmp/nvptx/sm_86_r_64_32.ll -o r_64_32.ptx
 ptxas -arch=sm_86 -v r_64_32.ptx -o r_64_32.cubin   # -v prints registers, shared, spills
 nvdisasm r_64_32.cubin | less                         # the SASS
 ```
@@ -133,7 +146,7 @@ differs from capture, and `SVOD_DEVICE=CUDA:0 cargo test -p svod-tensor` runs
 the `codegen_tests!` `cuda` variants, the same tensor-level assertions the CPU
 backends pass, one kernel at a time.
 
-:::tip The pipeline debugger
+:::tip[The pipeline debugger]
 For compiler-side issues (which UOps produced which IR) the `/svod-debug` skill
 documents the frontend → codegen tracing targets; `SVOD_DUMP_NVPTX_IR` is the
 CUDA member of that family next to `SVOD_DUMP_AMD_IR` and `SVOD_DUMP_LLVM_IR`.

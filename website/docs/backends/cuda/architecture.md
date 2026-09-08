@@ -8,27 +8,31 @@ This page follows the backend from the driver binding up to graph replay.
 Everything below is in `device/src/cuda/` unless noted.
 
 ```text
+mod.rs        the dl_api! runtime-binding macro and the module's re-exports
 sys.rs        the bound driver entry points (libloading), CUresult, handles
-device.rs     CudaDevice: primary context, limits, streams, base event, poison latch
+device.rs     CudaDevice: primary context, limits, lanes, base event, scoped-sync tables, poison latch
 allocator.rs  CudaAllocator: device / managed / pinned memory, staged copies
-program.rs    CudaProgram: PTX module load, cuLaunchKernel, execute_timed, resources
-sync.rs       CudaPlanCtx, CudaDispatchTimestamps, CudaCompletionToken, CudaTimelineSignal
+program.rs    CudaProgram: cubin or PTX module load, cuLaunchKernel, execute_timed, resources
+sync.rs       CudaPlanCtx, CudaDispatchTimestamps, CudaCompletionToken
 graph.rs      CudaGraph: a CUDA graph DAG from GraphKernel::deps, patched replays
+cupti.rs      the CUPTI range profiler behind Tier 4 (see Profiling)
 ```
 
 ---
 
 ## Driver bindings
 
-`sys.rs` declares every entry point the backend uses in one `cuda_api!`
-macro: the Rust field, the exact export name, and the C prototype. `Api::load`
-opens `libcuda.so.1` and resolves all of them up front, so a missing or renamed
-symbol fails once, at load, as `Error::DeviceUnavailable` (`libcuda.so.1 has no
-symbol ...`) rather than at first use. Names are the **versioned** exports that
-`cuda.h` remaps to: `cuMemAlloc_v2`, `cuCtxDestroy_v2`,
+`sys.rs` declares every entry point the backend uses in one `dl_api!` block —
+the Rust field, the exact export name, and the C prototype; the macro itself
+lives in `mod.rs` and `cupti.rs` reuses it. `Api::load` opens `libcuda.so.1`
+and resolves all of them up front, so a missing or renamed symbol fails once,
+at load, as `Error::DeviceUnavailable` (`libcuda.so.1 has no symbol ...`)
+rather than at first use. Names are the **versioned** exports that `cuda.h`
+remaps to: `cuMemAlloc_v2`, `cuDevicePrimaryCtxRelease_v2`,
 `cuGraphAddKernelNode_v2`, `cuGraphExecKernelNodeSetParams_v2`,
 `cuGraphInstantiateWithFlags` (the unversioned `cuGraphInstantiate` is a legacy
-five-argument ABI and is never touched).
+five-argument ABI and is never touched). `cuEventElapsedTime` is the deliberate
+exception: its `_v2` is CUDA 12.8, which would raise the driver floor to R570.
 
 Handles are `#[repr(transparent)]` pointer newtypes (`CUcontext`, `CUmodule`,
 `CUfunction`, `CUstream`, `CUevent`, `CUgraph`, `CUgraphExec`, ...);
@@ -50,9 +54,9 @@ compile-time size and offset assertions.
 
 `CudaDevice::open(id)` is cached per process. It runs `cuInit`, retains the
 device's **primary context** (`cuDevicePrimaryCtxRetain`), reads the
-`CudaLimits` it needs (`cuDeviceGetAttribute`: SM count, threads and shared
-memory per block and per SM, registers, warp size, L2, managed-memory
-support), creates two non-blocking streams (a **copy stream** for the
+`CudaLimits` it needs (`cuDeviceGetAttribute`: SM count, threads per block and
+per SM, shared memory per block, warp size, and whether managed memory is
+coherently accessible), creates two non-blocking streams (a **copy stream** for the
 allocator and a **dispatch stream** for per-call `Program::execute`), and
 records one **base event** that is the zero of every GPU-clock timestamp.
 
@@ -80,11 +84,15 @@ A `RawBuffer::Cuda` carries a device pointer, an optional host pointer, and its
 `supports_device_local()` is `true`, so intermediates stay on the device.
 Host <-> device copies first wait the storage's in-flight producers and
 readers (`CudaDevice::wait_storage`, below — host access is not ordered
-against the lanes), then move data with one synchronous `cuMemcpy` up to
-4 MiB and above that in 4 MiB chunks through a lazily allocated **pinned
-staging buffer** with `cuMemcpyHtoDAsync` / `cuMemcpyDtoHAsync` on the copy
-stream, synchronizing the stream per chunk. Pinned buffers are `memcpy`'d
-directly. Device-to-device `_transfer` and zero-fills are asynchronous on
+against the lanes), then move data. Up to 4 MiB a copy-out is one synchronous
+`cuMemcpyDtoH`, while a copy-in is a `cuMemcpyHtoDAsync` on the copy lane
+published as the storage's new producer; it synchronizes the stream only when
+the source is memory the driver tracks (pinned, registered or managed, asked
+with `cuPointerGetAttribute`), because the driver stages a pageable source
+before it returns. Above 4 MiB both directions go in 4 MiB chunks through a
+lazily allocated **pinned staging buffer** with `cuMemcpyHtoDAsync` /
+`cuMemcpyDtoHAsync`, synchronizing the stream per chunk. Pinned buffers are
+`memcpy`'d directly. Device-to-device `_transfer` and zero-fills are asynchronous on
 the copy lane: ordered after the producers with `cuStreamWaitEvent`,
 published as the new producer of both ranges, and waited by every later
 launch on any lane, so they never block the host; an overlapping range
@@ -99,7 +107,9 @@ producers.
 
 ## Programs and launches
 
-`CudaProgram::load` hands the PTX text to `cuModuleLoadDataEx` with 16 KiB
+`CudaProgram::load` branches on `is_cubin` — an ELF image goes through
+`validate_cubin`, PTX text through the entry's `.param` check — and both reach
+the same `cuModuleLoadDataEx` with 16 KiB
 error and info log buffers, so a JIT failure surfaces as
 `Error::CudaJit { kernel, cause, log }` carrying `ptxas`'s own message (see
 [Debugging](./debugging.md)); the info log goes to `tracing::debug!`. It then
@@ -114,8 +124,8 @@ shared `ClikeKernargLayout`: 8-byte device pointers, 4-byte `i32` scalars, in
 PARAM slot order, which is exactly PTX's natural `.param` layout. `global_size`
 is the **grid in blocks** and `local_size` the **block in threads** (the
 work-group convention AMD and Metal use); a block larger than the function's
-`maxThreadsPerBlock` is rejected before launch with the register and shared
-memory figures in the message.
+`maxThreadsPerBlock` is rejected before launch with the register, shared and
+local memory figures in the message.
 
 `Program::execute` launches on the device's dispatch stream and optionally
 waits on it; `execute_timed` records a timing event pair around the launch and
@@ -126,7 +136,8 @@ returns `cuEventElapsedTime`, so BEAM ranks candidates on GPU time.
 ## Plan contexts, tokens, timelines
 
 Each execution plan gets a `CudaPlanCtx`: **one non-blocking stream**, which
-is its lane. `dispatch` launches on it; with `profile` set it brackets the
+is its lane, plus the CUPTI counter selection and session when counters are
+armed. `dispatch` launches on it; with `profile` set it brackets the
 launch with timing events and returns a `CudaDispatchTimestamps`
 ([Profiling](./profiling.md)). `completion_token` records a completion-only
 event (`CU_EVENT_DISABLE_TIMING`) whose `wait` is `cuEventSynchronize` and
@@ -141,26 +152,26 @@ tables (module docs of `device/src/cuda/device.rs`):
   read or wrote it (a host overwrite is a WAR hazard against in-flight
   readers too). The executor publishes a plan's or graph's token on every
   storage the plan touches after each execute; the allocator publishes a
-  copy-lane token after each transfer or memset. `wait_storage(base)` waits
-  those tokens only. A storage the table does not know falls back to
-  `cuCtxSynchronize`.
-- **lanes** — every live lane and whether it holds submissions no token
+  copy-lane token after each transfer or memset. `wait_storage(base)` drains
+  the lanes below, then waits those tokens, then drops them from the table. A
+  storage the table does not know — including one whose newest token belongs
+  to another backend — falls back to `cuCtxSynchronize`.
+- **lanes** — every live lane and how many submissions it holds that no token
   has been published for (per-call `Program::execute`, a plan that failed
-  mid-way, a graph replay before its token is fetched); every scoped wait
-  drains such lanes.
+  mid-way, a graph replay before its token is fetched). `wait_storage` drains
+  such lanes on the host; a copy instead records a tail event on each and
+  waits it on the GPU. The copy lane itself is not in this table.
 - **copy tail** — the newest copy-lane event; each launch waits it on the
   GPU before running, so asynchronous copies precede every later kernel.
 
 `SVOD_CUDA_SCOPED_SYNC=0` disables all of it: every wait drains the context
 and every copy synchronizes the copy stream.
 
-The executor's cross-plan ordering uses `CudaTimelineSignal`, a timeline
-published by events: `signal(stream, value)` records an event at the stream's
-tail and files `(value, event)`; `value()` folds every retired publication
-into the floor; `wait(target)` blocks on the event carrying the smallest value
-`>= target`; `wait_on_stream` orders GPU work after it with
-`cuStreamWaitEvent`. Slots are `Arc`'d so a waiter keeps its event alive while
-another thread folds it away.
+The executor's cross-plan ordering is a host signal (`CpuTimelineSignal`) on
+every backend, CUDA included; there is no `TimelineSignal` implementation of
+its own. What keeps the host signal off the critical path is the machinery
+above: the tables order GPU work against GPU work with `cuStreamWaitEvent`, so
+a plan only ever waits on the host for what it actually reads.
 
 ---
 
@@ -200,17 +211,23 @@ rendered IR and a `CompilerIdentity`:
 ```text
 backend:             nvptx-clang
 target_architecture: nvptx64-nvidia-cuda/sm_86
-toolchain:           <clang identity>
-flags:               -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 -Wno-override-module - -o -
+toolchain:           <clang identity>[;ptxas:path=...;version=...]
+flags:               -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx78 -Wno-override-module - -o -
+                     [-arch=sm_86 -o /dev/stdout /dev/stdin]
 abi:                 ptx-kernel-abi-v1;warp-size=32
-object_format:       ptx-text-v1
+object_format:       ptx-text-v1 | cubin-v1
 ```
 
-The cache stores **PTX text**, never a cubin: the driver assembles it at load
-and keeps the SASS in its own `~/.nv/ComputeCache`. Every cache hit is
-re-validated (`validate_ptx`) before it reaches the driver, see
-[Codegen](./codegen.md). `SVOD_OBJECT_CACHE=0` disables the cache and
-`SVOD_OBJECT_CACHE_DIR` relocates it.
+The bracketed halves are the `ptxas` path: with the assembler the cached
+object is a **cubin**, without it **PTX text** the driver assembles at load,
+keeping the SASS in its own `~/.nv/ComputeCache`. The two formats never share
+an entry, since they differ in `toolchain`, `flags` and `object_format` alike.
+The rendered IR is not the whole key either: the ABI descriptors are appended
+to it, because a cubin's entry is checked against them at compile time. Every
+cache hit is re-validated by its format's validator — `validate_cubin` or
+`validate_ptx`, see [Codegen](./codegen.md) — before it reaches the driver.
+`SVOD_OBJECT_CACHE=0` disables the cache and `SVOD_OBJECT_CACHE_DIR`
+relocates it.
 
 The device factory (`create_cuda_device`) also refuses a device whose
 per-block shared memory limit is below the optimizer profile's static

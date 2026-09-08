@@ -12,8 +12,9 @@ authority for a compute lane**.
 ## Compute lanes
 
 `AmdDeviceCore` owns a bounded `QueuePool`. Its slots are fixed `OnceLock`s and
-queues are created lazily up to `SVOD_AMD_HW_QUEUES` (default 4, maximum 64).
-An atomic bitset tracks leases:
+queues are created lazily up to `SVOD_AMD_HW_QUEUES`, which is clamped to 1
+through 64 and defaults to 4 on multi-XCC CDNA, 1 everywhere else. An atomic
+bitset tracks leases:
 
 - claiming an initialized idle lane is an atomic compare-exchange;
 - queue creation is a cold serialized path;
@@ -38,7 +39,7 @@ each publication epoch.
 doorbell mapping, and KFD queue backing. Packet format is selected once:
 
 ```text
-PM4 = num_xcc == 1 && SVOD_AMD_AQL != 1
+PM4 = num_xcc == 1 && SVOD_AMD_AQL is unset or "0"
 AQL = otherwise
 ```
 
@@ -110,13 +111,17 @@ that an abandoned queue may still target.
 ## Device-wide drains
 
 Each lane owns a queue timeline and a FIFO of non-queue finalizers. The device
-core keeps weak references to every initialized lane. Host reads, host writes,
-and destructive frees call `synchronize_all`, which snapshots those lanes and
-waits their timelines without taking publication locks.
+core keeps weak references to every initialized lane. `synchronize_all`
+snapshots those lanes and waits their timelines without taking publication
+locks. Host reads, writes, and destructive frees prefer the scoped
+`wait_storage`, which waits only the submissions recorded against that storage
+base and falls back to the full drain for an unknown VA or under
+`SVOD_AMD_SCOPED_SYNC=0`.
 
-Native replay additionally validates every current PROGRAM and COPY endpoint.
-For AMD buffers this compares the actual `RawBuffer::AmdDevice` core with the
-selected physical device; an allocator merely reporting `AMD:N` is not enough.
+Native replay additionally re-validates every operation before republishing: a
+PROGRAM must still be an `AmdProgram` whose core is the very same `Arc`
+(`Arc::ptr_eq`, not an allocator merely reporting `AMD:N`) with unchanged PM4
+and AQL program addresses, and a COPY lane requires an installed SDMA queue.
 
 ## Backend seam
 
@@ -133,11 +138,18 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
         doorbell_base: NonNull<u8>,
     ) -> Result<QueueTeardown>;
     fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
+
+    // Defaulted hooks; only `KfdIface` and the host mock override them.
+    fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> { None }
+    fn publication_checkpoint(&self, stage: PublicationStage) -> Result<()> { Ok(()) }
+    fn update_queue_percentage(/* ... */) -> Result<()> { Ok(()) }
 }
 ```
 
 Ring, GART, EOP, context-save, and inactive-signal buffers are allocated above
 this seam. `setup_ring` activates those resources and maps the doorbell.
+`update_queue_percentage` is what re-maps an AQL queue so CP firmware re-reads
+its cached `amd_queue_t` scratch descriptor.
 
 ## Configuration
 
@@ -145,12 +157,16 @@ this seam. `setup_ring` activates those resources and maps the doorbell.
 |---|---|---|
 | `SVOD_DEVICE` | `CPU` | Select default tensor device, for example `AMD:0` |
 | `SVOD_AMD_BACKEND` | `kfd` | AMD backend; only `kfd` is currently accepted |
-| `SVOD_AMD_HW_QUEUES` | `4` | Bounded compute-lane count, clamped to 1 through 64 |
-| `SVOD_AMD_AQL` | unset | Nonzero forces AQL on single-XCC hardware |
-| `SVOD_PM4_GRAPH` | unset | `=1` enables PM4 graph capture |
+| `SVOD_AMD_HW_QUEUES` | 4 on multi-XCC, else 1 | Bounded compute-lane count, clamped to 1 through 64 |
+| `SVOD_AMD_AQL` | unset | Any value other than `0` forces AQL on single-XCC hardware |
+| `SVOD_AMD_SCOPED_SYNC` | unset | `=0` replaces every storage-scoped host wait with a full device drain |
+| `SVOD_PM4_GRAPH` | unset | `=1` enables PM4 graph capture; only `1` counts |
+| `AMD_DISABLE_SDMA` | unset | Set to anything to skip the SDMA copy queue, forcing host-visible buffers |
 | `SVOD_KFD_TOPOLOGY` | sysfs | Override KFD topology root for tests |
-| `SVOD_DEBUG_DISPATCH` | unset | Print dispatch grid, kernarg, scratch, and buffer addresses |
+| `SVOD_DEBUG_DISPATCH` | unset | Set to anything to print program-load and dispatch grid, kernarg, scratch, and buffer addresses |
 | `SVOD_DUMP_AMD_IR` | unset | Directory for generated AMD LLVM IR |
+| `SVOD_AM_DEBUG` | unset | AM bring-up only: read registers back after writing them |
+| `SVOD_AM_MCBASE` | unset | AM bring-up only: `raw`, `fb`, or `fbxgmi` MC aperture base |
 
 There is no `SVOD_AMD_SINGLE_QUEUE`. Set `SVOD_AMD_HW_QUEUES=1` when a single
 hardware lane is required.

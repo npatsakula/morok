@@ -25,7 +25,7 @@
 //! Direct callers of [`Renderer::render`] (and the per-backend `render` free
 //! functions) must pass a LINEAR-stage UOp produced by
 //! [`svod_schedule::linearize::line_rewrite_cleanups`]. The cleanup pass
-//! lowers gated LOADs into IF/STORE/ENDIF and provides the `alt` value that
+//! lowers gated STOREs into IF/STORE/ENDIF and provides the `alt` value that
 //! per-backend op handlers rely on; backends report `Error::InvalidGraph` if
 //! these invariants are violated. The staged entrypoints in
 //! [`program_pipeline`] run the cleanup pass automatically.

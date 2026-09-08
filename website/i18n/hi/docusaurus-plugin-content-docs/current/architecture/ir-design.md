@@ -56,9 +56,9 @@ pub enum Op {
     Range { end: Arc<UOp>, axis_id: AxisId, axis_type: AxisType, deps: SmallVec<[Arc<UOp>; 2]> },
     End { computation: Arc<UOp>, ranges: SmallVec<[Arc<UOp>; 4]> },
 
-    // Memory operations
-    Load { buffer: Arc<UOp>, index: Arc<UOp>, alt: Option<Arc<UOp>> },
-    Store { index: Arc<UOp>, value: Arc<UOp>, ranges: SmallVec<[Arc<UOp>; 4]> },
+    // Memory operations (the buffer is reached through the INDEX, not a field)
+    Load { index: Arc<UOp>, alt: Option<Arc<UOp>>, gate: Option<Arc<UOp>> },
+    Store { index: Arc<UOp>, value: Arc<UOp>, gate: Option<Arc<UOp>> },
 
     // ALU operations (grouped enums with many individual values)
     Binary(BinaryOp, Arc<UOp>, Arc<UOp>),  // Add, Mul, etc.
@@ -76,20 +76,20 @@ enum में ~60 Op वैरिएंट हैं जो ऐब्स्ट�
 | **Control** | `RANGE`, `END`, `IF`, `BARRIER` | लूप और ब्रांच स्ट्रक्चर |
 | **Memory** | `LOAD`, `STORE`, `INDEX`, `BUFFER` | हार्डवेयर मेमोरी एक्सेस |
 | **ALU** | `ADD`, `MUL`, `SQRT`, `EXP`, `WHERE` | CPU/GPU इंस्ट्रक्शन |
-| **Advanced** | `WMMA`, `CONTRACT`, `UNROLL` | Tensor cores, वेक्टराइज़ेशन |
+| **Advanced** | `WMMA` | Tensor cores और उनका expansion metadata |
 
 जब आप UOp ग्राफ़ प्रिंट करते हैं, आपको उसका tree स्ट्रक्चर दिखता है:
 
 ```mermaid
 flowchart TD
-  N42["[42] STORE : Void"] --> N35["[35] INDEX : Ptr(Float32)"]
-  N42 --> N40["[40] REDUCE(Add) : Float32"]
-  N42 --> N30["[30] RANGE(axis=0, Reduce) : Index"]
-  N35 --> N10["[10] DEFINE_GLOBAL(0) : Ptr(Float32)"]
-  N35 --> N30
-  N30 --> N5["[5] CONST(4) : Index"]
+  N42["[42] STORE : Void"] --> N35["[35] INDEX : Float32"]
+  N42 --> N40["[40] REDUCE(Add, num_axes=1) : Float32"]
+  N35 --> N10["[10] PARAM(slot=0) : Float32"]
+  N35 --> N31["[31] RANGE(R0, Global) : Index"]
+  N31 --> N5["[5] CONST(4) : Index"]
   N40 --> N38["[38] MUL : Float32"]
-  N40 --> N30
+  N40 --> N30["[30] RANGE(R1, Reduce) : Index"]
+  N30 --> N5
   N38 --> N36["[36] LOAD : Float32"]
   N38 --> N37["[37] LOAD : Float32"]
 ```
@@ -103,13 +103,13 @@ flowchart TD
 जब आप Svod में एक ही एक्सप्रेशन दो बार बनाते हैं, आपको *वही पॉइंटर* मिलता है। इक्वल वैल्यूज़ नहीं — वही मेमोरी एड्रेस।
 
 ```rust
-let a = UOp::binary(Add, x.clone(), y.clone());
-let b = UOp::binary(Add, x.clone(), y.clone());
+let a = x.try_add(&y)?;
+let b = x.try_add(&y)?;
 
 assert!(Arc::ptr_eq(&a, &b));  // Same pointer!
 ```
 
-:::note Origin नोड की आइडेंटिटी का हिस्सा है
+:::note[Origin नोड की आइडेंटिटी का हिस्सा है]
 `SVOD_ORIGIN=1` के साथ हर नोड वह `OriginScope` भी साथ रखता है जिसके अंदर वह बना था, और यह origin
 उसके content hash में घुल जाता है। तब अलग-अलग scopes में बने दो एक जैसे सबग्राफ़ *अलग* नोड होते
 हैं और तब तक शेयर नहीं होते जब तक kernel cut origins हटा नहीं देता। लिटरल इसका अपवाद हैं, और
@@ -179,7 +179,8 @@ flowchart TD
 
 | AxisType | CPU | CUDA | मतलब |
 |----------|-----|------|------|
-| **Loop** | `for` loop | `for` loop | सीक्वेंशियल इटरेशन; rangeify का डिफ़ॉल्ट |
+| **Weak** | `for` loop | `for` loop | अनपैरेललाइज़्ड रेंज; rangeify का डिफ़ॉल्ट |
+| **Loop** | `for` loop | `for` loop | एक्सप्लिसिट रेगुलर लूप |
 | **Global** | Thread pool | `blockIdx` | आउटर पैरेलल डायमेंशन |
 | **Thread** | Thread pool | — | CPU पैरेलिज़्म |
 | **Warp** | (N/A) | warp/wavefront | सब-ग्रुप पैरेलिज़्म |
@@ -189,7 +190,7 @@ flowchart TD
 | **Reduce** | Accumulator | Warp reduce | रिडक्शन डायमेंशन |
 | **Unroll** | Unrolled | Unrolled | लूप अनरोलिंग |
 
-AxisType हाइरार्की (Loop → Global/Thread → Warp → Local/GroupReduce → Upcast → Reduce → Unroll) हार्डवेयर एक्ज़ीक्यूशन मॉडल से मैप करती है — आउटर लूप्स की प्रायोरिटी कम होती है। `AxisType::Global` वाला `RANGE` CUDA में `blockIdx.x` बनता है। `AxisType::Local` वाला `RANGE` `threadIdx.x` बनता है।
+AxisType हाइरार्की (Weak/Loop → Global/Thread → Warp → Local/GroupReduce → Upcast → Reduce → Unroll) हार्डवेयर एक्ज़ीक्यूशन मॉडल से मैप करती है — आउटर लूप्स की प्रायोरिटी कम होती है। `AxisType::Global` वाला `RANGE` CUDA में `blockIdx.x` बनता है। `AxisType::Local` वाला `RANGE` `threadIdx.x` बनता है।
 
 एक्सप्लिसिट लूप्स क्यों ज़रूरी हैं:
 
@@ -216,8 +217,8 @@ patterns! {
     Add(a @const(a_val), _b @const(b_val))
         => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 
-    // Self-folding: x / x → 1
-    Idiv(x, x) => UOp::one(x.dtype()),
+    // Self-folding: x // x → 1
+    FloorDiv(x, x) => 1.into_uop(x.dtype()),
 
     // Dead code: if(true) { x } else { y } → x
     Where(Const(ConstValue::Bool(true)), t, _f) => t,
@@ -280,11 +281,9 @@ Rangeify पास movement ops (`EXPAND`, `PERMUTE`) को `RANGE` लूप�
 flowchart TD
   STORE["STORE"] --> IDXC["INDEX"]
   STORE --> RED["REDUCE(Add)"]
-  STORE --> RJ["RANGE(j, Global) j in [0, 4)"]
-  STORE --> RI["RANGE(i, Global) i in [0, 4)"]
-  IDXC --> DG["DEFINE_GLOBAL(C)"]
-  IDXC --> RI
-  IDXC --> RJ
+  IDXC --> DG["PARAM(C)"]
+  IDXC --> RI["RANGE(i, Global) i in [0, 4)"]
+  IDXC --> RJ["RANGE(j, Global) j in [0, 4)"]
   RED --> MUL["MUL"]
   RED --> RK["RANGE(k, Reduce) k in [0, 4)"]
   MUL --> LA["LOAD(A)"]

@@ -6,13 +6,16 @@ sidebar_label: AM Driver
 
 The **AM** driver is a second [`AmdIface`](./overview.md) backend that drives the
 GPU's PCI BARs directly, bypassing the kernel `amdgpu`/KFD driver entirely. It
-is a port of tinygrad's userspace AM driver. The motivation is concrete: the
-lock-free [multi-queue dispatch](./queues-and-dispatch.md) path overloads the
-kernel's MES/runlist scheduler under heavy concurrent load and can crash the
-kernel. If we own the GPU — page tables, firmware, scheduling — the kernel is
-never in the dispatch path and can't be overloaded.
+is a port of tinygrad's userspace AM driver. The motivation is concrete: on
+single-XCC gfx11+ parts the lock-free
+[multi-queue dispatch](./queues-and-dispatch.md) path can park CP micro-engines
+in waits that the kernel's MES firmware cannot preempt, wedging it into an
+unrecoverable reset. The kernel scheduler is the shared weakness — the same
+class of failure is what forces the lane pool to stay conservative on every
+part. If we own the GPU — page tables, firmware, scheduling — the kernel is
+never in the dispatch path and can't be wedged.
 
-:::caution Work in progress — not yet selectable
+:::caution[Work in progress — not yet selectable]
 This page documents both what exists today and the roadmap for the rest.
 **`SVOD_AMD_BACKEND=am` currently returns an error** (`device.rs` accepts only
 `kfd`): no AM type implements the [`AmdIface`](./overview.md) seam yet, so the
@@ -36,10 +39,12 @@ The driver targets a **CDNA3** GPU — **gfx9.4.3**, 8 XCCs in SPX mode — and
 specifically its **SR-IOV Virtual Function** flavor (the GPU is a VF passed into
 a KVM guest). `AmDev::open` hard-rejects anything else: a non-VF function, or a
 GC version whose major.minor isn't `(9, 4)`, fails fast
-(`device/src/amd/am/dev.rs`). The earlier gfx1151 (RDNA3.5) survives only as a
-vendored register table and one vestigial unit test; it is no longer the target.
+(`device/src/amd/am/dev.rs`). gfx1151 (RDNA3.5) is no longer the *target*, but
+the gfx11 arch branch stays implemented and unit-tested — and its page-table
+geometry and palloc-range helpers are what the gfx9 path reuses.
 
-> Validated on AMD Instinct MI300X (gfx942) and Ryzen AI "Strix Halo" (gfx1151).
+> Bring-up hardware: an SR-IOV VF of an AMD Instinct MI300X (gfx942 /
+> GC 9.4.3). `AmDev::open` accepts nothing else.
 
 Being a **VF** (rather than bare metal) is the defining constraint, and it shapes
 the whole driver:
@@ -74,8 +79,8 @@ the hardware-facing pieces are additionally validated on the live VF through the
 
 | Group | Module(s) | What it does | Status |
 |---|---|---|---|
-| **Discovery** | `pci.rs`, `discovery.rs` | sysfs BAR mmap (BAR0 VRAM / BAR2 doorbell / BAR5 MMIO), config-space r/w, bounds-checked IP-discovery parser (per-XCC segment bases, `gc_info` v1/v2) | **HW-validated** + unit-tested |
-| **Register access** | `regaccess.rs`, `rlcg.rs`, `mailbox.rs`, `regs.rs`, `regs_gen.rs` | the mxgpu VF↔GIM mailbox handshake, RLCG indirect GC/GCVM r/w (per-XCC), the MMIO/RLCG router, vendored register tables | **HW-validated** + unit-tested |
+| **Discovery** | `pci.rs`, `discovery.rs` | sysfs BAR mmap (BAR0 VRAM / BAR2 doorbell / BAR5 MMIO), config-space r/w, bounds-checked IP-discovery parser (per-XCC segment bases, `gc_info` v1/v2) | **HW-validated**; the discovery parser is unit-tested |
+| **Register access** | `regaccess.rs`, `rlcg.rs`, `mailbox.rs`, `regs.rs`, `regs_gen.rs` | the mxgpu VF↔GIM mailbox handshake, RLCG indirect GC/GCVM r/w (per-XCC), the MMIO/RLCG router, vendored register tables | **HW-validated**; the register-table select/encode logic is unit-tested |
 | **Memory (GMMU)** | `mm/{tlsf,pagetable,manager,mod}.rs` | TLSF VA/PA/page-table allocators, 4-level/48-bit walk, gfx9 **and** gfx11 PTE/PDE encoding, huge-page selection, table reclaim, `valloc`/`vfree` | **Done** + tests (PTE write path HW-exercised) |
 | **GMC bring-up** | `ip/gmc.rs` | program both hubs' context0 (start/end/base + CNTL), MX_L1_TLB enable, per-engine invalidation ranges, ENG17 TLB flush, HDP flush, fault-status decode | **HW-validated** to context-program level |
 | **GFX bring-up** | `ip/gfx.rs` | enable the MEC (icache invalidate, golden `GB_ADDR_CONFIG`, doorbell range, unhalt), build a v9 compute MQD, activate the HQD (`CP_HQD_ACTIVE=1`), `WRITE_DATA` PM4 | **MEC HQD activates**; queue does not yet run |
@@ -88,12 +93,13 @@ The page-table geometry is **4-level / 48-bit** (`va_shifts = [12, 21, 30, 39]`)
 a shape **shared across gfx9/11/12** — so the geometry itself does not branch on
 arch. Only the leaf PTE encoding (notably the MTYPE memory-type field) is
 arch-specific, and **both gfx9 (CDNA) and gfx11 (RDNA3) are now implemented
-and unit-tested** — gfx9 leaf flags put MTYPE at bits 57–58, set the PDB1 `bfs`,
-the PDB0 translate-further bit, and the `PDE_PTE` bit on higher leaves. **gfx12 is
-the only remaining `unimplemented!`** (constants captured, not yet hardware-
-validated; a test asserts it panics). The `MemoryManager` runs three TLSF
-sub-allocators (VA space, physical VRAM, page-table pool) and walks the table in
-`Inspect` / `Create` / `Free` modes, reclaiming empty tables on unmap.
+and unit-tested** — gfx9 puts MTYPE at bits 57–58, sets `bfs` on PDB1 table
+entries and the translate-further bit on PDB0 table entries, and marks PDB1/PDB2
+leaves with `PDE_PTE` (a 2 MiB PDB0 leaf is the *absence* of translate-further).
+**gfx12 is the only remaining `unimplemented!`** (constants captured, not yet
+hardware-validated; a test asserts it panics). The `MemoryManager` runs three
+TLSF sub-allocators (VA space, physical VRAM, page-table pool) and walks the
+table in `Inspect` / `Create` / `Free` modes, reclaiming empty tables on unmap.
 
 ### Register tables are generated-once, then vendored
 
@@ -180,11 +186,12 @@ bypassed.
 
 ## Why this matters
 
-The AM driver is the real answer to the kernel-overload problem that the
-[single-queue mode](./queues-and-dispatch.md) only sidesteps. The expensive,
-GPU-free parts — the GMMU, the register tables, the mailbox/RLCG indirect-access
-machinery — are built and validated on the live VF, and the page tables, GMC, and
-ownership handshake all work. The remaining gap is a hardware boundary (the
-PF-owned doorbell aperture), not a design one. And because it slots in behind the
-same five-method [seam](./overview.md), none of the dispatch, compile, or graph
-machinery has to change when it lands.
+The AM driver is the real answer to the firmware-wedge problem that clamping the
+lane pool ([`SVOD_AMD_HW_QUEUES=1`](./queues-and-dispatch.md)) only sidesteps.
+The expensive, GPU-free parts — the GMMU, the register tables, the mailbox/RLCG
+indirect-access machinery — are built and validated on the live VF, and the page
+tables, GMC, and ownership handshake all work. The remaining gap is a hardware
+boundary (the PF-owned doorbell aperture), not a design one. And because it
+slots in behind the same [seam](./overview.md) — five required methods plus
+three defaulted hooks — none of the dispatch, compile, or graph machinery has to
+change when it lands.

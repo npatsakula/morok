@@ -34,7 +34,6 @@ flowchart LR
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tk::arch::FragRole;
-use svod_tk::index::Idx;
 use svod_tk::tiles::TileLayout;
 use svod_tk::{run_kernel, MoveIdx};
 
@@ -58,18 +57,17 @@ run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| {
     let gb = ker.gl(&[1, 1, 16, 16], DType::Float32);
 
     // Ask for the 16×16 f32 fragment by role — arch-correct on wave32 and wave64.
-    let frag = ker.caps.frag(FragRole::Accumulator);
-    let blk = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::Const(0)];
+    let frag = ker.frag(FragRole::Accumulator);
 
     // global → register
-    let ra = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), ga, MoveIdx::block(&blk, 2));
-    let rb = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), gb, MoveIdx::block(&blk, 2));
+    let ra = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), ga, MoveIdx::block((0, 0, 0, 0), 2));
+    let rb = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), gb, MoveIdx::block((0, 0, 0, 0), 2));
 
     // the one compute op
     let rc = warp.add(ra, &rb);
 
     // register → global, then close the kernel around its single store
-    let _ = warp.store(o, rc, MoveIdx::block(&blk, 2));
+    let _ = warp.store(o, rc, MoveIdx::block((0, 0, 0, 0), 2));
     ker.finish(1)
 })
 .expect("tile_add launch");
@@ -96,8 +94,8 @@ run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| { /* bo
 `[1, 1, 1]` grid और `w` block — यही launch geometry है। हम **एक wave का एक workgroup** इस्तेमाल करते हैं:
 पूरा `16×16` tile एक ही wave के registers में समा जाता है, इसलिए blocks भर में फैलाने को कुछ है ही नहीं।
 block size `w` है, यानी **wave width** — जिसे हमने पहले ही device से query कर लिया था
-(`resolve_arch(&ta.device()).wave_size()`), क्योंकि एक wave CDNA पर 64 lanes की होती है पर RDNA पर 32, और
-block dimension *वही* lane count है। output slice पहले आता है, inputs बाद में — और **यही order वह contract
+(`ArchCaps::for_arch(resolve_arch(&ta.device())).wave_size`), क्योंकि एक wave CDNA पर 64 lanes की होती है पर
+RDNA और NVIDIA पर 32, और block dimension *वही* lane count है। output slice पहले आता है, inputs बाद में — और **यही order वह contract
 है** जिस पर अगला step टिका है।
 
 ### 2. काम के लिए एक wave लें
@@ -131,30 +129,30 @@ tensor साथ रखता है, allocation के लिए।)
 ### 4. role से tile माँगें
 
 ```rust
-let frag = ker.caps.frag(FragRole::Accumulator);
+let frag = ker.frag(FragRole::Accumulator);
 ```
 
 यह [Wave32 बनाम Wave64](./wave-portability) वाली portability की चाल है, और यह उस कर्नेल में भी मायने रखती है
-जिसमें कोई matrix multiply है ही नहीं: वही logical `16×16` f32 tile दोनों AMD wave widths पर एक *अलग
+जिसमें कोई matrix multiply है ही नहीं: वही logical `16×16` f32 tile हर supported architecture पर एक *अलग
 physical lane layout* रखता है, इसलिए किसी hardcoded fragment के बजाय एक **role** का नाम लेने से एक ही body
-दोनों के लिए compile हो जाती है। हम `ArchCaps` से `Accumulator` role माँगते हैं — यानी बस एक
-full-precision result tile का role, जो एक add भी produce करता है, सिर्फ़ MMA ही नहीं — और इसे target के लिए
-physical fragment resolve करने देते हैं: CDNA पर wave64, RDNA पर even/odd wave32 layout।
+उन सबके लिए compile हो जाती है। हम कर्नेल से `Accumulator` role माँगते हैं — यानी बस एक
+full-precision result tile का role, जो एक add भी produce करता है, सिर्फ़ MMA ही नहीं — और `Kernel::frag`
+इसे `ArchCaps::frag` को आगे सौंप देता है ताकि target के लिए physical fragment resolve हो सके: CDNA पर
+wave64, RDNA पर even/odd wave32 layout, और CUDA पर two-half `mma.sync` layout।
 
 ### 5. Load: global → register
 
 ```rust
-let blk = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::Const(0)];
-let ra = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), ga, MoveIdx::block(&blk, 2));
-let rb = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), gb, MoveIdx::block(&blk, 2));
+let ra = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), ga, MoveIdx::block((0, 0, 0, 0), 2));
+let rb = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), gb, MoveIdx::block((0, 0, 0, 0), 2));
 ```
 
 `ker.rt(...)` अभी resolve हुई fragment layout में एक register tile allocate करता है; `warp.load` इसे global
-से भर देता है। `MoveIdx::block(&blk, 2)` बताता है कि global का *कौन-सा* tile पढ़ना है: `blk` चारों
+से भर देता है। `MoveIdx::block((0, 0, 0, 0), 2)` बताता है कि global का *कौन-सा* tile पढ़ना है: यह tuple चारों
 dimensions में से हर एक पर tile का coordinate है — सब zero, क्योंकि एक अकेले `16×16` tile की बस `(0, 0)`
 position होती है — और `2` वह axis है जिसके साथ ये tiles stacked हैं: dimension 2, यानी `[1, 1, 16, 16]`
 view का row dimension। (एक `[1, 1, 32, 16]` global में दो row-tiles होते; दूसरे को पढ़ने पर वह coordinate
-`Idx::Const(1)` हो जाता।) wave मिलकर 256 elements को सीधे registers में खींच लेती है, पहले से ही उस layout में
+`1` हो जाता।) wave मिलकर 256 elements को सीधे registers में खींच लेती है, पहले से ही उस layout में
 जो compute चाहता है।
 
 यह *सीधा* `global → register` path है — बीच में कोई shared-memory रुकावट नहीं। जो कर्नेल बड़े tensors stream
@@ -176,7 +174,7 @@ let rc = warp.add(ra, &rb);
 ### 7. Store और finish
 
 ```rust
-let _ = warp.store(o, rc, MoveIdx::block(&blk, 2));
+let _ = warp.store(o, rc, MoveIdx::block((0, 0, 0, 0), 2));
 ker.finish(1)
 ```
 
@@ -208,17 +206,17 @@ let result = out.as_vec::<f32>().expect("read out"); // result[i] == 3 * i
 |------|-----|
 | **Tile dims `16` के गुणक हों** | एक tile `16×16` matrix-core fragments की पूरी संख्या है; `ker.rt` इसे assert करता है। |
 | **`gl()` order = launch buffer order** | पहले outputs, फिर inputs। bind positional है; एक mismatch चुपचाप buffers swap कर देता है — ग़लत numbers, कोई error नहीं, इसलिए compiler इसे पकड़ नहीं पाता। |
-| **fragments role से माँगें, constant से नहीं** | `caps.frag(role)` ही वह चीज़ है जो एक body को wave32 *और* wave64, दोनों पर चलाती है। |
+| **fragments role से माँगें, constant से नहीं** | `ker.frag(role)` ही वह चीज़ है जो एक body को wave32 पर, wave64 पर, *और* NVIDIA के warp32 पर चलाती है। |
 | **यह एक GPU कर्नेल है** | builder असली lane indices (`Op::Special`) mint करता है, इसलिए execution एक GPU को target करता है — AMD या CUDA — CPU को नहीं। |
 
 ---
 
-:::tip GPU विशेषज्ञों के लिए
+:::tip[GPU विशेषज्ञों के लिए]
 body बिल्कुल [IR में authoring](./lowering) वाले `RANGE` / `INDEX` / `LOAD` / `STORE` shape में lower होता
 है — कोई नए node types नहीं। कर्नेल एक lane-index `Op::Special` mint करता है जिस पर wave के loads सवार होते
 हैं; हर `warp.load` उस lane के तहत एक global `LOAD` बनता है, `warp.add` एक अकेला `Op::Binary(Add)` है, और
-store एक `STORE` है जिस पर `SINK` close होता है। यहाँ **न** कोई `Wmma` है **न** कोई `DefineLocal`: यह एक
-register-only round-trip है, सबसे compact कर्नेल जिसे IR express कर सकता है।
+store एक `STORE` है जिस पर `SINK` close होता है। यहाँ **न** कोई `Wmma` है **न** `Local` address space वाला कोई `BUFFER`: यह
+एक register-only round-trip है, सबसे compact कर्नेल जिसे IR express कर सकता है।
 
 चूँकि कर्नेल `Special` ops emit करता है, यह एक पूरी तरह hand-lowered GPU कर्नेल *है* — optimizer और
 workgroup-dimension passes एक `Special`-bearing graph को already-lowered मानकर उसे pass through कर देते हैं
@@ -242,5 +240,5 @@ recurrence, double-buffered streaming, और एक wave-size branch के स
 और यह सब एक ही UOp IR है। जो `SINK` आपने बनाया, वह उसी तरह की object है जो compiler एक autotuned कर्नेल के
 लिए produce करता है — और यही इस पूरे section का असल मक़सद है।
 
-आगे वह बारीकी है जो AMD पर हाथ से authoring को सचमुच मुश्किल बना देती है — एक कर्नेल को wave sizes भर में
-correct रखना: [Wave32 बनाम Wave64](./wave-portability)।
+आगे वह बारीकी है जो हाथ से authoring को सचमुच मुश्किल बना देती है — एक कर्नेल को wave sizes और fragment
+layouts भर में correct रखना: [Wave32 बनाम Wave64](./wave-portability)।

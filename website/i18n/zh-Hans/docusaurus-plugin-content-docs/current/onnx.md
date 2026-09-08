@@ -19,7 +19,7 @@ Svod 的 ONNX 导入器是运行模型推理的推荐方式。它加载标准的
 
 **与其他框架的比较**
 
-在纯 Rust 框架中，Svod 的 ONNX 算子覆盖面最广——162 个算子，双后端（Clang + LLVM）上通过 1361 项一致性测试。`candle` 和 `burn` 支持的算子更少，也没有同等规模的测试套件。如果需要与生产环境 ONNX 模型的最大兼容性，用 `ort`——C++ ONNX Runtime 的 Rust 封装，覆盖完整的 ONNX 规范。
+在纯 Rust 框架中，Svod 的 ONNX 算子覆盖面最广——162 个算子，两个 CPU 后端（Clang 与 LLVM）上通过 1357 项一致性测试；当 `SVOD_DEVICE` 选择了 AMD 或 CUDA 设备时，同一套测试也会在该设备上运行。`candle` 和 `burn` 支持的算子更少，也没有同等规模的测试套件。如果需要与生产环境 ONNX 模型的最大兼容性，用 `ort`——C++ ONNX Runtime 的 Rust 封装，覆盖完整的 ONNX 规范。
 
 ---
 
@@ -46,8 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let OnnxModel { mut outputs, .. } = importer.import("model.onnx", &[])?;
 
     // 一次性调度所有输出，统一执行
-    let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
-    Tensor::realize_batch(&mut outs)?;
+    let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    Tensor::realize_batch(outs)?;
 
     for (name, tensor) in &outputs {
         println!("{name}: {:?}", tensor.as_ndarray::<f32>()?);
@@ -74,8 +74,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 一次性调度所有输出，统一执行
     //（内部自动解析输入的 assign——无需单独 realize）
-    let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
-    Tensor::realize_batch(&mut outs)?;
+    let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    Tensor::realize_batch(outs)?;
     Ok(())
 }
 ```
@@ -175,15 +175,18 @@ for (name, spec) in &graph.inputs {
 }
 ```
 
-### 外部权重
+### 外部权重与预构建输入
 
-一些 ONNX 模型将权重存储在单独的文件中。使用 `import_model_with_inputs()` 来提供它们：
+存放在 `.onnx` 文件之外的权重（`data_location = EXTERNAL`）无需额外调用：`import()` 会相对模型自身所在目录解析它们。
+
+如果要自己把输入张量交给导入器——例如算子在 trace 阶段就要读取的具体值——请对预解析的 `ModelProto` 使用 `import_model_with_inputs()`：
 
 ```rust
+let model_proto = ModelProto::decode(bytes)?;
 let model = importer.import_model_with_inputs(
-    "model.onnx",
+    model_proto,
+    inputs,  // HashMap<String, Tensor>
     &[],
-    external_weights,  // HashMap<String, Tensor>
 )?;
 ```
 
@@ -229,8 +232,8 @@ Svod:   then_result.where_(&condition, &else_result)
 
 ```rust
 // Realize all outputs at once (shares compilation and execution)
-let mut outputs: Vec<&mut Tensor> = model.outputs.values_mut().collect();
-Tensor::realize_batch(&mut outputs)?;
+let outputs: Vec<&mut Tensor> = model.outputs.values_mut().collect();
+Tensor::realize_batch(outputs)?;
 ```
 
 对于重复推理，使用 prepare/execute 模式（测试位于
@@ -245,8 +248,8 @@ let input = inputs.remove("audio").unwrap();
 input.assign(&Tensor::from_slice(&first_frame));
 
 // 2. Compile the execution plan (resolves assigns, allocates buffers)
-let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
-let mut plan = Tensor::prepare_batch(&mut outs)?;
+let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+let mut plan = Tensor::prepare_batch(outs)?;
 plan.execute()?;  // first run
 
 // 3. Fast loop: zero-copy writes via array_view_mut, no recompilation
@@ -316,8 +319,8 @@ println!("Variables: {:?}", model.variables.keys().collect::<Vec<_>>());
 | **简单导入** | `importer.import("model.onnx", &[])?` |
 | **动态维度** | `importer.import(path, &[("batch", 4)])?` |
 | **算子** | 162 / 200（[完整对齐表](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)） |
-| **已验证模型** | ResNet50、DenseNet121、VGG19、Inception、AlexNet、ShuffleNet、SqueezeNet、ZFNet |
-| **后端** | Clang + LLVM（结果一致） |
+| **已验证模型** | ResNet50、DenseNet121、VGG19、Inception v1/v2、AlexNet、ShuffleNet、SqueezeNet、ZFNet |
+| **后端** | CPU 上的 Clang + LLVM（结果一致）；`SVOD_DEVICE` 选择 GPU 时为 AMD 与 CUDA |
 | **扩展** | com.microsoft Attention、RotaryEmbedding、SkipLayerNorm、EmbedLayerNorm |
 | **局限性** | 不支持训练、不支持 Loop/Scan、形状多态的 If |
 

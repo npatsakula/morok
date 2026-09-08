@@ -19,7 +19,7 @@ Svod का ONNX इम्पोर्टर मॉडल इन्फ़रे�
 
 **दूसरे फ़्रेमवर्क से तुलना**
 
-Pure-Rust फ़्रेमवर्कों में Svod का ONNX ऑपरेटर कवरेज सबसे ज़्यादा है — 162 ऑपरेटर, दोनों बैकएंड (Clang + LLVM) पर 1361 पासिंग conformance टेस्ट। `candle` और `burn` में ऑपरेटर कम हैं और इतने बड़े टेस्ट सूट नहीं हैं। अगर प्रोडक्शन ONNX मॉडलों के साथ पूरी कम्पैटिबिलिटी चाहिए, तो `ort` इस्तेमाल करें — C++ ONNX Runtime का Rust रैपर, जो पूरा ONNX स्पेक कवर करता है।
+Pure-Rust फ़्रेमवर्कों में Svod का ONNX ऑपरेटर कवरेज सबसे ज़्यादा है — 162 ऑपरेटर, दोनों CPU बैकएंड (Clang और LLVM) पर 1357 पासिंग conformance टेस्ट; जब `SVOD_DEVICE` कोई AMD या CUDA डिवाइस चुनता है तो वही सूट उस पर भी चलता है। `candle` और `burn` में ऑपरेटर कम हैं और इतने बड़े टेस्ट सूट नहीं हैं। अगर प्रोडक्शन ONNX मॉडलों के साथ पूरी कम्पैटिबिलिटी चाहिए, तो `ort` इस्तेमाल करें — C++ ONNX Runtime का Rust रैपर, जो पूरा ONNX स्पेक कवर करता है।
 
 ---
 
@@ -46,8 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let OnnxModel { mut outputs, .. } = importer.import("model.onnx", &[])?;
 
     // सभी आउटपुट एक साथ शेड्यूल करें, एक ही पास में एक्ज़ीक्यूट करें
-    let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
-    Tensor::realize_batch(&mut outs)?;
+    let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    Tensor::realize_batch(outs)?;
 
     for (name, tensor) in &outputs {
         println!("{name}: {:?}", tensor.as_ndarray::<f32>()?);
@@ -74,8 +74,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // सभी आउटपुट एक साथ शेड्यूल करें, एक ही पास में एक्ज़ीक्यूट करें
     // (इनपुट के assign को इंटरनली रिज़ॉल्व करता है — अलग से realize की ज़रूरत नहीं)
-    let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
-    Tensor::realize_batch(&mut outs)?;
+    let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    Tensor::realize_batch(outs)?;
     Ok(())
 }
 ```
@@ -175,15 +175,21 @@ for (name, spec) in &graph.inputs {
 }
 ```
 
-### एक्सटर्नल वेट्स
+### एक्सटर्नल वेट्स और पहले से बने इनपुट
 
-कुछ ONNX मॉडल वेट्स अलग फ़ाइलों में स्टोर करते हैं। इन्हें प्रदान करने के लिए `import_model_with_inputs()` का उपयोग करें:
+`.onnx` फ़ाइल के बाहर रखे गए वेट्स (`data_location = EXTERNAL`) के लिए अलग कॉल की
+ज़रूरत नहीं है: `import()` उन्हें मॉडल की अपनी डायरेक्टरी के सापेक्ष हल कर लेता है।
+
+अगर आप इनपुट टेंसर खुद देना चाहते हैं — जैसे वे कंक्रीट वैल्यू जिन्हें ऑपरेटर trace
+के समय पढ़ते हैं — तो पहले से पार्स्ड `ModelProto` के साथ
+`import_model_with_inputs()` इस्तेमाल करें:
 
 ```rust
+let model_proto = ModelProto::decode(bytes)?;
 let model = importer.import_model_with_inputs(
-    "model.onnx",
+    model_proto,
+    inputs,  // HashMap<String, Tensor>
     &[],
-    external_weights,  // HashMap<String, Tensor>
 )?;
 ```
 
@@ -230,8 +236,8 @@ Svod:   then_result.where_(&condition, &else_result)
 
 ```rust
 // Realize all outputs at once (shares compilation and execution)
-let mut outputs: Vec<&mut Tensor> = model.outputs.values_mut().collect();
-Tensor::realize_batch(&mut outputs)?;
+let outputs: Vec<&mut Tensor> = model.outputs.values_mut().collect();
+Tensor::realize_batch(outputs)?;
 ```
 
 बार-बार इन्फ़रेंस के लिए, prepare/execute पैटर्न इस्तेमाल करें
@@ -246,8 +252,8 @@ let input = inputs.remove("audio").unwrap();
 input.assign(&Tensor::from_slice(&first_frame));
 
 // 2. Compile the execution plan (resolves assigns, allocates buffers)
-let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
-let mut plan = Tensor::prepare_batch(&mut outs)?;
+let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+let mut plan = Tensor::prepare_batch(outs)?;
 plan.execute()?;  // first run
 
 // 3. Fast loop: zero-copy writes via array_view_mut, no recompilation
@@ -317,8 +323,8 @@ println!("Variables: {:?}", model.variables.keys().collect::<Vec<_>>());
 | **सरल इम्पोर्ट** | `importer.import("model.onnx", &[])?` |
 | **डायनामिक dims** | `importer.import(path, &[("batch", 4)])?` |
 | **ऑपरेटर** | 162 / 200 ([पूर्ण पैरिटी तालिका](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)) |
-| **सत्यापित मॉडल** | ResNet50, DenseNet121, VGG19, Inception, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
-| **बैकएंड** | Clang + LLVM (समान परिणाम) |
+| **सत्यापित मॉडल** | ResNet50, DenseNet121, VGG19, Inception v1/v2, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
+| **बैकएंड** | CPU पर Clang + LLVM (समान परिणाम); `SVOD_DEVICE` से GPU चुनने पर AMD और CUDA |
 | **एक्सटेंशन** | com.microsoft Attention, RotaryEmbedding, SkipLayerNorm, EmbedLayerNorm |
 | **सीमाएँ** | कोई ट्रेनिंग नहीं, कोई Loop/Scan नहीं, शेप-पॉलीमॉर्फ़िक If |
 

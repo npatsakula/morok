@@ -67,27 +67,32 @@ After kernel splitting, pre-opt and post-opt run once per kernel.
 | | `uop.tree` | `Stage 7b: buffer limit enforcement complete` *(conditional)* |
 | **PRE-OPT** (`optimizer/mod.rs: apply_pre_optimization`) | | |
 | | `ast.initial` | `kernel initial` |
-| | `ast.pre` | `pre-opt: movement ops + syntactic sugar complete` |
+| | `ast.pre` | `pre-opt: movement ops complete` |
 | | `ast.pre` | `pre-opt: load collapse complete` |
 | | `ast.pre` | `pre-opt: split ranges complete` |
 | | `ast.pre` | `pre-opt: symbolic + flatten complete` |
 | | `ast.pre` | `pre-opt: simplify ranges complete` |
 | **POST-OPT** (`optimizer/mod.rs: apply_post_optimization_with_renderer`) | | |
-| | `ast.initial` | `kernel initial` |
+| | `ast.initial` | `kernel initial` *(trace level)* |
 | | `ast.optimized` | `Stage 8: after post-opt symbolic` |
 | | `ast.optimized` | `Stage 9: after pre_expand` |
-| | `ast.optimized` | `Stage 10: after add local buffers` |
 | | `ast.optimized` | `after pm_reduce` |
+| | `ast.optimized` | `after add local buffers` |
 | | `ast.optimized` | `after pm_add_gpudims` |
-| | — | `after pm_add_loads` *(elapsed_ms only, no tree)* |
+| | `ast.optimized` | `after pm_add_loads` |
 | | `ast.optimized` | `after devectorize` |
-| | `ast.optimized` | `after pm_bool_devectorize` |
-| | `ast.optimized` | `after pm_reduce_devectorize` |
+| | `ast.optimized` | `after early symbolic` |
+| | `ast.optimized` | `after memory coalescing` |
+| | `ast.optimized` | `after bottom-up elementwise/image pass` *(image renderers only)* |
+| | `ast.optimized` | `after extra symbolic` |
 | | `ast.optimized` | `after pm_lower_index_dtype` |
 | | `ast.optimized` | `after post-index symbolic` |
-| | `ast.optimized` | `Stage 18-19: after pm_decomp + pm_render` |
-| | `ast.optimized` | `after pm_float_decomp` |
-| | `ast.optimized` | `after bool_storage_pattern` |
+| | `ast.optimized` | `after cast float ALU operands` |
+| | `ast.optimized` | `after early decompositions` |
+| | `ast.optimized` | `after dtype decompositions` |
+| | `ast.optimized` | `Stage 18: after late decompositions` |
+| | `ast.optimized` | `Stage 19: after move gates from index` |
+| | `ast.optimized` | `Stage 20: after final rewrite` |
 | **LINEARIZER** | — | *No tree tracing (linear instruction lists)* |
 
 ### Extract All Stages at Once (Recommended)
@@ -155,7 +160,7 @@ For quick single-stage checks without the full extraction script:
 RUST_LOG=svod_schedule::rangeify::transforms=debug cargo test test_name -- --nocapture 2>&1 | rg 'range assignment complete'
 
 # Extract IR after a specific optimizer stage
-RUST_LOG=svod_schedule::optimizer=debug cargo test test_name -- --nocapture 2>&1 | rg 'Stage 18-19'
+RUST_LOG=svod_schedule::optimizer=debug cargo test test_name -- --nocapture 2>&1 | rg 'Stage 18'
 ```
 
 **Note**: Output is JSON. Use `scripts/extract-ir.sh` for readable, formatted output.

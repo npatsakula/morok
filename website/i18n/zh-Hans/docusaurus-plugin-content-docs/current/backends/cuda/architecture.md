@@ -8,26 +8,31 @@ sidebar_label: 架构
 都在 `device/src/cuda/` 中。
 
 ```text
+mod.rs        the dl_api! runtime-binding macro and the module's re-exports
 sys.rs        the bound driver entry points (libloading), CUresult, handles
-device.rs     CudaDevice: primary context, limits, streams, base event, poison latch
+device.rs     CudaDevice: primary context, limits, lanes, base event, scoped-sync tables, poison latch
 allocator.rs  CudaAllocator: device / managed / pinned memory, staged copies
-program.rs    CudaProgram: PTX module load, cuLaunchKernel, execute_timed, resources
-sync.rs       CudaPlanCtx, CudaDispatchTimestamps, CudaCompletionToken, CudaTimelineSignal
+program.rs    CudaProgram: cubin or PTX module load, cuLaunchKernel, execute_timed, resources
+sync.rs       CudaPlanCtx, CudaDispatchTimestamps, CudaCompletionToken
 graph.rs      CudaGraph: a CUDA graph DAG from GraphKernel::deps, patched replays
+cupti.rs      the CUPTI range profiler behind Tier 4 (see Profiling)
 ```
 
 ---
 
 ## 驱动绑定
 
-`sys.rs` 在一个 `cuda_api!` 宏里声明了后端用到的每一个入口点：Rust 字段、
-确切的导出名，以及 C 原型。`Api::load` 打开 `libcuda.so.1` 并预先把它们
-全部解析出来，因此一个缺失或被改名的符号会在加载时一次性失败，表现为
+`sys.rs` 在一个 `dl_api!` 块里声明了后端用到的每一个入口点：Rust 字段、
+确切的导出名，以及 C 原型；宏本身住在 `mod.rs` 里，`cupti.rs` 也复用它。
+`Api::load` 打开 `libcuda.so.1` 并预先把它们全部解析出来，因此一个缺失或
+被改名的符号会在加载时一次性失败，表现为
 `Error::DeviceUnavailable`（`libcuda.so.1 has no symbol ...`），而不是在首次
 使用时才失败。这些名字是 `cuda.h` 会重映射到的**带版本的**导出：
-`cuMemAlloc_v2`、`cuCtxDestroy_v2`、`cuGraphAddKernelNode_v2`、
+`cuMemAlloc_v2`、`cuDevicePrimaryCtxRelease_v2`、`cuGraphAddKernelNode_v2`、
 `cuGraphExecKernelNodeSetParams_v2`、`cuGraphInstantiateWithFlags`（不带版本的
 `cuGraphInstantiate` 是一个遗留的五参数 ABI，绝不会被碰到）。
+`cuEventElapsedTime` 是刻意的例外：它的 `_v2` 是 CUDA 12.8，那会把驱动下限
+抬到 R570。
 
 句柄是 `#[repr(transparent)]` 的指针 newtype（`CUcontext`、`CUmodule`、
 `CUfunction`、`CUstream`、`CUevent`、`CUgraph`、`CUgraphExec`……）；
@@ -48,10 +53,10 @@ CUDA cuLaunchKernel failed: CUDA_ERROR_INVALID_VALUE (1): invalid argument
 
 `CudaDevice::open(id)` 每进程缓存一次。它运行 `cuInit`，保持住设备的
 **主上下文**（`cuDevicePrimaryCtxRetain`），读取它需要的 `CudaLimits`
-（`cuDeviceGetAttribute`：SM 数量、每 block 与每 SM 的线程数与共享内存、
-寄存器、warp 大小、L2、托管内存支持），创建两个非阻塞流（供分配器用的
-**复制流**，以及供每调用 `Program::execute` 用的**调度流**），并记录一个
-**基准 event**，它是每个 GPU 时钟时间戳的零点。
+（`cuDeviceGetAttribute`：SM 数量、每 block 与每 SM 的线程数、每 block 的
+共享内存、warp 大小，以及托管内存是否可被一致地访问），创建两个非阻塞流
+（供分配器用的**复制流**，以及供每调用 `Program::execute` 用的**调度流**），
+并记录一个**基准 event**，它是每个 GPU 时钟时间戳的零点。
 
 驱动按线程保存当前上下文，因此后端的每一个入口点都以 `enter()` 开始：
 若设备已被毒化则拒绝，然后 `cuCtxSetCurrent`。一个**粘性**的 `CUresult`
@@ -74,22 +79,30 @@ CUDA cuLaunchKernel failed: CUDA_ERROR_INVALID_VALUE (1): invalid argument
 | `host` | `Pinned` | `cuMemHostAlloc(PORTABLE \| DEVICEMAP)`，内核经由总线读取它 |
 
 `supports_device_local()` 为 `true`，因此中间结果留在设备上。
-宿主 <-> 设备的复制先排空上下文（`cuCtxSynchronize`：宿主访问并不与 plan
-的那些流相互定序），然后用复制流上的 `cuMemcpyHtoDAsync` /
-`cuMemcpyDtoHAsync`、以 4 MiB 为块、通过一个惰性分配的**固定（pinned）暂存
-缓冲区**搬运数据，每块同步一次该流。固定缓冲区则直接 `memcpy`。
-设备到设备的 `_transfer` 是 `cuMemcpyDtoDAsync`；一次分配内部相互重叠的
-范围会经由一个临时缓冲区中转，以保持 `memmove` 语义。释放会先排空；
-若排空失败（上下文已被毒化），该分配会被**隔离**（泄漏），而不是在一个
-仍在飞行中的内核之下被释放。与每个计算分配器一样，它坐落在 `LruAllocator`
-之下。
+宿主 <-> 设备的复制先等待该存储在飞行中的生产者与读者
+（`CudaDevice::wait_storage`，见下——宿主访问并不与那些车道相互定序），
+然后再搬运数据。不超过 4 MiB 时，一次 copy-out 是一个同步的
+`cuMemcpyDtoH`，而一次 copy-in 是复制车道上的一个 `cuMemcpyHtoDAsync`，
+并被发布为该存储新的生产者；只有当源是驱动会跟踪的内存（固定、已注册或
+托管，用 `cuPointerGetAttribute` 问出来）时它才同步该流，因为驱动在返回
+之前会先把可分页的源暂存一遍。超过 4 MiB 时两个方向都以 4 MiB 为块、
+通过一个惰性分配的**固定（pinned）暂存缓冲区**用 `cuMemcpyHtoDAsync` /
+`cuMemcpyDtoHAsync` 搬运，每块同步一次该流。固定缓冲区则直接 `memcpy`。
+设备到设备的 `_transfer` 与清零在复制车道上是异步的：用 `cuStreamWaitEvent`
+排在那些生产者之后，被发布为两个范围新的生产者，并被此后任意车道上的每一次
+启动等待，因此它们从不阻塞宿主；一次分配内部相互重叠的范围会经由一个临时
+缓冲区中转，以保持 `memmove` 语义。释放会先等待该存储的生产者；若等待失败
+（上下文已被毒化），该分配会被**隔离**（泄漏），而不是在一个仍在飞行中的
+内核之下被释放。与每个计算分配器一样，它坐落在 `LruAllocator` 之下，而后者
+会把一个被回收的分配栅栏在其上一位所有者的生产者上。
 
 ---
 
 ## 程序与启动
 
-`CudaProgram::load` 把 PTX 文本连同 16 KiB 的错误与信息日志缓冲区交给
-`cuModuleLoadDataEx`，因此一次 JIT 失败会浮现为
+`CudaProgram::load` 按 `is_cubin` 分支——一个 ELF 映像走 `validate_cubin`，
+PTX 文本走入口的 `.param` 检查——两者都抵达同一个 `cuModuleLoadDataEx`，
+带着 16 KiB 的错误与信息日志缓冲区，因此一次 JIT 失败会浮现为
 `Error::CudaJit { kernel, cause, log }`，其中携带 `ptxas` 自己的消息（见
 [调试](./debugging.md)）；信息日志则走 `tracing::debug!`。随后它用
 `cuModuleGetFunction` 绑定入口，并读取函数属性
@@ -102,7 +115,7 @@ CUDA cuLaunchKernel failed: CUDA_ERROR_INVALID_VALUE (1): invalid argument
 槽顺序排列，这恰好就是 PTX 天然的 `.param` 布局。`global_size` 是**以 block
 为单位的 grid**，`local_size` 是**以线程为单位的 block**（AMD 与 Metal 所用的
 工作组约定）；一个大于函数 `maxThreadsPerBlock` 的 block 会在启动前被拒绝，
-消息中带上寄存器与共享内存的数字。
+消息中带上寄存器、共享内存与局部内存的数字。
 
 `Program::execute` 在设备的调度流上启动，并可选地在其上等待；
 `execute_timed` 在启动前后记录一对计时 event 并返回 `cuEventElapsedTime`，
@@ -112,19 +125,39 @@ CUDA cuLaunchKernel failed: CUDA_ERROR_INVALID_VALUE (1): invalid argument
 
 ## plan 上下文、令牌、timeline
 
-每个执行 plan 得到一个 `CudaPlanCtx`：**一个非阻塞流**，那就是它的车道。
-`dispatch` 在其上启动；设置了 `profile` 时，它会用计时 event 把这次启动
-括起来，并返回一个 `CudaDispatchTimestamps`（[剖析](./profiling.md)）。
+每个执行 plan 得到一个 `CudaPlanCtx`：**一个非阻塞流**，那就是它的车道，
+外加装填计数器时的 CUPTI 计数器选择与 session。`dispatch` 在其上启动；
+设置了 `profile` 时，它会用计时 event 把这次启动括起来，并返回一个
+`CudaDispatchTimestamps`（[剖析](./profiling.md)）。
 `completion_token` 记录一个仅完成用的 event（`CU_EVENT_DISABLE_TIMING`），
 它的 `wait` 是 `cuEventSynchronize`，`retired` 是 `cuEventQuery`；
 `synchronize` 是 `cuStreamSynchronize`。
 
-执行器的跨 plan 定序使用 `CudaTimelineSignal`，一条由 event 发布的
-timeline：`signal(stream, value)` 在流的尾部记录一个 event 并归档
-`(value, event)`；`value()` 把每一次已退休的发布折叠进下界；`wait(target)`
-在携带最小的 `>= target` 值的那个 event 上阻塞；`wait_on_stream` 用
-`cuStreamWaitEvent` 把 GPU 工作排在它之后。槽位是 `Arc` 的，因此一个等待者
-可以在另一个线程把它折叠掉的同时让自己的 event 保持存活。
+### 带作用域的同步
+
+各条车道之间并不相互定序，因此 `CudaDevice` 维护三张表
+（`device/src/cuda/device.rs` 的模块文档）：
+
+- **producers**——存储基址 -> 每条车道上读过或写过它的最新完成令牌
+  （一次宿主覆写对在飞行中的读者也是一个 WAR 冒险）。执行器在每次 execute
+  之后，把一个 plan 或图的令牌发布到该 plan 触及的每一处存储上；分配器在
+  每次传输或 memset 之后发布一个复制车道的令牌。`wait_storage(base)` 先排空
+  下面说的那些车道，再等待这些令牌，然后把它们从表里丢掉。一处表里不认识的
+  存储——包括其最新令牌属于另一个后端的那种——会回落到 `cuCtxSynchronize`。
+- **lanes**——每一条活着的车道，以及它上面有多少次尚无令牌被发布的提交
+  （每调用的 `Program::execute`、一个中途失败的 plan、一次在其令牌被取走
+  之前的图重放）。`wait_storage` 会在宿主上排空这样的车道；而一次复制则改为
+  在每条车道上记录一个尾部 event 并在 GPU 上等待它。复制车道自己不在这张表里。
+- **copy tail**——最新的那个复制车道 event；每一次启动都会在 GPU 上先等待它
+  再运行，因此异步复制先于此后的每一个内核。
+
+`SVOD_CUDA_SCOPED_SYNC=0` 会把这一切统统关掉：每一次等待都排空上下文，
+每一次复制都同步复制流。
+
+执行器的跨 plan 定序在每个后端上都是一个宿主信号（`CpuTimelineSignal`），
+CUDA 也不例外；并没有它自己的 `TimelineSignal` 实现。把这个宿主信号挡在
+关键路径之外的，正是上面这套机制：那些表用 `cuStreamWaitEvent` 让 GPU 工作
+相对 GPU 工作定序，因此一个 plan 在宿主上等待的，永远只是它真正要读的东西。
 
 ---
 
@@ -160,16 +193,21 @@ params 经由与即时启动相同的 `extra` 协议指向该内核的 kernarg b
 ```text
 backend:             nvptx-clang
 target_architecture: nvptx64-nvidia-cuda/sm_86
-toolchain:           <clang identity>
-flags:               -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 -Wno-override-module - -o -
+toolchain:           <clang identity>[;ptxas:path=...;version=...]
+flags:               -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx78 -Wno-override-module - -o -
+                     [-arch=sm_86 -o /dev/stdout /dev/stdin]
 abi:                 ptx-kernel-abi-v1;warp-size=32
-object_format:       ptx-text-v1
+object_format:       ptx-text-v1 | cubin-v1
 ```
 
-缓存存的是 **PTX 文本**，绝不是 cubin：驱动在加载时汇编它，并把 SASS 留在
-自己的 `~/.nv/ComputeCache` 里。每一次缓存命中在抵达驱动之前都会被重新校验
-（`validate_ptx`），见[代码生成](./codegen.md)。`SVOD_OBJECT_CACHE=0` 关闭该
-缓存，`SVOD_OBJECT_CACHE_DIR` 则可迁移它的位置。
+方括号里的那两半是 `ptxas` 那条路径：有这个汇编器时，缓存下来的对象是一个
+**cubin**；没有它时则是 **PTX 文本**，由驱动在加载时汇编，并把 SASS 留在
+自己的 `~/.nv/ComputeCache` 里。两种格式绝不会共用同一条缓存项，因为它们在
+`toolchain`、`flags` 与 `object_format` 上都各不相同。渲染出的 IR 也不是键的
+全部：ABI 描述符会被追加到它后面，因为一个 cubin 的入口是在编译期对着它们
+校验的。每一次缓存命中在抵达驱动之前，都会被其格式对应的校验器重新校验——
+`validate_cubin` 或 `validate_ptx`，见[代码生成](./codegen.md)。
+`SVOD_OBJECT_CACHE=0` 关闭该缓存，`SVOD_OBJECT_CACHE_DIR` 则可迁移它的位置。
 
 设备工厂（`create_cuda_device`）还会拒绝一台每 block 共享内存上限低于优化器
 profile 静态 `shared_max` 的设备，否则一个按该 profile 定尺的内核就只会在

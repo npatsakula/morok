@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 4. `as_ndarray()` extracts the result as an `ndarray::ArrayD` for inspection.
 
-**Try this:** Remove the `realize()` call. The code still runs, but `data` would be empty—nothing was computed.
+**Try this:** Remove the `realize()` call. `as_ndarray()` then fails with a "no buffer" error—nothing was computed, so there is no result to read.
 
 ---
 
@@ -70,6 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Neural networks constantly reshape data. Let's master the basics.
 
 ```rust
+use svod_tensor::Tensor;
 use ndarray::array;
 
 fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,7 +80,7 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Reshape to a 2x3 matrix (or create directly with from_ndarray)
     let matrix = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-    println!("Matrix shape: {:?}", matrix.shape());  // [2, 3]
+    println!("Matrix shape: {:?}", matrix.shape()?);  // [2, 3]
     // [[1, 2, 3],
     //  [4, 5, 6]]
 
@@ -133,6 +134,7 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
 Matrix multiplication is the workhorse of neural networks. Every layer uses it.
 
 ```rust
+use svod_tensor::Tensor;
 use ndarray::array;
 
 fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
@@ -156,7 +158,7 @@ fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
 
     output.realize()?;
     println!("Output shape: {:?}", output.shape()?);  // [4, 2]
-    println!("{:?}", biased.as_ndarray::<f32>()?);
+    println!("{:?}", output.as_ndarray::<f32>()?);
     // Each row: weighted sum of that sample's features
 
     Ok(())
@@ -194,7 +196,7 @@ fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
     let mut output = layer.forward(&input)?;
 
     output.realize()?;
-    println!("Output: {:?}", biased.as_ndarray::<f32>()?);
+    println!("Output: {:?}", output.as_ndarray::<f32>()?);
 
     Ok(())
 }
@@ -236,12 +238,12 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get results
     probs.realize()?;
-    println!("Probabilities: {:?}", probs_biased.as_ndarray::<f32>()?);
+    println!("Probabilities: {:?}", probs.as_ndarray::<f32>()?);
 
     // Get predicted class
     let mut prediction = logits.argmax(Some(-1))?;
     prediction.realize()?;
-    println!("Predicted digit: {:?}", pred_output.as_ndarray::<i32>()?);
+    println!("Predicted digit: {:?}", prediction.as_ndarray::<i32>()?);
 
     Ok(())
 }
@@ -263,9 +265,11 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Example 6: Under the Hood
 
-Want to see what Svod generates? Here's how to inspect the IR and generated code.
+Want to see what Svod generates? Here's how to inspect the IR and the compiled kernels.
 
 ```rust
+use svod_tensor::Tensor;
+
 fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
     let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
     let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
@@ -290,7 +294,7 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 1. **IR Graph:** The UOp tree shows operations like `BUFFER`, `LOAD`, `ADD`, `STORE`. This is Svod's intermediate representation before optimization.
 
-2. **Generated Code:** The actual LLVM IR or GPU code that runs. Notice how Svod fuses the loads and add into a single kernel—no intermediate buffers needed.
+2. **Execution plan:** `prepare()` returns the compiled kernels. Notice how Svod fuses the two loads and the add into a single kernel—no intermediate buffers needed.
 
 **Debugging tip:** If something seems slow or wrong, print the IR tree. Look for:
 - Unexpected operations (redundant reshapes, extra copies)
@@ -314,8 +318,8 @@ You've learned the core patterns for using Svod:
 | Chain layers | `x.sequential(&[&fc1, &Relu, &fc2])?` |
 | Activation | `t.relu()?`, `t.softmax(-1)?` |
 | Execute | `t.realize()?` |
-| Batch realize | `Tensor::realize_batch(&mut [&mut a, &mut b])?` |
-| Extract data | `biased.as_ndarray::<f32>()?` |
+| Batch realize | `Tensor::realize_batch([&mut a, &mut b])?` |
+| Extract data | `t.as_ndarray::<f32>()?` |
 
 **The lazy evaluation pattern:**
 

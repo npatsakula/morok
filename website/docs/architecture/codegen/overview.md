@@ -34,6 +34,7 @@ If you're not a compiler engineer, this chapter might seem intimidating. Here's 
   - Local: Parallel within a workgroup
   - Reduce: Accumulator (sum, max, etc.)
   - Loop: Sequential iteration
+  - Upcast / Unroll: Expanded away by the expander into lanes
 
 **Stage**
 - One transformation pass through the code
@@ -73,11 +74,12 @@ Each stage applies pattern-based rewrites. Patterns fire until fixpoint, then th
 
 Several passes run between the numbered stages and don't have their own stage number:
 
-| Pass | Between Stages | Purpose |
+| Pass | Where It Runs | Purpose |
 |------|---------------|---------|
-| `linearize_multi_index` | Before Stage 8 | Flatten multi-dimensional indices to linear offsets |
-| `pm_bool_devectorize` | 14–15 | Handle boolean vector patterns |
-| `pm_reduce_devectorize` | 14–15 | Handle vector reductions (K-vec, bool, horizontal) |
-| `merge_sibling_ends` | 14–15 | Merge adjacent END operations |
-| `pm_float_decomp` | Post-opt | Decompose floating-point operations |
-| `bool_storage_patterns` | Post-opt | Convert bool ↔ uint8 for memory operations |
+| `bool_storage_patterns` | Inside Stage 14 | Convert bool ↔ uint8 for memory operations |
+| `indexing_simplify` | Inside Stages 14 and 15 | Fold the addressing arithmetic scalarization exposes |
+| `sym()` (early symbolic) | 14–15 | Full symbolic simplification once the graph is scalar |
+| `memory_coalescing` | 14–15 | Merge neighbouring accesses into wider ones |
+| `pm_simplify_add_image` | 14–15 (bottom-up) | Image-dtype address simplification |
+| `pm_float_decomp` / `pm_long_decomp` | Inside Stage 18 | Emulate dtypes the target lacks (FP8/BF16, 64-bit ints) |
+| `pm_move_gates_from_index` | 18–19 | Move index validity onto the LOAD/STORE `gate` field |

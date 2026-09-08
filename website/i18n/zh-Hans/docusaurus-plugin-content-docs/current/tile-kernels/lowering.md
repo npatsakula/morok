@@ -44,8 +44,8 @@ flowchart LR
 
 你用两个类型来编写（来自 `tk/src/lib.rs` 里的 AUTHOR 面孔）：
 
-- **`Kernel`**（`tk/src/kernel.rs`）是即时构建器。它把原材料交到你手上：网格/块维度（会变成 `SPECIAL` 操作）、循环范围（`RANGE`）、共享内存缓冲区（`DEFINE_LOCAL`）、寄存器缓冲区（`DEFINE_REG`），以及全局参数。你把张量绑定上去，再向它索要 tile。
-- **`Group`**（`tk/src/group.rs`）是那群协作的 wave（或一组 wave）。它携带*计算*词汇：内存空间之间的加载与存储、`mma` 矩阵乘法、规约、混洗、逐元素映射。
+- **`Kernel`**（`tk/src/kernel.rs`）是即时构建器。它把原材料交到你手上：网格/块维度（会变成 `SPECIAL` 操作）、循环范围（`RANGE`）、共享内存与寄存器缓冲区（两者都是 `BUFFER`，靠 `addrspace = Local` / `Reg` 区分），以及全局参数（`PARAM`）。你把张量绑定上去，再向它索要 tile。
+- **`Group`**（`tk/src/group/`，每个关注点一个子模块：`movement`、`mma`、`reduce`、`shuffle`、`elementwise`）是那群协作的 wave（或一组 wave）。它携带*计算*词汇：内存空间之间的加载与存储、`mma` 矩阵乘法、规约、混洗、逐元素映射。
 
 每个 `Group` 操作都直接构建 UOp 节点。一次加载会打开必要的若干 `RANGE`，发射一个把它们关闭的 `STORE`，再返回一个重新包装过、带依赖边的目标 tile，好让下一个操作排在它之后。你是在即时地编写一张图，一次一个 tile 操作。
 
@@ -69,7 +69,7 @@ KernelInfo { opts_to_apply: Some(vec![]), name: Some(...), .. }
 | `Some(vec![])` | 「这个内核体**已经降级了**。一项进一步的优化都*别*应用。」 |
 | `Some(non-empty)` | 「就按这个顺序，恰好应用这些优化。」 |
 
-`tk` 内核用的是 `Some(vec![])`：调度是你亲手写的，优化器便原封不动。那些*仍然*会跑的重写遍（代数化简、索引降级）则被告知不要下探进内核体。你手工调优的循环原样存活到 codegen，但它仍是一张普通的 UOp 图，由*同一个*渲染器变成 LLVM IR，由*同一个*运行时执行。
+`tk` 内核用的是 `Some(vec![])`：调度是你亲手写的，优化器便一项调度优化都不应用。而每个内核在 codegen 之前都需要的那些共享重写（代数化简、索引 dtype 降级）仍会在这个内核体上跑；永远不会发生的是对它重新分块、重新向量化或重排。再往上，在图这一层，调度器的重写是*保持调用不变的*，它根本不会下探进一个手写内核的体内。你手工调优的循环原样存活到 codegen，但它仍是一张普通的 UOp 图，由*同一个*渲染器变成 LLVM IR，由*同一个*运行时执行。
 
 而这不只是图个方便（「你既然优化过了，那就别费心」）。它是一份**安全契约**，因为优化器*根本无法*安全地碰一个手写内核体。这个体里可能含有以 `Op::Custom` 形式出现的原始 LLVM/ASM 内建函数，[FLOPS 藏在哪里](./where-flops-hide) 里那些机器调度器原语正是如此。优化器**对这些不透明操作的语义毫无模型**，所以跨它们重新分块、重排或融合，都可能悄无声息地改变内核的结果，或悄悄毁掉你亲手搭起来的性能。于是 `Some(vec![])` 告诉优化器：对一个你并不完全理解的内核体，唯一安全的做法就是别碰它。
 
@@ -79,7 +79,7 @@ KernelInfo { opts_to_apply: Some(vec![]), name: Some(...), .. }
 
 从一个完成的 `Kernel` 到运行的代码，有两条路线，对应两类受众。
 
-:::tip 面向 GPU 专家
+:::tip[面向 GPU 专家]
 调度器把内核的 `Op::Call` 当成任何别的图节点对待：它沿 `AFTER`/`Call` 依赖链行走以找出内核边界，并把它作为一个被调度的内核发射；与此同时，重写遍以一种*保留 calls*的遍历方式运行，不下探进内核体。于是你手工降级的 `SINK` 被调度、被依赖跟踪的方式与自动调优内核完全一样，但它的内部从不被重写。
 :::
 
@@ -107,7 +107,7 @@ flowchart TD
 
 ## 没有静默回退
 
-内核库里有一种微妙的失败模式：你调用快速路径，它悄悄判定自己处理不了你的输入，于是把慢速路径塞给你却一声不吭，或者更糟，给你一个错误答案。`tk` 的公开内核（`tk/src/kernels/{fa,matmul}.rs`，经 `tk/src/launch.rs` 里的 `launch_custom`）从设计上就杜绝了这种情况。每个入口点都返回一个三态结果：
+内核库里有一种微妙的失败模式：你调用快速路径，它悄悄判定自己处理不了你的输入，于是把慢速路径塞给你却一声不吭，或者更糟，给你一个错误答案。`tk` 的公开内核（`tk/src/kernels/`：单输出的那些经 `tk/src/launch.rs` 里的 `launch_custom`，多输出的 k-means 与 k-NN 则内联同一套策略）从设计上就杜绝了这种情况。每个入口点都返回一个三态结果：
 
 | 结果 | 含义 | 你该做什么 |
 |--------|---------|-------------|
@@ -130,14 +130,14 @@ flowchart TD
   END --> RANGE["RANGE(0..N, Local) -- threadIdx, workgroup lane"]
   STORE --> IDX_OUT["INDEX"]
   STORE --> LOAD["LOAD"]
-  IDX_OUT --> DG_OUT["DEFINE_GLOBAL(out)"]
+  IDX_OUT --> P_OUT["PARAM(slot=0) -- out"]
   IDX_OUT --> RANGE
   LOAD --> IDX_IN["INDEX"]
-  IDX_IN --> DG_IN["DEFINE_GLOBAL(in)"]
+  IDX_IN --> P_IN["PARAM(slot=1) -- in"]
   IDX_IN --> RANGE
 ```
 
-没有新节点类型，没有单独的方言，正是 [IR 章节里那段 matmul 历程](../architecture/ir-design) 所终结于的那些操作。真实内核会再加上 `WMMA`、`DEFINE_LOCAL`（LDS）和 `DEFINE_REG`（寄存器），但形状一样：一个 SINK 罩着一个 STORE，由若干范围限定作用域。
+没有新节点类型，没有单独的方言，正是 [IR 章节里那段 matmul 历程](../architecture/ir-design) 所终结于的那些操作。真实内核会再加上 `WMMA`，以及位于 `Local`（LDS）和 `Reg`（寄存器）地址空间的 `BUFFER` 节点，但形状一样：一个 SINK 罩着一个 STORE，由若干范围限定作用域。
 
 ---
 
@@ -146,4 +146,3 @@ flowchart TD
 Svod 之所以能*同时*提供「让编译器找调度」和「我自己写调度」，又不用两个编译器，是因为两者产出的是同一个产物：一个由 UOp 组成的 `SINK`。优化器的 `opts_to_apply` 字段就是两者之间的接缝，它离 `None` 只差一个枚举值。[tk、HipKittens 与 CuTile 对比](./comparison) 会回过头来讲为什么这并不寻常。
 
 接下来，把这个构建器端到端地用起来：[编写一个内核](./first-kernel) 会逐行走过最简单的真实内核的编写与运行。
-</content>

@@ -29,7 +29,7 @@ Svod 是一个基于 Rust 的 ML 编译器，灵感来自 [Tinygrad](https://git
 | [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp 图 IR：80+ 操作、符号整数、内核来源 |
 | [device](https://github.com/npatsakula/svod/tree/main/device/) | 缓冲区管理：惰性分配、零拷贝视图、LRU 缓存 |
 | [schedule](https://github.com/npatsakula/svod/tree/main/schedule/) | 优化引擎：20+ 趟、RANGEIFY、Z3 验证 |
-| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | 代码生成：Clang（默认）、LLVM JIT |
+| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | 代码生成：LLVM IR（默认）、Clang C |
 | [runtime](https://github.com/npatsakula/svod/tree/main/runtime/) | JIT 编译与内核执行 |
 | [tensor](https://github.com/npatsakula/svod/tree/main/tensor/) | 高层惰性张量 API |
 | [onnx](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX 模型导入器 |
@@ -48,11 +48,15 @@ let b = Tensor::from_ndarray(&array![[5.0f32, 6.0], [7.0, 8.0]]);
 
 // Lazy — nothing executes yet
 let mut c = &a + &b;
-c.realize()?;
 
-// Zero-copy view into the result
-let view = c.array_view::<f32>()?;
-assert_eq!(view, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
+// Compile and execute, then extract as ndarray
+c.realize()?;
+let result = c.as_ndarray::<f32>()?;
+assert_eq!(result, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
+
+// Or extract as flat Vec
+let flat = c.as_vec::<f32>()?;
+assert_eq!(flat, vec![6.0, 8.0, 10.0, 12.0]);
 ```
 
 ## 模式 DSL 示例
@@ -91,17 +95,23 @@ nix fmt # Format source files
 
 | 依赖 | 版本 | 必需 | 描述 |
 |------------|---------|----------|-------------|
-| Rust | 1.85+ | 是 | Edition 2024 |
-| LLVM | 22.x | 是 | CPU 代码生成后端 |
-| Clang | - | 是 | LLVM 构建所需的 C 编译器 |
+| Rust | 1.88+ | 是 | Edition 2024、let-chains |
+| LLVM | >=16 | 是 | CPU 代码生成后端：`libLLVM` 在运行时加载（Nix 固定为 22.x） |
+| Clang | - | 是 | Clang 后端，以及 `libLLVM` 缺失时生成目标文件的回退路径 |
 | pkgconf | - | 是 | 构建配置工具 |
 | protobuf | - | 是 | ONNX proto 编译 |
 | zlib | >=1.3 | 是 | 压缩库 |
 | libffi | >=3.4 | 是 | 外部函数接口 |
 | libxml2 | >=2.13 | 是 | XML 解析 |
 | Z3 | >=4.15 | 否 | 用于优化验证的 SMT 求解器 |
-| NVIDIA 驱动 | CUDA >=12.8 (R570) | 否 | CUDA 后端所需的 `libcuda.so.1`，在运行时加载；无需 toolkit |
+| NVIDIA 驱动 | CUDA >=12.0 (R525) | 否 | CUDA 后端所需的 `libcuda.so.1`，在运行时加载；无需 toolkit |
 | Clang NVPTX / AMDGPU target | - | 否 | GPU 内核编译（`clang --print-targets`） |
+
+### 线程
+
+`SVOD_THREADS`（默认值：主机的并行度）是唯一的线程预算：它决定编译内核并执行
+CPU 内核的线程池大小，同时也是 CPU 内核默认的 `core_id` 切分数。
+`RAYON_NUM_THREADS` 不会被读取。
 
 ## 测试
 

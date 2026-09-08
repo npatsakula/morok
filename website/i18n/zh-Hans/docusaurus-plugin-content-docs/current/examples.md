@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 4. `as_ndarray()` 将结果提取为 `ndarray::ArrayD` 以供查看。
 
-**试试看：** 去掉 `realize()` 调用。代码仍能运行，但 `data` 会是空的——什么都没有被计算。
+**试试看：** 去掉 `realize()` 调用。此时 `as_ndarray()` 会返回“没有缓冲区”的错误——什么都没有被计算，也就没有结果可读。
 
 ---
 
@@ -70,28 +70,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 神经网络不断地重塑数据。来掌握基础操作。
 
 ```rust
+use svod_tensor::Tensor;
+use ndarray::array;
+
 fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
     // Create a 1D tensor with 6 elements
     let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    println!("Original shape: {:?}", data.shape());  // [6]
+    println!("Original shape: {:?}", data.shape()?);  // [6]
 
-    // Reshape to a 2x3 matrix
-    let matrix = data.try_reshape(&[2, 3])?;
-    println!("Matrix shape: {:?}", matrix.shape());  // [2, 3]
+    // Reshape to a 2x3 matrix (or create directly with from_ndarray)
+    let matrix = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+    println!("Matrix shape: {:?}", matrix.shape()?);  // [2, 3]
     // [[1, 2, 3],
     //  [4, 5, 6]]
 
     // Transpose to 3x2
     let transposed = matrix.try_transpose(0, 1)?;
-    println!("Transposed shape: {:?}", transposed.shape());  // [3, 2]
+    println!("Transposed shape: {:?}", transposed.shape()?);  // [3, 2]
     // [[1, 4],
     //  [2, 5],
     //  [3, 6]]
 
     // Broadcasting: add a row vector to every row
     // [3, 2] + [1, 2] → [3, 2]
-    let bias = Tensor::from_slice([100.0f32, 200.0])
-        .try_reshape(&[1, 2])?;
+    let bias = Tensor::from_ndarray(&array![[100.0f32, 200.0]]);
     let mut biased = &transposed + &bias;
 
     biased.realize()?;
@@ -132,9 +134,10 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
 矩阵乘法是神经网络的核心运算，每一层都会用到它。
 
 ```rust
-fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
-    use ndarray::array;
+use svod_tensor::Tensor;
+use ndarray::array;
 
+fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
     // Input: 4 samples, 3 features each → shape [4, 3]
     let input = Tensor::from_ndarray(&array![
         [1.0f32, 2.0, 3.0],    // sample 0
@@ -155,7 +158,7 @@ fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
 
     output.realize()?;
     println!("Output shape: {:?}", output.shape()?);  // [4, 2]
-    println!("{:?}", biased.as_ndarray::<f32>()?);
+    println!("{:?}", output.as_ndarray::<f32>()?);
     // Each row: weighted sum of that sample's features
 
     Ok(())
@@ -193,7 +196,7 @@ fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
     let mut output = layer.forward(&input)?;
 
     output.realize()?;
-    println!("Output: {:?}", biased.as_ndarray::<f32>()?);
+    println!("Output: {:?}", output.as_ndarray::<f32>()?);
 
     Ok(())
 }
@@ -235,12 +238,12 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get results
     probs.realize()?;
-    println!("Probabilities: {:?}", probs_biased.as_ndarray::<f32>()?);
+    println!("Probabilities: {:?}", probs.as_ndarray::<f32>()?);
 
     // Get predicted class
     let mut prediction = logits.argmax(Some(-1))?;
     prediction.realize()?;
-    println!("Predicted digit: {:?}", pred_output.as_ndarray::<i32>()?);
+    println!("Predicted digit: {:?}", prediction.as_ndarray::<i32>()?);
 
     Ok(())
 }
@@ -262,9 +265,11 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 示例 6：深入内部
 
-想看看 Svod 生成了什么？以下是如何查看 IR 和生成的代码。
+想看看 Svod 生成了什么？以下是如何查看 IR 和编译出的 kernel。
 
 ```rust
+use svod_tensor::Tensor;
+
 fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
     let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
     let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
@@ -289,7 +294,7 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 1. **IR 图：** UOp 树展示了 `BUFFER`、`LOAD`、`ADD`、`STORE` 等操作。这是 Svod 在优化之前的中间表示。
 
-2. **生成的代码：** 实际运行的 LLVM IR 或 GPU 代码。注意 Svod 是如何将 load 和 add 融合到一个 kernel 中的——无需中间缓冲区。
+2. **执行计划：** `prepare()` 返回编译好的 kernel。注意 Svod 是如何将两次 load 和 add 融合到一个 kernel 中的——无需中间缓冲区。
 
 **调试技巧：** 如果某些操作看起来慢或不对，打印 IR 树。注意检查：
 - 意外的操作（冗余的 reshape、多余的拷贝）
@@ -313,8 +318,8 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 | 层链接 | `x.sequential(&[&fc1, &Relu, &fc2])?` |
 | 激活函数 | `t.relu()?`, `t.softmax(-1)?` |
 | 执行 | `t.realize()?` |
-| 批量 realize | `Tensor::realize_batch(&mut [&mut a, &mut b])?` |
-| 提取数据 | `biased.as_ndarray::<f32>()?` |
+| 批量 realize | `Tensor::realize_batch([&mut a, &mut b])?` |
+| 提取数据 | `t.as_ndarray::<f32>()?` |
 
 **惰性求值模式：**
 

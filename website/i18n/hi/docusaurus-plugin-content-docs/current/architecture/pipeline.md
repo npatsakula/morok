@@ -66,7 +66,7 @@ Reshape, permute, और इसी तरह के ऑपरेशन मौज
 
 ### ग्लोबल रजिस्ट्री
 
-Svod तीन ग्लोबल maps मेंटेन करता है (lock-free, thread-safe):
+Svod दो ग्लोबल maps मेंटेन करता है (lock-free, thread-safe):
 
 | Map | Key → Value | उद्देश्य |
 |-----|-------------|---------|
@@ -159,18 +159,18 @@ Rangeify के बाद, कोई movement ops नहीं बचते — 
 
 एक कम्प्यूटेशन ग्राफ़ में कई आउटपुट हो सकते हैं, या इंटरमीडिएट वैल्यूज़ जिन्हें materialize करना पड़े। **कर्नेल स्प्लिटिंग** इन बाउंड्रीज़ को पहचानती है और अलग-अलग कर्नेल बनाती है।
 
-एंट्री पॉइंट `schedule/src/rangeify/kernel.rs` में `run_kernel_split_pipeline()` है।
+एंट्री पॉइंट `schedule/src/rangeify/kernel.rs` में `try_get_kernel_graph()` है।
 
 ### कर्नेल स्प्लिटिंग पाइपलाइन
 
 स्प्लिटिंग कई कोऑर्डिनेटेड स्टेप्स से गुज़रती है:
 
-**स्टेप 1: BUFFERIZE → STORE**
+**स्टेप 1: STAGE → STORE**
 
-`BUFFERIZE` नोड मार्क करते हैं कि वैल्यूज़ को कहाँ materialize होना चाहिए। `pm_add_buffers_patterns()` उन्हें एक्सप्लिसिट `STORE` ऑपरेशन में बदलता है:
+`STAGE` नोड मार्क करते हैं कि वैल्यूज़ को कहाँ materialize होना चाहिए। `pm_add_buffers_patterns()` उन्हें एक्सप्लिसिट `STORE` ऑपरेशन में बदलता है:
 
 ```text
-Before: BUFFERIZE(computation, ranges)
+Before: STAGE(computation, ranges)
 After:  END(STORE(INDEX(...), computation), ranges)
 ```
 
@@ -178,7 +178,7 @@ After:  END(STORE(INDEX(...), computation), ranges)
 
 **स्टेप 2: Stores को कर्नेल में स्प्लिट करें**
 
-`split_all_stores()` और `split_store()` ग्राफ़ को STORE बाउंड्रीज़ पर स्प्लिट करते हैं, अलग-अलग कर्नेल बनाते हैं। बफ़र नंबरिंग स्प्लिटिंग के दौरान `LocalAddBufferContext.dg` काउंटर से असाइन होती है।
+`split_all_stores()` और `split_store()` ग्राफ़ को STORE बाउंड्रीज़ पर स्प्लिट करते हैं, अलग-अलग कर्नेल बनाते हैं। बफ़र नंबरिंग स्प्लिटिंग के दौरान `LocalAddBufferContext.param_slot` काउंटर से असाइन होती है।
 
 ```text
 Before: END(STORE(...), ranges)
@@ -203,7 +203,7 @@ After:  KERNEL(SINK(STORE(...)), ranges, buffer_list)
 
 ### बफ़र नंबरिंग
 
-बफ़र नंबरिंग `split_store()` में `LocalAddBufferContext.dg` काउंटर हैंडल करता है। बफ़र indices स्प्लिट प्रोसेस में पैटर्न-मैच ऑर्डर में असाइन होते हैं — अलग रीनंबरिंग पास की ज़रूरत नहीं।
+बफ़र नंबरिंग `split_store()` में `LocalAddBufferContext.param_slot` काउंटर हैंडल करता है। हर kernel argument एक `PARAM(slot=N)` बनता है, और ये slots स्प्लिट प्रोसेस में पैटर्न-मैच ऑर्डर में असाइन होते हैं — अलग रीनंबरिंग पास की ज़रूरत नहीं।
 
 ---
 
@@ -215,15 +215,14 @@ After:  KERNEL(SINK(STORE(...)), ranges, buffer_list)
 
 ```rust
 pub struct ScheduleItem {
-    pub kernel: Arc<UOp>,              // KERNEL wrapper
+    pub kernel: Arc<UOp>,              // Callable (CALL) wrapper: dependency identity
     pub ast: Arc<UOp>,                 // Inner computation (for codegen)
     pub buffers: Vec<Buffer>,          // Device buffers
     pub buffer_uop_ids: Vec<u64>,      // UOp IDs for registry cleanup
     pub fixedvars: HashMap<String, i64>,  // Bound iteration variables
-    pub bound_ranges: Vec<BoundRange>,    // Ranges needing expansion
-    pub source_buffers: HashMap<u64, Arc<UOp>>,  // DEFINE_GLOBAL -> BUFFER mapping
-    pub dependencies: Vec<u64>,        // Producer kernel IDs
-    pub alias_registered_ids: Vec<u64>, // Alias UOp IDs for cleanup
+    pub loop_var_names: HashSet<String>,  // fixedvars fed by schedule-loop counters
+    pub dependencies: Vec<u64>,        // Producer callable UOp IDs
+    pub instance_dependencies: Vec<usize>, // Producer schedule-item indices
 }
 ```
 
@@ -256,11 +255,14 @@ flowchart TD
 
 ## कोड जनरेशन: UOp से LLVM IR तक
 
-कर्नेल शेड्यूल होने के बाद, हम असल कोड जनरेट करते हैं। Svod वर्तमान में LLVM बैकएंड सपोर्ट करता है:
+कर्नेल शेड्यूल होने के बाद, हम असल कोड जनरेट करते हैं। Svod के दो renderer हैं, और कौन-सा चलेगा यह डिवाइस बैकएंड तय करता है:
 
-| बैकएंड | कम्पाइल स्पीड | आउटपुट क्वालिटी | उपयोग |
-|--------|---------------|-----------------|-------|
-| **LLVM** | धीमा | हाइली ऑप्टिमाइज़्ड | प्रोडक्शन |
+| डिवाइस बैकएंड | Renderer | आउटपुट |
+|---------------|----------|--------|
+| **CPU** | LLVM text (डिफ़ॉल्ट) या C | LLVM IR, या C सोर्स |
+| **CUDA** | LLVM text, NVPTX टारगेट | LLVM IR (`ptx_kernel`) |
+| **AMD** | LLVM text, AMDGPU टारगेट | LLVM IR (`amdgpu_kernel`) |
+| **Metal** | C, Metal डायलेक्ट | Metal Shading Language |
 
 `Renderer` trait कोड जनरेशन को ऐब्स्ट्रैक्ट करता है:
 
@@ -306,7 +308,7 @@ exit:
 | `devectorize` | कॉन्टिग्युअस मेमोरी एक्सेसेज़ ग्रुप करें |
 | `pm_reduce_devectorize` | वेक्टर रिडक्शन हैंडल करें (K-vec, bool, horizontal) |
 | `pm_bool_devectorize` | Boolean वेक्टर पैटर्न हैंडल करें |
-| `merge_sibling_ends` | एडजेसेंट END ऑपरेशन मर्ज करें |
+| `pm_split_ends` | मल्टी-रेंज END को nested सिंगल-रेंज END में बाँटें |
 | `pm_fma_decomposition` | `a*b+c` को fused multiply-add में बदलें (सपोर्ट करने वाले बैकएंड के लिए) |
 | `pm_float_decomp` | फ़्लोटिंग-पॉइंट ऑपरेशन डीकम्पोज़ करें |
 | `bool_storage_patterns` | मेमोरी ऑपरेशन के लिए bool ↔ uint8 कन्वर्ट करें |
@@ -315,29 +317,33 @@ exit:
 
 ### बैकएंड सपोर्ट
 
-Svod कई कोड जनरेशन बैकएंड सपोर्ट करता है:
+दो renderer चार डिवाइस बैकएंड को कवर करते हैं:
 
-| बैकएंड | आउटपुट | स्थिति |
-|--------|--------|-------|
-| **LLVM** | नेटिव मशीन कोड | प्राइमरी (CPU) |
-| **C** | C सोर्स कोड | उपलब्ध |
+| Renderer | आउटपुट | कौन इस्तेमाल करता है |
+|----------|--------|----------------------|
+| **LLVM text** | CPU, AMDGPU और NVPTX टारगेट के लिए LLVM IR | CPU (डिफ़ॉल्ट), AMD, CUDA |
+| **C** | C सोर्स, या Metal Shading Language | CPU (`SVOD_CPU_BACKEND=clang`), Metal |
 
 ---
 
 ## एक्ज़ीक्यूशन: कर्नेल चलाना
 
-कोड जनरेशन LLVM IR स्ट्रिंग प्रोड्यूस करता है। एक्ज़ीक्यूशन में JIT कम्पाइलेशन और कर्नेल लॉन्च शामिल है।
+कोड जनरेशन सोर्स स्ट्रिंग प्रोड्यूस करता है — LLVM IR, C या Metal Shading Language। एक्ज़ीक्यूशन में उन्हें रनटाइम पर कम्पाइल करना और कर्नेल लॉन्च करना शामिल है।
 
 ### ExecutionPlan
 
-`prepare()` (सिंगल tensor) या `prepare_batch()` (मल्टीपल tensor) एक `ExecutionPlan` बनाता है:
+`prepare()` (सिंगल tensor) या `prepare_batch()` (मल्टीपल tensor) एक `ExecutionPlan` (`runtime/src/execution_plan.rs`) बनाता है:
 
 ```rust
 pub struct ExecutionPlan {
-    kernels: Vec<PreparedKernel>,       // Compiled kernels (topological order)
+    ops: Vec<PreparedOp>,               // Compiled kernels and buffer copies
+    op_order: Vec<usize>,               // Topological execution order
+    op_levels: Vec<Vec<usize>>,         // Parallel groups (Kahn levels)
     buffers: Vec<Buffer>,
     ast_to_buffer: HashMap<u64, usize>, // AST id -> buffer index mapping
     output_buffer_indices: Vec<usize>,  // Indices of output buffers (multi-output)
+    device: DeviceSpec,
+    // ... graph/queue state elided
 }
 ```
 
@@ -355,20 +361,18 @@ Plans अब `realize_batch()` / `prepare_batch()` के ज़रिए **म�
 
 ### JIT कम्पाइलेशन
 
-LLVM रनटाइम (`runtime/src/llvm.rs`) IR को मशीन कोड में कम्पाइल करता है:
+LLVM रनटाइम (`runtime/src/llvm.rs`) IR को मशीन कोड में कम्पाइल करता है। यहाँ कोई LLVM `ExecutionEngine` नहीं है: IR एक relocatable ऑब्जेक्ट बनता है, जिसे इन-प्रोसेस ELF लोडर मैप और relocate करता है।
 
-1. LLVM IR स्ट्रिंग को module में **पार्स** करें
-2. module well-formed है **वेरिफ़ाई** करें
-3. LLVM की O3 पास पाइपलाइन से **ऑप्टिमाइज़** करें
-4. नेटिव मशीन कोड में **JIT कम्पाइल** करें
-5. (AST ID, device) से रीयूज़ के लिए **कैश** करें
+1. IR टेक्स्ट को `-O2` पर relocatable ऑब्जेक्ट में **कम्पाइल** करें — उपलब्ध हो तो `dlopen` की गई libLLVM से इन-प्रोसेस, वरना `clang -x ir -c -O2` से
+2. सोर्स डाइजेस्ट + कम्पाइलर आइडेंटिटी की key पर डिस्क कैश से ऑब्जेक्ट **रीयूज़** करें
+3. ELF लोडर से **लोड** करें: सेक्शन anonymous mmap में, relocations लागू
+4. मिली हुई फ़ंक्शन को (AST ID, device) से रीयूज़ के लिए **कैश** करें
 
 ```rust
-// Simplified JIT flow
-let module = Module::parse_ir(context, ir_string)?;
-module.verify()?;
-pass_manager.run(&module);  // O3 optimization
-let function = execution_engine.get_function::<KernelFn>(&name)?;
+// Simplified compile flow
+let object = producer.compile_object(ir_string)?;  // libLLVM in-process, or `clang -x ir -c -O2`
+validate_relocatable_object(&object, &entry_point)?;
+let (fn_ptr, _mmap) = jit_load(&object, &entry_point)?;  // ELF loader, no linker
 // Cache: (ast_id, device) → function
 ```
 

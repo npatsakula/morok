@@ -47,7 +47,7 @@ No changes—symbolic already clean.
 UPCAST expansion is represented directly with STACK/INDEX structure:
 ```mermaid
 flowchart TD
-  V["VECTORIZE"] --> ADD["ADD"]
+  V["STACK"] --> ADD["ADD"]
   ADD --> LA["LOAD(a)"]
   ADD --> LB["LOAD(b)"]
   LA --> IA["INDEX"]
@@ -70,7 +70,7 @@ Note: shared ranges and index expressions are deduplicated by hash consing.
 
 ### After Stage 12: Add GPU Dims
 ```
-[SPECIAL(gidx0)] : Index  // replaces RANGE(i)
+[SPECIAL(gidx0)] : WeakInt  // replaces RANGE(i)
 ```
 
 ### After Stage 13: Add Loads
@@ -80,7 +80,7 @@ Note: shared ranges and index expressions are deduplicated by hash consing.
 Vector structure after devectorize (shows effect, not exact UOp structure):
 ```mermaid
 flowchart TD
-  V["VECTORIZE : (4 x Float32)"] --> A0["ADD(a[0], b[0])"]
+  V["STACK : 4 lanes of Float32"] --> A0["ADD(a[0], b[0])"]
   V --> A1["ADD(a[1], b[1])"]
   V --> A2["ADD(a[2], b[2])"]
   V --> A3["ADD(a[3], b[3])"]
@@ -109,9 +109,9 @@ Dependencies tracked—no issues.
 ### After Stage 21: Linearize
 Linear instruction sequence (simplified):
 ```
-1. DEFINE_GLOBAL(0)  // Output buffer c
-2. DEFINE_GLOBAL(1)  // Input buffer a
-3. DEFINE_GLOBAL(2)  // Input buffer b
+1. PARAM(0)  // Output buffer c
+2. PARAM(1)  // Input buffer a
+3. PARAM(2)  // Input buffer b
 4. RANGE(i, 0..100, Global)  // gidx0
 5. LOAD(a, i*4+0..i*4+3)  // Vector load (vec4)
 6. LOAD(b, i*4+0..i*4+3)  // Vector load (vec4)
@@ -143,11 +143,14 @@ Both iterate to fixpoint—patterns fire until no more match.
 
 ## Debugging the Pipeline
 
-When a kernel produces wrong results, the bug lives in one of these 22 stages. Use environment variables to extract IR at each stage:
+When a kernel produces wrong results, the bug lives in one of these 22 stages. Every stage logs its UOp tree through `tracing`; `scripts/extract-ir.sh` turns those logs into a readable dump:
 
 ```bash
 # See IR after each transformation
-SVOD_DEBUG=ir cargo test failing_test
+./scripts/extract-ir.sh failing_test -p svod-tensor -o /tmp/ir.txt
+
+# Or dump a single stage straight to stderr (no tracing subscriber needed)
+SVOD_PER_STAGE_UOPS=1 SVOD_DUMP_STAGE=09 cargo test failing_test -- --nocapture
 ```
 
 ### Quick Reference
@@ -192,7 +195,7 @@ This chapter describes the "ideal" 22-stage pipeline based on Tinygrad's impleme
 
 | Stage | Tinygrad | Svod | Notes |
 |--------|-----------|-------|--------|
-| 1: Early Movement Ops | Moves movement ops through AFTER/END wrappers via 3 specific patterns (movement through INDEX, AFTER, END) | Removes movement ops during bufferization | Both approaches achieve functional equivalence; Svod's is cleaner |
+| 17: Pre-Matcher | Backend hooks sit on one `Renderer` class | Split across two traits: `svod_codegen::traits::Renderer` renders, `svod_device::device::Renderer` carries `decompositor()`, `extra_matcher()`, `pre_isel_matcher()`, `isel_matcher()` | Same hooks, different ownership |
 
 ### Aligned Stages (Previously Different)
 
@@ -200,9 +203,9 @@ The following stages were aligned with Tinygrad as of this implementation:
 
 | Stage | What Changed |
 |-------|--------------|
-| 15: Index Dtype Lowering | Svod now has `pm_lower_index_dtype()` with full pattern coverage: Binary ops, CONST, WHERE, VECTORIZE, SPECIAL, DEFINE_VAR, RANGE, CAST cleanup |
-| 18: Decompositions | Added: `fast_division_patterns()`, `pm_div_to_shr()`, `pm_fdiv_to_mul()`, `pm_comparison_negations()`, De Morgan's laws |
-| 19: Final Rewrite | `pm_render()` moved from codegen to Stage 19 in schedule pipeline |
+| 15: Index Dtype Lowering | Svod now has `pm_lower_index_dtype()` with full pattern coverage: Binary ops, CONST/VCONST, WHERE, STACK, SPECIAL, PARAM, RANGE, double weak CAST |
+| 18: Decompositions | Added: `fast_division_patterns()`, `pm_div_to_shr()`, `pm_fdiv_to_mul()`, `pm_comparison_negations()`, De Morgan's law |
+| 19: Final Rewrite | `renderer.extra_matcher()` and `pm_split_ends()` are summed into the schedule pipeline's final rewrite instead of running in codegen |
 
 ### Tinygrad-Only Patterns
 
@@ -210,8 +213,7 @@ Svod intentionally does not implement these Tinygrad-specific patterns:
 
 | Pattern | Purpose | Why Svod Doesn't Need It |
 |----------|-----------|-----------------------------|
-| `to_bufferview` | Avoid disk buffer copies for DISK/TINYFS devices | Svod doesn't support DISK/TINYFS; in-memory backends don't need this |
-| AFTER/END movement patterns | Move movement ops through timing wrappers | Svod removes movement ops during bufferization instead |
+| `pm_regalloc_rewrite` | Linear-scan register allocation for ISA backends | Svod emits LLVM IR / source, so register allocation belongs to the backend compiler |
 
 ### Svod Enhancements
 
@@ -219,9 +221,8 @@ Svod has some patterns/enhancements not in Tinygrad:
 
 | Enhancement | Location | Purpose |
 |-------------|---------|---------|
-| Nested INDEX flattening with identical indices | `movement_op_patterns()` | Removes redundant `INDEX(INDEX(ptr, [i]), [i])` |
-| GEP through CAST/BITCAST | `gep_pushing_patterns()` | Pushes GEP through type casts for better optimization |
-| Image dtype guard | `pm_add_loads()` | Skips LOAD wrapping for Image dtype (handled in codegen) |
+| Bool storage via `uint8` | `bool_storage_patterns()` in `devectorize.rs` | LLVM's `i1` can carry garbage in the upper bits, so bool LOAD/STORE go through `uint8` |
+| Wide-float demotion | `demote_unsupported_floats()` in `late/dtype.rs` | Renderers without a wide float (Metal, WebGPU) compute internal f64 in f32 |
 
 ---
 
@@ -237,9 +238,9 @@ Svod has some patterns/enhancements not in Tinygrad:
 | **Devectorize** | Split vectors to match hardware | `vec8 → vec4, vec4` |
 | **Divmod** | Division and remainder operations | `x // 7, x % 7` |
 | **Fixpoint** | When applying patterns no longer changes anything | Patterns fire until fixpoint |
-| **GEP** | Get Element Pointer—compute address from indices | `arr[i][j] → base + i*stride + j` |
+| **STACK** | Collect lanes into one shaped value (Tinygrad's VECTORIZE) | `STACK(a, b, c, d)` |
 | **Hash consing** | Reuse identical expressions | `ADD(x, 0) + ADD(x, 0)` shares memory |
-| **Index** | Integer type for array indices | i32 or i64, depending on device |
+| **WeakInt** | Abstract integer type for indices, lowered at Stage 15 | i32 or i64, depending on the proven bounds |
 | **Load** | Read from memory | `value = arr[i]` |
 | **Pattern** | Find-and-replace rule for code | `ADD(x, 0) → x` |
 | **Predicated store** | Write to memory conditionally | Write if valid else skip |
@@ -247,9 +248,9 @@ Svod has some patterns/enhancements not in Tinygrad:
 | **Reduction** | Combine many values into one | Sum, max, min |
 | **Store** | Write to memory | `arr[i] = value` |
 | **Symbolic** | Simplify using algebra rules | `(x/4)*4 → x` (when `x%4=0`) |
-| **Tensor core** | Hardware for fast matrix multiply | NVIDIA tensor cores & AMD matrix cores |
+| **Tensor core** | Hardware for fast matrix multiply | NVIDIA, AMD, Apple Metal, Intel Xe |
 | **Topological sort** | Order nodes respecting dependencies | A before B if B uses A's result |
-| **UNROLL** | Expand one op into multiple positions | `x → [x_0, x_1, x_2, x_3]` |
-| **UPCAST** | Mark intent to vectorize | `RANGE(0..4, UPCAST)` |
+| **UNROLL** | Axis type marking a loop to be unrolled | `RANGE(0..4, Unroll)` |
+| **UPCAST** | Axis type marking intent to vectorize | `RANGE(0..4, Upcast)` |
 | **Vectorize** | Process multiple values together | SIMD: add 4 numbers at once |
 | **WHERE** | Conditional selection | `WHERE(cond, x, y) = x if cond else y` |

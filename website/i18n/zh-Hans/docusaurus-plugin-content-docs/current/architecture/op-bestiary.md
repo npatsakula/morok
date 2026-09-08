@@ -39,7 +39,9 @@ Range {
 | 类型 | 优先级 | GPU 映射 | 用途 |
 |------|--------|----------|------|
 | `Placeholder` | -3 | — | RESHAPE 缓存期间使用的临时规范化 range |
-| `Loop` | -1 | `for` 循环 | rangeify 产生的默认 range；schedule 层的封装通过 `END(Call)` 配对在结构上区分 |
+| `Device` | -2 | — | 设备选择维度，启动时按设备逐一绑定 |
+| `Weak` | -1 | `for` 循环 | rangeify 产生的未并行化 range |
+| `Loop` | -1 | `for` 循环 | 显式的常规循环；schedule 层的封装与 `END(Call)` 配对 |
 | `Global` | 0 | `blockIdx` | 网格并行 |
 | `Thread` | 0 | 线程池 | CPU 并行 |
 | `Warp` | 1 | warp/wavefront | 子组并行 |
@@ -109,6 +111,7 @@ Reduce {
     src: Arc<UOp>,                      // value to accumulate
     ranges: SmallVec<[Arc<UOp>; 4]>,    // ranges being reduced
     reduce_op: ReduceOp,                // Add, Mul, Max, Min
+    num_axes: usize,                    // reduced axes of the shaped source
 }
 ```
 
@@ -140,7 +143,7 @@ flowchart TD
 ```rust
 AllReduce {
     src: Arc<UOp>,           // local partial result
-    device: Arc<UOp>,        // device specification
+    device: DeviceSpec,      // device specification
     reduce_op: ReduceOp,     // reduction operation
 }
 ```
@@ -155,21 +158,20 @@ AllReduce {
 
 ```rust
 Buffer {
-    unique: Arc<UOp>,        // UNIQUE op for identity
-    device: Arc<UOp>,        // DEVICE op
-    size: usize,             // total element count
+    shape: Arc<UOp>,         // flat storage shape (one element count)
+    arg: Box<ParamArg>,      // slot, dtype, address space, device
 }
 ```
 
-声明一个用于张量存储的 buffer。`unique` 字段确保即使 size/device 相同，不同 buffer 也能区分。
+声明一个用于张量存储的 buffer。`arg.slot` 字段确保即使 size/device 相同，不同 buffer 也能区分。`arg.addrspace` 决定 buffer 所在的内存：`Global` 表示设备内存，`Local` 表示 GPU 共享内存（LDS），`Reg` 表示寄存器/暂存分配。
 
-### BUFFERIZE — 物化标记
+### STAGE — 物化标记
 
 ```rust
-Bufferize {
+Stage {
     compute: Arc<UOp>,                  // computation to materialize
     ranges: SmallVec<[Arc<UOp>; 4]>,    // output dimensions
-    opts: BufferizeOpts,                // address space, device
+    opts: Box<BufferizeOpts>,           // address space, device
 }
 ```
 
@@ -180,13 +182,14 @@ Bufferize {
 | 字段 | 类型 | 用途 |
 |------|------|------|
 | `device` | `Option<DeviceSpec>` | 目标设备，`None` 表示本地 |
+| `local_axis` | `Option<AxisId>` | 拥有 LOCAL 暂存 buffer 的 `GroupReduce` 轴 |
 | `addrspace` | `AddrSpace` | `Global`（设备）或 `Local`（共享） |
-| `removable` | `bool` | 为 `false` 时禁止 `buffer_removal` 内联此 BUFFERIZE——多消费者 realize 边界使用此设置，使得 buffer 在大型 pass 的不动点迭代中保持不变 |
+| `removable` | `bool` | 为 `false` 时禁止 `buffer_removal` 内联此 STAGE——多消费者 realize 边界使用此设置，使得 buffer 在大型 pass 的不动点迭代中保持不变 |
 
 **示例：**
 ```mermaid
 flowchart TD
-  BZ["BUFFERIZE(opts=(addrspace=Global))"] -->|"computation"| RED["REDUCE(Add, ...)"]
+  BZ["STAGE(opts=(addrspace=Global))"] -->|"computation"| RED["REDUCE(Add, ...)"]
   BZ -->|"output dim 0"| R0["RANGE(R0, Global)"]
   BZ -->|"output dim 1"| R1["RANGE(R1, Global)"]
 ```
@@ -195,13 +198,12 @@ flowchart TD
 
 ```rust
 Index {
-    buffer: Arc<UOp>,                   // BUFFER or PARAM
+    buffer: Arc<UOp>,                   // BUFFER, PARAM or STACK
     indices: SmallVec<[Arc<UOp>; 4]>,   // index per dimension
-    gate: Option<Arc<UOp>>,             // optional predicate
 }
 ```
 
-从多维索引计算内存地址。返回元素 dtype（不是指针）。
+从多维索引计算内存地址。返回元素 dtype（不是指针）。可以用 `idx.valid(cond)` 把索引变成条件式的，它会将索引包进 `WHERE(cond, idx, INVALID)`。对 `STACK` 使用 INDEX 选出的是一个通道而非地址：常量标量索引会直接折叠到被堆叠的那个源上。
 
 **示例：**
 ```mermaid
@@ -212,37 +214,23 @@ flowchart TD
   IDX -->|"index for dim 2"| M["MUL(...)"]
 ```
 
-### POINTER_INDEX — 底层指针算术
-
-```rust
-PointerIndex {
-    ptr: Arc<UOp>,           // base pointer
-    offset: Arc<UOp>,        // byte offset
-}
-```
-
-直接指针算术。在线性化后、索引被展平时使用。
-
-> **兼容性：** Tinygrad 使用 `INDEX` 加 `ptr=True` 标志，而不是独立的操作。
-
 ### LOAD — 内存读取
 
 ```rust
 Load {
-    buffer: Arc<UOp>,        // buffer or pointer
-    index: Arc<UOp>,         // INDEX op
+    index: Arc<UOp>,         // INDEX op (buffer accessed via the INDEX)
     alt: Option<Arc<UOp>>,   // alternative value for gated loads
+    gate: Option<Arc<UOp>>,  // predicate for gated loads
 }
 ```
 
-从 buffer 的指定索引处读取值。对于门控加载，`alt` 字段提供当 INDEX 的 `gate` 为 false 时的替代值（完全跳过内存访问）。
+从 buffer 的指定索引处读取值；没有单独的 `buffer` 字段，buffer 是通过 INDEX 节点到达的。对于门控加载，`gate` 为 false 时由 `alt` 提供取值（从而完全跳过内存访问）。`alt` 与 `gate` 总是成对设置：一次 load 要么两者都有，要么两者都没有。渲染器要求单轴的 `INDEX`，因此多索引访问必须在 rangeify 期间展平，才能让 load 进入代码生成。
 
 **示例：**
 ```mermaid
 flowchart TD
-  L["LOAD : Float32"] --> P1["PARAM(1)"]
-  L --> IDX["INDEX"]
-  IDX --> P1b["PARAM(1)"]
+  L["LOAD : Float32"] --> IDX["INDEX"]
+  IDX --> P1["PARAM(1)"]
   IDX --> R0["RANGE(R0)"]
   IDX --> R2["RANGE(R2)"]
 ```
@@ -253,23 +241,23 @@ flowchart TD
 Store {
     index: Arc<UOp>,                    // INDEX op (buffer accessed via index.src[0])
     value: Arc<UOp>,                    // value to write
-    ranges: SmallVec<[Arc<UOp>; 4]>,    // ranges being closed
+    gate: Option<Arc<UOp>>,             // predicate for gated stores
 }
 ```
 
-向 buffer 写入值。Buffer 通过 INDEX 节点（`index.src[0]`）访问，而不是单独的字段。STORE 关闭指定的 range，这些 range 代表输出迭代维度。ranges 字段用于输出 upcast：当包含 `Range(Upcast)` 时，展开阶段会将其变为 `UNROLL`，再通过 `CONTRACT` 收缩。
+向 buffer 写入值。Buffer 通过 INDEX 节点（`index.src[0]`）访问，而不是单独的字段。`UPCAST` 和 `UNROLL` 在展开期间仍然是 range 的轴类型分类。
 
-对于门控写入，使用带 gate 的 INDEX（INDEX 有一个可选的 `gate` 字段）。
+对于门控写入，`store_gated` 会设置 `gate`；把 gate 从地址表达式上提到 LOAD/STORE 上的则是 `pm_move_gates_from_index`。
 
-> **兼容性：** Svod 的 STORE 没有单独的 `buffer` 字段——源为：index=0, value=1, ranges=2+（range_start=2）。Tinygrad 的布局类似。
+> **兼容性：** Svod 的 STORE 没有单独的 `buffer` 字段——源为：index=0, value=1。与 STAGE 或 REDUCE 不同，STORE 不关闭 range。
 
 **示例：**
 ```mermaid
 flowchart TD
   ST["STORE"] -->|"write address (buffer via index.src[0])"| IDX["INDEX[R0, R1]"]
   ST -->|"value"| RED["REDUCE(Add, ...)"]
-  ST -->|"output dim 0 (closed)"| R0["RANGE(R0, Global)"]
-  ST -->|"output dim 1 (closed)"| R1["RANGE(R1, Global)"]
+  IDX --> R0["RANGE(R0, Global)"]
+  IDX --> R1["RANGE(R1, Global)"]
 ```
 
 ---
@@ -287,7 +275,7 @@ SOURCE → BINARY` 的严格阶段把体送进编译流水线。
 Call {
     body: Arc<UOp>,                     // FUNCTION（或其体）
     args: SmallVec<[Arc<UOp>; 4]>,      // 具体的参数值
-    info: CallInfo,                     // 注解（name、origin……）
+    info: Box<CallInfo>,                // 注解（name、origin……）
 }
 ```
 
@@ -312,7 +300,7 @@ Call {
 Function {
     body: Arc<UOp>,                     // 计算
     args: SmallVec<[Arc<UOp>; 4]>,      // 形参
-    info: CallInfo,
+    info: Box<CallInfo>,
 }
 ```
 
@@ -335,7 +323,7 @@ GetTuple { src: Arc<UOp>, index: usize }
 ```rust
 Program {
     sink: Arc<UOp>,                     // 根 SINK
-    device: Arc<UOp>,                   // DEVICE
+    info: Box<ProgramInfo>,             // 名称、启动维度、ABI 槽位、目标
     linear: Option<Arc<UOp>>,           // LINEAR（线性化后）
     source: Option<Arc<UOp>>,           // SOURCE（渲染后）
     binary: Option<Arc<UOp>>,           // PROGRAM_BINARY（编译后）
@@ -346,7 +334,8 @@ Program {
 SOURCE → PROGRAM_BINARY` 阶段（`do_linearize`/`do_render`/`do_compile`/
 `get_program`），每一阶段填入下一字段。C/LLVM 渲染器期望 `Op::Linear`
 作为输入，并通过上下文的 `pending_error` 报告 `Error::InvalidGraph`，不
-再用 panic；多索引 `INDEX` 必须先经 `pm_linearize_multi_index` 降级。
+再用 panic；抵达渲染器的多索引 `INDEX` 会以同样的方式被拒绝，因此索引
+必须事先展平成单个轴。
 
 ### LINEAR — 线性化的操作流
 
@@ -359,18 +348,21 @@ Linear { ops: SmallVec<[Arc<UOp>; 8]> }
 ### SOURCE / PROGRAM_BINARY — 编译产物
 
 ```rust
-Source { code: String }              // 渲染后的源码（C / LLVM-IR）
-ProgramBinary { bytes: Vec<u8> }     // 编译产物
+Source { code: String, identity: Option<Box<SourceStageIdentity>> }
+ProgramBinary { bytes: Vec<u8>, identity: Option<Box<BinaryStageIdentity>> }
 ```
 
-流水线的终结阶段。两者都是叶子（无子节点）。
+流水线的终结阶段。两者都是叶子（无子节点）。可选的 `identity` 是把某一
+阶段与紧邻的前一阶段严格绑定的语义凭证（`SourceStageIdentity` 携带 ABI、
+目标、入口名以及 LINEAR/SOURCE 的摘要；`BinaryStageIdentity` 在其之上再
+包上编译器键与二进制摘要），因此缓存的产物不可能被跨越已变更的图复用。
 
 ### SINK — 多根收集器
 
 ```rust
 Sink {
     sources: SmallVec<[Arc<UOp>; 4]>,
-    info: Option<KernelInfo>,           // 内核 AST 的结构性标记
+    info: Option<Box<KernelInfo>>,      // 内核 AST 的结构性标记
 }
 ```
 
@@ -421,42 +413,34 @@ GPU 工作组同步。确保工作组中的所有线程到达栅栏后才继续�
 
 ## 向量操作
 
-### VECTORIZE — 从标量创建向量
+### STACK — 用通道构建带形状的值
 
 ```rust
-Vectorize {
-    elements: SmallVec<[Arc<UOp>; 4]>,
+Stack {
+    sources: SmallVec<[Arc<UOp>; 4]>,
 }
 ```
 
-将 N 个标量值组合成一个大小为 N 的向量。所有元素必须具有相同的基础 dtype。
+将 N 个值组合成一个含 N 个通道的带形状值。元素 dtype 仍然是标量——通道数由 STACK 自身携带，而不是靠加宽 dtype——各个源在构造时会被转换到提升后的 dtype。
 
 **示例：**
 ```mermaid
 flowchart TD
-  V["VECTORIZE : 4 x Float32"] --> C1["CONST(1.0)"]
+  V["STACK(len=4) : Float32"] --> C1["CONST(1.0)"]
   V --> C2["CONST(2.0)"]
   V --> C3["CONST(3.0)"]
   V --> C4["CONST(4.0)"]
 ```
 
-### GEP — Get Element Pointer（向量元素提取）
+### 通道选择 — 对 STACK 使用 INDEX
 
-```rust
-Gep {
-    vector: Arc<UOp>,        // source vector
-    indices: Vec<usize>,     // positions to extract
-}
-```
-
-从向量中提取元素：
-- 单个索引 → 标量
-- 多个索引 → 更小的向量
+没有单独的提取操作。`INDEX` 从 `STACK` 中选出一个通道，方式与它从 buffer 中选出一个地址完全相同；常量索引在构造时就直接折叠到被堆叠的那个源上。
 
 **示例：**
 ```mermaid
 flowchart TD
-  G["GEP([0, 2]) : 2 x Float32"] --> V["VECTORIZE : 4 x Float32"]
+  G["INDEX : Float32"] --> V["STACK(len=4) : Float32"]
+  G --> C["CONST(2) : Index"]
   V --> E["..."]
 ```
 
@@ -468,71 +452,9 @@ VConst {
 }
 ```
 
-编译期常量向量。比用 `CONST` 节点构建 `VECTORIZE` 更高效。
+编译期常量向量。比用 `CONST` 节点构建的 `STACK` 更高效。
 
-### CAT — 向量拼接
-
-```rust
-Cat {
-    sources: SmallVec<[Arc<UOp>; 4]>,
-}
-```
-
-将多个向量拼接成更大的向量。输出的 `vcount` = 各输入 `vcount` 之和。
-
-**示例：**
-```mermaid
-flowchart TD
-  CAT["CAT : 8 x Float32"] --> V1["VECTORIZE : 4 x Float32"]
-  CAT --> V2["VECTORIZE : 4 x Float32"]
-```
-
-### PtrCat — 指针拼接
-
-```rust
-PtrCat {
-    sources: SmallVec<[Arc<UOp>; 4]>,
-}
-```
-
-将内存访问分组以实现向量化 load/store。由 devectorizer pass 使用。
-
----
-
-## 展开：UNROLL 和 CONTRACT
-
-### UNROLL — 跨迭代展开计算
-
-```rust
-Unroll {
-    src: Arc<UOp>,                       // computation to expand
-    unroll_axes: Vec<(usize, usize)>,    // (axis_index, factor) pairs
-}
-```
-
-为不同的迭代值创建计算的多个副本，用于循环展开优化。
-
-**示例：** `UNROLL(unroll_axes=[(0, 4)])` 将计算展开 4 次，使用不同的索引值。
-
-### CONTRACT — 将展开的值收缩为向量
-
-```rust
-Contract {
-    src: Arc<UOp>,                       // unrolled computation
-    upcast_ranges: Vec<(usize, usize)>,  // (axis_index, factor) pairs
-}
-```
-
-UNROLL 的逆操作——将展开的标量值收集成一个向量。输出向量大小 = 各 factor 之积。
-
-**示例：**
-```mermaid
-flowchart TD
-  CT["CONTRACT(upcast_ranges=[(0, 4)]) : 4 x Float32"] --> U["UNROLL(unroll_axes=[(0, 4)])"]
-  U --> L["LOAD(...)"]
-```
-
-这个模式实现了 load 的向量化：展开 4 次迭代，然后将结果打包成 4 元素向量。
+通道聚合使用 `STACK`；通道选择与地址选择都使用 `INDEX`。循环展开由带 `AxisType::Unroll` 的 `Range` 表示，而不是一个单独的操作。张量核心的扩展轴则存放在 `WmmaMetadata` 中。
 
 ---
 
@@ -544,8 +466,8 @@ flowchart TD
 Wmma {
     a: Arc<UOp>,             // matrix A fragment
     b: Arc<UOp>,             // matrix B fragment
-    c: Arc<UOp>,             // accumulator C fragment
-    metadata: WmmaMetadata,  // hardware configuration
+    c: Arc<UOp>,                 // accumulator C fragment
+    metadata: Box<WmmaMetadata>, // hardware configuration
 }
 ```
 
@@ -561,8 +483,8 @@ Wmma {
 | `dtype_out` | `DType` | 输出精度（如 `Float32`） |
 | `device` | `RendererDevice` | 产生此 WMMA 的渲染器 / TC 后端 |
 | `threads` | `usize` | 每个 warp 的线程数（通常 32） |
-| `upcast_axes` | `WmmaUpcastAxes` | 各操作数的向量化信息（字段：`a`、`b`、`c`） |
-| `reduce_axes` | `Vec<(usize, usize)>` | 收缩轴 |
+| `upcast_axes` | `Option<WmmaUpcastAxes>` | 各个源的扩展轴（字段：`a`、`b`、`c`）；一旦 `expander2` 塑形完源与输出便被清空 |
+| `reduce_axes` | `Vec<AxisId>` | TC 规约轴的 ID，在展开期间用作 `exclude_args` |
 
 **示例：**
 ```mermaid
@@ -607,21 +529,22 @@ flowchart TD
 ### PARAM — Buffer 参数
 
 ```rust
-Param { slot: usize, size: usize, device: Option<Arc<UOp>> }
+Param { shape: Arc<UOp>, arg: Box<ParamArg> }
 ```
 
 归一化的 buffer 参数——对输入/输出 buffer 的位置引用。
 由预调度归一化（BUFFER→PARAM）创建，通过擦除 buffer 身份，
 实现对不同 buffer 上相同计算的结构性去重。
-`slot` 是内核参数列表中的位置，`size` 是元素数量。
+`arg.slot` 是内核参数列表中的位置，`shape` 携带元素数量。
+`ParamArg` 也涵盖标量参数（`UOp::scalar_param`），它们携带的是名称和
+取值边界，而不是地址空间。
 
-### DEFINE_LOCAL — 共享内存分配
+### 共享内存与寄存器
 
-```rust
-DefineLocal(usize)           // local memory index
-```
-
-GPU 共享内存（LDS）分配。在工作组内可见。
+没有专门的 `DefineLocal` 或 `DefineReg` 操作。GPU 共享内存（LDS）以及
+寄存器/暂存分配都是 `Buffer` 节点，其 `arg.addrspace` 为
+`AddrSpace::Local` 或 `AddrSpace::Reg`；它们不携带设备，且只在工作组内
+（LOCAL）或线程内（REG）可见。
 
 ### DEFINE_VAR — 符号运行时变量
 
@@ -639,17 +562,6 @@ DefineVar {
 ```text
 DEFINE_VAR(name="batch_size", min=1, max=128) : Index
 ```
-
-### DEFINE_REG — 寄存器分配
-
-```rust
-DefineReg {
-    size: usize,             // register size
-    id: usize,               // unique accumulator ID
-}
-```
-
-分配一个寄存器用于中间存储。`id` 字段用于区分相同 dtype 的寄存器——没有它的话，两个相同 dtype 的 reduce 会因为 hash consing 共享同一个 DEFINE_REG。用于代码生成。
 
 ### BIND — 变量绑定
 
@@ -695,13 +607,9 @@ LUnique(usize)               // 局部作用域身份计数器
 提供同样的消歧能力，且不与全局计数器冲突——这样 callable 体可以独立于
 调用点进行哈希 consing。
 
-### DEVICE — 设备规格
-
-```rust
-Device(DeviceSpec)           // device specification
-```
-
-指定计算的目标设备。
+设备本身不是一个节点：目标是那些需要它的操作上的一个 `DeviceSpec` 字段
+（`Copy`、`GetAddr`、`AllReduce`、`ParamArg.device`、`BufferizeOpts.device`、
+`ProgramInfo.target`）。
 
 ---
 
@@ -715,7 +623,7 @@ Device(DeviceSpec)           // device specification
 | `Permute` | `{ src, axes: Vec<usize> }` | 转置/重排轴 |
 | `Expand` | `{ src, new_shape }` | 广播到更大的 shape |
 | `Pad` | `{ src, begin_pads, end_pads }` | 添加填充 |
-| `Shrink` | `{ src, begins, ends }` | 提取子区域 |
+| `Shrink` | `{ src, offsets, sizes }` | 提取子区域 |
 | `Flip` | `{ src, axes: Vec<bool> }` | 沿轴翻转 |
 
 **示例：** RESHAPE
@@ -733,18 +641,21 @@ flowchart TD
 
 | 操作 | 用途 |
 |------|------|
-| `Copy` | 显式复制值 |
+| `Copy` | `{ src, device }` —— 把值显式复制到另一个设备 |
 | `Slice` | `{ buffer, offset, size }` —— buffer 上连续的类型化切片元数据 |
-| `MStack` | 内存栈分配 |
-| `MSelect` | 内存选择（条件内存访问） |
-| `Multi` | 多输出操作 |
+| `GetAddr` | `{ src, device }` —— 某个类 buffer 源的 `UInt64` 地址 |
+| `MStack` | `{ buffers }` —— 一个多设备张量在各设备上的 buffer |
+| `MSelect` | `{ buffer, device_index }` —— 从多设备张量中取出某一个设备的 buffer |
+| `Multi` | `{ src, axis }` —— 分片标记：多设备张量沿哪个轴切分 |
 | `Group` | 用于调度的操作分组 |
+| `Noop` | 无操作数、无副作用的占位符 |
 | `Detach` | 从图中分离（阻止优化穿透） |
 | `Contiguous` | 标记数据连续的提示 |
 | `ContiguousBackward` | contiguous 提示的反向传播 |
 | `Precast` | 类型转换的预转型 |
 | `Custom` / `CustomI` | 内联自定义操作扩展（`Custom` 仅 C 后端支持） |
-| `CustomFunction` | 运行时自定义函数钩子（种类：`EncDec`、`Graph`） |
+| `CustomFunction` | 运行时自定义函数钩子（种类：`EncDec`、`Graph`、`AllReduce`） |
+| `Ins` | `{ sources, arg }` —— 由 ISA 渲染器选出的目标指令 |
 
 ---
 
@@ -756,13 +667,13 @@ flowchart TD
 |------|------|
 | **循环控制** | `RANGE`, `END` |
 | **规约** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **内存** | `BUFFER`, `SLICE`, `STAGE`, `INDEX`, `LOAD`, `STORE` |
+| **内存** | `BUFFER`, `SLICE`, `STAGE`, `INDEX`, `LOAD`, `STORE`, `GETADDR` |
 | **内核与可调用** | `SINK`, `CALL`, `FUNCTION`, `TUPLE`, `GET_TUPLE`, `PROGRAM`, `LINEAR`, `SOURCE`, `PROGRAM_BINARY`, `AFTER`, `BARRIER` |
-| **向量** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
-| **展开** | `UNROLL`, `CONTRACT` |
+| **向量** | `STACK`, `INDEX`, `VCONST` |
+| **展开** | 带 `AxisType::Upcast` 或 `AxisType::Unroll` 的 `RANGE` |
 | **硬件** | `WMMA`, `SPECIAL` |
 | **控制** | `IF`, `ENDIF` |
-| **定义** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `LUNIQUE`, `DEVICE` |
+| **定义** | `PARAM`, `DEFINE_VAR`, `BIND`, `UNIQUE`, `LUNIQUE` |
 | **移动** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 
@@ -772,21 +683,20 @@ flowchart TD
 
 | 操作 | Range 起始索引 |
 |------|----------------|
-| `BUFFERIZE` | 1 (compute=0, ranges=1+) |
+| `STAGE` | 1 (compute=0, ranges=1+) |
 | `REDUCE` | 1 (src=0, ranges=1+) |
-| `STORE` | 2 (index=0, value=1, ranges=2+) |
 | `WMMA` | 3 (a=0, b=1, c=2) |
 | `END` | 1 (computation=0, ranges=1+) |
 | `CALL` / `FUNCTION` | 1 (body=0, args=1+) |
 
 ### 可展开操作
 
-通过计算图传播 UNROLL 的操作：
+通过计算图传播已展开通道的操作：
 
 - ALU：`Unary`、`Binary`、`Ternary`
 - 类型：`Cast`、`BitCast`
-- 向量：`Gep`、`Vectorize`
-- 内存：`Load`、`Store`、`Index`、`PointerIndex`
+- 带形状的值：`Stack`
+- 内存：`Load`、`Store`、`Index`
 - 控制：`Reduce`、`End`、`After`
-- Buffer：`Bufferize`
+- Buffer：`Stage`
 - 硬件：`Wmma`

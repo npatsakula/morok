@@ -62,7 +62,8 @@ The fix: size tiles to the matrix-core fragment so data lands already in MMA lay
 ### 2. Memory latency — and AMD has no `cp.async`
 
 On NVIDIA, asynchronous copy instructions (`cp.async`, and later TMA) let you start a load and
-keep computing while it lands. AMD GPUs don't have those. Instead, the hardware offers a
+keep computing while it lands — `tk`'s CUDA path uses `cp.async` for exactly this. AMD GPUs don't
+have those. Instead, the hardware offers a
 **buffer load directly into shared memory (LDS)** that bypasses registers entirely. A fast
 kernel streams the *next* block of data into LDS while the matrix core chews on the *current*
 one. Get this wrong and the math unit stalls on every load.
@@ -97,21 +98,24 @@ recover real performance for free.
 
 ---
 
-## The AMD angle: MFMA vs WMMA, wave32 vs wave64
+## The arch angle: MFMA vs WMMA vs `mma.sync`, wave32 vs wave64
 
-Two hardware facts shape every AMD tile kernel, and they're worth holding onto:
+Three hardware facts shape every tile kernel `tk` builds, and they're worth holding onto:
 
 - **CDNA** (datacenter, e.g. gfx942) issues matrix multiplies via **MFMA** instructions and
   runs **wave64** — 64 lanes per wavefront.
 - **RDNA** (e.g. gfx1151, RDNA3.5, wave32) issues **WMMA** instructions and
   runs **wave32** — 32 lanes.
+- **NVIDIA** (`sm_80+`) issues **`mma.sync`** and runs a **warp32** — 32 lanes, but a fragment
+  layout of its own again: a 16×16 tile held as two `m16n8` halves.
 
 The lane count changes how a tile's elements are distributed across the wave, which changes the
-register layout, which changes the reductions. A kernel written for one and run on the other —
-without accounting for this — is silently wrong. Keeping a single kernel correct on both is its
-own chapter: [Wave32 vs Wave64](./wave-portability).
+register layout, which changes the reductions — and even at the same width the fragment layout
+differs. A kernel written for one and run on another — without accounting for this — is silently
+wrong. Keeping a single kernel correct on all three is its own chapter:
+[Wave32 vs Wave64](./wave-portability).
 
-:::tip For GPU experts
+:::tip[For GPU experts]
 HipKittens' `analysis/paper_experiments/` micro-benchmarks quantify the gaps above. They justify
 the design:
 
@@ -146,13 +150,13 @@ Everything in the rest of this section is a response to one of these five gaps:
   layout, in the right memory, conflict-free.
 - [Flash Attention](./flash-attention) shows gaps 2 and 4 in action: double-buffered streaming
   and an explicit pipeline.
-- [Wave32 vs Wave64](./wave-portability) is the AMD-specific tax that gap 1 and the lane-count
-  difference impose.
+- [Wave32 vs Wave64](./wave-portability) is the portability tax that gap 1, the lane-count
+  difference, and the per-arch fragment layouts impose.
 
 The headline: a fast GPU kernel is not "the math, written down." It is *the math, plus an
 answer to where every cycle between two matrix instructions goes.* That's where the FLOPS hide.
 
-:::note Doesn't the compiler already use matrix cores?
+:::note[Doesn't the compiler already use matrix cores?]
 Yes — and nothing here says otherwise. For graph-native kernels, BEAM's `TC` action maps a matmul
 straight onto WMMA/MFMA and tiles it against these same gaps; the compiler is perfectly capable of
 driving the matrix cores. The five gaps are the *hardware reality* every fast kernel must beat —

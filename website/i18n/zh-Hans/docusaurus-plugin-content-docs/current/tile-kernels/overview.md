@@ -30,7 +30,7 @@ Svod 的一切都围绕自动化展开。你搭好一张惰性图，调用 `real
 
 | 面孔 | 你是…… | 你接触的东西 |
 |------|----------|----------------|
-| **USE** | 只想拿到一个快内核的应用作者 | `matmul`、`flash_attention`、`flash_attention_with`、`kmeans_assign`，它们返回惰性 `Tensor`，无需任何内核知识 |
+| **USE** | 只想拿到一个快内核的应用作者 | `matmul`、`flash_attention`、`flash_attention_with`、`single_query_attention`，以及仅限 AMD 的 `kmeans_assign` / `knn`，它们返回惰性 `Tensor`，无需任何内核知识 |
 | **AUTHOR** | 正在编写一个新的 tile 内核 | `Kernel` / `Group` 构建器、`ArchCaps`、各 tile 类型（`GL`/`ST`/`RT`/`RV`）、`Swizzle`、`graph_launch` |
 | **DEBUG** | 想隔离测试或基准测试某个内核 | `compile`、`launch`、`run_kernel`、`CompiledLaunch`，以及结构化的 `KernelFingerprint` |
 
@@ -61,7 +61,7 @@ BEAM，连同它兜底时所用的启发式优化器，搜索的是某个*固定
 
 `tk` 同样附带一个手写 `matmul`，但它属于上表的第一行：它是这门 DSL 的性能风向标，并非生产用的 matmul（后者走的是图这条路）。
 
-:::tip 面向 GPU 专家
+:::tip[面向 GPU 专家]
 手写内核与 BEAM 调优内核之间的结构差异，仅在 `SINK` UOp 的 `KernelInfo` 上一个字段：图内核令 `opts_to_apply: None`，`tk` 内核则设为 `Some(vec![])`。同一套 IR、同一条流水线，只差一个标记。[向 IR 中编写](./lowering) 会端到端地追踪这一点。
 :::
 
@@ -80,5 +80,3 @@ BEAM，连同它兜底时所用的启发式优化器，搜索的是某个*固定
 7. **[调试](./debugging)**：手动运行并验证内核。
 8. **[剖析与基准测试](./profiling)**：分层 profiler 与 criterion 集成，适用于任何 `Tensor` 或 `ExecutionPlan`。
 9. **[tk、HipKittens 与 CuTile 对比](./comparison)**：这套设计在整个版图中的位置。
-</content>
-</invoke>

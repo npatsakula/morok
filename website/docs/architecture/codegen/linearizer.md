@@ -22,13 +22,14 @@ sidebar_label: Phase 4 — Linearizer
 
 **Pattern**: `symbolic`
 
-Includes GEP pushing patterns—move address calculations through arithmetic:
+Svod has no GEP op—addressing is `INDEX(STACK(...))`—so Tinygrad's `gep_pushing`
+has no counterpart here. The nearest analogue is `alu_vectorize_reorder_patterns`:
 ```text
-Before:  GEP(ADD(arr_a, arr_b), idx)
-              ↓ [Push GEP through ADD]
-After:   ADD(GEP(arr_a, idx), GEP(arr_b, idx))
+Before:  ADD(STACK(x, x, x, x), STACK(y, y, y, y))
+              ↓ [Reorder ALU over STACK]
+After:   STACK(ADD(x, y), ADD(x, y), ADD(x, y), ADD(x, y))
 ```
-*Why?* Enables parallel computation of GEPs and may enable downstream vectorization. (Note: The pattern only applies when GEP's dtype and ALU's dtype are NOT pointers.)
+*Why?* Enables constant folding and scalar optimization on the collapsed operation. That rule lives in tier-3 `sym()`, so it already fired at Stage 14, not here.
 
 ---
 
@@ -48,7 +49,7 @@ After:   ADD(GEP(arr_a, idx), GEP(arr_b, idx))
 
 Most backends (CPU, GPU) don't need this. Only specialized hardware uses it.
 
-**Note**: Svod does not currently implement this stage. The `Renderer` trait has `render()`, `backend_name()`, and `decompositor()` methods, but no `pre_matcher` support yet. This is a future enhancement for DSP and other specialized backends.
+**Note**: Svod has no `pre_matcher`. Backend hooks live on the `svod_device::device::Renderer` trait (`device/src/device.rs`): `decompositor()`, `extra_matcher()`, `pre_isel_matcher()` and `isel_matcher()`. The last two run at the PROGRAM boundary, between Stages 20 and 21, not before decomposition. (`svod_codegen::traits::Renderer` is a separate, narrower trait with `render()`, `backend_name()` and `decompositor()`.)
 
 ---
 
@@ -64,23 +65,23 @@ Most backends (CPU, GPU) don't need this. Only specialized hardware uses it.
 
 **Why This Matters**: Hardware doesn't have every operation. For example, most CPUs don't have a direct `sin` instruction. We approximate it with operations that do exist (addition, multiplication, etc.).
 
-**Pattern**: `symbolic_simple() + get_late_rewrite_patterns()`
+**Pattern**: `early_decomposition_patterns() + get_late_rewrite_patterns() + get_transcendental_patterns()` (plus `renderer.decompositor()` when the backend supplies one). `early_decomposition_patterns()` itself starts with `symbolic_simple()`.
 
-Note: `pm_render()` and `pm_split_ends()` are not part of this combined pass—they run separately in Stage 19.
+Note: `pm_split_ends()` is not part of this pass—it is folded into the Stage 19 matcher and runs again at the head of Stage 20.
 
 | Pattern | Example | When Used |
 |----------|---------|----------|
 | `MOD → AND` | `x % 8 → x & 7` | Power-of-2 divisor |
 | `MUL → SHL` | `x * 16 → x << 4` | Power-of-2 multiplier |
-| `DIV → SHR` | `x // 8 → x >> 3` | Power-of-2 divisor |
+| `DIV → SHR` | `x / 8 → x >> 3` | Power-of-2 divisor (C-style CDIV) |
 | `FDIV → MUL` | `x / 2.0 → x * 0.5` | Float constant divisor |
 | `NEG` | `x * -1 → NEG(x)` | When NEG supported |
 | `MULACC` | `a * b + c → MULACC(a, b, c)` | When FMA supported |
 | Fast integer division | `x // 7 → (x * M) >> S` | Non-power-of-2 divisor |
-| De Morgan's laws | `(!x) & (!y) → !(x \| y)` | Boolean simplification (both directions) |
+| De Morgan's law | `(!x) & (!y) → !(x \| y)` | Boolean simplification (AND-of-NOTs only) |
 | Comparison negations | `!(x < c) → (c-1) < x` | Integer comparisons |
 
-Transcendental function approximations (SIN, EXP, LOG, etc.) are implemented via the `decompositor()` pathway (see `ir/src/decompositions/transcendentals.rs`).
+Transcendental approximations (EXP2, LOG2, SIN, …) come from `get_transcendental_patterns()` (`ir/src/decompositions/mod.rs`, implementations in `ir/src/decompositions/transcendentals.rs`). They are enabled per operation when the renderer lacks the instruction, or for every operation when `TRANSCENDENTAL=2`. The optional `Renderer::decompositor()` hook adds backend-specific rules on top; no in-tree backend uses it.
 
 **Svod**: `optimizer/mod.rs`
 
@@ -91,24 +92,16 @@ Transcendental function approximations (SIN, EXP, LOG, etc.) are implemented via
 > **Stage at a Glance**
 >
 > **Goal**: Prepare for linearization
-> **Key Patterns**: CONST vectorization, GEP resolution, END splitting
+> **Key Patterns**: Weak-cast commit, renderer rewrites, END splitting
 > **Impact**: Clean representation ready for linearization
 
 **What This Does**: Prepare for linearization.
 
 **Why This Matters**: Some patterns are easier to apply after decomposition. This stage does final cleanup before converting to a linear sequence.
 
-**Pattern**: `symbolic_simple() + get_late_rewrite_patterns()`
+**Pattern**: `pm_commit_weak() + pm_cast_weak() + pm_decomp` (the Stage 18 decompositions), plus `renderer.extra_matcher()` and `pm_split_ends()`—all summed into one matcher. `pm_remove_invalid()` and `add_implicit_barriers()` then run as separate passes.
 
-Note: `extra_matcher` and `pm_split_ends` run separately, not as part of this combined pass.
-
-**CONST vectorization**:
-```text
-// Make vector constants explicit
-CONST(1.0) used as vec4 → VECTORIZE(1.0, 1.0, 1.0, 1.0)
-```
-
-**GEP resolution**: Convert remaining GEP operations.
+Note: `extra_matcher` and `pm_split_ends` are part of this combined matcher, not separate passes. Svod has no CONST-vectorization or GEP-resolution step; Tinygrad's `pm_render` has no counterpart here.
 
 **Split multi-range ENDs**:
 ```text
@@ -119,9 +112,11 @@ END(op, [range_a, range_b])
 END(END(op, range_a), range_b)
 ```
 
+The ranges are sorted descending by `(axis_id, axis_type.priority())`, so the innermost END is built first. Void/Bool "backedge" sources are partitioned out and re-attached to the outermost END, with the original tag preserved.
+
 **extra_matcher**: Each backend can add its own final patterns. This allows hardware-specific optimizations without changing the generic pipeline.
 
-**Svod**: `devectorize.rs`, `linearize/mod.rs`, `optimizer/mod.rs`
+**Svod**: `optimizer/mod.rs`, `linearize/mod.rs`
 
 ---
 
@@ -137,7 +132,7 @@ END(END(op, range_a), range_b)
 
 **Why This Matters**: Operations must execute in a valid order. If a load uses a RANGE's value, the RANGE must come first. This stage tracks and enforces these dependencies.
 
-**Pattern**: `pm_add_control_flow` (bottom-up)
+**Pattern**: `pm_add_control_flow` (bottom-up), preceded by a second `pm_split_ends` run
 
 ```text
 // Analyze which END operations depend on which
@@ -150,15 +145,15 @@ RANGE_B waits for RANGE_A to complete
 
 **Three relationship types**:
 
-| Relationship | Example | Meaning |
-|--------------|---------|---------|
-| Nested | RANGE_A inside RANGE_B | A must complete before B starts |
-| Dependent | END_A and END_B are siblings | END_B must wait for END_A (sibling dependency) |
-| Independent | RANGE_X and RANGE_Y don't interact | Can run in parallel |
+| Relationship | Condition | Meaning |
+|--------------|-----------|---------|
+| Nested | END_A is a dep of END_B **and** RANGE_B is a dep of END_A | A's loop sits inside B's, so A closes before B closes |
+| Dependent | END_A is a dep of END_B without that nesting | B's loop must be emitted after A's |
+| Independent | Neither END depends on the other | Order is free; can run in parallel |
 
 Bottom-up traversal ensures dependencies flow correctly from leaves to roots.
 
-**Svod**: `schedule/src/linearize/mod.rs`
+**Svod**: `schedule/src/linearize/mod.rs`, `schedule/src/linearize/cfg_context.rs`
 
 ---
 
@@ -178,13 +173,12 @@ Bottom-up traversal ensures dependencies flow correctly from leaves to roots.
 
 | Operation | Priority | Why |
 |-----------|----------|-----|
-| DEFINE_GLOBAL | -20 | Arguments must be defined first |
-| DEFINE_VAR | -19 | Variables must be defined first |
-| DEFINE_LOCAL | -18 | Allocations first |
-| DEFINE_REG | -17 | Registers first |
-| CONST | -10 | Constants early for reuse (Svod extension; Tinygrad defaults to 0) |
-| LOAD | -1 | Loads before use |
+| PARAM | -20 | Kernel arguments (and symbolic variables) must be defined first; ties break on the parameter slot |
+| BUFFER | -18 | Allocations first |
+| BUFFER (`AddrSpace::Local`) | -17 | Local allocations right after the global ones |
 | END | -5 | Closes ranges |
+| LOAD | -1 | Loads before use |
+| Everything else (CONST, ALU, …) | 0 | Sinks next to its consumer |
 | STORE | +1 | Stores after computation |
 | RANGE | +5 | Ranges open before use |
 
@@ -194,15 +188,15 @@ Lower priority = earlier in sequence. This ensures:
 - Stores happen last
 - Ranges open before their contents, close after
 
-**Run_count ordering**: Operations are sorted primarily by execution frequency (run_count), then by priority. Operations with lower execution frequency (outside inner loops) are scheduled first, while operations in inner loops (higher run_count) are scheduled later. Example: A CONST executed 100 times appears before a CONST executed 1M times.
+**Run_count ordering**: Operations are sorted primarily by execution frequency (run_count), then by priority, then by the PARAM slot and the tuplize rank. Operations with lower execution frequency (outside inner loops) are scheduled first, while operations in inner loops (higher run_count) are scheduled later. Example: A CONST executed 100 times appears before a CONST executed 1M times.
 
 **run_count Calculation**:
 ```text
-run_count = prod(int(r.vmax) + 1 for r in u.ranges)
+run_count = prod(int(r.vmax) + 1 for r in u.in_scope_ranges())
 ```
-This computes how many times an operation executes based on its enclosing ranges.
+This computes how many times an operation executes based on its enclosing in-scope ranges; a range whose `vmax` isn't a concrete integer contributes 1.
 
-**Svod**: `schedule/src/linearize/mod.rs`
+**Svod**: `linearize()` in `schedule/src/linearize/linearize.rs`
 
 ---
 
@@ -211,18 +205,18 @@ This computes how many times an operation executes based on its enclosing ranges
 > **Stage at a Glance**
 >
 > **Goal**: Final cleanup of linear instruction list
-> **Key Transformation**: Gated INDEX → IF/STORE/ENDIF
+> **Key Transformation**: Gated STORE → IF/STORE/ENDIF
 > **Impact**: Handles hardware without predicated stores
 
 **What This Does**: Final cleanup of the linear instruction list.
 
-**Why This Matters**: Some hardware (modern GPUs) supports "predicated stores"—write to memory only if condition is true. Older hardware doesn't. For those, we wrap store in an IF statement. This stage ONLY runs when hardware lacks predicated store support.
+**Why This Matters**: Some hardware (modern GPUs) supports "predicated stores"—write to memory only if condition is true. Older hardware doesn't. For those, we wrap store in an IF statement. This stage is only needed by backends that lack predicated store support; LLVM, CUDA and Metal handle the gate natively, so `linearize_with_cfg()` does not run it.
 
-**Pattern**: `pm_linearize_cleanups` (via `line_rewrite`, not `graph_rewrite`)
+**Pattern**: `line_rewrite_cleanups` (via `line_rewrite`, not `graph_rewrite`)
 
 ```text
-// Gated INDEX in STORE becomes conditional store
-STORE(INDEX(ptr, idx, valid=cond), value)
+// Gated STORE becomes a conditional store
+STORE(INDEX(ptr, idx), value, gate=cond)
 → IF(cond) { STORE(INDEX(ptr, idx), value) } ENDIF
 ```
 
@@ -230,4 +224,4 @@ STORE(INDEX(ptr, idx, valid=cond), value)
 
 At this point, the instruction list is ready for code generation.
 
-**Svod**: `schedule/src/linearize/mod.rs` (predicated stores path)
+**Svod**: `line_rewrite_cleanups()` in `schedule/src/linearize/mod.rs`

@@ -73,10 +73,11 @@ that is the cost it refuses to pay.
 You author with two types (from the AUTHOR face in `tk/src/lib.rs`):
 
 - **`Kernel`** (`tk/src/kernel.rs`) is the eager builder. It hands you the raw materials —
-  grid/block dimensions (which become `SPECIAL` ops), loop ranges (`RANGE`), shared-memory
-  buffers (`DEFINE_LOCAL`), register buffers (`DEFINE_REG`), and global parameters. You bind
-  tensors to it and ask it for tiles.
-- **`Group`** (`tk/src/group.rs`) is the cooperating wave (or group of waves). It carries the
+  grid/block dimensions (which become `SPECIAL` ops), loop ranges (`RANGE`), shared-memory and
+  register buffers (both `BUFFER`, distinguished by `addrspace = Local` / `Reg`), and global
+  parameters (`PARAM`). You bind tensors to it and ask it for tiles.
+- **`Group`** (`tk/src/group/`, one submodule per concern — `movement`, `mma`, `reduce`,
+  `shuffle`, `elementwise`) is the cooperating wave (or group of waves). It carries the
   *compute* vocabulary: loads and stores between memory spaces, the `mma` matrix multiply,
   reductions, shuffles, elementwise maps.
 
@@ -107,11 +108,13 @@ it checks this field (in `schedule/src/optimizer/`):
 | `Some(vec![])` | "This body is **already lowered**. Apply *zero* further optimizations." |
 | `Some(non-empty)` | "Apply exactly these optimizations, in order." |
 
-A `tk` kernel uses `Some(vec![])`: you wrote the schedule by hand, so the optimizer leaves it
-untouched. The rewrite passes that *do* still run (algebraic simplification, index lowering)
-are told not to descend into the kernel body. Your hand-tuned loop survives to codegen exactly
-as written — but it's still a normal UOp graph that the *same* renderer turns into LLVM IR and
-the *same* runtime executes.
+A `tk` kernel uses `Some(vec![])`: you wrote the schedule by hand, so the optimizer applies no
+schedule opts at all. The shared rewrites every kernel needs before codegen (algebraic
+simplification, index-dtype lowering) still run over the body; what never happens is re-tiling,
+re-vectorizing, or reordering it. And at the graph level, the scheduler's rewrites are
+*calls-preserving* — they don't descend into a hand kernel's body at all. Your hand-tuned loop
+survives to codegen exactly as written — but it's still a normal UOp graph that the *same* renderer
+turns into LLVM IR and the *same* runtime executes.
 
 And this isn't only a convenience ("you already optimized it, so don't bother"). It's a
 **safety contract**, because the optimizer *cannot* safely touch a hand-written body. That body
@@ -128,7 +131,7 @@ alone.
 
 There are two routes from a finished `Kernel` to running code, for the two different audiences.
 
-:::tip For GPU experts
+:::tip[For GPU experts]
 The scheduler treats the kernel's `Op::Call` like any other graph node — it walks the `AFTER`/`Call` dependency chains to find kernel boundaries and emits it as one scheduled kernel, while the rewrite passes run in a *calls-preserving* traversal that doesn't descend into the body. So your hand-lowered `SINK` is scheduled and dependency-tracked exactly like an autotuned kernel, but its interior is never rewritten.
 :::
 
@@ -167,7 +170,8 @@ That's the payoff of "one IR": the hand-written kernel and the autotuned kernel 
 
 A subtle failure mode in kernel libraries: you call the fast path, it quietly decides it can't
 handle your input, and you get the slow path with no warning — or worse, a wrong answer. `tk`'s
-public kernels (`tk/src/kernels/{fa,matmul}.rs`, via `launch_custom` in `tk/src/launch.rs`) are
+public kernels (`tk/src/kernels/`, the single-output ones via `launch_custom` in
+`tk/src/launch.rs`, the multi-output k-means and k-NN inlining the same policy) are
 built to make that impossible. Every entry point returns a three-way result:
 
 | Result | Meaning | What you do |
@@ -194,17 +198,17 @@ flowchart TD
   END --> RANGE["RANGE(0..N, Local) -- threadIdx, workgroup lane"]
   STORE --> IDX_OUT["INDEX"]
   STORE --> LOAD["LOAD"]
-  IDX_OUT --> DG_OUT["DEFINE_GLOBAL(out)"]
+  IDX_OUT --> P_OUT["PARAM(slot=0) -- out"]
   IDX_OUT --> RANGE
   LOAD --> IDX_IN["INDEX"]
-  IDX_IN --> DG_IN["DEFINE_GLOBAL(in)"]
+  IDX_IN --> P_IN["PARAM(slot=1) -- in"]
   IDX_IN --> RANGE
 ```
 
 No new node types, no separate dialect — the same operations the
 [matmul journey in the IR chapter](../architecture/ir-design)
-ends on. A real kernel adds `WMMA`, `DEFINE_LOCAL` (LDS), and `DEFINE_REG` (registers), but the
-shape is the same: a SINK over a STORE, scoped by ranges.
+ends on. A real kernel adds `WMMA` and `BUFFER` nodes in the `Local` (LDS) and `Reg` (register)
+address spaces, but the shape is the same: a SINK over a STORE, scoped by ranges.
 
 ---
 

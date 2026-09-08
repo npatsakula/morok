@@ -15,8 +15,28 @@
     "message": "परिचय",
     "description": "The label for the doc item 'Introduction' in sidebar 'defaultSidebar', linking to the doc introduction"
   },
+  "sidebar.defaultSidebar.category.Codegen Pipeline": {
+    "message": "कोडजेन पाइपलाइन",
+    "description": "The label for category 'Codegen Pipeline' in sidebar 'defaultSidebar'"
+  },
+  "sidebar.defaultSidebar.category.Optimizations": {
+    "message": "ऑप्टिमाइज़ेशन",
+    "description": "The label for category 'Optimizations' in sidebar 'defaultSidebar'"
+  },
   "sidebar.defaultSidebar.category.Tile Kernels (tk)": {
     "message": "Tile कर्नेल (tk)",
     "description": "The label for category 'Tile Kernels (tk)' in sidebar 'defaultSidebar'"
+  },
+  "sidebar.defaultSidebar.category.Backends": {
+    "message": "बैकएंड",
+    "description": "The label for category 'Backends' in sidebar 'defaultSidebar'"
+  },
+  "sidebar.defaultSidebar.category.AMD Backend": {
+    "message": "AMD बैकएंड",
+    "description": "The label for category 'AMD Backend' in sidebar 'defaultSidebar'"
+  },
+  "sidebar.defaultSidebar.category.CUDA Backend": {
+    "message": "CUDA बैकएंड",
+    "description": "The label for category 'CUDA Backend' in sidebar 'defaultSidebar'"
   }
 }

@@ -1785,7 +1785,7 @@ pub fn pm_wmma_add() -> &'static TypedPatternMatcher {
 
 use crate::symbolic::dce::reduce_identity;
 
-/// Convert REDUCE to explicit DEFINE_REG + LOAD/STORE accumulation pattern.
+/// Convert REDUCE to an explicit register `placeholder` + LOAD/STORE accumulation pattern.
 ///
 /// Transforms:
 /// ```text
@@ -1794,7 +1794,7 @@ use crate::symbolic::dce::reduce_identity;
 ///
 /// To:
 /// ```text
-/// acc = DEFINE_REG_TYPED(1, Float32)
+/// acc = placeholder(AddrSpace::Reg, 1, Float32)
 /// idx = INDEX(acc, [0])
 /// store_init = STORE(acc, idx, identity)  // Initialize with 0 for Add
 /// // Loop body (ranges provide iteration):

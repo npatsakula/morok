@@ -100,7 +100,7 @@ The `(a*m + b) / n` -> `a + b/n` pattern requires `0 <= b < n`. Without the rang
 
 ## 3. The `fold_divmod_general` Algorithm
 
-The catch-all for Index-dtype `Idiv` and `Mod`. Implements all 8 rules from Tinygrad's `divandmod.py:8-93` in priority order, including the recursive `nest_div_by_smallest_factor`. Each rule is tried in sequence; the first match wins.
+The catch-all for Index-dtype `Idiv` and `Mod`. Implements the rules of Tinygrad's `divandmod.py:8-96` in priority order. Each rule is tried in sequence; the first match wins. Rules 1-6 need a constant denominator, and the recursive `nest_div_by_smallest_factor` runs at the end of that half; `divide_by_gcd` and `factor_remainder` are the denominator-agnostic fallback that follows it.
 
 Entry point: when `Idiv(x, y)` or `Mod(x, y)` has `dtype == Index`, the pattern delegates to `fold_divmod_general(op, x, y)`.
 
@@ -124,18 +124,17 @@ If the entire range `[x_min, x_max]` maps to a single quotient across all corner
 
 **Example**: `(RANGE(8) % 4 + RANGE(2)) % 2` -> `(RANGE(8) + RANGE(2)) % 2`
 
-### Rule 3 -- fold_binary_numerator
+### Rule 3 -- nested_div
 
-When a single non-constant term has exactly 2 values (`vmax - vmin == 1`), the result is a linear interpolation: `(y2 - y1) * (v - v_min) + y1`.
+`(a % (k*c)) // c` -> `(a // c) % k` when `k > 0`. A modulus that is a multiple of the divisor turns the outer division into a modulo of the inner quotient.
 
-**Guard**: Exactly one non-constant term after decomposition, and that term's range spans exactly 2 values.
+**Guard**: `op == Idiv`, the numerator is a `Mod(inner, modulus)`, `modulus` is exactly divisible by the denominator `c`, and the resulting `k` has `vmin > 0`.
 
-**What it does**: Evaluates the div/mod at both endpoints and constructs a linear map between them. This avoids the division entirely.
+**What it does**: Rewrites the division of a modulo as a modulo of a division, removing one level of nesting.
 
-**Example**: For `(v * 3 + 2) % 5` where `v` is in `{0, 1}`:
-- `v=0`: `(0 + 2) % 5 = 2`
-- `v=1`: `(3 + 2) % 5 = 0`
-- Result: `(0 - 2) * (v - 0) + 2 = -2*v + 2`
+**Example**: `(R % 12) // 4` -> `(R // 4) % 3`
+
+A numerator that spans exactly two values is handled inside Rule 4 instead: `fold_divmod_congruence` searches both remainder signs precisely so a binary numerator crossing one period still folds.
 
 ### Rule 4 -- fold_divmod_congruence
 
@@ -157,7 +156,19 @@ Compute the symbolic GCD of all additive terms and the denominator. If GCD > 1, 
 
 **Example**: `(6*a + 4*b) // 8` with `GCD(6, 4, 8) = 2` -> `(3*a + 2*b) // 4`
 
-### Rule 6 -- divide_by_gcd
+### Rule 6 -- nest_div_by_smallest_factor
+
+Recursive decomposition for constant divisors. Finds the smallest factor shared between the divisor and any term's coefficient, divides both by it, then recurses.
+
+**Guard**: `x_min >= 0`, constant `y > 1`, and at least one non-constant term has a factor `f > 1` where `y % f == 0`.
+
+**What it does**: Picks `div = min(|f|)` among qualifying factors, rewrites `x // y` as `(x // div) // (y / div)`. Each step reduces `y`, converging to rules 1-7.
+
+**Example**: `(6*a + 4*b) // 12` → `((6*a + 4*b) // 2) // 6` → `(3*a + 2*b) // 6` → `(3*a + 2*b) // 6` (then rule 8 finishes).
+
+Tinygrad: `divandmod.py:62-67`. Svod: `nest_div_by_smallest_factor` in `fold_divmod_general`.
+
+### Rule 7 -- divide_by_gcd
 
 Variable denominator version of Rule 5. Computes `GCD(all_terms..., y)` including both numerator and denominator, then divides both sides. Unlike Rule 5, this works when the denominator is not a constant.
 
@@ -165,7 +176,7 @@ Variable denominator version of Rule 5. Computes `GCD(all_terms..., y)` includin
 
 **Example**: `(4*a) // (2*b)` -> `(2*a) // b`
 
-### Rule 7 -- factor_remainder
+### Rule 8 -- factor_remainder
 
 Last resort. Partition terms into exactly-divisible (quotient) and remainder.
 
@@ -174,18 +185,6 @@ Last resort. Partition terms into exactly-divisible (quotient) and remainder.
 **What it does**: For `Idiv`: `quo_sum + rem // y`. For `Mod`: `rem % y` (with coefficient reduction for constant `y`).
 
 **Example**: `(8*a + 3*b) // 8` -> `a + (3*b) // 8`
-
-### Rule 8 -- nest_div_by_smallest_factor
-
-Recursive decomposition for constant divisors. Finds the smallest factor shared between the divisor and any term's coefficient, divides both by it, then recurses.
-
-**Guard**: `x_min >= 0`, constant `y > 1`, and at least one non-constant term has a factor `f > 1` where `y % f == 0`.
-
-**What it does**: Picks `div = min(|f|)` among qualifying factors, rewrites `x // y` as `(x // div) // (y / div)`. Each step reduces `y`, converging to rules 1-7.
-
-**Example**: `(6*a + 4*b) // 12` → `((6*a + 4*b) // 2) // 6` → `(3*a + 2*b) // 6` → `(3*a + 2*b) // 6` (then rule 7 finishes).
-
-Tinygrad: `divandmod.py:62-67`. Svod: `nest_div_by_smallest_factor` in `fold_divmod_general`.
 
 :::caution
 Rules 5-8 require non-negative numerators (`x_min >= 0`). Floor division with negative operands has different rounding semantics (toward negative infinity in Python/Tinygrad, toward zero in hardware). The implementation returns `None` for negative ranges, falling through to let later passes handle the expression.
@@ -278,7 +277,7 @@ This ensures commutative operations have a deterministic operand order based on 
 **Why NOT applied to non-Index types**: Applying canonicalization to float/int arithmetic would reorder VECTORIZE elements and break vector math merging in later passes. Tinygrad makes the same choice (`symbolic.py:178-182`).
 
 :::caution
-Canonicalization interacts with the rewrite engine's fixed-point iteration. If two patterns disagree on operand order (one canonicalizes, another produces non-canonical output), the engine can oscillate. All index-producing patterns must respect canonical order, or the 1000-iteration safety limit will trigger.
+Canonicalization interacts with the rewrite engine's fixed-point iteration. If two patterns disagree on operand order (one canonicalizes, another produces non-canonical output), the engine can oscillate. All index-producing patterns must respect canonical order, or the rewrite engine's 500,000-entry stack limit (`REWRITE_STACK_LIMIT`) will trigger.
 :::
 
 ---

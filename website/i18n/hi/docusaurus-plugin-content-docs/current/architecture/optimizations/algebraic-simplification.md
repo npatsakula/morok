@@ -8,12 +8,12 @@ Svod का symbolic simplifier UOp computation graphs को 140+ अल्ज�
 
 | कहाँ | Matcher | Context |
 |------|---------|---------|
-| Pre-optimization | `symbolic()` | Rangeify + range splitting के बाद, कर्नेल ऑप्टिमाइज़ेशन से पहले |
-| Post-opt (Stage 8) | `symbolic()` | ऑप्टिमाइज़ेशन actions के बाद, expansion से पहले |
-| Post-index (Stage 16) | `symbolic()` | Index dtype lowering के बाद, फ़ाइनल cleanup |
-| Decomp+Render (Stage 18-19) | `symbolic_simple()` | Late rewrites और render पैटर्न के साथ combined |
+| Pre-optimization | `sym()` | Rangeify + range splitting के बाद, कर्नेल ऑप्टिमाइज़ेशन से पहले |
+| Post-opt (Stage 8) | `sym()` + `pm_move_where_on_load` | ऑप्टिमाइज़ेशन actions के बाद, expansion से पहले |
+| Post-index (Stage 16) | `sym()` + `indexing_simplify()` | Index dtype lowering के बाद, फ़ाइनल cleanup |
+| Decomp+Render (Stage 18-19) | `symbolic_simple()` | Late rewrites और renderer के अपने matchers के साथ combined |
 
-`symbolic()` = `symbolic_simple()` + GEP pushing पैटर्न। फ़ाइनल decomp+render पास के अलावा सभी stages फ़ुल `symbolic()` सेट चलाते हैं।
+Matchers तीन tiers में आते हैं: `symbolic_simple()` tier-1 base है (identities, constant folding, size-1 RANGE collapse), `symbolic()` उस पर tier-2 groups जोड़ता है (canonicalization, comparisons, range bounds के ख़िलाफ़ div/mod), और `sym()` tier 3 जोड़ता है (`pm_simplify_valid`, ALU/STACK reordering, opinionated term combining)। सिर्फ़ फ़ाइनल decomp+render पास अकेले tier-1 सेट चलाता है।
 
 **Range analysis**: हर UOp अपनी runtime minimum (`vmin`) और maximum (`vmax`) वैल्यूज़ ट्रैक करता है, जो नोड construction के दौरान inputs के bounds से eagerly कम्प्यूट होती हैं। कई पैटर्न इन bounds का इस्तेमाल करते हैं compile time पर conditions prove करने के लिए (जैसे, "x हमेशा non-negative है" या "x < n सभी values के लिए")।
 
@@ -64,35 +64,44 @@ flowchart TD
 
 ## पैटर्न ऑर्डरिंग
 
-`symbolic_simple()` matcher पैटर्न ग्रुप्स को एक स्पेसिफ़िक ऑर्डर में compose करता है। एक ग्रुप के अंदर, पैटर्न sequentially ट्राई होते हैं जब तक कोई मैच न हो। ग्रुप्स `+` ऑपरेटर से concatenate होते हैं:
+हर matcher पैटर्न ग्रुप्स को एक स्पेसिफ़िक ऑर्डर में compose करता है — ऑर्डर load-bearing है, क्योंकि एक ग्रुप बाद वाले के लिए नए matches खोल सकता है। एक ग्रुप के अंदर, पैटर्न sequentially ट्राई होते हैं जब तक कोई मैच न हो। ग्रुप्स `+` ऑपरेटर से concatenate होते हैं:
 
 ```text
-propagate_invalid          -- MUST be first (before x*0=0)
-fold_invalid_load_store
-constant_folding_dsl_patterns
-vconst_folding_patterns
-identity_and_zero_patterns
-commutative_canonicalization
-self_folding_dsl_patterns
-zero_folding_dsl_patterns
-division_dsl_patterns
-cast_dsl_patterns
-cast_where_dsl_patterns
-term_combining_dsl_patterns
-alu_folding_dsl_patterns
-advanced_division_dsl_patterns
-div_mod_recombine_dsl_patterns
-comparison_dsl_patterns
-boolean_dsl_patterns
-minmax_dsl_patterns
-where_bound_patterns
-power_dsl_patterns
-negation_dsl_patterns
-range_based_mod_div_patterns
-dce_dsl_patterns
-dead_loop_patterns
-after_simplification_patterns
-pm_move_where_on_load       -- WHERE->INDEX embedding for masked loads
+symbolic_simple() = symbolic_simple_base() + dead_loop_patterns()
+
+symbolic_simple_base()          -- tier 1
+  propagate_invalid             -- MUST be first (before x*0=0)
+  fold_invalid_load_store
+  constant_folding_dsl_patterns
+  vconst_folding_patterns
+  bool_arithmetic_patterns
+  identity_and_zero_patterns
+  self_folding_dsl_patterns
+  zero_folding_dsl_patterns
+  division_dsl_patterns
+  cast_dsl_patterns
+  uint_pack_dsl_patterns
+  div_mod_recombine_dsl_patterns
+  power_dsl_patterns
+  boolean_dsl_simple_patterns
+  dce_dsl_simple_patterns
+
+symbolic() = symbolic_simple() + tier 2
+  commutative_canonicalization
+  boolean_dsl_patterns
+  term_combining_dsl_patterns
+  dce_dsl_patterns
+  where_alu_combining_patterns
+  vmin_vmax_collapse_patterns
+  minmax_dsl_patterns
+  alu_folding_dsl_patterns
+  comparison_dsl_patterns
+  range_based_mod_div_patterns
+  advanced_division_dsl_patterns
+  range_based_cast_patterns
+  long_to_int_narrowing_patterns
+  after_simplification_patterns
+  where_bound_patterns
 ```
 
 ---
@@ -140,7 +149,7 @@ VConst folding 11 binary ops कवर करता है (Pow और Fdiv excl
 | `MUL[x, 0]` | `0` | सिर्फ़ जब float NOT हो |
 | `AND[_, 0]` | `0` | Commutative |
 
-:::caution IEEE 754: MUL by zero
+:::caution[IEEE 754: MUL by zero]
 `MUL[x, 0]` floats के लिए **सिम्प्लिफ़ाई नहीं** होता क्योंकि IEEE 754 require करता है:
 - `NaN * 0 = NaN`
 - `Inf * 0 = NaN`
@@ -184,7 +193,7 @@ VConst folding 11 binary ops कवर करता है (Pow और Fdiv excl
 | `FDIV(MUL(x, y), y)` | `x` | Cancellation (float) |
 | `IDIV(MUL(x, y), y)` | `x` | Cancellation (integer) |
 
-:::caution पैटर्न प्रायोरिटी
+:::caution[पैटर्न प्रायोरिटी]
 `FDIV(0, 0) -> NaN` matcher में `FDIV(x, x) -> 1` से पहले होना ज़रूरी ताकि priority ले सके। `division_dsl_patterns()` के अंदर ऑर्डरिंग यह ensure करता है।
 :::
 
@@ -202,7 +211,7 @@ VConst folding 11 binary ops कवर करता है (Pow और Fdiv excl
 
 `can_safe_cast(to, from)` फ़ंक्शन determine करता है कि intermediate type सभी values hold कर सकता है या नहीं। यह bit widths, signedness, और float/int categories चेक करता है।
 
-:::caution Truncation kills round-trips
+:::caution[Truncation kills round-trips]
 `CAST(CAST(x, i8), i64)` जब `x` `i64` हो तो `x` में collapse **नहीं** होता। Intermediate `i8` values truncate करता है — `can_safe_cast(i64, i8)` `false` रिटर्न करता है क्योंकि `i8` सभी `i64` values hold नहीं कर सकता।
 
 सेफ़ example: `CAST(CAST(x, i32), bool)` -> `CAST(x, bool)` जब `x` `bool` हो, क्योंकि `i32` `true` और `false` दोनों represent कर सकता है।
@@ -282,7 +291,7 @@ Svod `SUB` को first-class IR op रखता है (Tinygrad से अल�
 | `LT(x, x)`, `GT(x, x)`, `NE(x, x)` | `false` |
 | `LE(x, x)`, `GE(x, x)`, `EQ(x, x)` | `true` |
 
-:::caution Float self-comparison
+:::caution[Float self-comparison]
 Self-comparison पैटर्न `!x.dtype().is_float()` से guarded हैं। Floats में, `NaN != NaN` `true` है और `NaN == NaN` `false` है, तो ये identities hold नहीं करतीं।
 :::
 
@@ -342,7 +351,7 @@ Range analysis के लिए `VminVmaxProperty` इस्तेमाल क�
 | `WHERE(NOT(cond), t, f)` | `WHERE(cond, f, t)` | Condition flip |
 | `WHERE(a, WHERE(b, c, d), d)` | `WHERE(AND(a, b), c, d)` | Branch merging (`d` पर ptr_eq) |
 
-:::caution Condition flip पर Invalid गार्ड
+:::caution[Condition flip पर Invalid गार्ड]
 `WHERE(NOT(cond), t, f) -> WHERE(cond, f, t)` जब `f` में `Invalid` हो तब **अप्लाई नहीं** होता। Padding `WHERE(valid, idx, Invalid)` structures बनाता है, और swap करने से `Invalid` true branch में चला जाएगा जहाँ downstream पैटर्न उसे मैच नहीं कर सकते। Scalar `Invalid` और vectorized `VECTORIZE(Invalid, ...)` दोनों चेक होते हैं।
 
 Tinygrad में भी यही गार्ड है: `symbolic.py:201-202`।
@@ -445,59 +454,46 @@ Tinygrad alignment: `symbolic.py:37`। Right-position bare Invalid propagate **
 
 ---
 
-## 16. GEP Pushing
+## 16. Lane Folds — STACK के ऊपर INDEX
 
-GEP (Get Element Pointer) vectors से elements extract करता है। ये पैटर्न GEP को दूसरे operations से push करके vector source तक पहुँचाते हैं, जिससे devectorization के बाद scalar simplification संभव होता है।
+Svod में GEP op नहीं है: shaped value दरअसल lanes का एक `STACK` है, और `INDEX` उसमें से lane उसी तरह चुनता है जैसे वह buffer से address चुनता है। इसलिए Tinygrad के `gep_pushing` का यहाँ कोई सीधा counterpart नहीं है। Svod के पास इसकी जगह ऐसे folds हैं जो `INDEX`/`STACK` structure को collapse कर देते हैं ताकि devectorizer को scalars दिखें।
 
-सिर्फ़ `symbolic()` (Stage 4) में include, `symbolic_simple()` (Stages 8, 16) में नहीं।
+इनमें से ज़्यादातर folds structural हैं और devectorizer की movement cleanup में रहते हैं (`schedule/src/devectorize.rs`), `symbolic_simple()` में नहीं। symbolic tier का इकलौता rule `alu_vectorize_reorder_patterns` है, जो tier-3 `sym()` का हिस्सा है।
 
-### Composition और Extraction
+### Lane चुनना और Collapse करना
 
 | पैटर्न | रिज़ल्ट | नोट्स |
-|--------|--------|-------|
-| `GEP(GEP(x, inner), outer)` | `GEP(x, inner[outer])` | Nested compose |
-| `GEP(VECTORIZE(x,x,x,x), [i])` | `x` | Broadcast से (सभी ptr_eq) |
-| `GEP(VECTORIZE(elems), [i])` | `elems[i]` | VECTORIZE से |
-| `GEP(scalar, [i])` | `scalar` | Scalar identity (vcount == 1) |
-| `GEP(VCONST(vals), [i])` | `CONST(vals[i])` | VConst से |
-| `GEP(x, [0,1,...,n-1])` | `x` | Identity removal |
+|--------|---------|-------|
+| `INDEX(STACK([a, b, c]), 2)` | `c` | Constant lane index सीधे stacked source में fold हो जाता है |
+| `INDEX(STACK([...]), c0, rest...)` | `INDEX(sources[c0], rest...)` | अग्रणी constant recursively एक STACK level छीलता है |
+| `STACK([INDEX(b, 0), INDEX(b, 1), ...])` | `b` | क्रमिक lane reads source को वापस बना देते हैं |
+| `INDEX(INDEX(b, i), j)` | `INDEX(b, i, j)` | Scalar index chains को compose करता है |
+| `INDEX(AFTER(STACK([...]), deps), c)` | चुनी हुई lane, `deps` दोबारा जुड़े हुए | Register-stack lane selection ordering बनाए रखता है |
 
-### Operations से Push करना
+`const_index_into_stack` recursive है: index list के जितने अग्रणी entries constants हैं, हर एक पर `STACK` की एक level छिलती है।
+
+### STACK पर ALU
 
 | पैटर्न | रिज़ल्ट | गार्ड |
-|--------|--------|------|
-| `GEP(op(a, b), idx)` | `op(GEP(a, idx), GEP(b, idx))` | Binary, सिर्फ़ Index dtype |
-| `GEP(unary(x), idx)` | `unary(GEP(x, idx))` | Unary, सिर्फ़ Index dtype |
-| `GEP(WHERE(c, t, f), idx)` | `WHERE(GEP(c, idx), GEP(t, idx), GEP(f, idx))` | सिर्फ़ Index dtype |
-| `GEP(MULACC(a, b, c), idx)` | `MULACC(GEP(a, idx), GEP(b, idx), GEP(c, idx))` | सिर्फ़ Index dtype |
+|--------|---------|-------|
+| `op(STACK(x,x,x,x), STACK(y,y,y,y))` | `STACK(op(x,y), op(x,y), ...)` | दोनों operands broadcast हों (सभी lanes `ptr_eq`), बराबर लंबाई > 1 |
 
-:::caution Index dtype गार्ड graph explosion रोकता है
-ALU ops से GEP pushing सिर्फ़ `Index` dtype तक restricted है (Tinygrad: `symbolic.py:167`)। इस गार्ड के बिना, GEP pushing और `no_vectorized_alu` मिलकर high-dimensional kernels पर exponential graph blowup पैदा करते हैं।
+यह अठारह binary ops पर लागू होता है — Add, Mul, Sub, FloorMod, Max, FloorDiv, Fdiv, Pow, And, Or, Xor, Shl, Shr और छह comparisons। एक ही scalar operation के `STACK` में collapse होने से operands constant folding और scalar simplification के सामने आ जाते हैं।
+
+:::caution[सिर्फ़ Tier-3]
+`alu_vectorize_reorder_patterns` `sym()` का हिस्सा है, `symbolic()` या `symbolic_simple()` का नहीं। यह उन्हीं stages पर fire करता है जहाँ `sym()` चलता है — pre-optimization, Stage 8 और devectorizer — इसलिए फ़ाइनल decomp+render पास तक reordering हो चुकी होती है।
 :::
 
-### Structural Ops से Push करना
+### STACK के इर्द-गिर्द Movement Cleanup
 
 | पैटर्न | रिज़ल्ट |
-|--------|--------|
-| `GEP(CAT([a<4>, b<4>]), [5])` | `GEP(b, [1])` |
-| `GEP(PTRCAT([a, b, c]), [1, 2])` | `PTRCAT([b, c])` |
-| `GEP(CAST(x, dtype), idx)` | `CAST(GEP(x, idx), scalar_dtype)` |
-| `GEP(BITCAST(x, dtype), idx)` | `BITCAST(GEP(x, idx), scalar_dtype)` |
-| `GEP(WMMA(a, b, c), idx)` | `WMMA(GEP(a, ...), GEP(b, ...), GEP(c, ...))` |
-| `GEP(UNROLL(x, ...), idx)` | `GEP(x, idx)` |
-| `GEP(void_node, _)` | `void_node` |
+|--------|---------|
+| `RESHAPE(STACK([x]))` | `x` — जब shapes पहले से मेल खाती हों |
+| अग्रणी 1-dims जोड़ने वाला `RESHAPE(x)` | हर जोड़े गए dimension पर एक `STACK([x])` wrapper |
+| `EXPAND(STACK([x]))` | `STACK([x, x, ..., x])` — broadcast को materialize करता है |
+| `PERMUTE(PERMUTE(x, a), b)` | `PERMUTE(x, a∘b)`; identity permutes हट जाते हैं |
 
-WMMA पैटर्न tile indices को upcast axes से मैप करता है ताकि corresponding input subgroups extract हों।
-
-### Re-collection
-
-| पैटर्न | रिज़ल्ट |
-|--------|--------|
-| `VECTORIZE(GEP(x,[0]), GEP(x,[1]), ..., GEP(x,[N-1]))` | `GEP(x, [0,1,...,N-1])` |
-
-यह `no_vectorized_alu` से बनी VECTORIZE structures को वापस single GEP में collapse करता है, जिसे फिर identity पैटर्न remove कर देता है।
-
----
+ये `movement_cleanup_patterns()` / `mop_cleanup_patterns()` में रहते हैं, जिन्हें devectorizer scalarization से पहले लगाता है। WMMA lanes भी वहीं हैंडल होती हैं — `stack_wmma_sources` और `broadcast_and_devec_wmma` से, किसी symbolic पैटर्न से नहीं।
 
 ## 17. WHERE on LOAD (सिर्फ़ Stage 8)
 
@@ -555,17 +551,18 @@ Commutative binary ops पर Index dtype के लिए, operands UOp id स�
 
 ### Unified Div-Mod Engine (`fold_divmod_general`)
 
-Index dtype पर IDIV और MOD के लिए, एक unified engine priority order में simplification rules ट्राई करता है। Tinygrad के `fold_divmod_general` (`divandmod.py:8-93`) पर based।
+Index dtype पर IDIV और MOD के लिए, एक unified engine priority order में simplification rules ट्राई करता है। Tinygrad के `fold_divmod_general` (`divandmod.py:8-96`) पर based।
 
 | प्रायोरिटी | Rule | Description |
 |-----------|------|-------------|
 | 1 | cancel_divmod | Range single denominator interval में |
-| 2 | remove_nested_mod | `(a%4 + b)%2 -> (a+b)%2` जब `2 | 4` |
-| 3 | fold_binary_numerator | Single term range 2 के साथ |
+| 2 | nested_div | `(a % (k*c)) // c -> (a // c) % k` |
+| 3 | remove_nested_mod | `(a%4 + b)%2 -> (a+b)%2` जब `2 | 4` |
 | 4 | fold_divmod_congruence | Factor congruence modular arithmetic |
 | 5 | gcd_with_remainder | Numerator से common GCD factor out |
-| 6 | divide_by_gcd | Variable denominator GCD factoring |
-| 7 | factor_remainder | `(d*x+y)//d -> x + y//d` (last resort) |
+| 6 | nest_div_by_smallest_factor | सबसे छोटे common factor से recursive split |
+| 7 | divide_by_gcd | किसी भी denominator के लिए GCD factoring |
+| 8 | factor_remainder | `(d*x+y)//d -> x + y//d` (last resort) |
 
 ### Div-Mod Recombination
 

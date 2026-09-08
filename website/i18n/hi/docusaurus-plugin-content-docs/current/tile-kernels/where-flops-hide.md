@@ -60,7 +60,8 @@ swizzled offsets को हर iteration पर दोबारा compute क�
 ### 2. Memory latency — और AMD के पास कोई `cp.async` नहीं
 
 NVIDIA पर asynchronous copy instructions (`cp.async`, और बाद में TMA) आपको एक load शुरू करके उसके
-land होने तक compute करते रहने देते हैं। AMD GPUs के पास ये हैं ही नहीं। इसके बदले hardware एक
+land होने तक compute करते रहने देते हैं — `tk` का CUDA path ठीक इसी के लिए `cp.async` इस्तेमाल करता है। AMD
+GPUs के पास ये हैं ही नहीं। इसके बदले hardware एक
 **सीधे shared memory (LDS) में buffer load** देता है, जो registers को पूरी तरह bypass कर देता है। तेज़ कर्नेल
 data का *अगला* block LDS में stream करता रहता है जबकि matrix core *मौजूदा* block पर काम कर रहा होता है।
 यहाँ ज़रा-सी चूक हुई, तो math unit हर load पर stall कर जाता है।
@@ -95,21 +96,24 @@ remap करके कि कौन-सा workgroup ID कहाँ run हो�
 
 ---
 
-## AMD का पहलू: MFMA बनाम WMMA, wave32 बनाम wave64
+## arch का पहलू: MFMA बनाम WMMA बनाम `mma.sync`, wave32 बनाम wave64
 
-दो hardware facts हर AMD tile कर्नेल को आकार देते हैं, और इन्हें ध्यान में रखना ज़रूरी है:
+तीन hardware facts हर उस tile कर्नेल को आकार देते हैं जो `tk` बनाता है, और इन्हें ध्यान में रखना ज़रूरी है:
 
 - **CDNA** (datacenter, जैसे gfx942) matrix multiplies को **MFMA** instructions के ज़रिए issue करता है और
   **wave64** चलाता है — प्रति wavefront 64 lanes।
 - **RDNA** (जैसे gfx1151, RDNA3.5, wave32) **WMMA** instructions issue करता है और
   **wave32** चलाता है — 32 lanes।
+- **NVIDIA** (`sm_80+`) **`mma.sync`** issue करता है और एक **warp32** चलाता है — 32 lanes, पर fragment
+  layout फिर से अपना ही: एक 16×16 tile जो दो `m16n8` halves के रूप में रखा जाता है।
 
 lane count बदलते ही यह बदल जाता है कि एक tile के elements wave भर में कैसे बँटते हैं; इससे register layout
-बदलता है, और उसके साथ reductions भी। एक के लिए लिखा कर्नेल अगर दूसरे पर — इसका हिसाब रखे बिना — चला दिया जाए,
-तो वह चुपचाप ग़लत नतीजे देता है। एक ही कर्नेल को दोनों पर correct रखना अपने आप में एक पूरा chapter है:
+बदलता है, और उसके साथ reductions भी — और एक ही width पर भी fragment layout अलग होता है। एक के लिए लिखा कर्नेल
+अगर किसी दूसरे पर — इसका हिसाब रखे बिना — चला दिया जाए, तो वह चुपचाप ग़लत नतीजे देता है। एक ही कर्नेल को
+तीनों पर correct रखना अपने आप में एक पूरा chapter है:
 [Wave32 बनाम Wave64](./wave-portability)।
 
-:::tip GPU विशेषज्ञों के लिए
+:::tip[GPU विशेषज्ञों के लिए]
 HipKittens के `analysis/paper_experiments/` micro-benchmarks ऊपर बताए gaps को आँकड़ों में ढालते हैं। यही design को
 justify करते हैं:
 
@@ -144,12 +148,12 @@ default तो `sched::pipeline` ही है; ये manual override तब �
   सही memory में, और conflict-free रखता है।
 - [Flash Attention](./flash-attention) gaps 2 और 4 को असल काम में दिखाता है: double-buffered streaming
   और एक explicit pipeline।
-- [Wave32 बनाम Wave64](./wave-portability) वह AMD-specific tax है जो gap 1 और lane-count का फ़र्क़ आप पर थोपते हैं।
+- [Wave32 बनाम Wave64](./wave-portability) वह portability tax है जो gap 1, lane-count का फ़र्क़, और per-arch fragment layouts आप पर थोपते हैं।
 
 लब्बोलुआब: एक तेज़ GPU कर्नेल बस "गणित, लिख दिया गया" नहीं होता। वह है *गणित, साथ में इस बात का जवाब कि दो
 matrix instructions के बीच का हर cycle आख़िर कहाँ जाता है।* FLOPS ठीक वहीं छिपते हैं।
 
-:::note क्या compiler पहले से matrix cores इस्तेमाल नहीं करता?
+:::note[क्या compiler पहले से matrix cores इस्तेमाल नहीं करता?]
 करता है — और यहाँ कुछ भी इसके उलट नहीं कह रहा। graph-native कर्नेल के लिए BEAM का `TC` action एक matmul को
 सीधे WMMA/MFMA पर map कर देता है और इसे इन्हीं gaps के मुक़ाबले tile करता है; compiler matrix cores चलाने में
 पूरी तरह सक्षम है। ये पाँच gaps वह *hardware reality* हैं जिसे हर तेज़ कर्नेल को हराना होता है —

@@ -53,20 +53,21 @@ pub enum Op {
     ReduceAxis { src: Arc<UOp>, reduce_op: ReduceOp, axes: Vec<usize> },
 
     // Loop-level control flow
-    Range { end: Arc<UOp>, axis_id: AxisId, axis_type: AxisType },
+    Range { end: Arc<UOp>, axis_id: AxisId, axis_type: AxisType, deps: SmallVec<[Arc<UOp>; 2]> },
     End { computation: Arc<UOp>, ranges: SmallVec<[Arc<UOp>; 4]> },
 
-    // Memory operations
-    Load { buffer: Arc<UOp>, index: Arc<UOp> },
-    Store { buffer: Arc<UOp>, index: Arc<UOp>, value: Arc<UOp>, ... },
+    // Memory operations (the buffer is reached through the INDEX, not a field)
+    Load { index: Arc<UOp>, alt: Option<Arc<UOp>>, gate: Option<Arc<UOp>> },
+    Store { index: Arc<UOp>, value: Arc<UOp>, gate: Option<Arc<UOp>> },
 
-    // ALU operations (same as hardware)
+    // ALU operations (grouped enums with many individual values)
     Binary(BinaryOp, Arc<UOp>, Arc<UOp>),  // Add, Mul, etc.
     Unary(UnaryOp, Arc<UOp>),              // Sqrt, Exp, etc.
+    Ternary(TernaryOp, Arc<UOp>, Arc<UOp>, Arc<UOp>),  // Where, MulAcc, etc.
 }
 ```
 
-这个 enum 包含约 80 个变体，按抽象层级组织：
+这个 enum 有约 60 个 Op 变体，按抽象层级组织（把 UnaryOp/BinaryOp/TernaryOp 各自的具体取值也算进来则有 80 多个）：
 
 | 类别 | 示例 | 表示什么 |
 |----------|----------|-------------------|
@@ -75,20 +76,20 @@ pub enum Op {
 | **控制** | `RANGE`, `END`, `IF`, `BARRIER` | 循环和分支结构 |
 | **内存** | `LOAD`, `STORE`, `INDEX`, `BUFFER` | 硬件内存访问 |
 | **ALU** | `ADD`, `MUL`, `SQRT`, `EXP`, `WHERE` | CPU/GPU 指令 |
-| **高级** | `WMMA`, `CONTRACT`, `UNROLL` | Tensor core、向量化 |
+| **高级** | `WMMA` | Tensor core 及其扩展元数据 |
 
 打印 UOp 图时，你会看到它的树形结构：
 
 ```mermaid
 flowchart TD
-  N42["[42] STORE : Void"] --> N35["[35] INDEX : Ptr(Float32)"]
-  N42 --> N40["[40] REDUCE(Add) : Float32"]
-  N42 --> N30["[30] RANGE(axis=0, Reduce) : Index"]
-  N35 --> N10["[10] DEFINE_GLOBAL(0) : Ptr(Float32)"]
-  N35 --> N30
-  N30 --> N5["[5] CONST(4) : Index"]
+  N42["[42] STORE : Void"] --> N35["[35] INDEX : Float32"]
+  N42 --> N40["[40] REDUCE(Add, num_axes=1) : Float32"]
+  N35 --> N10["[10] PARAM(slot=0) : Float32"]
+  N35 --> N31["[31] RANGE(R0, Global) : Index"]
+  N31 --> N5["[5] CONST(4) : Index"]
   N40 --> N38["[38] MUL : Float32"]
-  N40 --> N30
+  N40 --> N30["[30] RANGE(R1, Reduce) : Index"]
+  N30 --> N5
   N38 --> N36["[36] LOAD : Float32"]
   N38 --> N37["[37] LOAD : Float32"]
 ```
@@ -102,17 +103,17 @@ flowchart TD
 在 Svod 中创建同一个表达式两次，你会得到*同一个指针*。不是值相等——而是同一个内存地址。
 
 ```rust
-let a = UOp::binary(Add, x.clone(), y.clone());
-let b = UOp::binary(Add, x.clone(), y.clone());
+let a = x.try_add(&y)?;
+let b = x.try_add(&y)?;
 
 assert!(Arc::ptr_eq(&a, &b));  // Same pointer!
 ```
 
-:::note 来源是节点身份的一部分
+:::note[来源是节点身份的一部分]
 开启 `SVOD_ORIGIN=1` 后，节点还会带上构建时所处的 `OriginScope`，并把它折进自己的内容哈希。于是在不同作用域下构建的两个相同子图成了*不同*的节点，在内核切分剥除来源之前一直不共享。字面量是例外，`BUFFER`/`PARAM`/`UNIQUE` 也一样：同一个常量本就由两个作用域各自独立构建，给它带上来源只会拆出一个切分之后又要合并回去的节点。相关取舍参见[剖析与基准测试内核](../tile-kernels/profiling.md#attributing-kernels-to-model-code)。
 :::
 
-这通过全局缓存实现。构造 UOp 时先检查是否已有相同的：
+这通过一个全局的无锁缓存实现（使用 `papaya` crate，并以 `Weak` 引用避免内存泄漏）。构造 UOp 时先检查是否已有相同的：
 
 ```rust
 pub fn new(op: Op, dtype: DType) -> Arc<Self> {
@@ -172,7 +173,8 @@ flowchart TD
 
 | AxisType | CPU | CUDA | 含义 |
 |----------|-----|------|---------|
-| **Loop** | `for` 循环 | `for` 循环 | 顺序迭代；rangeify 默认 |
+| **Weak** | `for` 循环 | `for` 循环 | 未并行化的 range；rangeify 的默认值 |
+| **Loop** | `for` 循环 | `for` 循环 | 显式的常规循环 |
 | **Global** | 线程池 | `blockIdx` | 外层并行维度 |
 | **Thread** | 线程池 | — | CPU 并行 |
 | **Warp** | (N/A) | warp/wavefront | 子组并行 |
@@ -182,7 +184,7 @@ flowchart TD
 | **Reduce** | 累加器 | Warp reduce | 规约维度 |
 | **Unroll** | 展开 | 展开 | 循环展开 |
 
-AxisType 层次结构（Loop → Global/Thread → Warp → Local/GroupReduce → Upcast → Reduce → Unroll）映射到硬件执行模型——外层循环的优先级数值更小。`AxisType::Global` 的 `RANGE` 在 CUDA 中变成 `blockIdx.x`。`AxisType::Local` 的 `RANGE` 变成 `threadIdx.x`。
+AxisType 层次结构（Weak/Loop → Global/Thread → Warp → Local/GroupReduce → Upcast → Reduce → Unroll）映射到硬件执行模型——外层循环的优先级数值更小。`AxisType::Global` 的 `RANGE` 在 CUDA 中变成 `blockIdx.x`。`AxisType::Local` 的 `RANGE` 变成 `threadIdx.x`。
 
 为什么显式循环重要：
 
@@ -209,8 +211,8 @@ patterns! {
     Add(a @const(a_val), _b @const(b_val))
         => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 
-    // Self-folding: x / x → 1
-    Idiv(x, x) => UOp::one(x.dtype()),
+    // Self-folding: x // x → 1
+    FloorDiv(x, x) => 1.into_uop(x.dtype()),
 
     // Dead code: if(true) { x } else { y } → x
     Where(Const(ConstValue::Bool(true)), t, _f) => t,
@@ -273,11 +275,9 @@ Rangeify pass 将变换操作（`EXPAND`、`PERMUTE`）转换为带有 `RANGE` �
 flowchart TD
   STORE["STORE"] --> IDXC["INDEX"]
   STORE --> RED["REDUCE(Add)"]
-  STORE --> RJ["RANGE(j, Global) j in [0, 4)"]
-  STORE --> RI["RANGE(i, Global) i in [0, 4)"]
-  IDXC --> DG["DEFINE_GLOBAL(C)"]
-  IDXC --> RI
-  IDXC --> RJ
+  IDXC --> DG["PARAM(C)"]
+  IDXC --> RI["RANGE(i, Global) i in [0, 4)"]
+  IDXC --> RJ["RANGE(j, Global) j in [0, 4)"]
   RED --> MUL["MUL"]
   RED --> RK["RANGE(k, Reduce) k in [0, 4)"]
   MUL --> LA["LOAD(A)"]

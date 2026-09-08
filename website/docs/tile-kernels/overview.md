@@ -48,7 +48,7 @@ re-exported from `tk/src/lib.rs`):
 
 | Face | You are… | What you touch |
 |------|----------|----------------|
-| **USE** | an application author who just wants a fast kernel | `matmul`, `flash_attention`, `flash_attention_with`, `kmeans_assign` — they return lazy `Tensor`s, no kernel knowledge required |
+| **USE** | an application author who just wants a fast kernel | `matmul`, `flash_attention`, `flash_attention_with`, `single_query_attention`, and the AMD-only `kmeans_assign` / `knn` — they return lazy `Tensor`s, no kernel knowledge required |
 | **AUTHOR** | writing a new tile kernel | the `Kernel` / `Group` builder, `ArchCaps`, the tile types (`GL`/`ST`/`RT`/`RV`), `Swizzle`, `graph_launch` |
 | **DEBUG** | testing or benchmarking a kernel in isolation | `compile`, `launch`, `run_kernel`, `CompiledLaunch`, and structural `KernelFingerprint`s |
 
@@ -96,7 +96,7 @@ schedule, and that is what `tk` fills.
 `tk` also ships a hand-written `matmul`, but it belongs in the first row of the table: it is a
 performance canary for the DSL, not the production matmul, which goes through the graph.
 
-:::tip For GPU experts
+:::tip[For GPU experts]
 The structural difference between a hand-authored kernel and a BEAM-tuned one is a single field
 on the `SINK` UOp's `KernelInfo`: a graph kernel leaves `opts_to_apply: None`, a `tk` kernel sets
 `Some(vec![])`. Same IR, same pipeline, one marker. [Authoring into the IR](./lowering) traces

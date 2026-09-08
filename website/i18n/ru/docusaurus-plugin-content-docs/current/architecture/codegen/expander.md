@@ -4,7 +4,7 @@ sidebar_label: Фаза 2 — Expander
 
 # Фаза 2: Expander
 
-**Цель**: Трансформировать оптимизационные примитивы (UNROLL/UPCAST) в явные операции.
+**Цель**: Трансформировать оптимизационные примитивы (RANGE типов UPCAST/UNROLL) в явные операции с формой.
 
 ---
 
@@ -18,23 +18,23 @@ sidebar_label: Фаза 2 — Expander
 
 **Что делает**: Символическое упрощение после оптимизации, плюс перемещение WHERE.
 
-**Зачем это нужно**: WHERE-операции — это аналог `if`-выражений. Эта стадия переносит `if`-проверки с позиции после загрузки на позицию до неё. Железо может пропустить загрузку, когда условие ложно — экономия пропускной способности памяти.
+**Зачем это нужно**: WHERE-операции — это аналог `if`-выражений. Эта стадия переносит `if`-проверки, окружающие индексированное чтение, внутрь самого выражения индекса. Железо может пропустить загрузку, когда условие ложно — экономия пропускной способности памяти.
 
-**Паттерн**: `sym + pm_move_where_on_load`
+**Паттерн**: `sym + pm_move_where_on_load + pm_flatten_range + pm_reduce_unparented` (матчер `POST_OPT_SYM`)
 
 ```text
-// Before: WHERE guards a load
-WHERE(valid, LOAD(index), alt)
+// Before: WHERE guards an indexed read
+WHERE(cond, INDEX(buf, idx), 0)
 
-// After: validity moved to INDEX
-LOAD(INDEX(ptr, idx, valid=valid), alt)
+// After: validity moved into INDEX
+INDEX(buf, WHERE(cond, idx, Invalid))
 ```
 
 Перенос валидности в INDEX улучшает комбинирование загрузок и векторизацию.
 
-**Примечание**: Этот паттерн срабатывает только когда альтернативное значение равно `0`. Трансформация включает сложный анализ клауз: обнаружение дубликатов, проверки зависимостей от RANGE, верификацию data-dependent загрузок.
+**Примечание**: Этот паттерн срабатывает только когда альтернативное значение равно `0`; второе плечо обрабатывает инвертированную форму `WHERE(cond, 0, INDEX(...))` с отрицанием условия. Трансформация включает сложный анализ клауз: обнаружение дубликатов, проверки зависимостей от RANGE, верификацию data-dependent загрузок.
 
-**Примечание**: Реализация Svod использует `gate=` вместо `valid=` (у структуры Index есть поле `gate`). Концепция идентична.
+**Примечание**: Svod держит валидность внутри выражения индекса, как `WHERE(cond, idx, Invalid)`. Полем `gate` у LOAD/STORE она становится значительно позже, в `pm_move_gates_from_index` (`late/gater.rs`); у самого INDEX поля gate нет.
 
 **Svod**: `pm_move_where_on_load()` в `symbolic/patterns.rs`
 
@@ -44,91 +44,73 @@ LOAD(INDEX(ptr, idx, valid=valid), alt)
 
 > **Стадия кратко**
 >
-> **Цель**: Преобразовать UNROLL/UPCAST в явные операции
-> **Ключевые концепции**: UNROLL, CONTRACT, порядок паттернов
+> **Цель**: Развернуть RANGE типов UPCAST и UNROLL в координаты STACK с формой
+> **Ключевые концепции**: типы осей RANGE, STACK, INDEX, порядок паттернов
 > **Эффект**: Делает векторизацию явной и готовой для железа
 
-**Что делает**: Трансформирует оптимизационные примитивы UNROLL/UPCAST в явные операции.
+**Что делает**: Трансформирует классификации RANGE типов UPCAST/UNROLL в координаты с формой.
 
 **Зачем это нужно**: UPCAST и UNROLL помечают намерение — что мы хотим сделать. Эта стадия делает это намерение явным, чтобы железо могло его реально выполнить.
 
-**Паттерн**: `symbolic_simple() + pm_pre_expander + pm_group_for_reduce + expander`
+**Паттерн**: `expander2 + pm_flatten_range + mop_cleanup_patterns` (точка входа `pre_expand()`)
 
-Примечание: Svod использует `symbolic_simple()` (не `sym`) на этой стадии, поскольку `symbolic()` уже отработал на стадии 4. Tinygrad использует `sym`, который включает дополнительные паттерны.
+Примечание: внутри `pre_expand` символический матчер не запускается. `sym` уже отработал на стадии 8, а `symbolic_simple` запускается снова на стадиях 13 и 14.
 
-**Важно: приоритет паттернов**
+⚠️ **Важно: приоритет паттернов**
 
 Паттерны объединяются и выполняются до fixpoint. Порядок влияет на то, какой паттерн пробуется первым, когда подходят несколько:
-1. `sym` первым (символическое упрощение)
-2. `pm_pre_expander` вторым (преобразование UPCAST/UNROLL RANGE)
-3. `pm_group_for_reduce` третьим (обработка оси GROUP_REDUCE)
-4. `expander` последним (основное расширение)
+1. `expander2` первым (разворачивает RANGE типов UPCAST/UNROLL, операнды REDUCE и WMMA)
+2. `pm_flatten_range` вторым (перестраивает списки RANGE у END, когда RANGE исчезают)
+3. `mop_cleanup_patterns` последним (вычищает movement ops, оставшиеся после разворачивания)
 
 Неправильный приоритет может привести к некорректной векторизации или скоупингу редукций.
 
-**UNROLL и CONTRACT**:
+Развёрнутые линии (lanes) собираются через `STACK` и выбираются через `INDEX`. UPCAST и
+UNROLL — это значения `AxisType` у `RANGE`, а не самостоятельные операции. (`STACK` — это
+название Svod для того, что Tinygrad называет VECTORIZE; операции VECTORIZE не существует.)
 
-UNROLL и CONTRACT работают в связке:
-
-```text
-UNROLL: "Take this one thing and make N copies for different positions"
-Example:  x → [x_0, x_1, x_2, x_3]
-
-CONTRACT: "Take these N things and combine them back"
-Example:  [a, b, c, d] → one vector containing all four
-```
-
-Вместе: UPCAST помечает намерение векторизовать → UNROLL расширяет → CONTRACT объединяет.
-
-**UPCAST range → VECTORIZE**:
+**RANGE типа UPCAST / UNROLL → координата с формой**:
 ```mermaid
 flowchart TD
-  A["Before: UPCAST marks vectorization intent. RANGE(end=4, UPCAST)"]
-  A -->|"pm_pre_expander"| B["Step 1: Convert to UNROLL with constant indices. UNROLL(VCONST([0, 1, 2, 3]))"]
-  B -->|"expander"| C["Step 2: Expand operations with UNROLL sources. Operations now have unrolled sources"]
-  C -->|"CONTRACT or implicit"| D["After: explicit VECTORIZE. VECTORIZE(op[0], op[1], op[2], op[3])"]
+  A["Before: RANGE(end=4, Upcast) marks vectorization intent"]
+  A -->|"expander2"| B["After: RESHAPE(STACK(0, 1, 2, 3), [4])"]
 ```
 
-**UNROLL range → дублированные операции**:
+RANGE типов upcast и unroll идут одним и тем же путём — одно правило подходит для обоих типов осей.
+Сам узел RANGE заменяется на константную координату с формой, поэтому каждая операция,
+которая его потребляла, просто получает форму. Операции по отдельным линиям материализуются
+позже, через `devectorize_alu` на стадии 14.
 
 Когда мы говорим «операции дублируются», это звучит как copy-paste. Но на самом деле всё не так. Компилятор создаёт одну SIMD-инструкцию, которая обрабатывает все N элементов одновременно. Представьте SIMD-регистр как коробку, вмещающую 4 числа; сложение двух коробок складывает все 8 чисел за раз.
 
+**Взаимодействие с развёрнутым END**:
 ```mermaid
 flowchart TD
-  A["Before: UPCAST marks vectorization intent. RANGE(end=3, UPCAST)"]
-  A -->|"pm_pre_expander"| B["Step 1: Convert to UNROLL. UNROLL(VCONST([0, 1, 2]))"]
-  B -->|"expander"| C["Step 2: Operations expand to handle all positions. After: operations processed together (not duplicated). UNROLL([op_at_0, op_at_1, op_at_2])"]
+  A["Before: END(STORE(...), [RANGE(Upcast)])"]
+  A -->|"expander2 + pm_flatten_range"| B["After: END(shaped STORE(...), [])"]
 ```
 
-**Взаимодействие UNROLL/END/CONTRACT**:
-```mermaid
-flowchart TD
-  A["Before: END(STORE(...), [RANGE(UPCAST)])"]
-  A -->|"pm_pre_expander"| B["Step 1: END(STORE(...), [UNROLL(VCONST([0,1,2,3]))])"]
-  B -->|"expander"| C["Step 2: END(CONTRACT(STORE(...x4)), [])"]
-```
-
-**Бродкаст через AFTER/END**:
-```text
-// Broadcast VECTORIZE (all elements identical)
-AFTER(VECTORIZE([x, x, x, x]), deps) → VECTORIZE([AFTER(x, deps), AFTER(x, deps), ...])
-```
+`pm_flatten_range` перестраивает список RANGE у END из тех RANGE-узлов, что всё ещё
+достижимы через его источники. После разворачивания upcast-RANGE исчезает, поэтому
+список пустеет. Отдельные store по линиям появляются на стадии 14, обёрнутые в `GROUP`.
 
 **Обработка GROUP_REDUCE** (`pm_group_for_reduce`):
 
-GROUP_REDUCE — специальный тип оси для тензорных редукций:
+GROUP_REDUCE — специальный тип оси для редукций на тензорных ядрах:
 
 ```mermaid
 flowchart TD
   A["Before: REDUCE with GROUP_REDUCE ranges. REDUCE(src, [range(GROUP_REDUCE)])"]
   A -->|"pm_group_for_reduce"| B["After: Shared memory reduction pattern"]
   B --> S1["1. Track upstream LOCAL ranges"]
-  B --> S2["2. BUFFERIZE result with group ranges (AddrSpace.LOCAL)"]
-  B --> S3["3. INDEX into buffer with transformed ranges"]
-  B --> S4["4. Final REDUCE with axes (range_id+100, AxisType.REDUCE)"]
+  B --> S2["2. STAGE the partial result with the group ranges (AddrSpace::Local)"]
+  B --> S3["3. INDEX into that buffer with the transformed ranges"]
+  B --> S4["4. Final REDUCE over derived loops (axis_id.group_reduce_loop(), AxisType::Reduce)"]
 ```
 
-Это обеспечивает эффективную аккумуляцию через тензорные ядра с использованием shared-памяти.
+Это обеспечивает эффективную аккумуляцию на тензорных ядрах через shared-память. Хотя
+`pm_group_for_reduce` живёт в `expand.rs`, он скомпонован в `pm_reduce_local`
+и потому срабатывает во время удаления редукций, а не внутри `pre_expand`.
 
 **Svod**: `expand.rs`
 
@@ -139,10 +121,10 @@ flowchart TD
 > **Стадия кратко**
 >
 > **Цель**: Подготовить буферы для быстрой памяти (shared / L1)
-> **Ключевые паттерны**: Bufferize с locals, извлечение хинтов
+> **Ключевые паттерны**: Выделение локальных буферов, проталкивание movement ops
 > **Эффект**: Часто используемые данные остаются в быстрой памяти
 
-**Что делает**: Подготавливает буферы для использования локальной памяти и применяет кодогенерационные чистки.
+**Что делает**: Превращает каждый промежуточный STAGE в настоящий локальный буфер.
 
 **Зачем это нужно**: **Локальные буферы** = быстрая память рядом с вычислительным блоком:
 - GPU: Shared memory (LDS) — в 100 раз быстрее глобальной памяти
@@ -150,12 +132,15 @@ flowchart TD
 
 Компилятор перемещает часто используемые данные в локальные буферы — аналогично тому, как важные файлы хранятся на рабочем столе, а не на сетевом диске.
 
-**Паттерн**: `pm_add_buffers_local + rangeify_codegen`
+**Паттерн**: `pm_add_local_buffers`
 
 | Трансформация | Назначение |
-|---------------|------------|
-| `bufferize_to_store` | Конвертация BUFFERIZE с `allow_locals=true` |
-| Удаление обёртки CONTIGUOUS | Удаление оптимизационных хинтов перед кодогенерацией |
-| Удаление NOOP | Чистка нопов |
+|-----------|---------|
+| `add_local_buffer` | Выделить локальный `placeholder` для каждого узла STAGE и переписать его в INDEX / STORE / END / AFTER |
+| `movement_op_patterns` | Протолкнуть movement ops вниз, чтобы индексы нового буфера оставались простыми |
 
-**Svod**: `rangeify/patterns.rs`, `rangeify/transforms.rs`, `optimizer/mod.rs`
+**Примечание о порядке**: удаление редукций (стадия 11) на самом деле выполняется *до* этой
+стадии — `add_local_buffer` потребляет узлы STAGE, которые порождает понижение редукций.
+Tinygrad упорядочивает эти два прохода так же.
+
+**Svod**: `optimizer/mod.rs`, `rangeify/patterns.rs`

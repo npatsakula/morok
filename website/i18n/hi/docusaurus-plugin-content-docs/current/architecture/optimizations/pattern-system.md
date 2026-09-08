@@ -104,9 +104,9 @@ Context पैटर्न closures को लास्ट आर्ग्यु
 अलग-अलग context types वाले matchers को combine करते समय, `.with_context()` इस्तेमाल करें:
 
 ```rust
-let mega_pass = symbolic().with_context::<PcontigConfig>()
-    + reduction_simplify_patterns().with_context()
-    + buffer_removal_with_pcontig();
+let pm_add_images = symbolic_simple().clone().with_context::<AddImageContext>()
+    + no_vectorized_alu().clone().with_context()
+    + pm_simplify_add_image();
 ```
 
 ---
@@ -203,7 +203,7 @@ flowchart TD
 ### सेफ़्टी लिमिट्स
 
 इन्फ़िनिट लूप रोकने के लिए:
-- कुल मैक्सिमम **500,000 iterations**
+- अधिकतम **500,000 rewrite-stack entries** (`REWRITE_STACK_LIMIT`)
 - लिमिट पार होने पर डायग्नोस्टिक इन्फ़ो के साथ panic
 
 प्रैक्टिस में, ठीक से बने पैटर्न जल्दी converge करते हैं।

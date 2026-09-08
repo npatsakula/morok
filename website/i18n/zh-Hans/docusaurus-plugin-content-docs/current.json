@@ -15,8 +15,28 @@
     "message": "简介",
     "description": "The label for the doc item 'Introduction' in sidebar 'defaultSidebar', linking to the doc introduction"
   },
+  "sidebar.defaultSidebar.category.Codegen Pipeline": {
+    "message": "代码生成流水线",
+    "description": "The label for category 'Codegen Pipeline' in sidebar 'defaultSidebar'"
+  },
+  "sidebar.defaultSidebar.category.Optimizations": {
+    "message": "优化",
+    "description": "The label for category 'Optimizations' in sidebar 'defaultSidebar'"
+  },
   "sidebar.defaultSidebar.category.Tile Kernels (tk)": {
     "message": "Tile 内核 (tk)",
     "description": "The label for category 'Tile Kernels (tk)' in sidebar 'defaultSidebar'"
+  },
+  "sidebar.defaultSidebar.category.Backends": {
+    "message": "后端",
+    "description": "The label for category 'Backends' in sidebar 'defaultSidebar'"
+  },
+  "sidebar.defaultSidebar.category.AMD Backend": {
+    "message": "AMD 后端",
+    "description": "The label for category 'AMD Backend' in sidebar 'defaultSidebar'"
+  },
+  "sidebar.defaultSidebar.category.CUDA Backend": {
+    "message": "CUDA 后端",
+    "description": "The label for category 'CUDA Backend' in sidebar 'defaultSidebar'"
   }
 }

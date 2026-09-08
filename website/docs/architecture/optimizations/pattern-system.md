@@ -102,9 +102,9 @@ patterns! {
 When combining matchers with different context types, use `.with_context()`:
 
 ```rust
-let mega_pass = symbolic().with_context::<PcontigConfig>()
-    + reduction_simplify_patterns().with_context()
-    + buffer_removal_with_pcontig();
+let pm_add_images = symbolic_simple().clone().with_context::<AddImageContext>()
+    + no_vectorized_alu().clone().with_context()
+    + pm_simplify_add_image();
 ```
 
 ---
@@ -201,7 +201,7 @@ The engine always traverses bottom-up; the distinction is *when* patterns fire: 
 ### Safety Limits
 
 To prevent infinite loops:
-- **500,000 iterations** total maximum
+- **500,000 rewrite-stack entries** maximum (`REWRITE_STACK_LIMIT`)
 - Panics with diagnostic info if limits exceeded
 
 In practice, well-formed patterns converge quickly.

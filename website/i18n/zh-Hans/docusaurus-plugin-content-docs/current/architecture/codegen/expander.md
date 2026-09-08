@@ -4,7 +4,7 @@ sidebar_label: 阶段 2 — Expander
 
 # 阶段 2：Expander
 
-**目标**：将优化原语（UNROLL/UPCAST）转换为显式操作。
+**目标**：将优化原语（UPCAST/UNROLL range）转换为显式的带形状操作。
 
 ---
 
@@ -18,23 +18,23 @@ sidebar_label: 阶段 2 — Expander
 
 **做了什么**：优化之后的符号化简，外加 WHERE 移动。
 
-**为什么重要**：WHERE 操作类似于 `if` 语句。这个阶段将 `if` 检查从 load 之后移到 load 之前。硬件可以在条件为 false 时跳过加载，节省内存带宽。
+**为什么重要**：WHERE 操作类似于 `if` 语句。这个阶段把带索引读取外围的 `if` 检查移进索引表达式本身。硬件可以在条件为 false 时跳过加载，节省内存带宽。
 
-**模式**：`sym + pm_move_where_on_load`
+**模式**：`sym + pm_move_where_on_load + pm_flatten_range + pm_reduce_unparented`（即 `POST_OPT_SYM` 匹配器）
 
 ```text
-// Before: WHERE guards a load
-WHERE(valid, LOAD(index), alt)
+// Before: WHERE guards an indexed read
+WHERE(cond, INDEX(buf, idx), 0)
 
-// After: validity moved to INDEX
-LOAD(INDEX(ptr, idx, valid=valid), alt)
+// After: validity moved into INDEX
+INDEX(buf, WHERE(cond, idx, Invalid))
 ```
 
 将 validity 移入 INDEX 可以改善 load 合并和向量化。
 
-**注意**：该模式仅在替代值为 `0` 时匹配。变换涉及复杂的子句分析：重复检测、range 依赖检查和数据依赖 load 验证。
+**注意**：该模式仅在替代值为 `0` 时匹配；第二条分支用取反的条件处理颠倒形式 `WHERE(cond, 0, INDEX(...))`。变换涉及复杂的子句分析：重复检测、range 依赖检查和数据依赖 load 验证。
 
-**注意**：Svod 实现使用 `gate=` 而不是 `valid=`（Index 结构体有一个 `gate` 字段）。概念完全相同。
+**注意**：Svod 把 validity 保留在索引表达式内部，形式为 `WHERE(cond, idx, Invalid)`。它要到很晚才在 `pm_move_gates_from_index`（`late/gater.rs`）中变成 LOAD/STORE 上的 `gate` 字段；INDEX 本身没有 gate 字段。
 
 **Svod**：`symbolic/patterns.rs` 中的 `pm_move_where_on_load()`
 
@@ -44,75 +44,54 @@ LOAD(INDEX(ptr, idx, valid=valid), alt)
 
 > **阶段速览**
 >
-> **目标**：将 UNROLL/UPCAST 转换为显式操作
-> **关键概念**：UNROLL、CONTRACT、模式顺序
+> **目标**：将 UPCAST 和 UNROLL range 展开为带形状的 STACK 坐标
+> **关键概念**：range 轴类型、STACK、INDEX、模式顺序
 > **影响**：使向量化变得显式，为硬件做好准备
 
-**做了什么**：将 UNROLL/UPCAST 优化原语转换为显式操作。
+**做了什么**：将 UPCAST/UNROLL 的 range 分类转换为带形状的坐标。
 
-**为什么重要**：UPCAST 和 UNROLL 标记的是意图——我们想做什么。这个阶段将意图变为现实，让硬件能够实际执行。
+**为什么重要**：UPCAST 和 UNROLL 标记的是意图——我们想做什么。这个阶段将意图变为显式，让硬件能够实际执行。
 
-**模式**：`symbolic_simple() + pm_pre_expander + pm_group_for_reduce + expander`
+**模式**：`expander2 + pm_flatten_range + mop_cleanup_patterns`（入口点 `pre_expand()`）
 
-注意：Svod 在此阶段使用 `symbolic_simple()`（不是 `sym`），因为 `symbolic()` 已在 Stage 4 运行过。Tinygrad 使用 `sym`，包含额外的模式。
+注意：`pre_expand` 内部不运行任何符号化简匹配器。`sym` 已在 Stage 8 运行过，而 `symbolic_simple` 会在 Stage 13 和 14 再次运行。
 
 ⚠️ **重要：模式优先级**
 
 这些模式被组合在一起运行直到不动点。顺序会影响当多个模式都能匹配时哪个先尝试：
-1. `sym` 优先（符号化简）
-2. `pm_pre_expander` 其次（转换 UPCAST/UNROLL range）
-3. `pm_group_for_reduce` 第三（处理 GROUP_REDUCE 轴）
-4. `expander` 最后（主展开）
+1. `expander2` 优先（展开 UPCAST/UNROLL range、REDUCE 和 WMMA 操作数）
+2. `pm_flatten_range` 其次（在 range 消失后重建 END 的 range 列表）
+3. `mop_cleanup_patterns` 最后（清理展开留下的移动操作）
 
 错误的优先级可能导致向量化或规约作用域不正确。
 
-**UNROLL 和 CONTRACT**：
+展开出来的 lane 用 `STACK` 收集，用 `INDEX` 选取。UPCAST 和
+UNROLL 是 `RANGE` 上的 `AxisType`，而不是独立的操作。（`STACK` 是 Svod 对
+Tinygrad 所称 VECTORIZE 的叫法；这里没有 VECTORIZE 操作。）
 
-UNROLL 和 CONTRACT 协同工作：
-
-```text
-UNROLL: "Take this one thing and make N copies for different positions"
-Example:  x → [x_0, x_1, x_2, x_3]
-
-CONTRACT: "Take these N things and combine them back"
-Example:  [a, b, c, d] → one vector containing all four
-```
-
-二者配合：UPCAST 标记向量化意图 → UNROLL 展开 → CONTRACT 组合。
-
-**UPCAST range → VECTORIZE**：
+**UPCAST / UNROLL range → 带形状的坐标**：
 ```mermaid
 flowchart TD
-  A["Before: UPCAST marks vectorization intent. RANGE(end=4, UPCAST)"]
-  A -->|"pm_pre_expander"| B["Step 1: Convert to UNROLL with constant indices. UNROLL(VCONST([0, 1, 2, 3]))"]
-  B -->|"expander"| C["Step 2: Expand operations with UNROLL sources. Operations now have unrolled sources"]
-  C -->|"CONTRACT or implicit"| D["After: explicit VECTORIZE. VECTORIZE(op[0], op[1], op[2], op[3])"]
+  A["Before: RANGE(end=4, Upcast) marks vectorization intent"]
+  A -->|"expander2"| B["After: RESHAPE(STACK(0, 1, 2, 3), [4])"]
 ```
 
-**UNROLL range → 重复操作**：
+Upcast 和 unroll range 走的是同一条路径——一条规则同时匹配这两种轴类型。
+RANGE 节点本身被替换为一个带形状的常量坐标，于是每个消费它的操作都自然而然
+变成带形状的。逐 lane 的操作要到 Stage 14 才由 `devectorize_alu` 具体化。
 
 当我们说"操作被复制"时，听起来像是复制粘贴。但实际上不是。编译器创建的是单条 SIMD 指令，同时处理所有 N 个元素。把 SIMD 寄存器想象成一个装着 4 个数字的盒子；两个盒子相加就是 8 个数字同时相加。
 
+**展开后的 END 交互**：
 ```mermaid
 flowchart TD
-  A["Before: UPCAST marks vectorization intent. RANGE(end=3, UPCAST)"]
-  A -->|"pm_pre_expander"| B["Step 1: Convert to UNROLL. UNROLL(VCONST([0, 1, 2]))"]
-  B -->|"expander"| C["Step 2: Operations expand to handle all positions. After: operations processed together (not duplicated). UNROLL([op_at_0, op_at_1, op_at_2])"]
+  A["Before: END(STORE(...), [RANGE(Upcast)])"]
+  A -->|"expander2 + pm_flatten_range"| B["After: END(shaped STORE(...), [])"]
 ```
 
-**UNROLL/END/CONTRACT 交互**：
-```mermaid
-flowchart TD
-  A["Before: END(STORE(...), [RANGE(UPCAST)])"]
-  A -->|"pm_pre_expander"| B["Step 1: END(STORE(...), [UNROLL(VCONST([0,1,2,3]))])"]
-  B -->|"expander"| C["Step 2: END(CONTRACT(STORE(...x4)), [])"]
-```
-
-**穿过 AFTER/END 的广播**：
-```text
-// Broadcast VECTORIZE (all elements identical)
-AFTER(VECTORIZE([x, x, x, x]), deps) → VECTORIZE([AFTER(x, deps), AFTER(x, deps), ...])
-```
+`pm_flatten_range` 会根据仍然可以通过 END 的源到达的 RANGE 节点，重建
+END 的 range 列表。展开之后 upcast range 已经消失，因此这个列表变空。
+逐 lane 的 store 会在 Stage 14 出现，并被包在 `GROUP` 里。
 
 **GROUP_REDUCE 处理**（`pm_group_for_reduce`）：
 
@@ -123,12 +102,14 @@ flowchart TD
   A["Before: REDUCE with GROUP_REDUCE ranges. REDUCE(src, [range(GROUP_REDUCE)])"]
   A -->|"pm_group_for_reduce"| B["After: Shared memory reduction pattern"]
   B --> S1["1. Track upstream LOCAL ranges"]
-  B --> S2["2. BUFFERIZE result with group ranges (AddrSpace.LOCAL)"]
-  B --> S3["3. INDEX into buffer with transformed ranges"]
-  B --> S4["4. Final REDUCE with axes (range_id+100, AxisType.REDUCE)"]
+  B --> S2["2. STAGE the partial result with the group ranges (AddrSpace::Local)"]
+  B --> S3["3. INDEX into that buffer with the transformed ranges"]
+  B --> S4["4. Final REDUCE over derived loops (axis_id.group_reduce_loop(), AxisType::Reduce)"]
 ```
 
-这实现了通过共享内存进行高效的张量核心累加。
+这实现了通过共享内存进行高效的张量核心累加。虽然
+`pm_group_for_reduce` 位于 `expand.rs` 中，但它被组合进了 `pm_reduce_local`，
+因此是在移除规约期间触发，而不是在 `pre_expand` 内部。
 
 **Svod**：`expand.rs`
 
@@ -139,10 +120,10 @@ flowchart TD
 > **阶段速览**
 >
 > **目标**：为快速内存（共享 / L1）准备 buffer
-> **关键模式**：带 locals 的 bufferize、提取提示
+> **关键模式**：本地 buffer 分配、移动操作下推
 > **影响**：频繁访问的数据留在快速内存中
 
-**做了什么**：为本地内存使用准备 buffer，并应用代码生成特定的清理。
+**做了什么**：把每个暂存的中间结果变成真正的本地 buffer。
 
 **为什么重要**：**本地 buffer** = 靠近计算单元的快速内存：
 - GPU：共享内存（LDS）——比全局内存快 100 倍
@@ -150,12 +131,15 @@ flowchart TD
 
 编译器将频繁访问的数据移到本地 buffer，就像把重要文件放在桌面而不是网络驱动器上一样。
 
-**模式**：`pm_add_buffers_local + rangeify_codegen`
+**模式**：`pm_add_local_buffers`
 
 | 变换 | 用途 |
-|------|------|
-| `bufferize_to_store` | 转换 `allow_locals=true` 的 BUFFERIZE |
-| 移除 CONTIGUOUS 包装器 | 在代码生成前移除优化提示 |
-| 移除 NOOP | 清理无操作 |
+|-----------|---------|
+| `add_local_buffer` | 为每个 STAGE 节点分配一个本地 `placeholder`，并把它重写成 INDEX / STORE / END / AFTER |
+| `movement_op_patterns` | 下推移动操作，使新 buffer 的索引保持简单 |
 
-**Svod**：`rangeify/patterns.rs`、`rangeify/transforms.rs`、`optimizer/mod.rs`
+**关于顺序的注意**：移除规约（Stage 11）实际上运行在本阶段*之前*——
+`add_local_buffer` 消费的正是规约下降所产生的 STAGE 节点。
+Tinygrad 对这两个 pass 的排序方式相同。
+
+**Svod**：`optimizer/mod.rs`、`rangeify/patterns.rs`

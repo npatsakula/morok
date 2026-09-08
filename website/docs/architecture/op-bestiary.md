@@ -39,7 +39,9 @@ Range {
 | Type | Priority | GPU Mapping | Purpose |
 |------|----------|-------------|---------|
 | `Placeholder` | -3 | — | Transient canonical range used during RESHAPE caching |
-| `Loop` | -1 | `for` loop | Default range produced by rangeify; schedule-level wrappers paired with `END(Call)` |
+| `Device` | -2 | — | Device-selection dimension, bound per device at launch |
+| `Weak` | -1 | `for` loop | Unparallelized range produced by rangeify |
+| `Loop` | -1 | `for` loop | Explicit regular loop; schedule-level wrappers paired with `END(Call)` |
 | `Global` | 0 | `blockIdx` | Grid parallelism |
 | `Thread` | 0 | thread pool | CPU parallelism |
 | `Warp` | 1 | warp/wavefront | Sub-group parallelism |
@@ -111,6 +113,7 @@ Reduce {
     src: Arc<UOp>,                      // value to accumulate
     ranges: SmallVec<[Arc<UOp>; 4]>,    // ranges being reduced
     reduce_op: ReduceOp,                // Add, Mul, Max, Min
+    num_axes: usize,                    // reduced axes of the shaped source
 }
 ```
 
@@ -142,7 +145,7 @@ flowchart TD
 ```rust
 AllReduce {
     src: Arc<UOp>,           // local partial result
-    device: Arc<UOp>,        // device specification
+    device: DeviceSpec,      // device specification
     reduce_op: ReduceOp,     // reduction operation
 }
 ```
@@ -157,21 +160,20 @@ Performs distributed reduction across multiple devices. Used for multi-GPU train
 
 ```rust
 Buffer {
-    unique: Arc<UOp>,        // UNIQUE op for identity
-    device: Arc<UOp>,        // DEVICE op
-    size: usize,             // total element count
+    shape: Arc<UOp>,         // flat storage shape (one element count)
+    arg: Box<ParamArg>,      // slot, dtype, address space, device
 }
 ```
 
-Declares a buffer for tensor storage. The `unique` field ensures distinct buffers even with identical size/device.
+Declares a buffer for tensor storage. The `arg.slot` field ensures distinct buffers even with identical size/device. `arg.addrspace` picks the memory the buffer lives in: `Global` for device memory, `Local` for GPU shared memory (LDS), `Reg` for a register/scratch allocation.
 
-### BUFFERIZE — Materialization Marker
+### STAGE — Materialization Marker
 
 ```rust
-Bufferize {
+Stage {
     compute: Arc<UOp>,                  // computation to materialize
     ranges: SmallVec<[Arc<UOp>; 4]>,    // output dimensions
-    opts: BufferizeOpts,                // address space, device
+    opts: Box<BufferizeOpts>,           // address space, device
 }
 ```
 
@@ -182,13 +184,14 @@ Marks where computation should materialize to memory. Triggers kernel splitting.
 | Field | Type | Purpose |
 |-------|------|---------|
 | `device` | `Option<DeviceSpec>` | Target device, `None` for local |
+| `local_axis` | `Option<AxisId>` | `GroupReduce` axis that owns a LOCAL staging buffer |
 | `addrspace` | `AddrSpace` | `Global` (device) or `Local` (shared) |
-| `removable` | `bool` | When `false`, `buffer_removal` is forbidden from inlining this BUFFERIZE — used at multi-consumer realize boundaries to keep the buffer fixed across mega-pass fixpoint iterations |
+| `removable` | `bool` | When `false`, `buffer_removal` is forbidden from inlining this STAGE — used at multi-consumer realize boundaries to keep the buffer fixed across mega-pass fixpoint iterations |
 
 **Example:**
 ```mermaid
 flowchart TD
-  BZ["BUFFERIZE(opts=(addrspace=Global))"] -->|"computation"| RED["REDUCE(Add, ...)"]
+  BZ["STAGE(opts=(addrspace=Global))"] -->|"computation"| RED["REDUCE(Add, ...)"]
   BZ -->|"output dim 0"| R0["RANGE(R0, Global)"]
   BZ -->|"output dim 1"| R1["RANGE(R1, Global)"]
 ```
@@ -197,13 +200,12 @@ flowchart TD
 
 ```rust
 Index {
-    buffer: Arc<UOp>,                   // BUFFER or PARAM
+    buffer: Arc<UOp>,                   // BUFFER, PARAM or STACK
     indices: SmallVec<[Arc<UOp>; 4]>,   // index per dimension
-    gate: Option<Arc<UOp>>,             // optional predicate
 }
 ```
 
-Computes memory address from multi-dimensional indices. Returns element dtype (not pointer).
+Computes memory address from multi-dimensional indices. Returns element dtype (not pointer). An index can be made conditional with `idx.valid(cond)`, which wraps it in `WHERE(cond, idx, INVALID)`. INDEX over a `STACK` selects a lane instead of an address: a constant scalar index folds directly to the stacked source.
 
 **Example:**
 ```mermaid
@@ -214,37 +216,23 @@ flowchart TD
   IDX -->|"index for dim 2"| M["MUL(...)"]
 ```
 
-### POINTER_INDEX — Low-Level Pointer Arithmetic
-
-```rust
-PointerIndex {
-    ptr: Arc<UOp>,           // base pointer
-    offset: Arc<UOp>,        // byte offset
-}
-```
-
-Direct pointer arithmetic. Used after linearization when indices are flattened.
-
-> **Compatibility:** Tinygrad uses `INDEX` with a `ptr=True` flag instead of a separate operation.
-
 ### LOAD — Memory Read
 
 ```rust
 Load {
-    buffer: Arc<UOp>,        // buffer or pointer
-    index: Arc<UOp>,         // INDEX op
+    index: Arc<UOp>,         // INDEX op (buffer accessed via the INDEX)
     alt: Option<Arc<UOp>>,   // alternative value for gated loads
+    gate: Option<Arc<UOp>>,  // predicate for gated loads
 }
 ```
 
-Read value from buffer at index. For gated loads, the `alt` field provides a value when the INDEX's `gate` is false (avoids the memory access entirely).
+Read value from buffer at index; there is no separate `buffer` field, the buffer is reached through the INDEX node. For gated loads, `alt` provides the value when `gate` is false (avoiding the memory access entirely). `alt` and `gate` are always set together: a load carries both or neither. Renderers require a single-axis `INDEX`, so multi-index accesses must be flattened during rangeify before the load reaches code generation.
 
 **Example:**
 ```mermaid
 flowchart TD
-  L["LOAD : Float32"] --> P1["PARAM(1)"]
-  L --> IDX["INDEX"]
-  IDX --> P1b["PARAM(1)"]
+  L["LOAD : Float32"] --> IDX["INDEX"]
+  IDX --> P1["PARAM(1)"]
   IDX --> R0["RANGE(R0)"]
   IDX --> R2["RANGE(R2)"]
 ```
@@ -255,23 +243,23 @@ flowchart TD
 Store {
     index: Arc<UOp>,                    // INDEX op (buffer accessed via index.src[0])
     value: Arc<UOp>,                    // value to write
-    ranges: SmallVec<[Arc<UOp>; 4]>,    // ranges being closed
+    gate: Option<Arc<UOp>>,             // predicate for gated stores
 }
 ```
 
-Write value to buffer. The buffer is accessed through the INDEX node (via `index.src[0]`), not a separate field. STORE closes the specified ranges, which represent output iteration dimensions. UPCAST and UNROLL remain range axis classifications during expansion.
+Write value to buffer. The buffer is accessed through the INDEX node (via `index.src[0]`), not a separate field. `UPCAST` and `UNROLL` remain range axis classifications during expansion.
 
-For gated stores, use an INDEX with a gate (INDEX has an optional `gate` field).
+For gated stores, `store_gated` sets `gate`; `pm_move_gates_from_index` is what lifts a gate off the address expression onto the LOAD/STORE.
 
-> **Compatibility:** Svod's STORE has no separate `buffer` field—sources are: index=0, value=1, ranges=2+ (range_start=2). Tinygrad's layout is similar.
+> **Compatibility:** Svod's STORE has no separate `buffer` field—sources are: index=0, value=1. Unlike a STAGE or a REDUCE, a STORE does not close ranges.
 
 **Example:**
 ```mermaid
 flowchart TD
   ST["STORE"] -->|"write address (buffer via index.src[0])"| IDX["INDEX[R0, R1]"]
   ST -->|"value"| RED["REDUCE(Add, ...)"]
-  ST -->|"output dim 0 (closed)"| R0["RANGE(R0, Global)"]
-  ST -->|"output dim 1 (closed)"| R1["RANGE(R1, Global)"]
+  IDX --> R0["RANGE(R0, Global)"]
+  IDX --> R1["RANGE(R1, Global)"]
 ```
 
 ---
@@ -290,7 +278,7 @@ arguments, and a `Program` carries the body through the strict
 Call {
     body: Arc<UOp>,                     // FUNCTION (or its body)
     args: SmallVec<[Arc<UOp>; 4]>,      // concrete argument values
-    info: CallInfo,                     // annotations (name, origin, ...)
+    info: Box<CallInfo>,                // annotations (name, origin, ...)
 }
 ```
 
@@ -316,7 +304,7 @@ The kernel CALL is where a dispatch keeps the attribution the profiler rollups r
 Function {
     body: Arc<UOp>,                     // computation
     args: SmallVec<[Arc<UOp>; 4]>,      // formal parameters
-    info: CallInfo,
+    info: Box<CallInfo>,
 }
 ```
 
@@ -341,7 +329,7 @@ outputs through the otherwise-Void function boundary.
 ```rust
 Program {
     sink: Arc<UOp>,                     // root SINK
-    device: Arc<UOp>,                   // DEVICE
+    info: Box<ProgramInfo>,             // name, launch dims, ABI slots, target
     linear: Option<Arc<UOp>>,           // LINEAR (after linearize)
     source: Option<Arc<UOp>>,           // SOURCE (after render)
     binary: Option<Arc<UOp>>,           // PROGRAM_BINARY (after compile)
@@ -353,8 +341,8 @@ staging enforced by `codegen/src/program_pipeline.rs`
 (`do_linearize`/`do_render`/`do_compile`/`get_program`). Each stage fills in
 the next field. The C/LLVM renderers expect `Op::Linear` input and
 surface `Error::InvalidGraph` via per-context `pending_error` rather than
-panicking; multi-index `INDEX`s must be lowered with `pm_linearize_multi_index`
-before render.
+panicking; a multi-index `INDEX` reaching a renderer is rejected the same way,
+so indices must already be flattened to a single axis.
 
 ### LINEAR — Linearized Op Stream
 
@@ -368,18 +356,23 @@ directly without re-walking the graph.
 ### SOURCE / PROGRAM_BINARY — Compilation Artifacts
 
 ```rust
-Source { code: String }              // rendered source (C / LLVM-IR)
-ProgramBinary { bytes: Vec<u8> }     // compiled artifact
+Source { code: String, identity: Option<Box<SourceStageIdentity>> }
+ProgramBinary { bytes: Vec<u8>, identity: Option<Box<BinaryStageIdentity>> }
 ```
 
-Terminal stages of the program pipeline. Both are leaves (no children).
+Terminal stages of the program pipeline. Both are leaves (no children). The
+optional `identity` is the semantic proof that binds a stage to the exact
+preceding one (`SourceStageIdentity` carries the ABI, target, entry name and
+the LINEAR/SOURCE digests; `BinaryStageIdentity` wraps it with the compiler key
+and the binary digest), so a cached artifact cannot be reused across a changed
+graph.
 
 ### SINK — Multiple Root Collector
 
 ```rust
 Sink {
     sources: SmallVec<[Arc<UOp>; 4]>,
-    info: Option<KernelInfo>,           // structural marker for kernel ASTs
+    info: Option<Box<KernelInfo>>,      // structural marker for kernel ASTs
 }
 ```
 
@@ -431,42 +424,38 @@ GPU workgroup synchronization. Ensures all threads in a workgroup reach the barr
 
 ## Vector Operations
 
-### VECTORIZE — Create Vector from Scalars
+### STACK — Build a Shaped Value from Lanes
 
 ```rust
-Vectorize {
-    elements: SmallVec<[Arc<UOp>; 4]>,
+Stack {
+    sources: SmallVec<[Arc<UOp>; 4]>,
 }
 ```
 
-Combines N scalar values into a vector of size N. All elements must have the same base dtype.
+Combines N values into one shaped value of N lanes. The element dtype stays
+scalar — the lane count is carried by the STACK itself, not by widening the
+dtype — and sources are cast to the promoted dtype on construction.
 
 **Example:**
 ```mermaid
 flowchart TD
-  V["VECTORIZE : 4 x Float32"] --> C1["CONST(1.0)"]
+  V["STACK(len=4) : Float32"] --> C1["CONST(1.0)"]
   V --> C2["CONST(2.0)"]
   V --> C3["CONST(3.0)"]
   V --> C4["CONST(4.0)"]
 ```
 
-### GEP — Get Element Pointer (Vector Extract)
+### Lane Selection — INDEX over a STACK
 
-```rust
-Gep {
-    vector: Arc<UOp>,        // source vector
-    indices: Vec<usize>,     // positions to extract
-}
-```
-
-Extracts elements from a vector:
-- Single index → scalar
-- Multiple indices → smaller vector
+There is no separate extract operation. `INDEX` selects a lane from a `STACK`
+exactly as it selects an address from a buffer, and a constant index folds
+straight to the stacked source at construction time.
 
 **Example:**
 ```mermaid
 flowchart TD
-  G["GEP([0, 2]) : 2 x Float32"] --> V["VECTORIZE : 4 x Float32"]
+  G["INDEX : Float32"] --> V["STACK(len=4) : Float32"]
+  G --> C["CONST(2) : Index"]
   V --> E["..."]
 ```
 
@@ -478,7 +467,7 @@ VConst {
 }
 ```
 
-Vector of compile-time constants. More efficient than `VECTORIZE` of `CONST` nodes.
+Vector of compile-time constants. More efficient than a `STACK` of `CONST` nodes.
 
 Lane aggregation uses `STACK`; lane and address selection use `INDEX`. Loop
 unrolling is represented by `Range` with `AxisType::Unroll`, not a separate
@@ -494,8 +483,8 @@ operation. Tensor-core expansion axes live in `WmmaMetadata`.
 Wmma {
     a: Arc<UOp>,             // matrix A fragment
     b: Arc<UOp>,             // matrix B fragment
-    c: Arc<UOp>,             // accumulator C fragment
-    metadata: WmmaMetadata,  // hardware configuration
+    c: Arc<UOp>,                 // accumulator C fragment
+    metadata: Box<WmmaMetadata>, // hardware configuration
 }
 ```
 
@@ -511,8 +500,8 @@ Hardware tensor core operation: `D = A × B + C`. Requires specific matrix shape
 | `dtype_out` | `DType` | Output precision (e.g., `Float32`) |
 | `device` | `RendererDevice` | Renderer / TC backend that produced this WMMA |
 | `threads` | `usize` | Threads per warp (typically 32) |
-| `upcast_axes` | `WmmaUpcastAxes` | Per-operand vectorization (fields: `a`, `b`, `c`) |
-| `reduce_axes` | `Vec<(usize, usize)>` | Contraction axes |
+| `upcast_axes` | `Option<WmmaUpcastAxes>` | Per-source expansion axes (fields: `a`, `b`, `c`); cleared once `expander2` has shaped the sources and output |
+| `reduce_axes` | `Vec<AxisId>` | TC reduce axis IDs, used as `exclude_args` during expansion |
 
 **Example:**
 ```mermaid
@@ -557,21 +546,22 @@ flowchart TD
 ### PARAM — Buffer Parameter
 
 ```rust
-Param { slot: usize, size: usize, device: Option<Arc<UOp>> }
+Param { shape: Arc<UOp>, arg: Box<ParamArg> }
 ```
 
 Normalized buffer parameter — positional reference to an input/output buffer.
 Created by pre-schedule normalization (BUFFER→PARAM) to erase buffer identity,
 enabling structural deduplication of identical computations on different buffers.
-`slot` is the position in the kernel argument list, `size` is element count.
+`arg.slot` is the position in the kernel argument list, `shape` carries the
+element count. `ParamArg` also covers scalar parameters (`UOp::scalar_param`),
+which carry a name and value bounds instead of an address space.
 
-### DEFINE_LOCAL — Shared Memory Allocation
+### Shared Memory and Registers
 
-```rust
-DefineLocal(usize)           // local memory index
-```
-
-GPU shared memory (LDS) allocation. Visible within a workgroup.
+There is no dedicated `DefineLocal` or `DefineReg` operation. GPU shared memory
+(LDS) and register/scratch allocations are `Buffer` nodes whose
+`arg.addrspace` is `AddrSpace::Local` or `AddrSpace::Reg`; they carry no device
+and are visible only inside a workgroup (LOCAL) or a thread (REG).
 
 ### DEFINE_VAR — Symbolic Runtime Variable
 
@@ -589,17 +579,6 @@ Runtime variable with known bounds. Used for dynamic shapes where bounds are kno
 ```text
 DEFINE_VAR(name="batch_size", min=1, max=128) : Index
 ```
-
-### DEFINE_REG — Register Allocation
-
-```rust
-DefineReg {
-    size: usize,             // register size
-    id: usize,               // unique accumulator ID
-}
-```
-
-Allocates a register for intermediate storage. The `id` field disambiguates registers of the same dtype—without it, two same-dtype reduces would share one DEFINE_REG via hash consing. Used in code generation.
 
 ### BIND — Variable Binding
 
@@ -646,13 +625,9 @@ provides the same disambiguation within a local scope (e.g. inside a
 `Function` body) without colliding with the global counter, so callable
 bodies can be hash-consed independently of where they're called from.
 
-### DEVICE — Device Specification
-
-```rust
-Device(DeviceSpec)           // device specification
-```
-
-Specifies target device for computation.
+Devices are not a node of their own: the target is a `DeviceSpec` field on the
+operations that need one (`Copy`, `GetAddr`, `AllReduce`, `ParamArg.device`,
+`BufferizeOpts.device`, `ProgramInfo.target`).
 
 ---
 
@@ -666,7 +641,7 @@ High-level tensor shape transformations. These are converted to explicit INDEX o
 | `Permute` | `{ src, axes: Vec<usize> }` | Transpose/reorder axes |
 | `Expand` | `{ src, new_shape }` | Broadcast to larger shape |
 | `Pad` | `{ src, begin_pads, end_pads }` | Add padding |
-| `Shrink` | `{ src, begins, ends }` | Extract sub-region |
+| `Shrink` | `{ src, offsets, sizes }` | Extract sub-region |
 | `Flip` | `{ src, axes: Vec<bool> }` | Reverse along axes |
 
 **Example:** RESHAPE
@@ -684,18 +659,21 @@ The following operations exist in the `Op` enum but are either internal or rarel
 
 | Operation | Purpose |
 |-----------|---------|
-| `Copy` | Explicit copy of a value |
+| `Copy` | `{ src, device }` - explicit copy of a value to another device |
 | `Slice` | `{ buffer, offset, size }` - contiguous typed slice metadata over a buffer |
-| `MStack` | Memory stack allocation |
-| `MSelect` | Memory select (conditional memory access) |
-| `Multi` | Multi-output operation |
+| `GetAddr` | `{ src, device }` - the `UInt64` address of a buffer-like source |
+| `MStack` | `{ buffers }` - the per-device buffers of a multi-device tensor |
+| `MSelect` | `{ buffer, device_index }` - one device's buffer out of a multi-device tensor |
+| `Multi` | `{ src, axis }` - shard marker: the axis a multi-device tensor is split along |
 | `Group` | Group operations for scheduling |
+| `Noop` | Placeholder with no operands and no effect |
 | `Detach` | Detach from graph (prevent optimization through) |
 | `Contiguous` | Hint that data is contiguous |
 | `ContiguousBackward` | Backward pass for contiguous hint |
 | `Precast` | Pre-cast for type conversion |
 | `Custom` / `CustomI` | Inline custom operation extensibility (C only for `Custom`) |
-| `CustomFunction` | Runtime custom-function hook (kinds: `EncDec`, `Graph`) |
+| `CustomFunction` | Runtime custom-function hook (kinds: `EncDec`, `Graph`, `AllReduce`) |
+| `Ins` | `{ sources, arg }` - a target instruction selected by an ISA renderer |
 
 ---
 
@@ -707,13 +685,13 @@ The following operations exist in the `Op` enum but are either internal or rarel
 |----------|------------|
 | **Loop Control** | `RANGE`, `END` |
 | **Reduction** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **Memory** | `BUFFER`, `SLICE`, `STAGE`, `INDEX`, `LOAD`, `STORE` |
+| **Memory** | `BUFFER`, `SLICE`, `STAGE`, `INDEX`, `LOAD`, `STORE`, `GETADDR` |
 | **Kernel & Callable** | `SINK`, `CALL`, `FUNCTION`, `TUPLE`, `GET_TUPLE`, `PROGRAM`, `LINEAR`, `SOURCE`, `PROGRAM_BINARY`, `AFTER`, `BARRIER` |
 | **Vector** | `STACK`, `INDEX`, `VCONST` |
 | **Expansion** | `RANGE` with `AxisType::Upcast` or `AxisType::Unroll` |
 | **Hardware** | `WMMA`, `SPECIAL` |
 | **Control** | `IF`, `ENDIF` |
-| **Definition** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `LUNIQUE`, `DEVICE` |
+| **Definition** | `PARAM`, `DEFINE_VAR`, `BIND`, `UNIQUE`, `LUNIQUE` |
 | **Movement** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 
@@ -723,21 +701,20 @@ Operations that close RANGE scopes (remove ranges from active set):
 
 | Operation | Range Start Index |
 |-----------|-------------------|
-| `BUFFERIZE` | 1 (compute=0, ranges=1+) |
+| `STAGE` | 1 (compute=0, ranges=1+) |
 | `REDUCE` | 1 (src=0, ranges=1+) |
-| `STORE` | 2 (index=0, value=1, ranges=2+) |
 | `WMMA` | 3 (a=0, b=1, c=2) |
 | `END` | 1 (computation=0, ranges=1+) |
 | `CALL` / `FUNCTION` | 1 (body=0, args=1+) |
 
 ### Expandable Operations
 
-Operations that propagate UNROLL through the computation graph:
+Operations that propagate expanded lanes through the computation graph:
 
 - ALU: `Unary`, `Binary`, `Ternary`
 - Type: `Cast`, `BitCast`
-- Vector: `Gep`, `Vectorize`
-- Memory: `Load`, `Store`, `Index`, `PointerIndex`
+- Shaped values: `Stack`
+- Memory: `Load`, `Store`, `Index`
 - Control: `Reduce`, `End`, `After`
-- Buffer: `Bufferize`
+- Buffer: `Stage`
 - Hardware: `Wmma`

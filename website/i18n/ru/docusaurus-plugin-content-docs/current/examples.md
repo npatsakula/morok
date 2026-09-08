@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 4. `as_ndarray()` извлекает результат в виде `ndarray::ArrayD` для просмотра.
 
-**Попробуйте:** Уберите вызов `realize()`. Код всё ещё запустится, но `data` будет пустым — ничего не было вычислено.
+**Попробуйте:** Уберите вызов `realize()`. Тогда `as_ndarray()` вернёт ошибку «нет буфера» — ничего не было вычислено, а значит и читать нечего.
 
 ---
 
@@ -70,6 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Нейросети постоянно меняют форму данных. Освоим базовые операции.
 
 ```rust
+use svod_tensor::Tensor;
 use ndarray::array;
 
 fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,7 +80,7 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Reshape to a 2x3 matrix (or create directly with from_ndarray)
     let matrix = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-    println!("Matrix shape: {:?}", matrix.shape());  // [2, 3]
+    println!("Matrix shape: {:?}", matrix.shape()?);  // [2, 3]
     // [[1, 2, 3],
     //  [4, 5, 6]]
 
@@ -133,6 +134,7 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
 Матричное умножение — рабочая лошадка нейросетей. Каждый слой его использует.
 
 ```rust
+use svod_tensor::Tensor;
 use ndarray::array;
 
 fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
@@ -156,7 +158,7 @@ fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
 
     output.realize()?;
     println!("Output shape: {:?}", output.shape()?);  // [4, 2]
-    println!("{:?}", biased.as_ndarray::<f32>()?);
+    println!("{:?}", output.as_ndarray::<f32>()?);
     // Each row: weighted sum of that sample's features
 
     Ok(())
@@ -194,7 +196,7 @@ fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
     let mut output = layer.forward(&input)?;
 
     output.realize()?;
-    println!("Output: {:?}", biased.as_ndarray::<f32>()?);
+    println!("Output: {:?}", output.as_ndarray::<f32>()?);
 
     Ok(())
 }
@@ -236,12 +238,12 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get results
     probs.realize()?;
-    println!("Probabilities: {:?}", probs_biased.as_ndarray::<f32>()?);
+    println!("Probabilities: {:?}", probs.as_ndarray::<f32>()?);
 
     // Get predicted class
     let mut prediction = logits.argmax(Some(-1))?;
     prediction.realize()?;
-    println!("Predicted digit: {:?}", pred_output.as_ndarray::<i32>()?);
+    println!("Predicted digit: {:?}", prediction.as_ndarray::<i32>()?);
 
     Ok(())
 }
@@ -263,9 +265,11 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Пример 6: Под капотом
 
-Хотите увидеть, что генерирует Svod? Вот как заглянуть в IR и сгенерированный код.
+Хотите увидеть, что генерирует Svod? Вот как заглянуть в IR и в скомпилированные ядра.
 
 ```rust
+use svod_tensor::Tensor;
+
 fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
     let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
     let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
@@ -290,7 +294,7 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 1. **IR-граф:** UOp-дерево показывает операции вроде `BUFFER`, `LOAD`, `ADD`, `STORE`. Это промежуточное представление Svod до оптимизаций.
 
-2. **Сгенерированный код:** Реальный LLVM IR или GPU-код, который выполняется. Обратите внимание, как Svod фьюзит загрузки и сложение в одно ядро — промежуточные буферы не нужны.
+2. **План выполнения:** `prepare()` возвращает скомпилированные ядра. Обратите внимание, как Svod фьюзит обе загрузки и сложение в одно ядро — промежуточные буферы не нужны.
 
 **Совет по отладке:** Если что-то кажется медленным или неправильным, напечатайте IR-дерево. Ищите:
 - Неожиданные операции (лишние reshape, дополнительные копии)
@@ -314,8 +318,8 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 | Цепочка слоёв | `x.sequential(&[&fc1, &Relu, &fc2])?` |
 | Активация | `t.relu()?`, `t.softmax(-1)?` |
 | Выполнить | `t.realize()?` |
-| Батч-реализация | `Tensor::realize_batch(&mut [&mut a, &mut b])?` |
-| Извлечь данные | `biased.as_ndarray::<f32>()?` |
+| Батч-реализация | `Tensor::realize_batch([&mut a, &mut b])?` |
+| Извлечь данные | `t.as_ndarray::<f32>()?` |
 
 **Паттерн ленивых вычислений:**
 

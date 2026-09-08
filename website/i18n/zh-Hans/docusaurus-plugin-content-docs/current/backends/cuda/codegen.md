@@ -18,13 +18,14 @@ STORE、CAST、RANGE）原样穿过。这张降低表是用 clang 22 与 `ptxas`
 
 ```llvm
 ; ModuleID = 'r_64_32'
+source_filename = "r_64_32"
 target datalayout = "e-p6:32:32-i64:64-i128:128-i256:256-v16:16-v32:32-n16:32:64"
 target triple = "nvptx64-nvidia-cuda"
 
 declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
 declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
 
-define ptx_kernel void @r_64_32(ptr addrspace(1) %data0, ptr addrspace(1) %data1) #0 {
+define ptx_kernel void @r_64_32(ptr noalias align 32 %data0, ptr noalias align 32 %data1) #0 {
 entry:
   ...
   ret void
@@ -50,7 +51,7 @@ attributes #0 = { nounwind "no-builtins" "no-trapping-math"="true" "nvvm.maxntid
 | 内核 ABI | `amdgpu_kernel`，`.kd` 描述符 | `ptx_kernel` |
 | 工作 id | `llvm.amdgcn.workgroup.id.*` / `workitem.id.*` | `llvm.nvvm.read.ptx.sreg.ctaid.{x,y,z}` / `tid.{x,y,z}` |
 | barrier | `fence syncscope("workgroup")` + `s.barrier` | `fence syncscope("block") release; llvm.nvvm.barrier0; fence syncscope("block") acquire`（`bar.sync 0`） |
-| 地址空间 | global 1、LDS 3、private 5 | global 1、shared 3；REG 缓冲区保持为普通的通用 `alloca` |
+| 地址空间 | global 1、LDS 3、private 5 | `cp.async` / `ldmatrix` 的 cast 中是 shared 3、global 1；内核参数是通用指针，REG 缓冲区保持为普通的 `alloca` |
 | 共享内存 | `addrspace(3)` 模块全局量 | 同上 |
 | launch bound | `"amdgpu-flat-work-group-size"` | `"nvvm.maxntid"` |
 
@@ -76,7 +77,9 @@ NVPTX 对通用的 `@llvm.{exp,log,sin,cos,pow}` intrinsic **没有降低**（�
 和 `Threefry` 从它的 `supported_ops` 中移除，由调度器用
 `nvptx_decomposition_patterns()` 将它们分解：AMD 的那一套（在原生 `exp2` /
 `log2` 之上做多项式 `exp`/`log`/三角函数、整数域的 bf16 舍入），外加 f64 的
-`Exp2`/`Log2` 展开，因为 NVPTX 只为 f16/f32 降低 `@llvm.exp2`。
+`Exp2`/`Log2` 展开，因为 NVPTX 只为 f16/f32 降低 `@llvm.exp2`。`Max`、`Pow`
+与 `Threefry` 是每一个 GPU 渲染器都会丢弃的，而非 NVPTX 自己的选择：它们分别
+分解成一次 select 和一次裸 XOR。
 
 保持原生的是：`@llvm.exp2.f32` 选出 `ex2.approx.f32`，`@llvm.sqrt` 选出
 `sqrt.rn`，`fma`/`floor`/`rint`/`maxnum` 直接降低。
@@ -133,7 +136,10 @@ f32 累加器以 `float` 传递；聚合结果会被重新组装回 WMMA 天然�
 上那样借 `.shared` 中转的东西：`ldmatrix`（sm_75+）直接按 `mma.sync` 期望的
 寄存器布局载入一块矩阵片段，而 `cp_async` / `cp_async_16`（sm_80+）把
 global → shared 的拷贝绕开寄存器，再用 `cp_async_commit`、`cp_async_wait` 和
-`cp_async_wait_all` 提交与等待。`CpAsyncCache` 为每个 module 只保留一份声明。
+`cp_async_wait_all` 提交与等待。`CpAsyncCache` 就是这次拷贝的缓存策略——`.cg`
+（只走 L2，16 字节）或 `.ca`（L1 与 L2，4、8 或 16 字节）。每个构造器都自带
+`declare`；`dedup_declares` 为每个函数名只保留第一份，于是一个满是 `cp.async`
+的内核只把该 intrinsic 声明一次。
 
 ---
 
@@ -143,12 +149,12 @@ global → shared 的拷贝绕开寄存器，再用 `cp_async_commit`、`cp_asyn
 clang，从 stdin 到 stdout，与 AMD 和 CPU 路径完全一样：
 
 ```text
-clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 -Wno-override-module - -o -
+clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx78 -Wno-override-module - -o -
 ```
 
-一个被缓存的 `has_nvptx_target()` 探测（`clang --print-targets`）会把一个不带
-NVPTX 的 clang 变成一个干净的 `JitCompilation` 错误。
-`SVOD_DUMP_NVPTX_IR=<dir>` 会把每个内核的 `.ll` 写到那里。
+一个被缓存的 `clang --print-targets` 探测会把一个不带 NVPTX 的 clang 变成一个
+干净的 `JitCompilation` 错误。`SVOD_DUMP_NVPTX_IR=<dir>` 会把每个内核的 IR 以
+`sm_XY_<module>.ll` 的名字写到那里。
 
 在任何 PTX 抵达驱动之前——无论是新鲜编译的还是来自对象缓存的——
 `validate_ptx` 都会检查它有一个 `.version`、一个等于设备 `sm_XY` 的
@@ -156,9 +162,14 @@ NVPTX 的 clang 变成一个干净的 `JitCompilation` 错误。
 很要紧：一个拼错的 `llvm.nvvm.*` 名字并不是编译错误，LLVM 会静默地把它发射
 成一个外部调用，而它本来只会以一次 `cuModuleLoadDataEx` 失败的形式浮现。
 
+当 `ptxas` 已经装好时，PTX 就在这里、在编译期被检查——包括拿它的 `.param`
+列表对照 ABI，而这正是 cubin 不再携带的信息——并且被缓存的是汇编好的 cubin；
+这时一次命中改走 `validate_cubin`（一个面向 `EM_CUDA` 的小端 ELF64，且把入口
+定义为代码）。
+
 PTX ISA 版本按架构锁定，而不是交给 clang——它的默认值取决于它找到的 CUDA toolkit
 （带 CUDA 13 的 clang 22：`.version 8.8`，需要一个 CUDA 12.9 驱动；没有 toolkit 时：
-一个对任何 tensor core 都太老的版本）。这个锁定随算力单调递增：sm_88 及更早为 `+ptx78`，
-sm_89 与 sm_90 为 `+ptx84`（它们的 fp8 `mma.sync` 形状自 8.4 起才存在），sm_100/sm_101 为
-`+ptx86`，sm_120 为 `+ptx87`，sm_103、sm_121 及更新为 `+ptx88`。更老的会被 clang 拒绝：
+一个对任何 tensor core 都太老的版本）。`ptx_isa` 随算力单调递增：直到 sm_88 为 `+ptx78`，
+从 sm_89 起直到每一个 9.x 为 `+ptx84`（fp8 的 `mma.sync` 形状自 8.4 起才存在），sm_100 到
+sm_102 为 `+ptx86`，sm_120 为 `+ptx87`，sm_103、sm_121 及更新为 `+ptx88`。更老的会被 clang 拒绝：
 `PTX version 8.4 does not support target 'sm_120'. Minimum required PTX version is 8.7`。

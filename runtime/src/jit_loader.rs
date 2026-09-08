@@ -737,7 +737,7 @@ fn reloc_ppc64(
             let v = (target as i64 + addend) as u32;
             mmap[off..off + 4].copy_from_slice(&v.to_le_bytes());
         }
-        // nop (ori 0,0,0) after bl — linker may rewrite for TOC restore; we skip
+        // TOC-relative 16-bit halves: low or high half of (target - TOC base).
         R_PPC64_TOC16 | R_PPC64_TOC16_HI => {
             let toc = toc_base(state)?;
             let v = target as i64 + addend - toc as i64;

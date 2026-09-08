@@ -48,7 +48,7 @@ matrix-core ops। यानी बिल्कुल वही intermediate rep
 
 | चेहरा | आप हैं… | आप किससे काम लेते हैं |
 |------|----------|----------------|
-| **USE** | एक application author जिसे बस एक तेज़ कर्नेल चाहिए | `matmul`, `flash_attention`, `flash_attention_with`, `kmeans_assign` — ये lazy `Tensor` लौटाते हैं, कर्नेल की कोई जानकारी ज़रूरी नहीं |
+| **USE** | एक application author जिसे बस एक तेज़ कर्नेल चाहिए | `matmul`, `flash_attention`, `flash_attention_with`, `single_query_attention`, और सिर्फ़-AMD वाले `kmeans_assign` / `knn` — ये lazy `Tensor` लौटाते हैं, कर्नेल की कोई जानकारी ज़रूरी नहीं |
 | **AUTHOR** | एक नया tile कर्नेल लिख रहे | `Kernel` / `Group` builder, `ArchCaps`, tile types (`GL`/`ST`/`RT`/`RV`), `Swizzle`, `graph_launch` |
 | **DEBUG** | किसी कर्नेल को isolation में test या benchmark कर रहे | `compile`, `launch`, `run_kernel`, `CompiledLaunch`, और structural `KernelFingerprint` |
 
@@ -95,7 +95,7 @@ block वही state पढ़ता है जो पिछले block ने
 `tk` एक हाथ से लिखा `matmul` भी रखता है, पर वह table की पहली row में ही आता है: यह DSL के लिए एक
 performance canary है, production वाला matmul नहीं — production वाला तो graph से होकर जाता है।
 
-:::tip GPU विशेषज्ञों के लिए
+:::tip[GPU विशेषज्ञों के लिए]
 हाथ से authored कर्नेल और BEAM-tuned कर्नेल के बीच structural अंतर बस इतना-सा है — `SINK` UOp के
 `KernelInfo` पर एक अकेला field: graph कर्नेल `opts_to_apply: None` छोड़ देता है, जबकि `tk` कर्नेल इसे
 `Some(vec![])` सेट करता है। IR वही, pipeline वही, बस एक marker का फ़र्क़। [IR में authoring](./lowering) इसे

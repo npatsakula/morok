@@ -1426,16 +1426,14 @@ impl LinkedCopyPublication<'_> {
 }
 
 impl AmdComputeQueue {
-    /// Create a compute queue. The queue kind is selected by `is_aql =
-    /// xccs > 1`. Single-XCC GPUs (the gfx11/12 default) use the
-    /// PM4 path (`KFD_IOC_QUEUE_TYPE_COMPUTE`), submitting raw PM4 dwords
-    /// directly into the ring. Multi-XCC CDNA falls back to AQL, where each
-    /// dispatch is a 64-byte AQL packet and PM4 helpers are wrapped via
-    /// the vendor IB packet.
     /// Predict whether `create` would build a PM4 queue for this device,
-    /// WITHOUT allocating anything. Used by `AmdGraph::capture` to skip the
-    /// (multi-MiB) per-graph connector build on AQL hardware where the graph
-    /// path is unsupported anyway. Same logic as `create`'s `is_pm4` decision.
+    /// WITHOUT allocating anything. Single-XCC GPUs (the gfx11/12 default)
+    /// use the PM4 path (`KFD_IOC_QUEUE_TYPE_COMPUTE`), submitting raw PM4
+    /// dwords directly into the ring; multi-XCC CDNA uses AQL, where each
+    /// dispatch is a 64-byte AQL packet and PM4 helpers are wrapped via the
+    /// vendor IB packet. `SVOD_AMD_AQL` set to anything but `"0"` forces AQL.
+    /// Used by `AmdGraph::capture` to skip the (multi-MiB) per-graph queue
+    /// build on AQL hardware where the graph path is unsupported anyway.
     pub fn will_use_pm4(core: &AmdDeviceCore) -> bool {
         let force_aql = std::env::var("SVOD_AMD_AQL").ok().map(|s| s != "0").unwrap_or(false);
         !force_aql && core.node.num_xcc.max(1) == 1

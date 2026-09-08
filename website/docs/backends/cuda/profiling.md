@@ -73,13 +73,23 @@ registers, shared memory and the per-SM block limit.
 
 ## Tier 4: hardware counters
 
-Counters come from the CUPTI range profiler, bound at runtime from
-`libcupti.so.13` (`device/src/cuda/cupti.rs`). CUDA 13 folded the PerfWorks
-host API into CUPTI, so that one library carries the whole sequence — CUPTI
-`dlopen`s `libnvperf_host.so` itself, which therefore has to be resolvable by
-the loader. The binding is optional the way `ptxas` is: when it is absent,
-unusable, or disabled with `SVOD_CUDA_CUPTI=0`, `pmc_available()` is `false`
-and the profiler degrades to Tiers 1-3 with its one-line note.
+Counters come from the CUPTI range profiler, bound at runtime from one
+soname, `libcupti.so.13`, looked up on the loader path and then in
+`/opt/cuda/lib64`, `/usr/local/cuda/extras/CUPTI/lib64` and
+`$CUDA_PATH/{lib64,extras/CUPTI/lib64}` (`device/src/cuda/cupti.rs`). CUDA 13
+folded the PerfWorks host API into CUPTI, so that one library carries the
+whole sequence — CUPTI `dlopen`s `libnvperf_host.so` itself, which therefore
+has to be resolvable by the loader, and a `CUPTI_ERROR_NOT_INITIALIZED` is
+what it looks like when it is not. The binding is optional the way `ptxas` is:
+when it is absent, unusable, or disabled with `SVOD_CUDA_CUPTI=0`,
+`pmc_available()` is `false` and the profiler degrades to Tiers 1-3 with its
+one-line note.
+
+Two of the params structs grew in CUDA 13.3, so each call sends the newest
+`struct_size` first and steps back one size on `CUPTI_ERROR_INVALID_PARAMETER`
+— `cuptiProfilerGetCounterAvailability` (41 then 40) and
+`cuptiProfilerHostInitialize` (56 then 48) — and `abi_ladder` remembers
+whichever size the installed CUPTI accepted.
 
 `SVOD_PMC=1` selects the backend default:
 
@@ -93,8 +103,16 @@ and the profiler degrades to Tiers 1-3 with its one-line note.
 
 Name a subset by token — `SVOD_PMC=tensor,dram`. Tokens are unique across
 backends, so an AMD token on CUDA is dropped rather than mis-programming a
-block. `tensor` against `cycles` is the tensor-core utilization of a matmul or
-a flash-attention kernel; `dram` is what separates a bandwidth-bound kernel
+block; `set_pmc` returns how many it kept and the executor says so on stderr:
+
+```text
+SVOD_PMC: 2 of 5 requested counters are not collected on this backend
+```
+
+A list whose tokens are all unknown falls back to the default set, and a
+selection nothing survives means an ordinary un-armed timing run. `tensor`
+against `cycles` is the tensor-core utilization of a matmul or a
+flash-attention kernel; `dram` is what separates a bandwidth-bound kernel
 from an issue-bound one.
 
 ```bash
@@ -116,19 +134,21 @@ echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' \
 # rebuild the initramfs for your distro, then reboot
 ```
 
-`scripts/cupti_probe.cu` runs the whole sequence standalone and reports where
-it stops, which is the quickest way to tell a privilege problem from a
-toolkit one.
+`scripts/cupti_probe.cu` runs the whole sequence standalone against a saxpy
+kernel and reports where it stops, which is the quickest way to tell a
+privilege problem from a toolkit one; running it under `sudo` confirms the
+diagnosis without a reboot.
 
 ### What collection costs
 
 Capture runs in `CUPTI_AutoRange` with `CUPTI_KernelReplay`: CUPTI opens one
 range per launch and replays the kernel internally to cover a multi-pass
-config (the five counters above schedule in one pass). Two consequences are
-handled for you:
+config (the five counters above have scheduled in one pass on every chip we
+have run; a set that needs more is caught at `Stop` and degrades to timing).
+Two consequences are handled for you:
 
-- A captured CUDA graph replays as one opaque submission and would report no
-  counters, so a counted run takes the per-dispatch path.
+- A captured CUDA graph replays as one opaque submission and its handles
+  never carry counters, so a counted run takes the per-dispatch path.
 - Kernel replay inflates the dispatch's own event pair by orders of magnitude,
   so a counted run adds one disarmed pass; `merge_min` keeps its timing next
   to the counted pass's counters. Timing and counters in one table therefore

@@ -76,7 +76,7 @@ KFD-direct AMD के लिए वही है जो [CPU JIT लोडर](.
 flowchart TD
   subgraph above["ABOVE THE SEAM — backend-agnostic (no ioctls)"]
     A1["AmdProgram, AmdComputeQueue, KernargArena, Timeline"]
-    A2["AmdConnector, AmdGraph, SignalPool, AmdAllocator"]
+    A2["QueuePool, AmdGraph, SignalPool, AmdAllocator"]
     A3["PM4 / AQL packet builders, ring back-pressure"]
   end
   subgraph below["BELOW THE SEAM — the actual driver"]
@@ -88,8 +88,10 @@ flowchart TD
 
 जो कुछ भी kernel call *नहीं* है — 16 MiB command ring, PM4/AQL packet construction,
 kernarg bump arena, timeline counter, program loader — वह seam के ऊपर रहता है और हर बैकएंड
-द्वारा साझा होता है। यह trait जान-बूझकर बहुत छोटा है: **पाँच methods** (`alloc_raw`,
-`free_raw`, `setup_ring`, `teardown_ring`, `wait_events`)। जो key insight इसे छोटा रखती है
+द्वारा साझा होता है। यह trait जान-बूझकर बहुत छोटा है: **पाँच required methods**
+(`alloc_raw`, `free_raw`, `setup_ring`, `teardown_ring`, `wait_events`) और साथ में तीन
+hooks जिनका default एक no-op है (`queue_event_mailbox`, `publication_checkpoint`,
+`update_queue_percentage`)। जो key insight इसे छोटा रखती है
 वह यह है कि ring, GART page, EOP buffer और MQD *बस GPU memory* हैं — वे seam के ऊपर
 `alloc_raw` के माध्यम से allocate होते हैं, और एक driver को असल में अलग तरीक़े से करने की
 एकमात्र चीज़ है **queue को activate करना** (doorbell map करना, scheduler को बताना कि ring
@@ -102,7 +104,7 @@ Implementor को device-open समय पर `SVOD_AMD_BACKEND` environment v
 | `kfd` (default) | `KfdIface` — KFD-direct | Production |
 | `am` | `AmIface` — userspace AM driver | अभी selectable नहीं — नीचे देखें |
 
-:::caution AM अभी चलने योग्य नहीं है
+:::caution[AM अभी चलने योग्य नहीं है]
 `SVOD_AMD_BACKEND=am` सेट करना फ़िलहाल एक error देता है (`device.rs` केवल `kfd` स्वीकार
 करता है) — अभी तक कोई AM type seam को implement नहीं करता। userspace **AM** driver का target
 है एक **CDNA3 SR-IOV VF** (gfx9.4.3) और यह एक work in progress है: discovery, VF↔GIM
@@ -116,8 +118,9 @@ host-owned है)। आज ठीक-ठीक क्या मौजूद �
 
 ## Device-local memory और SDMA copy queue
 
-बैकएंड device-open पर एक **SDMA copy queue** (`AmdCopyQueue`) install करता है जब एक बनाई जा
-सकती हो, जो `has_sdma_queue` को true कर देता है। इसके साथ, intermediates **device-only VRAM**
+बैकएंड CDNA parts पर device-open पर एक **SDMA copy queue** (`AmdCopyQueue`) install करता है
+— RDNA host-visible path पर ही रहता है, और `AMD_DISABLE_SDMA` इस प्रयास को पूरी तरह बंद कर
+देता है — जो `has_sdma_queue` को true कर देता है। इसके साथ, intermediates **device-only VRAM**
 (`cpu_access = false`) में रह सकते हैं और host↔device copies asynchronous DMA के माध्यम से
 जाती हैं: `_copyin`/`_copyout` SDMA queue के माध्यम से stage होती हैं, `_transfer` एक direct
 device→device copy करता है। जब कोई copy queue मौजूद न हो तो allocator सरल model पर वापस आ जाता
@@ -139,8 +142,8 @@ SVOD_DEVICE=AMD:0 cargo run --release -p svod-model --example gigaam_infer -- ./
 
 एक supported AMD GPU के अलावा एकमात्र host requirement है `PATH` पर `amdgcn` target वाला
 `clang` (kernels compile करने के लिए — देखें [Compile और Graph](./compile-and-graph.md));
-कोई ROCm/HIP install नहीं। [Queues और Dispatch](./queues-and-dispatch.md) पेज हर `SVOD_*`
-knob की सूची देता है।
+कोई ROCm/HIP install नहीं। [Queues और Dispatch](./queues-and-dispatch.md) पेज हर
+environment knob की सूची देता है।
 
 ---
 
@@ -148,7 +151,7 @@ knob की सूची देता है।
 
 AMD बैकएंड compiler का device हिस्सा है। Frontend tensors को एक single UOp IR में lower
 करता है; codegen उस IR को GPU thread indices पर map करता है (["Add GPU Dims"](../../architecture/codegen/devectorizer.md)
-stage ranges को `blockIdx`/`threadIdx` में बदलता है, जैसा [IR Design](../../architecture/ir-design.md)
+stage ranges को `gidxN`/`lidxN` SPECIAL indices में बदलता है, जैसा [IR Design](../../architecture/ir-design.md)
 में बताया गया है); renderer AMD LLVM IR emit करता है; और यह बैकएंड उसे compile और run करता है:
 
 ```mermaid
@@ -170,7 +173,7 @@ flowchart LR
 | पेज | यह क्या कवर करता है |
 |---|---|
 | [KFD Bindings](./kfd-bindings.md) | kernel ABI कैसे bind होता है (एक vendored header पर bindgen), ठीक-ठीक उपयोग होने वाले ioctls, sysfs topology, और allocation flow |
-| [Queues और Dispatch](./queues-and-dispatch.md) | command ring, PM4 बनाम AQL, connectors, single-queue/multi-queue dispatcher, timeline, और हर configuration env var |
-| [Compile और Graph](./compile-and-graph.md) | एक kernel LLVM IR से loaded program तक कैसे जाता है, यह कैसे dispatch होता है, और PM4 graph capture/replay कैसे काम करता है |
+| [Queues और Dispatch](./queues-and-dispatch.md) | command ring, PM4 बनाम AQL, bounded compute-lane pool, publication और device-wide drains, timeline, और हर configuration env var |
+| [Compile और Graph](./compile-and-graph.md) | एक kernel LLVM IR से loaded program तक कैसे जाता है, यह कैसे dispatch होता है, और graph capture/replay कैसे काम करता है (AQL by default, PM4 opt-in) |
 | [AM Driver](./am-driver.md) | प्रगति-में userspace driver: क्या बना है, क्या स्थगित है, और यह seam में कैसे plug होता है |
 | [Debugging](./debugging.md) | fault triage के लिए VA→allocation registry, poison latch, और dispatch/tracing diagnostics |

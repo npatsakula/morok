@@ -4,7 +4,7 @@ sidebar_label: Phase 2 — Expander
 
 # Phase 2: Expander
 
-**गोल**: ऑप्टिमाइज़ेशन primitives (UNROLL/UPCAST) को एक्सप्लिसिट ऑपरेशन में बदलें।
+**गोल**: ऑप्टिमाइज़ेशन primitives (UPCAST/UNROLL ranges) को एक्सप्लिसिट shaped ऑपरेशन में बदलें।
 
 ---
 
@@ -18,23 +18,23 @@ sidebar_label: Phase 2 — Expander
 
 **यह क्या करता है**: ऑप्टिमाइज़ेशन के बाद symbolic सिम्प्लीफ़िकेशन, साथ में WHERE मूवमेंट।
 
-**यह क्यों ज़रूरी है**: WHERE ऑपरेशन `if` स्टेटमेंट जैसे हैं। यह स्टेज `if` चेक को load के बाद से load के पहले ले जाता है। जब कंडीशन false हो, हार्डवेयर loading स्किप कर सकता है — मेमोरी बैंडविड्थ बचती है।
+**यह क्यों ज़रूरी है**: WHERE ऑपरेशन `if` स्टेटमेंट जैसे हैं। यह स्टेज `if` चेक को indexed रीड के इर्द-गिर्द से हटाकर ख़ुद index एक्सप्रेशन में ले जाता है। जब कंडीशन false हो, हार्डवेयर loading स्किप कर सकता है — मेमोरी बैंडविड्थ बचती है।
 
-**Pattern**: `sym + pm_move_where_on_load`
+**Pattern**: `sym + pm_move_where_on_load + pm_flatten_range + pm_reduce_unparented` (`POST_OPT_SYM` matcher)
 
 ```text
-// Before: WHERE guards a load
-WHERE(valid, LOAD(index), alt)
+// Before: WHERE guards an indexed read
+WHERE(cond, INDEX(buf, idx), 0)
 
-// After: validity moved to INDEX
-LOAD(INDEX(ptr, idx, valid=valid), alt)
+// After: validity moved into INDEX
+INDEX(buf, WHERE(cond, idx, Invalid))
 ```
 
 Validity को INDEX में मूव करने से बेहतर load combining और वेक्टराइज़ेशन मिलता है।
 
-**नोट**: यह pattern तभी मैच होता है जब alternative वैल्यू `0` हो। ट्रांसफ़ॉर्मेशन में कॉम्प्लेक्स clause एनालिसिस होता है: duplicate डिटेक्शन, range डिपेंडेंसी चेक, और data-dependent load वेरिफ़िकेशन।
+**नोट**: यह pattern तभी मैच होता है जब alternative वैल्यू `0` हो; एक दूसरा arm उलटे रूप `WHERE(cond, 0, INDEX(...))` को negated कंडीशन के साथ हैंडल करता है। ट्रांसफ़ॉर्मेशन में कॉम्प्लेक्स clause एनालिसिस होता है: duplicate डिटेक्शन, range डिपेंडेंसी चेक, और data-dependent load वेरिफ़िकेशन।
 
-**नोट**: Svod इम्प्लीमेंटेशन `valid=` के बजाय `gate=` इस्तेमाल करता है (Index struct में `gate` फ़ील्ड है)। कॉन्सेप्ट एक ही है।
+**नोट**: Svod validity को index एक्सप्रेशन के अंदर `WHERE(cond, idx, Invalid)` के रूप में रखता है। यह बहुत बाद में, `pm_move_gates_from_index` (`late/gater.rs`) में जाकर LOAD/STORE का `gate` फ़ील्ड बनता है; ख़ुद INDEX में कोई gate फ़ील्ड नहीं है।
 
 **Svod**: `pm_move_where_on_load()` in `symbolic/patterns.rs`
 
@@ -44,75 +44,55 @@ Validity को INDEX में मूव करने से बेहतर lo
 
 > **स्टेज एक नज़र में**
 >
-> **गोल**: UNROLL/UPCAST को एक्सप्लिसिट ऑपरेशन में बदलें
-> **मुख्य कॉन्सेप्ट**: UNROLL, CONTRACT, pattern ऑर्डर
+> **गोल**: UPCAST और UNROLL ranges को shaped STACK coordinates में एक्सपैंड करें
+> **मुख्य कॉन्सेप्ट**: range axis types, STACK, INDEX, pattern ऑर्डर
 > **प्रभाव**: वेक्टराइज़ेशन एक्सप्लिसिट बनाता है और हार्डवेयर के लिए तैयार करता है
 
-**यह क्या करता है**: UNROLL/UPCAST ऑप्टिमाइज़ेशन primitives को एक्सप्लिसिट ऑपरेशन में ट्रांसफ़ॉर्म करता है।
+**यह क्या करता है**: UPCAST/UNROLL range क्लासिफ़िकेशन को shaped coordinates में ट्रांसफ़ॉर्म करता है।
 
 **यह क्यों ज़रूरी है**: UPCAST और UNROLL इंटेंट मार्क करते हैं — हम क्या करना चाहते हैं। यह स्टेज उस इंटेंट को एक्सप्लिसिट बनाता है ताकि हार्डवेयर वाकई कर सके।
 
-**Pattern**: `symbolic_simple() + pm_pre_expander + pm_group_for_reduce + expander`
+**Pattern**: `expander2 + pm_flatten_range + mop_cleanup_patterns` (`pre_expand()` एंट्री पॉइंट)
 
-नोट: Svod इस स्टेज पर `symbolic_simple()` इस्तेमाल करता है (`sym` नहीं) क्योंकि `symbolic()` Stage 4 पर पहले ही चल चुका है। Tinygrad `sym` इस्तेमाल करता है जिसमें अतिरिक्त patterns शामिल हैं।
+नोट: `pre_expand` के अंदर कोई symbolic matcher नहीं चलता। `sym` Stage 8 पर चल चुका है, और `symbolic_simple` Stage 13 व 14 पर दोबारा चलता है।
 
-> **ज़रूरी: Pattern Precedence**
+⚠️ **ज़रूरी: Pattern Precedence**
 
 Patterns कम्बाइन होकर fixpoint तक चलते हैं। ऑर्डर तय करता है कि कई मैच होने पर कौन सा pattern पहले ट्राई हो:
-1. `sym` पहले (symbolic सिम्प्लीफ़िकेशन)
-2. `pm_pre_expander` दूसरा (UPCAST/UNROLL ranges कन्वर्ट करता है)
-3. `pm_group_for_reduce` तीसरा (GROUP_REDUCE axis हैंडल करता है)
-4. `expander` आखिर में (मुख्य expansion)
+1. `expander2` पहले (UPCAST/UNROLL ranges, REDUCE और WMMA operands एक्सपैंड करता है)
+2. `pm_flatten_range` दूसरा (ranges हटने के बाद END की range लिस्ट दोबारा बनाता है)
+3. `mop_cleanup_patterns` आखिर में (expansion से बचे movement ops साफ़ करता है)
 
 गलत precedence से गलत वेक्टराइज़ेशन या reduction scoping हो सकती है।
 
-**UNROLL और CONTRACT**:
+एक्सपैंड हुई lanes `STACK` से इकट्ठी होती हैं और `INDEX` से चुनी जाती हैं। UPCAST और
+UNROLL `RANGE` पर लगे `AxisType` हैं, अलग ऑपरेशन नहीं। (Tinygrad जिसे VECTORIZE
+कहता है, Svod में उसका नाम `STACK` है; VECTORIZE नाम का कोई op नहीं है।)
 
-UNROLL और CONTRACT साथ मिलकर काम करते हैं:
-
-```text
-UNROLL: "Take this one thing and make N copies for different positions"
-Example:  x → [x_0, x_1, x_2, x_3]
-
-CONTRACT: "Take these N things and combine them back"
-Example:  [a, b, c, d] → one vector containing all four
-```
-
-साथ में: UPCAST वेक्टराइज़ करने का इंटेंट मार्क करता है → UNROLL एक्सपैंड करता है → CONTRACT कम्बाइन करता है।
-
-**UPCAST range → VECTORIZE**:
+**UPCAST / UNROLL range → shaped coordinate**:
 ```mermaid
 flowchart TD
-  A["Before: UPCAST marks vectorization intent. RANGE(end=4, UPCAST)"]
-  A -->|"pm_pre_expander"| B["Step 1: Convert to UNROLL with constant indices. UNROLL(VCONST([0, 1, 2, 3]))"]
-  B -->|"expander"| C["Step 2: Expand operations with UNROLL sources. Operations now have unrolled sources"]
-  C -->|"CONTRACT or implicit"| D["After: explicit VECTORIZE. VECTORIZE(op[0], op[1], op[2], op[3])"]
+  A["Before: RANGE(end=4, Upcast) marks vectorization intent"]
+  A -->|"expander2"| B["After: RESHAPE(STACK(0, 1, 2, 3), [4])"]
 ```
 
-**UNROLL range → repeated ऑपरेशन**:
+Upcast और unroll ranges एक ही रास्ते से गुज़रते हैं — एक ही नियम दोनों axis types पर
+मैच होता है। ख़ुद RANGE नोड की जगह एक shaped constant coordinate आ जाता है, इसलिए
+उसे कंज़्यूम करने वाला हर ऑपरेशन बस shaped बन जाता है। प्रति-lane ऑपरेशन बाद में,
+Stage 14 पर `devectorize_alu` से बनते हैं।
 
 जब हम "ऑपरेशन डुप्लीकेट होते हैं" कहते हैं, तो ऐसा नहीं है कि कॉपी-पेस्ट होता है। कम्पाइलर एक सिंगल SIMD इंस्ट्रक्शन बनाता है जो सभी N एलिमेंट एक साथ प्रोसेस करती है। SIMD रजिस्टर को 4 नंबर रखने वाला बॉक्स सोचें; दो बॉक्स जोड़ने से सभी 8 नंबर एक साथ जुड़ते हैं।
 
+**एक्सपैंड हुए END का इंटरैक्शन**:
 ```mermaid
 flowchart TD
-  A["Before: UPCAST marks vectorization intent. RANGE(end=3, UPCAST)"]
-  A -->|"pm_pre_expander"| B["Step 1: Convert to UNROLL. UNROLL(VCONST([0, 1, 2]))"]
-  B -->|"expander"| C["Step 2: Operations expand to handle all positions. After: operations processed together (not duplicated). UNROLL([op_at_0, op_at_1, op_at_2])"]
+  A["Before: END(STORE(...), [RANGE(Upcast)])"]
+  A -->|"expander2 + pm_flatten_range"| B["After: END(shaped STORE(...), [])"]
 ```
 
-**UNROLL/END/CONTRACT इंटरैक्शन**:
-```mermaid
-flowchart TD
-  A["Before: END(STORE(...), [RANGE(UPCAST)])"]
-  A -->|"pm_pre_expander"| B["Step 1: END(STORE(...), [UNROLL(VCONST([0,1,2,3]))])"]
-  B -->|"expander"| C["Step 2: END(CONTRACT(STORE(...x4)), [])"]
-```
-
-**AFTER/END से ब्रॉडकास्ट**:
-```text
-// Broadcast VECTORIZE (all elements identical)
-AFTER(VECTORIZE([x, x, x, x]), deps) → VECTORIZE([AFTER(x, deps), AFTER(x, deps), ...])
-```
+`pm_flatten_range` किसी END की range लिस्ट को उन RANGE नोड्स से दोबारा बनाता है जो
+अब भी उसके sources के ज़रिए पहुँच में हैं। Expansion के बाद upcast range बची नहीं
+रहती, इसलिए लिस्ट खाली हो जाती है। प्रति-lane stores Stage 14 पर `GROUP` में लिपटकर आते हैं।
 
 **GROUP_REDUCE हैंडलिंग** (`pm_group_for_reduce`):
 
@@ -123,12 +103,14 @@ flowchart TD
   A["Before: REDUCE with GROUP_REDUCE ranges. REDUCE(src, [range(GROUP_REDUCE)])"]
   A -->|"pm_group_for_reduce"| B["After: Shared memory reduction pattern"]
   B --> S1["1. Track upstream LOCAL ranges"]
-  B --> S2["2. BUFFERIZE result with group ranges (AddrSpace.LOCAL)"]
-  B --> S3["3. INDEX into buffer with transformed ranges"]
-  B --> S4["4. Final REDUCE with axes (range_id+100, AxisType.REDUCE)"]
+  B --> S2["2. STAGE the partial result with the group ranges (AddrSpace::Local)"]
+  B --> S3["3. INDEX into that buffer with the transformed ranges"]
+  B --> S4["4. Final REDUCE over derived loops (axis_id.group_reduce_loop(), AxisType::Reduce)"]
 ```
 
-यह shared memory से एफ़िशिएंट tensor core accumulation सक्षम करता है।
+यह shared memory से एफ़िशिएंट tensor core accumulation सक्षम करता है। हालाँकि
+`pm_group_for_reduce` `expand.rs` में रहता है, यह `pm_reduce_local` में कम्पोज़ होता है
+और इसलिए reduction हटाने के दौरान चलता है, `pre_expand` के अंदर नहीं।
 
 **Svod**: `expand.rs`
 
@@ -139,10 +121,10 @@ flowchart TD
 > **स्टेज एक नज़र में**
 >
 > **गोल**: फ़ास्ट मेमोरी (shared / L1) के लिए बफ़र तैयार करें
-> **मुख्य Patterns**: Locals के साथ bufferize, hints एक्सट्रैक्ट करें
+> **मुख्य Patterns**: लोकल बफ़र एलोकेशन, movement op पुशडाउन
 > **प्रभाव**: बार-बार एक्सेस होने वाला डेटा फ़ास्ट मेमोरी में रहता है
 
-**यह क्या करता है**: लोकल मेमोरी यूज़ के लिए बफ़र तैयार करता है और codegen-स्पेसिफ़िक क्लीनअप अप्लाई करता है।
+**यह क्या करता है**: हर staged इंटरमीडिएट को असली लोकल बफ़र में बदल देता है।
 
 **यह क्यों ज़रूरी है**: **लोकल बफ़र** = कम्प्यूट यूनिट के पास फ़ास्ट मेमोरी:
 - GPU: Shared memory (LDS) — global memory से 100x तेज़
@@ -150,12 +132,15 @@ flowchart TD
 
 कम्पाइलर बार-बार एक्सेस होने वाले डेटा को लोकल बफ़र में ले जाता है — ठीक वैसे जैसे ज़रूरी फ़ाइलें नेटवर्क ड्राइव के बजाय डेस्कटॉप पर रखना।
 
-**Pattern**: `pm_add_buffers_local + rangeify_codegen`
+**Pattern**: `pm_add_local_buffers`
 
 | ट्रांसफ़ॉर्म | उद्देश्य |
 |-------------|----------|
-| `bufferize_to_store` | `allow_locals=true` वाले BUFFERIZE कन्वर्ट करें |
-| CONTIGUOUS wrapper हटाएँ | Codegen से पहले ऑप्टिमाइज़ेशन hints हटाएँ |
-| NOOP हटाना | No-op ऑपरेशन साफ़ करें |
+| `add_local_buffer` | हर STAGE नोड के लिए एक लोकल `placeholder` एलोकेट करें और उसे INDEX / STORE / END / AFTER में बदलें |
+| `movement_op_patterns` | Movement ops नीचे धकेलें ताकि नए बफ़र के indices सरल रहें |
 
-**Svod**: `rangeify/patterns.rs`, `rangeify/transforms.rs`, `optimizer/mod.rs`
+**ऑर्डर पर नोट**: reduction हटाना (Stage 11) असल में इस स्टेज से *पहले* चलता है —
+`add_local_buffer` उन्हीं STAGE नोड्स को कंज़्यूम करता है जो reduce lowering बनाता है।
+Tinygrad भी दोनों passes को इसी क्रम में चलाता है।
+
+**Svod**: `optimizer/mod.rs`, `rangeify/patterns.rs`

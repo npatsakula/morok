@@ -8,7 +8,8 @@
 //! or failing deep in compile.
 //!
 //! The gate is generic over the supported set: a kernel passes its own [`ArchSet`]
-//! (flash-attention declares the AMD pair; single-query attention adds `sm_80+`).
+//! (k-means and k-NN declare the AMD pair; flash-attention, matmul and
+//! single-query attention add `sm_80+`).
 //! Adding a GPU is "declare it here (and supply its arch-specific kernel bits)",
 //! not "rewrite this"; the generic launch infra (`compile`/`run_kernel`/
 //! `graph_launch`) stays arch-agnostic — only the per-kernel launcher invokes this.

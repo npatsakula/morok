@@ -29,7 +29,7 @@ Svod एक Rust-आधारित ML कम्पाइलर है जो [T
 | [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp ग्राफ़ IR: 80+ ops, symbolic integers, origins |
 | [device](https://github.com/npatsakula/svod/tree/main/device/) | बफ़र मैनेजमेंट: lazy alloc, zero-copy views, LRU कैशिंग |
 | [schedule](https://github.com/npatsakula/svod/tree/main/schedule/) | ऑप्टिमाइज़ेशन इंजन: 20+ पासेज़, RANGEIFY, Z3 वेरिफ़िकेशन |
-| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | कोड जनरेशन: Clang (डिफ़ॉल्ट), LLVM JIT |
+| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | कोड जनरेशन: LLVM IR (डिफ़ॉल्ट), Clang C |
 | [runtime](https://github.com/npatsakula/svod/tree/main/runtime/) | JIT कम्पाइलेशन और कर्नेल एक्ज़ीक्यूशन |
 | [tensor](https://github.com/npatsakula/svod/tree/main/tensor/) | हाई-लेवल lazy tensor API |
 | [onnx](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX मॉडल इम्पोर्टर |
@@ -48,11 +48,15 @@ let b = Tensor::from_ndarray(&array![[5.0f32, 6.0], [7.0, 8.0]]);
 
 // Lazy — nothing executes yet
 let mut c = &a + &b;
-c.realize()?;
 
-// Zero-copy view into the result
-let view = c.array_view::<f32>()?;
-assert_eq!(view, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
+// Compile and execute, then extract as ndarray
+c.realize()?;
+let result = c.as_ndarray::<f32>()?;
+assert_eq!(result, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
+
+// Or extract as flat Vec
+let flat = c.as_vec::<f32>()?;
+assert_eq!(flat, vec![6.0, 8.0, 10.0, 12.0]);
 ```
 
 ## Pattern DSL उदाहरण
@@ -91,17 +95,23 @@ nix fmt # Format source files
 
 | डिपेंडेंसी | वर्शन | ज़रूरी | विवरण |
 |------------|--------|--------|-------|
-| Rust | 1.85+ | हाँ | Edition 2024 |
-| LLVM | 22.x | हाँ | CPU कोड जनरेशन बैकएंड |
-| Clang | - | हाँ | LLVM बिल्ड्स के लिए C कम्पाइलर |
+| Rust | 1.88+ | हाँ | Edition 2024, let-chains |
+| LLVM | >=16 | हाँ | CPU कोड जनरेशन बैकएंड: `libLLVM` रनटाइम पर लोड होता है (Nix में 22.x पिन है) |
+| Clang | - | हाँ | Clang बैकएंड, और `libLLVM` न मिलने पर ऑब्जेक्ट बनाने का फ़ॉलबैक |
 | pkgconf | - | हाँ | बिल्ड कॉन्फ़िगरेशन टूल |
 | protobuf | - | हाँ | ONNX proto कम्पाइलेशन |
 | zlib | >=1.3 | हाँ | कम्प्रेशन लाइब्रेरी |
 | libffi | >=3.4 | हाँ | फ़ॉरेन फ़ंक्शन इंटरफ़ेस |
 | libxml2 | >=2.13 | हाँ | XML पार्सिंग |
 | Z3 | >=4.15 | नहीं | ऑप्टिमाइज़ेशन वेरिफ़िकेशन के लिए SMT सॉल्वर |
-| NVIDIA ड्राइवर | CUDA >=12.8 (R570) | नहीं | CUDA बैकएंड के लिए `libcuda.so.1`, रनटाइम पर लोड होता है; किसी toolkit की ज़रूरत नहीं |
+| NVIDIA ड्राइवर | CUDA >=12.0 (R525) | नहीं | CUDA बैकएंड के लिए `libcuda.so.1`, रनटाइम पर लोड होता है; किसी toolkit की ज़रूरत नहीं |
 | Clang NVPTX / AMDGPU टारगेट्स | - | नहीं | GPU कर्नेल कम्पाइलेशन (`clang --print-targets`) |
+
+### थ्रेड्स
+
+`SVOD_THREADS` (डिफ़ॉल्ट: होस्ट का पैरललिज़्म) इकलौता थ्रेड बजट है: यह उस पूल का
+आकार तय करता है जो कर्नेल कम्पाइल करता है और CPU कर्नेल चलाता है, और यही CPU
+कर्नेल का डिफ़ॉल्ट `core_id` विभाजन भी है। `RAYON_NUM_THREADS` नहीं पढ़ा जाता।
 
 ## टेस्ट
 

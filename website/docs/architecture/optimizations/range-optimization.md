@@ -136,57 +136,54 @@ Tinygrad: `simplify.py:82-142`. Svod: `pm_reduce_simplify()` + `reduce_collapse_
 
 ## Buffer Removal (Partial Contiguous)
 
-**What**: Decide whether to materialize an intermediate result to a buffer or inline the computation. Often called "pcontig" in the codebase (short for partial contiguous — the optimization that inlines BUFFERIZE nodes by substituting range variables).
+**What**: Decide whether to materialize an intermediate result to a buffer or inline the computation, by substituting the bufferized ranges with the ranges the reader indexes with.
 
-When the rangeify pass creates a `BUFFERIZE` node (marking "this needs a buffer"), the buffer removal pass evaluates whether actually allocating memory is worthwhile. A `BUFFERIZE` is Svod's intermediate representation between "this needs a buffer" and the final `STORE`+`BUFFER`+`AFTER` — it lets this pass decide if materialization is actually needed. If the computation is cheap enough, it substitutes the range variables and inlines the expression directly.
+When the rangeify pass creates a `STAGE` node (marking "this needs a buffer"), the buffer removal pass evaluates whether actually allocating memory is worthwhile. A `STAGE` is Svod's intermediate representation between "this needs a buffer" and the final `STORE`+`BUFFER`+`AFTER` — it lets this pass decide if materialization is actually needed. If the computation is cheap enough, it substitutes the range variables and inlines the expression directly.
 
 ### Decision Tree
 
 ```mermaid
 flowchart TD
-  Q1["Is this an always-run op (CONTIGUOUS, COPY)?"]
+  Q1["Always-run op (CONTIGUOUS, COPY), or a non-removable STAGE?"]
   Q1 -->|"YES"| K1["Keep buffer (always materialized)"]
-  Q1 -->|"NO"| Q2["Does inlining exceed the buffer limit?"]
+  Q1 -->|"NO"| Q2["More than 3 distinct buffers accessed?"]
   Q2 -->|"YES"| K2["Keep buffer"]
-  Q2 -->|"NO"| Q3["Is there a reduce in scope?"]
-  Q3 -->|"NO"| I1["Inline (cheap: just substitute ranges)"]
-  Q3 -->|"YES"| Q4["Is pcontig level (less than or equal to) 2?"]
-  Q4 -->|"YES"| K3["Keep buffer (reduce recomputation too expensive)"]
-  Q4 -->|"NO"| Q5["Check input/output ratio"]
-  Q5 -->|"Ratio low (output small relative to input)"| K4["Keep buffer"]
-  Q5 -->|"Ratio high (output much greater than input)"| I2["Partial inline"]
+  Q2 -->|"NO"| Q3["Does a REDUCE in the body read a buffer?"]
+  Q3 -->|"YES"| K3["Keep buffer (reduce recomputation too expensive)"]
+  Q3 -->|"NO"| I1["Inline: substitute the STAGE ranges with the INDEX ranges"]
 ```
 
-:::caution Unary Ops in Reduce Context
-Unary operations (like negation) are NOT inlined when inside a reduce scope, even though they're cheap. Reason: if `argmax(-x)` inlines the negation, it recomputes `-x` for every reduction iteration — N extra negations instead of one buffer read.
+:::caution[Buffer Reads Inside a Reduce]
+The reduce guard is not about how cheap the operation is — it fires whenever any REDUCE in the body reads a buffer (`Param`, `Buffer` or a `Stage`). Reason: if `argmax(-x)` inlines the negation, `-x` is recomputed on every reduction iteration — N extra loads and negations instead of one buffer read. A reduce over values that touch no buffer is still inlinable.
 :::
 
 ### Related Patterns
 
 | Pattern | What |
 |---------|------|
-| Buffer folding | `BUFFERIZE(CONST) → CONST` — buffer of constant is just the constant |
-| Index folding | `INDEX(CONST) → CONST` — indexing into constant is the constant |
-| Identity fold | `INDEX(BUFFERIZE(compute, ranges), ranges) → compute` — same ranges cancel |
-| Nested flatten | `BUFFERIZE(BUFFERIZE(...))` — flatten nested bufferization |
+| Stage folding | `STAGE(CONST) → CONST` — a stage of a constant is just the constant |
+| Index folding | `INDEX(CONST) → CONST` — indexing into a constant is the constant |
+| Copy folding | `COPY(CONST) → CONST` — copying a constant is the constant |
+| MStack folding | `INDEX(MSTACK([CONST, ...])) → CONST` — a multi-device stack of constants |
+| Identity fold | `INDEX(STAGE(compute, ranges), ranges) → compute` — same ranges cancel |
 
-Svod: `buffer_removal_with_pcontig()` in `rangeify/patterns.rs`.
+Svod: `pm_remove_bufferize()` and `buffer_folding()` in `rangeify/patterns.rs`.
 
 ---
 
 ## Dead Axis Removal
 
-**What**: Remove unused dimensions from BUFFERIZE operations.
+**What**: Remove unused dimensions from STAGE operations.
 
 A dimension is "dead" when:
 - It has size 1 (contributes nothing)
 - It appears as a constant in the index (not a variable)
 - The compute expression doesn't reference it
 
-Dead axes are removed from BUFFERIZE, then the shape is restored via RESHAPE (insert size-1 dims) and EXPAND (broadcast to original size). This reduces the dimensionality of the buffer allocation.
+Dead axes are removed from STAGE, then the shape is restored via RESHAPE (insert size-1 dims) and EXPAND (broadcast to original size). This reduces the dimensionality of the buffer allocation.
 
-:::caution Scalar Case
-Even when ALL ranges are dead (scalar output), BUFFERIZE must be kept with empty ranges — removing it entirely causes `NoKernelsFound` since no STORE gets created during kernel splitting.
+:::caution[Scalar Case]
+Even when ALL ranges are dead (scalar output), STAGE must be kept with empty ranges — removing it entirely causes `NoKernelsFound` since no STORE gets created during kernel splitting.
 :::
 
 Svod: `dead_axis_removal()` in `rangeify/patterns.rs`.

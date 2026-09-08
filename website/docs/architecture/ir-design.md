@@ -56,9 +56,9 @@ pub enum Op {
     Range { end: Arc<UOp>, axis_id: AxisId, axis_type: AxisType, deps: SmallVec<[Arc<UOp>; 2]> },
     End { computation: Arc<UOp>, ranges: SmallVec<[Arc<UOp>; 4]> },
 
-    // Memory operations
-    Load { buffer: Arc<UOp>, index: Arc<UOp>, alt: Option<Arc<UOp>> },
-    Store { index: Arc<UOp>, value: Arc<UOp>, ranges: SmallVec<[Arc<UOp>; 4]> },
+    // Memory operations (the buffer is reached through the INDEX, not a field)
+    Load { index: Arc<UOp>, alt: Option<Arc<UOp>>, gate: Option<Arc<UOp>> },
+    Store { index: Arc<UOp>, value: Arc<UOp>, gate: Option<Arc<UOp>> },
 
     // ALU operations (grouped enums with many individual values)
     Binary(BinaryOp, Arc<UOp>, Arc<UOp>),  // Add, Mul, etc.
@@ -82,14 +82,14 @@ When you print a UOp graph, you see its tree structure:
 
 ```mermaid
 flowchart TD
-  N42["[42] STORE : Void"] --> N35["[35] INDEX : Ptr(Float32)"]
-  N42 --> N40["[40] REDUCE(Add) : Float32"]
-  N42 --> N30["[30] RANGE(axis=0, Reduce) : Index"]
-  N35 --> N10["[10] DEFINE_GLOBAL(0) : Ptr(Float32)"]
-  N35 --> N30
-  N30 --> N5["[5] CONST(4) : Index"]
+  N42["[42] STORE : Void"] --> N35["[35] INDEX : Float32"]
+  N42 --> N40["[40] REDUCE(Add, num_axes=1) : Float32"]
+  N35 --> N10["[10] PARAM(slot=0) : Float32"]
+  N35 --> N31["[31] RANGE(R0, Global) : Index"]
+  N31 --> N5["[5] CONST(4) : Index"]
   N40 --> N38["[38] MUL : Float32"]
-  N40 --> N30
+  N40 --> N30["[30] RANGE(R1, Reduce) : Index"]
+  N30 --> N5
   N38 --> N36["[36] LOAD : Float32"]
   N38 --> N37["[37] LOAD : Float32"]
 ```
@@ -103,13 +103,13 @@ Notice the arrows pointing to "(same RANGE as above)"? That's not just pretty-pr
 When you create the same expression twice in Svod, you get the *same pointer*. Not equal values—the same memory address.
 
 ```rust
-let a = UOp::binary(Add, x.clone(), y.clone());
-let b = UOp::binary(Add, x.clone(), y.clone());
+let a = x.try_add(&y)?;
+let b = x.try_add(&y)?;
 
 assert!(Arc::ptr_eq(&a, &b));  // Same pointer!
 ```
 
-:::note Origin is part of node identity
+:::note[Origin is part of node identity]
 With `SVOD_ORIGIN=1` each node also carries the `OriginScope` it was built under, folded
 into its content hash. Two identical subgraphs built under different scopes are then
 *different* nodes and stay unshared until the kernel cut strips origins. Literals are the
@@ -178,7 +178,8 @@ Each `RANGE` has an **AxisType** that tells the code generator how to compile it
 
 | AxisType | CPU | CUDA | Meaning |
 |----------|-----|------|---------|
-| **Loop** | `for` loop | `for` loop | Sequential iteration; rangeify default |
+| **Weak** | `for` loop | `for` loop | Unparallelized range; the rangeify default |
+| **Loop** | `for` loop | `for` loop | Explicit regular loop |
 | **Global** | Thread pool | `blockIdx` | Outer parallel dimension |
 | **Thread** | Thread pool | — | CPU parallelism |
 | **Warp** | (N/A) | warp/wavefront | Sub-group parallelism |
@@ -188,7 +189,7 @@ Each `RANGE` has an **AxisType** that tells the code generator how to compile it
 | **Reduce** | Accumulator | Warp reduce | Reduction dimension |
 | **Unroll** | Unrolled | Unrolled | Loop unrolling |
 
-The AxisType hierarchy (Loop → Global/Thread → Warp → Local/GroupReduce → Upcast → Reduce → Unroll) maps to hardware execution models — outer loops have lower priority. A `RANGE` with `AxisType::Global` becomes `blockIdx.x` in CUDA. A `RANGE` with `AxisType::Local` becomes `threadIdx.x`.
+The AxisType hierarchy (Weak/Loop → Global/Thread → Warp → Local/GroupReduce → Upcast → Reduce → Unroll) maps to hardware execution models — outer loops have lower priority. A `RANGE` with `AxisType::Global` becomes `blockIdx.x` in CUDA. A `RANGE` with `AxisType::Local` becomes `threadIdx.x`.
 
 Why explicit loops matter:
 
@@ -215,8 +216,8 @@ patterns! {
     Add(a @const(a_val), _b @const(b_val))
         => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 
-    // Self-folding: x / x → 1
-    Idiv(x, x) => UOp::one(x.dtype()),
+    // Self-folding: x // x → 1
+    FloorDiv(x, x) => 1.into_uop(x.dtype()),
 
     // Dead code: if(true) { x } else { y } → x
     Where(Const(ConstValue::Bool(true)), t, _f) => t,
@@ -279,11 +280,9 @@ The rangeify pass converts movement ops (`EXPAND`, `PERMUTE`) into explicit inde
 flowchart TD
   STORE["STORE"] --> IDXC["INDEX"]
   STORE --> RED["REDUCE(Add)"]
-  STORE --> RJ["RANGE(j, Global) j in [0, 4)"]
-  STORE --> RI["RANGE(i, Global) i in [0, 4)"]
-  IDXC --> DG["DEFINE_GLOBAL(C)"]
-  IDXC --> RI
-  IDXC --> RJ
+  IDXC --> DG["PARAM(C)"]
+  IDXC --> RI["RANGE(i, Global) i in [0, 4)"]
+  IDXC --> RJ["RANGE(j, Global) j in [0, 4)"]
   RED --> MUL["MUL"]
   RED --> RK["RANGE(k, Reduce) k in [0, 4)"]
   MUL --> LA["LOAD(A)"]

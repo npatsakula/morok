@@ -11,7 +11,10 @@ surface का होना ज़रूरी हुआ। यह chapter इ�
 सामने आता है।
 
 हम `tk/src/kernels/fa.rs` के forward कर्नेल की बात कर रहे हैं, जहाँ तक USE-चेहरे के
-`flash_attention(q, k, v)` से पहुँचा जाता है।
+`flash_attention(q, k, v)` से पहुँचा जाता है। यह gfx942 (CDNA3), gfx1151 (RDNA3.5) और CUDA `sm_80+` के लिए
+बना है; per-warp `(q_blk, kv_blk)` tile हर device के लिए `FaPolicy` चुनता है — ऊँचा tile तभी, जब इसके
+shared-memory buffers समा जाएँ और launch grid पहले से device की compute units को cover करता हो, वरना
+baseline `{16, 32}`।
 
 ---
 
@@ -81,16 +84,18 @@ bank-conflict-free रहते हैं।
 
 ---
 
-## wave-size की बारीकी: दो matmuls के बीच relayout
+## layout की बारीकी: दो matmuls के बीच relayout
 
 यहीं [Wave32 बनाम Wave64](./wave-portability) theory से निकलकर असल में सामने आता है। कर्नेल दो
 matrix multiplies करता है, और पहले का output (`S = Q·Kᵀ`, जो softmax के बाद `P` बन जाता है) दूसरे का
 *input* है (`P·V`)। तो क्या score accumulator को सीधे एक operand की तरह वापस feed किया जा सकता है?
 
-- **CDNA पर** (`acc_reusable_as_input() == true`): हाँ। accumulator layout operand layout से मेल खाता है,
-  इसलिए यह बस एक register copy है। सस्ता।
-- **RDNA पर** (`acc_reusable_as_input() == false`): नहीं। layouts अलग होते हैं, इसलिए दूसरे multiply से पहले
-  `P` को relayout के लिए **LDS से होकर एक round-trip** करना पड़ता है।
+- **CDNA और CUDA पर** (`acc_reusable_as_input() == true`): हाँ। CDNA पर MFMA accumulator ख़ुद *ही* input
+  fragment है, और two-half `mma.sync` f32 accumulator m16n8 C fragments को ठीक उसी A-operand register
+  order में रखता है — इसलिए यह बस एक register copy है। सस्ता।
+- **RDNA पर** (`acc_reusable_as_input() == false`): नहीं। even/odd accumulator और replicated operand अलग
+  होते हैं, इसलिए दूसरे multiply से पहले `P` को relayout के लिए **LDS से होकर एक round-trip** करना पड़ता है
+  (उसी per-warp softmax band से होकर जो policy का `att_band` allocate करता है)।
 
 कर्नेल हर architecture पर सही काम करने के लिए `ArchCaps` पर branch करता है। algorithm वही, पर दो physical
 realizations — ठीक वही portability tax जिसका ज़िक्र पिछले chapter में था, और वह भी सबसे अहम कर्नेल के
@@ -106,7 +111,7 @@ memory से load नहीं किया जाता, बल्कि tile 
 element की position इसी से तय हो जाती है कि उसे कौन-सा fragment और lane रखता है, इसलिए mask compute होता है,
 fetch नहीं।
 
-:::tip GPU विशेषज्ञों के लिए
+:::tip[GPU विशेषज्ञों के लिए]
 compute/memory overlap को `tk` में raw scheduling intrinsics के रूप में hand-emit नहीं किया जाता, जैसा
 HipKittens के कर्नेल में होता है। इसके बजाय KV loop पर `sched::pipeline(SchedKind::Attention, …)`
 (`tk/src/kernels/fa.rs`) का annotation लगा होता है — एक marker, जिसे codegen में एक post-linearization
@@ -128,7 +133,7 @@ Flash Attention पूरे section को एक ही file में सम�
 - यह पूरी तरह **tiles और roles** में व्यक्त होता है, कभी lane indices में नहीं ([Tiling क्या है](./tiling));
 - यह बाक़ी सब चीज़ों जैसा **वही UOp IR** बनकर compile होता है और lazy graph में एक
   `Op::Call` के रूप में शामिल होता है ([IR में authoring](./lowering));
-- और अपने hot loop में यह एक explicit **wave32/wave64 branch** साथ रखता है
+- और अपने hot loop में यह एक explicit **accumulator-reuse branch** साथ रखता है, हर fragment layout के लिए एक
   ([Wave32 बनाम Wave64](./wave-portability))।
 
 इसीलिए यह हाथ से लिखा गया है, और इसीलिए इसे लिखने के लिए `tk` मौजूद है। इसे isolation में run करके इसके

@@ -16,7 +16,7 @@ use std::fmt;
 ///
 /// Each operation represents a specific kernel optimization strategy:
 /// - Parallelization: `LOCAL`, `THREAD`, `GLOBAL`
-/// - Vectorization: `UPCAST`
+/// - Parallelization: `LOCAL`, `THREAD`
 /// - Loop optimization: `UNROLL`, `GROUP`, `GROUPTOP`
 /// - Layout: `SWAP`, `PADTO`
 /// - Hardware acceleration: `TC` (Tensor Cores)

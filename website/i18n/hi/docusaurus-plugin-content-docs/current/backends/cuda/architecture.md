@@ -8,27 +8,31 @@ sidebar_label: आर्किटेक्चर
 वह `device/src/cuda/` में है जब तक कि अन्यथा न कहा गया हो।
 
 ```text
+mod.rs        the dl_api! runtime-binding macro and the module's re-exports
 sys.rs        the bound driver entry points (libloading), CUresult, handles
-device.rs     CudaDevice: primary context, limits, streams, base event, poison latch
+device.rs     CudaDevice: primary context, limits, lanes, base event, scoped-sync tables, poison latch
 allocator.rs  CudaAllocator: device / managed / pinned memory, staged copies
-program.rs    CudaProgram: PTX module load, cuLaunchKernel, execute_timed, resources
-sync.rs       CudaPlanCtx, CudaDispatchTimestamps, CudaCompletionToken, CudaTimelineSignal
+program.rs    CudaProgram: cubin or PTX module load, cuLaunchKernel, execute_timed, resources
+sync.rs       CudaPlanCtx, CudaDispatchTimestamps, CudaCompletionToken
 graph.rs      CudaGraph: a CUDA graph DAG from GraphKernel::deps, patched replays
+cupti.rs      the CUPTI range profiler behind Tier 4 (see Profiling)
 ```
 
 ---
 
 ## Driver bindings
 
-`sys.rs` बैकएंड द्वारा उपयोग किए जाने वाले हर entry point को एक ही `cuda_api!` macro में
-declare करता है: Rust field, exact export name, और C prototype। `Api::load`
+`sys.rs` बैकएंड द्वारा उपयोग किए जाने वाले हर entry point को एक ही `dl_api!` block में
+declare करता है: Rust field, exact export name, और C prototype; macro ख़ुद `mod.rs` में
+रहता है और `cupti.rs` उसे फिर से उपयोग करता है। `Api::load`
 `libcuda.so.1` खोलता है और उन सबको पहले ही resolve कर लेता है, इसलिए एक ग़ायब या नाम बदला
 हुआ symbol पहले उपयोग पर नहीं, बल्कि एक ही बार, load पर, `Error::DeviceUnavailable`
 (`libcuda.so.1 has no symbol ...`) के रूप में fail होता है। नाम वे **versioned** exports हैं
-जिन पर `cuda.h` remap करता है: `cuMemAlloc_v2`, `cuCtxDestroy_v2`,
+जिन पर `cuda.h` remap करता है: `cuMemAlloc_v2`, `cuDevicePrimaryCtxRelease_v2`,
 `cuGraphAddKernelNode_v2`, `cuGraphExecKernelNodeSetParams_v2`,
 `cuGraphInstantiateWithFlags` (unversioned `cuGraphInstantiate` एक legacy पाँच-argument ABI
-है और उसे कभी छुआ नहीं जाता)।
+है और उसे कभी छुआ नहीं जाता)। `cuEventElapsedTime` जान-बूझकर रखा गया अपवाद है: उसका `_v2`
+CUDA 12.8 का है, जो driver की न्यूनतम सीमा को R570 तक उठा देता।
 
 Handles `#[repr(transparent)]` pointer newtypes हैं (`CUcontext`, `CUmodule`, `CUfunction`,
 `CUstream`, `CUevent`, `CUgraph`, `CUgraphExec`, ...); `CUdeviceptr` एक `u64` है।
@@ -50,7 +54,8 @@ assertions के साथ mirror करता है।
 `CudaDevice::open(id)` प्रति process cached है। यह `cuInit` चलाता है, device के
 **primary context** को retain करता है (`cuDevicePrimaryCtxRetain`), उन `CudaLimits` को
 पढ़ता है जिनकी उसे ज़रूरत है (`cuDeviceGetAttribute`: SM count, प्रति block और प्रति SM
-threads और shared memory, registers, warp size, L2, managed-memory support), दो
+threads, प्रति block shared memory, warp size, और यह कि managed memory coherently
+accessible है या नहीं), दो
 non-blocking streams बनाता है (allocator के लिए एक **copy stream** और per-call
 `Program::execute` के लिए एक **dispatch stream**), और एक **base event** record करता है जो
 हर GPU-clock timestamp का शून्य है।
@@ -76,22 +81,33 @@ kind रखता है, जिसे `BufferSpec` से चुना जा�
 | `host` | `Pinned` | `cuMemHostAlloc(PORTABLE \| DEVICEMAP)`, kernels इसे bus के ऊपर से पढ़ते हैं |
 
 `supports_device_local()` `true` है, इसलिए intermediates device पर ही रहते हैं।
-Host <-> device copies पहले context को drain करती हैं (`cuCtxSynchronize`: host access
-plan streams के विरुद्ध ordered नहीं है), फिर copy stream पर `cuMemcpyHtoDAsync` /
-`cuMemcpyDtoHAsync` के साथ एक lazily allocate किए गए **pinned staging buffer** के माध्यम से
-data को 4 MiB chunks में ले जाती हैं, प्रति chunk stream को synchronize करते हुए। Pinned
-buffers सीधे `memcpy` कर दिए जाते हैं। Device-to-device `_transfer` `cuMemcpyDtoDAsync` है;
-एक allocation के अंदर overlapping range `memmove` semantics बनाए रखने के लिए एक temporary
-से होकर गुज़रती है। Free करना पहले drain करता है; यदि drain fail होता है (poisoned context)
+Host <-> device copies पहले storage के in-flight producers और readers की प्रतीक्षा करती
+हैं (`CudaDevice::wait_storage`, नीचे — host access lanes के विरुद्ध ordered नहीं है), फिर
+data ले जाती हैं। 4 MiB तक एक copy-out एक synchronous `cuMemcpyDtoH` है, जबकि एक copy-in
+copy lane पर एक `cuMemcpyHtoDAsync` है जो storage के नए producer के रूप में publish होती
+है; यह stream को केवल तभी synchronize करती है जब source ऐसी memory हो जिसे driver track
+करता है (pinned, registered या managed, `cuPointerGetAttribute` से पूछा गया), क्योंकि
+driver एक pageable source को return करने से पहले stage करता है। 4 MiB से ऊपर दोनों दिशाएँ
+एक lazily allocate किए गए **pinned staging buffer** के माध्यम से `cuMemcpyHtoDAsync` /
+`cuMemcpyDtoHAsync` के साथ 4 MiB chunks में जाती हैं, प्रति chunk stream को synchronize
+करते हुए। Pinned buffers सीधे `memcpy` कर दिए जाते हैं। Device-to-device `_transfer` और
+zero-fills copy lane पर asynchronous हैं: `cuStreamWaitEvent` से producers के बाद ordered,
+दोनों ranges के नए producer के रूप में publish, और किसी भी lane पर हर बाद के launch द्वारा
+प्रतीक्षित, इसलिए वे host को कभी block नहीं करतीं; एक allocation के अंदर overlapping range
+`memmove` semantics बनाए रखने के लिए एक temporary से होकर गुज़रती है। Free करना पहले
+storage के producers की प्रतीक्षा करता है; यदि यह प्रतीक्षा fail होती है (poisoned context)
 तो allocation को एक in-flight kernel के नीचे free करने के बजाय **quarantine** (leak) कर
-दिया जाता है। हर compute allocator की तरह यह `LruAllocator` के नीचे बैठता है।
+दिया जाता है। हर compute allocator की तरह यह `LruAllocator` के नीचे बैठता है, जो एक
+recycle की गई allocation को उसके पिछले owner के producers पर fence करता है।
 
 ---
 
 ## Programs और launches
 
-`CudaProgram::load` PTX text को 16 KiB error और info log buffers के साथ
-`cuModuleLoadDataEx` को सौंपता है, ताकि एक JIT failure `Error::CudaJit { kernel, cause, log }`
+`CudaProgram::load` `is_cubin` पर branch करता है — एक ELF image `validate_cubin` से होकर
+जाती है, PTX text entry की `.param` जाँच से — और दोनों 16 KiB error और info log buffers
+के साथ उसी `cuModuleLoadDataEx` तक पहुँचते हैं, ताकि एक JIT failure
+`Error::CudaJit { kernel, cause, log }`
 के रूप में सामने आए जो `ptxas` का अपना message रखता है (देखें [Debugging](./debugging.md));
 info log `tracing::debug!` पर जाता है। फिर यह entry को `cuModuleGetFunction` से bind करता
 है और function attributes `MAX_THREADS_PER_BLOCK`, `NUM_REGS`, `SHARED_SIZE_BYTES`,
@@ -104,7 +120,7 @@ lay out करता है: 8-byte device pointers, 4-byte `i32` scalars, PARAM
 ठीक-ठीक PTX का स्वाभाविक `.param` layout है। `global_size` **blocks में grid** है और
 `local_size` **threads में block** (वही work-group convention जो AMD और Metal उपयोग करते
 हैं); function के `maxThreadsPerBlock` से बड़ा block launch से पहले ही reject कर दिया जाता
-है, message में register और shared memory के आँकड़ों के साथ।
+है, message में register, shared और local memory के आँकड़ों के साथ।
 
 `Program::execute` device की dispatch stream पर launch करता है और वैकल्पिक रूप से उस पर
 wait करता है; `execute_timed` launch के इर्द-गिर्द एक timing event pair record करता है और
@@ -115,18 +131,42 @@ wait करता है; `execute_timed` launch के इर्द-गिर�
 ## Plan contexts, tokens, timelines
 
 हर execution plan को एक `CudaPlanCtx` मिलता है: **एक non-blocking stream**, जो उसकी lane
-है। `dispatch` उस पर launch करता है; `profile` सेट होने पर यह launch को timing events से
+है, और साथ में CUPTI counter selection तथा session जब counters armed हों। `dispatch` उस पर
+launch करता है; `profile` सेट होने पर यह launch को timing events से
 घेरता है और एक `CudaDispatchTimestamps` return करता है ([Profiling](./profiling.md))।
 `completion_token` एक completion-only event (`CU_EVENT_DISABLE_TIMING`) record करता है
 जिसका `wait` `cuEventSynchronize` है और जिसका `retired` `cuEventQuery` है; `synchronize`
 `cuStreamSynchronize` है।
 
-Executor की cross-plan ordering `CudaTimelineSignal` का उपयोग करती है, एक timeline जो
-events द्वारा publish होती है: `signal(stream, value)` stream की tail पर एक event record
-करता है और `(value, event)` फ़ाइल करता है; `value()` हर retired publication को floor में
-मोड़ देता है; `wait(target)` उस event पर block करता है जो `>= target` वाली सबसे छोटी value
-रखता है; `wait_on_stream` उसके बाद GPU work को `cuStreamWaitEvent` से order करता है। Slots
-`Arc`'d हैं ताकि एक waiter अपने event को ज़िंदा रखे जबकि दूसरा thread उसे मोड़कर हटा दे।
+### Scoped synchronization
+
+Lanes आपस में एक-दूसरे के विरुद्ध ordered नहीं हैं, इसलिए `CudaDevice` तीन tables रखता है
+(`device/src/cuda/device.rs` के module docs):
+
+- **producers** — storage base -> प्रति lane वह नवीनतम completion token जिसने उसे पढ़ा या
+  लिखा (एक host overwrite in-flight readers के विरुद्ध भी एक WAR hazard है)। Executor हर
+  execute के बाद plan के या graph के token को उन सभी storages पर publish करता है जिन्हें
+  plan छूता है; allocator हर transfer या memset के बाद एक copy-lane token publish करता है।
+  `wait_storage(base)` नीचे बताई गई lanes को drain करता है, फिर उन tokens की प्रतीक्षा
+  करता है, फिर उन्हें table से हटा देता है। जिस storage को table नहीं जानता — इसमें वह भी
+  शामिल है जिसका नवीनतम token किसी दूसरे backend का हो — वह `cuCtxSynchronize` पर वापस
+  गिर जाता है।
+- **lanes** — हर जीवित lane और उसके पास कितनी submissions हैं जिनके लिए कोई token publish
+  नहीं हुआ (per-call `Program::execute`, एक plan जो बीच में fail हुआ, एक graph replay उसका
+  token लिए जाने से पहले)। `wait_storage` ऐसी lanes को host पर drain करता है; एक copy
+  इसके बजाय हर एक पर एक tail event record करती है और उसकी प्रतीक्षा GPU पर करती है। Copy
+  lane ख़ुद इस table में नहीं है।
+- **copy tail** — नवीनतम copy-lane event; हर launch चलने से पहले उसकी प्रतीक्षा GPU पर
+  करता है, ताकि asynchronous copies हर बाद के kernel से पहले आएँ।
+
+`SVOD_CUDA_SCOPED_SYNC=0` इस सबको disable कर देता है: तब हर wait context को drain करती है
+और हर copy copy stream को synchronize करती है।
+
+Executor की cross-plan ordering हर backend पर, CUDA सहित, एक host signal
+(`CpuTimelineSignal`) है; इसका अपना कोई `TimelineSignal` implementation नहीं है। Host
+signal को critical path से बाहर जो रखता है वह ऊपर की machinery है: tables GPU work को GPU
+work के विरुद्ध `cuStreamWaitEvent` से order करती हैं, इसलिए एक plan host पर केवल उसी के
+लिए प्रतीक्षा करता है जिसे वह वास्तव में पढ़ता है।
 
 ---
 
@@ -164,15 +204,21 @@ Compiled PTX साझा on-disk object cache से होकर जाता 
 ```text
 backend:             nvptx-clang
 target_architecture: nvptx64-nvidia-cuda/sm_86
-toolchain:           <clang identity>
-flags:               -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 -Wno-override-module - -o -
+toolchain:           <clang identity>[;ptxas:path=...;version=...]
+flags:               -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx78 -Wno-override-module - -o -
+                     [-arch=sm_86 -o /dev/stdout /dev/stdin]
 abi:                 ptx-kernel-abi-v1;warp-size=32
-object_format:       ptx-text-v1
+object_format:       ptx-text-v1 | cubin-v1
 ```
 
-Cache **PTX text** store करता है, कभी cubin नहीं: driver उसे load पर assemble करता है और
-SASS को अपने ख़ुद के `~/.nv/ComputeCache` में रखता है। हर cache hit को driver तक पहुँचने से
-पहले फिर से validate किया जाता है (`validate_ptx`), देखें [Codegen](./codegen.md)।
+कोष्ठकों वाले हिस्से `ptxas` के रास्ते के हैं: assembler के साथ cached object एक **cubin**
+होता है, उसके बिना **PTX text**, जिसे driver load पर assemble करता है और SASS को अपने ख़ुद
+के `~/.nv/ComputeCache` में रखता है। ये दोनों formats कभी एक ही entry साझा नहीं करते,
+क्योंकि वे `toolchain`, `flags` और `object_format` — तीनों में भिन्न हैं। Rendered IR भी
+पूरी key नहीं है: ABI descriptors उसके साथ जोड़ दिए जाते हैं, क्योंकि एक cubin की entry की
+जाँच compile time पर उन्हीं के विरुद्ध होती है। हर cache hit को driver तक पहुँचने से पहले
+उसके format के validator द्वारा फिर से validate किया जाता है — `validate_cubin` या
+`validate_ptx`, देखें [Codegen](./codegen.md)।
 `SVOD_OBJECT_CACHE=0` cache को disable करता है और `SVOD_OBJECT_CACHE_DIR` उसे स्थानांतरित
 करता है।
 

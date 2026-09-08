@@ -102,9 +102,9 @@ patterns! {
 При комбинировании матчеров с разными типами контекста используется `.with_context()`:
 
 ```rust
-let mega_pass = symbolic().with_context::<PcontigConfig>()
-    + reduction_simplify_patterns().with_context()
-    + buffer_removal_with_pcontig();
+let pm_add_images = symbolic_simple().clone().with_context::<AddImageContext>()
+    + no_vectorized_alu().clone().with_context()
+    + pm_simplify_add_image();
 ```
 
 ---
@@ -204,7 +204,7 @@ flowchart TD
 ### Ограничения безопасности
 
 Для предотвращения бесконечных циклов:
-- **500 000 итераций** максимум в сумме
+- максимум **500 000 записей в стеке перезаписи** (`REWRITE_STACK_LIMIT`)
 - Panic с диагностикой при превышении лимитов
 
 На практике корректные паттерны сходятся быстро.

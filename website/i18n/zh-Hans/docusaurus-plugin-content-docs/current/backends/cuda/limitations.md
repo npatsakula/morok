@@ -14,12 +14,12 @@ sidebar_label: 限制与路线图
 | 缺口 | 今天的状况 | 位置 |
 |---|---|---|
 | **fp8 转换** | 一次到 `FP8E4M3` / `FP8E5M2` 的 cast（或从它们出发的 cast）会在渲染时失败（`NVPTX fp8 cast ...`）；sm_89 的 `cvt.*.e4m3x2` intrinsic 并未发射。fp8 的 `mma.sync` 行在 `resolve_mma` 中存在，但喂不进去。 | `codegen/src/llvm/nvptx/ops.rs` |
-| **带作用域的同步** | 宿主的读与写会排空整个上下文（`_copyin` / `_copyout` 中的 `cuCtxSynchronize`），而不是只等待该缓冲区的生产者。plan 与图确实会交出基于 event 的 `CompletionToken`。 | `device/src/cuda/allocator.rs` |
+| **流序释放** | `cuMemFree*` 会同步整台设备，并在此期间阻塞其他所有线程的驱动调用；在 `LruAllocator` 下 `_free` 很罕见，但 `cuMemFreeAsync` 未做绑定。 | `device/src/cuda/allocator.rs` |
 | **点对点复制** | `cuMemcpyPeerAsync` / `cuDeviceCanAccessPeer` 未做绑定。一次 `CUDA:0 → CUDA:1` 的复制在执行器中走 `SyncStrategy::PeerToPeer`，而它回落到 `Buffer::copy_from`；两个分配器就是两台设备，因此字节要经由一个宿主 `Vec` 中转。 | `runtime/src/executor.rs`、`device/src/buffer.rs` |
 | **动态共享内存** | 启动传的是 `shared_mem_bytes = 0`；只用到静态 `.shared`，而 `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` 从不被调用，因此一个需要超过每 block 默认上限的内核会在 JIT 时失败。设备工厂会预先拒绝一台上限低于 profile `shared_max`（48 KiB）的设备。 | `device/src/cuda/program.rs`、`runtime/src/devices/cuda.rs` |
 | **Hopper / Blackwell 矩阵路径** | 只降低了 `mma.sync`（`m16n8kK`）；没有 `wgmma`，没有 `tcgen05`。 | `codegen/src/llvm/nvptx/wmma.rs` |
-| **预汇编的对象** | 对象缓存存的是 PTX 文本；每一次新鲜加载都要付出驱动 JIT 的代价（驱动会把它缓存在 `~/.nv/ComputeCache`）。`ptxas` 预汇编（`object_format: cubin`）尚未接线。 | `runtime/src/devices/cuda.rs` |
-| **用户态 NV 驱动** | Tinygrad 的 `ops_nv`（直接的 GPU-FIFO 提交）需要为每个驱动分支生成一套 ABI；Svod 留在稳定的 `libcuda.so.1` API 上。`NV` 在 `SVOD_DEVICE` 中被接受为 `CUDA` 的别名，并为那个未来的后端保留。 | `nvidia_backend_plan.md` |
+| **没有 `ptxas` 的宿主上的 cubin** | 没有 CUDA toolkit 时，对象缓存存的是 PTX 文本，每一次新鲜加载都要付出驱动 JIT 的代价（驱动会把它缓存在 `~/.nv/ComputeCache`）。并不附带汇编器：`ptxas` 装了才用（`object_format: cubin-v1`），否则这活儿交给驱动。 | `runtime/src/cuda/compile.rs` |
+| **用户态 NV 驱动** | Tinygrad 的 `ops_nv`（直接的 GPU-FIFO 提交）需要为每个驱动分支生成一套 ABI；Svod 留在稳定的 `libcuda.so.1` API 上。`NV` 在 `SVOD_DEVICE` 中被刻意*不*接受（只接受 `CUDA` 和 `GPU`）；这个名字为那个未来的后端保留。 | `nvidia_backend_plan.md` |
 
 算是数值上的注记而非缺口：f64 的 `Exp2` / `Log2` 以及全部超越函数都走多项式
 路径（[代码生成](./codegen.md)）；`lg2.approx.f32` 对渲染器可用，但普通的图
@@ -39,13 +39,16 @@ sidebar_label: 限制与路线图
 
 ## 路线图
 
-按计划（`nvidia_backend_plan.md`，第 5 阶段）列出的顺序：
+计划中可选阶段（`nvidia_backend_plan.md`，第 5 阶段）剩下的部分，按优先级排列：
 
-1. **带作用域的同步**：为每个缓冲区建一张生产者表，让宿主访问等待 event
-   而不是 `cuCtxSynchronize`。
+1. **流序释放**：在复制通道上对设备内存使用 `cuMemFreeAsync`，让一次释放不再
+   排空整台设备。
 2. **真正的 P2P**：绑定 `cuDeviceCanAccessPeer` / `cuCtxEnablePeerAccess` /
    `cuMemcpyPeerAsync`，并把 `SyncStrategy::PeerToPeer` 路由到它们上面。
-3. **fp8**：降低 sm_89 的 `cvt` intrinsic，好让 fp8 的 `mma.sync` 行变得可达。
-5. 当 toolkit 存在时做 **`ptxas` 预汇编**，并作为 cubin 缓存。
-6. 经由 `cuFuncSetAttribute` 支持**动态共享内存**，以及让 `tk` 走 `GpuArch`，
-   使 tile 内核能在 CUDA 上运行。
+3. **fp8**：降低 sm_89 的 `cvt` intrinsic，好让 fp8 的 `mma.sync` 行变得可达，
+   并让 `for_cuda_arch` 能构建出 sm_89 的 profile。
+4. 经由 `cuFuncSetAttribute` 支持**动态共享内存**，好让一个内核可以超出每 block
+   默认的 48 KiB 上限。
+
+带作用域的同步与 CUPTI 硬件计数器是另外两项；它们都已经落地
+（[架构](./architecture.md)、[剖析](./profiling.md)）。

@@ -19,8 +19,8 @@ or a documented fallback.
 | **Peer-to-peer copies** | `cuMemcpyPeerAsync` / `cuDeviceCanAccessPeer` are not bound. A `CUDA:0 → CUDA:1` copy takes `SyncStrategy::PeerToPeer` in the executor, which falls back to `Buffer::copy_from`; two allocators are two devices, so the bytes bounce through a host `Vec`. | `runtime/src/executor.rs`, `device/src/buffer.rs` |
 | **Dynamic shared memory** | Launches pass `shared_mem_bytes = 0`; only static `.shared` is used and `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` is never called, so a kernel needing more than the default per-block limit fails at JIT. The device factory refuses a device whose limit is below the profile's `shared_max` (48 KiB) up front. | `device/src/cuda/program.rs`, `runtime/src/devices/cuda.rs` |
 | **Hopper / Blackwell matrix paths** | Only `mma.sync` (`m16n8kK`) is lowered; no `wgmma`, no `tcgen05`. | `codegen/src/llvm/nvptx/wmma.rs` |
-| **Pre-assembled objects** | The object cache stores PTX text; every fresh load pays the driver JIT (cached by the driver in `~/.nv/ComputeCache`). A `ptxas` pre-assembly (`object_format: cubin`) is not wired. | `runtime/src/devices/cuda.rs` |
-| **Userspace NV driver** | Tinygrad's `ops_nv` (direct GPU-FIFO submission) needs a generated ABI per driver branch; Svod stays on the stable `libcuda.so.1` API. `NV` is accepted as an alias of `CUDA` in `SVOD_DEVICE` and reserved for that future backend. | `nvidia_backend_plan.md` |
+| **Cubins on hosts without `ptxas`** | With no CUDA toolkit the object cache stores PTX text and every fresh load pays the driver JIT (cached by the driver in `~/.nv/ComputeCache`). There is no bundled assembler: `ptxas` is used when it is installed (`object_format: cubin-v1`), otherwise the driver does the work. | `runtime/src/cuda/compile.rs` |
+| **Userspace NV driver** | Tinygrad's `ops_nv` (direct GPU-FIFO submission) needs a generated ABI per driver branch; Svod stays on the stable `libcuda.so.1` API. `NV` is deliberately *not* accepted in `SVOD_DEVICE` (only `CUDA` and `GPU` are); the name is reserved for that future backend. | `nvidia_backend_plan.md` |
 
 Numerical notes rather than gaps: f64 `Exp2` / `Log2` and all transcendentals
 take the polynomial path ([Codegen](./codegen.md)); `lg2.approx.f32` is
@@ -42,14 +42,18 @@ available to the renderer but not used by ordinary graphs.
 
 ## Roadmap
 
-In the order the plan (`nvidia_backend_plan.md`, phase 5) lists them:
+What is left of the plan's optional phase (`nvidia_backend_plan.md`, phase 5),
+in priority order:
 
 1. **Stream-ordered frees**: `cuMemFreeAsync` on the copy lane for device
    memory, so a free stops draining the device.
 2. **Real P2P**: bind `cuDeviceCanAccessPeer` / `cuCtxEnablePeerAccess` /
    `cuMemcpyPeerAsync` and route `SyncStrategy::PeerToPeer` through them.
 3. **fp8**: lower the sm_89 `cvt` intrinsics so the fp8 `mma.sync` rows become
-   reachable.
-4. **`ptxas` pre-assembly** when the toolkit is present, cached as a cubin.
-5. **Dynamic shared memory** via `cuFuncSetAttribute`, so a kernel may exceed
+   reachable, and let `for_cuda_arch` build the sm_89 profile.
+4. **Dynamic shared memory** via `cuFuncSetAttribute`, so a kernel may exceed
    the default 48 KiB per-block limit.
+
+Scoped synchronization and CUPTI hardware counters were the other two items;
+both have shipped ([Architecture](./architecture.md),
+[Profiling](./profiling.md)).

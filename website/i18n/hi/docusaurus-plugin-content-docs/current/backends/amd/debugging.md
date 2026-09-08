@@ -40,13 +40,18 @@ faulting `va`, failure flags (`NotPresent`, `ReadOnly`, `NoExecute`, `imprecise`
 
 ### Tags
 
-हर allocation को उसके उद्देश्य (`AllocTag`) से tag किया जाता है, जो `alloc_raw` call sites पर
-derive होता है:
+हर allocation को उसके उद्देश्य (`AllocTag`) से tag किया जाता है। `Vram` और `Gtt` वे defaults
+हैं जो `AllocKind` से derive होते हैं; बारीक tags `alloc_*_tagged` call sites द्वारा explicit
+रूप से pass किए जाते हैं:
 
 | Tag | किसे cover करता है |
 |---|---|
-| `Vram` | General device VRAM — tensor data, code, kernargs, EOP/ctx-save |
-| `Gtt` | GTT-pinned host-visible control memory — queue ring, GART, signal slots |
+| `Vram` | General device VRAM — tensor data, code objects, EOP/ctx-save |
+| `Gtt` | GTT-pinned host-visible control memory |
+| `Kernarg` | Kernarg arenas — per-dispatch, graph, और linked-plan argument pages |
+| `SignalPool` | GTT signal-slot pool |
+| `QueueRing` / `QueueGart` / `QueueInactive` | एक queue का ring, GART page, और queue-inactive signal |
+| `Staging` | GTT SDMA bounce buffer |
 | `Scratch` | Register-spill scratch — GPU-only VRAM, प्रति kernel realloc'd |
 
 जो भेद मायने रखता है वह है **scratch बनाम बाक़ी सब कुछ**: scratch एकमात्र shared, GPU-only,
@@ -84,8 +89,8 @@ Unmapped: va is in NO tracked allocation; nearest live below: VRAM buffer
 ## एक fault कैसे report होता है
 
 `KfdIface::wait_events` (`device/src/amd/iface.rs`) में, जब memory-fault event fire हो चुका
-हो (`gpu_id != 0`), तो fields को `#[repr(packed)]` struct से copy किया जाता है, VA को classify
-किया जाता है, और एक enriched message बनाया जाता है:
+हो (`gpu_id != 0`), तो fields को bindgen union payload से locals में copy किया जाता है, VA को
+classify किया जाता है, और एक enriched message बनाया जाता है:
 
 ```text
 AMD GPU memory fault on gpu_id=… va=0x… (NotPresent=1 ReadOnly=0 NoExecute=0
@@ -95,8 +100,9 @@ Imprecise=0 ErrorType=…) — va is at offset +0x40 within a LIVE scratch …
 इसे एक `fault_logged: AtomicBool` latch और एक `tracing::error!` के माध्यम से **एक बार** log
 किया जाता है। one-shot मायने रखता है: memory-fault event auto-reset नहीं होता, इसलिए बाद की
 poll-fault calls (`wait_events(0)`) वही fault फिर से observe करती हैं — हर बार log करना spam
-करता। फिर message को एक `Error::Runtime` के रूप में return किया जाता है और caller के सामने
-लाया जाता है। (एक hardware-exception event, slot `[2]`, इसके बजाय
+करता। फिर इसे एक typed `Error::GpuFault` के रूप में return किया जाता है, जिसका `Display` ऊपर
+वाली string ही है; poison latch हर बाद के entry point पर वही text एक `Error::Runtime` के रूप
+में फिर से throw करता है। (एक hardware-exception event, slot `[2]`, इसके बजाय
 `reset_type`/`reset_cause`/`memory_lost` report करता है — उनके पास classify करने के लिए कोई
 faulting VA नहीं होती।)
 
@@ -112,28 +118,27 @@ point पर check होता है:
 - `poison(msg)` message को एक बार record करता है और flag सेट करता है;
 - `is_poisoned()` hot-path gate है;
 - `poison_error()` poisoned होने पर record किया गया `Error::Runtime` return करता है;
-- `poll_faults_nonblocking()` `wait_events(0)` जारी करता है और इसे एक stalled signal wait से
-  call किया जाता है (असली error को 30 s timeout से attach करने के लिए) और `WAIT_EVENTS`
-  escalation path से (एक fault पर polling से जल्दी बाहर निकलने के लिए)।
+- `poll_faults_nonblocking()` एक stalled signal wait से `wait_events(0)` जारी करता है, ताकि
+  असली error एक नंगी deadline के बजाय 30 s timeout से attach हो जाए। (spin-escalation path भी
+  एक fault पर जल्दी बाहर निकलता है, पर इस poll के बजाय एक छोटे *blocking* `wait_events` के
+  माध्यम से।)
 
-एक बार poisoned हो जाने पर, device पर किसी भी connector के विरुद्ध हर `synchronize`/`execute`
+एक बार poisoned हो जाने पर, device पर किसी भी lane के विरुद्ध हर `synchronize`/`execute`
 fail-fast होता है — GPU state और cached mappings अब भरोसेमंद नहीं रहते।
 
 ---
 
 ## Dispatch instrumentation: `SVOD_DEBUG_DISPATCH`
 
-`SVOD_DEBUG_DISPATCH` (किसी भी चीज़ पर) सेट करना तीन बिंदुओं पर `eprintln` dumps चालू कर देता
-है:
+`SVOD_DEBUG_DISPATCH` (किसी भी चीज़ पर) सेट करना दो बिंदुओं पर `eprintln` dumps चालू कर देता
+है, दोनों `device/src/amd/program.rs` में:
 
-- **`[program-load]`** (`program.rs`) — प्रति program: kernarg/private/group sizes,
+- **`[program-load]`** — प्रति program: kernarg/private/group sizes,
   `kernel_code_properties` (bit-by-bit decoded), user-SGPR count, `wave32`, और raw
   `rsrc1/2/3`। यह उन `kernel_code_properties` bits को flag करता है जिन्हें loader populate
   *नहीं* करता (जो kernel को garbage pointers पढ़ने और fault करने पर मजबूर कर देता)।
-- **`[dispatch tv=…]`** (`program.rs`) — प्रति dispatch: kernel name, `grid`, `local`,
+- **`[dispatch tv=…]`** — प्रति dispatch: kernel name, `grid`, `local`,
   `is_pm4`, kernarg GPU VA, scratch VA, और हर buffer की VA।
-- **`[graph capture]`** (`graph.rs`) — प्रति captured graph: kernel count, kernargs page VA,
-  kick/self signal VAs, और scratch VA।
 
 यह ठीक-ठीक यह देखने का सबसे तेज़ तरीक़ा है कि एक faulting dispatch ने किन VAs को छुआ, ताकि
 registry की classification के विरुद्ध cross-reference किया जा सके।
@@ -156,7 +161,7 @@ SVOD_DEVICE=AMD:0 \
   cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav
 ```
 
-:::tip Pipeline debugger
+:::tip[Pipeline debugger]
 driver के बजाय *compiler*-side issues (IR extraction, LLVM IR, UOp trees) के लिए, project एक
 `/svod-debug` skill ship करता है जो frontend → codegen tracing targets (`SVOD_DUMP_LLVM_IR`,
 `SVOD_DUMP_AMD_IR`, per-stage `RUST_LOG` targets, `setup_test_tracing()`) का दस्तावेज़ीकरण

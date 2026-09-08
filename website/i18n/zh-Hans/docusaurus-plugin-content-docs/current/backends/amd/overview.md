@@ -79,7 +79,7 @@ KFD 环调度出去。
 flowchart TD
   subgraph above["ABOVE THE SEAM — backend-agnostic (no ioctls)"]
     A1["AmdProgram, AmdComputeQueue, KernargArena, Timeline"]
-    A2["AmdConnector, AmdGraph, SignalPool, AmdAllocator"]
+    A2["QueuePool, AmdGraph, SignalPool, AmdAllocator"]
     A3["PM4 / AQL packet builders, ring back-pressure"]
   end
   subgraph below["BELOW THE SEAM — the actual driver"]
@@ -92,8 +92,10 @@ flowchart TD
 每一样*不是*内核调用的东西——16 MiB 命令环、PM4/AQL
 数据包构造、kernarg bump arena、timeline 计数器、程序
 加载器——都位于接缝之上，并被每个后端共享。这个 trait 被
-刻意做得很小：**五个方法**（`alloc_raw`、`free_raw`、`setup_ring`、
-`teardown_ring`、`wait_events`）。让它保持小巧的关键洞见在于：
+刻意做得很小：**五个必需方法**（`alloc_raw`、`free_raw`、
+`setup_ring`、`teardown_ring`、`wait_events`），外加三个默认为空操作的
+钩子方法（`queue_event_mailbox`、`publication_checkpoint`、
+`update_queue_percentage`）。让它保持小巧的关键洞见在于：
 环、GART 页、EOP 缓冲区和 MQD *只不过是 GPU 内存*——它们都在接缝之上
 经由 `alloc_raw` 分配，而一个驱动真正必须做得不同的唯一一件事就是
 **激活队列**（映射 doorbell，告诉调度器环已存在）：那就是 `setup_ring`。
@@ -106,7 +108,7 @@ flowchart TD
 | `kfd`（默认） | `KfdIface` — KFD 直连 | 生产可用 |
 | `am` | `AmIface` — 用户态 AM 驱动 | 尚不可选——见下文 |
 
-:::caution AM 尚不可运行
+:::caution[AM 尚不可运行]
 设置 `SVOD_AMD_BACKEND=am` 目前会返回错误（`device.rs` 只接受
 `kfd`）——尚无 AM 类型实现接缝。用户态 **AM** 驱动的目标是
 一块 **CDNA3 SR-IOV VF**（gfx9.4.3），仍在开发中：
@@ -120,8 +122,9 @@ discovery、VF↔GIM mailbox、间接寄存器访问、GMMU 与 GMC
 
 ## 设备本地内存与 SDMA 复制队列
 
-后端在设备打开时——只要能够创建——就会安装一个 **SDMA 复制队列**
-（`AmdCopyQueue`），这会把 `has_sdma_queue` 置为 true。有了它，中间结果就可以
+后端在设备打开时会在 CDNA 硬件上安装一个 **SDMA 复制队列**
+（`AmdCopyQueue`）——RDNA 保留宿主可见路径，而 `AMD_DISABLE_SDMA`
+会彻底关掉这次尝试——这会把 `has_sdma_queue` 置为 true。有了它，中间结果就可以
 存在于**仅设备的 VRAM** 中（`cpu_access = false`），而宿主↔设备的复制
 走异步 DMA：`_copyin`/`_copyout` 经由 SDMA 队列暂存，
 `_transfer` 做一次直接的 设备→设备 复制。当没有复制队列存在时，
@@ -145,7 +148,7 @@ SVOD_DEVICE=AMD:0 cargo run --release -p svod-model --example gigaam_infer -- ./
 除了一块受支持的 AMD GPU 之外，对宿主的唯一要求就是 `PATH` 上带有
 `amdgcn` target 的 `clang`（用于编译内核——见
 [编译与图](./compile-and-graph.md)）；无需安装 ROCm/HIP。
-[队列与调度](./queues-and-dispatch.md) 页列出了每一个 `SVOD_*` 旋钮。
+[队列与调度](./queues-and-dispatch.md) 页列出了每一个环境变量旋钮。
 
 ---
 
@@ -154,7 +157,7 @@ SVOD_DEVICE=AMD:0 cargo run --release -p svod-model --example gigaam_infer -- ./
 AMD 后端是编译器的设备这一半。前端将张量降低
 为单一的 UOp IR；codegen 将该 IR 映射到 GPU 线程索引（
 [「添加 GPU 维度」](../../architecture/codegen/devectorizer.md) 阶段将 range 变为
-`blockIdx`/`threadIdx`，参见 [IR 设计](../../architecture/ir-design.md)）；渲染器发出
+`gidxN`/`lidxN` SPECIAL 索引，参见 [IR 设计](../../architecture/ir-design.md)）；渲染器发出
 AMD LLVM IR；而本后端则编译并运行它：
 
 ```mermaid
@@ -176,7 +179,7 @@ flowchart LR
 | 页面 | 涵盖内容 |
 |---|---|
 | [KFD 绑定](./kfd-bindings.md) | 内核 ABI 如何被绑定（在 vendored 头文件上跑 bindgen）、实际使用的确切 ioctl、sysfs 拓扑，以及分配流程 |
-| [队列与调度](./queues-and-dispatch.md) | 命令环、PM4 与 AQL 的对比、connector、单队列/多队列调度器、timeline，以及每一个配置用环境变量 |
-| [编译与图](./compile-and-graph.md) | 一个内核如何从 LLVM IR 走到已加载的程序、它如何调度，以及 PM4 图捕获/重放如何工作 |
+| [队列与调度](./queues-and-dispatch.md) | 命令环、PM4 与 AQL 的对比、有界的计算通道池、发布与设备级排空、timeline，以及每一个配置用环境变量 |
+| [编译与图](./compile-and-graph.md) | 一个内核如何从 LLVM IR 走到已加载的程序、它如何调度，以及图捕获/重放如何工作（AQL 默认启用，PM4 需选择启用） |
 | [AM 驱动](./am-driver.md) | 开发中的用户态驱动：已构建什么、推迟了什么，以及它如何接入接缝 |
 | [调试](./debugging.md) | 用于故障分诊的 VA→分配注册表、poison 闩锁，以及调度/追踪诊断 |
