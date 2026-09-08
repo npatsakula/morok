@@ -77,14 +77,14 @@ block-beta
 
 而且它能向上组合：逐元素数学、规约、掩码，全都不过是*作用在 tile 上*的操作，带着同样的布局保证。你写的是 `tile_a * tile_b`，而不是一串 lane 索引计算。
 
-:::tip 面向 GPU 专家
+:::tip[面向 GPU 专家]
 `tk` 把一个 tile 的*形状*与它所绑定的*缓冲区*拆开。
 
-纯形状描述符在 `tk/src/tiles.rs`。基础片段是 `BaseShape { rows, cols, ept }`，其中 `ept`（每线程元素数）是被**显式**携带的，而非按 `rows*cols / wave_size` 算出来；因为在 RDNA 上，矩阵指令会把操作数*跨 lane 复制*，所以拿操作数 tile 的元素数除以 wave 大小是错的。寄存器 tile 额外加上 `stride`/`interleave` 字段（`RTBaseShape`），用来编码 RDNA 累加器的偶/奇行映射，这是任何普通 stride 都表达不出来的。
+纯形状描述符在 `tk/src/tiles.rs`。基础片段是 `BaseShape { rows, cols, ept }`，其中 `ept`（每线程元素数）是被**显式**携带的，而非按 `rows*cols / wave_size` 算出来；因为在 RDNA 上，矩阵指令会把操作数*跨 lane 复制*，所以拿操作数 tile 的元素数除以 wave 大小是错的。寄存器 tile 额外加上一个 `LaneMap`（`RTBaseShape`），也就是该片段那个闭式的 `(lane, j) → (row, col)` 映射，用来编码任何普通 stride 都表达不出来的布局：RDNA 累加器的偶/奇行交织，以及 CUDA 的 `mma.sync` 把一个 16×16 tile 拆成两个 `m16n8` 半块来持有的布局。
 
 绑定缓冲区的包装器在 `tk/src/tile.rs`：`GL`（全局布局）、`ST`（共享 / LDS，可选双缓冲）、`RT`（寄存器 tile）、`RV`（寄存器向量，用于 softmax 所需的行/列规约）。每一种都是一个扁平的 `Arc<UOp>` 缓冲区，外加一个逻辑形状和一个 dtype。
 
-至关重要的是，内核从不直接点名 `RT_16X16` 这类片段常量。它们请求的是一个**角色**（`FragRole::{Accumulator, Operand, AccumulatorT}`），再由 `tk/src/arch.rs` 中的 `ArchCaps::frag(role)` 把它解析成目标平台（CDNA 或 RDNA）上正确的物理形状。正是这层间接，让同一个内核能在不同 wave 大小间移植；见 [Wave32 与 Wave64](./wave-portability)。矩阵乘法本身则降级为 [操作图鉴](../architecture/op-bestiary) 中记录的 `WMMA` 操作。
+至关重要的是，内核从不直接点名 `RT_16X16` 这类片段常量。它们请求的是一个**角色**（`FragRole::{Accumulator, Operand, AccumulatorT}`），再由 `tk/src/arch.rs` 中的 `ArchCaps::frag(role)` 把它解析成目标平台（CDNA、RDNA，或 CUDA 的 `mma.sync`）上正确的物理形状。正是这层间接，让同一个内核能在不同 wave 大小与片段布局间移植；见 [Wave32 与 Wave64](./wave-portability)。矩阵乘法本身则降级为 [操作图鉴](../architecture/op-bestiary) 中记录的 `WMMA` 操作。
 :::
 
 ---
@@ -92,4 +92,3 @@ block-beta
 ## 走向
 
 现在你已经有了词汇：内存里的张量、寄存器里的 tile、矩阵核心里的片段。[向 IR 中编写](./lowering) 会展示，当你真用这些零件*写出*一个内核时会发生什么，也就是 `Kernel`/`Group` 构建器如何把 tile 操作变成 Svod 其余部分所编译的那同一套 UOp IR。
-</content>

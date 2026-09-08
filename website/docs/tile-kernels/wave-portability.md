@@ -2,7 +2,7 @@
 sidebar_label: Wave32 vs Wave64
 ---
 
-# Keeping One Kernel Correct on Two Architectures
+# Keeping One Kernel Correct on Three Architectures
 
 Here is a bug NVIDIA hardware cannot give you. You write a tile kernel, test it on a CDNA
 datacenter GPU, and it's perfect. You run the *same* kernel on an RDNA laptop APU and the
@@ -27,6 +27,10 @@ two sizes, and Svod targets both, plus NVIDIA's single one:
 | **CDNA** | gfx942 (datacenter) | MFMA | **wave64** — 64 lanes |
 | **RDNA** | gfx1151 (RDNA3.5) | WMMA | **wave32** — 32 lanes |
 | **CUDA** | sm_80+ (Ampere and later) | `mma.sync` | **warp32** — 32 lanes |
+
+(The table is the set of architectures the DSL resolves layouts for; an individual kernel declares
+its own `ArchSet` on top of it. Flash Attention, matmul and single-query attention are built for all
+three; the k-means and k-NN kernels are AMD-only and return `Ok(None)` on CUDA.)
 
 That single number ripples through everything. A `16×16` tile has 256 elements. Spread across
 64 lanes, that's 4 elements per lane; across 32 lanes, it's 8. Different lanes own different
@@ -53,19 +57,23 @@ capabilities resolve it:
    kernel says:  "I need an accumulator fragment"   (FragRole::Accumulator)
                           │
                           ▼
-   ArchCaps::frag(role)   ── on CDNA ──▶  the wave64 16×16 shape
-                          └─ on RDNA ──▶  the wave32 16×16 shape (8 ept, replicated operands)
+   ArchCaps::frag(role)   ── on CDNA ──▶  the wave64 16×16 shape (RT_16X16)
+                          ├─ on RDNA ──▶  the wave32 16×16 shape (8 ept, replicated operands)
+                          └─ on CUDA ──▶  the two-half mma.sync shape (RT_16X16_MMA)
 ```
 
 The roles are `FragRole::{Accumulator, Operand, AccumulatorT}` and the resolver is
-`ArchCaps::frag(role)` in `tk/src/arch.rs`. The kernel author writes "accumulator" and "operand";
-the *physical* layout — element count per lane, the interleave map, replication — is filled in
-for the target wave size. Write once, run on both.
+`ArchCaps::frag(role)` in `tk/src/arch.rs` (kernels reach it as `ker.frag(role)`). The kernel author
+writes "accumulator" and "operand"; the *physical* layout — element count per lane, the interleave
+map, replication — is filled in for the target. It has three arms: CDNA resolves every role to the
+one wave64 shape, RDNA to the even/odd accumulator and the replicated operand, CUDA to the two-half
+`mma.sync` shape. `None` where tk has no table at all (Metal, pre-Ampere CUDA), so a matrix-core
+kernel fails loudly instead of rendering a wrong layout. Write once, run on all three.
 
-This is the same lesson HipKittens learned (see [tk vs HipKittens vs CuTile](./comparison)): it
-ships two parallel backends, `cdna4` (wave64) and `udna1` (wave32), keyed off a single
-`WARP_THREADS` constant so the tile types recompile correctly for each. `tk` collapses that into
-one runtime-resolved `ArchCaps`.
+This is the same lesson HipKittens learned (see [tk vs HipKittens vs CuTile](./comparison)): its
+tile types are keyed off a single compile-time `WARP_THREADS` constant (`64` in the CDNA build), so
+a different wave width means a different build of the library. `tk` collapses that into one
+runtime-resolved `ArchCaps`.
 
 ---
 
@@ -79,7 +87,7 @@ to drive the reduction off `caps.wave_size` and the role-resolved fragment inste
 constant. The shuffle primitives in `tk/src/group/shuffle.rs` now read the wave size; the bug class is
 designed out.
 
-:::tip For GPU experts
+:::tip[For GPU experts]
 Two things carry most of the wave-specific weight:
 
 - **The fragment's `LaneMap`** carries the fold. A reduction reads its tree off the resolved
@@ -88,8 +96,9 @@ Two things carry most of the wave-specific weight:
   partial from lane `L + d`) folding 4 sub-fragments, on RDNA wave32 the same gather with the
   single offset `[16]`, and on CUDA's `MmaSync` layout an xor butterfly over masks `[1, 2]`.
 - **`acc_reusable_as_input()`** answers: "can a matrix accumulator be fed straight back in as an
-  operand to the next multiply?" On CDNA and on CUDA it's `true` — the layouts match, so it's a
-  free register copy. On RDNA it's `false` — the accumulator and operand layouts differ, so the
+  operand to the next multiply?" On CDNA (MFMA acc == input fragment) and on CUDA with the bf16
+  `mma.sync` layouts it's `true` — the layouts match, so it's a free register copy. On RDNA it's
+  `false` — the even/odd `<8×f32>` accumulator and the replicated `<16×in>` operand differ, so the
   value makes a round-trip through LDS to be relaid out. [Flash Attention](./flash-attention)
   handles this split between its two matmuls.
 
@@ -102,10 +111,10 @@ reason: on RDNA, operands are replicated across lanes, so elements-per-thread is
 
 ## Why this matters
 
-Portability across wave sizes is the tax hand-written kernels pay, and it's why a naive port of
-an NVIDIA tile library onto AMD doesn't just work. `tk` pays the tax once, in the `ArchCaps`
-abstraction, so individual kernels stay readable: they speak in *roles* and let the hardware
-table sort out the lanes. That the same abstraction then carries a kernel *onto* NVIDIA — where
-the warp is always 32 but the fragment layout is `mma.sync`'s own — is the payoff for having
+Portability across wave sizes and fragment layouts is the tax hand-written kernels pay, and it's
+why a naive port of an NVIDIA tile library onto AMD doesn't just work. `tk` pays the tax once, in
+the `ArchCaps` abstraction, so individual kernels stay readable: they speak in *roles* and let the
+hardware table sort out the lanes. That the same abstraction then carries a kernel *onto* NVIDIA —
+where the warp is always 32 but the fragment layout is `mma.sync`'s own — is the payoff for having
 built it. [Flash Attention](./flash-attention) is where you see this
 pay off in a real kernel.

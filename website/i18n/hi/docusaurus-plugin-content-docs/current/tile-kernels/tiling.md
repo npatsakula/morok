@@ -95,15 +95,16 @@ Tiling बस "loop को blocking करना" नहीं है। यह 
 और यह ऊपर की ओर compose भी होता है: elementwise math, reductions, masks — ये सब बस tiles *पर* operations
 हैं, उन्हीं layout guarantees के साथ। आप `tile_a * tile_b` लिखते हैं, कोई lane index calculation नहीं।
 
-:::tip GPU विशेषज्ञों के लिए
+:::tip[GPU विशेषज्ञों के लिए]
 `tk` एक tile के *shape* को उस *buffer* से अलग रखता है जिससे यह bound होता है।
 
 विशुद्ध shape descriptors `tk/src/tiles.rs` में रहते हैं। base fragment है
 `BaseShape { rows, cols, ept }`, जहाँ `ept` (elements-per-thread) को `rows*cols / wave_size` के रूप में
 compute करने के बजाय **explicitly** साथ रखा जाता है, क्योंकि RDNA पर matrix instruction operands को lanes
 भर में *replicate* करता है — इसलिए एक operand tile की element count को wave size से भाग देना ग़लत जवाब देता
-है। Register tiles, RDNA accumulator के even/odd row map को encode करने के लिए `stride`/`interleave` fields
-(`RTBaseShape`) जोड़ते हैं, जिसे कोई plain stride express नहीं कर सकता।
+है। Register tiles एक `LaneMap` (`RTBaseShape`) जोड़ते हैं — fragment का closed-form `(lane, j) → (row, col)`
+map — ताकि वे layouts encode हो सकें जिन्हें कोई plain stride express नहीं कर सकता: RDNA accumulator का
+even/odd row interleave, और CUDA का `mma.sync` 16×16 tile जो दो `m16n8` halves के रूप में रखा जाता है।
 
 buffer-bound wrappers `tk/src/tile.rs` में रहते हैं: `GL` (global layout), `ST` (shared / LDS,
 optionally double-buffered), `RT` (register tile), और `RV` (register vector, उन row/column reductions के
@@ -111,8 +112,8 @@ optionally double-buffered), `RT` (register tile), और `RV` (register vector,
 
 सबसे अहम बात, कर्नेल कभी `RT_16X16` जैसे किसी fragment constant को सीधे नाम नहीं देते। वे एक **role** माँगते
 हैं — `FragRole::{Accumulator, Operand, AccumulatorT}` — और `tk/src/arch.rs` में `ArchCaps::frag(role)` इसे
-target (CDNA बनाम RDNA) के लिए सही physical shape में resolve करता है। यही indirection एक कर्नेल को wave
-sizes भर में portable बनाती है; देखें [Wave32 बनाम Wave64](./wave-portability)। matrix multiply ख़ुद उस
+target (CDNA, RDNA, या CUDA का `mma.sync`) के लिए सही physical shape में resolve करता है। यही indirection एक कर्नेल को wave
+sizes और fragment layouts भर में portable बनाती है; देखें [Wave32 बनाम Wave64](./wave-portability)। matrix multiply ख़ुद उस
 `WMMA` op में lower होता है जो [Op Bestiary](../architecture/op-bestiary) में documented है।
 :::
 

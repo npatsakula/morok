@@ -15,7 +15,7 @@ or were hand-authored with `tk`. A graph matmul, a fused feed-forward block, and
 Flash Attention all show up in the same table, timed and analysed the same way. It is documented
 in this section only because hand-kernel authors are the readers most likely to reach for it.
 
-:::note Framework-wide, not tk-only
+:::note[Framework-wide, not tk-only]
 Everything below applies to any realizable `Tensor`. The [one-IR design](./lowering) is what makes
 this possible: a `tk` kernel is just more UOps, so it carries its `name` into the device profile
 and is measured by the exact same path as an autotuned kernel.
@@ -40,7 +40,7 @@ flowchart TD
 |------|-----------------|--------|------------------|
 | **1 — device time** | per-kernel GPU execution time | GPU-clock dispatch timestamps | yes |
 | **2 — roofline** | derived **GFLOP/s** and **GB/s** | FLOP estimate from the kernel's IR; bytes from the plan's buffers | yes (rates need time) |
-| **3 — static occupancy** | VGPR / SGPR / LDS / scratch usage and an **occupancy %** | AMD: decoded from the kernel descriptor. CUDA: `cuFuncGetAttribute` and the driver's own occupancy calculator | no — pure static decode |
+| **3 — static occupancy** | VGPR / SGPR / LDS / scratch usage and an **occupancy %** | AMD: decoded from the kernel descriptor. CUDA: `cuFuncGetAttribute` plus `cuOccupancyMaxActiveBlocksPerMultiprocessor` | no dispatch — a static decode on AMD, a driver query on CUDA |
 | **4 — hardware counters (PMC)** | AMD: SQ busy cycles, waves, VALU instructions. CUDA: SM cycles, warps, instructions, tensor-pipe cycles, DRAM bytes | AMD: PM4 perf-counter packets summed across the grid. CUDA: the CUPTI range profiler | yes, and the counters must be unlocked |
 
 A few details worth knowing:
@@ -48,10 +48,15 @@ A few details worth knowing:
 - **Tier 2** estimates FLOPs by walking the kernel's IR (AST). For scheduler-built kernels the
   ranges are bounded, so the estimate is a real count and the GFLOP/s column is populated. The
   GB/s figure counts each distinct LOAD/STORE buffer once, so it is available whenever Tier 2 is.
-- **Tier 3** is modeled for RDNA3.5 (wave32), whose register-file geometry is known, so it reports
-  an occupancy %. On CDNA3 (wave64) the resources (VGPR/SGPR/LDS/scratch) are still decoded and
-  shown, but the occupancy column reads `-` because that geometry is not modeled. Occupancy here is
-  the **VGPR-limited** first-order limiter only — LDS and workgroup limits are not folded in.
+- **Tier 3** decodes AMD resources (VGPR/SGPR/LDS/scratch) straight from the kernel descriptor, with
+  no GPU access at all. Its occupancy % is modeled only for gfx11 (RDNA3/3.5, wave32), whose
+  register-file geometry is known; on CDNA3 (wave64) the resources are still shown but the occupancy
+  column reads `-`. That AMD number is the **VGPR-limited** first-order limiter only — LDS and
+  workgroup limits are not folded in. On CUDA the numbers come from the loaded function instead:
+  registers-per-thread, static shared memory and local (scratch) bytes from `cuFuncGetAttribute`, and
+  an occupancy the *driver* computes (`cuOccupancyMaxActiveBlocksPerMultiprocessor` for the block
+  size of the last launch, over the SM's thread capacity), so it does fold in shared memory and block
+  shape. There is no SGPR column on CUDA.
 - **Tier 4** is per-backend. On AMD it programs the SQ block with PM4 packets and sums across the
   grid: `sqbusy` (busy cycles), `waves` (waves launched) and `valu` (VALU instructions issued),
   which together answer the ILP/occupancy question timing alone cannot. On CUDA it drives the
@@ -143,7 +148,7 @@ resolved through `PlanContext::pmc_default`), or `Custom(Vec<PmcCounter>)` (an e
 |---------|--------|
 | `SVOD_PROFILE_ITERS` | replay count for the min-merge (clamped to at least 1) |
 | `SVOD_PMC` | Tier-4 selection: empty or `0` → off; `1` → the backend's default set; otherwise a comma-separated token list (AMD `sqbusy`, `waves`, `valu`; CUDA `cycles`, `warps`, `inst`, `tensor`, `dram`) |
-| `SVOD_ORIGIN` | `1` records the scope every op is built under (module path, call site, ONNX node), see below |
+| `SVOD_ORIGIN` | any value but empty or `0` records the scope every op is built under (module path, call site, ONNX node), see below — read at op-build time in `svod-ir`, not by `from_env` |
 | `SVOD_ORIGIN_DEPTH` | path segments the origin rollups keep (`origin_depth`); unset — or `0` — keeps the full path |
 
 ```bash
@@ -262,14 +267,14 @@ completely unaffected — same numbers, no extra passes.
 
 ## Honest limitations
 
-:::caution Two things the profiler cannot give you
+:::caution[Two things the profiler cannot give you]
 **Tier 2 GFLOP/s is blank for hand-authored kernels.** The FLOP estimate walks the kernel's IR,
 and it only auto-rates **scheduler-built** kernels. It infers which loops an operation sits in from
 what its operands depend on, which holds while the scheduler writes the index expressions. A
 hand-lowered `tk` kernel does its own addressing, and its loop variables then reach the arithmetic
 only through addresses — so the walk can no longer recover the nesting, in either direction. The
 profiler declines the estimate rather than printing a garbage roofline (an early version reported a
-matmul at eight times the hardware's peak), so the **GFLOP/s column shows `-`** for those kernels. (GB/s still works, since bytes come from the plan's buffers, not the
+matmul at tens of times the hardware's peak), so the **GFLOP/s column shows `-`** for those kernels. (GB/s still works, since bytes come from the plan's buffers, not the
 IR.) Compute the roofline for hand kernels by hand from the algorithm's known FLOP count and the
 Tier-1 device time.
 
@@ -291,11 +296,12 @@ collection costs an extra pass there.
 |----------------|-----|
 | "How long does each kernel take on this GPU?" | `Tensor::profile` with `ProfileOptions::default()`, read the device-time column |
 | "Is this kernel compute- or bandwidth-bound?" | the Tier-2 GFLOP/s and GB/s columns (graph kernels), or compute the roofline by hand (tk kernels) |
-| "Why is occupancy low — registers or LDS?" | the Tier-3 VGPR/SGPR/LDS/occ% columns (no run needed) |
+| "Why is occupancy low — registers or LDS?" | the Tier-3 VGPR/SGPR/LDS/occ% columns (no timed run needed) |
 | "Is the kernel issuing enough VALU work per busy cycle?" | Tier-4 `SVOD_PMC=1`, on a `profile_standard` GPU |
 | "Is the kernel actually using the tensor cores, or bound on DRAM?" | Tier-4 `SVOD_PMC=tensor,dram` on CUDA |
 | "How does this compare to the graph-native baseline over many runs?" | `cargo bench --profile-time` — see [Debugging → Timing on real hardware](./debugging) |
 
 For correctness and structural checks rather than performance, stay in [Debugging](./debugging);
 for problems *below* the kernel (queues, faults, the driver), see
-[AMD Backend → Debugging](../backends/amd/debugging).
+[AMD Backend → Debugging](../backends/amd/debugging) or
+[CUDA Backend → Debugging](../backends/cuda/debugging).

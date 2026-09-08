@@ -15,7 +15,7 @@ authored हों। एक graph matmul, एक fused feed-forward block, औ�
 table में दिखते हैं, एक ही तरीक़े से timed और analysed। इसे इसी section में document करने की वजह बस इतनी है
 कि इसकी ओर सबसे ज़्यादा हाथ बढ़ाने वाले पाठक हाथ से कर्नेल लिखने वाले ही होते हैं।
 
-:::note पूरे framework के लिए, सिर्फ़ tk के लिए नहीं
+:::note[पूरे framework के लिए, सिर्फ़ tk के लिए नहीं]
 नीचे लिखी हर बात किसी भी realizable `Tensor` पर लागू होती है। [एक ही IR का design](./lowering) ही इसे मुमकिन
 बनाता है: एक `tk` कर्नेल बस और UOps ही है, इसलिए यह अपना `name` device profile तक साथ ले जाता है और बिल्कुल
 उसी path से measure होता है जिससे एक autotuned कर्नेल।
@@ -40,7 +40,7 @@ flowchart TD
 |------|-----------------|--------|------------------|
 | **1 — device time** | हर कर्नेल का GPU execution time | GPU-clock dispatch timestamps | हाँ |
 | **2 — roofline** | derived **GFLOP/s** और **GB/s** | कर्नेल के IR से FLOP estimate; bytes plan के buffers से | हाँ (rates के लिए time चाहिए) |
-| **3 — static occupancy** | VGPR / SGPR / LDS / scratch usage और **occupancy %** | AMD: kernel descriptor से decoded। CUDA: `cuFuncGetAttribute` और driver का अपना occupancy calculator | नहीं — pure static decode |
+| **3 — static occupancy** | VGPR / SGPR / LDS / scratch usage और **occupancy %** | AMD: kernel descriptor से decoded। CUDA: `cuFuncGetAttribute` के साथ `cuOccupancyMaxActiveBlocksPerMultiprocessor` | कोई dispatch नहीं — AMD पर एक static decode, CUDA पर एक driver query |
 | **4 — hardware counters (PMC)** | AMD: SQ busy cycles, waves, VALU instructions. CUDA: SM cycles, warps, instructions, tensor-pipe cycles, DRAM bytes | AMD: PM4 packets, grid भर में summed. CUDA: CUPTI range profiler | हाँ, और counters unlocked होने चाहिए |
 
 कुछ बातें जानने लायक़:
@@ -48,10 +48,15 @@ flowchart TD
 - **Tier 2** कर्नेल के IR (AST) पर चलकर FLOPs का estimate लगाता है। scheduler-built कर्नेल के लिए ranges
   bounded होती हैं, इसलिए estimate एक असली count होता है और GFLOP/s column भर जाता है। GB/s का आँकड़ा हर
   distinct LOAD/STORE buffer को एक बार गिनता है, इसलिए जब भी Tier 2 उपलब्ध हो, यह भी उपलब्ध रहता है।
-- **Tier 3** RDNA3.5 (wave32) के लिए modeled है, जिसकी register-file geometry जानी-पहचानी है, इसलिए यह एक
-  occupancy % report करता है। CDNA3 (wave64) पर resources (VGPR/SGPR/LDS/scratch) फिर भी decode होकर दिखते
-  हैं, पर occupancy column `-` दिखाता है क्योंकि वह geometry modeled नहीं है। यहाँ occupancy सिर्फ़
-  **VGPR-limited** first-order limiter है — LDS और workgroup limits इसमें fold नहीं किए गए।
+- **Tier 3** AMD resources (VGPR/SGPR/LDS/scratch) सीधे kernel descriptor से decode करता है, बिना GPU को
+  छुए। इसका occupancy % सिर्फ़ gfx11 (RDNA3/3.5, wave32) के लिए modeled है, जिसकी register-file geometry
+  जानी-पहचानी है; CDNA3 (wave64) पर resources फिर भी दिखते हैं, पर occupancy column `-` दिखाता है। वह AMD
+  वाला number सिर्फ़ **VGPR-limited** first-order limiter है — LDS और workgroup limits इसमें fold नहीं किए
+  गए। CUDA पर numbers इसके बजाय loaded function से आते हैं: `cuFuncGetAttribute` से registers-per-thread,
+  static shared memory, और local (scratch) bytes, और वह occupancy जिसे *driver* ख़ुद compute करता है
+  (आख़िरी launch के block size के लिए `cuOccupancyMaxActiveBlocksPerMultiprocessor`, SM की thread capacity
+  के सापेक्ष) — इसलिए यह shared memory और block shape को fold कर ही लेता है। CUDA पर कोई SGPR column नहीं
+  होता।
 - **Tier 4** backend के हिसाब से अलग है। AMD पर यह SQ block को PM4 packets से program करता है और grid
   भर में sum करता है: `sqbusy` (busy cycles), `waves` (launch हुई waves), और `valu` (issue हुए VALU
   instructions) — मिलकर ये वह ILP/occupancy सवाल जवाब देते हैं जिसे अकेला timing नहीं दे सकता। CUDA पर
@@ -144,7 +149,7 @@ let opts = ProfileOptions {
 |---------|--------|
 | `SVOD_PROFILE_ITERS` | min-merge के लिए replay count (कम से कम 1 तक clamp किया गया) |
 | `SVOD_PMC` | Tier-4 selection: empty या `0` → off; `1` → backend का default set; वरना एक comma-separated token list (AMD: `sqbusy`, `waves`, `valu`; CUDA: `cycles`, `warps`, `inst`, `tensor`, `dram`) |
-| `SVOD_ORIGIN` | `1` हर op का scope दर्ज करता है — module path, call site, ONNX node; नीचे देखें |
+| `SVOD_ORIGIN` | खाली या `0` के अलावा कोई भी value हर op का scope दर्ज करती है — module path, call site, ONNX node; नीचे देखें — इसे op-build के समय `svod-ir` पढ़ता है, `from_env` नहीं |
 | `SVOD_ORIGIN_DEPTH` | origin rollups path के कितने segments रखें (`origin_depth`); unset या `0` = पूरा path |
 
 ```bash
@@ -265,14 +270,14 @@ SVOD_DEVICE=AMD:0 SVOD_PMC=1 cargo bench -p svod-tk --bench kmeans -- --profile-
 
 ## साफ़-साफ़ कुछ सीमाएँ
 
-:::caution दो चीज़ें जो profiler आपको नहीं दे सकता
+:::caution[दो चीज़ें जो profiler आपको नहीं दे सकता]
 **Tier 2 GFLOP/s हाथ से authored कर्नेल के लिए blank रहता है।** FLOP estimate कर्नेल के IR पर चलता है, और
 यह सिर्फ़ **scheduler-built** कर्नेल को ही auto-rate करता है। कोई operation किन loops के भीतर बैठा है, यह
 वह उसके operands की निर्भरता से निकालता है — और यह तब तक सही है जब तक index expressions scheduler
 लिखता है। हाथ से lower किया गया `tk` कर्नेल अपनी addressing ख़ुद करता है, और तब उसके loop variables
 arithmetic तक सिर्फ़ addresses के रास्ते पहुँचते हैं, इसलिए यह walk nesting को दोबारा नहीं निकाल पाता — किसी भी
 दिशा में नहीं। profiler garbage roofline print करने के बजाय estimate देने से इनकार कर देता है (एक शुरुआती
-version एक matmul को hardware peak से आठ गुना बताता था), इसलिए उन कर्नेल के लिए **GFLOP/s column `-`
+version एक matmul को hardware peak से दसियों गुना बताता था), इसलिए उन कर्नेल के लिए **GFLOP/s column `-`
 दिखाता है**। (GB/s फिर भी काम करता है, क्योंकि bytes plan के buffers से आते हैं,
 IR से नहीं।) हाथ से लिखे कर्नेल के लिए roofline को algorithm की जानी-पहचानी FLOP count और Tier-1 device time
 से ख़ुद हाथ से compute करें।
@@ -296,11 +301,12 @@ admin users को देता है, और CUPTI load होने लाय
 |----------------|-----|
 | "इस GPU पर हर कर्नेल कितना समय लेता है?" | `Tensor::profile` के साथ `ProfileOptions::default()`, device-time column पढ़ें |
 | "क्या यह कर्नेल compute- या bandwidth-bound है?" | Tier-2 GFLOP/s और GB/s columns (graph कर्नेल), या roofline हाथ से compute करें (tk कर्नेल) |
-| "occupancy कम क्यों है — registers या LDS?" | Tier-3 VGPR/SGPR/LDS/occ% columns (कोई run ज़रूरी नहीं) |
+| "occupancy कम क्यों है — registers या LDS?" | Tier-3 VGPR/SGPR/LDS/occ% columns (कोई timed run ज़रूरी नहीं) |
 | "क्या कर्नेल हर busy cycle में काफ़ी VALU work issue कर रहा है?" | Tier-4 `SVOD_PMC=1`, एक `profile_standard` GPU पर |
 | "कर्नेल tensor cores सचमुच इस्तेमाल कर रहा है, या DRAM पर अटका है?" | CUDA पर Tier-4 `SVOD_PMC=tensor,dram` |
 | "कई runs भर में यह graph-native baseline से कैसे तुलना करता है?" | `cargo bench --profile-time` — देखें [Debugging → असली hardware पर timing](./debugging) |
 
 performance के बजाय correctness और structural checks के लिए, [Debugging](./debugging) में ही रहें; कर्नेल से
 *नीचे* की समस्याओं के लिए (queues, faults, driver), देखें
-[AMD Backend → Debugging](../backends/amd/debugging)।
+[AMD Backend → Debugging](../backends/amd/debugging) या
+[CUDA Backend → Debugging](../backends/cuda/debugging)।

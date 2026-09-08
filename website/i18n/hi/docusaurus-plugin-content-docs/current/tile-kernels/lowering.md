@@ -73,9 +73,11 @@ UOps *ही है*, इसलिए compiler का सारा infrastructur
 आप दो types से author करते हैं (`tk/src/lib.rs` में AUTHOR चेहरे से):
 
 - **`Kernel`** (`tk/src/kernel.rs`) eager builder है। यह आपको कच्चा माल देता है — grid/block dimensions
-  (जो `SPECIAL` ops बनते हैं), loop ranges (`RANGE`), shared-memory buffers (`DEFINE_LOCAL`), register
-  buffers (`DEFINE_REG`), और global parameters। आप इससे tensors bind करते हैं और tiles माँगते हैं।
-- **`Group`** (`tk/src/group.rs`) एक साथ काम करने वाली wave (या waves का समूह) है। यह *compute* वाली
+  (जो `SPECIAL` ops बनते हैं), loop ranges (`RANGE`), shared-memory और register buffers (दोनों ही
+  `BUFFER`, जो `addrspace = Local` / `Reg` से अलग होते हैं), और global parameters (`PARAM`)। आप इससे
+  tensors bind करते हैं और tiles माँगते हैं।
+- **`Group`** (`tk/src/group/`, हर concern के लिए एक submodule — `movement`, `mma`, `reduce`,
+  `shuffle`, `elementwise`) एक साथ काम करने वाली wave (या waves का समूह) है। यह *compute* वाली
   शब्दावली साथ रखता है: memory spaces के बीच loads और stores, `mma` matrix multiply, reductions, shuffles,
   और elementwise maps।
 
@@ -106,10 +108,12 @@ KernelInfo { opts_to_apply: Some(vec![]), name: Some(...), .. }
 | `Some(vec![])` | "यह body **पहले से lowered** है। *शून्य* और optimizations apply करो।" |
 | `Some(non-empty)` | "बिल्कुल यही optimizations, इसी क्रम में apply करो।" |
 
-एक `tk` कर्नेल `Some(vec![])` इस्तेमाल करता है: schedule आपने हाथ से लिखा है, इसलिए optimizer इसे अछूता
-छोड़ देता है। बाक़ी rewrite passes जो *फिर भी* चलती हैं (algebraic simplification, index lowering), उन्हें
-कह दिया जाता है कि कर्नेल body में मत उतरना। आपका hand-tuned loop जैसा लिखा गया, ठीक वैसे ही codegen तक
-बच जाता है — पर तब भी यह एक आम UOp graph ही रहता है, जिसे *वही* renderer LLVM IR में बदलता है और *वही*
+एक `tk` कर्नेल `Some(vec![])` इस्तेमाल करता है: schedule आपने हाथ से लिखा है, इसलिए optimizer कोई भी
+schedule opt apply नहीं करता। वे साझा rewrites जो हर कर्नेल को codegen से पहले चाहिए (algebraic
+simplification, index-dtype lowering), body पर फिर भी चलती हैं; जो कभी नहीं होता वह है इसे दोबारा tile
+करना, दोबारा vectorize करना, या reorder करना। और graph level पर scheduler के rewrites *calls-preserving*
+हैं — वे किसी hand कर्नेल की body में उतरते ही नहीं। आपका hand-tuned loop जैसा लिखा गया, ठीक वैसे ही codegen
+तक बच जाता है — पर तब भी यह एक आम UOp graph ही रहता है, जिसे *वही* renderer LLVM IR में बदलता है और *वही*
 runtime execute करता है।
 
 और यह सिर्फ़ सुविधा भर नहीं है ("तुमने इसे पहले ही optimize कर दिया, तो माथापच्ची मत करो")। यह एक
@@ -126,7 +130,7 @@ body को यह पूरी तरह समझता नहीं, उस�
 
 एक finished `Kernel` से चलते हुए code तक पहुँचने के दो रास्ते हैं, दो अलग audiences के लिए।
 
-:::tip GPU विशेषज्ञों के लिए
+:::tip[GPU विशेषज्ञों के लिए]
 scheduler कर्नेल के `Op::Call` को बाक़ी किसी भी graph node जैसा ही बरतता है — यह kernel boundaries ढूँढने के लिए `AFTER`/`Call` dependency chains पर चलता है और इसे एक scheduled कर्नेल के रूप में emit करता है, जबकि rewrite passes एक *calls-preserving* traversal में चलती हैं जो body में नहीं उतरती। तो आपका hand-lowered `SINK` बिल्कुल एक autotuned कर्नेल की तरह scheduled और dependency-tracked होता है, पर इसका interior कभी rewrite नहीं होता।
 :::
 
@@ -163,8 +167,9 @@ DAG का एक और node है। यह scheduled होता है, �
 
 कर्नेल libraries में एक बारीक failure mode होता है: आप fast path कॉल करते हैं, यह चुपचाप तय कर लेता है कि
 आपके input को handle नहीं कर सकता, और आपको बिना किसी warning के slow path मिल जाता है — या उससे भी बुरा,
-एक ग़लत जवाब। `tk` के public कर्नेल (`tk/src/kernels/{fa,matmul}.rs`, `tk/src/launch.rs` में `launch_custom`
-के ज़रिए) इसी को नामुमकिन बनाने के लिए बने हैं। हर entry point तीन में से एक result लौटाता है:
+एक ग़लत जवाब। `tk` के public कर्नेल (`tk/src/kernels/` — single-output वाले `tk/src/launch.rs` के
+`launch_custom` के ज़रिए, और multi-output k-means तथा k-NN वही policy inline करके) इसी को नामुमकिन बनाने
+के लिए बने हैं। हर entry point तीन में से एक result लौटाता है:
 
 | Result | मतलब | आप क्या करें |
 |--------|---------|-------------|
@@ -190,17 +195,17 @@ flowchart TD
   END --> RANGE["RANGE(0..N, Local) -- threadIdx, workgroup lane"]
   STORE --> IDX_OUT["INDEX"]
   STORE --> LOAD["LOAD"]
-  IDX_OUT --> DG_OUT["DEFINE_GLOBAL(out)"]
+  IDX_OUT --> P_OUT["PARAM(slot=0) -- out"]
   IDX_OUT --> RANGE
   LOAD --> IDX_IN["INDEX"]
-  IDX_IN --> DG_IN["DEFINE_GLOBAL(in)"]
+  IDX_IN --> P_IN["PARAM(slot=1) -- in"]
   IDX_IN --> RANGE
 ```
 
 न कोई नए node types, न कोई अलग dialect — वही operations जिन पर
-[IR chapter में matmul की यात्रा](../architecture/ir-design) ख़त्म होती है। एक असली कर्नेल `WMMA`,
-`DEFINE_LOCAL` (LDS), और `DEFINE_REG` (registers) जोड़ता है, पर shape वही रहता है: ranges से scoped एक
-STORE पर एक SINK।
+[IR chapter में matmul की यात्रा](../architecture/ir-design) ख़त्म होती है। एक असली कर्नेल `WMMA` और
+`Local` (LDS) तथा `Reg` (registers) address spaces वाले `BUFFER` nodes जोड़ता है, पर shape वही रहता है:
+ranges से scoped एक STORE पर एक SINK।
 
 ---
 

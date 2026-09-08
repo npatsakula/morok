@@ -11,7 +11,10 @@ the tile abstractions answer that, and where the [Wave32 vs Wave64](./wave-porta
 shows up in anger.
 
 We're describing the forward kernel in `tk/src/kernels/fa.rs`, reached through the USE-face
-`flash_attention(q, k, v)`.
+`flash_attention(q, k, v)`. It is built for gfx942 (CDNA3), gfx1151 (RDNA3.5) and CUDA `sm_80+`;
+the per-warp `(q_blk, kv_blk)` tile is chosen per device by `FaPolicy` — the taller tile only when
+its shared-memory buffers fit and the launch grid already covers the device's compute units,
+otherwise the baseline `{16, 32}`.
 
 ---
 
@@ -82,16 +85,18 @@ are bank-conflict-free.
 
 ---
 
-## The wave-size wrinkle: relayout between the two matmuls
+## The layout wrinkle: relayout between the two matmuls
 
 Here's where [Wave32 vs Wave64](./wave-portability) stops being abstract. The kernel does two
 matrix multiplies, and the output of the first (`S = Q·Kᵀ`, after softmax becomes `P`) is the
 *input* of the second (`P·V`). Can the score accumulator be fed straight back in as an operand?
 
-- **On CDNA** (`acc_reusable_as_input() == true`): yes. The accumulator layout matches the
-  operand layout, so it's a register copy. Cheap.
-- **On RDNA** (`acc_reusable_as_input() == false`): no. The layouts differ, so `P` has to make a
-  **round-trip through LDS** to be relaid out before the second multiply.
+- **On CDNA and on CUDA** (`acc_reusable_as_input() == true`): yes. The MFMA accumulator *is* the
+  input fragment on CDNA, and the two-half `mma.sync` f32 accumulator holds the m16n8 C fragments in
+  exactly the A-operand register order — so it's a register copy. Cheap.
+- **On RDNA** (`acc_reusable_as_input() == false`): no. The even/odd accumulator and the replicated
+  operand differ, so `P` has to make a **round-trip through LDS** (the per-warp softmax band the
+  policy's `att_band` allocates) to be relaid out before the second multiply.
 
 The kernel branches on `ArchCaps` to do the right thing on each. Same algorithm, two physical
 realizations — exactly the portability tax the previous chapter described, here in the hottest
@@ -107,7 +112,7 @@ from the tile's own lane/row coordinates rather than loaded from memory — the 
 score element is implied by which fragment and lane holds it, so the mask is computed, not
 fetched.
 
-:::tip For GPU experts
+:::tip[For GPU experts]
 The compute/memory overlap isn't hand-emitted as raw scheduling intrinsics in `tk` the way it is
 in HipKittens' kernels. Instead the KV loop is annotated with
 `sched::pipeline(SchedKind::Attention, …)` (`tk/src/kernels/fa.rs`), a marker that a
@@ -129,7 +134,7 @@ Flash Attention is the whole section condensed into one file:
 - it's expressed entirely in **tiles and roles**, never lane indices ([What Tiling Is](./tiling));
 - it compiles to **the same UOp IR** as everything else and joins the lazy graph as an
   `Op::Call` ([Authoring into the IR](./lowering));
-- and it carries an explicit **wave32/wave64 branch** in its hot loop
+- and it carries an explicit **accumulator-reuse branch** in its hot loop, one per fragment layout
   ([Wave32 vs Wave64](./wave-portability)).
 
 That's why it's hand-written, and why `tk` exists to write it. To run it in isolation and check

@@ -2,7 +2,7 @@
 sidebar_label: Wave32 बनाम Wave64
 ---
 
-# एक कर्नेल को दो architectures पर correct रखना
+# एक कर्नेल को तीन architectures पर correct रखना
 
 यह रहा एक ऐसा bug जो NVIDIA पर होता ही नहीं। आप एक tile कर्नेल लिखते हैं, इसे एक CDNA datacenter GPU पर
 test करते हैं, और यह बिल्कुल सही चलता है। फिर *वही* कर्नेल आप एक RDNA laptop APU पर run करते हैं और
@@ -16,14 +16,18 @@ numbers बिल्कुल कचरा निकलते हैं — न 
 
 ## 32-बनाम-64 का बँटवारा
 
-एक wavefront (AMD का "warp") उन lanes का समूह है जो lockstep में execute होती हैं। AMD पर इसके दो sizes
-हैं, और Svod दोनों को target करता है:
+एक wavefront (NVIDIA का "warp") उन lanes का समूह है जो lockstep में execute होती हैं। AMD पर इसके दो sizes
+हैं, और Svod दोनों को target करता है, साथ ही NVIDIA वाले इकलौते size को भी:
 
 | Architecture | उदाहरण | Matrix op | Wavefront |
 |--------------|---------|-----------|-----------|
 | **CDNA** | gfx942 (datacenter) | MFMA | **wave64** — 64 lanes |
 | **RDNA** | gfx1151 (RDNA3.5) | WMMA | **wave32** — 32 lanes |
 | **CUDA** | sm_80+ (Ampere और उसके बाद) | `mma.sync` | **warp32** — 32 lanes |
+
+(यह table उन architectures का set है जिनके लिए DSL layouts resolve करता है; इसके ऊपर हर कर्नेल अपना
+`ArchSet` ख़ुद declare करता है। Flash Attention, matmul और single-query attention तीनों के लिए बने हैं;
+k-means और k-NN कर्नेल सिर्फ़ AMD के लिए हैं और CUDA पर `Ok(None)` लौटाते हैं।)
 
 बस यही एक number है जिसका असर हर चीज़ पर पड़ता है। एक `16×16` tile में 256 elements होते हैं। 64 lanes में
 बाँटें तो प्रति lane 4 elements; 32 lanes में बाँटें तो 8। अलग-अलग lanes अलग-अलग elements की मालिक होती हैं।
@@ -50,19 +54,22 @@ fragment shape नहीं लिखता। इसके बजाय यह 
    kernel says:  "I need an accumulator fragment"   (FragRole::Accumulator)
                           │
                           ▼
-   ArchCaps::frag(role)   ── on CDNA ──▶  the wave64 16×16 shape
-                          └─ on RDNA ──▶  the wave32 16×16 shape (8 ept, replicated operands)
+   ArchCaps::frag(role)   ── on CDNA ──▶  the wave64 16×16 shape (RT_16X16)
+                          ├─ on RDNA ──▶  the wave32 16×16 shape (8 ept, replicated operands)
+                          └─ on CUDA ──▶  the two-half mma.sync shape (RT_16X16_MMA)
 ```
 
 roles हैं `FragRole::{Accumulator, Operand, AccumulatorT}`, और resolver है `tk/src/arch.rs` में
-`ArchCaps::frag(role)`। कर्नेल author बस "accumulator" और "operand" लिखता है; *physical* layout — प्रति
-lane element count, interleave map, replication — target wave size के हिसाब से अपने-आप भर जाता है। एक बार
-लिखो, दोनों पर चलाओ।
+`ArchCaps::frag(role)` (कर्नेल इस तक `ker.frag(role)` से पहुँचते हैं)। कर्नेल author बस "accumulator" और
+"operand" लिखता है; *physical* layout — प्रति lane element count, interleave map, replication — target के
+हिसाब से अपने-आप भर जाता है। इसकी तीन arms हैं: CDNA हर role को उसी एक wave64 shape में resolve करता है,
+RDNA even/odd accumulator और replicated operand में, और CUDA two-half `mma.sync` shape में। जहाँ tk के पास
+कोई table है ही नहीं (Metal, pre-Ampere CUDA), वहाँ `None` — ताकि कोई matrix-core कर्नेल ग़लत layout render
+करने के बजाय ज़ोर-शोर से fail हो। एक बार लिखो, तीनों पर चलाओ।
 
-यही सबक़ HipKittens ने भी सीखा था (देखें [tk बनाम HipKittens बनाम CuTile](./comparison)): यह दो parallel
-backends भेजता है, `cdna4` (wave64) और `udna1` (wave32), जो एक अकेले `WARP_THREADS` constant से keyed हैं,
-ताकि tile types हर एक के लिए सही ढंग से recompile हों। `tk` इस सबको एक ही runtime-resolved `ArchCaps` में
-समेट देता है।
+यही सबक़ HipKittens ने भी सीखा था (देखें [tk बनाम HipKittens बनाम CuTile](./comparison)): इसके tile types एक
+अकेले compile-time `WARP_THREADS` constant से keyed हैं (CDNA build में `64`), इसलिए अलग wave width का मतलब
+है library का एक अलग build। `tk` इस सबको एक ही runtime-resolved `ArchCaps` में समेट देता है।
 
 ---
 
@@ -75,7 +82,7 @@ softmax-style reductions के लिए ग़लत sums निकाल द�
 constant से नहीं, बल्कि `caps.wave_size` और role-resolved fragment से चलाना। अब `tk/src/group/shuffle.rs` में
 shuffle primitives wave size पढ़ते हैं; पूरी bug class को design से ही बाहर कर दिया गया।
 
-:::tip GPU विशेषज्ञों के लिए
+:::tip[GPU विशेषज्ञों के लिए]
 दो चीज़ें अधिकांश wave-specific बोझ संभालती हैं:
 
 - **fragment का `LaneMap`** fold को साथ लाता है। कोई reduction अपना tree resolve हुए fragment से पढ़ती
@@ -84,9 +91,10 @@ shuffle primitives wave size पढ़ते हैं; पूरी bug class �
   sub-fragments को fold करता है, RDNA के wave32 पर वही gather एकमात्र offset `[16]` के साथ, और
   CUDA के `MmaSync` layout पर masks `[1, 2]` पर एक xor butterfly।
 - **`acc_reusable_as_input()`** यह जवाब देता है: "क्या एक matrix accumulator को सीधे अगले multiply के
-  operand के रूप में वापस feed किया जा सकता है?" CDNA और CUDA पर यह `true` है — layouts मेल खाते हैं, इसलिए यह बिना
-  किसी अलग लागत के एक register copy है। RDNA पर यह `false` है — accumulator और operand layouts अलग होते हैं,
-  इसलिए value relayout के लिए LDS से होकर एक round-trip करती है। [Flash Attention](./flash-attention) इस
+  operand के रूप में वापस feed किया जा सकता है?" CDNA पर (MFMA acc == input fragment) और CUDA पर bf16
+  `mma.sync` layouts के साथ यह `true` है — layouts मेल खाते हैं, इसलिए यह बिना किसी अलग लागत के एक register
+  copy है। RDNA पर यह `false` है — even/odd `<8×f32>` accumulator और replicated `<16×in>` operand अलग होते
+  हैं, इसलिए value relayout के लिए LDS से होकर एक round-trip करती है। [Flash Attention](./flash-attention) इस
   बँटवारे को अपने दो matmuls के बीच handle करता है।
 
 `BaseShape` पर `ept` field ([Tiling क्या है](./tiling) से) इसी वजह से मौजूद है: RDNA पर operands lanes भर
@@ -98,7 +106,9 @@ store करना ही पड़ता है।
 
 ## यह क्यों ज़रूरी है
 
-wave sizes भर में portability ही हाथ से लिखे कर्नेल पर AMD-specific tax है, और इसी वजह से किसी NVIDIA tile
-library का naive port यूँ ही नहीं चल जाता। `tk` यह tax एक बार चुका देता है, `ArchCaps` abstraction में, ताकि
-अलग-अलग कर्नेल पढ़ने लायक़ बने रहें: वे *roles* में बात करते हैं और lanes का हिसाब hardware table पर छोड़
-देते हैं। [Flash Attention](./flash-attention) वह जगह है जहाँ आप इसे एक असली कर्नेल में रंग लाते देखते हैं।
+wave sizes और fragment layouts भर में portability ही वह tax है जो हाथ से लिखे कर्नेल चुकाते हैं, और इसी वजह
+से किसी NVIDIA tile library का AMD पर naive port यूँ ही नहीं चल जाता। `tk` यह tax एक बार चुका देता है,
+`ArchCaps` abstraction में, ताकि अलग-अलग कर्नेल पढ़ने लायक़ बने रहें: वे *roles* में बात करते हैं और lanes
+का हिसाब hardware table पर छोड़ देते हैं। और वही abstraction फिर एक कर्नेल को NVIDIA *पर* भी ले जाता है —
+जहाँ warp हमेशा 32 का होता है पर fragment layout `mma.sync` का अपना — यही इसे बनाने का इनाम है।
+[Flash Attention](./flash-attention) वह जगह है जहाँ आप इसे एक असली कर्नेल में रंग लाते देखते हैं।

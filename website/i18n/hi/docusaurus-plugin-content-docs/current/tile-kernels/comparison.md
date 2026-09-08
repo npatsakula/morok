@@ -41,6 +41,9 @@ CuTile उस छोर पर जहाँ कंपाइलर ही सब 
 | **Headline differentiator** | एक IR ⇒ hand कर्नेल और autotuned कर्नेल बराबर के peers हैं | "hardware up से बना" | launch boundary के आर-पार memory safety |
 | **Target** | AMD CDNA / RDNA **और** NVIDIA `sm_80+` | AMD CDNA / RDNA | केवल NVIDIA `sm_80+` |
 
+इसके ऊपर हर `tk` कर्नेल अपना arch set ख़ुद declare करता है: matmul, Flash Attention और single-query
+attention gfx942, gfx1151 और CUDA `sm_80+` के लिए बने हैं; k-means और k-NN कर्नेल सिर्फ़ AMD के लिए हैं।
+
 ---
 
 ## code कैसा दिखता है
@@ -108,7 +111,7 @@ shared-memory staging को जान-बूझकर छिपा देता
 यह इसका `tileiras` assembler तय करता है। `tk` और HipKittens register और shared tiles, *दोनों* expose करते
 हैं और staging आपसे explicitly करवाते हैं। CuTile register/shared distinction से एक level *ऊपर* बैठता है;
 `tk` ठीक उसी *पर*। control की कीमत भी यही है और ताक़त भी: manage करने को ज़्यादा है, पर वे
-[overlap और swizzle के फ़ैसले](./where-flops-hide) जो AMD performance जिताते हैं, अब आपके हाथ में हैं।
+[overlap और swizzle के फ़ैसले](./where-flops-hide) जो performance जिताते हैं, अब आपके हाथ में हैं।
 
 **IR कहाँ रहता है।** यही `tk` की असली ख़ास चाल है। HipKittens एक standalone C++ framework है — यह कर्नेल
 produce करता है, बस इतना ही। CuTile एक *अलग* MLIR dialect में lower होता है जिसे सिर्फ़ इसका अपना toolchain
@@ -116,9 +119,10 @@ consume करता है। जबकि `tk` **उसी UOp IR में lo
 किसी दूसरे compiler को सौंपा गया कोई artifact नहीं है — यह तो एक ही IR में एक subgraph है, हर autotuned
 कर्नेल के बग़ल में।
 
-:::tip GPU विशेषज्ञों के लिए
+:::tip[GPU विशेषज्ञों के लिए]
 IR-target का फ़र्क़ toolchain level पर ठोस रूप में दिखता है। `tk` अपने `SINK` को `svod-codegen` से होकर
-LLVM IR और फिर एक AMD binary में render करता है — वही path जो graph कर्नेल लेते हैं। CuTile इसके बजाय
+LLVM IR और फिर या तो एक AMD binary में, या PTX में (जिसे `ptxas` assemble करता है, वरना driver JIT कर देता
+है) render करता है — वही path जो graph कर्नेल लेते हैं। CuTile इसके बजाय
 अपने tile dialect को bytecode में serialize करता है, जिसे एक *external* `tileiras` assembler cubin में बदलता
 है, और पहले launch पर JIT-compile होता है; HipKittens तो clang से compile हुए C++ templates ही है। तो `tk`
 के लिए "एक IR" का सचमुच मतलब है एक ही render-and-compile pipeline, जबकि बाक़ी एक अलग compiler में bridge करते हैं।

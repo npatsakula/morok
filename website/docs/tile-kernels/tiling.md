@@ -96,7 +96,7 @@ And it composes upward: the elementwise math, the reductions, the masks — they
 operations *on tiles*, with the same layout guarantees. You write `tile_a * tile_b`, not a lane
 index calculation.
 
-:::tip For GPU experts
+:::tip[For GPU experts]
 `tk` separates the *shape* of a tile from the *buffer* it's bound to.
 
 The pure shape descriptors live in `tk/src/tiles.rs`. The base fragment is
@@ -104,8 +104,9 @@ The pure shape descriptors live in `tk/src/tiles.rs`. The base fragment is
 rather than computed as `rows*cols / wave_size`, because on RDNA the matrix instruction
 *replicates* operands across lanes — so an operand tile's element count divided by the wave
 size is the wrong answer. Register tiles add
-`stride`/`interleave` fields (`RTBaseShape`) to encode the RDNA accumulator's even/odd row map,
-which no plain stride can express.
+a `LaneMap` (`RTBaseShape`) — the closed-form `(lane, j) → (row, col)` map of the fragment — to
+encode layouts no plain stride can express: the RDNA accumulator's even/odd row interleave, and
+CUDA's `mma.sync` 16×16 tile held as two `m16n8` halves.
 
 The buffer-bound wrappers live in `tk/src/tile.rs`: `GL` (global layout), `ST` (shared / LDS,
 optionally double-buffered), `RT` (register tile), `RV` (register vector, for the row/column
@@ -113,8 +114,9 @@ reductions softmax needs). Each is a flat `Arc<UOp>` buffer plus a logical shape
 
 Crucially, kernels never name a fragment constant like `RT_16X16` directly. They request a
 **role** — `FragRole::{Accumulator, Operand, AccumulatorT}` — and `ArchCaps::frag(role)` in
-`tk/src/arch.rs` resolves it to the right physical shape for the target (CDNA vs RDNA). That
-indirection is what makes one kernel portable across wave sizes; see
+`tk/src/arch.rs` resolves it to the right physical shape for the target (CDNA, RDNA, or CUDA's
+`mma.sync`). That
+indirection is what makes one kernel portable across wave sizes and fragment layouts; see
 [Wave32 vs Wave64](./wave-portability). The matrix multiply itself lowers to the `WMMA` op
 documented in the [Op Bestiary](../architecture/op-bestiary).
 :::

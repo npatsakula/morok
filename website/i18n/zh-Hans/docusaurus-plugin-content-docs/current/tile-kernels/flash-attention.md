@@ -6,7 +6,7 @@ sidebar_label: Flash Attention
 
 Flash Attention 正是那个为 `tk` 的存在撑起理由的内核，也就是 [概览](./overview) 点名*无法*表达成单一可调度规约的那个，是手工编写面孔之所以存在的全部缘由。本章带你走一遍：它难在哪里，tile 抽象如何应对，以及 [Wave32 与 Wave64](./wave-portability) 的分歧在何处实打实地显现。
 
-我们要讲的是 `tk/src/kernels/fa.rs` 里的前向内核，从 USE 面孔的 `flash_attention(q, k, v)` 进入。
+我们要讲的是 `tk/src/kernels/fa.rs` 里的前向内核，从 USE 面孔的 `flash_attention(q, k, v)` 进入。它面向 gfx942（CDNA3）、gfx1151（RDNA3.5）与 CUDA `sm_80+` 构建；每 warp 的 `(q_blk, kv_blk)` tile 由 `FaPolicy` 按设备选定——只有当更高的那个 tile 的共享内存缓冲区装得下、且启动网格已经铺满设备的计算单元时才选它，否则退回基线的 `{16, 32}`。
 
 ---
 
@@ -59,14 +59,14 @@ O = O / l                                        └─ final normalize
 
 ---
 
-## wave 大小的细节：两个 matmul 之间的重新布局
+## 布局的细节：两个 matmul 之间的重新布局
 
 这里就是 [Wave32 与 Wave64](./wave-portability) 不再抽象的地方。内核做两次矩阵乘法，第一次的输出（`S = Q·Kᵀ`，经 softmax 后变成 `P`）是第二次（`P·V`）的*输入*。得分累加器能不能直接回喂、当作操作数？
 
-- **在 CDNA 上**（`acc_reusable_as_input() == true`）：能。累加器布局与操作数布局相符，所以那是一次寄存器拷贝，很便宜。
-- **在 RDNA 上**（`acc_reusable_as_input() == false`）：不能。布局不同，所以 `P` 必须在第二次乘法之前**经 LDS 往返一趟**重新布局。
+- **在 CDNA 和 CUDA 上**（`acc_reusable_as_input() == true`）：能。CDNA 上 MFMA 累加器*就是*输入片段，而两半式 `mma.sync` 的 f32 累加器把 m16n8 的 C 片段恰好按 A 操作数的寄存器次序持有，所以那是一次寄存器拷贝，很便宜。
+- **在 RDNA 上**（`acc_reusable_as_input() == false`）：不能。偶/奇累加器与复制式操作数并不相同，所以 `P` 必须在第二次乘法之前**经 LDS 往返一趟**（也就是策略中 `att_band` 所分配的那条每 warp softmax 带）重新布局。
 
-内核基于 `ArchCaps` 分支，在两种平台上各做正确的事。同一个算法，两种物理实现，正是上一章所说的那笔可移植性税，落在最重要内核的最热循环里。
+内核基于 `ArchCaps` 分支，在每种平台上各做正确的事。同一个算法，两种物理实现，正是上一章所说的那笔可移植性税，落在最重要内核的最热循环里。
 
 ---
 
@@ -74,7 +74,7 @@ O = O / l                                        └─ final normalize
 
 因果掩码（一个查询不能关注一个未来的 key）和 key 填充掩码（忽略一个 batch 中被填充的位置）都在 softmax 之前作用到得分 tile `S` 上。掩码是从 tile 自身的 lane/行坐标导出的，而非从内存加载：每个得分元素的位置，由「是哪个片段、哪个 lane 持有它」隐含给出，所以掩码是算出来的，不是取出来的。
 
-:::tip 面向 GPU 专家
+:::tip[面向 GPU 专家]
 计算/内存的重叠在 `tk` 里并不像 HipKittens 的内核那样被手工发射成原始调度内建函数。这里的 KV 循环被标注上 `sched::pipeline(SchedKind::Attention, …)`（`tk/src/kernels/fa.rs`），这是一个标记，由 codegen 中线性化之后的一个调度遍来消费，用以交织矩阵、内存和指数这三股指令流。这让内核体保持可读：它表达的是*要重叠什么*，至于具体的指令排序，则交给后续的遍去决定，而不是让作者亲手把原始调度内建函数一根根穿进算法里。
 :::
 
@@ -88,7 +88,6 @@ Flash Attention 是整节内容浓缩进一个文件：
 - 它的成败系于**流式传输与重叠**（[FLOPS 藏在哪里](./where-flops-hide)）；
 - 它完全用 **tile 和角色**表达，从不用 lane 索引（[什么是分块](./tiling)）；
 - 它编译成与其他一切**相同的 UOp IR**，并作为一个 `Op::Call` 融入惰性图（[向 IR 中编写](./lowering)）；
-- 而且它的热循环里携带一个显式的 **wave32/wave64 分支**（[Wave32 与 Wave64](./wave-portability)）。
+- 而且它的热循环里携带一个显式的**累加器复用分支**，每种片段布局各一条（[Wave32 与 Wave64](./wave-portability)）。
 
 这就是它为什么要手写，以及 `tk` 为什么为写它而存在。要隔离运行它、检验它的数字，见 [调试](./debugging)。
-</content>
