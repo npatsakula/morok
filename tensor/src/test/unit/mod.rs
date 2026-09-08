@@ -35,9 +35,13 @@ pub mod triangular;
 pub mod variable;
 
 mod attention_helpers;
+mod layers;
+mod module;
 mod nn_affine;
 mod reduce_symbolic;
+mod rnn_v2;
 pub mod scatter_debug;
 pub mod schedule;
 pub mod schedule_cache;
 mod shape_helpers;
+mod stft;

@@ -68,6 +68,9 @@ pub enum ErrorKind {
     #[snafu(display("{op}: exactly one of {options} must be provided"))]
     ExclusiveParams { op: &'static str, options: &'static str },
 
+    #[snafu(display("state dict has no key '{key}'"))]
+    MissingKey { key: String },
+
     #[snafu(display("{op}: {param} = {value} is invalid, expected {constraint}"))]
     ParamRange { op: &'static str, param: &'static str, value: String, constraint: &'static str },
 

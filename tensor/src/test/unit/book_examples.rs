@@ -242,7 +242,7 @@ crate::codegen_tests! {
             [0.4, 0.5, 0.6, 0.7],
         ]);
         let bias = Tensor::from_slice([0.0f32, 0.0]);
-        let layer = nn::Linear::new(weight, bias);
+        let layer = nn::Linear::new(weight, Some(bias));
 
         let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
 
@@ -272,12 +272,12 @@ crate::codegen_tests! {
         let w1_data: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1 - 0.5).collect();
         let w1 = Tensor::from_ndarray(&ndarray::Array2::from_shape_vec((3, 4), w1_data).unwrap());
         let b1 = Tensor::from_slice([0.0f32; 3]);
-        let fc1 = nn::Linear::new(w1, b1);
+        let fc1 = nn::Linear::new(w1, Some(b1));
 
         let w2_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.1 - 0.3).collect();
         let w2 = Tensor::from_ndarray(&ndarray::Array2::from_shape_vec((2, 3), w2_data).unwrap());
         let b2 = Tensor::from_slice([0.0f32; 2]);
-        let fc2 = nn::Linear::new(w2, b2);
+        let fc2 = nn::Linear::new(w2, Some(b2));
 
         let input = Tensor::from_slice([0.5f32, -0.3, 0.8, 0.1]);
 

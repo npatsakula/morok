@@ -3,20 +3,32 @@
 mod conv;
 mod conv1d;
 mod grid_sample;
+mod layers;
 mod linear;
 mod lstm_cell;
+pub mod module;
 mod norm;
 pub mod pad;
 mod pool;
 mod quantize;
 mod resize;
 mod rnn;
+pub mod stft;
 
 pub use conv::Pad1d;
 pub use conv1d::Conv1d;
+pub use layers::{BatchNorm2d, Conv2d, ConvTranspose2d, Embedding, LayerNorm, RmsNorm};
 pub use linear::Linear;
-pub use lstm_cell::LSTMCell;
-pub use rnn::{GruOutput, LstmOutput, RnnOutput};
+pub use lstm_cell::{LSTMCell, LstmCell};
+pub use module::{Module, StateDict, get_tensor, prefixed};
+pub use rnn::{
+    GruCell, GruDirection, GruOutput, LinearBeforeReset, LstmOutput, RecurrentCell, RnnCell, RnnDirection, RnnLayout,
+    RnnOutput, RnnStack,
+};
+pub use stft::Window;
+/// Derive [`Module`](trait@Module): the trait lives in the type namespace and
+/// this derive in the macro namespace, so one name serves both.
+pub use svod_macros::Module;
 
 /// A neural network layer.
 pub trait Layer {
