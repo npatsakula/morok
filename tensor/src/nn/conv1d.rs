@@ -31,7 +31,7 @@ impl Conv1d {
         let weight = Tensor::from_slice(&weight_data)
             .try_reshape([out_channels as isize, in_channels as isize, kernel as isize])
             .expect("conv1d weight reshape failed");
-        let bias = Tensor::full(&[out_channels], 0.0, dtype).expect("conv1d bias creation failed");
+        let bias = Tensor::full(&[out_channels], 0.0, dtype);
         Self { weight, bias: Some(bias), stride: 1, padding: (0, 0) }
     }
 

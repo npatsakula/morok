@@ -368,7 +368,7 @@ fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
 
     let mk = || {
         let t = Tensor::randn(&[b, n, h, d]).expect("randn");
-        let t = t.cast(DType::BFloat16).expect("cast bf16");
+        let t = t.cast(DType::BFloat16);
         t.realize().expect("realize");
         t
     };
@@ -393,12 +393,12 @@ fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
         ker.finish(1)
     })
     .expect("fa_mw_rdb tiled launch");
-    let of = o.cast(DType::Float32).expect("o→f32");
+    let of = o.cast(DType::Float32);
     of.realize().expect("realize o→f32");
     let got: Vec<f32> = of.as_vec::<f32>().expect("read o");
 
     // Reference: permute [B,N,H,D] → [B,H,N,D], SDPA (causal), permute back.
-    let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("permute");
+    let perm = |t: &Tensor| t.cast(DType::Float32).try_permute(&[0, 2, 1, 3]).expect("permute");
     let (qp, kp, vp) = (perm(&q), perm(&k), perm(&v));
     let ref_bhnd = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(true).call().expect("sdpa");
     let reference = ref_bhnd.try_permute(&[0, 2, 1, 3]).expect("permute back");
@@ -442,7 +442,7 @@ fn test_fa_graph_amd() {
     for (b, n, h, d) in [(1usize, 128usize, 2usize, 64usize), (1, 512, 2, 64), (2, 256, 4, 64)] {
         let mk = || {
             let t = Tensor::randn(&[b, n, h, d]).expect("randn");
-            let t = t.cast(DType::BFloat16).expect("cast bf16");
+            let t = t.cast(DType::BFloat16);
             t.realize().expect("realize");
             t
         };
@@ -450,19 +450,19 @@ fn test_fa_graph_amd() {
 
         // Graph path: lazy custom_kernel Tensor → realize.
         let og = crate::kernels::fa::flash_attention(&q, &k, &v).expect("graph fa").expect("FA kernel applies");
-        let og_f = og.cast(DType::Float32).expect("og→f32");
+        let og_f = og.cast(DType::Float32);
         og_f.realize().expect("realize graph");
         let graph: Vec<f32> = og_f.as_vec::<f32>().expect("read graph");
 
         // Direct-launch path (same kernel, in-place dispatch).
         let mut od = Tensor::empty(&[b, n, h, d], DType::BFloat16);
         crate::kernels::fa::flash_attention_forward_mw_rdb(&mut od, &q, &k, &v).expect("direct fa");
-        let od_f = od.cast(DType::Float32).expect("od→f32");
+        let od_f = od.cast(DType::Float32);
         od_f.realize().expect("realize direct");
         let direct: Vec<f32> = od_f.as_vec::<f32>().expect("read direct");
 
         // Reference: causal SDPA over the same operands.
-        let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("permute");
+        let perm = |t: &Tensor| t.cast(DType::Float32).try_permute(&[0, 2, 1, 3]).expect("permute");
         let (qp, kp, vp) = (perm(&q), perm(&k), perm(&v));
         let ref_bhnd = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(true).call().expect("sdpa");
         let reference = ref_bhnd.try_permute(&[0, 2, 1, 3]).expect("permute back");
@@ -488,7 +488,7 @@ fn test_fa_graph_amd() {
 /// The f32 causal SDPA reference for the graph check below, in `[B,N,H,D]`.
 #[allow(clippy::result_large_err)] // one-shot check helper, like the macro body
 fn fa_causal_reference(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor, svod_tensor::error::Error> {
-    let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("permute");
+    let perm = |t: &Tensor| t.cast(DType::Float32).try_permute(&[0, 2, 1, 3]).expect("permute");
     let (qp, kp, vp) = (perm(q), perm(k), perm(v));
     let r = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(true).call().expect("sdpa");
     r.try_permute(&[0, 2, 1, 3])
@@ -531,7 +531,7 @@ fn test_fa_noncausal_f16_amd() {
 
     let (b, n, h, d) = (1usize, 256usize, 8usize, 64usize);
     let mk = || {
-        let t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::Float16).expect("cast f16");
+        let t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::Float16);
         t.realize().expect("realize");
         t
     };
@@ -540,12 +540,12 @@ fn test_fa_noncausal_f16_amd() {
     let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: None })
         .expect("fa noncausal")
         .expect("FA kernel applies");
-    let og_f = og.cast(DType::Float32).expect("og→f32");
+    let og_f = og.cast(DType::Float32);
     og_f.realize().expect("realize og");
     let got: Vec<f32> = og_f.as_vec::<f32>().expect("read og");
 
     // Reference: full (non-causal) SDPA over the same f32-permuted operands.
-    let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("permute");
+    let perm = |t: &Tensor| t.cast(DType::Float32).try_permute(&[0, 2, 1, 3]).expect("permute");
     let (qp, kp, vp) = (perm(&q), perm(&k), perm(&v));
     let ref_bhnd = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(false).call().expect("sdpa");
     let reference = ref_bhnd.try_permute(&[0, 2, 1, 3]).expect("permute back");
@@ -578,7 +578,7 @@ fn test_fa_noncausal_f16_masked_amd() {
     let (b, n, h, d) = (1usize, 256usize, 8usize, 64usize);
     let valid: i32 = 200;
     let mk = || {
-        let t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::Float16).expect("cast f16");
+        let t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::Float16);
         t.realize().expect("realize");
         t
     };
@@ -591,13 +591,13 @@ fn test_fa_noncausal_f16_masked_amd() {
     let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: Some(&lens) })
         .expect("fa masked")
         .expect("FA kernel applies");
-    let og_f = og.cast(DType::Float32).expect("og→f32");
+    let og_f = og.cast(DType::Float32);
     og_f.realize().expect("realize og");
     let got: Vec<f32> = og_f.as_vec::<f32>().expect("read og");
 
     // Reference: full SDPA with the same [B,1,1,N] bool key mask (true = masked,
     // where arange(N) >= valid), mirroring the kernel's `kv_pos >= lens[batch]`.
-    let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("permute");
+    let perm = |t: &Tensor| t.cast(DType::Float32).try_permute(&[0, 2, 1, 3]).expect("permute");
     let (qp, kp, vp) = (perm(&q), perm(&k), perm(&v));
     let range = Tensor::arange(n as i64, None, None).expect("arange").try_reshape([1usize, 1, 1, n]).expect("reshape");
     let lref = Tensor::from_slice([valid; 1]).try_reshape([b, 1, 1, 1]).expect("reshape lens");
@@ -640,7 +640,7 @@ fn test_fa_key_lens_zero_is_finite_amd() {
 
     let (b, n, h, d) = (1usize, 256usize, 8usize, 64usize);
     let mk = || {
-        let t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::Float16).expect("cast f16");
+        let t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::Float16);
         t.realize().expect("realize");
         t
     };
@@ -653,7 +653,7 @@ fn test_fa_key_lens_zero_is_finite_amd() {
     let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: Some(&lens) })
         .expect("fa masked")
         .expect("FA kernel applies");
-    let og_f = og.cast(DType::Float32).expect("og→f32");
+    let og_f = og.cast(DType::Float32);
     og_f.realize().expect("realize og");
     let got: Vec<f32> = og_f.as_vec::<f32>().expect("read og");
 
@@ -687,7 +687,7 @@ fn test_fa_tile_bench_cuda() {
     let tiles = [(16usize, 16usize), (16, 32), (32, 32), (16, 64)];
     for (b, n, h, d) in geometries {
         let mk = || {
-            let t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::Float16).expect("cast");
+            let t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::Float16);
             t.realize().expect("realize");
             t
         };
@@ -867,7 +867,7 @@ fn fa_reference(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool, key_lens: Opti
     let (b, n, h, d) = (dims(q)[0], dims(q)[1], dims(q)[2], dims(q)[3]);
     let h_kv = dims(k)[2];
     let perm = |t: &Tensor| {
-        let t = t.cast(DType::Float32).unwrap();
+        let t = t.cast(DType::Float32);
         let t = if dims(&t)[2] == h {
             t
         } else {
@@ -882,7 +882,7 @@ fn fa_reference(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool, key_lens: Opti
     };
     let mask = key_lens.map(|lens| {
         let range = Tensor::arange(n as i64, None, None).unwrap().try_reshape([1usize, 1, 1, n]).unwrap();
-        range.try_ge(&Tensor::from_slice(lens).try_reshape([b, 1, 1, 1]).unwrap()).unwrap()
+        range.try_ge(Tensor::from_slice(lens).try_reshape([b, 1, 1, 1]).unwrap()).unwrap()
     });
     perm(q)
         .scaled_dot_product_attention()
@@ -921,7 +921,7 @@ fn test_fa_cuda(b: usize, n: usize, h: usize, h_kv: usize, d: usize, dtype: DTyp
         return;
     }
     let mk = |h: usize| {
-        let t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(dtype.clone()).expect("cast");
+        let t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(dtype.clone());
         t.realize().expect("realize");
         t
     };
@@ -931,8 +931,7 @@ fn test_fa_cuda(b: usize, n: usize, h: usize, h_kv: usize, d: usize, dtype: DTyp
     let got = flash_attention_with(&q, &k, &v, FaOpts { causal, key_lens: lens_t.as_ref() })
         .expect("fa")
         .expect("the FA kernel applies on CUDA sm_80+")
-        .cast(DType::Float32)
-        .expect("→f32");
+        .cast(DType::Float32);
     got.realize().expect("realize");
     let reference = fa_reference(&q, &k, &v, causal, lens.as_deref());
     reference.realize().expect("realize reference");

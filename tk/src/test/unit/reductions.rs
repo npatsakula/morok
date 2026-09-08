@@ -173,7 +173,7 @@ fn test_softmax_gpu() {
     let (n, block) = (64usize, 32usize);
 
     let a = Tensor::rand(&[1, 1, block, n]).expect("rand a");
-    let a = a.cast(DType::Float32).expect("cast a");
+    let a = a.cast(DType::Float32);
     a.realize().expect("realize a");
     let mut out = Tensor::empty(&[1, 1, block, n], DType::Float32);
 
@@ -211,7 +211,7 @@ fn test_softmax_unroll_gpu() {
     };
     for (n, block) in [(64usize, 16usize), (64, 32)] {
         let a = Tensor::rand(&[1, 1, block, n]).expect("rand a");
-        let a = a.cast(DType::Float32).expect("cast a");
+        let a = a.cast(DType::Float32);
         a.realize().expect("realize a");
         let mut out = Tensor::empty(&[1, 1, block, n], DType::Float32);
 

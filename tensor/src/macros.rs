@@ -46,7 +46,7 @@ macro_rules! custom_kernel_check {
             let shape: &[usize] = &$shape;
             let mk = || {
                 let t = $crate::Tensor::randn(shape).expect("custom_kernel_check: randn input");
-                let t = t.cast($dt).expect("custom_kernel_check: cast input");
+                let t = t.cast($dt);
                 t.realize().expect("custom_kernel_check: realize input");
                 t
             };
@@ -54,7 +54,6 @@ macro_rules! custom_kernel_check {
 
             let to_f32_vec = |t: $crate::Tensor| -> Vec<f32> {
                 t.cast(::svod_dtype::DType::Float32)
-                    .expect("custom_kernel_check: cast → f32")
                     .to_vec::<f32>()
                     .expect("custom_kernel_check: read f32")
             };

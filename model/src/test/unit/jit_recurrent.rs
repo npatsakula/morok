@@ -15,9 +15,9 @@ impl RecurrentTestModel {
     /// Output is `[head | h_next | c_next]` along axis 0 (single 1-D tensor of
     /// length `1 + HIDDEN + HIDDEN`).
     fn forward(&self, x: &Tensor, h: &Tensor, c: &Tensor) -> Result<Tensor> {
-        let one_scalar = Tensor::ones(&[1], DType::Float32)?;
-        let one_vec = Tensor::ones(&[HIDDEN], DType::Float32)?;
-        let two_vec = Tensor::full(&[HIDDEN], 2.0f32, DType::Float32)?;
+        let one_scalar = Tensor::ones(&[1], DType::Float32);
+        let one_vec = Tensor::ones(&[HIDDEN], DType::Float32);
+        let two_vec = Tensor::full(&[HIDDEN], 2.0f32, DType::Float32);
         let head = x.try_add(&one_scalar)?;
         let h_next = h.try_add(&one_vec)?;
         let c_next = c.try_add(&two_vec)?;

@@ -32,7 +32,7 @@ fn forward_shape_semseg() {
     let cfg = YoloConfig::new(YoloScale::Nano, 19);
     let model = Yolo26SemSeg::with_zero_weights(cfg);
 
-    let images = Tensor::zeros(&[1, 3, 320, 320], DType::Float32).unwrap();
+    let images = Tensor::zeros(&[1, 3, 320, 320], DType::Float32);
     let var = Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();
 

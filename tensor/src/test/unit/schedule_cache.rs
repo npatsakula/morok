@@ -15,8 +15,8 @@ fn test_same_shape_same_hash() {
     svod_schedule::testing::setup_test_tracing();
     let cfg = cfg();
 
-    let c1 = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c2 = &Tensor::from_slice([10.0f32, 20.0, 30.0]) + &Tensor::from_slice([40.0f32, 50.0, 60.0]);
+    let c1 = (&Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0])).unwrap();
+    let c2 = (&Tensor::from_slice([10.0f32, 20.0, 30.0]) + &Tensor::from_slice([40.0f32, 50.0, 60.0])).unwrap();
 
     let (h1, d1) = crate::schedule_cache::cache_key_for(&c1, &cfg).unwrap();
     let (h2, d2) = crate::schedule_cache::cache_key_for(&c2, &cfg).unwrap();
@@ -30,8 +30,8 @@ fn test_different_shape_different_hash() {
     svod_schedule::testing::setup_test_tracing();
     let cfg = cfg();
 
-    let c1 = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c2 = &Tensor::from_slice([1.0f32, 2.0]) + &Tensor::from_slice([3.0f32, 4.0]);
+    let c1 = (&Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0])).unwrap();
+    let c2 = (&Tensor::from_slice([1.0f32, 2.0]) + &Tensor::from_slice([3.0f32, 4.0])).unwrap();
 
     let (h1, _) = crate::schedule_cache::cache_key_for(&c1, &cfg).unwrap();
     let (h2, _) = crate::schedule_cache::cache_key_for(&c2, &cfg).unwrap();
@@ -44,8 +44,8 @@ fn test_different_op_different_hash() {
     svod_schedule::testing::setup_test_tracing();
     let cfg = cfg();
 
-    let add = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let mul = &Tensor::from_slice([1.0f32, 2.0, 3.0]) * &Tensor::from_slice([4.0f32, 5.0, 6.0]);
+    let add = (&Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0])).unwrap();
+    let mul = (&Tensor::from_slice([1.0f32, 2.0, 3.0]) * &Tensor::from_slice([4.0f32, 5.0, 6.0])).unwrap();
 
     let (h_add, _) = crate::schedule_cache::cache_key_for(&add, &cfg).unwrap();
     let (h_mul, _) = crate::schedule_cache::cache_key_for(&mul, &cfg).unwrap();
@@ -59,11 +59,11 @@ fn test_repeated_realize_correct() {
     svod_schedule::testing::setup_test_tracing();
     let cfg = cfg();
 
-    let c1 = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
+    let c1 = (&Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0])).unwrap();
     c1.realize_with(&cfg).unwrap();
     assert_eq!(c1.as_vec::<f32>().unwrap(), vec![5.0, 7.0, 9.0]);
 
-    let c2 = &Tensor::from_slice([10.0f32, 20.0, 30.0]) + &Tensor::from_slice([40.0f32, 50.0, 60.0]);
+    let c2 = (&Tensor::from_slice([10.0f32, 20.0, 30.0]) + &Tensor::from_slice([40.0f32, 50.0, 60.0])).unwrap();
     c2.realize_with(&cfg).unwrap();
     assert_eq!(c2.as_vec::<f32>().unwrap(), vec![50.0, 70.0, 90.0]);
 }
@@ -74,7 +74,7 @@ fn test_prepare_with_reuses_same_schedule_cache_entry() {
     crate::test::helpers::test_setup();
     let cfg = cfg();
 
-    let c1 = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
+    let c1 = (&Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0])).unwrap();
     let key1 = crate::schedule_cache::cache_key_for(&c1, &cfg).expect("first key");
     c1.prepare_with(&cfg).expect("first prepare");
 
@@ -84,7 +84,7 @@ fn test_prepare_with_reuses_same_schedule_cache_entry() {
         cache.get(&key1, &guard).cloned().expect("entry after first prepare")
     };
 
-    let c2 = &Tensor::from_slice([10.0f32, 20.0, 30.0]) + &Tensor::from_slice([40.0f32, 50.0, 60.0]);
+    let c2 = (&Tensor::from_slice([10.0f32, 20.0, 30.0]) + &Tensor::from_slice([40.0f32, 50.0, 60.0])).unwrap();
     let key2 = crate::schedule_cache::cache_key_for(&c2, &cfg).expect("second key");
     assert_eq!(key1, key2, "same-shape graph should map to same schedule cache key");
     c2.prepare_with(&cfg).expect("second prepare");
@@ -148,8 +148,8 @@ fn test_prepare_batch_with_reuses_same_schedule_cache_entry() {
     crate::test::helpers::test_setup();
     let cfg = cfg();
 
-    let a1 = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let b1 = &Tensor::from_slice([7.0f32, 8.0, 9.0]) + &Tensor::from_slice([10.0f32, 11.0, 12.0]);
+    let a1 = (&Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0])).unwrap();
+    let b1 = (&Tensor::from_slice([7.0f32, 8.0, 9.0]) + &Tensor::from_slice([10.0f32, 11.0, 12.0])).unwrap();
     let key1 = batch_cache_key(&[&a1, &b1], &cfg);
 
     Tensor::prepare_batch_with([&a1, &b1], &cfg).expect("first batch prepare");
@@ -160,8 +160,8 @@ fn test_prepare_batch_with_reuses_same_schedule_cache_entry() {
         cache.get(&key1, &guard).cloned().expect("entry after first batch prepare")
     };
 
-    let a2 = &Tensor::from_slice([13.0f32, 14.0, 15.0]) + &Tensor::from_slice([16.0f32, 17.0, 18.0]);
-    let b2 = &Tensor::from_slice([19.0f32, 20.0, 21.0]) + &Tensor::from_slice([22.0f32, 23.0, 24.0]);
+    let a2 = (&Tensor::from_slice([13.0f32, 14.0, 15.0]) + &Tensor::from_slice([16.0f32, 17.0, 18.0])).unwrap();
+    let b2 = (&Tensor::from_slice([19.0f32, 20.0, 21.0]) + &Tensor::from_slice([22.0f32, 23.0, 24.0])).unwrap();
     let key2 = batch_cache_key(&[&a2, &b2], &cfg);
     assert_eq!(key1, key2, "same-structure batch graph should map to same schedule cache key");
 
@@ -347,7 +347,7 @@ fn test_normalize_for_schedule_cache_preserves_internal_buffers() {
 
 #[test]
 fn test_post_sched_cache_restore_replaces_params() {
-    let c = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
+    let c = (&Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0])).unwrap();
     let sink = UOp::sink(vec![c.uop().contiguous()]);
 
     let normalized = crate::realize::normalize_for_schedule_cache(&sink).expect("normalize param restore sink");
@@ -401,7 +401,7 @@ fn test_post_sched_cache_restore_materializes_runtime_buffers() {
 fn test_post_sched_cache_restore_keeps_codegen_params_inside_call_body() {
     crate::test::helpers::test_setup();
 
-    let c = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
+    let c = (&Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0])).unwrap();
     let sink = UOp::sink(vec![c.uop().contiguous()]);
 
     let normalization = crate::realize::normalize_for_schedule_cache(&sink).expect("normalize call boundary sink");
@@ -501,11 +501,11 @@ fn test_cache_disabled_equals_enabled_outputs_static_shape() {
     let lhs = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
     let rhs = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0];
 
-    let warm = (&Tensor::from_slice(lhs) + &Tensor::from_slice(rhs)).try_reshape([2, 3]).unwrap();
+    let warm = (&Tensor::from_slice(lhs) + &Tensor::from_slice(rhs)).unwrap().try_reshape([2, 3]).unwrap();
     warm.realize_with(&cfg()).expect("cache-warm realize");
     let warm_out = warm.as_vec::<f32>().expect("warm output");
 
-    let cold = (&Tensor::from_slice(lhs) + &Tensor::from_slice(rhs)).try_reshape([2, 3]).unwrap();
+    let cold = (&Tensor::from_slice(lhs) + &Tensor::from_slice(rhs)).unwrap().try_reshape([2, 3]).unwrap();
     cold.realize_with(&cfg_with_cache_disabled()).expect("cache-cold realize");
     let cold_out = cold.as_vec::<f32>().expect("cold output");
 
@@ -592,12 +592,14 @@ fn test_cache_disabled_matches_enabled_var_names_and_kernel_count() {
     let rhs = [10.0f32, 20.0, 30.0, 40.0];
 
     let warm_plan = (&Tensor::from_slice(lhs) + &Tensor::from_slice(rhs))
+        .unwrap()
         .try_reshape([2, 2])
         .unwrap()
         .prepare_with(&cfg())
         .expect("warm prepare");
 
     let cold_plan = (&Tensor::from_slice(lhs) + &Tensor::from_slice(rhs))
+        .unwrap()
         .try_reshape([2, 2])
         .unwrap()
         .prepare_with(&cfg_with_cache_disabled())

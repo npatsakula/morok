@@ -115,7 +115,7 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
             let padded_mask = if mask_k < full_k_len {
                 let mut pad_shape = mask.dims()?;
                 *pad_shape.last_mut().expect("mask is not a scalar") = full_k_len - mask_k;
-                let pad_fill = Tensor::full(&pad_shape, 0.0f64, mask.dtype())?;
+                let pad_fill = Tensor::full(&pad_shape, 0.0f64, mask.dtype());
                 Tensor::cat(&[mask, &pad_fill], -1)?
             } else {
                 mask.clone()
@@ -142,7 +142,7 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
     if is_causal {
         let past_seq_len = past_key.map(|pk| pk.dim_const(2)).transpose()?.unwrap_or(0);
         let q_len = q.dim_const(-2)?;
-        let causal = Tensor::full(&[q_len, full_k_len], true, DType::Bool)?.tril(past_seq_len as i64)?;
+        let causal = Tensor::full(&[q_len, full_k_len], true, DType::Bool).tril(past_seq_len as i64)?;
         let neg_inf = Tensor::const_(f64::NEG_INFINITY, q_dtype.clone());
         scores = scores.where_(&causal, &neg_inf)?;
     }
@@ -180,17 +180,17 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
             16 => DType::BFloat16,
             _ => DType::Float32,
         };
-        scores.cast(sm_dtype)?
+        scores.cast(sm_dtype)
     } else {
         scores
     };
 
-    let attn_weights = scores.softmax(-1isize)?.cast(q_dtype.clone())?;
+    let attn_weights = scores.softmax(-1isize)?.cast(q_dtype.clone());
 
     // Mode 3: after softmax
     let qk_mode3 = attn_weights.clone();
 
-    let output = attn_weights.matmul(&v)?.cast(q_dtype)?;
+    let output = attn_weights.matmul(&v)?.cast(q_dtype);
 
     let qk_return = match qk_matmul_output_mode {
         1 => qk_mode1,
@@ -480,7 +480,7 @@ pub(crate) fn op_attention_contrib(inputs: &[Option<Tensor>], attrs: &mut Attrs)
     // Unidirectional causal mask
     if unidirectional {
         let causal =
-            Tensor::full(&[seq_len, total_seq], true, DType::Bool)?.tril((total_seq as i64) - (seq_len as i64))?;
+            Tensor::full(&[seq_len, total_seq], true, DType::Bool).tril((total_seq as i64) - (seq_len as i64))?;
         let filter = Tensor::const_(mask_filter_value, q_dtype.clone());
         let zero = Tensor::const_(0.0f64, q_dtype.clone());
         let causal_additive = zero.where_(&causal, &filter)?;

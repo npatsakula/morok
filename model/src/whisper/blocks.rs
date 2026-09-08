@@ -46,12 +46,7 @@ pub(crate) fn linear_with_bias(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Re
         return Ok(x.linear().weight(weight).bias(bias).call()?);
     }
 
-    Ok(x.linear()
-        .weight(weight)
-        .dtype(DType::Float32)
-        .call()?
-        .try_add(&bias.cast(DType::Float32)?)?
-        .cast(output_dtype)?)
+    Ok(x.linear().weight(weight).dtype(DType::Float32).call()?.try_add(bias.cast(DType::Float32))?.cast(output_dtype))
 }
 
 impl HasStateDict for LinearWeights {
@@ -94,10 +89,10 @@ impl LayerNormWeights {
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
         let output_dtype = x.dtype();
         if output_dtype == DType::Float16 || output_dtype == DType::BFloat16 {
-            let x = x.cast(DType::Float32)?;
-            let weight = self.weight.cast(DType::Float32)?;
-            let bias = self.bias.cast(DType::Float32)?;
-            return Ok(x.layernorm(-1, self.eps)?.try_mul(&weight)?.try_add(&bias)?.cast(output_dtype)?);
+            let x = x.cast(DType::Float32);
+            let weight = self.weight.cast(DType::Float32);
+            let bias = self.bias.cast(DType::Float32);
+            return Ok(x.layernorm(-1, self.eps)?.try_mul(&weight)?.try_add(&bias)?.cast(output_dtype));
         }
 
         let normed = x.layernorm(-1, self.eps)?;
@@ -192,7 +187,7 @@ pub fn sinusoids(length: usize, channels: usize, max_timescale: f64) -> Result<T
     let inv_data: Vec<f32> = (0..half).map(|i| (-log_inc * i as f64).exp() as f32).collect();
     let inv = Tensor::from_slice(&inv_data);
     let scaled_time =
-        Tensor::arange(0, Some(length as i64), None)?.cast(DType::Float32)?.try_unsqueeze(-1)?.try_mul(&inv)?;
+        Tensor::arange(0, Some(length as i64), None)?.cast(DType::Float32).try_unsqueeze(-1)?.try_mul(&inv)?;
     let sin = scaled_time.sin()?;
     let cos = scaled_time.cos()?;
     Ok(Tensor::cat(&[&sin, &cos], -1)?)

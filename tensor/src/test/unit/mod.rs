@@ -17,6 +17,7 @@ pub mod indexing;
 pub mod math;
 pub mod matmul;
 pub mod nn;
+pub mod operand;
 pub mod origin;
 pub mod origin_carriage;
 pub mod profile;

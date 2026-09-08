@@ -405,7 +405,7 @@ impl Tensor {
     fn inverse(&self) -> Result<Self> {
         let dtype = self.uop().dtype();
         if dtype.is_float() {
-            self.try_neg()
+            Ok(self.neg())
         } else if dtype.is_int() {
             self.bitwise_not()
         } else if matches!(dtype.scalar(), Some(ScalarDType::Bool)) {
@@ -468,13 +468,14 @@ impl Tensor {
         let axis_size = shape[norm_axis].as_const().ok_or_else(|| {
             crate::error::ErrorKind::SymbolicShapeUnsupported { operation: format!("hardmax axis {norm_axis}") }
         })?;
-        self.argmax_with()
+        Ok(self
+            .argmax_with()
             .axis(Some(axis))
             .keepdim(false)
             .call()?
             .try_unsqueeze(axis)?
             .one_hot_along_dim(axis_size, axis)?
-            .cast(self.uop().dtype())
+            .cast(self.uop().dtype()))
     }
 
     /// Index of minimum value along axis.
@@ -590,7 +591,7 @@ fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
     let indices_broadcast = indices_reshaped.try_expand(&shape_vec)?;
 
     // Step 5: Multiply mask by indices (0 where not max, index where max)
-    let mask_int = mask.cast(DType::Int32)?;
+    let mask_int = mask.cast(DType::Int32);
     let masked_indices = mask_int.try_mul(&indices_broadcast)?;
 
     // Step 6: Take max of masked indices (gives highest index, which is first occurrence)
@@ -615,7 +616,7 @@ fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
     };
 
     // Cast final result to Int32 (like Tinygrad)
-    result.cast(DType::Int32)
+    Ok(result.cast(DType::Int32))
 }
 
 /// Internal argmin implementation.
@@ -628,7 +629,7 @@ fn argmin_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
 /// Internal any implementation.
 fn any_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool) -> Result<Tensor> {
     // Cast to bool (non-zero becomes true)
-    let as_bool = tensor.cast(DType::Bool)?;
+    let as_bool = tensor.cast(DType::Bool);
 
     // Max reduction on bool is logical OR
     reduce_internal(&as_bool, ReduceOp::Max, axes, keepdim, None, false)
@@ -679,7 +680,7 @@ fn reduce_internal(
     };
 
     // Cast to accumulation dtype if needed
-    let working_tensor = if acc_dtype != original_dtype { tensor.cast(acc_dtype.clone())? } else { tensor.clone() };
+    let working_tensor = if acc_dtype != original_dtype { tensor.cast(acc_dtype.clone()) } else { tensor.clone() };
 
     // Perform reduction
     let reduced = working_tensor.uop().try_reduce_axis(op, resolved_axes.clone()).context(UOpSnafu)?;
@@ -699,7 +700,7 @@ fn reduce_internal(
     // Cast back to the input dtype whenever we accumulated in a wider type
     // (fp16/bf16/fp8), whether via `promote` or the float32 sum-acc upcast above.
     if dtype.is_none() && acc_dtype != original_dtype && Tensor::should_cast_back_after_sum(&original_dtype) {
-        result.cast(original_dtype)
+        Ok(result.cast(original_dtype))
     } else {
         Ok(result)
     }
@@ -733,8 +734,8 @@ fn mean_impl(tensor: &Tensor, axes: impl Into<AxisSpec>, keepdim: bool) -> Resul
     let sum = reduce_internal(tensor, ReduceOp::Add, axes, keepdim, Some(acc_dtype.clone()), false)?;
 
     let count_tensor = Tensor::new(UOp::const_(acc_dtype.clone(), svod_ir::ConstValue::Float(count as f64)));
-    let mean = &sum / &count_tensor;
-    if acc_dtype != output_dtype { mean.cast(output_dtype) } else { Ok(mean) }
+    let mean = (&sum / &count_tensor)?;
+    Ok(if acc_dtype != output_dtype { mean.cast(output_dtype) } else { mean })
 }
 
 /// Variance implementation using the numerically-stable `(X - E[X])²` formula.
@@ -785,7 +786,7 @@ fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool, correction: i64
     };
 
     // Square the deviations: (X - E[X])²
-    let squared_dev = deviation.square()?;
+    let squared_dev = deviation.square();
 
     // Accumulate *and* divide in `sum_acc_dtype` like `mean_impl`, casting to the
     // output dtype only at the end: a float16 sum of squares cast back before the
@@ -801,12 +802,12 @@ fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool, correction: i64
         // svod's `/` rejects a constant-zero divisor, so express the IEEE result as
         // `reduced * inf` (0*inf = NaN, k*inf = +inf).
         let inf = Tensor::new(UOp::const_(acc_dtype.clone(), svod_ir::ConstValue::Float(f64::INFINITY)));
-        &sum_sq_dev * &inf
+        (&sum_sq_dev * &inf)?
     } else {
         let denom_tensor = Tensor::new(UOp::const_(acc_dtype.clone(), svod_ir::ConstValue::Float(denom as f64)));
-        &sum_sq_dev / &denom_tensor
+        (&sum_sq_dev / &denom_tensor)?
     };
-    let variance = if acc_dtype != output_dtype { variance.cast(output_dtype)? } else { variance };
+    let variance = if acc_dtype != output_dtype { variance.cast(output_dtype) } else { variance };
 
     Ok((variance, mean))
 }

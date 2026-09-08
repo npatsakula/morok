@@ -29,7 +29,7 @@ use super::firered_vad::{lcg, load_golden_vec, real_file, synthetic_waveform};
 #[test]
 fn stream_forward_shape() {
     let model = FireRedVadStream::with_random_weights();
-    let feat = Tensor::zeros(&[1, 16, N_MELS], DType::Float32).unwrap();
+    let feat = Tensor::zeros(&[1, 16, N_MELS], DType::Float32);
     let caches = FireRedVadStream::zero_caches().unwrap();
     let (probs, new_caches) = model.forward_stream(&feat, &caches).unwrap();
 

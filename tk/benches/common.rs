@@ -23,7 +23,7 @@ use svod_tensor::Tensor;
 
 /// A realized random bf16 tensor on the env-selected device.
 pub fn randn_bf16(shape: &[usize]) -> Tensor {
-    let mut t = Tensor::randn(shape).expect("randn").cast(DType::BFloat16).expect("→bf16");
+    let t = Tensor::randn(shape).expect("randn").cast(DType::BFloat16);
     t.realize().expect("realize");
     t
 }

@@ -10,7 +10,7 @@ use crate::modernbert::{cls, masked_mean};
 #[test]
 fn masked_mean_excludes_padding() {
     let h = Tensor::from_slice([1.0f32, 1.0, 2.0, 2.0, 3.0, 3.0]).try_reshape([1isize, 3, 2]).unwrap();
-    let mask = Tensor::from_slice([1.0f32, 1.0, 0.0]).try_reshape([1isize, 3]).unwrap().cast(DType::Bool).unwrap();
+    let mask = Tensor::from_slice([1.0f32, 1.0, 0.0]).try_reshape([1isize, 3]).unwrap().cast(DType::Bool);
 
     let out = masked_mean(&h, &mask).unwrap();
     out.realize().unwrap();
@@ -24,7 +24,7 @@ fn masked_mean_excludes_padding() {
 #[test]
 fn masked_mean_all_real_is_plain_mean() {
     let h = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape([1isize, 3, 2]).unwrap();
-    let mask = Tensor::from_slice([1.0f32, 1.0, 1.0]).try_reshape([1isize, 3]).unwrap().cast(DType::Bool).unwrap();
+    let mask = Tensor::from_slice([1.0f32, 1.0, 1.0]).try_reshape([1isize, 3]).unwrap().cast(DType::Bool);
 
     let out = masked_mean(&h, &mask).unwrap();
     out.realize().unwrap();
@@ -43,11 +43,8 @@ fn masked_mean_two_rows() {
         .try_reshape([2isize, 3, 2])
         .unwrap();
     // row 0: last token padded; row 1: all real.
-    let mask = Tensor::from_slice([1.0f32, 1.0, 0.0, 1.0, 1.0, 1.0])
-        .try_reshape([2isize, 3])
-        .unwrap()
-        .cast(DType::Bool)
-        .unwrap();
+    let mask =
+        Tensor::from_slice([1.0f32, 1.0, 0.0, 1.0, 1.0, 1.0]).try_reshape([2isize, 3]).unwrap().cast(DType::Bool);
 
     let out = masked_mean(&h, &mask).unwrap();
     out.realize().unwrap();

@@ -613,9 +613,9 @@ fn test_real_numeric_result_matches_with_planner_disabled_and_arena() {
     fn run(mode: PlannerMode) -> Vec<f32> {
         let a = crate::Tensor::from_slice([1.0f32, -2.0, 3.5, 4.0]);
         let b = crate::Tensor::from_slice([0.5f32, 3.0, -1.5, 2.0]);
-        let first = &a + &b;
-        let second = &first * &a;
-        let output = &second + &b;
+        let first = (&a + &b).unwrap();
+        let second = (&first * &a).unwrap();
+        let output = (&second + &b).unwrap();
         let config = crate::PrepareConfig { planner_mode: mode, disable_schedule_cache: true, ..Default::default() };
         output.realize_with(&config).expect("realize numeric planner differential");
         output.as_vec::<f32>().expect("numeric output")

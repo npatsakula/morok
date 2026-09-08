@@ -248,7 +248,7 @@ impl MultiHeadSelfAttention {
         let rope_dtype = y_heads.dtype();
         let (cos, sin) = {
             let _shared = OriginScope::suspend();
-            (cos.cast(rope_dtype.clone())?, sin.cast(rope_dtype)?)
+            (cos.cast(rope_dtype.clone()), sin.cast(rope_dtype))
         };
         let qk_input = y_heads
             .apply_rotary_emb(&cos, &sin, false)?
@@ -301,7 +301,7 @@ fn sdpa_attention(q: &Tensor, k: &Tensor, v: &Tensor, key_lens: Option<&Tensor>)
             // layer's origin scope so the layers share one mask.
             let _shared = OriginScope::suspend();
             let range = Tensor::arange(n as i64, None, None)?.try_reshape([1usize, 1, 1, n])?;
-            let lens = lens.cast(DType::Int32)?.try_reshape([b, 1, 1, 1])?;
+            let lens = lens.cast(DType::Int32).try_reshape([b, 1, 1, 1])?;
             Some(range.try_ge(&lens)?)
         }
         None => None,
@@ -452,7 +452,7 @@ impl ConvModule {
         // BN/LN params (scale, bias, mean, invstd) are stored fp32; broadcasting promotes
         // the norm output. Re-cast to the activation dtype so SiLU/pw2 stay in the right
         // precision, matching Python's BatchNorm1d dtype semantics. No-op when types match.
-        let y = if y.dtype() != activation_dtype { y.cast(activation_dtype)? } else { y };
+        let y = if y.dtype() != activation_dtype { y.cast(activation_dtype) } else { y };
 
         let y = y.silu()?;
 
@@ -703,7 +703,7 @@ impl ConformerLayer {
         key_lens: Option<&Tensor>,
         pad_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let half = Tensor::from_const(0.5f64).cast(x.dtype())?;
+        let half = Tensor::from_const(0.5f64).cast(x.dtype());
 
         // FFN1 half-step
         let ffn1 = scoped("ffn1", || self.ffn1.forward(x))?;
@@ -811,7 +811,7 @@ impl Encoder {
     /// Input: tensor `[B, n_mels, T]`. Output: lazy tensor `[B, d_model, T/4]`.
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
         let x = mel.try_transpose(-1, -2)?;
-        let x = x.cast(self.input_dtype())?;
+        let x = x.cast(self.input_dtype());
         let x = scoped("subsampling", || self.subsampling.forward(&x))?;
 
         let shape = x.shape()?;
@@ -844,7 +844,7 @@ impl Encoder {
         let mel_shape = mel.shape()?;
         let b = mel_shape[0].clone();
 
-        let lengths = lengths.cast(DType::Int32)?;
+        let lengths = lengths.cast(DType::Int32);
 
         let two_t = Tensor::const_(2i32, DType::Int32);
         let one_t = Tensor::const_(1i32, DType::Int32);
@@ -855,7 +855,7 @@ impl Encoder {
         }
 
         let x = mel.try_transpose(-1, -2)?;
-        let x = x.cast(self.input_dtype())?;
+        let x = x.cast(self.input_dtype());
         let x = scoped("subsampling", || self.subsampling.forward(&x))?;
 
         let shape = x.shape()?;
@@ -864,10 +864,10 @@ impl Encoder {
         // `key_lens` = subsampled valid-frame counts as a realized `[B]` `i32`
         // tensor — attention's key-only padding mask. Keep `lengths_sub` in the
         // same concrete dtype for the `pad_valid` comparison (the conv `pad_mask`).
-        let key_lens = lengths_sub.cast(DType::Int32)?.try_reshape([b.clone()])?;
+        let key_lens = lengths_sub.cast(DType::Int32).try_reshape([b.clone()])?;
 
         let range = Tensor::arange(self.max_encoder_frames as i64, None, None)?;
-        let range = range.cast(DType::Int32)?;
+        let range = range.cast(DType::Int32);
         let range = range.try_shrink([(SInt::Const(0), t_sub.clone())])?;
         let range = range.try_reshape([SInt::Const(1), t_sub.clone()])?;
         let lens = lengths_sub;

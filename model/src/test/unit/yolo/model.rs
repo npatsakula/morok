@@ -56,7 +56,7 @@ fn forward_shape_nano() {
     let cfg = YoloConfig::new(YoloScale::Nano, 80);
     let model = Yolo26Detect::with_zero_weights(cfg);
 
-    let images = Tensor::zeros(&[1, 3, 320, 320], DType::Float32).unwrap();
+    let images = Tensor::zeros(&[1, 3, 320, 320], DType::Float32);
     let var = Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();
 
@@ -74,7 +74,7 @@ fn forward_realize_nano() {
     let cfg = YoloConfig::new(YoloScale::Nano, 80);
     let model = Yolo26Detect::with_zero_weights(cfg);
 
-    let images = Tensor::zeros(&[1, 3, 320, 320], DType::Float32).unwrap();
+    let images = Tensor::zeros(&[1, 3, 320, 320], DType::Float32);
     let var = Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();
 

@@ -301,7 +301,7 @@ impl Tensor {
     /// ```
     /// # use svod_tensor::Tensor;
     /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    /// assert_eq!((&a + &a).to_vec::<f32>().unwrap(), vec![2.0, 4.0, 6.0]);
+    /// assert_eq!((&a + &a).unwrap().to_vec::<f32>().unwrap(), vec![2.0, 4.0, 6.0]);
     /// ```
     pub fn to_vec<T: HasDType + Default + Clone>(&self) -> Result<Vec<T>> {
         self.realized_for_read()?;

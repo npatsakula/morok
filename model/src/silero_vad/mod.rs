@@ -151,7 +151,7 @@ impl SileroVad {
             Some((SInt::Const(CUTOFF), SInt::Const(258))),
             Some((SInt::Const(0), SInt::Const(4))),
         ])?;
-        let x = real.square()?.try_add(&imag.square()?)?.try_sqrt()?;
+        let x = real.square().try_add(imag.square())?.try_sqrt()?;
 
         let x = self.conv1.forward(&x)?.relu()?;
         let x = self.conv2.forward(&x)?.relu()?;

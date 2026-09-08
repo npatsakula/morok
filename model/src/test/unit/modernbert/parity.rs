@@ -99,8 +99,7 @@ fn last_hidden_state_matches_pytorch() {
     let (model, ids, mask, want) = load_fixture();
     let d = want.len() / mask.len();
 
-    let mask_t =
-        Tensor::from_slice(mask.clone()).cast(DType::Bool).unwrap().try_reshape([1isize, mask.len() as isize]).unwrap();
+    let mask_t = Tensor::from_slice(mask.clone()).cast(DType::Bool).try_reshape([1isize, mask.len() as isize]).unwrap();
     let got = run_forward(&model, &ids, Some(&mask_t));
 
     let real_max = real_token_max_delta(&got, &want, &mask, d);
@@ -122,7 +121,6 @@ fn ignoring_padding_diverges_from_golden() {
     // All-ones mask: attend to every position including padding.
     let all_ones = Tensor::from_slice(vec![1i64; mask.len()])
         .cast(DType::Bool)
-        .unwrap()
         .try_reshape([1isize, mask.len() as isize])
         .unwrap();
     let got_unmasked = run_forward(&model, &ids, Some(&all_ones));
@@ -180,8 +178,7 @@ fn mlm_logits_match_pytorch() {
     let (model, ids, mask, want) = load_mlm_fixture();
     let v = want.len() / mask.len();
 
-    let mask_t =
-        Tensor::from_slice(mask.clone()).cast(DType::Bool).unwrap().try_reshape([1isize, mask.len() as isize]).unwrap();
+    let mask_t = Tensor::from_slice(mask.clone()).cast(DType::Bool).try_reshape([1isize, mask.len() as isize]).unwrap();
     let got = model.forward(&ids, Some(&mask_t)).expect("MLM forward");
     got.realize().expect("realize logits");
     let got = got.as_vec::<f32>().expect("logits readout");

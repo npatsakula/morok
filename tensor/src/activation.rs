@@ -415,7 +415,7 @@ impl Tensor {
     pub fn softsign(&self) -> Result<Self> {
         origin_call!("softsign");
         let one = self.one()?;
-        let denom = one.try_add(&self.try_abs()?)?;
+        let denom = one.try_add(self.abs())?;
         self.try_div(&denom)
     }
 

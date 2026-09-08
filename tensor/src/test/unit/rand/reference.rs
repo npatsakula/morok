@@ -34,7 +34,7 @@ crate::codegen_tests! {
         let u32_dt = DType::Scalar(ScalarDType::UInt32);
 
         let key = Tensor::from_slice([0u32, 1337u32]);
-        let counts = Tensor::arange(0, Some(20), None).unwrap().cast(u32_dt).unwrap();
+        let counts = Tensor::arange(0, Some(20), None).unwrap().cast(u32_dt);
         let counts0 = counts.try_shrink([(0usize, 10usize)]).unwrap();
         let counts1 = counts.try_shrink([(10usize, 20usize)]).unwrap();
 

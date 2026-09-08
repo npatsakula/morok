@@ -123,7 +123,7 @@ impl Tensor {
         } else {
             let out_dtype = product.uop().dtype();
             let summed = product.sum(-1)?;
-            if summed.uop().dtype() != out_dtype { summed.cast(out_dtype) } else { Ok(summed) }
+            Ok(if summed.uop().dtype() != out_dtype { summed.cast(out_dtype) } else { summed })
         }
     }
 
@@ -144,10 +144,10 @@ impl Tensor {
         let b = if trans_b { b.try_transpose(0, 1)? } else { b.clone() };
         let mut result = a.matmul(&b)?;
         if alpha != 1.0 {
-            result = result.try_mul(&Tensor::from_slice([alpha]))?;
+            result = result.try_mul(Tensor::from_slice([alpha]))?;
         }
         if let Some(c) = c {
-            let c = if beta != 1.0 { c.try_mul(&Tensor::from_slice([beta]))? } else { c.clone() };
+            let c = if beta != 1.0 { c.try_mul(Tensor::from_slice([beta]))? } else { c.clone() };
             result = result.try_add(&c)?;
         }
         Ok(result)
@@ -186,7 +186,7 @@ impl Tensor {
         // For 1D weight, use element-wise multiply (broadcast)
         let result = if weight_shape.len() == 1 {
             if let Some(dt) = dtype {
-                let casted = self.cast(dt)?;
+                let casted = self.cast(dt);
                 casted.try_mul(weight)?
             } else {
                 self.try_mul(weight)?

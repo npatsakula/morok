@@ -32,7 +32,7 @@ fn opaque_input(shape: &[usize], seed: u32) -> Result<Tensor, Box<dyn std::error
         let bits = (state >> 1) | 0x3f800000; // [1.0, 2.0)
         data.push(f32::from_bits(bits) - 1.5); // ~[-0.5, 0.5]
     }
-    let mut t = Tensor::from_slice(data);
+    let t = Tensor::from_slice(data);
     t.realize()?;
     Ok(t.try_reshape(shape.iter().map(|&d| SInt::Const(d)).collect::<Vec<_>>())?)
 }
@@ -57,7 +57,7 @@ fn fmt_bytes(n: usize) -> String {
     }
 }
 
-fn dump_plan(label: &str, mut output: Tensor) -> Result<(), Box<dyn std::error::Error>> {
+fn dump_plan(label: &str, output: Tensor) -> Result<(), Box<dyn std::error::Error>> {
     let plan = output.prepare()?;
 
     let kernels = plan.prepared_kernels();
@@ -111,9 +111,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Library SDPA path.
     {
         let (b, h, t, d) = dims();
-        let q = Tensor::full(&[b, h, t, d], 0.5f32, DType::Float32)?;
-        let k = Tensor::full(&[b, h, t, d], 0.5f32, DType::Float32)?;
-        let v = Tensor::full(&[b, h, t, d], 0.5f32, DType::Float32)?;
+        let q = Tensor::full(&[b, h, t, d], 0.5f32, DType::Float32);
+        let k = Tensor::full(&[b, h, t, d], 0.5f32, DType::Float32);
+        let v = Tensor::full(&[b, h, t, d], 0.5f32, DType::Float32);
         let out = q.scaled_dot_product_attention().key(&k).value(&v).call()?;
         dump_plan("Tensor::scaled_dot_product_attention", out)?;
     }
@@ -121,9 +121,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Hand-rolled Q@K^T → softmax → @V (identical math, no helper).
     {
         let (b, h, t, d) = dims();
-        let q = Tensor::full(&[b, h, t, d], 0.5f32, DType::Float32)?;
-        let k = Tensor::full(&[b, h, t, d], 0.5f32, DType::Float32)?;
-        let v = Tensor::full(&[b, h, t, d], 0.5f32, DType::Float32)?;
+        let q = Tensor::full(&[b, h, t, d], 0.5f32, DType::Float32);
+        let k = Tensor::full(&[b, h, t, d], 0.5f32, DType::Float32);
+        let v = Tensor::full(&[b, h, t, d], 0.5f32, DType::Float32);
         let kt = k.try_transpose(-1, -2)?;
         let scale = Tensor::const_(1.0 / (d as f64).sqrt(), DType::Float32);
         let scores = q.matmul(&kt)?.try_mul(&scale)?;

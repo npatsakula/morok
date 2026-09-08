@@ -6,13 +6,13 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 fn realized_f32(tensor: Tensor) -> Vec<f32> {
-    let tensor = tensor.cast(DType::Float32).unwrap();
+    let tensor = tensor.cast(DType::Float32);
     tensor.realize().unwrap();
     tensor.as_vec::<f32>().unwrap()
 }
 
 fn fp16(values: &[f32], shape: &[usize]) -> Tensor {
-    Tensor::from_slice(values).try_reshape(shape.to_vec()).unwrap().cast(DType::Float16).unwrap()
+    Tensor::from_slice(values).try_reshape(shape.to_vec()).unwrap().cast(DType::Float16)
 }
 
 /// `legacy` is the all-FP16 formulation the epilogue replaced: it must differ,
@@ -31,17 +31,16 @@ fn fp16_layernorm_keeps_affine_in_fp32_until_final_cast() {
         bias: fp16(&[0.03125, -0.0625, 0.09375, -0.125], &[4]),
         eps: 1e-5,
     };
-    let f32_of = |t: &Tensor| t.cast(DType::Float32).unwrap();
+    let f32_of = |t: &Tensor| t.cast(DType::Float32);
 
     let reference = f32_of(&x)
         .layernorm(-1, layer.eps)
         .unwrap()
-        .try_mul(&f32_of(&layer.weight))
+        .try_mul(f32_of(&layer.weight))
         .unwrap()
-        .try_add(&f32_of(&layer.bias))
+        .try_add(f32_of(&layer.bias))
         .unwrap()
-        .cast(DType::Float16)
-        .unwrap();
+        .cast(DType::Float16);
     let legacy = x.layernorm(-1, layer.eps).unwrap().try_mul(&layer.weight).unwrap().try_add(&layer.bias).unwrap();
 
     assert_rounds_once(layer.apply(&x).unwrap(), reference, legacy, "affine epilogue");
@@ -59,10 +58,9 @@ fn fp16_linear_keeps_bias_epilogue_in_fp32_until_final_cast() {
         .dtype(DType::Float32)
         .call()
         .unwrap()
-        .try_add(&bias.cast(DType::Float32).unwrap())
+        .try_add(bias.cast(DType::Float32))
         .unwrap()
-        .cast(DType::Float16)
-        .unwrap();
+        .cast(DType::Float16);
     let legacy = x.linear().weight(&weight).bias(&bias).call().unwrap();
 
     assert_rounds_once(linear_with_bias(&x, &weight, &bias).unwrap(), reference, legacy, "bias addition");

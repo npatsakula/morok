@@ -162,10 +162,10 @@ fn gigaam_quantization_scales_keep_checkpoint_dtype() {
         ("layers.0.mhsa.q_proj", "layers.0.mhsa.q_weight_scale"),
         ("layers.0.ffn1.linear1.weight", "layers.0.ffn1.linear1.weight_scale"),
     ] {
-        let quantized = sd[weight].cast(DType::Int8).expect("quantize weight");
+        let quantized = sd[weight].cast(DType::Int8);
         let out = quantized.dim_const(0).unwrap();
         sd.insert(weight.into(), quantized);
-        sd.insert(scale.into(), Tensor::full(&[out], 1.0f32, DType::Float32).unwrap());
+        sd.insert(scale.into(), Tensor::full(&[out], 1.0f32, DType::Float32));
     }
 
     let model = GigaAm::from_state_dict_with_encoder_dtype(&sd, cfg, None, DType::Float16).expect("load FP16 encoder");
@@ -185,8 +185,8 @@ fn gigaam_rejects_ctc_head_shape_mismatched_with_config() {
     let cfg = test_config();
     let source = GigaAm::with_random_weights(cfg.clone());
     let mut sd = compose_state_dict(&source);
-    sd.insert("head.weight".into(), Tensor::full(&[257, cfg.d_model, 1], 0.0f32, DType::Float32).unwrap());
-    sd.insert("head.bias".into(), Tensor::full(&[257], 0.0f32, DType::Float32).unwrap());
+    sd.insert("head.weight".into(), Tensor::full(&[257, cfg.d_model, 1], 0.0f32, DType::Float32));
+    sd.insert("head.bias".into(), Tensor::full(&[257], 0.0f32, DType::Float32));
 
     let err = match GigaAm::from_state_dict(&sd, cfg, None) {
         Ok(_) => panic!("mismatched CTC head must fail"),

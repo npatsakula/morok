@@ -837,7 +837,7 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
             // built outside the caller's origin scope.
             let key_lens_clamped = opts.key_lens.map(|lens| {
                 let _shared = svod_ir::origin::OriginScope::suspend();
-                let ones = Tensor::full(&[b], ConstValue::Int(1), DType::Int32).expect("ones[b]");
+                let ones = Tensor::full(&[b], ConstValue::Int(1), DType::Int32);
                 lens.maximum(&ones).expect("clamp key_lens >= 1")
             });
             let mut ins: Vec<&Tensor> = vec![q, k, v];

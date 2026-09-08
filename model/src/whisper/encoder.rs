@@ -123,7 +123,7 @@ impl AudioEncoder {
         // feeds fp32 mel). Matches `model.py:48` weight.to(x.dtype) from the
         // other direction — we cast x to the weight dtype so the graph is uniform.
         let dtype = self.conv1.weight.dtype().clone();
-        let mel = mel.cast(dtype.clone())?;
+        let mel = mel.cast(dtype.clone());
         let x = scoped("conv1", || self.conv1.forward(&mel))?;
         let x = x.gelu_exact()?;
         let x = scoped("conv2", || self.conv2.forward(&x))?;
@@ -133,7 +133,7 @@ impl AudioEncoder {
         let x = x.try_permute(&[0, 2, 1])?;
 
         // Add positional embedding [n_audio_ctx, D]
-        let x = x.try_add(&self.positional_embedding)?.cast(dtype)?;
+        let x = x.try_add(&self.positional_embedding)?.cast(dtype);
 
         let (batch, sequence, state) = (x.dim_const(0)?, x.dim_const(1)?, x.dim_const(2)?);
         let padded_sequence = encoder_padded_sequence_len(&x.device(), sequence);
@@ -141,7 +141,7 @@ impl AudioEncoder {
             Some(padded) => {
                 let x = x.try_pad(&[(0, 0), (0, (padded - sequence) as isize), (0, 0)])?;
                 let lens =
-                    Tensor::full(&[batch], svod_ir::ConstValue::Int(sequence as i64), DType::Int32)?.to(x.device());
+                    Tensor::full(&[batch], svod_ir::ConstValue::Int(sequence as i64), DType::Int32).to(x.device());
                 (x, Some(lens))
             }
             None => (x, None),
@@ -159,7 +159,7 @@ impl AudioEncoder {
         // host (copyout_prefix into Vec<f32>) and fed to the prefill/step JITs
         // which cast it back to the compute dtype. Keeping the output fp32 means
         // the host read path works regardless of compute dtype.
-        Ok(scoped("ln_post", || self.ln_post.apply(&x))?.cast(DType::Float32)?)
+        Ok(scoped("ln_post", || self.ln_post.apply(&x))?.cast(DType::Float32))
     }
 }
 

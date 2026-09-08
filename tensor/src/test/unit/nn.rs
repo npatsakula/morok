@@ -611,8 +611,8 @@ crate::codegen_tests! {
         let f = parts[1].sigmoid().unwrap();
         let g = parts[2].tanh().unwrap();
         let o = parts[3].sigmoid().unwrap();
-        let exp_c = f.try_mul(&c0).unwrap().try_add(&i.try_mul(&g).unwrap()).unwrap();
-        let exp_h = o.try_mul(&exp_c.tanh().unwrap()).unwrap();
+        let exp_c = f.try_mul(&c0).unwrap().try_add(i.try_mul(&g).unwrap()).unwrap();
+        let exp_h = o.try_mul(exp_c.tanh().unwrap()).unwrap();
         let exp_h = exp_h.contiguous();
         let exp_c = exp_c.contiguous();
         exp_h.realize_with(&config).unwrap();
@@ -625,10 +625,10 @@ crate::codegen_tests! {
     fn test_mean_variance_normalize_float16_constant_row(config) {
         // A float16 `eps` is subnormal and flushes to zero, so a constant row
         // divided 0 by 0 and produced NaN; the f32 path returns zeros.
-        let x = Tensor::from_slice(vec![1000.0f32; 512]).try_reshape([1, 512]).unwrap().cast(DType::Float16).unwrap();
+        let x = Tensor::from_slice(vec![1000.0f32; 512]).try_reshape([1, 512]).unwrap().cast(DType::Float16);
         let y = x.mean_variance_normalize(&[1], 1e-5).unwrap();
         assert_eq!(y.uop().dtype(), DType::Float16);
-        let y = y.cast(DType::Float32).unwrap();
+        let y = y.cast(DType::Float32);
         let values = y.realize_with_and(&config).as_vec::<f32>().unwrap();
         assert!(values.iter().all(|v| *v == 0.0), "expected zeros, got {:?}", &values[..4]);
     }
@@ -637,11 +637,11 @@ crate::codegen_tests! {
         // Near-constant row: 1000 ± 4 in float16 must track the float32 result.
         let data: Vec<f32> = (0..512).map(|i| if i % 2 == 0 { 1004.0 } else { 996.0 }).collect();
         let x32 = Tensor::from_slice(data).try_reshape([1, 512]).unwrap();
-        let x16 = x32.cast(DType::Float16).unwrap();
+        let x16 = x32.cast(DType::Float16);
 
         let reference = x32.mean_variance_normalize(&[1], 1e-5).unwrap();
         let reference = reference.realize_with_and(&config).as_vec::<f32>().unwrap();
-        let actual = x16.mean_variance_normalize(&[1], 1e-5).unwrap().cast(DType::Float32).unwrap();
+        let actual = x16.mean_variance_normalize(&[1], 1e-5).unwrap().cast(DType::Float32);
         let actual = actual.realize_with_and(&config).as_vec::<f32>().unwrap();
 
         for (got, expected) in actual.iter().zip(reference.iter()) {
@@ -703,10 +703,10 @@ crate::codegen_tests! {
             .try_reshape([1, 4])
             .unwrap()
             .cast(DType::Float16)
-            .unwrap();
+            ;
 
         // Reference from the float16-rounded activations, quantized in f32.
-        let widened = x.cast(DType::Float32).unwrap();
+        let widened = x.cast(DType::Float32);
         let values = widened.realize_with_and(&config).as_vec::<f32>().unwrap();
         let scale = (values.iter().fold(0.0f32, |acc, v| acc.max(v.abs())) / 127.0).max(1e-6);
         let expected: f32 = values.iter().map(|v| (v / scale).round().clamp(-127.0, 127.0)).sum::<f32>() * scale;
@@ -715,7 +715,7 @@ crate::codegen_tests! {
         let weight_scale = Tensor::from_slice([1.0f32]);
         let output = x.dynamic_quantized_linear().weight(&weight).weight_scale(&weight_scale).call().unwrap();
         assert_eq!(output.uop().dtype(), DType::Float16);
-        let output = output.cast(DType::Float32).unwrap();
+        let output = output.cast(DType::Float32);
         let got = output.realize_with_and(&config).as_vec::<f32>().unwrap()[0];
         assert!(got.is_finite(), "float16 activation scale overflowed: {got}");
         assert!((got - expected).abs() <= expected * 2e-2, "got {got}, expected {expected}");
@@ -724,8 +724,8 @@ crate::codegen_tests! {
     fn test_conv2d_int8_promotes_accumulator(config) {
         // 3x3 of 10 convolved with 3x3 of 5 sums to 450 — only representable
         // once the reduction promotes int8 to int32.
-        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 10.0f32)).cast(DType::Int8).unwrap();
-        let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 5.0f32)).cast(DType::Int8).unwrap();
+        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 10.0f32)).cast(DType::Int8);
+        let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 5.0f32)).cast(DType::Int8);
         let result = x.conv2d().weight(&w).call().unwrap().contiguous();
         result.realize_with(&config).unwrap();
         assert_eq!(result.uop().dtype(), DType::Int32);
@@ -735,8 +735,8 @@ crate::codegen_tests! {
     fn test_conv2d_int8_explicit_acc_dtype_wins(config) {
         // An explicit `acc_dtype` still selects the accumulator (and suppresses
         // promotion) rather than conflicting with it.
-        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 10.0f32)).cast(DType::Int8).unwrap();
-        let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 5.0f32)).cast(DType::Int8).unwrap();
+        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 10.0f32)).cast(DType::Int8);
+        let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 5.0f32)).cast(DType::Int8);
         let result =
             x.conv2d().weight(&w).acc_dtype(DType::Int64).call().unwrap().contiguous();
         result.realize_with(&config).unwrap();
@@ -746,7 +746,7 @@ crate::codegen_tests! {
 
     fn test_avg_pool2d_int8_promotes_accumulator(config) {
         // 2x2 window of 100 sums to 400: wraps to -112 (mean -28) in int8.
-        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 100.0f32)).cast(DType::Int8).unwrap();
+        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 100.0f32)).cast(DType::Int8);
 
         // count_include_pad=false divides two promoted int32 sums.
         let counted = x.avg_pool2d().kernel_size(&[2, 2]).count_include_pad(false).call().unwrap().contiguous();
@@ -783,8 +783,12 @@ fn test_densenet_two_layer_kernel_count() {
         let var = Tensor::from_slice(vec![1.0f32; ch]);
         let gamma = Tensor::from_slice(vec![1.0f32; ch]);
         let beta = Tensor::from_slice(vec![0.0f32; ch]);
-        let invstd =
-            (&var + Tensor::const_(1e-5f64, svod_dtype::DType::Float32)).try_sqrt().unwrap().reciprocal().unwrap();
+        let invstd = (&var + Tensor::const_(1e-5f64, svod_dtype::DType::Float32))
+            .unwrap()
+            .try_sqrt()
+            .unwrap()
+            .reciprocal()
+            .unwrap();
         (mean, invstd, gamma, beta)
     };
 

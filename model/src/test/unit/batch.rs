@@ -47,12 +47,12 @@ fn read_prefix_f32(t: &Tensor, len: usize) -> Vec<f32> {
 fn test_output_length_matches_forward() {
     let model = GigaAm::with_random_weights(test_config());
 
-    let x = Tensor::full(&[1, 100, 64], 0.0f32, DType::Float32).unwrap();
+    let x = Tensor::full(&[1, 100, 64], 0.0f32, DType::Float32);
     let out = model.encoder.subsampling.forward(&x).unwrap();
     let actual_t = out.dim_const(1).unwrap();
     assert_eq!(model.encoder.subsampling_output_length(100), actual_t);
 
-    let x2 = Tensor::full(&[1, 50, 64], 0.0f32, DType::Float32).unwrap();
+    let x2 = Tensor::full(&[1, 50, 64], 0.0f32, DType::Float32);
     let out2 = model.encoder.subsampling.forward(&x2).unwrap();
     let actual_t2 = out2.dim_const(1).unwrap();
     assert_eq!(model.encoder.subsampling_output_length(50), actual_t2);
@@ -111,7 +111,7 @@ fn test_encode_batch_near_max_mel_runs() {
     let cfg = test_config();
     let t = cfg.max_mel_frames;
 
-    let x = Tensor::full(&[1, cfg.n_mels, t], 0.1f32, DType::Float32).unwrap();
+    let x = Tensor::full(&[1, cfg.n_mels, t], 0.1f32, DType::Float32);
     let lengths = Tensor::from_slice([t as i32]);
 
     let out = model.encoder.forward_batch(&x, &lengths).unwrap();
@@ -128,8 +128,8 @@ fn test_single_vs_batch_consistency() {
     let t = 10;
     let t_sub = model.encoder.subsampling_output_length(t);
 
-    let x1 = Tensor::full(&[1, n_mels, t], 0.5f32, DType::Float32).unwrap();
-    let x2 = Tensor::full(&[1, n_mels, t], 0.3f32, DType::Float32).unwrap();
+    let x1 = Tensor::full(&[1, n_mels, t], 0.5f32, DType::Float32);
+    let x2 = Tensor::full(&[1, n_mels, t], 0.3f32, DType::Float32);
     let lengths_single = Tensor::from_slice([t as i32]);
 
     let out1 = model.encoder.forward_batch(&x1, &lengths_single).unwrap();
@@ -227,7 +227,7 @@ fn test_encode_batch_full_lengths_finite() {
     let cfg = test_config();
     let t = 256usize;
 
-    let x = Tensor::full(&[2, cfg.n_mels, t], 0.1f32, DType::Float32).unwrap();
+    let x = Tensor::full(&[2, cfg.n_mels, t], 0.1f32, DType::Float32);
     let lengths = Tensor::from_slice([t as i32, t as i32]);
 
     let out = model.encoder.forward_batch(&x, &lengths).unwrap();
@@ -291,7 +291,7 @@ fn encoder_forward_fa_eligible_finite() {
     let t_sub = model.encoder.subsampling_output_length(t);
     assert_eq!(t_sub, 128, "expected T_sub=128 for FA tile eligibility, got {t_sub}");
 
-    let x = Tensor::full(&[2, cfg.n_mels, t], 0.1f32, DType::Float32).unwrap();
+    let x = Tensor::full(&[2, cfg.n_mels, t], 0.1f32, DType::Float32);
     // Lane 0 partially valid (mel 300 -> shorter T_sub), lane 1 fully valid.
     let lengths = Tensor::from_slice([300i32, t as i32]);
 

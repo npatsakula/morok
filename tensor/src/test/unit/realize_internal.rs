@@ -52,7 +52,7 @@ fn test_build_schedule_input_buffers_collects_nonzero_mselect_shard() {
 fn test_profile_populates_static_info_and_realizes() {
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
     let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
 
     let report = c.profile(&ProfileOptions::default()).expect("profile");
     assert_eq!(report.stages.len(), 1, "one profile stage");
@@ -153,7 +153,7 @@ fn test_resolve_compiled_kernel_buffer_indices_rejects_wrong_compact_count() {
 fn test_restore_post_schedule_pre_schedule_rewrites_runtime_buf_uops() {
     crate::test::helpers::test_setup();
 
-    let c = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
+    let c = (&Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0])).unwrap();
     let sink = UOp::sink(vec![c.uop().contiguous()]);
 
     let normalization = normalize_for_schedule_cache(&sink).expect("normalize schedule cache");
@@ -431,7 +431,7 @@ fn test_realize_simple_add() {
     let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
 
     // Create computation: a + b
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
 
     // Realize should compile and execute the kernel
     c.realize().unwrap();
@@ -514,7 +514,7 @@ fn test_prepare_simple_add() {
     // Create computation: a + b
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
 
     // Prepare should compile kernels and allocate buffers
     let plan = c.prepare();
@@ -534,7 +534,7 @@ fn test_prepare_and_execute() {
     // Create computation: a + b
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
 
     // Prepare
     let plan = c.prepare().expect("prepare should succeed");
@@ -559,7 +559,7 @@ fn test_prepare_and_execute_twice() {
     // Create computation
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
 
     // Prepare once
     let plan = c.prepare().expect("prepare should succeed");
@@ -679,7 +679,7 @@ fn test_realize_buffer_cleanup() {
     let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
 
     // Realize the computation
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
     c.realize().expect("realize should succeed");
 
     // Verify computation is correct
@@ -697,7 +697,7 @@ fn test_prepare_execute_cleanup() {
     // Create input tensors
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
 
     // Prepare the plan
     let plan = c.prepare().expect("prepare should succeed");
@@ -747,7 +747,7 @@ fn test_memory_growth_detection() {
     // Create input tensors
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
     let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
 
     // Prepare ONCE
     let plan = c.prepare().expect("prepare should succeed");
@@ -799,7 +799,7 @@ fn test_memory_growth_realize_pattern() {
     // Single realize should work correctly
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
     let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
     c.realize().expect("realize should succeed");
 
     // Verify result
@@ -817,7 +817,7 @@ fn buffers_expire_automatically_with_their_graphs() {
     // live buffer) and defeat the lifetime assertion below.
     let a = Tensor::from_slice([13.5f32, 26.25, 39.125]);
     let b = Tensor::from_slice([48.0625f32, 60.03125, 72.015625]);
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
     c.realize().expect("realize");
     let out_id = c.uop().base().id;
     assert!(crate::tensor_registry::get_buffer(out_id).is_some());
@@ -847,8 +847,8 @@ fn test_parallel_prepare_names_kernels_in_schedule_order() {
         let outputs: Vec<Tensor> = (0..KERNELS)
             .map(|i| {
                 let x = Tensor::from_slice((0..LEN).map(|v| v as f32).collect::<Vec<_>>());
-                let scale = Tensor::full(&[LEN], offset + i as f32, DType::Float32).unwrap();
-                (&x * &scale).sum(0).unwrap()
+                let scale = Tensor::full(&[LEN], offset + i as f32, DType::Float32);
+                (&x * &scale).unwrap().sum(0).unwrap()
             })
             .collect();
         let config = PrepareConfig { threads, ..Default::default() };

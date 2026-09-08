@@ -489,11 +489,11 @@ crate::codegen_tests! {
         assert_eq!(indices.clone().realize_with_and(&config).as_vec::<i32>().unwrap(), [5i32, 4, 3, 2, 1], "Indices mismatch");
 
         // Step 5: Cast to int32
-        let mask_int = mask.cast(DType::Int32).unwrap();
+        let mask_int = mask.cast(DType::Int32);
         // Expected: [0, 0, 0, 1, 0]
         assert_eq!(mask_int.clone().realize_with_and(&config).as_vec::<i32>().unwrap(), [0, 0, 0, 1, 0], "Mask int mismatch");
 
-        let indices_i32 = indices.cast(DType::Int32).unwrap();
+        let indices_i32 = indices.cast(DType::Int32);
         assert_eq!(indices_i32.clone().realize_with_and(&config).as_vec::<i32>().unwrap(), [5, 4, 3, 2, 1], "Indices int32 mismatch");
 
         // Step 6: Multiply mask by indices
@@ -621,10 +621,10 @@ crate::codegen_tests! {
     // order; only a float32 accumulator keeps mean finite (= 100.0, cast back to f16).
     fn test_mean_float16_accumulates_in_float32(config) {
         test_setup();
-        let t = Tensor::from_slice(vec![100.0f32; 1024]).cast(DType::Float16).unwrap();
+        let t = Tensor::from_slice(vec![100.0f32; 1024]).cast(DType::Float16);
         let m = t.mean(()).unwrap();
         assert_eq!(m.uop().dtype(), DType::Float16, "mean must cast back to input dtype");
-        let v = m.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        let v = m.cast(DType::Float32).realize_with_and(&config).as_vec::<f32>().unwrap();
         assert!(v[0].is_finite(), "float16 mean overflowed to {} — accumulated in float16, not float32", v[0]);
         assert_close_f32(&v, &[100.0], 1e-2);
     }
@@ -633,10 +633,10 @@ crate::codegen_tests! {
     // float32 squared-deviation accumulation and the cast-back to float16.
     fn test_var_float16_value(config) {
         test_setup();
-        let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]).cast(DType::Float16).unwrap();
+        let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]).cast(DType::Float16);
         let v = t.var(()).unwrap();
         assert_eq!(v.uop().dtype(), DType::Float16, "var must cast back to input dtype");
-        let r = v.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        let r = v.cast(DType::Float32).realize_with_and(&config).as_vec::<f32>().unwrap();
         assert_close_f32(&r, &[2.5], 1e-2);
     }
 
@@ -646,16 +646,16 @@ crate::codegen_tests! {
     fn test_var_float16_large_n_stays_finite(config) {
         test_setup();
         let data: Vec<f32> = (0..16384).map(|i| if i % 2 == 0 { 3.0 } else { -3.0 }).collect();
-        let t = Tensor::from_slice(data).cast(DType::Float16).unwrap();
+        let t = Tensor::from_slice(data).cast(DType::Float16);
 
         let v = t.var_with().axes(()).correction(0).call().unwrap();
         assert_eq!(v.uop().dtype(), DType::Float16, "var must cast back to input dtype");
-        let v = v.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        let v = v.cast(DType::Float32).realize_with_and(&config).as_vec::<f32>().unwrap();
         assert!(v[0].is_finite(), "float16 var overflowed to {}", v[0]);
         assert_close_f32(&v, &[9.0], 1e-3);
 
         let s = t.std_with().axes(()).correction(0).call().unwrap();
-        let s = s.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        let s = s.cast(DType::Float32).realize_with_and(&config).as_vec::<f32>().unwrap();
         assert_close_f32(&s, &[3.0], 1e-3);
     }
 
@@ -664,10 +664,10 @@ crate::codegen_tests! {
     fn test_var_float16_near_constant_row(config) {
         test_setup();
         let data: Vec<f32> = (0..8192).map(|i| if i % 2 == 0 { 1004.0 } else { 996.0 }).collect();
-        let t = Tensor::from_slice(data).try_reshape([1, 8192]).unwrap().cast(DType::Float16).unwrap();
+        let t = Tensor::from_slice(data).try_reshape([1, 8192]).unwrap().cast(DType::Float16);
 
         let v = t.var_with().axes(1isize).correction(0).call().unwrap();
-        let v = v.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        let v = v.cast(DType::Float32).realize_with_and(&config).as_vec::<f32>().unwrap();
         assert!(v[0].is_finite(), "float16 var overflowed to {}", v[0]);
         assert_close_f32(&v, &[16.0], 1e-3);
     }
@@ -837,7 +837,7 @@ crate::codegen_tests! {
         // Create indices tensor [5, 4, 3, 2, 1]
         let indices = Tensor::arange(5, Some(0), Some(-1)).unwrap();
 
-        let indices_i32 = indices.cast(DType::Int32).unwrap();
+        let indices_i32 = indices.cast(DType::Int32);
         assert_eq!(indices_i32.realize_with_and(&config).as_vec::<i32>().unwrap(), [5, 4, 3, 2, 1]);
     }
 

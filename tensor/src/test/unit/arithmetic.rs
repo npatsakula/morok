@@ -11,7 +11,7 @@ fn simple() {
 fn test_add_same_shape() {
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
 
     // Verify it created an Add operation
     if let Op::Binary(op, _, _) = c.uop().op() {
@@ -28,7 +28,7 @@ fn test_add_same_shape() {
 fn test_mul_same_shape() {
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c = &a * &b;
+    let c = (&a * &b).unwrap();
 
     // Verify it created a Mul operation
     if let Op::Binary(op, _, _) = c.uop().op() {
@@ -45,7 +45,7 @@ fn test_mul_same_shape() {
 fn test_add_type_promotion() {
     let a = Tensor::from_slice([1i32, 2, 3]);
     let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
 
     // Result should be promoted to Float32
     assert_eq!(c.uop().dtype(), svod_dtype::DType::Float32);
@@ -55,7 +55,7 @@ fn test_add_type_promotion() {
 fn test_mul_type_promotion() {
     let a = Tensor::from_slice([1i32, 2, 3]);
     let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c = &a * &b;
+    let c = (&a * &b).unwrap();
 
     // Result should be promoted to Float32
     assert_eq!(c.uop().dtype(), svod_dtype::DType::Float32);
@@ -115,7 +115,7 @@ fn test_chained_operations() {
     let c = Tensor::from_slice([7.0f32, 8.0, 9.0]);
 
     // Test (a + b) * c
-    let result = (&a + &b) * &c;
+    let result = ((&a + &b).unwrap() * &c).unwrap();
 
     // Verify it creates the correct UOp graph
     if let Op::Binary(op, _, _) = result.uop().op() {
@@ -131,7 +131,7 @@ fn test_lazy_evaluation() {
     let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
 
     // Perform operation
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
 
     // Result should NOT have a buffer (lazy evaluation)
     assert!(c.buffer().is_none());
@@ -147,7 +147,7 @@ fn test_sub_same_shape() {
     // codegen rewrites for backends that support it.
     let a = Tensor::from_slice([5.0f32, 6.0, 7.0]);
     let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let c = &a - &b;
+    let c = (&a - &b).unwrap();
 
     assert!(
         matches!(c.uop().op(), Op::Binary(svod_ir::BinaryOp::Add, _, _)),
@@ -160,7 +160,7 @@ fn test_sub_same_shape() {
 fn test_div_same_shape() {
     let a = Tensor::from_slice([10.0f32, 20.0, 30.0]);
     let b = Tensor::from_slice([2.0f32, 4.0, 5.0]);
-    let c = &a / &b;
+    let c = (&a / &b).unwrap();
 
     if let Op::Binary(op, _, _) = c.uop().op() {
         assert_eq!(format!("{:?}", op), "Fdiv");
@@ -187,7 +187,7 @@ fn test_operator_variants_sub() {
     let a = Tensor::from_slice([5.0f32, 6.0, 7.0]);
     let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
 
-    let _c1 = &a - &b;
+    let _c1 = (&a - &b).unwrap();
     let _c2 = a.clone() - b.clone();
     let _c3 = &a - b.clone();
     let _c4 = a.clone() - &b;
@@ -198,7 +198,7 @@ fn test_operator_variants_div() {
     let a = Tensor::from_slice([10.0f32, 20.0, 30.0]);
     let b = Tensor::from_slice([2.0f32, 4.0, 5.0]);
 
-    let _c1 = &a / &b;
+    let _c1 = (&a / &b).unwrap();
     let _c2 = a.clone() / b.clone();
     let _c3 = &a / b.clone();
     let _c4 = a.clone() / &b;
@@ -282,7 +282,7 @@ fn test_neg_trait_variants() {
 #[test]
 fn test_abs_basic() {
     let a = Tensor::from_slice([-1.0f32, 2.0, -3.0]);
-    let b = a.try_abs().unwrap();
+    let b = a.abs();
 
     if let Op::Unary(op, _) = b.uop().op() {
         assert_eq!(format!("{:?}", op), "Abs");
@@ -294,7 +294,7 @@ fn test_abs_basic() {
 #[test]
 fn test_abs_int() {
     let a = Tensor::from_slice([-1i32, 2, -3]);
-    let b = a.try_abs().unwrap();
+    let b = a.abs();
 
     if let Op::Unary(op, _) = b.uop().op() {
         assert_eq!(format!("{:?}", op), "Abs");
@@ -380,7 +380,7 @@ fn test_transcendental_error_on_int() {
 fn test_unary_lazy_evaluation() {
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let b = -&a;
-    let c = a.try_abs().unwrap();
+    let c = a.abs();
     let d = a.try_sqrt().unwrap();
 
     // Results should NOT have buffers (lazy evaluation)

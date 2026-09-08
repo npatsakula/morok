@@ -24,7 +24,7 @@ fn forward_shape_cls() {
     let cfg = YoloConfig::new(YoloScale::Nano, 1000);
     let model = Yolo26Classify::with_zero_weights(cfg);
 
-    let images = Tensor::zeros(&[1, 3, 224, 224], DType::Float32).unwrap();
+    let images = Tensor::zeros(&[1, 3, 224, 224], DType::Float32);
     let var = Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();
 

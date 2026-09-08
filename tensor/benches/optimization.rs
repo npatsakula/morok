@@ -76,7 +76,7 @@ fn bench_matmul(c: &mut Criterion) {
             let b = create_matrix(size, size);
 
             // HEURISTIC: Prepare OUTSIDE timing (compilation happens here)
-            let mut result_h = a.matmul(&b).expect("matmul should succeed");
+            let result_h = a.matmul(&b).expect("matmul should succeed");
             let plan_h = result_h.prepare_with(&heuristic_config).expect("prepare should succeed");
 
             print_tree("HEURISTIC", size, &plan_h, &result_h);
@@ -86,7 +86,7 @@ fn bench_matmul(c: &mut Criterion) {
             });
 
             // BEAM: Prepare OUTSIDE timing (beam search + compilation happens here)
-            let mut result_b = a.matmul(&b).expect("matmul should succeed");
+            let result_b = a.matmul(&b).expect("matmul should succeed");
             let plan_b = result_b.prepare_with(&beam_config).expect("prepare should succeed");
 
             print_tree("BEAM", size, &plan_b, &result_b);

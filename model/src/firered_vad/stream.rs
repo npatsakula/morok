@@ -176,7 +176,7 @@ impl FireRedVadStream {
     /// state, equivalent to conv zero-padding at a sequence start. With these,
     /// `forward_stream` over a whole sequence IS the full causal forward.
     pub fn zero_caches() -> Result<Vec<Tensor>> {
-        (0..LAYERS).map(|_| Ok(Tensor::zeros(&[1, PROJ, 1, STREAM_CACHE], DType::Float32)?)).collect()
+        (0..LAYERS).map(|_| Ok(Tensor::zeros(&[1, PROJ, 1, STREAM_CACHE], DType::Float32))).collect()
     }
 
     /// Causal DFSMN forward over one chunk: pre-CMVN fbank `[1, T, N_MELS]` +

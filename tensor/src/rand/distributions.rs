@@ -54,7 +54,7 @@ impl Tensor {
         }
         let u = Tensor::rand(shape)?;
         let scale = u.broadcast_scalar(ConstValue::Float(high - low))?;
-        let scaled = u.try_mul(&scale)?.cast(dtype)?;
+        let scaled = u.try_mul(&scale)?.cast(dtype);
         let offset = scaled.broadcast_scalar(ConstValue::Float(low))?;
         scaled.try_add(&offset)
     }
@@ -132,7 +132,7 @@ impl Tensor {
         }
         let scaled = Tensor::rand(shape)?;
         let range = scaled.broadcast_scalar(ConstValue::Float((high - low) as f64))?;
-        let truncated = scaled.try_mul(&range)?.cast(DType::Int32)?;
+        let truncated = scaled.try_mul(&range)?.cast(DType::Int32);
         let offset = truncated.broadcast_scalar(ConstValue::Int(low))?;
         truncated.try_add(&offset)
     }

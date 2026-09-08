@@ -92,7 +92,7 @@ fn test_full_dynamic_binary_op_shape() {
     let shape = [bound.as_sint(), SInt::from(3)];
     let c = Tensor::full_dynamic(&shape, 2.0f32, DType::Float32)
         .unwrap()
-        .try_add(&Tensor::full_dynamic(&shape, 3.0f32, DType::Float32).unwrap())
+        .try_add(Tensor::full_dynamic(&shape, 3.0f32, DType::Float32).unwrap())
         .unwrap();
     let s = c.shape().unwrap();
     assert!(s[0].is_symbolic());
@@ -161,7 +161,7 @@ crate::codegen_tests! {
         let shape = [SInt::from(4)];
         let a = Tensor::full_dynamic(&shape, 2.0f32, DType::Float32).unwrap();
         let b = Tensor::full_dynamic(&shape, 3.0f32, DType::Float32).unwrap();
-        let c = &a + &b;
+        let c = (&a + &b).unwrap();
         assert_eq!(c.realize_with_and(&config).as_vec::<f32>().unwrap(), vec![5.0; 4]);
     }
 
@@ -171,7 +171,7 @@ crate::codegen_tests! {
         let a = Tensor::full_dynamic(&shape, 2.0f32, DType::Float32).unwrap();
         let b = Tensor::full_dynamic(&shape, 3.0f32, DType::Float32).unwrap();
         let c = Tensor::full_dynamic(&shape, 1.0f32, DType::Float32).unwrap();
-        let r = (&a + &b) * &c;
+        let r = ((&a + &b).unwrap() * &c).unwrap();
         assert_close_f32(&r.realize_with_and(&config).as_vec::<f32>().unwrap(), &[5.0; 4], 1e-6);
     }
 
@@ -179,7 +179,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
         let b = Tensor::full_dynamic(&[SInt::from(4)], 10.0f32, DType::Float32).unwrap();
-        let c = &a + &b;
+        let c = (&a + &b).unwrap();
         assert_close_f32(&c.realize_with_and(&config).as_vec::<f32>().unwrap(), &[11.0, 12.0, 13.0, 14.0], 1e-6);
     }
 
@@ -212,7 +212,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([0.0f32, 0.0, 0.0]);
         let b = Tensor::from_slice([10.0f32, 20.0, 30.0]);
-        let output = &a + &b;
+        let output = (&a + &b).unwrap();
         a.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0]));
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[10.0, 20.0, 30.0], 1e-6);
     }
@@ -229,7 +229,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([0.0f32, 0.0, 0.0]);
         let b = Tensor::from_slice([0.0f32, 0.0, 0.0]);
-        let output = &a * &b;
+        let output = (&a * &b).unwrap();
         a.assign(&Tensor::from_slice([2.0f32, 3.0, 4.0]));
         b.assign(&Tensor::from_slice([5.0f32, 6.0, 7.0]));
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[0.0, 0.0, 0.0], 1e-6);
@@ -240,7 +240,7 @@ crate::codegen_tests! {
         let a = Tensor::from_slice([0.0f32, 0.0, 0.0]);
         let b = Tensor::from_slice([10.0f32, 20.0, 30.0]);
         a.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0]));
-        let output = &a + &b;
+        let output = (&a + &b).unwrap();
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[11.0, 22.0, 33.0], 1e-6);
     }
 
@@ -249,7 +249,7 @@ crate::codegen_tests! {
         let a = Tensor::empty(&[3], DType::Float32);
         let b = Tensor::empty(&[3], DType::Float32);
         a.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0]));
-        b.assign(&(&a + &Tensor::from_slice([10.0f32, 20.0, 30.0])));
+        b.assign(&(&a + &Tensor::from_slice([10.0f32, 20.0, 30.0])).unwrap());
         let sum = b.sum(()).unwrap();
         sum.realize_with(&config).unwrap();
         assert_close_f32(&sum.as_vec::<f32>().unwrap(), &[66.0], 1e-5);
@@ -264,7 +264,7 @@ crate::codegen_tests! {
         left.assign(&Tensor::from_slice([1.0f32, 2.0]));
         right.assign(&Tensor::from_slice([3.0f32, 4.0]));
 
-        let output = &left + &right;
+        let output = (&left + &right).unwrap();
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[4.0, 6.0], 1e-6);
     }
 
@@ -274,7 +274,7 @@ crate::codegen_tests! {
         let right = base.try_shrink([(2, 4)]).unwrap();
         right.assign(&Tensor::from_slice([3.0f32, 4.0]));
 
-        let output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        let output = (&base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0])).unwrap();
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[9.0, 9.0, 3.0, 4.0], 1e-6);
     }
 
@@ -287,7 +287,7 @@ crate::codegen_tests! {
         left.assign(&Tensor::from_slice([1.0f32, 2.0]));
         right.assign(&Tensor::from_slice([3.0f32, 4.0]));
 
-        let output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        let output = (&base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0])).unwrap();
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[1.0, 2.0, 3.0, 4.0], 1e-6);
     }
 
@@ -297,7 +297,7 @@ crate::codegen_tests! {
         base.try_shrink([(0, 3)]).unwrap().assign(&Tensor::from_slice([1.0f32, 2.0, 3.0]));
         base.try_shrink([(1, 4)]).unwrap().assign(&Tensor::from_slice([4.0f32, 5.0, 6.0]));
 
-        let output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        let output = (&base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0])).unwrap();
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[1.0, 4.0, 5.0, 6.0], 1e-6);
     }
 
@@ -308,7 +308,7 @@ crate::codegen_tests! {
         let dst = base.try_shrink([(1, 3)]).unwrap();
         dst.assign(&src);
 
-        let output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        let output = (&base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0])).unwrap();
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[1.0, 1.0, 2.0, 4.0], 1e-6);
     }
 
@@ -318,13 +318,13 @@ crate::codegen_tests! {
         let base = Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]).try_reshape([2, 2]).unwrap();
         let transposed = base.try_permute(&[1, 0]).unwrap();
         transposed.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([2, 2]).unwrap());
-        let transposed_output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]).try_reshape([2, 2]).unwrap();
+        let transposed_output = (&base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]).try_reshape([2, 2]).unwrap()).unwrap();
         assert_close_f32(&transposed_output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[1.0, 3.0, 2.0, 4.0], 1e-6);
 
         let base = Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
         let flipped = base.flip(&[0]).unwrap();
         flipped.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]));
-        let flipped_output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        let flipped_output = (&base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0])).unwrap();
         assert_close_f32(&flipped_output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[4.0, 3.0, 2.0, 1.0], 1e-6);
     }
 }

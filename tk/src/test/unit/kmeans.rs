@@ -161,8 +161,8 @@ fn test_kmeans_assign_amd() {
 /// `‖x[n]‖² + ‖c[k]‖² − 2·⟨x[n],c[k]⟩` (clamped ≥ 0), argmin over K. Returns
 /// `(ids [N], min_dist [N])` — entirely in f32 (no kernel).
 fn kmeans_naive(x: &svod_tensor::Tensor, c: &svod_tensor::Tensor) -> (Vec<i32>, Vec<f32>) {
-    let xf = x.cast(DType::Float32).expect("x→f32");
-    let cf = c.cast(DType::Float32).expect("c→f32");
+    let xf = x.cast(DType::Float32);
+    let cf = c.cast(DType::Float32);
     let x_dims = x.shape().expect("x shape");
     let n = x_dims[0].as_const().expect("N");
     let k = c.shape().expect("c shape")[0].as_const().expect("K");
@@ -175,7 +175,7 @@ fn kmeans_naive(x: &svod_tensor::Tensor, c: &svod_tensor::Tensor) -> (Vec<i32>, 
     let dist = x_sq
         .try_add(&c_sq_row)
         .expect("‖x‖²+‖c‖²")
-        .try_sub(&cross.try_mul(&two).expect("2·cross"))
+        .try_sub(cross.try_mul(&two).expect("2·cross"))
         .expect("full ‖x−c‖²")
         .relu()
         .expect("clamp ≥ 0"); // [N,K]
@@ -202,8 +202,8 @@ fn kmeans_naive(x: &svod_tensor::Tensor, c: &svod_tensor::Tensor) -> (Vec<i32>, 
 
 /// The true squared-L2 distance `‖x[i] − c[j]‖²` in f32 (for tie-breaking).
 fn ref_dist_full(x: &svod_tensor::Tensor, c: &svod_tensor::Tensor, i: usize, j: usize) -> f32 {
-    let xf = x.cast(DType::Float32).expect("x→f32");
-    let cf = c.cast(DType::Float32).expect("c→f32");
+    let xf = x.cast(DType::Float32);
+    let cf = c.cast(DType::Float32);
     let d = x.shape().expect("x shape")[1].as_const().expect("D");
     let xi = xf.try_shrink([(i as isize, (i + 1) as isize), (0, d as isize)]).expect("xi");
     let cj = cf.try_shrink([(j as isize, (j + 1) as isize), (0, d as isize)]).expect("cj");
@@ -278,7 +278,7 @@ fn test_kmeans_update_vs_reference() {
 
     // Random assignments in [0, k).
     let ids_vec: Vec<i32> = (0..n).map(|i| (i % k) as i32).collect();
-    let ids = Tensor::from_slice(&ids_vec).cast(DType::Int32).expect("ids");
+    let ids = Tensor::from_slice(&ids_vec).cast(DType::Int32);
 
     let (new_c, shift) = crate::kmeans_update(&x, &ids, &c).expect("kmeans_update");
     let nc = new_c;
@@ -289,8 +289,8 @@ fn test_kmeans_update_vs_reference() {
     let got_shift = sh.as_vec::<f32>().expect("shift vec");
 
     // Reference: per-cluster mean of assigned points, shift = ‖new − old‖.
-    let xf_t = x.cast(DType::Float32).expect("x→f32");
-    let cf_t = c.cast(DType::Float32).expect("c→f32");
+    let xf_t = x.cast(DType::Float32);
+    let cf_t = c.cast(DType::Float32);
     xf_t.realize().expect("realize xf");
     cf_t.realize().expect("realize cf");
     let xf = xf_t.as_vec::<f32>().expect("xf vec");
@@ -339,7 +339,7 @@ fn test_kmeans_update_err_paths() {
     use svod_tensor::Tensor;
 
     let x = Tensor::randn(&[32, 64]).expect("x");
-    let ids = Tensor::from_slice([0i32, 1, 2, 0]).cast(DType::Int32).expect("ids");
+    let ids = Tensor::from_slice([0i32, 1, 2, 0]).cast(DType::Int32);
     let c_ok = Tensor::randn(&[4, 64]).expect("c ok");
 
     // D mismatch: c has D=32, x has D=64.
@@ -350,7 +350,7 @@ fn test_kmeans_update_err_paths() {
     crate::kmeans_update(&x, &ids, &c_ok).expect_err("N mismatch must error");
 
     // Non-rank-1 ids.
-    let ids2 = Tensor::from_slice([0i32, 1]).cast(DType::Int32).expect("ids rank-1");
+    let ids2 = Tensor::from_slice([0i32, 1]).cast(DType::Int32);
     let ids2 = ids2.try_reshape([1isize, 2]).expect("ids 2D");
     let x_small = Tensor::randn(&[2, 64]).expect("x small");
     let c_small = Tensor::randn(&[4, 64]).expect("c small");
@@ -373,8 +373,8 @@ fn test_kmeans_update_err_paths() {
 /// The generic GEMM-argmin kmeans baseline — identical to `benches/kmeans.rs`.
 fn kmeans_generic_ref(xb: &svod_tensor::Tensor, cb: &svod_tensor::Tensor) -> svod_tensor::Tensor {
     let f32 = DType::Float32;
-    let xf = xb.cast(f32.clone()).expect("x→f32");
-    let cf = cb.cast(f32.clone()).expect("c→f32");
+    let xf = xb.cast(f32.clone());
+    let cf = cb.cast(f32.clone());
     let x_sq = xf.try_mul(&xf).expect("x²").sum_with().axes(1isize).keepdim(true).call().expect("Σx²");
     let c_sq = cf.try_mul(&cf).expect("c²").sum_with().axes(1isize).keepdim(true).call().expect("Σc²");
     let c_sq_row = c_sq.try_transpose(0, 1).expect("c_sq→[1,K]");
@@ -394,8 +394,8 @@ fn kmeans_generic_phi_dominance_mre() {
     // produces them) so the matmul + min-over-K fuse into one kernel — the regime
     // that exposed the tensor-core-tiled-reduce-axis phi-dominance.
     for k in [64usize, 256, 1024, 4096] {
-        let xb = Tensor::randn(&[n, d]).expect("x").cast(DType::BFloat16).expect("x→bf16");
-        let cb = Tensor::randn(&[k, d]).expect("c").cast(DType::BFloat16).expect("c→bf16");
+        let xb = Tensor::randn(&[n, d]).expect("x").cast(DType::BFloat16);
+        let cb = Tensor::randn(&[k, d]).expect("c").cast(DType::BFloat16);
         xb.realize().expect("realize xb");
         cb.realize().expect("realize cb");
 

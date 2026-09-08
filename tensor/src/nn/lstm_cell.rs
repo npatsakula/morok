@@ -42,8 +42,8 @@ impl LSTMCell {
         let weight_hh = Tensor::from_slice(&w_hh_data)
             .try_reshape([four_hidden as isize, hidden_size as isize])
             .expect("lstm_cell weight_hh reshape failed");
-        let bias_ih = Tensor::full(&[four_hidden], 0.0, dtype.clone()).expect("lstm_cell bias_ih creation");
-        let bias_hh = Tensor::full(&[four_hidden], 0.0, dtype).expect("lstm_cell bias_hh creation");
+        let bias_ih = Tensor::full(&[four_hidden], 0.0, dtype.clone());
+        let bias_hh = Tensor::full(&[four_hidden], 0.0, dtype);
         Self { weight_ih, weight_hh, bias_ih, bias_hh, hidden_size }
     }
 

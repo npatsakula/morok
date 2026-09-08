@@ -79,7 +79,7 @@ pub struct WeSpeakerResNet34 {
 }
 
 fn zeros(shape: &[usize]) -> Tensor {
-    Tensor::zeros(shape, DType::Float32).expect("zeros for wespeaker placeholder must succeed")
+    Tensor::zeros(shape, DType::Float32)
 }
 
 impl WeSpeakerResNet34 {

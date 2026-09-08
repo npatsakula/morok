@@ -64,16 +64,16 @@ impl Tensor {
         let axes_spec = AxisSpec::Multiple(axes);
 
         let original_dtype = self.uop().dtype();
-        let x32 = if original_dtype != DType::Float32 { self.cast(DType::Float32)? } else { self.clone() };
+        let x32 = if original_dtype != DType::Float32 { self.cast(DType::Float32) } else { self.clone() };
 
         let mean = x32.mean_with().axes(axes_spec.clone()).keepdim(true).call()?;
         let centered = x32.try_sub(&mean)?;
-        let variance = centered.square()?.mean_with().axes(axes_spec).keepdim(true).call()?;
+        let variance = centered.square().mean_with().axes(axes_spec).keepdim(true).call()?;
         let eps_t = Tensor::new(UOp::const_(DType::Float32, ConstValue::Float(eps)));
         let inv_std = variance.try_add(&eps_t)?.try_rsqrt()?;
         let normalized = centered.try_mul(&inv_std)?;
 
-        let normalized = if original_dtype != DType::Float32 { normalized.cast(original_dtype)? } else { normalized };
+        let normalized = if original_dtype != DType::Float32 { normalized.cast(original_dtype) } else { normalized };
         Ok((normalized, mean, inv_std))
     }
 
@@ -105,21 +105,21 @@ impl Tensor {
         let axes_spec = AxisSpec::Multiple(axes);
 
         let original_dtype = self.uop().dtype();
-        let x32 = if original_dtype != DType::Float32 { self.cast(DType::Float32)? } else { self.clone() };
+        let x32 = if original_dtype != DType::Float32 { self.cast(DType::Float32) } else { self.clone() };
 
         let norm = x32
-            .square()?
+            .square()
             .mean_with()
             .axes(axes_spec)
             .keepdim(true)
             .call()?
-            .try_add(&Tensor::new(UOp::const_(DType::Float32, ConstValue::Float(eps))))?
+            .try_add(Tensor::new(UOp::const_(DType::Float32, ConstValue::Float(eps))))?
             .try_rsqrt()?;
 
         // The f32 `norm` promotes the product to f32; cast back to the input dtype
         // so an fp16 input returns fp16 rather than silently widening to f32.
         let normalized = self.try_mul(&norm)?;
-        if original_dtype != DType::Float32 { normalized.cast(original_dtype) } else { Ok(normalized) }
+        Ok(if original_dtype != DType::Float32 { normalized.cast(original_dtype) } else { normalized })
     }
 
     /// Lp normalization along an axis.
@@ -160,11 +160,11 @@ impl Tensor {
     pub fn lp_normalize(&self, axis: isize, p: i64) -> Result<Tensor> {
         origin_call!("lp_normalize");
         let norm = match p {
-            1 => self.try_abs()?.sum_with().axes(AxisSpec::Single(axis)).keepdim(true).call()?,
-            _ => self.square()?.sum_with().axes(AxisSpec::Single(axis)).keepdim(true).call()?.try_sqrt()?,
+            1 => self.abs().sum_with().axes(AxisSpec::Single(axis)).keepdim(true).call()?,
+            _ => self.square().sum_with().axes(AxisSpec::Single(axis)).keepdim(true).call()?.try_sqrt()?,
         };
         let eps = self.uop().dtype().base().min_positive();
-        self.try_div(&norm.try_add(&Tensor::const_(eps, self.uop().dtype()))?)
+        self.try_div(&norm.try_add(Tensor::const_(eps, self.uop().dtype()))?)
     }
 
     /// Mean Variance Normalization.
@@ -196,15 +196,15 @@ impl Tensor {
         let original_dtype = self.uop().dtype();
         // Integer inputs keep the float32 result they always produced.
         let output_dtype = if original_dtype.is_float() { original_dtype.clone() } else { DType::Float32 };
-        let x32 = if original_dtype != DType::Float32 { self.cast(DType::Float32)? } else { self.clone() };
+        let x32 = if original_dtype != DType::Float32 { self.cast(DType::Float32) } else { self.clone() };
 
         let mean = x32.mean_with().axes(axes_spec.clone()).keepdim(true).call()?;
         let centered = x32.try_sub(&mean)?;
-        let pop_std = centered.square()?.mean_with().axes(axes_spec).keepdim(true).call()?.try_sqrt()?;
+        let pop_std = centered.square().mean_with().axes(axes_spec).keepdim(true).call()?.try_sqrt()?;
         let eps = Tensor::const_(eps, DType::Float32);
         let normalized = centered.try_div(&pop_std.try_add(&eps)?)?;
 
-        if output_dtype != DType::Float32 { normalized.cast(output_dtype) } else { Ok(normalized) }
+        Ok(if output_dtype != DType::Float32 { normalized.cast(output_dtype) } else { normalized })
     }
 
     /// Group normalization: reshape into groups, layernorm each group, then
@@ -260,10 +260,10 @@ impl Tensor {
 
         // Reshape to (batch, num_groups, -1), cast to f32 before layernorm
         let reshaped = self.try_reshape([batch as isize, num_groups as isize, -1])?;
-        let reshaped = if reshaped.uop().dtype() != DType::Float32 { reshaped.cast(DType::Float32)? } else { reshaped };
+        let reshaped = if reshaped.uop().dtype() != DType::Float32 { reshaped.cast(DType::Float32) } else { reshaped };
         let normed = reshaped.layernorm(-1, eps)?;
         // Cast back and reshape to original
-        let normed = if self.uop().dtype() != DType::Float32 { normed.cast(self.uop().dtype())? } else { normed };
+        let normed = if self.uop().dtype() != DType::Float32 { normed.cast(self.uop().dtype()) } else { normed };
         let orig_shape = svod_ir::shape::to_vec_isize(&x_shape).context(UOpSnafu)?;
         let normed = normed.try_reshape(&orig_shape)?;
 

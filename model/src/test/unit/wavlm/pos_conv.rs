@@ -10,7 +10,7 @@ use crate::wavlm::ConvolutionalPositionalEmbedding;
 fn pos_conv_preserves_shape() {
     let pe = ConvolutionalPositionalEmbedding::empty(1024, 128, 16);
     let t = 799;
-    let x = Tensor::zeros(&[1, t, 1024], DType::Float32).unwrap();
+    let x = Tensor::zeros(&[1, t, 1024], DType::Float32);
     let y = pe.forward(&x).expect("symbolic forward");
     let shape = y.dims().unwrap();
     assert_eq!(shape, vec![1, t, 1024]);
@@ -32,7 +32,7 @@ fn pos_conv_weight_norm_reconstruction() {
     let v = pe_init.weight.clone();
     let _ = v.shape().unwrap(); // ensure shape is usable downstream
 
-    let g = Tensor::ones(&[1, 1, kernel], DType::Float32).unwrap();
+    let g = Tensor::ones(&[1, 1, kernel], DType::Float32);
     let bias = pe_init.bias.clone();
 
     let mut sd = StateDict::new();

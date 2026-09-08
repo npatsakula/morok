@@ -29,7 +29,7 @@ impl Tensor {
 
         // one-hot mask: [*idx_shape, vocab] bool — True where the vocab row
         // matches the index value.
-        let vocab_arange = Tensor::arange(0, Some(vocab_size as i64), None)?.cast(indices.uop().dtype())?;
+        let vocab_arange = Tensor::arange(0, Some(vocab_size as i64), None)?.cast(indices.uop().dtype());
         let mask = indices.try_unsqueeze(-1)?.try_eq(&vocab_arange)?;
 
         // Reshape weight to [1... (per idx dim), vocab, embed] so its trailing
@@ -46,7 +46,7 @@ impl Tensor {
         weight_bc
             .where_(
                 &mask.try_unsqueeze(-1)?,
-                &Tensor::new(self.uop().const_like(ConstValue::zero(self.uop().dtype().base()))),
+                Tensor::new(self.uop().const_like(ConstValue::zero(self.uop().dtype().base()))),
             )?
             .sum_with()
             .axes(-2isize)
@@ -252,7 +252,7 @@ impl Tensor {
         }
         // Back to the query dtype for `@ V`, as tinygrad does.
         if scores_dtype != q_dtype {
-            attn_weights = attn_weights.cast(q_dtype)?;
+            attn_weights = attn_weights.cast(q_dtype);
         }
         attn_weights.matmul(value)
     }

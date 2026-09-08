@@ -49,9 +49,9 @@ fn build_ffn(shape: FfnShape) -> Tensor {
     let w1_data: Vec<f32> = (0..shape.d * shape.ff).map(|i| (i as f32) * 1e-4).collect();
     let w2_data: Vec<f32> = (0..shape.ff * shape.d).map(|i| (i as f32) * 1e-4).collect();
 
-    let mut x = Tensor::from_slice(&x_data).try_reshape([shape.bt as isize, shape.d as isize]).expect("reshape x");
-    let mut w1 = Tensor::from_slice(&w1_data).try_reshape([shape.d as isize, shape.ff as isize]).expect("reshape w1");
-    let mut w2 = Tensor::from_slice(&w2_data).try_reshape([shape.ff as isize, shape.d as isize]).expect("reshape w2");
+    let x = Tensor::from_slice(&x_data).try_reshape([shape.bt as isize, shape.d as isize]).expect("reshape x");
+    let w1 = Tensor::from_slice(&w1_data).try_reshape([shape.d as isize, shape.ff as isize]).expect("reshape w1");
+    let w2 = Tensor::from_slice(&w2_data).try_reshape([shape.ff as isize, shape.d as isize]).expect("reshape w2");
 
     // Realize inputs/weights so they aren't included in the FFN graph timing.
     x.realize().expect("realize x");
@@ -99,7 +99,7 @@ fn bench_ffn(c: &mut Criterion) {
         // Build + prepare OUTSIDE timing. Beam search compilation cost is
         // not what we want to measure (and it's non-trivial: 200s+ per kernel
         // shape with width=4 in some cases).
-        let mut result = build_ffn(shape);
+        let result = build_ffn(shape);
         let prepare_start = std::time::Instant::now();
         let plan = result.prepare_with(&config).expect("prepare should succeed");
         let prepare_ms = prepare_start.elapsed().as_secs_f64() * 1000.0;

@@ -69,15 +69,15 @@ pub(crate) fn forward_block<const W: usize>(
     let blank = head.predictor.blank_id as i64;
     let (l, p) = (head.pred_rnn_layers as isize, head.pred_hidden as isize);
     let (b, j) = (enc_proj.dim_const(0)? as isize, enc_proj.dim_const(2)? as isize);
-    let valid64 = valid.cast(DType::Int64)?;
-    let last = valid64.try_sub(&Tensor::from_slice([1i64]))?;
+    let valid64 = valid.cast(DType::Int64);
+    let last = valid64.try_sub(Tensor::from_slice([1i64]))?;
     // Window offsets `[0, W)` as a row vector, broadcast onto each lane's frame
     // cursor. At `W == 1` the window collapses to the single current frame and
     // every step below reduces to the per-frame greedy update.
     let w = W as isize;
     let arange_w = {
         let a = Tensor::arange(0, Some(W as i64), Some(1))?;
-        a.cast(DType::Int64)?.try_reshape([1, w])?
+        a.cast(DType::Int64).try_reshape([1, w])?
     };
     let w_const = Tensor::from_slice([W as i64]);
     let zeros_i32 = Tensor::from_slice([0i32]);
@@ -107,19 +107,19 @@ pub(crate) fn forward_block<const W: usize>(
         // `argmax_preproj` broadcasts the `[B,1,J]` predictor projection over the
         // window axis, so the same call serves W=1 and W>1.
         let toks = scoped("head", || scoped("joint", || head.joint.argmax_preproj(&enc_window, &g)))?; // [B,W] i32
-        let tok64 = toks.cast(DType::Int64)?;
+        let tok64 = toks.cast(DType::Int64);
 
-        let is_blank = tok64.try_eq(&Tensor::from_slice([blank]))?; // [B,W]
+        let is_blank = tok64.try_eq(Tensor::from_slice([blank]))?; // [B,W]
         let not_blank = is_blank.logical_not()?;
         // A window offset is usable only if it maps to a real (in-bounds) frame.
         let off_valid = time.try_add(&arange_w)?.try_lt(&valid64)?; // [B,W]
-        let usable_i32 = off_valid.try_bitand(&not_blank)?.cast(DType::Int32)?; // [B,W] {0,1}
+        let usable_i32 = off_valid.try_bitand(&not_blank)?.cast(DType::Int32); // [B,W] {0,1}
         let any_nb = usable_i32.max_with().axes(1isize).keepdim(true).call()?; // [B,1]
-        let emit = any_nb.try_ge(&Tensor::from_slice([1i32]))?; // [B,1] bool
+        let emit = any_nb.try_ge(Tensor::from_slice([1i32]))?; // [B,1] bool
         // argmax ties resolve to the first index → first usable (non-blank) offset
         // (0 when none, which `emit == false` masks out).
         let first_nb = usable_i32.argmax_with().axis(Some(1isize)).keepdim(true).call()?; // [B,1] i32
-        let first_nb64 = first_nb.cast(DType::Int64)?;
+        let first_nb64 = first_nb.cast(DType::Int64);
         let tok_sel = tok64.gather(1, &first_nb64)?; // [B,1] i64 — token at the first non-blank
 
         // Commit the selected token + predictor state on emitting lanes.
@@ -135,32 +135,32 @@ pub(crate) fn forward_block<const W: usize>(
         // Same-frame run length: a window jump lands on a fresh frame, so reset
         // the counter before this emission; the cap then forces a single-frame
         // advance exactly as the per-frame loop does.
-        let jumped = emit.try_bitand(&first_nb64.try_ge(&Tensor::from_slice([1i64]))?)?;
+        let jumped = emit.try_bitand(&first_nb64.try_ge(Tensor::from_slice([1i64]))?)?;
         let sym_base = zeros_i32.where_(&jumped, &symbols)?;
-        let symbols1 = sym_base.try_add(&Tensor::from_slice([1i32]))?.where_(&emit, &sym_base)?;
-        let cap = symbols1.try_ge(&Tensor::from_slice([max_symbols as i32]))?;
+        let symbols1 = sym_base.try_add(Tensor::from_slice([1i32]))?.where_(&emit, &sym_base)?;
+        let cap = symbols1.try_ge(Tensor::from_slice([max_symbols as i32]))?;
         // Advance time: jump past the leading blanks (emit at `first_nb`) or the
         // whole in-bounds window (all blank), clamped so time never overshoots
         // valid; the cap adds the extra single-frame step after a capped emit.
         let rem = valid64.try_sub(&time)?;
         let blank_run = rem.maximum(&zeros_i64)?.minimum(&w_const)?;
         let blank_skip = first_nb64.where_(&emit, &blank_run)?;
-        let cap_adv = emit.try_bitand(&cap)?.cast(DType::Int64)?;
+        let cap_adv = emit.try_bitand(&cap)?.cast(DType::Int64);
         time = time.try_add(&blank_skip)?.try_add(&cap_adv)?;
-        let adv_frame = in_bounds.cast(DType::Bool)?.try_bitand(&emit.logical_not()?)?.try_bitor(&cap)?;
+        let adv_frame = in_bounds.cast(DType::Bool).try_bitand(&emit.logical_not()?)?.try_bitor(&cap)?;
         symbols = zeros_i32.where_(&adv_frame, &symbols1)?;
 
         // Emission frame = safe_t + first_nb on emit (the jumped frame); the
         // value is filtered out by `emit == 0` otherwise.
         let frame_tape = safe_t.try_add(&first_nb64.where_(&emit, &zeros_i64)?)?;
-        tapes.push(tok_sel.cast(DType::Int32)?);
-        emits.push(emit.cast(DType::Int32)?);
-        frames.push(frame_tape.cast(DType::Int32)?);
+        tapes.push(tok_sel.cast(DType::Int32));
+        emits.push(emit.cast(DType::Int32));
+        frames.push(frame_tape.cast(DType::Int32));
     }
 
     let cat = |v: &[Tensor]| -> Result<Tensor> { Ok(Tensor::cat(&v.iter().collect::<Vec<_>>(), 1)?) }; // [B,K]
     let active = time.try_lt(&valid64)?;
-    let active_any = active.cast(DType::Int32)?.sum_with().axes(0isize).keepdim(true).call()?.try_reshape([1, 1])?;
+    let active_any = active.cast(DType::Int32).sum_with().axes(0isize).keepdim(true).call()?.try_reshape([1, 1])?;
 
     // Carried-state outputs are in-place writes into the input buffers:
     // `AFTER(in_buf, STORE(in_buf, final))`. The captured plan stores the final

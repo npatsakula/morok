@@ -59,7 +59,7 @@ impl ColbertHead {
         let vecs = match attention_mask {
             Some(m) => {
                 let m_no_cls = m.getitem(s![.., 1..])?;
-                let m_3d = m_no_cls.cast(vecs.dtype())?.try_unsqueeze(-1)?;
+                let m_3d = m_no_cls.cast(vecs.dtype()).try_unsqueeze(-1)?;
                 vecs.try_mul(&m_3d)?
             }
             None => vecs,

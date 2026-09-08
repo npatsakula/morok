@@ -36,15 +36,15 @@ crate::codegen_tests! {
         crate::test::helpers::test_setup();
         let f32_dt = crate::DType::Scalar(svod_dtype::ScalarDType::Float32);
         // Two realized channel-dim buffers
-        let a = Tensor::full(&[1, 4, 3, 3], 1.0f32, f32_dt.clone()).unwrap();
+        let a = Tensor::full(&[1, 4, 3, 3], 1.0f32, f32_dt.clone());
         a.realize_with(&config).unwrap();
-        let b = Tensor::full(&[1, 2, 3, 3], 2.0f32, f32_dt.clone()).unwrap();
+        let b = Tensor::full(&[1, 2, 3, 3], 2.0f32, f32_dt.clone());
         b.realize_with(&config).unwrap();
 
         // Concat along channel dim (lazy)
         let cat = Tensor::cat(&[&a, &b], 1).unwrap();
         // Elementwise (lazy)
-        let half = Tensor::full(&[1, 6, 1, 1], 0.5f32, f32_dt).unwrap();
+        let half = Tensor::full(&[1, 6, 1, 1], 0.5f32, f32_dt);
         let added = cat.try_add(&half).unwrap();
         let relu = added.relu().unwrap();
         // Reduce over spatial dims (like GlobalAveragePool)
@@ -69,13 +69,13 @@ crate::codegen_tests! {
     fn test_cat_fused_with_reduce_large(config) {
         crate::test::helpers::test_setup();
         let f32_dt = crate::DType::Scalar(svod_dtype::ScalarDType::Float32);
-        let a = Tensor::full(&[1, 32, 7, 7], 1.0f32, f32_dt.clone()).unwrap();
+        let a = Tensor::full(&[1, 32, 7, 7], 1.0f32, f32_dt.clone());
         a.realize_with(&config).unwrap();
-        let b = Tensor::full(&[1, 8, 7, 7], 3.0f32, f32_dt.clone()).unwrap();
+        let b = Tensor::full(&[1, 8, 7, 7], 3.0f32, f32_dt.clone());
         b.realize_with(&config).unwrap();
 
         let cat = Tensor::cat(&[&a, &b], 1).unwrap();
-        let one = Tensor::full(&[1, 40, 1, 1], 1.0f32, f32_dt).unwrap();
+        let one = Tensor::full(&[1, 40, 1, 1], 1.0f32, f32_dt);
         let added = cat.try_add(&one).unwrap();
         let relu = added.relu().unwrap();
         let pooled = relu.mean(vec![2isize, 3]).unwrap();
@@ -829,7 +829,7 @@ fn test_chunk_zero_chunks_is_err() {
 #[test]
 fn test_chunk_empty_dim_returns_zero_sized_chunks() {
     // dim_size==0 → `chunks` zero-sized tensors.
-    let x = Tensor::full(&[3, 0], 0.0f32, svod_dtype::DType::Float32).unwrap();
+    let x = Tensor::full(&[3, 0], 0.0f32, svod_dtype::DType::Float32);
     let chunks = x.chunk(2, 1).unwrap();
     assert_eq!(chunks.len(), 2);
     for c in &chunks {

@@ -7,7 +7,7 @@ use bon::bon;
 use snafu::ResultExt;
 use svod_ir::UOp;
 
-use crate::{Result, Tensor, error::UOpSnafu};
+use crate::{Operand, Result, Tensor, error::UOpSnafu, operand::common_dtype};
 
 #[bon]
 impl Tensor {
@@ -33,10 +33,11 @@ impl Tensor {
     /// // result = [0.0, 0.0, 3.0, 4.0]
     /// ```
     #[track_caller]
-    pub fn where_(&self, condition: &Tensor, other: &Tensor) -> Result<Self> {
+    pub fn where_<'o>(&self, condition: &Tensor, other: impl Into<Operand<'o>>) -> Result<Self> {
         origin_call!("where");
         use svod_ir::shape::{align_shapes_left, broadcast_shapes};
 
+        let other = self.operand(other);
         let cond_shape = condition.shape()?;
         let self_shape = self.shape()?;
         let other_shape = other.shape()?;
@@ -69,9 +70,10 @@ impl Tensor {
     /// // result = [2.0, 5.0, 4.0]
     /// ```
     #[track_caller]
-    pub fn maximum(&self, other: &Tensor) -> Result<Self> {
+    pub fn maximum<'o>(&self, other: impl Into<Operand<'o>>) -> Result<Self> {
         origin_call!("maximum");
-        let (lhs, rhs) = self.broadcast_for_binop(other)?;
+        let other = self.operand(other);
+        let (lhs, rhs) = self.broadcast_for_binop(&other)?;
         let result = lhs.uop().try_max(&rhs.uop()).context(UOpSnafu)?;
         Ok(Self::new(result))
     }
@@ -92,12 +94,12 @@ impl Tensor {
     /// // result = [1.0, 3.0, 3.0]
     /// ```
     #[track_caller]
-    pub fn minimum(&self, other: &Tensor) -> Result<Self> {
+    pub fn minimum<'o>(&self, other: impl Into<Operand<'o>>) -> Result<Self> {
         origin_call!("minimum");
-        // Minimum is not a primitive, we implement it as: -max(-a, -b)
-        // Or equivalently: where(a < b, a, b)
-        let condition = self.try_lt(other)?;
-        self.where_(&condition, other)
+        // Minimum is not a primitive, we implement it as: where(a < b, a, b)
+        let other = self.operand(other);
+        let condition = self.try_lt(&other)?;
+        self.where_(&condition, &other)
     }
 
     /// Clamp values to a range: `max(min_val, min(self, max_val))`.
@@ -124,7 +126,11 @@ impl Tensor {
     /// ```
     #[builder]
     #[track_caller]
-    pub fn clamp(&self, min: Option<&Tensor>, max: Option<&Tensor>) -> Result<Self> {
+    pub fn clamp<'lo, 'hi>(
+        &self,
+        #[builder(into)] min: Option<Operand<'lo>>,
+        #[builder(into)] max: Option<Operand<'hi>>,
+    ) -> Result<Self> {
         origin_call!("clamp");
         let mut result = self.clone();
 
@@ -152,7 +158,11 @@ impl Tensor {
     /// ```
     #[builder]
     #[track_caller]
-    pub fn clip(&self, min: Option<&Tensor>, max: Option<&Tensor>) -> Result<Self> {
+    pub fn clip<'lo, 'hi>(
+        &self,
+        #[builder(into)] min: Option<Operand<'lo>>,
+        #[builder(into)] max: Option<Operand<'hi>>,
+    ) -> Result<Self> {
         origin_call!("clip");
         self.clamp().maybe_min(min).maybe_max(max).call()
     }
@@ -174,39 +184,33 @@ impl Tensor {
     /// let r2 = x.masked_fill(&mask, &fill)?;             // [-1.0, 2.0, -3.0, 4.0]
     /// ```
     #[track_caller]
-    pub fn masked_fill<'a>(&self, mask: &Tensor, value: impl Into<MaskedFillValue<'a>>) -> Result<Self> {
+    pub fn masked_fill<'v>(&self, mask: &Tensor, value: impl Into<Operand<'v>>) -> Result<Self> {
         origin_call!("masked_fill");
-        let fill_tensor: std::borrow::Cow<'_, Tensor> = match value.into() {
-            MaskedFillValue::Scalar(cv) => std::borrow::Cow::Owned(Tensor::full(&[1], cv, self.uop().dtype())?),
-            MaskedFillValue::Tensor(t) => std::borrow::Cow::Borrowed(t),
-        };
-        fill_tensor.where_(mask, self)
+        self.operand(value).where_(mask, self)
+    }
+
+    /// Branch on this boolean tensor: `self ? when_true : when_false`.
+    ///
+    /// The mirror image of [`where_`](Self::where_), which is called on the
+    /// *true* branch. Either branch may be a tensor or a scalar; a scalar takes
+    /// the dtype of the other branch.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
+    /// let big = x.try_gt(2.0)?;
+    /// let r = big.select(&x, 0.0)?;   // [0.0, 0.0, 3.0, 4.0]
+    /// ```
+    #[track_caller]
+    pub fn select<'t, 'f>(
+        &self,
+        when_true: impl Into<Operand<'t>>,
+        when_false: impl Into<Operand<'f>>,
+    ) -> Result<Self> {
+        origin_call!("select");
+        let (t, f) = (when_true.into(), when_false.into());
+        let dtype = common_dtype(&t, &f);
+        let when_false = f.materialize(dtype.clone());
+        t.materialize(dtype).where_(self, &when_false)
     }
 }
-
-/// Argument adapter for [`Tensor::masked_fill`]. Accepts either a borrowed
-/// tensor or any scalar that implements `Into<ConstValue>`.
-pub enum MaskedFillValue<'a> {
-    /// Constant scalar — broadcast to `self`'s shape via `Tensor::full`.
-    Scalar(svod_ir::ConstValue),
-    /// Tensor — broadcast directly through `where_`.
-    Tensor(&'a Tensor),
-}
-
-impl<'a> From<&'a Tensor> for MaskedFillValue<'a> {
-    fn from(t: &'a Tensor) -> Self {
-        MaskedFillValue::Tensor(t)
-    }
-}
-
-macro_rules! impl_scalar_into_masked_fill_value {
-    ($($ty:ty),+ $(,)?) => { $(
-        impl<'a> From<$ty> for MaskedFillValue<'a> {
-            fn from(v: $ty) -> Self {
-                MaskedFillValue::Scalar(svod_ir::ConstValue::from(v))
-            }
-        }
-    )+ };
-}
-
-impl_scalar_into_masked_fill_value!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, bool);

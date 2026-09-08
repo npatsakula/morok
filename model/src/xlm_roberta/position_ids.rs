@@ -26,7 +26,7 @@ use super::error::Result;
 /// are set to `padding_idx`.
 pub fn position_ids_from_input_ids(input_ids: &Tensor, padding_idx: usize) -> Result<Tensor> {
     let pad = Tensor::const_(padding_idx as i64, DType::Int32);
-    let mask = input_ids.try_ne(&pad)?.cast(DType::Int32)?;
+    let mask = input_ids.try_ne(&pad)?.cast(DType::Int32);
     let cumsum = mask.cumsum(-1)?;
     let incremental = cumsum.try_mul(&mask)?;
     Ok(incremental.try_add(&pad)?)

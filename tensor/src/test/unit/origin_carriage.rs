@@ -29,7 +29,7 @@ fn linear(scale: f32) -> Tensor {
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
     let b = Tensor::from_slice([scale, scale, scale, scale]);
     let c = Tensor::from_slice([0.5f32, 0.5, 0.5, 0.5]);
-    &(&a * &b) + &c
+    (&(&a * &b).unwrap() + &c).unwrap()
 }
 
 fn kernels(plan: &ExecutionPlan) -> Vec<&svod_runtime::PreparedKernel> {
@@ -246,7 +246,7 @@ fn hand_lowered_kernel_bodies_dedup_across_scopes() {
 fn hand_lowered_kernel_inputs_are_materialised_once_per_producer() {
     use svod_ir::{Op, UOp, ops};
 
-    let shared = &Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]) * &Tensor::from_slice([2.0f32; 4]);
+    let shared = (&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]) * &Tensor::from_slice([2.0f32; 4])).unwrap();
     let launch = |scope: OriginId| {
         let _scope = origin::install(Some(scope));
         let out = Tensor::from_slice([0.0f32; 4]);
@@ -363,9 +363,9 @@ fn a_literal_split_by_call_frames_does_not_change_the_kernel_abi() {
 
     let scattered = |capture: bool| -> Vec<f32> {
         let _capture = origin::capture_for_thread(capture);
-        let target = Tensor::full(&[4], ConstValue::Float(0.0), DType::Float32).expect("full target");
+        let target = Tensor::full(&[4], ConstValue::Float(0.0), DType::Float32);
         let index = Tensor::from_slice([0i32, 0, 2, 2]);
-        let source = Tensor::full(&[4], ConstValue::Float(1.0), DType::Float32).expect("full source");
+        let source = Tensor::full(&[4], ConstValue::Float(1.0), DType::Float32);
         let out = target
             .scatter_reduce(0, &index, &source, ScatterReduction::Sum, false)
             .expect("scatter_reduce")

@@ -76,14 +76,14 @@ fn dim_const_rejects_a_symbolic_axis_that_dim_still_reports() {
 #[test_case(DType::Int64; "i64")]
 #[test_case(DType::Bool; "bool")]
 fn dtype_reports_the_element_type(dtype: DType) {
-    assert_eq!(Tensor::zeros(&[2, 2], dtype.clone()).unwrap().dtype(), dtype);
+    assert_eq!(Tensor::zeros(&[2, 2], dtype.clone()).dtype(), dtype);
 }
 
 #[test]
 fn dtype_follows_a_cast() {
     let t = Tensor::from_slice([1.0f32, 2.0]);
     assert_eq!(t.dtype(), DType::Float32);
-    assert_eq!(t.cast(DType::Int32).unwrap().dtype(), DType::Int32);
+    assert_eq!(t.cast(DType::Int32).dtype(), DType::Int32);
 }
 
 // =========================================================================
@@ -121,7 +121,7 @@ fn debug_reports_an_unrealized_lazy_graph() {
 
 #[test]
 fn index_select_rejects_a_symbolic_index_length() {
-    let src = Tensor::zeros(&[4, 3], DType::Float32).unwrap();
+    let src = Tensor::zeros(&[4, 3], DType::Float32);
     let index = Tensor::empty_dynamic(&[Variable::new("k", 1, 4).as_sint()], DType::Int32);
 
     let err = src.index_select(0, &index).unwrap_err();
@@ -130,8 +130,8 @@ fn index_select_rejects_a_symbolic_index_length() {
 
 #[test]
 fn index_select_rejects_a_rank_0_index() {
-    let src = Tensor::zeros(&[4, 3], DType::Float32).unwrap();
-    let index = Tensor::zeros(&[], DType::Int32).unwrap();
+    let src = Tensor::zeros(&[4, 3], DType::Float32);
+    let index = Tensor::zeros(&[], DType::Int32);
     // Previously an out-of-bounds slice index on the index tensor's shape.
     assert!(src.index_select(0, &index).is_err());
 }

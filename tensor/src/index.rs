@@ -538,8 +538,8 @@ impl Tensor {
             ar_shape[d] = dim as isize;
             let ar = ar.try_reshape(&ar_shape)?;
             let dt = ar.uop().dtype();
-            let lo = ar.try_ge(&Tensor::const_(ConstValue::Int(*s as i64), dt.clone()))?;
-            let hi = ar.try_lt(&Tensor::const_(ConstValue::Int(*e as i64), dt))?;
+            let lo = ar.try_ge(Tensor::const_(ConstValue::Int(*s as i64), dt.clone()))?;
+            let hi = ar.try_lt(Tensor::const_(ConstValue::Int(*e as i64), dt))?;
             let cond = lo.try_bitand(&hi)?;
             mask = Some(match mask {
                 None => cond,

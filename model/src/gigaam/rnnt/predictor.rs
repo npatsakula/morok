@@ -103,7 +103,7 @@ impl RnntPredictor {
         let mut mask_data = vec![1.0_f32; self.num_classes];
         mask_data[self.blank_id] = 0.0;
         let embed_dtype = self.embed.dtype();
-        let mask = Tensor::from_slice(&mask_data).try_reshape([self.num_classes, 1])?.cast(embed_dtype)?;
+        let mask = Tensor::from_slice(&mask_data).try_reshape([self.num_classes, 1])?.cast(embed_dtype);
         self.embed = self.embed.try_mul(&mask)?;
         self.embed.realize()?;
         Ok(())

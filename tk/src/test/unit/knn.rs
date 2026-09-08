@@ -100,13 +100,13 @@ fn test_knn_score_amd() {
 
     for (corpus, query, d) in [(16usize, 16usize, 16usize), (32, 32, 32), (32, 16, 48)] {
         // Realized bf16 inputs so the kernel and the reference see identical rounding.
-        let x = Tensor::randn(&[query, d]).expect("randn x").cast(DType::BFloat16).expect("x→bf16");
-        let c = Tensor::randn(&[corpus, d]).expect("randn c").cast(DType::BFloat16).expect("c→bf16");
+        let x = Tensor::randn(&[query, d]).expect("randn x").cast(DType::BFloat16);
+        let c = Tensor::randn(&[corpus, d]).expect("randn c").cast(DType::BFloat16);
         x.realize().expect("realize x");
         c.realize().expect("realize c");
 
         // c_sq[m] = Σ_d c[m,d]² in f32, replicated to [corpus, query] (each (m,n) → c_sq[m]).
-        let cf = c.cast(DType::Float32).expect("c→f32");
+        let cf = c.cast(DType::Float32);
         let c_sq_rep = cf
             .try_mul(&cf)
             .expect("c²")
@@ -128,10 +128,10 @@ fn test_knn_score_amd() {
         let got = score.as_vec::<f32>().expect("read score");
 
         // Reference: c_sq[m] − 2·⟨c[m], x[n]⟩, oriented score[m, n] (corpus row, query col).
-        let xf = x.cast(DType::Float32).expect("x→f32");
+        let xf = x.cast(DType::Float32);
         let cross = cf.matmul(&xf.try_permute(&[1, 0]).expect("xᵀ")).expect("c @ xᵀ"); // [corpus, query]
         let two = Tensor::from_slice([2.0f32]);
-        let refb = c_sq_rep.try_sub(&cross.try_mul(&two).expect("2·cross")).expect("c_sq − 2·cross");
+        let refb = c_sq_rep.try_sub(cross.try_mul(&two).expect("2·cross")).expect("c_sq − 2·cross");
         refb.realize().expect("realize ref");
         let exp = refb.as_vec::<f32>().expect("read ref");
 
@@ -252,8 +252,8 @@ fn test_knn_topk_amd() {
     ];
 
     for &(corpus, query, d, k, tie) in cases {
-        let mut x = Tensor::randn(&[query, d]).expect("randn x").cast(DType::BFloat16).expect("x→bf16");
-        let mut c = Tensor::randn(&[corpus, d]).expect("randn c").cast(DType::BFloat16).expect("c→bf16");
+        let mut x = Tensor::randn(&[query, d]).expect("randn x").cast(DType::BFloat16);
+        let mut c = Tensor::randn(&[corpus, d]).expect("randn c").cast(DType::BFloat16);
         x.realize().expect("realize x");
         c.realize().expect("realize c");
 
@@ -274,7 +274,7 @@ fn test_knn_topk_amd() {
         }
 
         // c_sq[m] = Σ_d c[m,d]² in f32, replicated to [corpus, query].
-        let cf = c.cast(DType::Float32).expect("c→f32");
+        let cf = c.cast(DType::Float32);
         let c_sq_rep = cf
             .try_mul(&cf)
             .expect("c²")
@@ -298,10 +298,10 @@ fn test_knn_topk_amd() {
         let got_val = val_out.as_vec::<f32>().expect("read val");
 
         // Reference: x²-free score [corpus, query] → [query, corpus] → topk smallest.
-        let xf = x.cast(DType::Float32).expect("x→f32");
+        let xf = x.cast(DType::Float32);
         let cross = cf.matmul(&xf.try_permute(&[1, 0]).expect("xᵀ")).expect("c @ xᵀ");
         let two = Tensor::from_slice([2.0f32]);
-        let score = c_sq_rep.try_sub(&cross.try_mul(&two).expect("2·cross")).expect("score [corpus, query]");
+        let score = c_sq_rep.try_sub(cross.try_mul(&two).expect("2·cross")).expect("score [corpus, query]");
         let score_qc = score.try_permute(&[1, 0]).expect("→[query, corpus]");
         let (ref_val, ref_idx) = score_qc.topk(k, -1, false).expect("ref topk");
         ref_val.realize().expect("realize ref_val");
@@ -536,8 +536,8 @@ fn test_knn_amd() {
 /// distances). Computed entirely in f32 (no kernel) — the independent oracle.
 fn knn_torch_naive(x: &svod_tensor::Tensor, c: &svod_tensor::Tensor, k: usize) -> (Vec<f32>, Vec<i32>, Vec<f32>) {
     use svod_tensor::Tensor;
-    let xf = x.cast(DType::Float32).expect("x→f32");
-    let cf = c.cast(DType::Float32).expect("c→f32");
+    let xf = x.cast(DType::Float32);
+    let cf = c.cast(DType::Float32);
     let x_sq = xf.try_mul(&xf).expect("x²").sum_with().axes(1isize).keepdim(true).call().expect("‖x‖²"); // [N,1]
     let c_sq = cf.try_mul(&cf).expect("c²").sum_with().axes(1isize).keepdim(true).call().expect("‖c‖²"); // [M,1]
     let cross = xf.matmul(&cf.try_permute(&[1, 0]).expect("cᵀ")).expect("x@cᵀ"); // [N,M]
@@ -546,7 +546,7 @@ fn knn_torch_naive(x: &svod_tensor::Tensor, c: &svod_tensor::Tensor, k: usize) -
     let dist = x_sq
         .try_add(&c_sq_row)
         .expect("‖x‖²+‖c‖²")
-        .try_sub(&cross.try_mul(&two).expect("2·cross"))
+        .try_sub(cross.try_mul(&two).expect("2·cross"))
         .expect("full ‖x−c‖²")
         .relu()
         .expect("clamp ≥ 0"); // [N,M], numerically ≥ 0

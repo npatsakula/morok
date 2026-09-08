@@ -30,7 +30,7 @@ jit_wrapper! {
             let out = model.encoder.forward_batch(mel, lengths)?;
             // Match the standalone encoder JIT's fp32 cast so the head sees the
             // same dtype regardless of the encoder's compute dtype.
-            let out = out.cast(svod_dtype::DType::Float32)?;
+            let out = out.cast(svod_dtype::DType::Float32);
             let head = model.head.expect_ctc("GigaAmCtcJit")?;
             crate::state::scoped("head", || head.forward(&out))
         }

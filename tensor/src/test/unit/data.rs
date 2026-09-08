@@ -10,7 +10,7 @@ crate::codegen_tests! {
     fn test_to_vec_computed(config) {
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([10.0f32, 20.0, 30.0]);
-        let c = &a + &b;
+        let c = (&a + &b).unwrap();
         c.realize_with(&config).unwrap();
         let v = c.as_vec::<f32>().unwrap();
         assert_eq!(v, vec![11.0, 22.0, 33.0]);
@@ -114,7 +114,7 @@ fn test_array_view_unrealized() {
     let a = Tensor::from_slice([1.0f32, 2.0]);
     let b = Tensor::from_slice([3.0f32, 4.0]);
     let c = &a + &b; // lazy, no buffer
-    assert!(c.array_view::<f32>().is_err());
+    assert!(c.unwrap().array_view::<f32>().is_err());
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn test_array_view_mut_fill() {
 #[test]
 fn test_array_view_mut_unrealized() {
     let a = Tensor::from_slice([1.0f32, 2.0]);
-    let c = &a + &a;
+    let c = (&a + &a).unwrap();
     assert!(c.array_view_mut::<f32>().is_err());
 }
 
@@ -217,7 +217,7 @@ fn array_view_refuses_a_view_it_cannot_borrow_correctly() {
 #[test]
 fn as_vec_still_refuses_an_unrealized_graph() {
     let a = Tensor::from_slice([1.0f32, 2.0]);
-    let lazy = &a + &a;
+    let lazy = (&a + &a).unwrap();
     assert!(matches!(
         lazy.as_vec::<f32>().map_err(crate::error::Error::into_kind),
         Err(crate::error::ErrorKind::NoBuffer)
@@ -291,13 +291,13 @@ proptest! {
 #[test_case::test_case(&[1.0f32, -2.0, 0.0, 4.0], &[2.0, -4.0, 0.0, 8.0]; "signs")]
 fn to_vec_realizes_a_lazy_graph(input: &[f32], expected: &[f32]) {
     let a = Tensor::from_slice(input);
-    assert_eq!((&a + &a).to_vec::<f32>().unwrap(), expected);
+    assert_eq!((&a + &a).unwrap().to_vec::<f32>().unwrap(), expected);
 }
 
 #[test]
 fn to_ndarray_realizes_a_lazy_graph() {
     let a = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
-    let doubled = (&a + &a).to_ndarray::<f32>().unwrap();
+    let doubled = (&a + &a).unwrap().to_ndarray::<f32>().unwrap();
     assert_eq!(doubled, array![[2.0f32, 4.0], [6.0, 8.0]].into_dyn());
 }
 
@@ -306,7 +306,7 @@ fn to_ndarray_realizes_a_lazy_graph() {
 #[test]
 fn as_vec_refuses_what_to_vec_realizes() {
     let a = Tensor::from_slice([1.0f32, 2.0]);
-    let lazy = &a + &a;
+    let lazy = (&a + &a).unwrap();
     assert!(matches!(lazy.as_vec::<f32>().map_err(crate::error::Error::into_kind), Err(crate::ErrorKind::NoBuffer)));
     assert_eq!(lazy.to_vec::<f32>().unwrap(), vec![2.0, 4.0]);
     assert_eq!(lazy.as_vec::<f32>().unwrap(), vec![2.0, 4.0], "to_vec leaves the tensor realized");

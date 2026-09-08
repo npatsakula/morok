@@ -94,7 +94,7 @@ fn forward_zero_weights_shape_check(depth: ResNetDepth, output: OutputMode, expe
     let cfg = ResNetConfig::new(depth, output).with_max_batch_size(1);
     let model = ResNet::with_zero_weights(cfg);
 
-    let images = Tensor::zeros(&[1, 3, 32, 32], DType::Float32).unwrap();
+    let images = Tensor::zeros(&[1, 3, 32, 32], DType::Float32);
     let var = Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();
 
@@ -161,7 +161,7 @@ fn features_r18_returns_512_channel_map() {
     let config = ResNetConfig::new(ResNetDepth::R18, OutputMode::Features).with_max_batch_size(max_batch);
     let model = ResNet::with_zero_weights(config);
 
-    let images = Tensor::zeros(&[max_batch, 3, 32, 32], DType::Float32).unwrap();
+    let images = Tensor::zeros(&[max_batch, 3, 32, 32], DType::Float32);
     let var = Variable::new("b", 1, max_batch as i64);
     let b1 = var.bind(1).unwrap();
 
@@ -182,7 +182,7 @@ fn features_r50_returns_2048_channel_map() {
     let config = ResNetConfig::new(ResNetDepth::R50, OutputMode::Features).with_max_batch_size(max_batch);
     let model = ResNet::with_zero_weights(config);
 
-    let images = Tensor::zeros(&[max_batch, 3, 32, 32], DType::Float32).unwrap();
+    let images = Tensor::zeros(&[max_batch, 3, 32, 32], DType::Float32);
     let var = Variable::new("b", 1, max_batch as i64);
     let b1 = var.bind(1).unwrap();
 

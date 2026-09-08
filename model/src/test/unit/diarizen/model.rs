@@ -71,10 +71,10 @@ fn from_state_dict_via_remap() {
     }
 
     // Inert PyTorch buffers must be dropped silently.
-    sd.insert("wavlm_model.feature_extractor.dummy_weight".to_string(), Tensor::zeros(&[1], DType::Float32).unwrap());
+    sd.insert("wavlm_model.feature_extractor.dummy_weight".to_string(), Tensor::zeros(&[1], DType::Float32));
     sd.insert(
         "conformer.conformer_layer.0.conv.bn_norm.num_batches_tracked".to_string(),
-        Tensor::zeros(&[1], DType::Float32).unwrap(),
+        Tensor::zeros(&[1], DType::Float32),
     );
 
     let _model = DiariZenSegmentationModel::from_state_dict(&sd, cfg).expect("from_state_dict");
@@ -88,7 +88,7 @@ fn segmentation_forward_shape() {
     let model = DiariZenSegmentationModel::empty(cfg.clone());
 
     // (B, channels=1, samples) — small enough to stay cheap.
-    let wav = Tensor::zeros(&[1, 1, 4096], DType::Float32).unwrap();
+    let wav = Tensor::zeros(&[1, 1, 4096], DType::Float32);
     let out = model.forward(&wav).expect("forward");
     let shape = out.dims().unwrap();
     assert_eq!(shape.len(), 3);
@@ -103,7 +103,7 @@ fn segmentation_forward_shape() {
 fn segmentation_forward_logits_shape() {
     let cfg = tiny_cfg();
     let model = DiariZenSegmentationModel::empty(cfg.clone());
-    let wav = Tensor::zeros(&[1, 1, 4096], DType::Float32).unwrap();
+    let wav = Tensor::zeros(&[1, 1, 4096], DType::Float32);
     let logits = model.forward_logits(&wav).expect("forward_logits");
     let shape = logits.dims().unwrap();
     assert_eq!(shape[0], 1);

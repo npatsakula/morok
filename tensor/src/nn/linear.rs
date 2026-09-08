@@ -31,7 +31,7 @@ impl Linear {
         let weight = Tensor::from_slice(&weight_data)
             .try_reshape([out_features as isize, in_features as isize])
             .expect("linear weight reshape failed");
-        let bias = Tensor::full(&[out_features], 0.0, dtype).expect("linear bias creation failed");
+        let bias = Tensor::full(&[out_features], 0.0, dtype);
         Self { weight, bias }
     }
 }

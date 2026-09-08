@@ -19,8 +19,8 @@ use common::{bench_plan, randn_bf16, requirements_met};
 /// returns — so the `tk` and `generic` rows are comparable.
 fn kmeans_generic_ref(xb: &Tensor, cb: &Tensor) -> Tensor {
     let f32 = DType::Float32;
-    let xf = xb.cast(f32.clone()).expect("x→f32");
-    let cf = cb.cast(f32.clone()).expect("c→f32");
+    let xf = xb.cast(f32.clone());
+    let cf = cb.cast(f32.clone());
     let x_sq = xf.try_mul(&xf).expect("x²").sum_with().axes(1isize).keepdim(true).call().expect("Σx²"); // [N,1]
     let c_sq = cf.try_mul(&cf).expect("c²").sum_with().axes(1isize).keepdim(true).call().expect("Σc²"); // [K,1]
     let c_sq_row = c_sq.try_transpose(0, 1).expect("c_sq→[1,K]");
@@ -53,7 +53,7 @@ fn bench_kmeans(c: &mut Criterion) {
             let cb = randn_bf16(&[k, d]);
 
             // tk: fused running argmin.
-            let (_ids, mut dists) =
+            let (_ids, dists) =
                 svod_tk::kmeans_assign(&xb, &cb).expect("tk kmeans").expect("kmeans applies for bench shape");
             let plan = dists.prepare().expect("prepare tk kmeans");
             group.bench_with_input(BenchmarkId::new("tk", k), &k, |bencher, _| bench_plan(bencher, &plan));
@@ -61,7 +61,7 @@ fn bench_kmeans(c: &mut Criterion) {
             // Reference: the generic GEMM-argmin path (materialises the [N,K] matrix).
             // Optional — the generic codegen hits a WMMA-intrinsic redeclaration on
             // some archs (gfx1151); skip the row instead of failing the whole bench.
-            let mut reft = kmeans_generic_ref(&xb, &cb);
+            let reft = kmeans_generic_ref(&xb, &cb);
             match reft.prepare() {
                 Ok(ref_plan) => {
                     group.bench_with_input(BenchmarkId::new("generic", k), &k, |bencher, _| {

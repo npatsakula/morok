@@ -238,9 +238,7 @@ fn assert_tensors_close(actual: &Tensor, expected: &Tensor, label: &str, config:
     // Cast actual to match expected dtype if they differ
     let actual_cast;
     let actual: &Tensor = if actual.dtype() != expected_dtype {
-        actual_cast = actual.cast(expected_dtype.clone()).unwrap_or_else(|e| {
-            panic!("Output '{label}': dtype cast failed ({:?} -> {expected_dtype:?}): {e}", actual.dtype())
-        });
+        actual_cast = actual.cast(expected_dtype.clone());
         actual_cast.realize_with(config).unwrap_or_else(|e| panic!("Output '{label}': realize after cast failed: {e}"));
         &actual_cast
     } else {
@@ -252,9 +250,9 @@ fn assert_tensors_close(actual: &Tensor, expected: &Tensor, label: &str, config:
         ScalarDType::Float64 => assert_float_close!(actual, expected, label, 1e-3, 1e-7, f64),
         ScalarDType::Float16 | ScalarDType::BFloat16 | ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2 => {
             let f32_dtype = DType::Scalar(ScalarDType::Float32);
-            let a = actual.cast(f32_dtype.clone()).unwrap();
+            let a = actual.cast(f32_dtype.clone());
             a.realize_with(config).unwrap();
-            let e = expected.cast(f32_dtype).unwrap();
+            let e = expected.cast(f32_dtype);
             e.realize_with(config).unwrap();
             assert_float_close!(&a, &e, label, 1e-2, 1e-3, f32);
         }

@@ -27,7 +27,7 @@ pub(crate) fn op_one_hot(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result
     let values = inp(inputs, 2);
     let axis = attrs.int("axis", -1) as isize;
     let norm_idx = indices.normalize_negative_indices(depth as i64)?;
-    let norm_idx = norm_idx.cast(DType::Int32)?;
+    let norm_idx = norm_idx.cast(DType::Int32);
     let ndim = norm_idx.ndim()? + 1;
     let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
     let expanded = norm_idx.try_unsqueeze(norm_axis as isize)?;

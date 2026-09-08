@@ -166,8 +166,7 @@ impl TextDecoder {
         let dtype = dims.dtype.clone();
         Self {
             token_embedding: fan_in_uniform(&[dims.n_vocab, n_state], n_state, dtype.clone()),
-            positional_embedding: Tensor::zeros(&[dims.n_text_ctx, n_state], dtype.clone())
-                .expect("positional embedding"),
+            positional_embedding: Tensor::zeros(&[dims.n_text_ctx, n_state], dtype.clone()),
             blocks: (0..dims.n_text_layer)
                 .map(|_| DecoderBlock::empty_dtype(n_state, dims.n_text_head, dtype.clone()))
                 .collect(),
@@ -188,7 +187,7 @@ impl TextDecoder {
     /// Project encoder features into the fixed packed cross-attention cache.
     /// This graph is independent of decoder tokens and runs once per window.
     pub fn project_cross_kv(&self, xa: &Tensor) -> Result<(Tensor, Tensor)> {
-        let xa = xa.cast(self.activation_dtype.clone())?;
+        let xa = xa.cast(self.activation_dtype.clone());
         let mut cross_ks = Vec::with_capacity(self.blocks.len());
         let mut cross_vs = Vec::with_capacity(self.blocks.len());
         for (index, block) in self.blocks.iter().enumerate() {
@@ -199,7 +198,7 @@ impl TextDecoder {
             cross_ks.push(block.cross_attn.split_heads(&k)?);
             cross_vs.push(block.cross_attn.split_heads(&v)?);
         }
-        Ok((Self::pack_kv(cross_ks)?.cast(DType::Float32)?, Self::pack_kv(cross_vs)?.cast(DType::Float32)?))
+        Ok((Self::pack_kv(cross_ks)?.cast(DType::Float32), Self::pack_kv(cross_vs)?.cast(DType::Float32)))
     }
 
     /// Forward pass producing logits for all positions.
@@ -216,8 +215,8 @@ impl TextDecoder {
             self.positional_embedding.try_shrink([Some((offset as isize, (offset + seq_len) as isize)), None])?;
 
         let x = tok_emb.try_add(&pos_emb)?;
-        let x = x.cast(self.activation_dtype.clone())?;
-        let xa = xa.cast(self.activation_dtype.clone())?;
+        let x = x.cast(self.activation_dtype.clone());
+        let xa = xa.cast(self.activation_dtype.clone());
 
         let mask = causal_mask(seq_len, x.dtype().clone())?;
 
@@ -230,9 +229,9 @@ impl TextDecoder {
         let x = scoped("ln", || self.ln.apply(&x))?;
 
         // Tied output: logits = x @ token_embedding.T  → [B, L, n_vocab]
-        let output_weight = self.token_embedding.cast(x.dtype())?;
+        let output_weight = self.token_embedding.cast(x.dtype());
         let logits = x.linear().weight(&output_weight).call()?;
-        Ok(logits.cast(DType::Float32)?)
+        Ok(logits.cast(DType::Float32))
     }
 
     /// Teacher-forced decoder pass over packed cross K/V, returning raw scaled
@@ -251,9 +250,9 @@ impl TextDecoder {
         let pos_emb = self.positional_embedding.try_shrink([Some((0isize, seq_len as isize)), None])?;
 
         let x = tok_emb.try_add(&pos_emb)?;
-        let x = x.cast(self.activation_dtype.clone())?;
-        let cross_k = cross_k.cast(self.activation_dtype.clone())?;
-        let cross_v = cross_v.cast(self.activation_dtype.clone())?;
+        let x = x.cast(self.activation_dtype.clone());
+        let cross_k = cross_k.cast(self.activation_dtype.clone());
+        let cross_v = cross_v.cast(self.activation_dtype.clone());
 
         let mask = causal_mask(seq_len, x.dtype().clone())?;
 
@@ -317,7 +316,7 @@ impl TextDecoder {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Tensor::cat(&selected_qk.iter().collect::<Vec<_>>(), 1)?.cast(DType::Float32)?)
+        Ok(Tensor::cat(&selected_qk.iter().collect::<Vec<_>>(), 1)?.cast(DType::Float32))
     }
 
     /// Prefill consuming fixed packed cross-attention caches.
@@ -338,9 +337,9 @@ impl TextDecoder {
             self.positional_embedding.try_shrink([Some((offset as isize, (offset + seq_len) as isize)), None])?;
 
         let x = tok_emb.try_add(&pos_emb)?;
-        let x = x.cast(self.activation_dtype.clone())?;
-        let cross_k = cross_k.cast(self.activation_dtype.clone())?;
-        let cross_v = cross_v.cast(self.activation_dtype.clone())?;
+        let x = x.cast(self.activation_dtype.clone());
+        let cross_k = cross_k.cast(self.activation_dtype.clone());
+        let cross_v = cross_v.cast(self.activation_dtype.clone());
 
         let mask = causal_mask(seq_len, x.dtype().clone())?;
 
@@ -381,11 +380,11 @@ impl TextDecoder {
         }
 
         let x = scoped("ln", || self.ln.apply(&x))?;
-        let logits = x.linear().weight(&self.token_embedding.cast(x.dtype())?).call()?.cast(DType::Float32)?;
+        let logits = x.linear().weight(&self.token_embedding.cast(x.dtype())).call()?.cast(DType::Float32);
 
         // K/V cache outputs cast to fp32 — the cache buffers are fp32 (host
         // round-trips them as Vec<f32>), while compute is dims.dtype (fp16).
-        Ok((logits, Self::pack_kv(self_ks)?.cast(DType::Float32)?, Self::pack_kv(self_vs)?.cast(DType::Float32)?))
+        Ok((logits, Self::pack_kv(self_ks)?.cast(DType::Float32), Self::pack_kv(self_vs)?.cast(DType::Float32)))
     }
 
     /// Decoder logits using an already prepared cross-attention cache.
@@ -487,7 +486,7 @@ impl TextDecoder {
         // Embed single token + positional embedding
         let tok_emb = self.token_embedding.embedding(token)?;
         let x = tok_emb.try_add(pos_emb)?;
-        let x = x.cast(self.activation_dtype.clone())?;
+        let x = x.cast(self.activation_dtype.clone());
 
         let mut x = x;
         let mut new_ks: Vec<Tensor> = Vec::with_capacity(n_layer);
@@ -523,7 +522,7 @@ impl TextDecoder {
 
             let direct = if attention.custom_self {
                 svod_tk::single_query_attention(
-                    &q_seq.cast(DType::Float32)?,
+                    &q_seq.cast(DType::Float32),
                     &full_k,
                     &full_v,
                     svod_tk::SqAttentionOpts { key_lens: Some(self_key_lens), include_last: true, split: 1 },
@@ -533,11 +532,11 @@ impl TextDecoder {
                 None
             };
             let attn_out = match direct {
-                Some(out) => out.try_reshape([batch, 1, self.n_state])?.cast(self.activation_dtype.clone())?,
+                Some(out) => out.try_reshape([batch, 1, self.n_state])?.cast(self.activation_dtype.clone()),
                 None => {
                     let q_h = q_seq.try_permute(&[0, 2, 1, 3])?;
-                    let full_k_h = full_k.cast(self.activation_dtype.clone())?.try_permute(&[0, 2, 1, 3])?;
-                    let full_v_h = full_v.cast(self.activation_dtype.clone())?.try_permute(&[0, 2, 1, 3])?;
+                    let full_k_h = full_k.cast(self.activation_dtype.clone()).try_permute(&[0, 2, 1, 3])?;
+                    let full_v_h = full_v.cast(self.activation_dtype.clone()).try_permute(&[0, 2, 1, 3])?;
                     let mask = cached_step_mask(self_key_lens, batch, self_key_count)?;
                     let out = q_h
                         .scaled_dot_product_attention()
@@ -559,7 +558,7 @@ impl TextDecoder {
 
             let direct = if attention.custom_cross {
                 svod_tk::single_query_attention_packed(
-                    &cq_seq.cast(DType::Float32)?,
+                    &cq_seq.cast(DType::Float32),
                     cross_k,
                     cross_v,
                     lh_start,
@@ -570,14 +569,14 @@ impl TextDecoder {
                 None
             };
             let cross_out = match direct {
-                Some(out) => out.try_reshape([batch, 1, self.n_state])?.cast(self.activation_dtype.clone())?,
+                Some(out) => out.try_reshape([batch, 1, self.n_state])?.cast(self.activation_dtype.clone()),
                 None => {
                     let layer_ck = cross_k
                         .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])?
-                        .cast(self.activation_dtype.clone())?;
+                        .cast(self.activation_dtype.clone());
                     let layer_cv = cross_v
                         .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])?
-                        .cast(self.activation_dtype.clone())?;
+                        .cast(self.activation_dtype.clone());
                     let cq_h = cq_seq.try_permute(&[0, 2, 1, 3])?;
                     let layer_ck_h = layer_ck.try_permute(&[0, 2, 1, 3])?;
                     let layer_cv_h = layer_cv.try_permute(&[0, 2, 1, 3])?;
@@ -629,14 +628,14 @@ impl TextDecoder {
             svod_ir::SInt::Const(d_head),
         ])?;
         let x = scoped("ln", || self.ln.apply(&x))?;
-        let logits = x.linear().weight(&self.token_embedding.cast(x.dtype())?).call()?.cast(DType::Float32)?;
+        let logits = x.linear().weight(&self.token_embedding.cast(x.dtype())).call()?.cast(DType::Float32);
 
         // logits is [B, 1, n_vocab] → reshape to [B, n_vocab]
         let n_vocab = self.token_embedding.dim_const(0)?;
         let logits = logits.try_reshape(&[svod_ir::SInt::Const(batch), svod_ir::SInt::Const(n_vocab)])?;
 
         // K/V outputs cast to fp32 — appended into the fp32 cache buffer via SDMA.
-        Ok((logits, new_k_flat.cast(DType::Float32)?, new_v_flat.cast(DType::Float32)?))
+        Ok((logits, new_k_flat.cast(DType::Float32), new_v_flat.cast(DType::Float32)))
     }
 }
 

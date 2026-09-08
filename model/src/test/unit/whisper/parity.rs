@@ -113,8 +113,7 @@ fn decoder_logits_match_pytorch() {
     let tokens = Tensor::from_slice(tokens_vec.iter().map(|&t| t as i32).collect::<Vec<_>>())
         .try_reshape([1isize, tokens_vec.len() as isize])
         .unwrap()
-        .cast(DType::Int32)
-        .unwrap();
+        .cast(DType::Int32);
 
     let want: Vec<f32> = load_golden_vec(&golden, "logits");
 

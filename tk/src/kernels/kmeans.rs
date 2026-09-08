@@ -431,15 +431,15 @@ pub fn kmeans_assign(x: &Tensor, c: &Tensor) -> crate::LaunchResult<Option<(Tens
     let n_pad = pad16(n);
 
     // f32 copies for the tail (‖x‖² re-add).
-    let x_f32 = x.cast(f32.clone()).context(crate::launch::OperandSnafu)?;
+    let x_f32 = x.cast(f32.clone());
 
     // Kernel bf16 operands, zero-padded to the WMMA edge. `K` is NOT padded —
     // the kernel ragged-masks its final centroid tile.
-    let x_bf = pad_operand(&x.cast(bf16.clone()).context(crate::launch::OperandSnafu)?, n, dx, n_pad, d_pad)?;
-    let c_bf = pad_operand(&c.cast(bf16.clone()).context(crate::launch::OperandSnafu)?, k, dc, k, d_pad)?;
+    let x_bf = pad_operand(&x.cast(bf16.clone()), n, dx, n_pad, d_pad)?;
+    let c_bf = pad_operand(&c.cast(bf16.clone()), k, dc, k, d_pad)?;
 
     // c_sq[k] = Σ_d c[k,d]² in f32, replicated to [1,1,K,BLK].
-    let c_sq_rep = c_sq_replicated(&c.cast(f32.clone()).context(crate::launch::OperandSnafu)?, k)?;
+    let c_sq_rep = c_sq_replicated(&c.cast(f32.clone()), k)?;
 
     let ids_t = Tensor::empty(&[1, 1, n_pad, 1], DType::Int32);
     let val_t = Tensor::empty(&[1, 1, n_pad, 1], f32.clone());
@@ -564,13 +564,12 @@ pub fn kmeans_update(
     let op = crate::launch::OperandSnafu;
     let f32 = DType::Float32;
 
-    let xf = x.cast(f32.clone()).context(op)?;
-    let ocf = old_centroids.cast(f32.clone()).context(op)?;
+    let xf = x.cast(f32.clone());
+    let ocf = old_centroids.cast(f32.clone());
 
     // Per-cluster counts: scatter_reduce(Sum) of ones at cluster_ids → [K].
-    let ones_n = Tensor::full(&[n], ConstValue::Float(1.0), f32.clone()).context(op)?;
+    let ones_n = Tensor::full(&[n], ConstValue::Float(1.0), f32.clone());
     let counts = Tensor::full(&[k], ConstValue::Float(0.0), f32.clone())
-        .context(op)?
         .scatter_reduce(0, cluster_ids, &ones_n, ScatterReduction::Sum, false)
         .context(op)?; // [K]
 
@@ -578,7 +577,6 @@ pub fn kmeans_update(
     let ids_n1 = cluster_ids.try_reshape([n as isize, 1isize]).context(op)?;
     let ids_expand = ids_n1.try_expand([n as isize, d as isize]).context(op)?;
     let sums = Tensor::full(&[k, d], ConstValue::Float(0.0), f32.clone())
-        .context(op)?
         .scatter_reduce(0, &ids_expand, &xf, ScatterReduction::Sum, false)
         .context(op)?; // [K, D]
 

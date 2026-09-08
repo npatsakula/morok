@@ -405,8 +405,7 @@ fn matmul_inputs(n: usize) -> (svod_tensor::Tensor, svod_tensor::Tensor) {
 
 /// f32 ground-truth `a·b` over the bf16-rounded operands.
 fn matmul_reference(a: &svod_tensor::Tensor, b: &svod_tensor::Tensor) -> Vec<f32> {
-    let reference =
-        a.cast(DType::Float32).expect("a→f32").matmul(&b.cast(DType::Float32).expect("b→f32")).expect("ref matmul");
+    let reference = a.cast(DType::Float32).matmul(&b.cast(DType::Float32)).expect("ref matmul");
     reference.realize().expect("realize reference");
     reference.as_vec::<f32>().expect("read reference")
 }
@@ -435,7 +434,7 @@ fn test_matmul_rdna_computes_ab() {
     let (a, b) = matmul_inputs(n);
     let got = launch_matmul("matmul_diag", n, SMALL_CFG, |ker| build_matmul_cfg(ker, n, SMALL_CFG), &a, &b);
 
-    let f = |t: &Tensor| t.cast(DType::Float32).expect("→f32");
+    let f = |t: &Tensor| t.cast(DType::Float32);
     let (af, bf) = (f(&a), f(&b));
     let tr = |x: &Tensor| x.try_permute(&[1, 0]).expect("transpose");
     let mm = |x: &Tensor, y: &Tensor| x.matmul(y).expect("matmul");
@@ -483,8 +482,7 @@ fn test_matmul_rdna_grid() {
         a_data[i * n + i] = 1.0; // identity
     }
     let b_data: Vec<f32> = (0..n * n).map(|p| (((p / n) % 16) * 16 + (p % n) % 16) as f32).collect();
-    let mk =
-        |d: &[f32]| Tensor::from_slice(d).try_reshape([n, n]).expect("reshape").cast(DType::BFloat16).expect("→bf16");
+    let mk = |d: &[f32]| Tensor::from_slice(d).try_reshape([n, n]).expect("reshape").cast(DType::BFloat16);
     let (a, b) = (mk(&a_data), mk(&b_data));
     a.realize().expect("realize a");
     b.realize().expect("realize b");
@@ -545,8 +543,7 @@ fn test_matmul_cuda_grid() {
         a_data[i * n + i] = 1.0;
     }
     let b_data: Vec<f32> = (0..n * n).map(|p| (((p / n) % 16) * 16 + (p % n) % 16) as f32).collect();
-    let mk =
-        |d: &[f32]| Tensor::from_slice(d).try_reshape([n, n]).expect("reshape").cast(DType::BFloat16).expect("→bf16");
+    let mk = |d: &[f32]| Tensor::from_slice(d).try_reshape([n, n]).expect("reshape").cast(DType::BFloat16);
     let (a, b) = (mk(&a_data), mk(&b_data));
     a.realize().expect("realize a");
     b.realize().expect("realize b");
@@ -616,8 +613,8 @@ fn test_mma_variants_cuda() {
 
 /// Realized `(a, b)` inputs of `dtype` so kernel + reference see identical rounding.
 fn matmul_inputs_dt(n: usize, dtype: DType) -> (Tensor, Tensor) {
-    let a = Tensor::rand(&[n, n]).expect("rand a").cast(dtype.clone()).expect("cast a");
-    let b = Tensor::rand(&[n, n]).expect("rand b").cast(dtype).expect("cast b");
+    let a = Tensor::rand(&[n, n]).expect("rand a").cast(dtype.clone());
+    let b = Tensor::rand(&[n, n]).expect("rand b").cast(dtype);
     a.realize().expect("realize a");
     b.realize().expect("realize b");
     (a, b)

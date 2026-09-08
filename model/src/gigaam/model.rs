@@ -72,7 +72,7 @@ fn prepare_scaled_weights(sd: &mut StateDict, dtype: &DType) -> Result<()> {
             message: format!("quantized weight {weight_key} has symbolic output dimension"),
         })? as isize;
         let dequantized =
-            quantized.cast(target_dtype.clone())?.try_mul(&scale.cast(target_dtype)?.try_reshape(scale_shape)?)?;
+            quantized.cast(target_dtype.clone()).try_mul(&scale.cast(target_dtype).try_reshape(scale_shape)?)?;
         sd.remove(&scale_key);
         promoted.push((weight_key, dequantized.contiguous()));
     }
@@ -271,8 +271,7 @@ impl GigaAm {
                 // (FFN) and `<x>_weight_scale` (MHSA/conv), matching `prepare_scaled_weights`.
                 && !key.ends_with("weight_scale")
             {
-                *tensor =
-                    tensor.cast(encoder_dtype.clone()).map_err(|source| Error::Tensor { source: Box::new(source) })?;
+                *tensor = tensor.cast(encoder_dtype.clone());
             }
         }
         let sd = &sd_owned;

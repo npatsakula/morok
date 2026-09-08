@@ -77,6 +77,7 @@ pub mod math;
 pub mod matmul;
 pub mod memory_planner;
 pub mod nn;
+pub mod operand;
 pub mod rand;
 pub mod realize;
 pub mod reduce;
@@ -93,6 +94,7 @@ pub mod variable;
 pub use config::{PrepareConfig, device_supports_storage_dtype};
 pub use index::{Idx, IndexSpec};
 pub use memory_planner::PlannerMode;
+pub use operand::Operand;
 pub use svod_dtype::default_device::{clear_default_device, default_device, set_default_device, with_default_device};
 pub use svod_runtime::CpuBackend;
 pub use tensor_registry::apply_map_to_tensors;
@@ -167,7 +169,7 @@ pub struct KernelInfo {
 /// # use svod_tensor::Tensor;
 /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
 /// let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
-/// let c = &a + &b;  // Lazy - only builds UOp graph
+/// let c = (&a + &b).unwrap();  // Lazy - only builds UOp graph
 /// c.realize().unwrap();  // Executes the computation
 /// ```
 ///
@@ -323,26 +325,29 @@ impl Tensor {
 
     /// Create a tensor filled with a constant value, broadcast to the given shape.
     #[track_caller]
-    pub fn full(shape: &[usize], value: impl Into<ConstValue>, dtype: DType) -> Result<Self> {
+    pub fn full(shape: &[usize], value: impl Into<ConstValue>, dtype: DType) -> Self {
         origin_call!("full");
         let scalar = Self::const_(value, dtype);
         if shape.is_empty() {
-            return Ok(scalar);
+            return scalar;
         }
         let expand_shape: Vec<isize> = shape.iter().map(|&d| d as isize).collect();
-        scalar.try_reshape(vec![1; shape.len()])?.try_expand(&expand_shape)
+        scalar
+            .try_reshape(vec![1; shape.len()])
+            .and_then(|t| t.try_expand(&expand_shape))
+            .expect("a scalar constant always reshapes and expands to a concrete shape")
     }
 
     /// Create a zero-filled tensor with the given concrete shape.
     #[track_caller]
-    pub fn zeros(shape: &[usize], dtype: DType) -> Result<Self> {
+    pub fn zeros(shape: &[usize], dtype: DType) -> Self {
         origin_call!("zeros");
         Self::full(shape, ConstValue::zero(dtype.base()), dtype)
     }
 
     /// Create a one-filled tensor with the given concrete shape.
     #[track_caller]
-    pub fn ones(shape: &[usize], dtype: DType) -> Result<Self> {
+    pub fn ones(shape: &[usize], dtype: DType) -> Self {
         origin_call!("ones");
         Self::full(shape, ConstValue::one(dtype.base()), dtype)
     }
@@ -473,7 +478,7 @@ impl Tensor {
                 return Ok(Self::empty_zero(dtype));
             }
 
-            Self::full(&[ceildiv as usize], *s, dtype.clone())?
+            Self::full(&[ceildiv as usize], *s, dtype.clone())
         } else {
             let ceildiv = ceildiv_uop(&stop.sub(&start), &step);
             let output_len_sint = SInt::from(ceildiv.clone());
@@ -485,7 +490,7 @@ impl Tensor {
 
         let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
         let offset = Self::new(start.sub(&step));
-        cumsum.try_add(&offset)?.cast(dtype)
+        Ok(cumsum.try_add(&offset)?.cast(dtype))
     }
 
     /// Create 1D tensor with evenly spaced Int32 values.
@@ -513,10 +518,10 @@ impl Tensor {
             return Ok(Self::empty_zero(dtype));
         }
         let count = count as usize;
-        let step_tensor = Self::full(&[count], ConstValue::Float(step), dtype.clone())?;
+        let step_tensor = Self::full(&[count], ConstValue::Float(step), dtype.clone());
         let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
         let offset = Self::const_(ConstValue::Float(start - step), dtype.clone());
-        cumsum.try_add(&offset)?.cast(dtype)
+        Ok(cumsum.try_add(&offset)?.cast(dtype))
     }
 
     /// Create 1D tensor with `steps` evenly spaced values from `start` to `end` (inclusive).
@@ -527,12 +532,12 @@ impl Tensor {
             return Ok(Self::empty_zero(dtype));
         }
         if steps == 1 {
-            return Self::full(&[1], start, dtype);
+            return Ok(Self::full(&[1], start, dtype));
         }
         let t = Self::arange(steps as i64, None, None)?;
         let scale = Self::const_((end - start) / (steps as f64 - 1.0), DType::Float64);
         let offset = Tensor::const_(start, DType::Float64);
-        t.cast(DType::Float64)?.try_mul(&scale)?.try_add(&offset)?.cast(dtype)
+        Ok(t.cast(DType::Float64).try_mul(&scale)?.try_add(&offset)?.cast(dtype))
     }
 
     // === Constant Constructors ===
@@ -634,13 +639,12 @@ impl Tensor {
     /// # Examples
     /// ```ignore
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    /// let t_int = t.cast(DType::Int32)?;
+    /// let t_int = t.cast(DType::Int32);
     /// ```
     #[track_caller]
-    pub fn cast(&self, dtype: svod_dtype::DType) -> Result<Self> {
+    pub fn cast(&self, dtype: svod_dtype::DType) -> Self {
         origin_call!("cast");
-        let casted = self.uop().cast(dtype);
-        Ok(Self::new(casted))
+        Self::new(self.uop().cast(dtype))
     }
 
     /// Build and apply a custom UOp kernel over this tensor and additional inputs.
@@ -759,7 +763,7 @@ impl Tensor {
                     std::iter::repeat_n(None, new_shape.len() - 1).collect();
                 shrink_ranges.push(Some((i as isize, (i + 1) as isize)));
                 let slice = reshaped.try_shrink(shrink_ranges)?;
-                let widened = slice.cast(dst_uint.clone())?;
+                let widened = slice.cast(dst_uint.clone());
                 let shift_amount = 8 * i * src_size;
                 let term = if shift_amount == 0 {
                     widened
@@ -768,7 +772,7 @@ impl Tensor {
                         &svod_ir::shape::to_vec_usize(&widened.shape()?).context(UOpSnafu)?,
                         ConstValue::UInt(shift_amount as u64),
                         dst_uint.clone(),
-                    )?;
+                    );
                     widened.try_shl(&shift_t)?
                 };
                 acc = Some(match acc {
@@ -793,7 +797,7 @@ impl Tensor {
                         &svod_ir::shape::to_vec_usize(&tmp.shape()?).context(UOpSnafu)?,
                         ConstValue::UInt(shift_amount as u64),
                         src_uint.clone(),
-                    )?;
+                    );
                     tmp.try_shr(&shift_t)?
                 };
                 shifted.push(s);
@@ -808,7 +812,7 @@ impl Tensor {
             new_shape.truncate(nd - 2);
             new_shape.push(trailing);
             let flat = stacked.try_reshape(&new_shape)?;
-            flat.cast(dst_uint.clone())?
+            flat.cast(dst_uint.clone())
         };
 
         // Final reinterpretation at equal size (e.g. u16 → f16).
@@ -962,7 +966,7 @@ impl Tensor {
         origin_call!("eye");
         let rows = Self::arange(n as i64, None, None)?.try_unsqueeze(-1)?;
         let cols = Self::arange(m as i64, None, None)?;
-        rows.try_eq(&cols)?.cast(dtype)
+        Ok(rows.try_eq(&cols)?.cast(dtype))
     }
 }
 

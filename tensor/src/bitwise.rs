@@ -13,9 +13,10 @@ impl Tensor {
     /// Performs element-wise bitwise AND between two tensors with broadcasting.
     /// Both tensors must have integer or boolean dtype.
     #[track_caller]
-    pub fn bitwise_and(&self, other: &Tensor) -> Result<Tensor> {
+    pub fn bitwise_and<'o>(&self, other: impl Into<Operand<'o>>) -> Result<Tensor> {
         origin_call!("bitwise_and");
-        let (lhs, rhs) = self.broadcast_for_binop(other)?;
+        let other = self.operand(other);
+        let (lhs, rhs) = self.broadcast_for_binop(&other)?;
         lhs.uop().try_and_op(&rhs.uop()).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
@@ -24,9 +25,10 @@ impl Tensor {
     /// Performs element-wise bitwise OR between two tensors with broadcasting.
     /// Both tensors must have integer or boolean dtype.
     #[track_caller]
-    pub fn bitwise_or(&self, other: &Tensor) -> Result<Tensor> {
+    pub fn bitwise_or<'o>(&self, other: impl Into<Operand<'o>>) -> Result<Tensor> {
         origin_call!("bitwise_or");
-        let (lhs, rhs) = self.broadcast_for_binop(other)?;
+        let other = self.operand(other);
+        let (lhs, rhs) = self.broadcast_for_binop(&other)?;
         lhs.uop().try_or_op(&rhs.uop()).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
@@ -35,9 +37,10 @@ impl Tensor {
     /// Performs element-wise bitwise XOR between two tensors with broadcasting.
     /// Both tensors must have integer or boolean dtype.
     #[track_caller]
-    pub fn bitwise_xor(&self, other: &Tensor) -> Result<Tensor> {
+    pub fn bitwise_xor<'o>(&self, other: impl Into<Operand<'o>>) -> Result<Tensor> {
         origin_call!("bitwise_xor");
-        let (lhs, rhs) = self.broadcast_for_binop(other)?;
+        let other = self.operand(other);
+        let (lhs, rhs) = self.broadcast_for_binop(&other)?;
         lhs.uop().try_xor_op(&rhs.uop()).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
@@ -46,9 +49,10 @@ impl Tensor {
     /// Shifts bits of the tensor to the left by the specified amount with broadcasting.
     /// The tensor must have integer or boolean dtype.
     #[track_caller]
-    pub fn lshift(&self, other: &Tensor) -> Result<Tensor> {
+    pub fn lshift<'o>(&self, other: impl Into<Operand<'o>>) -> Result<Tensor> {
         origin_call!("lshift");
-        let (lhs, rhs) = self.broadcast_for_binop(other)?;
+        let other = self.operand(other);
+        let (lhs, rhs) = self.broadcast_for_binop(&other)?;
         lhs.uop().try_shl_op(&rhs.uop()).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
@@ -57,9 +61,10 @@ impl Tensor {
     /// Shifts bits of the tensor to the right by the specified amount with broadcasting.
     /// The tensor must have integer or boolean dtype.
     #[track_caller]
-    pub fn rshift(&self, other: &Tensor) -> Result<Tensor> {
+    pub fn rshift<'o>(&self, other: impl Into<Operand<'o>>) -> Result<Tensor> {
         origin_call!("rshift");
-        let (lhs, rhs) = self.broadcast_for_binop(other)?;
+        let other = self.operand(other);
+        let (lhs, rhs) = self.broadcast_for_binop(&other)?;
         lhs.uop().try_shr_op(&rhs.uop()).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 }

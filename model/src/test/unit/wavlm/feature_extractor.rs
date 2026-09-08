@@ -13,7 +13,7 @@ fn s80_md_v2_feature_extractor_shape() {
     let fe = FeatureExtractor::empty(&cfg);
 
     let n_samples = 256_000;
-    let wav = Tensor::zeros(&[1, n_samples], DType::Float32).unwrap();
+    let wav = Tensor::zeros(&[1, n_samples], DType::Float32);
     let out = fe.forward(&wav).expect("symbolic forward");
 
     let shape = out.dims().unwrap();

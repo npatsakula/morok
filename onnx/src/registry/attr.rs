@@ -137,8 +137,7 @@ pub(crate) fn reduce_attrs(
 
 /// Extract a scalar bool from a tensor (for If condition fallback).
 pub(crate) fn tensor_to_bool_scalar(t: &Tensor) -> Result<bool> {
-    let casted =
-        t.cast(DType::Bool).map_err(|e| Error::IrConstruction { details: format!("tensor_to_bool_scalar: {e}") })?;
+    let casted = t.cast(DType::Bool);
     casted.realize().map_err(|e| Error::IrConstruction { details: format!("tensor_to_bool_scalar: {e}") })?;
     let vals = casted
         .as_vec::<bool>()
@@ -166,7 +165,7 @@ fn host_f64_values(t: &Tensor, what: &str) -> Result<Vec<f64>> {
         return realized.as_vec::<f64>().map_err(failed);
     }
     let via = if dtype.is_float() { DType::Float32 } else { DType::Int64 };
-    let casted = t.cast(via.clone()).map_err(failed)?;
+    let casted = t.cast(via.clone());
     casted.realize().map_err(failed)?;
     if via == DType::Float32 {
         Ok(casted.as_vec::<f32>().map_err(failed)?.into_iter().map(f64::from).collect())
@@ -177,8 +176,7 @@ fn host_f64_values(t: &Tensor, what: &str) -> Result<Vec<f64>> {
 
 /// Extract concrete i64 values from a tensor (shape/indices/pads inputs).
 pub(crate) fn tensor_to_i64_vec(t: &Tensor) -> Result<Vec<i64>> {
-    let casted =
-        t.cast(DType::Int64).map_err(|e| Error::IrConstruction { details: format!("tensor_to_i64_vec: {e}") })?;
+    let casted = t.cast(DType::Int64);
     casted.realize().map_err(|e| Error::IrConstruction { details: format!("tensor_to_i64_vec: {e}") })?;
     casted.as_vec::<i64>().map_err(|e| Error::IrConstruction { details: format!("tensor_to_i64_vec: {e}") })
 }

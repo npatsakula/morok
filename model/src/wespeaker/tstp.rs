@@ -56,10 +56,10 @@ pub fn tstp_forward(features: &Tensor, weights: &Tensor) -> Result<Tensor> {
 
     // dx2 = (features - mean)^2
     let centered = features.try_sub(&mean)?;
-    let dx2 = centered.square()?;
+    let dx2 = centered.square();
 
     // v2 = (w^2).sum(dim=3, keepdim=True)                      [B, 1, 1, 1]
-    let w_sq = w.square()?;
+    let w_sq = w.square();
     let v2 = w_sq.sum_with().axes(3isize).keepdim(true).call()?;
 
     // denom = v1 - v2/v1 + eps                                 [B, 1, 1, 1]

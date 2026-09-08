@@ -301,7 +301,7 @@ impl Tensor {
     /// ```ignore
     /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
     /// let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
-    /// let c = &a + &b;
+    /// let c = (&a + &b)?;
     ///
     /// // One-time preparation (wires output tensor to plan buffer)
     /// let plan = c.prepare()?;
@@ -427,7 +427,18 @@ impl Tensor {
             return Ok(());
         }
 
-        let old_uops: Vec<Arc<UOp>> = pending_indices.iter().map(|&i| tensors[i].uop()).collect();
+        // Hash-consing makes structurally identical graphs one node, so tensors
+        // sharing a uop share one plan output.
+        let mut old_uops: Vec<Arc<UOp>> = Vec::new();
+        let mut output_slot: Vec<usize> = Vec::with_capacity(pending_indices.len());
+        for &i in &pending_indices {
+            let uop = tensors[i].uop();
+            let slot = old_uops.iter().position(|u| Arc::ptr_eq(u, &uop)).unwrap_or_else(|| {
+                old_uops.push(uop);
+                old_uops.len() - 1
+            });
+            output_slot.push(slot);
+        }
 
         // Create merged SINK(CONTIGUOUS(t1), ..., CONTIGUOUS(tN))
         let contiguouses: Vec<Arc<UOp>> = old_uops.iter().map(|u| u.contiguous()).collect();
@@ -444,34 +455,33 @@ impl Tensor {
         let plan = prepare_execution_plan(&schedule_result, config)?;
         let prep_ms = t_prep.elapsed().as_millis();
         snafu::ensure!(
-            plan.num_outputs() == pending_indices.len(),
-            BatchOutputMismatchSnafu { expected: pending_indices.len(), actual: plan.num_outputs() }
+            plan.num_outputs() == old_uops.len(),
+            BatchOutputMismatchSnafu { expected: old_uops.len(), actual: plan.num_outputs() }
         );
         let t_exec = std::time::Instant::now();
         plan.execute().context(ExecutionSnafu)?;
         let exec_ms = t_exec.elapsed().as_millis();
-        debug!(prep_ms, exec_ms, num_outputs = pending_indices.len(), "realize_batch complete");
+        debug!(prep_ms, exec_ms, num_outputs = old_uops.len(), "realize_batch complete");
 
-        // Finalize each pending tensor in-place + build batched becomes_map
+        // Finalize each plan output once, then wire every tensor that shares it.
         let mut becomes_map = HashMap::new();
-        for (buf_idx, &orig_idx) in pending_indices.iter().enumerate() {
+        let mut realized: Vec<(u64, Arc<UOp>, Arc<Buffer>)> = Vec::with_capacity(old_uops.len());
+        for (buf_idx, old_uop) in old_uops.iter().enumerate() {
             let output_buf = plan.output_buffer_at(buf_idx).expect("buf_idx in range").clone();
-            let old_uop = &old_uops[buf_idx];
-
             let output_dtype = old_uop.dtype();
             let output_device = output_buf.allocator().device_spec();
             let num_elements = output_buf.size() / output_dtype.bytes();
             let buffer_uop = UOp::new_buffer(output_device, num_elements, output_dtype);
-            let buf_arc = Arc::new(output_buf);
-
-            let t = tensors[orig_idx];
-            crate::tensor_registry::register_buffer(buffer_uop.id, t.entry.id, buf_arc.clone());
             let shape = old_uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
             let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;
+            becomes_map.insert(UOpKey(old_uop.clone()), realized_uop.clone());
+            realized.push((buffer_uop.id, realized_uop, Arc::new(output_buf)));
+        }
+        for (&orig_idx, &slot) in pending_indices.iter().zip(&output_slot) {
+            let (buffer_id, realized_uop, buf_arc) = &realized[slot];
+            let t = tensors[orig_idx];
+            crate::tensor_registry::register_buffer(*buffer_id, t.entry.id, buf_arc.clone());
             t.set_uop(realized_uop.clone());
-            t.entry.set_buffer(buf_arc);
-
-            becomes_map.insert(UOpKey(old_uop.clone()), realized_uop);
         }
 
         // Single batched apply_map (one global walk instead of N)

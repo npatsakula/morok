@@ -247,7 +247,7 @@ impl Tensor {
         let ndim = self.ndim()?;
         snafu::ensure!(ndim >= 2, NdimMinimumSnafu { op: "nll_loss", min: 2_usize, actual: ndim });
         // Gather log-probs at target class, negate
-        let nll = self.gather(1, &target.try_unsqueeze(1)?)?.try_squeeze(Some(1))?.try_neg()?;
+        let nll = self.gather(1, &target.try_unsqueeze(1)?)?.try_squeeze(Some(1))?.neg();
 
         // Per-sample weight: weight[target] or ones
         let sample_weight = match weight {
@@ -259,15 +259,15 @@ impl Tensor {
             }
             None => {
                 let shape = svod_ir::shape::to_vec_usize(&target.shape()?).context(UOpSnafu)?;
-                Tensor::full(&shape, 1.0, self.uop().dtype())?
+                Tensor::full(&shape, 1.0, self.uop().dtype())
             }
         };
 
         // Mask out ignore_index
         let masked_weight = match ignore_index {
             Some(idx) => {
-                let mask = target.try_ne(&Tensor::const_(idx as f64, target.uop().dtype()))?;
-                sample_weight.try_mul(&mask.cast(sample_weight.uop().dtype())?)?
+                let mask = target.try_ne(Tensor::const_(idx as f64, target.uop().dtype()))?;
+                sample_weight.try_mul(mask.cast(sample_weight.uop().dtype()))?
             }
             None => sample_weight,
         };
@@ -313,11 +313,11 @@ impl Tensor {
         let _ = p;
         let shape = svod_ir::shape::to_vec_usize(&self.shape()?).context(UOpSnafu)?;
         if !training {
-            let mask = Tensor::full(&shape, true, DType::Bool)?;
+            let mask = Tensor::full(&shape, true, DType::Bool);
             return Ok((self.clone(), mask));
         }
         // Training mode deferred (needs RNG: rand_like / Threefry)
-        let mask = Tensor::full(&shape, true, DType::Bool)?;
+        let mask = Tensor::full(&shape, true, DType::Bool);
         Ok((self.clone(), mask))
     }
     /// Convolution with ONNX-style parameters.
@@ -646,7 +646,7 @@ impl Tensor {
         let dtype = self.uop().dtype();
         let p_tensor = Tensor::const_(p_f, dtype.clone());
         let inv_p = Tensor::const_(1.0 / p_f, dtype);
-        let x_abs_p = self.try_abs()?.try_pow(&p_tensor)?;
+        let x_abs_p = self.abs().try_pow(&p_tensor)?;
 
         // Pad, pool (create windows), then sum over kernel axes.
         // This computes sum(|x|^p) directly — correct for all padding/ceil modes
@@ -899,9 +899,9 @@ impl Tensor {
             .ceil_mode(ceil_mode)
             .call()?;
         let indices = if storage_order == 1 {
-            indices.try_transpose(-2, -1)?.cast(DType::Int64)?
+            indices.try_transpose(-2, -1)?.cast(DType::Int64)
         } else {
-            indices.cast(DType::Int64)?
+            indices.cast(DType::Int64)
         };
         Ok((values, indices))
     }
@@ -958,7 +958,7 @@ impl Tensor {
             shape[2].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "lrn" })?,
             shape[3].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "lrn" })?,
         );
-        let x_sq = self.square()?;
+        let x_sq = self.square();
         let x_sq = x_sq.try_reshape([b as isize, 1, c as isize, (h * w) as isize])?;
         let pad_before = ((size - 1) / 2) as isize;
         let pad_after = (size / 2) as isize;
@@ -967,9 +967,9 @@ impl Tensor {
         let pooled = pooled.try_reshape([b as isize, c as isize, h as isize, w as isize])?;
         let dtype = self.uop().dtype();
         let scale = pooled
-            .try_mul(&Tensor::const_(alpha, dtype.clone()))?
-            .try_add(&Tensor::const_(bias, dtype.clone()))?
-            .try_pow(&Tensor::const_(beta, dtype))?;
+            .try_mul(Tensor::const_(alpha, dtype.clone()))?
+            .try_add(Tensor::const_(bias, dtype.clone()))?
+            .try_pow(Tensor::const_(beta, dtype))?;
         self.try_div(&scale)
     }
 }

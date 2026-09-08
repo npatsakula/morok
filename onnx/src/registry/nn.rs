@@ -40,7 +40,7 @@ pub(crate) fn op_batch_norm(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Res
         let axes = AxisSpec::Multiple(reduce_axes);
 
         // Compute batch stats in f32
-        let x32 = if x.dtype() != DType::Float32 { x.cast(DType::Float32)? } else { x.clone() };
+        let x32 = if x.dtype() != DType::Float32 { x.cast(DType::Float32) } else { x.clone() };
         let batch_mean = x32.mean_with().axes(axes.clone()).keepdim(false).call()?;
         let centered = x32.try_sub(&batch_mean.try_reshape(&{
             let mut s = vec![1isize; ndim];
@@ -48,29 +48,29 @@ pub(crate) fn op_batch_norm(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Res
             s
         })?)?;
         // Population variance (correction=0): mean(x²) not mean(x²)*N/(N-1)
-        let batch_var = centered.square()?.mean_with().axes(axes).keepdim(false).call()?;
+        let batch_var = centered.square().mean_with().axes(axes).keepdim(false).call()?;
 
         // EMA update: running = batch * (1 - momentum) + running * momentum
         let m = Tensor::const_(momentum, DType::Float64);
         let one_minus_m = Tensor::const_(1.0 - momentum, DType::Float64);
         let new_running_mean = batch_mean
-            .cast(DType::Float64)?
+            .cast(DType::Float64)
             .try_mul(&one_minus_m)?
-            .try_add(&running_mean.cast(DType::Float64)?.try_mul(&m)?)?
-            .cast(running_mean.dtype())?;
+            .try_add(&running_mean.cast(DType::Float64).try_mul(&m)?)?
+            .cast(running_mean.dtype());
         let new_running_var = batch_var
-            .cast(DType::Float64)?
+            .cast(DType::Float64)
             .try_mul(&one_minus_m)?
-            .try_add(&running_var.cast(DType::Float64)?.try_mul(&m)?)?
-            .cast(running_var.dtype())?;
+            .try_add(&running_var.cast(DType::Float64).try_mul(&m)?)?
+            .cast(running_var.dtype());
 
         // Normalize with batch stats, cast back to input dtype
-        let invstd = batch_var.try_add(&Tensor::const_(epsilon as f64, batch_var.dtype()))?.try_rsqrt()?;
+        let invstd = batch_var.try_add(Tensor::const_(epsilon as f64, batch_var.dtype()))?.try_rsqrt()?;
         let out = x.batchnorm().scale(scale).bias(bias).mean(&batch_mean).invstd(&invstd).call()?;
-        let out = out.cast(x.dtype())?;
+        let out = out.cast(x.dtype());
         Ok(vec![out, new_running_mean, new_running_var])
     } else {
-        let invstd = running_var.try_add(&Tensor::const_(epsilon as f64, running_var.dtype()))?.try_rsqrt()?;
+        let invstd = running_var.try_add(Tensor::const_(epsilon as f64, running_var.dtype()))?.try_rsqrt()?;
         let out = x.batchnorm().scale(scale).bias(bias).mean(running_mean).invstd(&invstd).call()?;
         Ok(vec![out])
     }

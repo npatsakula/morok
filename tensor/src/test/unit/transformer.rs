@@ -161,13 +161,13 @@ crate::codegen_tests! {
         let q_data: Vec<f32> = vec![100.0; 2 * 64];
         let mut k_data: Vec<f32> = vec![100.0; 64];
         k_data.extend(std::iter::repeat_n(99.0f32, 64));
-        let q = Tensor::from_slice(q_data).try_reshape([1, 1, 2, 64]).unwrap().cast(DType::Float16).unwrap();
-        let k = Tensor::from_slice(k_data).try_reshape([1, 1, 2, 64]).unwrap().cast(DType::Float16).unwrap();
-        let v = Tensor::from_slice([1.0f32, 100.0]).try_reshape([1, 1, 2, 1]).unwrap().cast(DType::Float16).unwrap();
+        let q = Tensor::from_slice(q_data).try_reshape([1, 1, 2, 64]).unwrap().cast(DType::Float16);
+        let k = Tensor::from_slice(k_data).try_reshape([1, 1, 2, 64]).unwrap().cast(DType::Float16);
+        let v = Tensor::from_slice([1.0f32, 100.0]).try_reshape([1, 1, 2, 1]).unwrap().cast(DType::Float16);
 
         let result = q.scaled_dot_product_attention().key(&k).value(&v).call().unwrap();
         assert_eq!(result.uop().dtype(), DType::Float16, "output must keep the query dtype");
-        let result = result.cast(DType::Float32).unwrap();
+        let result = result.cast(DType::Float32);
         result.realize_with(&config).unwrap();
         // Key 0 wins by 800 in score, so every query reads V[0] = 1.0.
         for value in result.as_vec::<f32>().unwrap() {
@@ -455,7 +455,7 @@ impl SdpaCase {
                 x
             };
             let heads = |seed: usize| {
-                realized(Tensor::from_ndarray(&self.sample(seed)).cast(DType::Float16).unwrap())
+                realized(Tensor::from_ndarray(&self.sample(seed)).cast(DType::Float16))
                     .try_permute(&[0, 2, 1, 3])
                     .unwrap()
             };
@@ -527,7 +527,6 @@ fn test_sdpa_cuda_masked_f16_matches_cpu(beam: bool) {
             .try_permute(&[0, 2, 1, 3])
             .unwrap()
             .cast(DType::Float32)
-            .unwrap()
     };
     let cpu = PrepareConfig::for_cpu_backend(CpuBackend::Llvm);
     let expected = case.run(DeviceSpec::Cpu, &cpu, &cpu, build);
@@ -571,8 +570,8 @@ fn test_sdpa_scores_cuda_tc_warp_with_three_locals_matches_cpu() {
         let keep = case.key_mask(lens).logical_not().unwrap();
         let kt = k.try_transpose(-1, -2).unwrap();
         let scores = q.matmul_with().other(&kt).dtype(DType::Float32).call().unwrap();
-        let scores = scores.try_mul(&Tensor::const_(0.125f64, DType::Float32)).unwrap();
-        scores.where_(&keep, &Tensor::const_(ConstValue::min(ScalarDType::Float32), DType::Float32)).unwrap()
+        let scores = scores.try_mul(Tensor::const_(0.125f64, DType::Float32)).unwrap();
+        scores.where_(&keep, Tensor::const_(ConstValue::min(ScalarDType::Float32), DType::Float32)).unwrap()
     };
     let cpu = PrepareConfig::for_cpu_backend(CpuBackend::Llvm);
     let expected = case.run(DeviceSpec::Cpu, &cpu, &cpu, build);

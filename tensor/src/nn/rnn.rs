@@ -116,7 +116,7 @@ impl Tensor {
         let mut h_t = if let Some(h0) = initial_h {
             h0.try_squeeze(Some(0))? // [batch, hidden]
         } else {
-            Tensor::full(&[batch_size, hidden_size], 0.0f32, dtype)?
+            Tensor::full(&[batch_size, hidden_size], 0.0f32, dtype)
         };
 
         let mut h_list = Vec::with_capacity(seq_length);
@@ -253,7 +253,7 @@ impl Tensor {
         let mut h_t = if let Some(h0) = initial_h {
             h0.try_squeeze(Some(0))?
         } else {
-            Tensor::full(&[batch_size, hidden_size], 0.0f32, dtype)?
+            Tensor::full(&[batch_size, hidden_size], 0.0f32, dtype)
         };
 
         let mut h_list = Vec::with_capacity(seq_length);
@@ -294,7 +294,7 @@ impl Tensor {
             };
 
             // H = (1 - z) * h_candidate + z * H_prev
-            let one = Tensor::full(&[1], 1.0f32, z.uop().dtype())?;
+            let one = Tensor::full(&[1], 1.0f32, z.uop().dtype());
             h_t = one.try_sub(&z)?.try_mul(&h_candidate)?.try_add(&z.try_mul(&h_t)?)?;
             h_list.push(h_t.clone());
         }
@@ -419,12 +419,12 @@ impl Tensor {
         let mut h_t = if let Some(h0) = initial_h {
             h0.try_squeeze(Some(0))?
         } else {
-            Tensor::full(&[batch_size, hidden_size], 0.0f32, dtype.clone())?
+            Tensor::full(&[batch_size, hidden_size], 0.0f32, dtype.clone())
         };
         let mut c_t = if let Some(c0) = initial_c {
             c0.try_squeeze(Some(0))?
         } else {
-            Tensor::full(&[batch_size, hidden_size], 0.0f32, dtype)?
+            Tensor::full(&[batch_size, hidden_size], 0.0f32, dtype)
         };
 
         let mut h_list = Vec::with_capacity(seq_length);

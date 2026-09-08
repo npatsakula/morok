@@ -471,7 +471,7 @@ impl Tensor {
         let mask = pooled.try_eq(&pooled_max)?;
 
         // Multiply mask * pooled_indices, take max → first-occurrence (via reverse index)
-        let masked_idx = mask.cast(DType::Int32)?.try_mul(&pooled_idx)?;
+        let masked_idx = mask.cast(DType::Int32).try_mul(&pooled_idx)?;
         let max_idx = masked_idx.max_with().axes(axes).keepdim(false).call()?;
 
         // spatial_sz - max_idx → convert reverse index to forward index
@@ -553,7 +553,7 @@ impl Tensor {
         let idx_flat = indices.try_reshape([bs as isize, 1, num_pooled as isize])?;
 
         // One-hot: compare indices against arange(inferred_numel)
-        let arange = Tensor::arange(inferred_numel as i64, None, None)?.cast(indices.uop().dtype())?.try_reshape([
+        let arange = Tensor::arange(inferred_numel as i64, None, None)?.cast(indices.uop().dtype()).try_reshape([
             1,
             inferred_numel as isize,
             1,
@@ -673,7 +673,7 @@ impl Tensor {
         // Initialize output: [N*C, *padded_img] with zeros
         let mut out_dims: Vec<usize> = vec![nc];
         out_dims.extend_from_slice(&padded_img);
-        let mut result = Tensor::full(&out_dims, 0.0f64, self.uop().dtype())?;
+        let mut result = Tensor::full(&out_dims, 0.0f64, self.uop().dtype());
 
         // Iterate over all kernel positions in block_shape
         for be in 0..bl {

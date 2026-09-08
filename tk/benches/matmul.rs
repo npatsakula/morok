@@ -26,12 +26,12 @@ fn bench_matmul(c: &mut Criterion) {
         let a = randn_bf16(&[n, n]);
         let b = randn_bf16(&[n, n]);
 
-        let mut y = svod_tk::matmul(&a, &b).expect("tk matmul").expect("matmul kernel applies");
+        let y = svod_tk::matmul(&a, &b).expect("tk matmul").expect("matmul kernel applies");
         let plan = y.prepare().expect("prepare matmul");
         group.bench_with_input(BenchmarkId::new("tk", n), &n, |bencher, _| bench_plan(bencher, &plan));
 
         // Reference: svod's generic bf16→f32 GEMM (the matmul a user would write).
-        let mut reft = a.matmul_with().other(&b).dtype(DType::Float32).call().expect("ref matmul");
+        let reft = a.matmul_with().other(&b).dtype(DType::Float32).call().expect("ref matmul");
         let ref_plan = reft.prepare().expect("prepare ref");
         group.bench_with_input(BenchmarkId::new("generic", n), &n, |bencher, _| bench_plan(bencher, &ref_plan));
     }

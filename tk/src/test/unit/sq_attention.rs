@@ -313,9 +313,9 @@ fn sq_attention_numerical_gpu() {
 #[test]
 fn undivisible_head_dim_declines_instead_of_erroring() {
     let (b, n, h, d) = (1usize, 3usize, 2usize, 4usize);
-    let q = Tensor::zeros(&[b, 1, h, d], DType::Float32).expect("q");
-    let k = Tensor::zeros(&[b, n, h, d], DType::Float32).expect("k");
-    let v = Tensor::zeros(&[b, n, h, d], DType::Float32).expect("v");
+    let q = Tensor::zeros(&[b, 1, h, d], DType::Float32);
+    let k = Tensor::zeros(&[b, n, h, d], DType::Float32);
+    let v = Tensor::zeros(&[b, n, h, d], DType::Float32);
     let out = crate::single_query_attention(&q, &k, &v, SqAttentionOpts::default()).expect("declines, not errors");
     assert!(out.is_none(), "head dim 4 divides no supported wave size (32/64); the launch must fall back");
 }

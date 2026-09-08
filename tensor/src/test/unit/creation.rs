@@ -22,7 +22,7 @@ crate::codegen_tests! {
         let t = Tensor::from_raw_bytes(&bytes, &[2], DType::Float16).unwrap();
         assert_eq!(t.uop().dtype(), DType::Float16);
 
-        let t_f32 = t.cast(DType::Float32).unwrap();
+        let t_f32 = t.cast(DType::Float32);
         t_f32.realize_with(&config).unwrap();
         let vals = t_f32.as_vec::<f32>().unwrap();
         assert!((vals[0] - 1.0).abs() < 1e-3);

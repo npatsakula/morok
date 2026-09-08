@@ -53,7 +53,7 @@ impl RotaryTable {
         let cos = cos_f32.try_unsqueeze(0)?.try_unsqueeze(0)?;
         let sin = sin_f32.try_unsqueeze(0)?.try_unsqueeze(0)?;
 
-        Ok(Self { cos: cos.cast(dtype.clone())?, sin: sin.cast(dtype)? })
+        Ok(Self { cos: cos.cast(dtype.clone()), sin: sin.cast(dtype) })
     }
 
     /// Apply RoPE to a q/k tensor of shape `(B, H, L, head_dim)`.

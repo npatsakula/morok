@@ -24,8 +24,8 @@ use common::{bench_plan, randn_bf16, requirements_met};
 /// same quantity `svod_tk::knn` returns — so the `tk` and `generic` rows are comparable.
 fn knn_generic_ref(xb: &Tensor, cb: &Tensor, k: usize) -> Tensor {
     let f32 = DType::Float32;
-    let xf = xb.cast(f32.clone()).expect("x→f32");
-    let cf = cb.cast(f32.clone()).expect("c→f32");
+    let xf = xb.cast(f32.clone());
+    let cf = cb.cast(f32.clone());
     // Per-row squared norms (cheap [N,1]/[M,1] reductions; the cost is the GEMM + topk).
     let x_sq = xf.try_mul(&xf).expect("x²").sum_with().axes(1isize).keepdim(true).call().expect("Σx²"); // [N,1]
     let c_sq = cf.try_mul(&cf).expect("c²").sum_with().axes(1isize).keepdim(true).call().expect("Σc²"); // [M,1]
@@ -93,12 +93,12 @@ fn bench_knn(c: &mut Criterion) {
 
             // tk: fused running top-K. `prepare()`-ing `dists` realises the kernel + the
             // sort/gather tail (the indices are a shared intermediate of the same graph).
-            let (mut dists, _idxs) = svod_tk::knn(&xb, &cb, k).expect("tk knn").expect("knn applies for bench shape");
+            let (dists, _idxs) = svod_tk::knn(&xb, &cb, k).expect("tk knn").expect("knn applies for bench shape");
             let plan = dists.prepare().expect("prepare tk knn");
             group.bench_with_input(BenchmarkId::new("tk", m), &m, |bencher, _| bench_plan(bencher, &plan));
 
             // Reference: the generic GEMM-topk path (materialises the [N,M] matrix).
-            let mut reft = knn_generic_ref(&xb, &cb, k);
+            let reft = knn_generic_ref(&xb, &cb, k);
             let ref_plan = reft.prepare().expect("prepare generic knn");
             group.bench_with_input(BenchmarkId::new("generic", m), &m, |bencher, _| bench_plan(bencher, &ref_plan));
         }

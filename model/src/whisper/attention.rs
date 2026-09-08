@@ -142,7 +142,7 @@ impl MultiHeadAttention {
         let need_cast = dt != svod_dtype::DType::BFloat16 && dt != svod_dtype::DType::Float16;
         let (q_f, k_f, v_f) = if need_cast {
             let to = svod_dtype::DType::BFloat16;
-            (q_fa.cast(to)?, k_fa.cast(svod_dtype::DType::BFloat16)?, v_fa.cast(svod_dtype::DType::BFloat16)?)
+            (q_fa.cast(to), k_fa.cast(svod_dtype::DType::BFloat16), v_fa.cast(svod_dtype::DType::BFloat16))
         } else {
             (q_fa.clone(), k_fa.clone(), v_fa.clone())
         };
@@ -155,7 +155,7 @@ impl MultiHeadAttention {
         };
         match direct {
             Some(out) => {
-                let out = if need_cast { out.cast(dt)? } else { out };
+                let out = if need_cast { out.cast(dt) } else { out };
                 Ok(out.try_reshape(&[b, s, svod_ir::SInt::Const(d)])?)
             }
             None => {

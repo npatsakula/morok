@@ -14,10 +14,8 @@ crate::codegen_tests! {
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
         let b = Tensor::from_slice([10.0f32, 20.0, 30.0, 40.0]);
 
-        let sum = &a + &b;
-        let scaled = sum * Tensor::from_slice([0.1f32]);
-
-        let result = scaled;
+        let sum = (&a + &b).unwrap();
+        let result = (sum * Tensor::from_slice([0.1f32])).unwrap();
         result.realize_with(&config).unwrap();
         let data = result.as_vec::<f32>().unwrap();
 
@@ -64,7 +62,7 @@ crate::codegen_tests! {
         // [3, 2] + [1, 2] → [3, 2]
         let transposed = Tensor::from_ndarray(&array![[1.0f32, 4.0], [2.0, 5.0], [3.0, 6.0]]);
         let bias = Tensor::from_ndarray(&array![[100.0f32, 200.0]]);
-        let biased = &transposed + &bias;
+        let biased = (&transposed + &bias).unwrap();
 
         let result = biased;
         result.realize_with(&config).unwrap();
@@ -141,7 +139,7 @@ crate::codegen_tests! {
         // y = input @ weight.T + bias
         let weight_t = weight.try_transpose(0, 1).unwrap();
         let out = input.dot(&weight_t).unwrap();
-        let result_tensor = &out + &bias;
+        let result_tensor = (&out + &bias).unwrap();
 
         // Verify shape
         let shape = result_tensor.shape().unwrap();
@@ -182,12 +180,12 @@ crate::codegen_tests! {
 
         // Layer 1: linear + relu
         let h = input.dot(&w1.try_transpose(0, 1).unwrap()).unwrap();
-        let h = &h + &b1;
+        let h = (&h + &b1).unwrap();
         let h = h.relu().unwrap();
 
         // Layer 2: linear
         let logits = h.dot(&w2.try_transpose(0, 1).unwrap()).unwrap();
-        let logits = &logits + &b2;
+        let logits = (&logits + &b2).unwrap();
 
         // Verify shape: [1, 2]
         let shape = logits.shape().unwrap();
@@ -311,7 +309,7 @@ crate::codegen_tests! {
 fn test_example_6_ir_graph() {
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
 
     // Verify we can print the IR tree without crashing
     let tree = c.uop().tree();
@@ -328,7 +326,7 @@ crate::codegen_tests! {
 
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-        let c = &a + &b;
+        let c = (&a + &b).unwrap();
 
         let plan = c.prepare_with(&config).unwrap();
         assert!(plan.kernels().count() > 0, "should have at least 1 kernel");

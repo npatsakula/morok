@@ -22,14 +22,14 @@ use super::device_supported;
 
 /// A realized random tensor of `dtype` on the env-selected device.
 fn randn_dt(shape: &[usize], dtype: DType) -> Tensor {
-    let t = Tensor::randn(shape).expect("randn").cast(dtype).expect("cast");
+    let t = Tensor::randn(shape).expect("randn").cast(dtype);
     t.realize().expect("realize");
     t
 }
 
 /// Realize, cast to f32, and read as a host `Vec<f32>` for comparison.
 fn to_f32_vec(t: Tensor) -> Vec<f32> {
-    let f = t.cast(DType::Float32).expect("→f32");
+    let f = t.cast(DType::Float32);
     f.realize().expect("realize f32");
     f.as_vec::<f32>().expect("read f32")
 }
@@ -57,8 +57,8 @@ fn prop_matmul_vs_reference_amd() {
         };
         let got = to_f32_vec(got_t);
 
-        let af = a.cast(DType::Float32).expect("a→f32");
-        let bf = b.cast(DType::Float32).expect("b→f32");
+        let af = a.cast(DType::Float32);
+        let bf = b.cast(DType::Float32);
         let exp = to_f32_vec(af.matmul(&bf).expect("ref matmul"));
 
         // abs err ~ √n·bf16_ulp and |e| ~ √n, so the atol floor grows with √n while
@@ -142,7 +142,7 @@ fn prop_fa_vs_sdpa_amd() {
         // For the masked case, the same [B,1,1,N] `arange(N) >= lens[b]` key mask
         // (true = masked) the kernel applies — an all-masked lane is a zero row on
         // both sides (SDPA zero-fills, the kernel's denominator clamp yields 0).
-        let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("perm");
+        let perm = |t: &Tensor| t.cast(DType::Float32).try_permute(&[0, 2, 1, 3]).expect("perm");
         let (qp, kp, vp) = (perm(&q), perm(&k), perm(&v));
         let sdpa = qp.scaled_dot_product_attention().key(&kp).value(&vp);
         let refb = if let Some(kl) = &key_lens_vec {

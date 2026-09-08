@@ -127,7 +127,7 @@ pub fn get_tensor(sd: &StateDict, key: &str) -> Result<Tensor> {
 pub fn cast_all(sd: &StateDict, dtype: DType) -> StateDict {
     sd.iter()
         .map(|(k, v)| {
-            let t = if v.dtype() == dtype { v.clone() } else { v.cast(dtype.clone()).unwrap_or_else(|_| v.clone()) };
+            let t = if v.dtype() == dtype { v.clone() } else { v.cast(dtype.clone()) };
             (k.clone(), t)
         })
         .collect()

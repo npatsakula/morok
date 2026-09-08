@@ -138,7 +138,7 @@ impl PlainMultiHeadSelfAttention {
         let v = project_and_split(&self.linear_v_weight, &self.linear_v_bias)?;
 
         let scaling = (self.d_k as f32).powf(-0.5);
-        let scaling_t = Tensor::full(&[1], scaling, DType::Float32)?;
+        let scaling_t = Tensor::full(&[1], scaling, DType::Float32);
         let q_scaled = q.try_mul(&scaling_t)?;
         let k_t = k.try_transpose(-2, -1)?; // (B, h, d_k, L)
         let scores = q_scaled.matmul(&k_t)?; // (B, h, L, L)

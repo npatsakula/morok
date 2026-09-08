@@ -57,7 +57,7 @@ impl Tensor {
         }
         let numel: usize = shape.iter().product();
         if numel == 0 {
-            return Tensor::zeros(shape, dtype);
+            return Ok(Tensor::zeros(shape, dtype));
         }
         // Number of uint32 words needed to cover `numel * itemsize` bytes.
         let num_words = (numel * scalar.bytes()).div_ceil(4) as u64;
@@ -83,8 +83,8 @@ fn random_bits(seed: &Tensor, counter: &Tensor, num: usize) -> Result<Tensor> {
     // `arange_with_dtype` only fast-paths on `ConstValue::Int`, so go through
     // the i64 entry point and cast to u32.
     let half = num.div_ceil(2);
-    let counts0 = Tensor::arange(0, Some(half as i64), None)?.cast(u32_dt.clone())?;
-    let half_t = Tensor::full(&[half], half as u32, u32_dt)?;
+    let counts0 = Tensor::arange(0, Some(half as i64), None)?.cast(u32_dt.clone());
+    let half_t = Tensor::full(&[half], half as u32, u32_dt);
     let counts1 = counts0.try_add(&half_t)?;
 
     // Step 3: bulk THREEFRY pass. Returns `[2 * half]` u32; truncate to `num`.
@@ -103,18 +103,18 @@ pub(crate) fn threefry_random_bits(key: &Tensor, counts0: &Tensor, counts1: &Ten
     let u64_dt = DType::Scalar(ScalarDType::UInt64);
     let counts_shape: Shape = counts0.shape()?;
 
-    let shift_32 = Tensor::full(&to_vec_usize(&counts_shape).context(UOpSnafu)?, 32u32, u64_dt.clone())?;
+    let shift_32 = Tensor::full(&to_vec_usize(&counts_shape).context(UOpSnafu)?, 32u32, u64_dt.clone());
 
     // x = (counts1 << 32) | counts0  (u64)
-    let c0_u64 = counts0.cast(u64_dt.clone())?;
-    let c1_u64 = counts1.cast(u64_dt.clone())?;
+    let c0_u64 = counts0.cast(u64_dt.clone());
+    let c1_u64 = counts1.cast(u64_dt.clone());
     let c1_shifted = c1_u64.try_shl(&shift_32)?;
     let x = c1_shifted.try_bitor(&c0_u64)?;
 
     // key_packed = (key[1] << 32) | key[0], then broadcast from [1] to counts_shape.
-    let k_shift_32 = Tensor::full(&[1], 32u32, u64_dt.clone())?;
-    let k0 = key.try_shrink([(0usize, 1usize)])?.cast(u64_dt.clone())?;
-    let k1 = key.try_shrink([(1usize, 2usize)])?.cast(u64_dt.clone())?;
+    let k_shift_32 = Tensor::full(&[1], 32u32, u64_dt.clone());
+    let k0 = key.try_shrink([(0usize, 1usize)])?.cast(u64_dt.clone());
+    let k1 = key.try_shrink([(1usize, 2usize)])?.cast(u64_dt.clone());
     let key_packed = k1.try_shl(&k_shift_32)?.try_bitor(&k0)?;
     let key_broadcast = key_packed.broadcast_to(&counts_shape)?;
 
@@ -127,8 +127,8 @@ pub(crate) fn threefry_random_bits(key: &Tensor, counts0: &Tensor, counts1: &Ten
     // Narrowing casts truncate, so no mask is needed; this is the exact inverse
     // of the pack above, which lets `symbolic_simple` cancel both against the
     // THREEFRY decomposition instead of emitting 64-bit ALU.
-    let lo = result.cast(u32_dt.clone())?;
-    let hi = result.try_shr(&shift_32)?.cast(u32_dt)?;
+    let lo = result.cast(u32_dt.clone());
+    let hi = result.try_shr(&shift_32)?.cast(u32_dt);
 
     Tensor::cat(&[&lo, &hi], 0)
 }
@@ -153,15 +153,15 @@ fn bits_to_rand(bits: &Tensor, shape: &[usize], dtype: DType) -> Result<Tensor> 
     let uint_bits = bits.bitcast(uint_dt.clone())?;
     let bits_shape_concrete = to_vec_usize(&uint_bits.shape()?).context(UOpSnafu)?;
 
-    let shift_t = Tensor::full(&bits_shape_concrete, ConstValue::UInt(shift as u64), uint_dt.clone())?;
+    let shift_t = Tensor::full(&bits_shape_concrete, ConstValue::UInt(shift as u64), uint_dt.clone());
     let shifted = uint_bits.try_shr(&shift_t)?;
 
     let one_bits = ConstValue::UInt(one_bits_for(scalar));
-    let one_bits_t = Tensor::full(&bits_shape_concrete, one_bits, uint_dt)?;
+    let one_bits_t = Tensor::full(&bits_shape_concrete, one_bits, uint_dt);
     let or_ed = shifted.try_bitor(&one_bits_t)?;
 
     let in_one_two = or_ed.bitcast(dtype.clone())?;
-    let one_f = Tensor::full(&bits_shape_concrete, ConstValue::Float(1.0), dtype)?;
+    let one_f = Tensor::full(&bits_shape_concrete, ConstValue::Float(1.0), dtype);
     let in_unit = in_one_two.try_sub(&one_f)?;
 
     // Bits-to-floats may produce more elements than needed (e.g. odd-numel f16

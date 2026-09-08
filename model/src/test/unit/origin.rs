@@ -73,7 +73,7 @@ fn gigaam_module_scopes_match_the_state_dict() {
     let _capture = origin::capture_for_thread(true);
     let config = test_config();
     let model = GigaAm::with_random_weights(config.clone());
-    let mel = Tensor::zeros(&[1, config.n_mels, 64], DType::Float32).expect("mel");
+    let mel = Tensor::zeros(&[1, config.n_mels, 64], DType::Float32);
 
     let out = model.encoder.forward(&mel).expect("encoder forward");
     let paths = module_paths(&out);
@@ -90,7 +90,7 @@ fn gigaam_layers_get_distinct_origins() {
     let _capture = origin::capture_for_thread(true);
     let config = test_config();
     let model = GigaAm::with_random_weights(config.clone());
-    let mel = Tensor::zeros(&[1, config.n_mels, 64], DType::Float32).expect("mel");
+    let mel = Tensor::zeros(&[1, config.n_mels, 64], DType::Float32);
 
     let out = model.encoder.forward(&mel).expect("encoder forward");
     let paths = module_paths(&out);
@@ -108,7 +108,7 @@ fn gigaam_capture_is_off_by_default() {
     let _capture = origin::capture_for_thread(false);
     let config = test_config();
     let model = GigaAm::with_random_weights(config.clone());
-    let mel = Tensor::zeros(&[1, config.n_mels, 64], DType::Float32).expect("mel");
+    let mel = Tensor::zeros(&[1, config.n_mels, 64], DType::Float32);
 
     let out = model.encoder.forward(&mel).expect("encoder forward");
     assert!(module_paths(&out).is_empty());
@@ -119,7 +119,7 @@ fn whisper_encoder_module_scopes_match_the_state_dict() {
     let _capture = origin::capture_for_thread(true);
     let dims = ModelDimensions::for_size(WhisperSize::Tiny);
     let model = Whisper::empty(dims.clone());
-    let mel = Tensor::zeros(&[1, dims.n_mels, 3000], DType::Float32).expect("mel");
+    let mel = Tensor::zeros(&[1, dims.n_mels, 3000], DType::Float32);
 
     let out = model.encode(&mel).expect("whisper encode");
     let paths = module_paths(&out);

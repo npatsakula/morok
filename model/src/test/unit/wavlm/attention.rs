@@ -61,7 +61,7 @@ fn bucket_indices_production_params_extremes() {
 #[test]
 fn position_bias_shape() {
     // rel_attn_embed: (num_buckets=320, total_num_heads=16)
-    let rel_embed = Tensor::zeros(&[320, 16], DType::Float32).unwrap();
+    let rel_embed = Tensor::zeros(&[320, 16], DType::Float32);
     let bias = compute_position_bias(&rel_embed, 10, 10, 320, 800).unwrap();
     let shape = bias.dims().unwrap();
     assert_eq!(shape, vec![1, 16, 10, 10]);
@@ -87,8 +87,8 @@ fn attention_forward_shape_full_heads() {
 
     let b = 1;
     let l = 8;
-    let x = Tensor::zeros(&[b, l, cfg.encoder_embed_dim], DType::Float32).unwrap();
-    let rel_embed = Tensor::zeros(&[cfg.encoder_num_buckets, attn.total_num_heads], DType::Float32).unwrap();
+    let x = Tensor::zeros(&[b, l, cfg.encoder_embed_dim], DType::Float32);
+    let rel_embed = Tensor::zeros(&[cfg.encoder_num_buckets, attn.total_num_heads], DType::Float32);
     let pb = compute_position_bias(&rel_embed, l, l, cfg.encoder_num_buckets, cfg.encoder_max_distance).unwrap();
 
     let out = attn.forward(&x, &pb).expect("symbolic forward");
@@ -120,8 +120,8 @@ fn attention_pruned_head_shapes() {
     assert_eq!(gate_c, vec![1, 8, 1, 1], "gru_rel_pos_const should be (1, total_num_heads, 1, 1) — NOT pruned");
 
     let l = 6;
-    let x = Tensor::zeros(&[1, l, cfg.encoder_embed_dim], DType::Float32).unwrap();
-    let rel_embed = Tensor::zeros(&[cfg.encoder_num_buckets, attn.total_num_heads], DType::Float32).unwrap();
+    let x = Tensor::zeros(&[1, l, cfg.encoder_embed_dim], DType::Float32);
+    let rel_embed = Tensor::zeros(&[cfg.encoder_num_buckets, attn.total_num_heads], DType::Float32);
     let pb = compute_position_bias(&rel_embed, l, l, cfg.encoder_num_buckets, cfg.encoder_max_distance).unwrap();
     let out = attn.forward(&x, &pb).expect("symbolic forward");
     let out_shape = out.dims().unwrap();

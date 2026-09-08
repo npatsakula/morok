@@ -31,7 +31,7 @@ pub fn masked_mean(hidden_states: &Tensor, mask: &Tensor) -> Result<Tensor> {
     // mask (B, L) bool → (B, L, 1) float (1.0 = real, 0.0 = pad) for broadcast
     // over the hidden dim D. cast(bool) yields 1.0/0.0. Both num and den share
     // this 3D rank so the divide doesn't re-expand the L axis.
-    let m = mask.cast(dtype.clone())?.try_unsqueeze(-1)?;
+    let m = mask.cast(dtype.clone()).try_unsqueeze(-1)?;
 
     // numerator = sum(hidden * mask, axis=L)                  → (B, 1, D)
     let xw = hidden_states.try_mul(&m)?;

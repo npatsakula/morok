@@ -94,8 +94,8 @@ impl OpRegistry {
                 let y = inp(inputs, 1);
                 vec![if x.dtype().is_int() { x.try_cdiv(y)? } else { x.try_div(y)? }]
             }
-            "Neg" => vec![inp(inputs, 0).try_neg()?],
-            "Abs" => vec![inp(inputs, 0).try_abs()?],
+            "Neg" => vec![inp(inputs, 0).neg()],
+            "Abs" => vec![inp(inputs, 0).abs()],
             "Pow" => vec![inp(inputs, 0).try_pow(inp(inputs, 1))?],
             "Mod" => {
                 let fmod = attrs.int("fmod", 0);
@@ -108,7 +108,7 @@ impl OpRegistry {
                     } else {
                         // floats: x - trunc(x/y) * y (primitive MOD is integer-only)
                         let div = x.try_div(y)?;
-                        x.try_sub(&div.trunc()?.try_mul(y)?)?
+                        x.try_sub(&div.trunc().try_mul(y)?)?
                     }
                 } else if x.dtype().is_int() {
                     // fmod=0 integers: Python-style modulo (sign of divisor)
@@ -116,7 +116,7 @@ impl OpRegistry {
                 } else {
                     // fmod=0 floats: x - floor(x/y) * y
                     let div = x.try_div(y)?;
-                    x.try_sub(&div.floor()?.try_mul(y)?)?
+                    x.try_sub(&div.floor().try_mul(y)?)?
                 }]
             }
             "Sum" => vec![fold_variadic(inputs, "Sum", |a, b| a.try_add(b))?],
@@ -124,7 +124,7 @@ impl OpRegistry {
                 let count = inputs.iter().filter(|o| o.is_some()).count();
                 vec![
                     fold_variadic(inputs, "Mean", |a, b| a.try_add(b))?
-                        .try_div(&Tensor::const_(count as f64, DType::Float32))?,
+                        .try_div(Tensor::const_(count as f64, DType::Float32))?,
                 ]
             }
 
@@ -146,10 +146,10 @@ impl OpRegistry {
             "Sqrt" => vec![inp(inputs, 0).try_sqrt()?],
             "Exp" => vec![inp(inputs, 0).try_exp()?],
             "Log" => vec![inp(inputs, 0).try_log()?],
-            "Ceil" => vec![inp(inputs, 0).ceil()?],
-            "Floor" => vec![inp(inputs, 0).floor()?],
-            "Round" => vec![inp(inputs, 0).round()?],
-            "Sign" => vec![inp(inputs, 0).sign()?],
+            "Ceil" => vec![inp(inputs, 0).ceil()],
+            "Floor" => vec![inp(inputs, 0).floor()],
+            "Round" => vec![inp(inputs, 0).round()],
+            "Sign" => vec![inp(inputs, 0).sign()],
             "Reciprocal" => vec![inp(inputs, 0).reciprocal()?],
             "Erf" => vec![inp(inputs, 0).erf()?],
             "Sin" => vec![inp(inputs, 0).sin()?],
@@ -232,18 +232,18 @@ impl OpRegistry {
             "GreaterOrEqual" => vec![inp(inputs, 0).try_ge(inp(inputs, 1))?],
             "Not" => vec![inp(inputs, 0).logical_not()?],
             "And" => {
-                let a = inp(inputs, 0).cast(DType::Bool)?;
-                let b = inp(inputs, 1).cast(DType::Bool)?;
+                let a = inp(inputs, 0).cast(DType::Bool);
+                let b = inp(inputs, 1).cast(DType::Bool);
                 vec![a.bitwise_and(&b)?]
             }
             "Or" => {
-                let a = inp(inputs, 0).cast(DType::Bool)?;
-                let b = inp(inputs, 1).cast(DType::Bool)?;
+                let a = inp(inputs, 0).cast(DType::Bool);
+                let b = inp(inputs, 1).cast(DType::Bool);
                 vec![a.bitwise_or(&b)?]
             }
             "Xor" => {
-                let x = inp(inputs, 0).cast(DType::Bool)?;
-                let y = inp(inputs, 1).cast(DType::Bool)?;
+                let x = inp(inputs, 0).cast(DType::Bool);
+                let y = inp(inputs, 1).cast(DType::Bool);
                 vec![x.bitwise_xor(&y)?]
             }
 
@@ -265,11 +265,11 @@ impl OpRegistry {
                     tracing::warn!("ONNX dtype {to} unsupported, falling back to Float32");
                     DType::Float32
                 });
-                vec![inp(inputs, 0).cast(dtype)?]
+                vec![inp(inputs, 0).cast(dtype)]
             }
             "CastLike" => {
                 let _saturate = attrs.int("saturate", 1);
-                vec![inp(inputs, 0).cast(inp(inputs, 1).dtype())?]
+                vec![inp(inputs, 0).cast(inp(inputs, 1).dtype())]
             }
             "BitCast" => {
                 let to = attrs.int("to", 1);
@@ -413,11 +413,11 @@ impl OpRegistry {
             }
             "ReduceSumSquare" => {
                 let (spec, kd) = reduce_attrs(&mut attrs, inputs, opset_version, op_type)?;
-                vec![inp(inputs, 0).square()?.sum_with().axes(spec).keepdim(kd).call()?]
+                vec![inp(inputs, 0).square().sum_with().axes(spec).keepdim(kd).call()?]
             }
             "ReduceL1" => {
                 let (spec, kd) = reduce_attrs(&mut attrs, inputs, opset_version, op_type)?;
-                vec![inp(inputs, 0).try_abs()?.sum_with().axes(spec).keepdim(kd).call()?]
+                vec![inp(inputs, 0).abs().sum_with().axes(spec).keepdim(kd).call()?]
             }
             "ReduceL2" => {
                 let (spec, kd) = reduce_attrs(&mut attrs, inputs, opset_version, op_type)?;
@@ -425,9 +425,9 @@ impl OpRegistry {
                 let orig_dtype = x.dtype();
                 let needs_upcast =
                     matches!(orig_dtype.scalar(), Some(ScalarDType::Float16) | Some(ScalarDType::BFloat16));
-                let x = if needs_upcast { x.cast(DType::Float32)? } else { x.clone() };
-                let result = x.square()?.sum_with().axes(spec).keepdim(kd).call()?.try_sqrt()?;
-                vec![if needs_upcast { result.cast(orig_dtype)? } else { result }]
+                let x = if needs_upcast { x.cast(DType::Float32) } else { x.clone() };
+                let result = x.square().sum_with().axes(spec).keepdim(kd).call()?.try_sqrt()?;
+                vec![if needs_upcast { result.cast(orig_dtype) } else { result }]
             }
             "ReduceLogSum" => {
                 let (spec, kd) = reduce_attrs(&mut attrs, inputs, opset_version, op_type)?;
@@ -445,15 +445,10 @@ impl OpRegistry {
                 vec![if select_last {
                     let ds = x.dim_const(axis)? as i64;
                     Tensor::const_(ConstValue::Int(ds - 1), DType::Int64).try_sub(
-                        &x.flip(&[axis])?
-                            .argmax_with()
-                            .axis(Some(axis))
-                            .keepdim(keepdims)
-                            .call()?
-                            .cast(DType::Int64)?,
+                        x.flip(&[axis])?.argmax_with().axis(Some(axis)).keepdim(keepdims).call()?.cast(DType::Int64),
                     )?
                 } else {
-                    x.argmax_with().axis(Some(axis)).keepdim(keepdims).call()?.cast(DType::Int64)?
+                    x.argmax_with().axis(Some(axis)).keepdim(keepdims).call()?.cast(DType::Int64)
                 }]
             }
             "ArgMin" => {
@@ -461,30 +456,30 @@ impl OpRegistry {
                 let keepdims = attrs.int("keepdims", 1) == 1;
                 let select_last = attrs.int("select_last_index", 0) == 1;
                 let x = inp(inputs, 0);
-                let neg_x = x.try_neg()?;
+                let neg_x = x.neg();
                 vec![if select_last {
                     let ds = x.dim_const(axis)? as i64;
                     Tensor::const_(ConstValue::Int(ds - 1), DType::Int64).try_sub(
-                        &neg_x
+                        neg_x
                             .flip(&[axis])?
                             .argmax_with()
                             .axis(Some(axis))
                             .keepdim(keepdims)
                             .call()?
-                            .cast(DType::Int64)?,
+                            .cast(DType::Int64),
                     )?
                 } else {
-                    neg_x.argmax_with().axis(Some(axis)).keepdim(keepdims).call()?.cast(DType::Int64)?
+                    neg_x.argmax_with().axis(Some(axis)).keepdim(keepdims).call()?.cast(DType::Int64)
                 }]
             }
 
             // === NN ===
             "MatMul" => vec![inp(inputs, 0).matmul(inp(inputs, 1))?],
             "MatMulInteger" => {
-                let a = inp(inputs, 0).cast(DType::Int32)?;
-                let b = inp(inputs, 1).cast(DType::Int32)?;
-                let a_zp = inputs.get(2).and_then(|o| o.as_ref()).map(|t| t.cast(DType::Int32)).transpose()?;
-                let b_zp = inputs.get(3).and_then(|o| o.as_ref()).map(|t| t.cast(DType::Int32)).transpose()?;
+                let a = inp(inputs, 0).cast(DType::Int32);
+                let b = inp(inputs, 1).cast(DType::Int32);
+                let a_zp = inputs.get(2).and_then(|o| o.as_ref()).map(|t| t.cast(DType::Int32));
+                let b_zp = inputs.get(3).and_then(|o| o.as_ref()).map(|t| t.cast(DType::Int32));
                 let a = if let Some(zp) = a_zp { a.try_sub(&zp)? } else { a };
                 let b = if let Some(zp) = b_zp { b.try_sub(&zp)? } else { b };
                 vec![a.matmul(&b)?]
@@ -596,7 +591,7 @@ impl OpRegistry {
             "RotaryEmbedding" => transformer::op_rotary_embedding(inputs, &mut attrs)?,
 
             // === NonZero ===
-            "NonZero" => vec![inp(inputs, 0).nonzero()?.try_transpose(0, 1)?.cast(DType::Int64)?],
+            "NonZero" => vec![inp(inputs, 0).nonzero()?.try_transpose(0, 1)?.cast(DType::Int64)],
 
             // === Einsum ===
             "Einsum" => {
@@ -612,7 +607,7 @@ impl OpRegistry {
                 let largest = attrs.int("largest", 1) == 1;
                 let _sorted = attrs.int("sorted", 1); // consume; we always sort
                 let (values, indices) = inp(inputs, 0).topk(k, axis, largest)?;
-                vec![values, indices.cast(DType::Int64)?]
+                vec![values, indices.cast(DType::Int64)]
             }
 
             // === Simple Ops ===
@@ -623,7 +618,7 @@ impl OpRegistry {
             "Binarizer" => {
                 let threshold = attrs.float("threshold", 0.0) as f64;
                 let x = inp(inputs, 0);
-                vec![x.try_gt(&Tensor::const_(threshold, x.dtype()))?.cast(DType::Float32)?]
+                vec![x.try_gt(Tensor::const_(threshold, x.dtype()))?.cast(DType::Float32)]
             }
             "Swish" => {
                 let alpha = attrs.float("alpha", 1.0) as f64;
@@ -756,8 +751,7 @@ pub(crate) fn gather_const_fast_path(
         out_dims.extend_from_slice(&concrete_shape[..norm_axis]);
         out_dims.extend_from_slice(idx_shape);
         out_dims.extend_from_slice(&concrete_shape[norm_axis + 1..]);
-        return Tensor::full(&out_dims, 0.0f32, data.dtype())
-            .map_err(|e| crate::Error::IrConstruction { details: e.to_string() });
+        return Ok(Tensor::full(&out_dims, 0.0f32, data.dtype()));
     }
 
     // Shrink: extract each index as a slice along the gather axis

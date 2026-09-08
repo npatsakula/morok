@@ -17,9 +17,9 @@ pub(crate) fn fan_in_uniform(shape: &[usize], fan_in: usize, dtype: DType) -> Te
 }
 
 pub(crate) fn ones(shape: &[usize], dtype: DType) -> Tensor {
-    Tensor::ones(shape, dtype).expect("non-empty shape").contiguous()
+    Tensor::ones(shape, dtype).contiguous()
 }
 
 pub(crate) fn zeros(shape: &[usize], dtype: DType) -> Tensor {
-    Tensor::zeros(shape, dtype).expect("non-empty shape").contiguous()
+    Tensor::zeros(shape, dtype).contiguous()
 }

@@ -23,7 +23,7 @@ fn encoder_forward_shape() {
     let model = Whisper::empty(dims.clone());
 
     // mel: [1, n_mels, 3000]
-    let mel = Tensor::zeros(&[1, dims.n_mels, 3000], DType::Float32).unwrap();
+    let mel = Tensor::zeros(&[1, dims.n_mels, 3000], DType::Float32);
 
     let out = model.encode(&mel).unwrap();
     let shape = out.shape().unwrap();
@@ -40,7 +40,7 @@ fn decoder_forward_shape() {
     let model = Whisper::empty(dims.clone());
 
     // mel → encoder → features
-    let mel = Tensor::zeros(&[1, dims.n_mels, 3000], DType::Float32).unwrap();
+    let mel = Tensor::zeros(&[1, dims.n_mels, 3000], DType::Float32);
     let features = model.encode(&mel).unwrap();
 
     // tokens: [1, 4]
@@ -79,8 +79,8 @@ fn reference_cross_kv_projection(model: &Whisper, audio: &Tensor) -> (Tensor, Te
         keys.push(block.cross_attn.split_heads(&key).unwrap().try_permute(&[0, 2, 1, 3]).unwrap());
         values.push(block.cross_attn.split_heads(&value).unwrap().try_permute(&[0, 2, 1, 3]).unwrap());
     }
-    let keys = Tensor::cat(&keys.iter().collect::<Vec<_>>(), 2).unwrap().cast(DType::Float32).unwrap();
-    let values = Tensor::cat(&values.iter().collect::<Vec<_>>(), 2).unwrap().cast(DType::Float32).unwrap();
+    let keys = Tensor::cat(&keys.iter().collect::<Vec<_>>(), 2).unwrap().cast(DType::Float32);
+    let values = Tensor::cat(&values.iter().collect::<Vec<_>>(), 2).unwrap().cast(DType::Float32);
     (keys, values)
 }
 
@@ -118,7 +118,7 @@ fn low_precision_cross_projection_keeps_fp32_cache_storage() {
     let audio_values: Vec<f32> =
         (0..dims.n_audio_ctx * dims.n_text_state).map(|index| (index as f32 - 13.0) * 0.037).collect();
     let audio = Tensor::from_slice(audio_values).try_reshape([1usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
-    let native_audio = audio.cast(DType::Float16).unwrap();
+    let native_audio = audio.cast(DType::Float16);
 
     let (expected_k, expected_v) = reference_cross_kv_projection(&model, &native_audio);
     let (legacy_k, legacy_v) = reference_cross_kv_projection(&model, &audio);
@@ -199,9 +199,8 @@ fn low_precision_prefill_does_not_inherit_fp32_cache_storage_dtype() {
     assert_eq!(cross_k.dtype(), DType::Float32);
 
     let (actual, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
-    let (expected, _, _) = model
-        .decode_prefill(&tokens, &cross_k.cast(DType::Float16).unwrap(), &cross_v.cast(DType::Float16).unwrap(), 0)
-        .unwrap();
+    let (expected, _, _) =
+        model.decode_prefill(&tokens, &cross_k.cast(DType::Float16), &cross_v.cast(DType::Float16), 0).unwrap();
     Tensor::realize_batch([&actual, &expected]).unwrap();
     assert_eq!(actual.as_vec::<f32>().unwrap(), expected.as_vec::<f32>().unwrap());
 }
@@ -246,7 +245,7 @@ fn prepared_cross_kv_materializes_each_projection_before_packing() {
 fn projected_cross_kv_and_prefill_shapes_are_concrete() {
     let dims = small_decoder_dims();
     let model = Whisper::empty(dims.clone());
-    let audio = Tensor::zeros(&[1, dims.n_audio_ctx, dims.n_text_state], DType::Float32).unwrap();
+    let audio = Tensor::zeros(&[1, dims.n_audio_ctx, dims.n_text_state], DType::Float32);
     let tokens = Tensor::from_slice([1i32, 2, 3]).try_reshape([1usize, 3]).unwrap();
 
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
@@ -377,7 +376,7 @@ fn prepared_language_detector_has_one_token_and_one_logits_row() {
     let dims = small_decoder_dims();
     let cache_shape = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
     let model = Whisper::empty(dims.clone());
-    let audio = Tensor::zeros(&[1, dims.n_audio_ctx, dims.n_text_state], DType::Float32).unwrap();
+    let audio = Tensor::zeros(&[1, dims.n_audio_ctx, dims.n_text_state], DType::Float32);
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
     let token = Tensor::from_slice([1i32]).try_reshape([1usize, 1]).unwrap();
     let logits = model.decode_with_cross_kv(&token, &cross_k, &cross_v).unwrap();
@@ -451,7 +450,7 @@ fn prepared_cross_kv_graph_reuses_device_local_outputs() {
 fn alignment_forward_exports_only_selected_heads() {
     let dims = make_dims();
     let model = Whisper::empty(dims.clone());
-    let features = Tensor::zeros(&[2, 8, dims.n_text_state], DType::Float32).unwrap();
+    let features = Tensor::zeros(&[2, 8, dims.n_text_state], DType::Float32);
     let tokens = Tensor::from_slice([50363i32, 50364, 50359, 50257, 50363, 50364, 50359, 50257])
         .try_reshape([2usize, 4])
         .unwrap();
@@ -482,8 +481,8 @@ fn alignment_compute_does_not_inherit_fp32_cache_storage_dtype() {
     assert_eq!(cross_k.dtype(), DType::Float32);
 
     let actual = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
-    let low_k = cross_k.cast(DType::Float16).unwrap();
-    let low_v = cross_v.cast(DType::Float16).unwrap();
+    let low_k = cross_k.cast(DType::Float16);
+    let low_v = cross_v.cast(DType::Float16);
     let expected = model.align_with_cross_kv(&tokens, &low_k, &low_v, &heads).unwrap();
     Tensor::realize_batch([&actual, &expected]).unwrap();
 
@@ -502,16 +501,16 @@ fn eager_audio_feature_alignment_reference(
     let seq_len = tokens.dim_const(1).unwrap();
     let tok_emb = model.decoder.token_embedding.embedding(tokens).unwrap();
     let pos_emb = model.decoder.positional_embedding.try_shrink([Some((0isize, seq_len as isize)), None]).unwrap();
-    let mut x = tok_emb.try_add(&pos_emb).unwrap().cast(features.dtype()).unwrap();
+    let mut x = tok_emb.try_add(&pos_emb).unwrap().cast(features.dtype());
     let mask = crate::whisper::causal_mask(seq_len, x.dtype().clone()).unwrap();
     let mut selected: Vec<Option<Tensor>> = (0..alignment_heads.len()).map(|_| None).collect();
 
     for (layer, block) in model.decoder.blocks.iter().enumerate() {
         let h = block.attn_ln.apply(&x).unwrap();
-        x = x.try_add(&block.attn.forward(&h, None, Some(&mask)).unwrap()).unwrap();
+        x = x.try_add(block.attn.forward(&h, None, Some(&mask)).unwrap()).unwrap();
 
         let h = block.cross_attn_ln.apply(&x).unwrap();
-        x = x.try_add(&block.cross_attn.forward(&h, Some(features), None).unwrap()).unwrap();
+        x = x.try_add(block.cross_attn.forward(&h, Some(features), None).unwrap()).unwrap();
         let q = block.cross_attn.split_heads(&block.cross_attn.query.forward(&h).unwrap()).unwrap();
         let k = block.cross_attn.split_heads(&block.cross_attn.key.forward(features).unwrap()).unwrap();
         for (index, &(_, head)) in alignment_heads.iter().enumerate().filter(|&(_, &(l, _))| l == layer) {
@@ -532,7 +531,7 @@ fn eager_audio_feature_alignment_reference(
     }
 
     let selected: Vec<_> = selected.into_iter().map(Option::unwrap).collect();
-    Tensor::cat(&selected.iter().collect::<Vec<_>>(), 1).unwrap().cast(DType::Float32).unwrap()
+    Tensor::cat(&selected.iter().collect::<Vec<_>>(), 1).unwrap().cast(DType::Float32)
 }
 
 #[test]

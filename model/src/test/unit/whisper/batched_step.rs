@@ -26,13 +26,13 @@ fn forward_step_fixed_batch_keeps_batch_concrete() {
     let (batch, n_audio_ctx) = (2usize, 8usize);
     let d_head = dims.n_text_state / dims.n_text_head;
     let layer_heads = dims.n_text_layer * dims.n_text_head;
-    let token = Tensor::zeros(&[batch, 1], DType::Int32).unwrap();
-    let pos_emb = Tensor::zeros(&[batch, 1, dims.n_text_state], DType::Float32).unwrap();
-    let self_k = Tensor::zeros(&[batch, dims.n_text_ctx, layer_heads, d_head], DType::Float32).unwrap();
-    let self_v = Tensor::zeros(&[batch, dims.n_text_ctx, layer_heads, d_head], DType::Float32).unwrap();
-    let cross_k = Tensor::zeros(&[batch, n_audio_ctx, layer_heads, d_head], DType::Float32).unwrap();
-    let cross_v = Tensor::zeros(&[batch, n_audio_ctx, layer_heads, d_head], DType::Float32).unwrap();
-    let key_lens = Tensor::zeros(&[batch], DType::Int32).unwrap();
+    let token = Tensor::zeros(&[batch, 1], DType::Int32);
+    let pos_emb = Tensor::zeros(&[batch, 1, dims.n_text_state], DType::Float32);
+    let self_k = Tensor::zeros(&[batch, dims.n_text_ctx, layer_heads, d_head], DType::Float32);
+    let self_v = Tensor::zeros(&[batch, dims.n_text_ctx, layer_heads, d_head], DType::Float32);
+    let cross_k = Tensor::zeros(&[batch, n_audio_ctx, layer_heads, d_head], DType::Float32);
+    let cross_v = Tensor::zeros(&[batch, n_audio_ctx, layer_heads, d_head], DType::Float32);
+    let key_lens = Tensor::zeros(&[batch], DType::Int32);
 
     let (logits, new_k, new_v) =
         model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens).unwrap();

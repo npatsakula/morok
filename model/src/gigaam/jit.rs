@@ -23,7 +23,7 @@ jit_wrapper! {
             // RN-T decoder consumes frame-major rows, and doing it here turns
             // the host-side strided transpose over the slow mapping into one
             // contiguous copyout.
-            Ok::<_, super::error::Error>(out.cast(svod_dtype::DType::Float32)?.try_permute(&[0, 2, 1])?)
+            Ok::<_, super::error::Error>(out.cast(svod_dtype::DType::Float32).try_permute(&[0, 2, 1])?)
         }
     }
 }

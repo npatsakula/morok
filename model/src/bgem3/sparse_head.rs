@@ -62,7 +62,7 @@ impl SparseHead {
 
         let token_weights = token_weights.try_squeeze(Some(-1))?;
 
-        let zeros = Tensor::zeros(&[b, self.vocab_size], hidden.dtype()).expect("non-empty shape");
+        let zeros = Tensor::zeros(&[b, self.vocab_size], hidden.dtype());
         let sparse = zeros.scatter_reduce(-1, input_ids, &token_weights, ScatterReduction::Amax, true)?;
 
         let mask = self.unused_token_mask(hidden.dtype())?;
@@ -76,7 +76,7 @@ impl SparseHead {
                 vals[id] = 0.0;
             }
         }
-        let mask = Tensor::from_slice(&vals).try_reshape([1isize, self.vocab_size as isize])?.cast(dtype)?;
+        let mask = Tensor::from_slice(&vals).try_reshape([1isize, self.vocab_size as isize])?.cast(dtype);
         Ok(mask)
     }
 }

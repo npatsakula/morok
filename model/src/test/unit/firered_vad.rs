@@ -30,7 +30,7 @@ use crate::firered_vad::{
 #[test]
 fn forward_zero_input_shape() {
     let model = FireRedVad::with_random_weights();
-    let feat = Tensor::zeros(&[2, 64, N_MELS], DType::Float32).unwrap();
+    let feat = Tensor::zeros(&[2, 64, N_MELS], DType::Float32);
     let out = model.forward(&feat, None).unwrap();
     let shape = out.dims().unwrap();
     assert_eq!(shape, vec![2, 64]);

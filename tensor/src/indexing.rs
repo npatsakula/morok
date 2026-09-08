@@ -79,10 +79,10 @@ impl Tensor {
             .stop(UOp::const_(arange_dtype.clone(), ConstValue::Int(dim_size as i64)))
             .dtype(arange_dtype)
             .call()?
-            .cast(index.uop().dtype())?;
+            .cast(index.uop().dtype());
         let mask = index.try_unsqueeze(-1)?.try_eq(&arange)?;
 
-        x.where_(&mask, &Self::new(x.uop().const_like(0)))?.sum_with().axes(-1).dtype(self.uop().dtype()).call()
+        x.where_(&mask, Self::new(x.uop().const_like(0)))?.sum_with().axes(-1).dtype(self.uop().dtype()).call()
     }
 
     /// Select elements along `dim` using a 1D index tensor.
@@ -280,7 +280,7 @@ impl Tensor {
         }
         let x = self.flatten()?;
         let mask_flat = mask.broadcast_to(&self.shape()?)?.flatten()?;
-        let mask_cumsum = mask_flat.cast(DType::Int64)?.cumsum(0)?;
+        let mask_cumsum = mask_flat.cast(DType::Int64).cumsum(0)?;
         // Realize to get output size (data-dependent shape)
         let n = mask_flat.numel()?;
         if n == 0 {
@@ -295,8 +295,8 @@ impl Tensor {
         }
 
         // Build gather indices: zeros.scatter(0, cumsum, 1).cumsum
-        let zeros = Tensor::full(&[count], ConstValue::Int(0), DType::Int64)?;
-        let ones = Tensor::full(&[n], ConstValue::Int(1), DType::Int64)?;
+        let zeros = Tensor::full(&[count], ConstValue::Int(0), DType::Int64);
+        let ones = Tensor::full(&[n], ConstValue::Int(1), DType::Int64);
         let idxs = zeros.scatter_reduce(0, &mask_cumsum, &ones, ScatterReduction::Sum, false)?.cumsum(0)?;
         x.gather(0, &idxs)
     }
@@ -331,7 +331,7 @@ impl Tensor {
             .ok_or_else(|| crate::error::ErrorKind::SymbolicShapeUnsupported { operation: "sort".into() })?;
 
         if orig_len <= 1 {
-            let idx = Tensor::full(&self.dims()?, ConstValue::Int(0), svod_dtype::DType::Int32)?;
+            let idx = Tensor::full(&self.dims()?, ConstValue::Int(0), svod_dtype::DType::Int32);
             return Ok((self.clone(), idx));
         }
 
@@ -420,7 +420,7 @@ impl Tensor {
         // Create 2D tril mask first (tril operates on last 2 dims), then reshape
         // to broadcast shape [1, ..., orig_len, orig_len, 1, ..., 1]
         // Tinygrad: Tensor.ones(orig_len, orig_len).tril().reshape((None, None) + (1,)*(ndim-dim-1))
-        let tril_2d = Tensor::full(&[orig_len, orig_len], true, svod_dtype::DType::Bool)?.tril(0)?;
+        let tril_2d = Tensor::full(&[orig_len, orig_len], true, svod_dtype::DType::Bool).tril(0)?;
         let mut tril_reshape: Vec<isize> = vec![1; ndim + 1];
         tril_reshape[dim] = orig_len as isize;
         tril_reshape[dim + 1] = orig_len as isize;
@@ -445,7 +445,7 @@ impl Tensor {
         let mut idx_shape = vec![1isize; ndim + 1];
         idx_shape[dim] = orig_len as isize;
         let idx = (cond
-            .cast(svod_dtype::DType::Int32)?
+            .cast(svod_dtype::DType::Int32)
             .try_mul(&Tensor::arange(0, Some(orig_len as i64), None)?.try_reshape(&idx_shape)?)?)
         .sum(dim as isize)?;
 
@@ -485,7 +485,7 @@ impl Tensor {
         let dims = svod_ir::shape::to_vec_usize(&shape).context(UOpSnafu)?;
         let numel: usize = dims.iter().product();
 
-        let mask = self.try_ne(&Tensor::const_(ConstValue::Int(0), self.uop().dtype()))?.flatten()?;
+        let mask = self.try_ne(Tensor::const_(ConstValue::Int(0), self.uop().dtype()))?.flatten()?;
 
         if numel == 0 {
             return Tensor::empty_zero(DType::Int32).to(self.device()).try_reshape([0, ndim as isize]);
@@ -503,17 +503,13 @@ impl Tensor {
         let coords = (0..ndim)
             .map(|axis| {
                 let stride = dims[axis + 1..].iter().product::<usize>();
-                let mut coord = if stride == 1 {
-                    selected.clone()
-                } else {
-                    selected.try_div(&Tensor::const_(ConstValue::Int(stride as i64), index_dtype.clone()))?
-                };
+                let mut coord = if stride == 1 { selected.clone() } else { selected.try_div(stride as i64)? };
                 // Axis 0 needs no modulo (the division already bounds it); every interior
                 // axis does, singleton dims included.
                 if axis != 0 {
-                    coord = coord.try_mod(&Tensor::const_(ConstValue::Int(dims[axis] as i64), index_dtype.clone()))?;
+                    coord = coord.try_mod(dims[axis] as i64)?;
                 }
-                coord.cast(DType::Int32)
+                Ok(coord.cast(DType::Int32))
             })
             .collect::<Result<Vec<_>>>()?;
         Tensor::stack(&coords.iter().collect::<Vec<_>>(), -1)
@@ -545,7 +541,7 @@ impl Tensor {
 
         // t = arange(T) as [T, 1], seq_lens as [1, B]
         let idx_dt = sequence_lens.uop().dtype();
-        let t = Tensor::arange(0, Some(time_len as i64), None)?.cast(idx_dt.clone())?.try_unsqueeze(1)?;
+        let t = Tensor::arange(0, Some(time_len as i64), None)?.cast(idx_dt.clone()).try_unsqueeze(1)?;
         let sl = sequence_lens.try_unsqueeze(0)?;
 
         // reversed_t = seq_lens - 1 - t; idx = where(t < seq_lens, reversed_t, t)
@@ -595,7 +591,7 @@ impl Tensor {
                 ranges[idx_dims.len() - 1] = (k as isize, k as isize + 1);
                 let idx_k = indices.try_shrink(&ranges)?.try_squeeze(Some(-1))?;
                 let stride_t = Tensor::const_(ConstValue::Int(*stride), DType::Int64);
-                flat_idx = flat_idx.try_add(&idx_k.cast(DType::Int64)?.try_mul(&stride_t)?)?;
+                flat_idx = flat_idx.try_add(&idx_k.cast(DType::Int64).try_mul(&stride_t)?)?;
             }
 
             let x_flat = self.try_reshape([outer as isize, inner as isize])?;
@@ -605,7 +601,7 @@ impl Tensor {
             let flat_idx_2d = flat_idx
                 .try_reshape([num_gathers as isize, 1])?
                 .try_expand([num_gathers as isize, inner as isize])?
-                .cast(DType::Int32)?;
+                .cast(DType::Int32);
             let result = x_flat.gather(0, &flat_idx_2d)?;
 
             let mut out_shape = gather_outer;
@@ -641,12 +637,12 @@ impl Tensor {
                 ranges[idx_flat_dims.len() - 1] = (k as isize, k as isize + 1);
                 let idx_k = idx_flat.try_shrink(&ranges)?.try_squeeze(Some(-1))?;
                 let stride_t = Tensor::const_(ConstValue::Int(*stride), DType::Int64);
-                flat_idx = flat_idx.try_add(&idx_k.cast(DType::Int64)?.try_mul(&stride_t)?)?;
+                flat_idx = flat_idx.try_add(&idx_k.cast(DType::Int64).try_mul(&stride_t)?)?;
             }
 
             let batch_stride = inner_x[..last_inner].iter().product::<usize>();
-            let batch_offset_arr = Tensor::arange(0, Some(batch_size as i64), None)?
-                .try_mul(&Tensor::from_slice([batch_stride as i64]))?;
+            let batch_offset_arr =
+                Tensor::arange(0, Some(batch_size as i64), None)?.try_mul(Tensor::from_slice([batch_stride as i64]))?;
             let gather_inner = idx_flat_dims[1..idx_flat_dims.len() - 1].iter().product::<usize>();
             flat_idx = flat_idx.try_reshape([batch_size as isize, gather_inner as isize])?;
             let batch_offset = batch_offset_arr
@@ -659,7 +655,7 @@ impl Tensor {
             let fi = flat_idx
                 .try_reshape([(batch_size * gather_inner) as isize, 1])?
                 .try_expand([(batch_size * gather_inner) as isize, remaining as isize])?
-                .cast(DType::Int32)?;
+                .cast(DType::Int32);
             let result = x_2d.gather(0, &fi)?;
 
             let mut out_shape: Vec<isize> = x_dims[..batch_dims].iter().map(|&d| d as isize).collect();
@@ -698,7 +694,7 @@ impl Tensor {
         let mut flat_idx = Tensor::const_(ConstValue::Int(0), DType::Int64);
         for (k, idx_k) in idx_splits.iter().enumerate() {
             let stride_t = Tensor::const_(ConstValue::Int(strides[k]), DType::Int64);
-            flat_idx = flat_idx.try_add(&idx_k.cast(DType::Int64)?.try_mul(&stride_t)?)?;
+            flat_idx = flat_idx.try_add(&idx_k.cast(DType::Int64).try_mul(&stride_t)?)?;
         }
         let upd_shape = updates.shape()?;
         let upd_outer: usize = upd_shape[..upd_shape.len() - (x_dims.len() - last_idx_dim)]
@@ -708,7 +704,7 @@ impl Tensor {
         let upd_flat = updates.try_reshape([upd_outer as isize, inner as isize])?;
         let flat_idx =
             flat_idx.try_reshape([upd_outer as isize, 1])?.try_expand([upd_outer as isize, inner as isize])?;
-        let flat_idx_i32 = flat_idx.cast(DType::Int32)?;
+        let flat_idx_i32 = flat_idx.cast(DType::Int32);
         let mut result = match reduction {
             "none" => x_flat.scatter(0, &flat_idx_i32, &upd_flat)?,
             "add" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Sum, true)?,
@@ -751,9 +747,9 @@ impl Tensor {
         let features: usize = data_dims[axis + 1..].iter().product();
 
         let write_idx = if let Some(wi) = write_indices {
-            wi.cast(DType::Int32)?
+            wi.cast(DType::Int32)
         } else {
-            Tensor::full(&[batch_size], ConstValue::Int(0), DType::Int32)?
+            Tensor::full(&[batch_size], ConstValue::Int(0), DType::Int32)
         };
 
         let wi_flat = if axis > 1 {
@@ -769,13 +765,13 @@ impl Tensor {
         let updates_flat = update.try_reshape([(b_total * seq_len) as isize, features as isize])?;
 
         let batch_offset = Tensor::arange(0, Some(b_total as i64), None)?
-            .cast(DType::Int32)?
-            .try_mul(&Tensor::const_(ConstValue::Int(max_seq as i64), DType::Int32))?
+            .cast(DType::Int32)
+            .try_mul(Tensor::const_(ConstValue::Int(max_seq as i64), DType::Int32))?
             .try_reshape([b_total as isize, 1])?;
 
         let wi_2d = wi_flat.try_reshape([b_total as isize, 1])?;
         let seq_arange =
-            Tensor::arange(0, Some(seq_len as i64), None)?.cast(DType::Int32)?.try_reshape([1, seq_len as isize])?;
+            Tensor::arange(0, Some(seq_len as i64), None)?.cast(DType::Int32).try_reshape([1, seq_len as isize])?;
         let mut row_idx = wi_2d.try_add(&seq_arange)?;
 
         if mode == "circular" {

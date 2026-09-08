@@ -85,7 +85,7 @@ fn loading_same_checkpoint_twice_shares_immutable_storage() {
     assert!(writable.copyin(&[0u8; 16]).is_err(), "shared weights must refuse host writes");
 
     // Both instances still evaluate correctly through the shared storage.
-    let sum = &sd1["w"] + &sd2["w"];
+    let sum = (&sd1["w"] + &sd2["w"]).unwrap();
     sum.realize().unwrap();
     assert_eq!(sum.as_vec::<f32>().unwrap(), vec![2.0, 4.0, 6.0, 8.0]);
 }

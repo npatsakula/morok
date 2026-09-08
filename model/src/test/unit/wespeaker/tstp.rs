@@ -17,8 +17,8 @@ use crate::wespeaker::WeSpeakerResNet34;
 fn forward_zero_weights_shape() {
     let model = WeSpeakerResNet34::with_zero_weights(crate::wespeaker::WeSpeakerConfig::new().with_max_batch_size(1));
 
-    let feats = Tensor::zeros(&[1, 1598, 80], DType::Float32).unwrap();
-    let weights = Tensor::ones(&[1, 799], DType::Float32).unwrap();
+    let feats = Tensor::zeros(&[1, 1598, 80], DType::Float32);
+    let weights = Tensor::ones(&[1, 799], DType::Float32);
 
     let var = svod_tensor::Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();
@@ -37,8 +37,8 @@ fn forward_zero_weights_shape() {
 fn forward_zero_weights_realize() {
     let model = WeSpeakerResNet34::with_zero_weights(crate::wespeaker::WeSpeakerConfig::new().with_max_batch_size(1));
 
-    let feats = Tensor::zeros(&[1, 1598, 80], DType::Float32).unwrap();
-    let weights = Tensor::ones(&[1, 799], DType::Float32).unwrap();
+    let feats = Tensor::zeros(&[1, 1598, 80], DType::Float32);
+    let weights = Tensor::ones(&[1, 799], DType::Float32);
 
     let var = svod_tensor::Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();

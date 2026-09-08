@@ -8,7 +8,7 @@ use crate::state::HasStateDict;
 #[test]
 fn conformer_block_preserves_shape() {
     let block = ConformerBlock::empty(256, 1024, 4, 31);
-    let x = Tensor::zeros(&[1, 7, 256], DType::Float32).unwrap();
+    let x = Tensor::zeros(&[1, 7, 256], DType::Float32);
     let y = block.forward(&x).expect("symbolic forward");
     let shape = y.dims().unwrap();
     assert_eq!(shape, vec![1, 7, 256]);
@@ -18,7 +18,7 @@ fn conformer_block_preserves_shape() {
 #[test]
 fn conformer_encoder_4_blocks_preserves_shape() {
     let enc = ConformerEncoder::empty(256, 1024, 4, 4, 31);
-    let x = Tensor::zeros(&[1, 5, 256], DType::Float32).unwrap();
+    let x = Tensor::zeros(&[1, 5, 256], DType::Float32);
     let y = enc.forward(&x).expect("symbolic forward");
     let shape = y.dims().unwrap();
     assert_eq!(shape, vec![1, 5, 256]);

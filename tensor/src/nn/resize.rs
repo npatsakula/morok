@@ -282,12 +282,12 @@ impl Tensor {
                 .into_iter()
                 .map(|idx| {
                     let rounded = match nearest_mode {
-                        NearestMode::RoundPreferFloor => idx.try_sub(&Tensor::const_(0.5f64, dtype.clone()))?.ceil()?,
-                        NearestMode::RoundPreferCeil => idx.try_add(&Tensor::const_(0.5f64, dtype.clone()))?.floor()?,
-                        NearestMode::Floor => idx.floor()?,
-                        NearestMode::Ceil => idx.ceil()?,
+                        NearestMode::RoundPreferFloor => idx.try_sub(0.5f64)?.ceil(),
+                        NearestMode::RoundPreferCeil => idx.try_add(0.5f64)?.floor(),
+                        NearestMode::Floor => idx.floor(),
+                        NearestMode::Ceil => idx.ceil(),
                     };
-                    rounded.cast(DType::Int32)
+                    Ok(rounded.cast(DType::Int32))
                 })
                 .collect::<Result<Vec<_>>>()?;
 
@@ -322,9 +322,9 @@ impl Tensor {
                 if antialias && scale < 1.0 {
                     x = interpolate_antialias_linear(&x, index, dim_pos, input_sz, scale, &reshape, &expand, &dtype)?;
                 } else {
-                    let low = index.floor()?.cast(DType::Int32)?.try_reshape(&reshape)?.try_expand(&expand)?;
-                    let high = index.ceil()?.cast(DType::Int32)?.try_reshape(&reshape)?.try_expand(&expand)?;
-                    let perc = index.try_sub(&index.floor()?)?.try_reshape(&reshape)?.try_expand(&expand)?;
+                    let low = index.floor().cast(DType::Int32).try_reshape(&reshape)?.try_expand(&expand)?;
+                    let high = index.ceil().cast(DType::Int32).try_reshape(&reshape)?.try_expand(&expand)?;
+                    let perc = index.try_sub(index.floor())?.try_reshape(&reshape)?.try_expand(&expand)?;
 
                     let dim_i = dim_pos as isize;
                     let gathered_low = x.gather(dim_i, &low)?;
@@ -348,8 +348,8 @@ impl Tensor {
                 if antialias && scale < 1.0 {
                     x = interpolate_antialias_cubic(&x, index, dim_pos, input_sz, scale, a, &reshape, &expand, &dtype)?;
                 } else {
-                    let p = index.floor()?.cast(DType::Int32)?;
-                    let ratio = index.try_sub(&index.floor()?)?;
+                    let p = index.floor().cast(DType::Int32);
+                    let ratio = index.try_sub(index.floor())?;
 
                     let one = Tensor::const_(ConstValue::Int(1), DType::Int32);
                     let two = Tensor::const_(ConstValue::Int(2), DType::Int32);
@@ -358,7 +358,7 @@ impl Tensor {
                     let idx2 = p.try_add(&one)?;
                     let idx3 = p.try_add(&two)?;
 
-                    let r1 = ratio.try_add(&Tensor::const_(1.0f64, dtype.clone()))?;
+                    let r1 = ratio.try_add(Tensor::const_(1.0f64, dtype.clone()))?;
                     let c0 = poly_n(&r1, &[a, -5.0 * a, 8.0 * a, -4.0 * a], &dtype)?;
                     let c1 = poly_n(&ratio, &[a + 2.0, -(a + 3.0), 0.0, 1.0], &dtype)?;
                     let r_neg1 = Tensor::const_(1.0f64, dtype.clone()).try_sub(&ratio)?;
@@ -454,11 +454,11 @@ fn apply_coordinate_transform(
     roi_end: f64,
 ) -> Result<Tensor> {
     let f64_dt = DType::Float64;
-    let index = Tensor::arange(0, Some(output_sz as i64), None)?.cast(f64_dt.clone())?;
+    let index = Tensor::arange(0, Some(output_sz as i64), None)?.cast(f64_dt.clone());
     let result = match mode {
         CoordinateTransformMode::HalfPixel => {
             let half = Tensor::const_(0.5f64, f64_dt.clone());
-            index.try_add(&half)?.try_div(&Tensor::const_(scale, f64_dt))?.try_sub(&half)?
+            index.try_add(&half)?.try_div(Tensor::const_(scale, f64_dt))?.try_sub(&half)?
         }
         CoordinateTransformMode::AlignCorners => {
             // ONNX reference uses float output_width = scale * input_sz, not integer output_sz.
@@ -468,17 +468,17 @@ fn apply_coordinate_transform(
                 Tensor::const_(0.0f64, f64_dt)
             } else {
                 let ratio = (input_sz as f64 - 1.0) / (output_width - 1.0);
-                index.try_mul(&Tensor::const_(ratio, f64_dt))?
+                index.try_mul(Tensor::const_(ratio, f64_dt))?
             }
         }
-        CoordinateTransformMode::Asymmetric => index.try_div(&Tensor::const_(scale, f64_dt))?,
+        CoordinateTransformMode::Asymmetric => index.try_div(Tensor::const_(scale, f64_dt))?,
         CoordinateTransformMode::PytorchHalfPixel => {
             let output_width = scale * input_sz as f64;
             if output_width == 1.0 {
                 Tensor::const_(0.0f64, f64_dt)
             } else {
                 let half = Tensor::const_(0.5f64, f64_dt.clone());
-                index.try_add(&half)?.try_div(&Tensor::const_(scale, f64_dt))?.try_sub(&half)?
+                index.try_add(&half)?.try_div(Tensor::const_(scale, f64_dt))?.try_sub(&half)?
             }
         }
         CoordinateTransformMode::HalfPixelSymmetric => {
@@ -486,7 +486,7 @@ fn apply_coordinate_transform(
             let offset = (input_sz as f64 / 2.0) * (1.0 - output_sz as f64 / output_dim_scaled);
             let half = Tensor::const_(0.5f64, f64_dt.clone());
             let off_t = Tensor::const_(offset, f64_dt.clone());
-            off_t.try_add(&index.try_add(&half)?.try_div(&Tensor::const_(scale, f64_dt))?)?.try_sub(&half)?
+            off_t.try_add(&index.try_add(&half)?.try_div(Tensor::const_(scale, f64_dt))?)?.try_sub(&half)?
         }
         CoordinateTransformMode::TfCropAndResize => {
             let len = (input_sz as f64) - 1.0;
@@ -496,17 +496,17 @@ fn apply_coordinate_transform(
             } else {
                 let stride = (roi_end - roi_start) * len / (output_width - 1.0);
                 let offset = roi_start * len;
-                index.try_mul(&Tensor::const_(stride, f64_dt.clone()))?.try_add(&Tensor::const_(offset, f64_dt))?
+                index.try_mul(Tensor::const_(stride, f64_dt.clone()))?.try_add(Tensor::const_(offset, f64_dt))?
             }
         }
     };
-    result.cast(dtype.clone())
+    Ok(result.cast(dtype.clone()))
 }
 
 /// Horner's method for polynomial evaluation.
 fn poly_n(x: &Tensor, coeffs: &[f64], dtype: &DType) -> Result<Tensor> {
     coeffs.iter().try_fold(Tensor::const_(0.0f64, dtype.clone()), |acc, &c| {
-        acc.try_mul(x)?.try_add(&Tensor::const_(c, dtype.clone()))
+        acc.try_mul(x)?.try_add(Tensor::const_(c, dtype.clone()))
     })
 }
 
@@ -529,8 +529,8 @@ fn interpolate_antialias_cubic(
     let i_end = 2 - i_start;
     let n_taps = (i_end - i_start) as usize;
 
-    let floored = index.floor()?;
-    let p = floored.cast(DType::Int32)?;
+    let floored = index.floor();
+    let p = floored.cast(DType::Int32);
     let ratio = index.try_sub(&floored)?;
 
     let one = Tensor::const_(1.0f64, dtype.clone());
@@ -540,9 +540,9 @@ fn interpolate_antialias_cubic(
     let mut coeffs = Vec::with_capacity(n_taps);
     for tap in i_start..i_end {
         let arg = ratio
-            .try_mul(&Tensor::const_(-scale, dtype.clone()))?
-            .try_add(&Tensor::const_(scale * tap as f64, dtype.clone()))?;
-        let abs_arg = arg.try_abs()?;
+            .try_mul(Tensor::const_(-scale, dtype.clone()))?
+            .try_add(Tensor::const_(scale * tap as f64, dtype.clone()))?;
+        let abs_arg = arg.abs();
         let c_inner = poly_n(&abs_arg, &[a + 2.0, -(a + 3.0), 0.0, 1.0], dtype)?;
         let c_outer = poly_n(&abs_arg, &[a, -5.0 * a, 8.0 * a, -4.0 * a], dtype)?;
         let mask_outer = abs_arg.try_lt(&two)?;
@@ -571,8 +571,8 @@ fn interpolate_antialias_linear(
     let start = (-1.0_f64 / scale).floor() as i32 + 1;
     let footprint = (2 - 2 * start) as usize;
 
-    let floored = index.floor()?;
-    let p = floored.cast(DType::Int32)?;
+    let floored = index.floor();
+    let p = floored.cast(DType::Int32);
     let ratio = index.try_sub(&floored)?;
 
     let one = Tensor::const_(1.0f64, dtype.clone());
@@ -582,9 +582,9 @@ fn interpolate_antialias_linear(
     for j in 0..footprint {
         let tap = start + j as i32;
         let arg = ratio
-            .try_mul(&Tensor::const_(-scale, dtype.clone()))?
-            .try_add(&Tensor::const_(scale * tap as f64, dtype.clone()))?;
-        let abs_arg = arg.try_abs()?;
+            .try_mul(Tensor::const_(-scale, dtype.clone()))?
+            .try_add(Tensor::const_(scale * tap as f64, dtype.clone()))?;
+        let abs_arg = arg.abs();
         let c = one.try_sub(&abs_arg)?;
         let c = c.clamp().min(&zero_f).max(&one).call()?;
         coeffs.push(c);
@@ -624,7 +624,7 @@ fn normalize_and_gather(
     let mut result: Option<Tensor> = None;
     for (j, c) in coeffs.into_iter().enumerate() {
         let tap = tap_start + j as i32;
-        let idx = p.try_add(&Tensor::const_(ConstValue::Int(tap as i64), DType::Int32))?;
+        let idx = p.try_add(Tensor::const_(ConstValue::Int(tap as i64), DType::Int32))?;
         let idx_clipped = idx.clamp().min(&zero_i).max(&max_val).call()?.try_reshape(reshape)?.try_expand(expand_i)?;
         let c_expanded = c.try_reshape(reshape)?.try_expand(expand_i)?;
         let val = x.gather(dim_i, &idx_clipped)?.try_mul(&c_expanded)?;
