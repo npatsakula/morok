@@ -8,6 +8,7 @@ use proc_macro::TokenStream;
 use syn::{DeriveInput, parse_macro_input};
 
 mod jit;
+mod module;
 mod pattern_enum;
 mod patterns;
 
@@ -210,6 +211,42 @@ pub fn cached_patterns(input: TokenStream) -> TokenStream {
 pub fn jit_wrapper(input: TokenStream) -> TokenStream {
     let jit = parse_macro_input!(input as jit::JitWrapper);
     match jit::generate(jit) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Derive `svod_tensor::nn::Module`: a state dict built from the field types.
+///
+/// Fields are classified by type syntax — a last path segment of `Tensor` is a
+/// parameter, `Option<Tensor>` an optional parameter, primitives and containers
+/// of primitives are ignored, and everything else delegates to that field's own
+/// `Module` impl. Keys always go through `nn::prefixed`, so a root module
+/// (`prefix == ""`) never emits a leading dot.
+///
+/// # Attributes
+///
+/// - `#[module(key = "attention.q_proj")]` — replaces the field-name segment;
+///   may contain dots or digits. `key = ""` passes the parent prefix through
+///   unchanged (flatten).
+/// - `#[module(skip)]` — ignore a non-primitive field (config, dtype, mode).
+/// - `#[module(optional)]` — required on `Option<Tensor>`: save when `Some`,
+///   load with an absent-tolerant lookup.
+/// - `#[module(optional = "<predicate over self>")]` — the key is required when
+///   the predicate holds and skipped otherwise.
+/// - `#[module(crate = "::my_tensor")]` on the type — where the `nn` module lives.
+///
+/// Enum variants derive too: a newtype variant is transparent (same prefix), a
+/// tuple variant indexes `.0`, `.1`, …, and a struct variant uses field names.
+/// `#[module(key = "…")]` on a variant nests all of its fields one segment deeper.
+///
+/// The derive also emits an inherent
+/// `const MODULE_FIELDS: &'static [(&'static str, &'static str)]` mapping each
+/// weight-carrying named field ident to its key segment.
+#[proc_macro_derive(Module, attributes(module))]
+pub fn derive_module(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match module::generate(&input) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }

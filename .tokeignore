@@ -14,3 +14,5 @@ submodules/
 scripts/
 ir/examples/
 tensor/examples/
+macros/src/module/test.rs
+macros/src/patterns/test/
