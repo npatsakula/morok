@@ -81,6 +81,7 @@ pub mod operand;
 pub mod rand;
 pub mod realize;
 pub mod reduce;
+mod scan;
 pub mod schedule;
 pub(crate) mod schedule_cache;
 pub mod shape_ops;

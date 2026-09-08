@@ -380,7 +380,7 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
                 ctx.clear_realize(value);
             }
             let index_base = index.base().id;
-            if value.any_in_subtree(|n| n.id == index_base) {
+            if value.any_in_subtree(|n| n.id == index_base) && !self_read_misses_store(index, value, index_base) {
                 ctx.mark_realize_non_removable(value);
             }
             None
@@ -413,6 +413,86 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
             None
         },
     }
+}
+
+/// Split an integer index expression into `(varying part, constant addend)`.
+///
+/// `t` yields `(Some(t), 0)` and `t + 1` yields `(Some(t), 1)`, which is all a
+/// scan needs to tell one time slot from the next.
+fn split_const_addend(u: &Arc<UOp>) -> (Option<u64>, i64) {
+    match u.op() {
+        Op::Cast(ops::Cast { src, .. }) => split_const_addend(src),
+        Op::Const(value) => match value.0 {
+            ConstValue::Int(v) => (None, v),
+            ConstValue::UInt(v) => (None, v as i64),
+            _ => (Some(u.id), 0),
+        },
+        Op::Binary(BinaryOp::Add, a, b) => match (split_const_addend(a), split_const_addend(b)) {
+            ((var, c), (None, k)) | ((None, k), (var, c)) => (var, c + k),
+            _ => (Some(u.id), 0),
+        },
+        _ => (Some(u.id), 0),
+    }
+}
+
+/// Whether two shrink windows over one buffer provably cover disjoint memory.
+///
+/// True when some axis separates them by a constant at least as large as both
+/// windows — the scan case, where step `t` reads slot `t` and writes slot
+/// `t + 1`.
+fn windows_disjoint(a: (&[Arc<UOp>], &[Arc<UOp>]), b: (&[Arc<UOp>], &[Arc<UOp>])) -> bool {
+    let ((a_off, a_size), (b_off, b_size)) = (a, b);
+    if a_off.len() != b_off.len() {
+        return false;
+    }
+    a_off.iter().zip(b_off).zip(a_size.iter().zip(b_size)).any(|((ao, bo), (asz, bsz))| {
+        let (Some(asz), Some(bsz)) = (asz.vmax().try_int(), bsz.vmax().try_int()) else { return false };
+        let ((a_var, a_c), (b_var, b_c)) = (split_const_addend(ao), split_const_addend(bo));
+        a_var == b_var && (a_c - b_c).abs() >= asz.max(bsz)
+    })
+}
+
+/// The `(offsets, sizes, viewed shape)` of a SHRINK that windows `base`
+/// directly, seen through any number of reshapes.
+type ShrinkView = (Vec<Arc<UOp>>, Vec<Arc<UOp>>, Option<svod_ir::shape::Shape>);
+
+fn shrink_over_base(node: &Arc<UOp>, base: u64) -> Option<ShrinkView> {
+    let Op::Shrink(ops::Shrink { src, offsets, sizes }) = node.op() else { return None };
+    let mut cur = src;
+    while let Op::Reshape(ops::Reshape { src: inner, .. }) = cur.op() {
+        cur = inner;
+    }
+    (cur.id == base)
+        .then(|| (extract_shape_uops(offsets), extract_shape_uops(sizes), src.shape().ok().flatten().cloned()))
+}
+
+/// Whether every read of `base` inside a STORE's value misses the slot the
+/// STORE writes.
+///
+/// The STORE rule's WAR temp exists for self-assigns that overlap; a scan
+/// reading slot `t` and writing slot `t + 1` does not, and paying for the temp
+/// there costs one extra kernel and one extra buffer round trip per time step.
+///
+/// Every unproven case keeps the temp: a size whose bound is symbolic, a
+/// non-SHRINK read of the base, a movement op other than RESHAPE between the
+/// SHRINK and the base, or two windows viewed through different shapes.
+fn self_read_misses_store(index: &Arc<UOp>, value: &Arc<UOp>, base: u64) -> bool {
+    let Some((store_off, store_size, store_shape)) = shrink_over_base(index, base) else { return false };
+
+    let mut aliasing: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for node in value.toposort() {
+        if node.id != base && !node.op().sources().iter().any(|src| aliasing.contains(&src.id)) {
+            continue;
+        }
+        if let Some((off, size, shape)) = shrink_over_base(&node, base)
+            && shape == store_shape
+            && windows_disjoint((&store_off, &store_size), (&off, &size))
+        {
+            continue;
+        }
+        aliasing.insert(node.id);
+    }
+    !aliasing.contains(&value.id)
 }
 
 /// Check if a UOp is always contiguous (doesn't need realization).

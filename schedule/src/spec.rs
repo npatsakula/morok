@@ -944,6 +944,20 @@ fn rule_kernel_graph() -> SpecRule {
             "kernel-graph BUFFER must be GLOBAL with matching metadata dtype",
         )),
         Op::Reshape(..) | Op::BitCast(..) => Some(Ok(())),
+        // Schedule-level loop: `RANGE` counts the iterations of the `END(CALL,
+        // [RANGE])` wrapper that `create_pre_schedule` replays. The bound must
+        // be concrete — the scheduler unrolls it eagerly.
+        Op::Range(ops::Range { end, .. }) => Some(ok_if(
+            matches_dtype(end, &u.dtype()) && end.vmax().try_int().is_some(),
+            "kernel-graph RANGE requires a matching-dtype bound with a concrete maximum",
+        )),
+        Op::End(ops::End { computation, ranges }) => Some(ok_if(
+            u.dtype() == DType::Void
+                && matches!(computation.op(), Op::Call(..))
+                && ranges.len() <= 1
+                && ranges.iter().all(|range| matches!(range.op(), Op::Range(..))),
+            "kernel-graph END must close at most one RANGE over a CALL",
+        )),
         Op::MStack(ops::MStack { buffers }) => Some(ok_if(
             !buffers.is_empty()
                 && buffers.iter().all(|source| matches_dtype(source, &u.dtype()))
@@ -974,8 +988,12 @@ fn rule_kernel_graph() -> SpecRule {
                             | Op::BitCast(..)
                             | Op::Reshape(..)
                     ))
-                && deps.iter().all(|dep| matches!(dep.op(), Op::Call(..) | Op::After(..))),
-            "kernel-graph AFTER requires a storage/view passthrough, matching dtype, and CALL/AFTER dependencies",
+                && deps.iter().all(|dep| match dep.op() {
+                    Op::Call(..) | Op::After(..) => true,
+                    Op::End(ops::End { computation, .. }) => matches!(computation.op(), Op::Call(..)),
+                    _ => false,
+                }),
+            "kernel-graph AFTER requires a storage/view passthrough, matching dtype, and CALL/END(CALL)/AFTER dependencies",
         )),
         _ => None,
     })

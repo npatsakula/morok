@@ -264,6 +264,17 @@ fn multi_output_call_graph() -> Arc<UOp> {
     UOp::sink(vec![out0, out1])
 }
 
+/// The schedule-level scan loop: `END(CALL, [RANGE])` with the counter bound
+/// into the CALL's arguments, replayed by `create_pre_schedule`.
+fn scan_loop_graph() -> Arc<UOp> {
+    let range = UOp::range_axis(UOp::index_const(4), svod_ir::AxisId::Renumbered(0), svod_ir::AxisType::Loop);
+    let bind = UOp::define_var("t".to_string(), 0, 3).bind(range.clone());
+    let call = UOp::sink(vec![kernel_param(0, DType::Float32)])
+        .call(smallvec![cpu_buffer(DType::Float32), bind], svod_ir::CallInfo::default());
+    let out = cpu_buffer(DType::Float32).after(smallvec![call.clone().end(smallvec![range])]);
+    UOp::sink(vec![out])
+}
+
 /// A cross-device COPY is the one non-SINK body a CALL may wrap.
 fn cross_device_copy_call() -> Arc<UOp> {
     let copy = kernel_param(0, DType::Float32).copy_to_device(DeviceSpec::Cuda { device_id: 0 });
@@ -273,6 +284,7 @@ fn cross_device_copy_call() -> Arc<UOp> {
 #[test_case(multi_output_call_graph(); "one call feeding two outputs")]
 #[test_case(UOp::sink(vec![device_mstack().mselect(1)]); "concrete-device mstack layout")]
 #[test_case(cross_device_copy_call(); "cross-device copy call body")]
+#[test_case(scan_loop_graph(); "schedule-level scan loop")]
 fn spec_kernel_graph_accepts(sink: Arc<UOp>) {
     verify_kernel_graph(&sink).expect("valid kernel graph");
 }
@@ -293,6 +305,15 @@ fn spec_kernel_graph_accepts(sink: Arc<UOp>) {
 #[test_case(
     UOp::sink(vec![cpu_buffer(DType::Float32).copy_to_device(DeviceSpec::Cuda { device_id: 0 })]),
     "no matching rule"; "bare copy in the outer graph")]
+#[test_case(
+    UOp::sink(vec![
+        UOp::native_const(1i32).end(smallvec![UOp::range_axis(
+            UOp::index_const(4),
+            svod_ir::AxisId::Renumbered(0),
+            svod_ir::AxisType::Loop,
+        )]),
+    ]),
+    "END must close at most one RANGE over a CALL"; "end wrapping a non-call")]
 fn spec_kernel_graph_rejects(sink: Arc<UOp>, expected: &str) {
     let err = verify_kernel_graph(&sink).expect_err("invalid kernel graph");
     assert!(err.to_string().contains(expected), "unexpected error: {err}");
@@ -306,7 +327,7 @@ fn verification_errors_locate_the_offending_node() {
     assert_eq!(boundary, "kernel graph");
     assert_eq!(uop_id, malformed.id);
     assert_eq!(source_path, vec![0]);
-    assert!(reason.contains("CALL/AFTER dependencies"), "unexpected reason: {reason}");
+    assert!(reason.contains("CALL/END(CALL)/AFTER dependencies"), "unexpected reason: {reason}");
 
     let stale = UOp::new(Op::Noop, DType::Index);
     let SpecError::Verification { boundary, uop_id, source_path, reason, .. } =

@@ -23,7 +23,7 @@ pub use lstm_cell::{LSTMCell, LstmCell};
 pub use module::{Module, StateDict, get_tensor, prefixed};
 pub use rnn::{
     GruCell, GruDirection, GruOutput, LinearBeforeReset, LstmOutput, RecurrentCell, RnnCell, RnnDirection, RnnLayout,
-    RnnOutput, RnnStack,
+    RnnOutput, RnnStack, ScanState,
 };
 pub use stft::Window;
 /// Derive [`Module`](trait@Module): the trait lives in the type namespace and

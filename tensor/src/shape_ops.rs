@@ -858,10 +858,17 @@ impl Tensor {
         let ndim = self.ndim()?;
         let dim = Self::normalize_axis(dim, ndim)?;
         let start: SInt = start.into();
-        let end = &start + len.into();
-        let ranges: Vec<Option<(SInt, SInt)>> =
-            (0..ndim).map(|d| (d == dim).then(|| (start.clone(), end.clone()))).collect();
-        self.try_shrink(ranges)
+        let len: SInt = len.into();
+        let shape = self.shape()?;
+        if start.as_const() == Some(0) && len == shape[dim] {
+            return Ok(self.clone());
+        }
+        // `(offset, size)` rather than `(begin, end)`: a symbolic `start` must
+        // not turn the narrowed axis symbolic (see `UOp::shrink_sized`).
+        let sized: Vec<(SInt, SInt)> = (0..ndim)
+            .map(|d| if d == dim { (start.clone(), len.clone()) } else { (SInt::Const(0), shape[d].clone()) })
+            .collect();
+        self.uop().shrink_sized(&sized).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Center-crop or center-pad each specified axis to the target size.

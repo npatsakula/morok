@@ -1190,6 +1190,18 @@ pub fn instantiate_schedule(
                 instance_dependencies.extend(instances.iter().copied());
             }
         }
+        // A schedule loop is a recurrence: iteration `t` reads what iteration
+        // `t - 1` wrote, at a symbolic offset into the same buffer, so the
+        // callable-id dependency graph cannot see the edge (all iterations
+        // share one kernel id, and self-edges are suppressed). Chaining every
+        // loop-body item to the item before it pins the linear bytecode order
+        // through levelling, which would otherwise hoist a dependency-free
+        // body kernel's iterations into one level and run them back to back.
+        if !invocation.fixedvars.is_empty()
+            && let Some(previous) = schedule.len().checked_sub(1)
+        {
+            instance_dependencies.insert(previous);
+        }
         let mut instance_dependencies: Vec<usize> = instance_dependencies.into_iter().collect();
         instance_dependencies.sort_unstable();
 

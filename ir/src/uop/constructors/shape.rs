@@ -223,7 +223,6 @@ impl UOp {
     /// - 0 <= begin, end <= dimension_size
     pub fn try_shrink(self: &Arc<Self>, ranges: &[(crate::SInt, crate::SInt)]) -> Result<Arc<Self>> {
         use crate::error::ShrinkBoundsViolationSnafu;
-        use crate::shape::ranges_to_uops;
         use snafu::ensure;
 
         // Empty ranges (scalar) → identity
@@ -250,11 +249,29 @@ impl UOp {
         }
 
         let offsets_and_sizes: Vec<_> = ranges.iter().map(|(begin, end)| (begin.clone(), end - begin)).collect();
-        let (offsets, sizes) = ranges_to_uops(&offsets_and_sizes);
+        self.shrink_sized(&offsets_and_sizes)
+    }
+
+    /// Shrink from `(offset, size)` pairs instead of `(begin, end)`.
+    ///
+    /// A symbolic offset with a constant size stays a constant-extent axis:
+    /// `end - begin` would spell the size as `(t + 1) + t * -1`, which no
+    /// eager `SInt` fold collapses, so the axis would turn symbolic and the
+    /// optimizer would stop upcasting it. Callers that already know the size
+    /// (`narrow`) hand it over directly.
+    pub fn shrink_sized(self: &Arc<Self>, offsets_and_sizes: &[(crate::SInt, crate::SInt)]) -> Result<Arc<Self>> {
+        use crate::shape::ranges_to_uops;
+
+        if offsets_and_sizes.is_empty() {
+            return Ok(self.clone());
+        }
+        let (offsets, sizes) = ranges_to_uops(offsets_and_sizes);
         let dtype = self.dtype();
         let result = Self::new(Op::Shrink(ops::Shrink { src: self.clone(), offsets, sizes }), dtype);
         // Tinygrad (movement.py:128): return self if ret.shape == self.shape else ret
-        if result.shape().ok().flatten() == self.shape().ok().flatten() {
+        if offsets_and_sizes.iter().all(|(o, _)| o.as_const() == Some(0))
+            && result.shape().ok().flatten() == self.shape().ok().flatten()
+        {
             return Ok(self.clone());
         }
         Ok(result)

@@ -92,6 +92,27 @@ fn test_narrow_symbolic_passthrough(sym: bool) {
     assert_eq!(dims_opt(&x.narrow(-1, 2usize, 2usize).unwrap()), vec![head(sym), Some(6), Some(2)]);
 }
 
+/// A symbolic `start` narrows to a *constant* extent: the offset becomes a
+/// runtime index, not a runtime axis length. Spelling the size as `end - begin`
+/// would leave `(t + 1) + t * -1` behind, turning the axis symbolic and
+/// stopping the optimizer from upcasting it.
+#[test]
+fn test_narrow_with_a_symbolic_start_keeps_a_constant_extent() {
+    let t = crate::Variable::new("t", 0, 5);
+    let x = Tensor::empty(&[6, 5], svod_dtype::DType::Float32);
+    let slot = x.narrow(0, t.as_sint(), 1usize).unwrap();
+    assert_eq!(dims_opt(&slot), vec![Some(1), Some(5)]);
+    assert_eq!(dims_opt(&slot.try_squeeze(Some(0)).unwrap()), vec![Some(5)]);
+
+    // The offset really is the variable, not a folded constant.
+    let uses_t = slot
+        .uop()
+        .toposort()
+        .iter()
+        .any(|n| matches!(n.op(), svod_ir::Op::Param(p) if p.arg.name.as_deref() == Some("t")));
+    assert!(uses_t, "narrow lost the symbolic offset");
+}
+
 #[test_case(false; "concrete")]
 #[test_case(true; "symbolic_batch")]
 fn test_unfold_symbolic_passthrough(sym: bool) {
