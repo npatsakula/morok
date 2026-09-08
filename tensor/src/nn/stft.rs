@@ -6,8 +6,10 @@
 //! kernel rather than a host-side FFT. That keeps an audio front-end (mel
 //! filterbank, VAD, speech enhancement) inside one JIT graph. The `[2F, 1,
 //! n_fft]` kernel is materialized before the convolution: left lazy it would
-//! fuse in and cost a `cos`/`sin` per multiply-add, 20-30× the convolution.
-//! Both operands are also zero-padded to extents the optimizer can tile
+//! fuse in and cost a `cos`/`sin` per multiply-add, 20-30× the convolution —
+//! and when the window is known on the host (a named one, or a `Custom`
+//! buffer) the kernel is tabulated there in f64 and uploaded once, like the
+//! mel filterbank, so no launch rebuilds it per run. Both operands are also zero-padded to extents the optimizer can tile
 //! ([`FRAME_ALIGN`], [`CHANNEL_ALIGN`]) and the surplus trimmed afterwards.
 //!
 //! ## Conventions
@@ -378,6 +380,63 @@ fn framed_window(kind: &Window, n_fft: usize, win_length: usize, dtype: DType) -
     w.try_pad(&[(left, (n_fft - win_length) as isize - left)])
 }
 
+/// [`framed_window`] as host f64 values when no graph has to run for it: a
+/// named window, or a `Custom` one already backed by a Float32 buffer (a
+/// `from_slice` window). A lazy `Custom` window yields `None`, and its
+/// caller builds the DFT kernel in the graph instead.
+fn host_framed_window(kind: &Window, n_fft: usize, win_length: usize) -> Option<Vec<f64>> {
+    let w: Vec<f64> = match kind {
+        Window::Custom(w) => {
+            let w = w.buffer().is_some().then(|| w.as_vec::<f32>().ok()).flatten()?;
+            (w.len() == win_length).then(|| w.into_iter().map(f64::from).collect())?
+        }
+        Window::Rectangular => vec![1.0; win_length],
+        cosine => {
+            let (a0, a1) = cosine.cosine_sum().expect("Rectangular and Custom handled above");
+            (0..win_length).map(|k| a0 - a1 * (TAU * k as f64 / win_length as f64).cos()).collect()
+        }
+    };
+    let mut framed = vec![0.0; n_fft];
+    let left = (n_fft - win_length) / 2;
+    framed[left..left + win_length].copy_from_slice(&w);
+    Some(framed)
+}
+
+/// Host twin of [`analysis_kernel`] / [`synthesis_kernel`], `[rows, n_fft]`
+/// row-major with `rows >= 2F` (the surplus rows zero): row `k` is
+/// `w[n]·re(k)·cos(2πkn/N)`, row `F + k` is `w[n]·im(k)·sin(2πkn/N)`.
+/// Built in f64 and uploaded once, the way [`mel_table`] is, so the kernel
+/// enters a plan as an input buffer rather than a launch.
+fn dft_table(n_fft: usize, n_bins: usize, rows: usize, win: &[f64], weights: impl Fn(usize) -> (f64, f64)) -> Vec<f32> {
+    let mut table = vec![0f32; rows * n_fft];
+    for k in 0..n_bins {
+        let (re, im) = weights(k);
+        for n in 0..n_fft {
+            let angle = TAU * ((k * n) % n_fft) as f64 / n_fft as f64;
+            table[k * n_fft + n] = (win[n] * re * angle.cos()) as f32;
+            table[(n_bins + k) * n_fft + n] = (win[n] * im * angle.sin()) as f32;
+        }
+    }
+    table
+}
+
+/// Per-bin `(re, im)` weights of the synthesis kernel — see [`synthesis_kernel`].
+fn synthesis_weights(n_fft: usize, onesided: bool) -> impl Fn(usize) -> (f64, f64) {
+    let inv = 1.0 / n_fft as f64;
+    let nyquist = if n_fft.is_multiple_of(2) { Some(n_fft / 2) } else { None };
+    move |k| {
+        let edge = onesided && (k == 0 || Some(k) == nyquist);
+        let (re, im) = if onesided { if edge { (1.0, 0.0) } else { (2.0, 2.0) } } else { (1.0, 1.0) };
+        (re * inv, -im * inv)
+    }
+}
+
+/// Upload a host table as a `[rows, 1, cols]` constant of `dtype`.
+fn upload(table: Vec<f32>, rows: usize, cols: usize, dtype: DType) -> Result<Tensor> {
+    let t = Tensor::from_slice(table).try_reshape([rows as isize, 1, cols as isize])?;
+    Ok(if dtype == DType::Float32 { t } else { t.cast(dtype) })
+}
+
 /// `(hop, win_length)` with the torch defaults applied and validated.
 fn resolve(op: &'static str, n_fft: usize, hop: Option<usize>, win_length: Option<usize>) -> Result<(usize, usize)> {
     ensure!(n_fft > 0, ParamRangeSnafu { op, param: "n_fft", value: n_fft.to_string(), constraint: "> 0" });
@@ -496,10 +555,15 @@ impl Tensor {
 
         let n_bins = if onesided { n_fft / 2 + 1 } else { n_fft };
         let channels = (2 * n_bins).next_multiple_of(CHANNEL_ALIGN);
-        let win = framed_window(window, n_fft, win_length, dtype.clone())?;
-        let kernel = analysis_kernel(n_fft, n_bins, &win, dtype)?
-            .try_pad(&[(0, (channels - 2 * n_bins) as isize), (0, 0), (0, 0)])?
-            .contiguous();
+        let kernel = match host_framed_window(window, n_fft, win_length) {
+            Some(win) => upload(dft_table(n_fft, n_bins, channels, &win, |_| (1.0, -1.0)), channels, n_fft, dtype)?,
+            None => {
+                let win = framed_window(window, n_fft, win_length, dtype.clone())?;
+                analysis_kernel(n_fft, n_bins, &win, dtype)?
+                    .try_pad(&[(0, (channels - 2 * n_bins) as isize), (0, 0), (0, 0)])?
+                    .contiguous()
+            }
+        };
 
         // [B, 1, L'] -> [B, 2F', T'] -> [B, 2F, T'] -> [B, 2, F, T'] -> [B, F, T', 2].
         let y = x.try_unsqueeze(1)?.conv1d().weight(&kernel).stride(hop).call()?.contiguous();
@@ -567,8 +631,25 @@ impl Tensor {
             ParamRangeSnafu { op: "istft", param: "frames", value: frames.to_string(), constraint: "> 0" }
         );
 
-        let win = framed_window(&window, n_fft, win_length, dtype.clone())?;
-        let kernel = synthesis_kernel(n_fft, n_bins, onesided, &win, dtype.clone())?.contiguous();
+        // The synthesis kernel and the window² of the overlap-add divisor.
+        let (kernel, wsq) = match host_framed_window(&window, n_fft, win_length) {
+            Some(win) => (
+                upload(
+                    dft_table(n_fft, n_bins, 2 * n_bins, &win, synthesis_weights(n_fft, onesided)),
+                    2 * n_bins,
+                    n_fft,
+                    dtype.clone(),
+                )?,
+                upload(win.iter().map(|w| (w * w) as f32).collect(), 1, n_fft, dtype.clone())?,
+            ),
+            None => {
+                let win = framed_window(&window, n_fft, win_length, dtype.clone())?;
+                (
+                    synthesis_kernel(n_fft, n_bins, onesided, &win, dtype.clone())?.contiguous(),
+                    win.square().try_reshape([1, 1, n_fft as isize])?,
+                )
+            }
+        };
 
         // [B, F, T, 2] -> [B, 2, F, T] -> [B, 2F, T]; the batch stays symbolic.
         let z = x.try_permute(&[0, 3, 1, 2])?.try_reshape([
@@ -580,7 +661,6 @@ impl Tensor {
         let ola = z.conv_transpose2d().weight(&kernel).stride(&[hop]).call()?;
 
         // Same overlap-add applied to window², giving the per-sample divisor.
-        let wsq = win.square().try_reshape([1, 1, n_fft as isize])?;
         let ones = Tensor::ones(&[1, 1, frames], dtype);
         let norm = ones.conv_transpose2d().weight(&wsq).stride(&[hop]).call()?;
         let y = ola.try_div(&norm.maximum(NOLA_EPS)?)?.try_squeeze(Some(1))?;

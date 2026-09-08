@@ -201,6 +201,34 @@ fn stft_custom_window_matches_gtcrn_sqrt_hann() {
     assert_close(&spec.to_vec::<f32>().unwrap(), &expected, 2e-4);
 }
 
+/// A `Custom` window that is still a graph (a `hann.sqrt()` built in-graph,
+/// as GTCRN's could be) cannot be tabulated on the host, so the DFT kernels
+/// are built in-graph — one launch each for the analysis and the synthesis
+/// kernel — and must agree with the host tables to f32 rounding.
+#[test]
+fn lazy_custom_window_falls_back_to_in_graph_kernels() {
+    let (n_fft, hop, len) = (32usize, 16usize, 96usize);
+    let input = Tensor::from_slice(signal(len, 2.4).iter().map(|&v| v as f32).collect::<Vec<_>>());
+    let sqrt_hann = || Tensor::window(&Window::Hann, n_fft, true, DType::Float32).unwrap().try_sqrt().unwrap();
+    let host = Tensor::from_slice(sqrt_hann().to_vec::<f32>().unwrap());
+    let lazy = sqrt_hann();
+    assert!(lazy.buffer().is_none(), "the window must reach stft unrealized");
+
+    let stft = |w: Tensor| input.stft().n_fft(n_fft).hop(hop).window(Window::Custom(w)).call().unwrap();
+    let (spec_host, spec_lazy) = (stft(host.clone()), stft(lazy.clone()));
+    assert_eq!(count_kernels(&spec_lazy), count_kernels(&spec_host) + 1);
+    let expected: Vec<f64> = spec_host.to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
+    assert_close(&spec_lazy.to_vec::<f32>().unwrap(), &expected, 1e-5);
+
+    let istft = |spec: &Tensor, w: Tensor| {
+        spec.istft().n_fft(n_fft).hop(hop).window(Window::Custom(w)).length(len).call().unwrap()
+    };
+    let (back_host, back_lazy) = (istft(&spec_host, host), istft(&spec_host, lazy));
+    assert_eq!(count_kernels(&back_lazy), count_kernels(&back_host) + 1);
+    let expected: Vec<f64> = back_host.to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
+    assert_close(&back_lazy.to_vec::<f32>().unwrap(), &expected, 1e-5);
+}
+
 // =========================================================================
 // Batch and rank handling
 // =========================================================================
@@ -522,20 +550,18 @@ fn count_kernels(t: &Tensor) -> usize {
 }
 
 /// The conv formulation: one launch pads the framed signal to a tileable
-/// frame count, one builds the `[2F', 1, n_fft]` DFT kernel (the window and
-/// the channel padding fold into it), one convolves at the padded extents,
-/// and one trims the result for a consumer that wants it materialized —
-/// fusing the basis into the convolution instead would recompute `cos`/`sin`
-/// per multiply-add, and trimming the convolution lazily would hand the
-/// natural extents back to the reduce. The inverse reads the trim as a view,
-/// so it adds its own kernel build and convolution plus one launch for the
-/// window-square overlap-add divisor on top of the first three.
+/// frame count, one convolves it at the padded extents with the host-built
+/// `[2F', 1, n_fft]` DFT kernel (an input buffer, not a launch), and one
+/// trims the result for a consumer that wants it materialized — trimming the
+/// convolution lazily would hand the natural extents back to the reduce. The
+/// inverse reads the trim as a view, so it adds its own convolution plus one
+/// launch for the window-square overlap-add divisor on top of the first two.
 #[test]
-fn stft_is_four_kernels_and_istft_is_six() {
+fn stft_is_three_kernels_and_istft_is_five() {
     let x = Tensor::empty(&[4, 16000], DType::Float32);
     let spec = x.stft().n_fft(512).hop(256).call().unwrap();
     let back = spec.istft().n_fft(512).hop(256).call().unwrap();
-    assert_eq!((count_kernels(&spec), count_kernels(&back)), (4, 6));
+    assert_eq!((count_kernels(&spec), count_kernels(&back)), (3, 5));
 }
 
 // =========================================================================
@@ -796,15 +822,16 @@ fn mel_spectrogram_rejects_bad_parameters() {
     assert!(matches!(err.kind(), ErrorKind::NdimMinimum { .. }), "got {err}");
 }
 
-/// A Whisper-sized front-end: the STFT's signal pad, kernel build and conv,
-/// then the filterbank contraction, which absorbs the trailing frame trim
-/// (its output is the trimmed `[B, n_mels, T]`), the `Ln` log and the
-/// three-pass Whisper log (reduce, floor, normalize).
+/// A Whisper-sized front-end: the STFT's signal pad and conv (the DFT kernel
+/// and the filterbank are host tables), then the filterbank contraction,
+/// which absorbs the trailing frame trim (its output is the trimmed
+/// `[B, n_mels, T]`), the `Ln` log and the three-pass Whisper log (reduce,
+/// floor, normalize).
 #[test]
 fn mel_spectrogram_kernel_count_stays_small() {
     let x = Tensor::empty(&[4, 16000 * 30], DType::Float32);
     let power = x.mel_spectrogram().sample_rate(16000).n_fft(400).hop(160).n_mels(80).call().unwrap();
     let whisper = power.mel_log(MelLog::Whisper).unwrap();
     let ln = power.mel_log(MelLog::Ln { min: 1e-9, max: 1e9 }).unwrap();
-    assert_eq!((count_kernels(&power), count_kernels(&ln), count_kernels(&whisper)), (4, 4, 7));
+    assert_eq!((count_kernels(&power), count_kernels(&ln), count_kernels(&whisper)), (3, 3, 6));
 }
