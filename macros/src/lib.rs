@@ -181,29 +181,53 @@ pub fn cached_patterns(input: TokenStream) -> TokenStream {
 /// Generates a struct with typed input/output buffer accessors and
 /// prepare/execute methods for zero-overhead repeated inference.
 ///
+/// The expansion refers to `::svod_tensor::jit` only, so the invoking crate
+/// needs `svod-tensor` and nothing else.
+///
 /// # Syntax
+///
+/// Every clause is optional and order-free; a bare `name: Tensor` line at the
+/// top level is an input, so the pre-v2 form parses unchanged.
 ///
 /// ```ignore
 /// jit_wrapper! {
 ///     MyModelJit(MyModel) {
-///         input1: Tensor,
-///         input2: Tensor,
+///         inputs { spec: Tensor, #[unbatched] mask: Tensor, taps: [Tensor; 3] }
+///         batch_var b: (1, model.config.max_batch_size),
+///         vars { t: (1, 512) }
+///         state { h: Tensor, caches: [Tensor; 8] }
+///         outputs { logits, hidden: [Tensor; 2] }
 ///
-///         build(input1, input2) {
-///             // Graph-building code using `self.model`
-///             self.model.forward(&input1, &input2)
+///         build(spec, mask, taps, h, caches, t) {
+///             model.forward_stream(spec, mask, taps, h, caches, &t)
 ///         }
 ///     }
 /// }
 /// ```
 ///
+/// - `name: [Tensor; N]` declares N buffers behind one name: `prepare` takes
+///   `[InputSpec; N]`, `build` gets `[&Tensor; N]`, accessors take an index.
+/// - `batch_var` declares a variable **and** shrinks every batched input's
+///   dim 0 to it after realization; `#[unbatched]` opts an input out.
+/// - `state` slots are inputs the plan also writes: the build tuple is
+///   `(declared outputs…, state values…)`, the macro assigns each new value
+///   back into its own device-local buffer, and they are never exposed as
+///   outputs.
+/// - The build tuple has one element per declared output slot plus one per
+///   state slot — and no tuple at all when there is exactly one of them.
+///
 /// # Generated API
 ///
-/// - `new(model)` — create wrapper
-/// - `prepare(&input1, &input2)` — build graph + compile (one-time)
-/// - `input1_mut()` / `input2_mut()` — typed mutable buffer accessors
-/// - `output()` — output buffer accessor
-/// - `execute()` / `execute_with_vars()` — replay with zero allocation
+/// - `new(model)`, `with_<var>_bound` / `_min_bound` / `_fixed`
+/// - `prepare(<spec per slot>)` / `prepare_with_config(.., &PrepareConfig)`
+/// - `<input>_mut()` / `<input>_view_mut::<T>()` — buffer and typed write view
+/// - `copy_output_to_<input>(out_pos, dst_off, src_off, len)`
+/// - `<output>()`, `<output>_shape()`, `<output>_view::<T>()`,
+///   `<output>_to_vec::<T>()` — the shape and both reads follow the live
+///   variable bindings
+/// - `reset()` — zero every state slot
+/// - `execute()`, `execute_bound(<var values>)`, `execute_with_vars()`,
+///   the `_profiled` variants
 /// - `replicate()` — deep copy of the prepared JIT (`Result<Self>`): forked
 ///   input/intermediate/output buffers, shared model/weights and compiled
 ///   kernels, independent backend queue for concurrent execution

@@ -72,6 +72,7 @@ pub use svod_dtype::default_device;
 pub mod einsum;
 pub mod index;
 pub mod indexing;
+pub mod jit;
 pub mod math;
 pub mod matmul;
 pub mod memory_planner;

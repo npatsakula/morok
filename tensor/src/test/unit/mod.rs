@@ -35,6 +35,7 @@ pub mod triangular;
 pub mod variable;
 
 mod attention_helpers;
+mod jit;
 mod layers;
 mod module;
 mod nn_affine;

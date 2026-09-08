@@ -115,6 +115,14 @@ impl PrepareConfig {
         }
     }
 
+    /// [`from_env`](Self::from_env) with device-local output buffers: results
+    /// are read back with `copyout` over the copy engine instead of through an
+    /// uncached host mapping. The default for JIT plans whose outputs are read
+    /// in bulk (or not at all, as with recurrent state).
+    pub fn device_local() -> Self {
+        Self { device_local_outputs: true, ..Self::from_env() }
+    }
+
     /// Convenience constructor: specific CPU backend with optimizer settings
     /// resolved from env (`BEAM`, `SVOD_NOOPT`, `IGNORE_BEAM_CACHE`,
     /// `BEAM_*`, `SVOD_*`). Used by the `codegen_tests!` macro so a single
