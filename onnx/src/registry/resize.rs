@@ -182,7 +182,7 @@ fn resize_nearest(
             mask_shape[dim] = valid.len() as isize;
             let mask = Tensor::from_slice(&valid).try_reshape(&mask_shape)?.try_expand(out_shape.clone())?;
             combined = Some(match combined {
-                Some(c) => c.bitwise_and(&mask)?,
+                Some(c) => c.try_bitand(&mask)?,
                 None => mask,
             });
         }

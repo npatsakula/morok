@@ -1,4 +1,4 @@
-//! Convolution operations: conv2d, conv_transpose2d.
+//! Convolution operations: conv1d, conv2d, conv_transpose2d.
 
 use bon::bon;
 use snafu::OptionExt;
@@ -6,13 +6,86 @@ use snafu::OptionExt;
 use svod_ir::SInt;
 
 use crate::Tensor;
-use crate::error::{KindResult, SymbolicShapeUnsupportedSnafu};
+use crate::error::{KindResult, NdimExactSnafu, SymbolicShapeUnsupportedSnafu};
 use crate::reduce::AxisSpec;
 
 type Result<T> = crate::Result<T>;
 
+/// Padding along the single spatial axis of [`Tensor::conv1d`].
+///
+/// Built from a symmetric `isize` (`2` → `(2, 2)`) or an explicit
+/// `(left, right)` pair. Negative values crop, as in [`Tensor::conv2d`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pad1d {
+    pub left: isize,
+    pub right: isize,
+}
+
+impl From<isize> for Pad1d {
+    fn from(pad: isize) -> Self {
+        Self { left: pad, right: pad }
+    }
+}
+
+impl From<(isize, isize)> for Pad1d {
+    fn from((left, right): (isize, isize)) -> Self {
+        Self { left, right }
+    }
+}
+
 #[bon]
 impl Tensor {
+    /// 1D convolution over `[N, C, L]` inputs.
+    ///
+    /// A scalar-parameter front end for [`conv2d`](Tensor::conv2d): `weight` is
+    /// `[O, C/groups, K]`, `bias` is `[O]`, and `padding` accepts either a
+    /// symmetric `isize` or an asymmetric `(left, right)` pair.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([1, 1, 4]).unwrap();
+    /// let w = Tensor::from_slice([1.0f32, 1.0]).try_reshape([1, 1, 2]).unwrap();
+    /// let y = x.conv1d().weight(&w).call().unwrap();
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![3.0, 5.0, 7.0]);
+    /// ```
+    ///
+    /// Asymmetric (causal) padding, stride and dilation:
+    ///
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([1, 1, 4]).unwrap();
+    /// let w = Tensor::from_slice([1.0f32, 1.0]).try_reshape([1, 1, 2]).unwrap();
+    /// let y = x.conv1d().weight(&w).padding((1, 0)).call().unwrap();
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0, 3.0, 5.0, 7.0]);
+    /// ```
+    #[builder]
+    #[track_caller]
+    pub fn conv1d(
+        &self,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        #[builder(default = 1)] stride: usize,
+        #[builder(into, default)] padding: Pad1d,
+        #[builder(default = 1)] dilation: usize,
+        #[builder(default = 1)] groups: usize,
+    ) -> Result<Tensor> {
+        origin_call!("conv1d");
+        for t in [self, weight] {
+            let ndim = t.ndim()?;
+            snafu::ensure!(ndim == 3, NdimExactSnafu { op: "conv1d", expected: 3_usize, actual: ndim });
+        }
+        self.conv2d()
+            .weight(weight)
+            .maybe_bias(bias)
+            .groups(groups)
+            .stride(&[stride])
+            .dilation(&[dilation])
+            .padding(&[(padding.left, padding.right)])
+            .call()
+    }
+
     /// N-d convolution. Input `(N, Cin, *spatial)`, Weight `(Cout, Cin/groups, *kernel)`.
     ///
     /// Computes cross-correlation (conv without kernel flip) by extracting sliding

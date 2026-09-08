@@ -132,14 +132,14 @@ impl OpRegistry {
             "BitShift" => {
                 let dir = attrs.string("direction", "");
                 vec![if dir == "LEFT" {
-                    inp(inputs, 0).lshift(inp(inputs, 1))?
+                    inp(inputs, 0).try_shl(inp(inputs, 1))?
                 } else {
-                    inp(inputs, 0).rshift(inp(inputs, 1))?
+                    inp(inputs, 0).try_shr(inp(inputs, 1))?
                 }]
             }
-            "BitwiseAnd" => vec![inp(inputs, 0).bitwise_and(inp(inputs, 1))?],
-            "BitwiseOr" => vec![inp(inputs, 0).bitwise_or(inp(inputs, 1))?],
-            "BitwiseXor" => vec![inp(inputs, 0).bitwise_xor(inp(inputs, 1))?],
+            "BitwiseAnd" => vec![inp(inputs, 0).try_bitand(inp(inputs, 1))?],
+            "BitwiseOr" => vec![inp(inputs, 0).try_bitor(inp(inputs, 1))?],
+            "BitwiseXor" => vec![inp(inputs, 0).try_bitxor(inp(inputs, 1))?],
             "BitwiseNot" => vec![inp(inputs, 0).bitwise_not()?],
 
             // === Math ===
@@ -234,17 +234,17 @@ impl OpRegistry {
             "And" => {
                 let a = inp(inputs, 0).cast(DType::Bool);
                 let b = inp(inputs, 1).cast(DType::Bool);
-                vec![a.bitwise_and(&b)?]
+                vec![a.try_bitand(&b)?]
             }
             "Or" => {
                 let a = inp(inputs, 0).cast(DType::Bool);
                 let b = inp(inputs, 1).cast(DType::Bool);
-                vec![a.bitwise_or(&b)?]
+                vec![a.try_bitor(&b)?]
             }
             "Xor" => {
                 let x = inp(inputs, 0).cast(DType::Bool);
                 let y = inp(inputs, 1).cast(DType::Bool);
-                vec![x.bitwise_xor(&y)?]
+                vec![x.try_bitxor(&y)?]
             }
 
             // === Conditional ===
@@ -385,8 +385,8 @@ impl OpRegistry {
             "ScatterND" => vec![indexing::op_scatter_nd(inputs, &mut attrs)?],
             "TensorScatter" => vec![indexing::op_tensor_scatter(inputs, &mut attrs)?],
             "ReverseSequence" => {
-                let batch_axis = attrs.int("batch_axis", 1) as usize;
-                let time_axis = attrs.int("time_axis", 0) as usize;
+                let batch_axis = attrs.int("batch_axis", 1) as isize;
+                let time_axis = attrs.int("time_axis", 0) as isize;
                 vec![inp(inputs, 0).reverse_sequence(inp(inputs, 1), time_axis, batch_axis)?]
             }
 
@@ -672,12 +672,7 @@ impl OpRegistry {
                 let t = inp(inputs, 0);
                 let target_shape = tensor_to_i64_vec(inp(inputs, 1))?;
                 let target: Vec<usize> = target_shape.iter().map(|&v| v as usize).collect();
-                let axes: Option<Vec<usize>> = attrs.get("axes").map(|a| {
-                    a.ints
-                        .iter()
-                        .map(|&v| if v < 0 { (t.ndim().unwrap() as i64 + v) as usize } else { v as usize })
-                        .collect()
-                });
+                let axes: Option<Vec<isize>> = attrs.get("axes").map(|a| a.ints.iter().map(|&v| v as isize).collect());
                 vec![t.center_crop_pad(&target, axes.as_deref())?]
             }
             "Compress" => {

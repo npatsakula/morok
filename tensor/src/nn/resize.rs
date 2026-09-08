@@ -6,12 +6,43 @@ use svod_ir::{ConstValue, SInt};
 
 use super::{AspectRatioPolicy, CoordinateTransformMode, NearestMode, ResizeMode};
 use crate::Tensor;
-use crate::error::KindResult;
+use crate::error::{KindResult, NdimMinimumSnafu, ParamRangeSnafu};
 
 type Result<T> = crate::Result<T>;
 
 #[bon]
 impl Tensor {
+    /// [`upsample`](Tensor::upsample) with an explicit coordinate transform.
+    ///
+    /// The default (`half_pixel`) reproduces "repeat every pixel" nearest
+    /// upsampling; `align_corners` is what torch's bilinear
+    /// `interpolate(..., align_corners=True)` uses.
+    #[builder]
+    #[track_caller]
+    pub fn upsample_with(
+        &self,
+        scale: &[usize],
+        #[builder(default)] mode: ResizeMode,
+        #[builder(default)] coordinate_transformation_mode: CoordinateTransformMode,
+    ) -> Result<Tensor> {
+        origin_call!("upsample");
+        let ndim = self.ndim()?;
+        snafu::ensure!(ndim >= scale.len(), NdimMinimumSnafu { op: "upsample", min: scale.len(), actual: ndim });
+
+        // Leading (batch / channel) axes get scale 1.0, so `resize` treats them
+        // as inactive and carries symbolic extents through untouched.
+        let mut scales = vec![1.0f64; ndim];
+        for (i, &s) in scale.iter().enumerate() {
+            snafu::ensure!(
+                s > 0,
+                ParamRangeSnafu { op: "upsample", param: "scale", value: s.to_string(), constraint: "> 0" }
+            );
+            scales[ndim - scale.len() + i] = s as f64;
+        }
+
+        self.resize().scales(&scales).mode(mode).coordinate_transformation_mode(coordinate_transformation_mode).call()
+    }
+
     /// Resize a tensor using interpolation (ONNX Resize operator).
     ///
     /// Supports nearest, linear, and cubic interpolation modes with various
@@ -254,7 +285,7 @@ impl Tensor {
                     .map(|(idx, &sz)| {
                         let zero = Tensor::const_(ConstValue::Float(0.0), dtype.clone());
                         let max_val = Tensor::const_(ConstValue::Float((sz - 1) as f64), dtype.clone());
-                        idx.try_ge(&zero)?.bitwise_and(&idx.try_le(&max_val)?)
+                        idx.try_ge(&zero)?.try_bitand(&idx.try_le(&max_val)?)
                     })
                     .collect::<Result<Vec<_>>>()?,
             )
@@ -426,7 +457,7 @@ impl Tensor {
                 shape[ndim - n_axes + active_idx[i]] = output_sizes[i] as isize;
                 let broad = mask.try_reshape(&shape)?.try_expand(&expand_shape)?;
                 combined = Some(match combined {
-                    Some(c) => c.bitwise_and(&broad)?,
+                    Some(c) => c.try_bitand(&broad)?,
                     None => broad,
                 });
             }
@@ -437,6 +468,31 @@ impl Tensor {
 
         // Permute back
         if perm.iter().enumerate().any(|(i, &p)| p != i as isize) { x.try_permute(&inv_perm_i) } else { Ok(x) }
+    }
+}
+
+impl Tensor {
+    /// Upsample the trailing spatial axes by integer factors (NCHW / NCL).
+    ///
+    /// Shortcut for [`resize`](Tensor::resize) with half-pixel coordinates,
+    /// which for an integer factor is exactly "repeat each element" in
+    /// [`ResizeMode::Nearest`]. Leading batch/channel axes may be symbolic.
+    /// Use [`upsample_with`](Tensor::upsample_with) to pick another coordinate
+    /// transform (e.g. `align_corners` for torch-style bilinear).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// # use svod_tensor::nn::ResizeMode;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 2, 3, 4), 1.0f32));
+    /// let y = x.upsample(&[2, 2], ResizeMode::Nearest).unwrap();
+    /// assert_eq!(y.dims().unwrap(), vec![1, 2, 6, 8]);
+    /// ```
+    #[track_caller]
+    pub fn upsample(&self, scale: &[usize], mode: ResizeMode) -> Result<Tensor> {
+        self.upsample_with().scale(scale).mode(mode).call()
     }
 }
 

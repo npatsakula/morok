@@ -395,7 +395,7 @@ crate::codegen_tests! {
         let u8s = Tensor::from_slice([1u8, 2, 200]);
         assert_eq!(realized(u8s.neg()), vec![255, 254, 56]);
         assert_eq!(realized(u8s.try_sub(Tensor::from_slice([2u8, 1, 100])).unwrap()), vec![255, 1, 100]);
-        assert_eq!(realized(u8s.lshift(Tensor::from_slice([4u8, 4, 4])).unwrap()), vec![16, 32, 128]);
+        assert_eq!(realized(u8s.try_shl(Tensor::from_slice([4u8, 4, 4])).unwrap()), vec![16, 32, 128]);
         let i8s = Tensor::from_slice([100i8, -128, 127]);
         assert_eq!(realized(i8s.try_add(&i8s).unwrap()), vec![-56, 0, -2]);
     }

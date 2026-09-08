@@ -63,7 +63,6 @@ use error::*;
 pub mod activation;
 pub mod arithmetic;
 pub mod beam_worker;
-pub mod bitwise;
 pub mod broadcast;
 pub mod conditional;
 pub mod config;
@@ -404,9 +403,9 @@ impl Tensor {
         let shape = self.shape()?;
         let ndim = shape.len();
         let axis_idx = Self::normalize_axis(axis, ndim)?;
-        let n = shape[axis_idx]
-            .as_const()
-            .ok_or_else(|| ErrorKind::SymbolicShapeUnsupported { operation: "_cumalu".to_string() })?;
+        let n = shape[axis_idx].as_const().ok_or_else(|| ErrorKind::SymbolicShapeUnsupported {
+            operation: "cumsum/cumprod over a symbolic axis".to_string(),
+        })?;
 
         if n <= 1 {
             return Ok(self.clone());
@@ -990,18 +989,17 @@ impl Tensor {
             result = result.flip(&[axis_idx as isize])?;
         }
         if exclusive {
-            let dim_size =
-                shape[axis_idx].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "cumsum" })? as isize;
+            let dim_size = shape[axis_idx]
+                .as_const()
+                .context(SymbolicShapeUnsupportedSnafu { operation: "exclusive cumsum over a symbolic axis" })?;
             let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); ndim];
             pad_spec[axis_idx] = (1, 0);
             result = result.try_pad(&pad_spec)?;
-            let mut shrink_spec: Vec<(isize, isize)> = result
-                .shape()?
-                .iter()
-                .map(|s| Ok((0, s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "cumsum" })? as isize)))
-                .collect::<Result<_>>()?;
-            shrink_spec[axis_idx] = (0, dim_size);
-            result = result.try_shrink(&shrink_spec)?;
+            // `None` keeps a dim whole, so only the (concrete) cum axis is sliced
+            // and every other dim may stay symbolic.
+            let mut shrink_spec: Vec<Option<(SInt, SInt)>> = vec![None; ndim];
+            shrink_spec[axis_idx] = Some((SInt::Const(0), SInt::Const(dim_size)));
+            result = result.try_shrink(shrink_spec)?;
         }
         result = result.cumsum(axis_idx as isize)?;
         if reverse {
@@ -1028,20 +1026,17 @@ impl Tensor {
             result = result.flip(&[axis_idx as isize])?;
         }
         if exclusive {
-            let dim_size =
-                shape[axis_idx].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "cumprod" })? as isize;
+            let dim_size = shape[axis_idx]
+                .as_const()
+                .context(SymbolicShapeUnsupportedSnafu { operation: "exclusive cumprod over a symbolic axis" })?;
             let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); ndim];
             pad_spec[axis_idx] = (1, 0);
             result = result.try_pad_value(&pad_spec, 1.0)?;
-            let mut shrink_spec: Vec<(isize, isize)> = result
-                .shape()?
-                .iter()
-                .map(|s| {
-                    Ok((0, s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "cumprod" })? as isize))
-                })
-                .collect::<Result<_>>()?;
-            shrink_spec[axis_idx] = (0, dim_size);
-            result = result.try_shrink(&shrink_spec)?;
+            // `None` keeps a dim whole, so only the (concrete) cum axis is sliced
+            // and every other dim may stay symbolic.
+            let mut shrink_spec: Vec<Option<(SInt, SInt)>> = vec![None; ndim];
+            shrink_spec[axis_idx] = Some((SInt::Const(0), SInt::Const(dim_size)));
+            result = result.try_shrink(shrink_spec)?;
         }
         result = result.cumprod(axis_idx as isize)?;
         if reverse {

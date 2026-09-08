@@ -12,6 +12,7 @@ mod quantize;
 mod resize;
 mod rnn;
 
+pub use conv::Pad1d;
 pub use conv1d::Conv1d;
 pub use linear::Linear;
 pub use lstm_cell::LSTMCell;

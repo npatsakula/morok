@@ -65,6 +65,9 @@ pub enum ErrorKind {
     #[snafu(display("{op}: {lhs_name} ({lhs}) must be divisible by {rhs_name} ({rhs})"))]
     Divisibility { op: &'static str, lhs_name: &'static str, lhs: usize, rhs_name: &'static str, rhs: usize },
 
+    #[snafu(display("{op}: exactly one of {options} must be provided"))]
+    ExclusiveParams { op: &'static str, options: &'static str },
+
     #[snafu(display("{op}: {param} = {value} is invalid, expected {constraint}"))]
     ParamRange { op: &'static str, param: &'static str, value: String, constraint: &'static str },
 

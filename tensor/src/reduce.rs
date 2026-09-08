@@ -4,7 +4,7 @@
 //! with ergonomic APIs that match PyTorch/NumPy conventions.
 
 use bon::bon;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::{ReduceOp, SInt, UOp};
 
@@ -554,69 +554,45 @@ impl Tensor {
 }
 
 /// Internal argmax implementation.
+///
+/// Only the reduced axis has to be concrete — the tie-break needs a descending
+/// index ramp `[N, N-1, .., 1]` of exactly that extent. Every other axis is
+/// carried as an `SInt`, so a symbolic batch flows through untouched.
 fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Tensor> {
-    // Handle None axis: flatten and call argmax on axis 0
-    let (working_tensor, working_axis) =
-        if let Some(ax) = axis { (tensor.clone(), ax) } else { (tensor.flatten()?, 0) };
+    // `axis = None` folds *every* axis into the reduced one, so all of them must
+    // be concrete for the ramp above to exist.
+    let (working_tensor, working_axis) = match axis {
+        Some(ax) => (tensor.clone(), ax),
+        None => {
+            snafu::ensure!(
+                tensor.shape()?.iter().all(|dim| dim.is_const()),
+                SymbolicShapeUnsupportedSnafu { operation: "argmax/argmin over a flattened symbolic shape" }
+            );
+            (tensor.flatten()?, 0)
+        }
+    };
 
     let shape = working_tensor.shape()?;
     let normalized_axis = Tensor::normalize_axis(working_axis, shape.len())?;
     let axis_size = shape[normalized_axis]
         .as_const()
-        .ok_or_else(|| ErrorKind::SymbolicShapeUnsupported { operation: "argmax".to_string() })?;
+        .context(SymbolicShapeUnsupportedSnafu { operation: "argmax/argmin over a symbolic axis" })?;
 
-    // Convert shape to isize vec once for reuse in expand operations
-    let shape_vec = svod_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
+    // Mask of the positions holding the per-axis maximum.
+    let max_vals = working_tensor.max_with().axes(working_axis).keepdim(true).call()?.try_expand(shape.clone())?;
+    let mask = working_tensor.try_eq(&max_vals)?.cast(DType::Int32);
 
-    // Step 1: Find maximum values along axis (with keepdim for broadcasting)
-    let max_vals_keepdim = working_tensor.max_with().axes(working_axis).keepdim(true).call()?;
+    // Descending ramp [N, N-1, .., 1] laid along `normalized_axis`, so the
+    // largest masked value — and thus the max below — is the *first* occurrence.
+    let mut ramp_shape: Vec<SInt> = vec![SInt::Const(1); shape.len()];
+    ramp_shape[normalized_axis] = SInt::Const(axis_size);
+    let ramp = Tensor::arange(axis_size as i64, Some(0), Some(-1))?.try_reshape(ramp_shape)?.try_expand(shape)?;
 
-    // Step 2: Create mask where values equal the max
-    // Need to broadcast max_vals to match working_tensor shape
-    let max_vals_broadcast = max_vals_keepdim.try_expand(&shape_vec)?;
+    let max_idx = mask.try_mul(&ramp)?.max_with().axes(working_axis).keepdim(keepdim).call()?;
 
-    let mask = working_tensor.try_eq(&max_vals_broadcast)?;
-
-    // Step 3: Create descending index tensor [N, N-1, ..., 1]
-    // This ensures ties go to first occurrence
-    let indices = Tensor::arange(axis_size as i64, Some(0), Some(-1))?;
-
-    // Step 4: Reshape indices to broadcast along the target axis
-    // E.g., for axis=1 with 3D tensor: [axis_size] -> [1, axis_size, 1]
-    let mut idx_shape = vec![1isize; shape.len()];
-    idx_shape[normalized_axis] = axis_size as isize;
-    let indices_reshaped = indices.try_reshape(&idx_shape)?;
-
-    // Expand indices to match working_tensor shape
-    let indices_broadcast = indices_reshaped.try_expand(&shape_vec)?;
-
-    // Step 5: Multiply mask by indices (0 where not max, index where max)
-    let mask_int = mask.cast(DType::Int32);
-    let masked_indices = mask_int.try_mul(&indices_broadcast)?;
-
-    // Step 6: Take max of masked indices (gives highest index, which is first occurrence)
-    let max_idx = masked_indices.max_with().axes(working_axis).keepdim(keepdim).call()?;
-
-    // Step 7: Invert: N - max_idx gives actual index
-    let n_tensor = Tensor::from_slice([axis_size as i32]);
-
-    // Broadcast n_tensor to match max_idx shape if needed
-    let max_idx_shape = max_idx.shape()?;
-    let result = if !max_idx_shape.is_empty() {
-        // Non-scalar result: broadcast n_tensor
-        let max_idx_shape_vec = svod_ir::shape::to_vec_isize(&max_idx_shape).context(UOpSnafu)?;
-        let ones_shape = vec![1isize; max_idx_shape.len()];
-        let n_reshaped = n_tensor.try_reshape(&ones_shape)?;
-        let n_broadcast = n_reshaped.try_expand(&max_idx_shape_vec)?;
-        n_broadcast.try_sub(&max_idx)?
-    } else {
-        // Scalar result: reshape n_tensor to scalar too
-        let n_scalar = n_tensor.try_reshape(&[] as &[isize])?;
-        n_scalar.try_sub(&max_idx)?
-    };
-
-    // Cast final result to Int32 (like Tinygrad)
-    Ok(result.cast(DType::Int32))
+    // Invert the ramp: N - max_idx is the actual index.
+    let n = Tensor::new(UOp::const_(DType::Int32, svod_ir::ConstValue::Int(axis_size as i64)));
+    Ok(n.broadcast_to(&max_idx.shape()?)?.try_sub(&max_idx)?.cast(DType::Int32))
 }
 
 /// Internal argmin implementation.
@@ -718,7 +694,7 @@ fn mean_impl(tensor: &Tensor, axes: impl Into<AxisSpec>, keepdim: bool) -> Resul
         if let Some(dim_size) = shape[axis].as_const() {
             count *= dim_size as i64;
         } else {
-            return SymbolicShapeUnsupportedSnafu { operation: "mean" }.fail().map_err(Into::into);
+            return SymbolicShapeUnsupportedSnafu { operation: "mean over a symbolic axis" }.fail().map_err(Into::into);
         }
     }
 
@@ -761,7 +737,9 @@ fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool, correction: i64
         if let Some(dim_size) = shape[axis].as_const() {
             count *= dim_size as i64;
         } else {
-            return SymbolicShapeUnsupportedSnafu { operation: "variance" }.fail().map_err(Into::into);
+            return SymbolicShapeUnsupportedSnafu { operation: "variance over a symbolic axis" }
+                .fail()
+                .map_err(Into::into);
         }
     }
 

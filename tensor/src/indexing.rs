@@ -429,7 +429,7 @@ impl Tensor {
         // Count occurrences of each value up to current position
         let compute_counts = |t: &Tensor| -> Result<Tensor> {
             let eq = t.try_unsqueeze(dim as isize)?.try_eq(&t.try_unsqueeze((dim + 1) as isize)?)?;
-            eq.bitwise_and(&tril_mask)?.sum((dim + 1) as isize)
+            eq.try_bitand(&tril_mask)?.sum((dim + 1) as isize)
         };
 
         let count_orig = compute_counts(self)?;
@@ -439,7 +439,7 @@ impl Tensor {
         let val_match = self.try_unsqueeze((dim + 1) as isize)?.try_eq(&x.try_unsqueeze(dim as isize)?)?;
         let cnt_match =
             count_orig.try_unsqueeze((dim + 1) as isize)?.try_eq(&count_sorted.try_unsqueeze(dim as isize)?)?;
-        let cond = val_match.bitwise_and(&cnt_match)?;
+        let cond = val_match.try_bitand(&cnt_match)?;
 
         // Build index arange and compute weighted sum
         let mut idx_shape = vec![1isize; ndim + 1];
@@ -518,10 +518,12 @@ impl Tensor {
     /// Reverse the first `sequence_lens[i]` elements along `time_axis` for each
     /// batch element `i` along `batch_axis`, leaving the rest unchanged.
     #[track_caller]
-    pub fn reverse_sequence(&self, sequence_lens: &Tensor, time_axis: usize, batch_axis: usize) -> Result<Self> {
+    pub fn reverse_sequence(&self, sequence_lens: &Tensor, time_axis: isize, batch_axis: isize) -> Result<Self> {
         origin_call!("reverse_sequence");
         let dims = svod_ir::shape::to_vec_usize(&self.shape()?).context(UOpSnafu)?;
         let ndim = dims.len();
+        let time_axis = Self::normalize_axis(time_axis, ndim)?;
+        let batch_axis = Self::normalize_axis(batch_axis, ndim)?;
         let time_len = dims[time_axis];
 
         // Transpose so time_axis→0, batch_axis→1
@@ -666,8 +668,16 @@ impl Tensor {
     }
 
     /// Scatter updates into a tensor using N-dimensional indices.
+    ///
+    /// `reduction` of `None` overwrites; `Some(..)` folds duplicate indices with
+    /// that [`ScatterReduction`].
     #[track_caller]
-    pub fn scatter_nd(&self, indices: &Tensor, updates: &Tensor, reduction: &str) -> Result<Tensor> {
+    pub fn scatter_nd(
+        &self,
+        indices: &Tensor,
+        updates: &Tensor,
+        reduction: impl Into<Option<ScatterReduction>>,
+    ) -> Result<Tensor> {
         origin_call!("scatter_nd");
         let x_shape = self.shape()?;
         let x_dims = svod_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
@@ -705,22 +715,12 @@ impl Tensor {
         let flat_idx =
             flat_idx.try_reshape([upd_outer as isize, 1])?.try_expand([upd_outer as isize, inner as isize])?;
         let flat_idx_i32 = flat_idx.cast(DType::Int32);
-        let mut result = match reduction {
-            "none" => x_flat.scatter(0, &flat_idx_i32, &upd_flat)?,
-            "add" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Sum, true)?,
-            "mul" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Prod, true)?,
-            "max" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Amax, true)?,
-            "min" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Amin, true)?,
-            _ => {
-                return Err(crate::error::ErrorKind::IrConstruction {
-                    details: format!("ScatterND: unsupported reduction '{reduction}'"),
-                }
-                .into());
-            }
+        let result = match reduction.into() {
+            None => x_flat.scatter(0, &flat_idx_i32, &upd_flat)?,
+            Some(reduce) => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, reduce, true)?,
         };
         let out_shape: Vec<isize> = x_dims.iter().map(|&d| d as isize).collect();
-        result = result.try_reshape(&out_shape)?;
-        Ok(result)
+        result.try_reshape(&out_shape)
     }
 
     /// Batch-aware tensor scatter with write index offsets.
@@ -813,7 +813,7 @@ fn masked_setitem(target: &Tensor, values: &Tensor, mask: &Tensor, axes: &[isize
         for (m, v) in mask_slices[1..].iter().zip(&val_slices[1..]) {
             // last-writer-wins: where m is true take v, otherwise keep acc
             acc_vals = v.where_(m, &acc_vals)?;
-            acc_mask = acc_mask.bitwise_or(m)?;
+            acc_mask = acc_mask.try_bitor(m)?;
         }
         mask = acc_mask;
         values = acc_vals;

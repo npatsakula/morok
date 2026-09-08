@@ -268,7 +268,7 @@ impl Tensor {
             (true, true) => {
                 // (bits & abs_mask) == +inf bits → matches both +inf and -inf
                 let mask = bits.broadcast_scalar(ConstValue::Int(abs_mask))?;
-                bits.bitwise_and(&mask)?.try_eq(&pos_pat)
+                bits.try_bitand(&mask)?.try_eq(&pos_pat)
             }
             (true, false) => bits.try_eq(&pos_pat),
             (false, true) => {

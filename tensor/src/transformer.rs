@@ -3,12 +3,21 @@
 use crate::Tensor;
 use bon::bon;
 use snafu::{OptionExt, ensure};
+use std::borrow::Cow;
 use svod_dtype::DType;
-use svod_ir::ConstValue;
+use svod_ir::{ConstValue, SInt};
 
-use crate::error::{FloatDTypeRequiredSnafu, NdimMinimumSnafu, SymbolicShapeUnsupportedSnafu};
+use crate::error::{
+    DivisibilitySnafu, FloatDTypeRequiredSnafu, NdimExactSnafu, NdimMinimumSnafu, ParamRangeSnafu,
+    SymbolicShapeUnsupportedSnafu,
+};
 
 type Result<T> = crate::Result<T>;
+
+/// Denominator floor for [`Tensor::masked_mean`], so an all-masked row divides
+/// by ~0 instead of producing `NaN`. Matches sentence-transformers' `clamp(…,
+/// min=1e-9)`.
+const MASKED_MEAN_EPS: f64 = 1e-9;
 
 impl Tensor {
     /// Embedding lookup: `self` is the weight table `[vocab_size, embed_dim]`.
@@ -106,19 +115,236 @@ impl Tensor {
             Tensor::cat(&[&real, &imag], -1)
         }
     }
+
+    /// Rotary `(cos, sin)` tables for [`apply_rotary_emb`](Self::apply_rotary_emb),
+    /// each shaped `[1, 1, seq_len, head_dim / 2]` — the half-width the
+    /// non-interleaved (GPT-NeoX) rotation consumes, broadcasting over q/k of
+    /// shape `[B, H, seq_len, head_dim]`.
+    ///
+    /// `inv_freq[i] = theta ^ (-2i / head_dim)`, `angle[s, i] = s * inv_freq[i]`:
+    /// two `arange`s and an outer product, all in the graph — no host loop over
+    /// `seq_len × head_dim`. Angles are built in float32 (bf16/f16 mantissas are
+    /// too short for the `position × frequency` products) and cast to `dtype`
+    /// last.
+    #[track_caller]
+    pub fn rope_table(theta: f64, seq_len: usize, head_dim: usize, dtype: DType) -> Result<(Tensor, Tensor)> {
+        origin_call!("rope_table");
+        ensure!(
+            head_dim >= 2 && head_dim.is_multiple_of(2),
+            ParamRangeSnafu {
+                op: "rope_table",
+                param: "head_dim",
+                value: head_dim.to_string(),
+                constraint: "an even number ≥ 2"
+            }
+        );
+        ensure!(
+            seq_len > 0,
+            ParamRangeSnafu { op: "rope_table", param: "seq_len", value: seq_len.to_string(), constraint: "≥ 1" }
+        );
+
+        // inv_freq: [head_dim/2], the per-pair angular frequency.
+        let exponent =
+            Tensor::arange_f64(0.0, (head_dim / 2) as f64, 1.0, DType::Float32)?.try_mul(-2.0 / head_dim as f64)?;
+        let inv_freq = Tensor::const_(theta, DType::Float32).try_pow(&exponent)?;
+
+        // angles: [seq_len, 1] × [head_dim/2] → [seq_len, head_dim/2].
+        let angles =
+            Tensor::arange_f64(0.0, seq_len as f64, 1.0, DType::Float32)?.try_unsqueeze(-1)?.try_mul(&inv_freq)?;
+        let table = |t: Tensor| -> Result<Tensor> { Ok(t.try_unsqueeze(0)?.try_unsqueeze(0)?.cast(dtype.clone())) };
+        Ok((table(angles.cos()?)?, table(angles.sin()?)?))
+    }
+
+    /// `[B, L, H * D] → [B, H, L, D]`: split the feature axis into `n_heads`
+    /// heads, then move the head axis ahead of the sequence axis. `B` and `L`
+    /// may be symbolic; only the feature axis must be concrete.
+    #[track_caller]
+    pub fn split_heads(&self, n_heads: usize) -> Result<Tensor> {
+        origin_call!("split_heads");
+        let shape = self.shape()?;
+        ensure!(shape.len() == 3, NdimExactSnafu { op: "split_heads", expected: 3usize, actual: shape.len() });
+        ensure!(
+            n_heads > 0,
+            ParamRangeSnafu { op: "split_heads", param: "n_heads", value: n_heads.to_string(), constraint: "≥ 1" }
+        );
+        let features = self.dim_const(2)?;
+        ensure!(
+            features.is_multiple_of(n_heads),
+            DivisibilitySnafu {
+                op: "split_heads",
+                lhs_name: "features",
+                lhs: features,
+                rhs_name: "n_heads",
+                rhs: n_heads
+            }
+        );
+        self.try_reshape([shape[0].clone(), shape[1].clone(), SInt::Const(n_heads), SInt::Const(features / n_heads)])?
+            .try_permute(&[0, 2, 1, 3])
+    }
+
+    /// `[B, H, L, D] → [B, L, H * D]`, the inverse of
+    /// [`split_heads`](Self::split_heads). `B` and `L` may be symbolic.
+    #[track_caller]
+    pub fn merge_heads(&self) -> Result<Tensor> {
+        origin_call!("merge_heads");
+        let shape = self.shape()?;
+        ensure!(shape.len() == 4, NdimExactSnafu { op: "merge_heads", expected: 4usize, actual: shape.len() });
+        let features = self.dim_const(1)? * self.dim_const(3)?;
+        self.try_permute(&[0, 2, 1, 3])?.try_reshape([shape[0].clone(), shape[2].clone(), SInt::Const(features)])
+    }
+
+    /// Additive causal mask `[1, 1, len, len]`: `0` on and below the diagonal,
+    /// `-inf` strictly above it. Added to attention scores (or handed to
+    /// [`scaled_dot_product_attention`](Self::scaled_dot_product_attention) as
+    /// the *float* `attn_mask`) it forbids attending to future positions.
+    #[track_caller]
+    pub fn causal_mask(len: usize, dtype: DType) -> Result<Tensor> {
+        origin_call!("causal_mask");
+        ensure!(dtype.is_float(), FloatDTypeRequiredSnafu { op: "causal_mask", arg: "dtype", dtype: dtype.clone() });
+        let q_idx = Tensor::arange(0, Some(len as i64), None)?.try_unsqueeze(-1)?; // [L, 1]
+        let k_idx = Tensor::arange(0, Some(len as i64), None)?; // [L]
+        let upper = q_idx.try_lt(&k_idx)?; // True above the diagonal
+        let neg_inf = Tensor::const_(ConstValue::Float(f64::NEG_INFINITY), dtype.clone());
+        let zero = Tensor::const_(ConstValue::zero(dtype.base()), dtype);
+        neg_inf.where_(&upper, zero)?.try_unsqueeze(0)?.try_unsqueeze(0)
+    }
+
+    /// Boolean validity mask `[B, max_len]` from per-row lengths `[B]` (any
+    /// integer dtype): **`true` = valid**, i.e. `position < lengths[b]`.
+    ///
+    /// This is the polarity
+    /// [`key_padding_mask`](Self::scaled_dot_product_attention) wants; invert it
+    /// (`logical_not`) for `attn_mask`, which masks OUT on `true`.
+    #[track_caller]
+    pub fn sequence_mask(lengths: &Tensor, max_len: usize) -> Result<Tensor> {
+        origin_call!("sequence_mask");
+        let ndim = lengths.ndim()?;
+        ensure!(ndim == 1, NdimExactSnafu { op: "sequence_mask", expected: 1usize, actual: ndim });
+        let positions = Tensor::arange(0, Some(max_len as i64), None)?.cast(lengths.dtype());
+        positions.try_lt(&lengths.try_unsqueeze(-1)?)
+    }
+
+    /// Repeat every slice along `dim` `repeats` times *consecutively*
+    /// (`[a, b] → [a, a, b, b]`), like `torch.repeat_interleave`.
+    ///
+    /// reshape → expand → reshape, so it stays a view op and every other axis —
+    /// symbolic ones included — passes through untouched. `dim` itself may be
+    /// symbolic too.
+    #[track_caller]
+    pub fn repeat_interleave(&self, repeats: usize, dim: isize) -> Result<Tensor> {
+        origin_call!("repeat_interleave");
+        ensure!(
+            repeats > 0,
+            ParamRangeSnafu {
+                op: "repeat_interleave",
+                param: "repeats",
+                value: repeats.to_string(),
+                constraint: "≥ 1"
+            }
+        );
+        let shape = self.shape()?;
+        let axis = Self::normalize_axis(dim, shape.len())?;
+        if repeats == 1 {
+            return Ok(self.clone());
+        }
+
+        let dims: Vec<SInt> = shape.iter().cloned().collect();
+        let mut split = dims.clone();
+        split.insert(axis + 1, SInt::Const(1));
+        let mut expanded = split.clone();
+        expanded[axis + 1] = SInt::Const(repeats);
+        let mut merged = dims;
+        merged[axis] = &shape[axis] * &SInt::Const(repeats);
+        self.try_reshape(split)?.try_expand(expanded)?.try_reshape(merged)
+    }
+
+    /// Mean over `axis` counting only the positions `mask` marks valid
+    /// (`true`/non-zero), dropping `axis` from the result.
+    ///
+    /// `mask` covers `self`'s *leading* axes — `[B, L]` against a `[B, L, D]`
+    /// input — and is unsqueezed over the trailing ones. The denominator is
+    /// floored at [`MASKED_MEAN_EPS`], so an all-masked row yields `0` rather
+    /// than `NaN`. Sums promote to the accumulator dtype (float32 for
+    /// f16/bf16 inputs), which is also the result dtype.
+    #[track_caller]
+    pub fn masked_mean(&self, mask: &Tensor, axis: isize) -> Result<Tensor> {
+        origin_call!("masked_mean");
+        let dtype = self.dtype();
+        ensure!(dtype.is_float(), FloatDTypeRequiredSnafu { op: "masked_mean", arg: "self", dtype: dtype.clone() });
+
+        let (ndim, mask_ndim) = (self.ndim()?, mask.ndim()?);
+        let mut weights = mask.cast(dtype);
+        for _ in mask_ndim..ndim {
+            weights = weights.try_unsqueeze(-1)?;
+        }
+
+        let sum = self.try_mul(&weights)?.sum_with().axes(axis).keepdim(true).call()?;
+        let count = weights.sum_with().axes(axis).keepdim(true).call()?.maximum(MASKED_MEAN_EPS)?;
+        sum.try_div(&count)?.try_squeeze(Some(axis))
+    }
+
+    /// Take position `index` along `axis` and drop that axis
+    /// (`[B, L, D] → [B, D]`) — CLS pooling is `take_index(1, 0)`, last-token
+    /// pooling `take_index(1, -1)`.
+    ///
+    /// A negative `index` counts from the end and therefore needs a concrete
+    /// axis size; a non-negative one works on a symbolic axis as well.
+    #[track_caller]
+    pub fn take_index(&self, axis: isize, index: isize) -> Result<Tensor> {
+        origin_call!("take_index");
+        let shape = self.shape()?;
+        let ax = Self::normalize_axis(axis, shape.len())?;
+        let position = if index < 0 {
+            let size = shape[ax]
+                .as_const()
+                .context(SymbolicShapeUnsupportedSnafu { operation: "take_index with a negative index" })?;
+            let resolved = size as isize + index;
+            ensure!(
+                resolved >= 0,
+                ParamRangeSnafu {
+                    op: "take_index",
+                    param: "index",
+                    value: index.to_string(),
+                    constraint: "within the axis"
+                }
+            );
+            resolved as usize
+        } else {
+            index as usize
+        };
+
+        let mut ranges: Vec<Option<(SInt, SInt)>> = vec![None; shape.len()];
+        ranges[ax] = Some((SInt::Const(position), SInt::Const(position + 1)));
+        self.try_shrink(ranges)?.try_squeeze(Some(ax as isize))
+    }
 }
 
 #[bon]
 impl Tensor {
     /// Scaled dot-product attention.
-    /// `self` (Q): `[B, H, Sq, D]`, `key` (K): `[B, H, Sk, D]`, `value` (V): `[B, H, Sk, Dv]`.
+    /// `self` (Q): `[B, H, Sq, D]`, `key` (K): `[B, Hkv, Sk, D]`, `value` (V): `[B, Hkv, Sk, Dv]`.
     /// Returns `[B, H, Sq, Dv]`.
+    ///
+    /// # Mask polarity — read this before passing a mask
+    ///
+    /// The two mask arguments use **opposite** conventions, mirroring PyTorch:
+    ///
+    /// - `attn_mask`, when boolean: **`true` = masked OUT**, `false` = attend.
+    ///   When floating-point it is an *additive* bias on the scores (`-inf`
+    ///   forbids), added after the boolean masks.
+    /// - `key_padding_mask`, `[B, Sk]`: **`true` = valid**, `false` = padding —
+    ///   the polarity [`Tensor::sequence_mask`] produces. It is inverted
+    ///   internally, broadcast to `[B, 1, 1, Sk]`, and intersected with
+    ///   `attn_mask`, the causal mask and the window band.
     ///
     /// `window = Some((left, right))` restricts each query `q` to keys in
     /// `[q - left, q + right]` (sliding-window / banded attention, as in
-    /// ModernBERT's local layers). `None` = full (global) attention. The band is
-    /// intersected with any causal mask and the boolean `attn_mask` (when the
-    /// latter encodes padding).
+    /// ModernBERT's local layers). `None` = full (global) attention.
+    ///
+    /// `enable_gqa` allows K/V to carry fewer heads than Q (grouped-query /
+    /// multi-query attention): each KV head is repeated `H / Hkv` times with
+    /// [`repeat_interleave`](Tensor::repeat_interleave), which requires
+    /// `H % Hkv == 0`. Without it, Q and K/V must have matching head counts.
     #[builder]
     #[track_caller]
     pub fn scaled_dot_product_attention(
@@ -126,8 +352,10 @@ impl Tensor {
         key: &Tensor,
         value: &Tensor,
         attn_mask: Option<&Tensor>,
+        key_padding_mask: Option<&Tensor>,
         scale: Option<f64>,
         #[builder(default)] is_causal: bool,
+        #[builder(default)] enable_gqa: bool,
         window: Option<(usize, usize)>,
         softcap: Option<f64>,
     ) -> Result<Tensor> {
@@ -147,6 +375,28 @@ impl Tensor {
             v_dtype.is_float(),
             FloatDTypeRequiredSnafu { op: "scaled_dot_product_attention", arg: "value", dtype: v_dtype.clone() }
         );
+
+        // Grouped-query attention: K/V carry `Hkv ≤ H` heads, each serving
+        // `H / Hkv` query heads. Repeating them interleaved lines the head axes
+        // up so the rest of the kernel is unchanged.
+        let (gqa_key, gqa_value) = if enable_gqa {
+            let (q_heads, kv_heads) = (self.dim_const(-3)?, key.dim_const(-3)?);
+            ensure!(
+                kv_heads > 0 && q_heads.is_multiple_of(kv_heads),
+                DivisibilitySnafu {
+                    op: "scaled_dot_product_attention",
+                    lhs_name: "query heads",
+                    lhs: q_heads,
+                    rhs_name: "key/value heads",
+                    rhs: kv_heads
+                }
+            );
+            let repeats = q_heads / kv_heads;
+            (Cow::Owned(key.repeat_interleave(repeats, -3)?), Cow::Owned(value.repeat_interleave(repeats, -3)?))
+        } else {
+            (Cow::Borrowed(key), Cow::Borrowed(value))
+        };
+        let (key, value): (&Tensor, &Tensor) = (&gqa_key, &gqa_value);
 
         let q_shape = self.shape()?;
         let k_shape = key.shape()?;
@@ -229,6 +479,21 @@ impl Tensor {
             } else {
                 float_additive_mask = Some(mask);
             }
+        }
+
+        // Key padding mask: `[B, Sk]`, True = valid (the inverse of
+        // `attn_mask`'s polarity). Broadcast over heads and queries.
+        if let Some(padding) = key_padding_mask {
+            let ndim = padding.ndim()?;
+            ensure!(
+                ndim == 2,
+                NdimExactSnafu { op: "scaled_dot_product_attention key_padding_mask", expected: 2usize, actual: ndim }
+            );
+            let keep = padding.cast(DType::Bool).try_unsqueeze(1)?.try_unsqueeze(1)?; // [B, 1, 1, Sk]
+            keep_mask = Some(match keep_mask {
+                Some(prev) => prev.try_bitand(&keep)?,
+                None => keep,
+            });
         }
 
         // Apply the boolean keep mask additively (out-of-band → -large).

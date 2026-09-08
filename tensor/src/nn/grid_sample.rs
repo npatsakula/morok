@@ -297,9 +297,9 @@ fn build_flat_index(
         if padding_mode == GridSamplePaddingMode::Zeros {
             let zero_i = Tensor::const_(ConstValue::Int(0), DType::Int32);
             let max_i = Tensor::const_(ConstValue::Int(spatial[i] as i64), DType::Int32);
-            let v = idx.try_ge(&zero_i)?.bitwise_and(&idx.try_lt(&max_i)?)?;
+            let v = idx.try_ge(&zero_i)?.try_bitand(&idx.try_lt(&max_i)?)?;
             valid_mask = Some(match valid_mask {
-                Some(m) => m.bitwise_and(&v)?,
+                Some(m) => m.try_bitand(&v)?,
                 None => v,
             });
         }

@@ -48,11 +48,6 @@ impl Conv1d {
 
 impl Layer for Conv1d {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.conv2d()
-            .weight(&self.weight)
-            .maybe_bias(self.bias.as_ref())
-            .stride(&[self.stride])
-            .padding(&[self.padding])
-            .call()
+        x.conv1d().weight(&self.weight).maybe_bias(self.bias.as_ref()).stride(self.stride).padding(self.padding).call()
     }
 }

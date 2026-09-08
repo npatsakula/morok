@@ -18,7 +18,7 @@ pub(crate) fn op_trilu(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<T
     let x = inp(inputs, 0);
     let k = inputs.get(1).and_then(|o| o.as_ref()).map(tensor_to_i64_vec).transpose()?.map(|v| v[0]).unwrap_or(0);
     let upper = attrs.int("upper", 1) == 1;
-    Ok(if upper { x.triu(k)? } else { x.tril(k)? })
+    Ok(if upper { x.triu(k as isize)? } else { x.tril(k as isize)? })
 }
 
 pub(crate) fn op_one_hot(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
@@ -83,8 +83,20 @@ pub(crate) fn op_scatter_nd(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Res
     let x = inp(inputs, 0);
     let indices = inp(inputs, 1);
     let updates = inp(inputs, 2);
-    let reduction = attrs.string("reduction", "none");
-    Ok(x.scatter_nd(indices, updates, &reduction)?)
+    let reduction = match attrs.string("reduction", "none").as_str() {
+        "none" => None,
+        "add" => Some(ScatterReduction::Sum),
+        "mul" => Some(ScatterReduction::Prod),
+        "max" => Some(ScatterReduction::Amax),
+        "min" => Some(ScatterReduction::Amin),
+        name => {
+            return Err(Error::UnhandledAttributes {
+                op: "ScatterND".into(),
+                attrs: vec![format!("reduction={name}")],
+            });
+        }
+    };
+    Ok(x.scatter_nd(indices, updates, reduction)?)
 }
 
 pub(crate) fn op_tensor_scatter(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {

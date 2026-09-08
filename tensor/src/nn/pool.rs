@@ -6,7 +6,7 @@ use svod_dtype::DType;
 use svod_ir::{ConstValue, SInt, UOp};
 
 use crate::Tensor;
-use crate::error::{DivisibilitySnafu, KindResult, SymbolicShapeUnsupportedSnafu};
+use crate::error::{DivisibilitySnafu, KindResult, ParamRangeSnafu, SymbolicShapeUnsupportedSnafu};
 use crate::reduce::AxisSpec;
 
 use super::pad::apply_ceil_mode;
@@ -151,10 +151,75 @@ impl Tensor {
 
         Ok(x)
     }
+
+    /// Sliding windows along a single axis (torch `Tensor.unfold`).
+    ///
+    /// Axis `dim` becomes the window count `(dim_size - size) / step + 1` and a
+    /// trailing axis of extent `size` is appended:
+    /// `(..., d_dim, ...)` &rarr; `(..., n_windows, ..., size)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// let t = Tensor::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0]);
+    /// let w = t.unfold(0, 3, 2).unwrap();  // windows [0,1,2] and [2,3,4]
+    /// assert_eq!(w.dims().unwrap(), vec![2, 3]);
+    /// ```
+    #[track_caller]
+    pub fn unfold(&self, dim: isize, size: usize, step: usize) -> Result<Tensor> {
+        origin_call!("unfold");
+        snafu::ensure!(
+            size > 0,
+            ParamRangeSnafu { op: "unfold", param: "size", value: size.to_string(), constraint: "> 0" }
+        );
+        snafu::ensure!(
+            step > 0,
+            ParamRangeSnafu { op: "unfold", param: "step", value: step.to_string(), constraint: "> 0" }
+        );
+        let ndim = self.ndim()?;
+        let dim = Self::normalize_axis(dim, ndim)?;
+
+        // `pool` windows the trailing axes, so rotate `dim` last and undo after.
+        let trailing = dim + 1 == ndim;
+        let mut perm: Vec<isize> = (0..ndim as isize).filter(|&a| a != dim as isize).collect();
+        perm.push(dim as isize);
+        let x = if trailing { self.clone() } else { self.try_permute(&perm)? };
+
+        let pooled = x.pool(&[size], &[step], &[1])?;
+        if trailing {
+            return Ok(pooled);
+        }
+
+        // Undo the rotation; the window axis stays trailing.
+        let mut back: Vec<isize> =
+            (0..ndim).map(|i| perm.iter().position(|&p| p == i as isize).unwrap() as isize).collect();
+        back.push(ndim as isize);
+        pooled.try_permute(&back)
+    }
 }
 
 #[bon]
 impl Tensor {
+    /// [`pool`](Tensor::pool) with defaults: `stride` falls back to `kernel`
+    /// (non-overlapping windows) and `dilation` to all-ones.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let y = x.pool_with().kernel(&[2, 2]).call().unwrap();
+    /// assert_eq!(y.dims().unwrap(), vec![1, 1, 2, 2, 2, 2]);
+    /// ```
+    #[builder]
+    #[track_caller]
+    pub fn pool_with(&self, kernel: &[usize], stride: Option<&[usize]>, dilation: Option<&[usize]>) -> Result<Tensor> {
+        let ones: Vec<usize> = vec![1; kernel.len()];
+        self.pool(kernel, stride.unwrap_or(kernel), dilation.unwrap_or(&ones))
+    }
+
     /// Average pooling over spatial dimensions.
     ///
     /// Computes the mean of each sliding window. Supports padding, dilation,

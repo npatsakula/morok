@@ -34,6 +34,10 @@ pub mod transformer;
 pub mod triangular;
 pub mod variable;
 
+mod attention_helpers;
+mod nn_affine;
+mod reduce_symbolic;
 pub mod scatter_debug;
 pub mod schedule;
 pub mod schedule_cache;
+mod shape_helpers;
