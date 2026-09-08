@@ -4,10 +4,11 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv1d, Layer, LayerNorm, Linear, Module};
 
+use crate::init::{Bias, conv1d, layer_norm, linear};
 use crate::state::{scoped, scoped_index};
 
 use super::attention::{MultiHeadAttention, padded_fa_sequence_len};
-use super::blocks::{conv1d, layer_norm, linear, linear_forward, sinusoids};
+use super::blocks::{linear_forward, sinusoids};
 use super::config::ModelDimensions;
 use super::error::Result;
 
@@ -34,8 +35,8 @@ impl EncoderBlock {
         Self {
             attn: MultiHeadAttention::empty_dtype(n_state, n_head, dtype.clone()),
             attn_ln: layer_norm(n_state, dtype.clone()),
-            mlp0: linear(n_state, mlp, true, dtype.clone()),
-            mlp2: linear(mlp, n_state, true, dtype.clone()),
+            mlp0: linear(n_state, mlp, Bias::FanIn, dtype.clone()),
+            mlp2: linear(mlp, n_state, Bias::FanIn, dtype.clone()),
             mlp_ln: layer_norm(n_state, dtype),
             n_state,
         }
@@ -76,8 +77,8 @@ impl AudioEncoder {
         let n_state = dims.n_audio_state;
         let dtype = dims.dtype.clone();
         Self {
-            conv1: conv1d(dims.n_mels, n_state, 3, 1, 1, true, dtype.clone()),
-            conv2: conv1d(n_state, n_state, 3, 2, 1, true, dtype.clone()),
+            conv1: conv1d(dims.n_mels, n_state, 3, Bias::FanIn, dtype.clone()).with_padding((1, 1)),
+            conv2: conv1d(n_state, n_state, 3, Bias::FanIn, dtype.clone()).with_stride(2).with_padding((1, 1)),
             positional_embedding: sinusoids(dims.n_audio_ctx, n_state, 10_000.0).expect("sinusoidal embedding"),
             blocks: (0..dims.n_audio_layer)
                 .map(|_| EncoderBlock::empty_dtype(n_state, dims.n_audio_head, dtype.clone()))

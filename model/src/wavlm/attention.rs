@@ -26,7 +26,7 @@ use svod_dtype::DType;
 use svod_tensor::nn::{Layer, Linear, Module};
 use svod_tensor::{Tensor, s};
 
-use crate::init::{fan_in_uniform, ones, zeros};
+use crate::init::{Bias, linear, ones};
 
 use super::config::WavLmConfig;
 use super::error::Result;
@@ -138,18 +138,16 @@ impl GatedRelPosAttention {
         assert!(num_kept > 0, "GatedRelPosAttention::empty requires non-empty remaining_heads");
 
         let proj_out = num_kept * head_dim;
-        let linear = |out: usize, inp: usize| {
-            Linear::new(fan_in_uniform(&[out, inp], inp, DType::Float32), Some(zeros(&[out], DType::Float32)))
-        };
+        let linear = |inp: usize, out: usize| linear(inp, out, Bias::Zero, DType::Float32);
 
         Self {
             total_num_heads,
             remaining_heads,
-            q: linear(proj_out, embed_dim),
-            k: linear(proj_out, embed_dim),
-            v: linear(proj_out, embed_dim),
-            out: linear(embed_dim, proj_out),
-            gru_rel_pos_linear: linear(8, head_dim),
+            q: linear(embed_dim, proj_out),
+            k: linear(embed_dim, proj_out),
+            v: linear(embed_dim, proj_out),
+            out: linear(proj_out, embed_dim),
+            gru_rel_pos_linear: linear(head_dim, 8),
             gru_rel_pos_const: ones(&[1, total_num_heads, 1, 1], DType::Float32),
         }
     }

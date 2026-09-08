@@ -29,14 +29,16 @@
 //! dict (Python instantiates them unconditionally in `__init__`); only the
 //! `attention` and `feed_forward` sub-modules are optional.
 
+use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, LayerNorm, Module};
+
+use crate::init::layer_norm;
 
 use super::attention::GatedRelPosAttention;
 use super::config::WavLmConfig;
 use super::error::Result;
 use super::feed_forward::FeedForward;
-use super::layer_norm;
 
 #[derive(Clone, Module)]
 pub struct EncoderLayer {
@@ -56,9 +58,9 @@ impl EncoderLayer {
             config.encoder_use_attention[layer_index] && !config.encoder_remaining_heads[layer_index].is_empty();
         Self {
             layer_norm_first: config.encoder_layer_norm_first,
-            layer_norm: layer_norm(embed_dim),
+            layer_norm: layer_norm(embed_dim, DType::Float32),
             attention: use_attn.then(|| GatedRelPosAttention::empty(config, layer_index)),
-            final_layer_norm: layer_norm(embed_dim),
+            final_layer_norm: layer_norm(embed_dim, DType::Float32),
             feed_forward: config.encoder_use_feed_forward[layer_index]
                 .then(|| FeedForward::empty(embed_dim, config.encoder_ff_interm_features[layer_index])),
         }

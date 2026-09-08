@@ -16,7 +16,7 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv1d, Layer, LayerNorm, Module};
 
-use crate::init::{fan_in_uniform, ones, zeros};
+use crate::init::{Bias, conv1d, layer_norm, ones, zeros};
 
 use super::config::{ConvLayerConfig, ExtractorMode, WavLmConfig};
 use super::error::Result;
@@ -49,11 +49,7 @@ pub enum BlockNorm {
 
 impl BlockNorm {
     fn layer(channels: usize) -> Self {
-        Self::Layer(LayerNorm::new(
-            ones(&[channels], DType::Float32),
-            Some(zeros(&[channels], DType::Float32)),
-            NORM_EPS,
-        ))
+        Self::Layer(layer_norm(channels, DType::Float32))
     }
 
     fn group(channels: usize) -> Self {
@@ -96,10 +92,9 @@ impl ConvLayerBlock {
         has_bias: bool,
         norm: Option<BlockNorm>,
     ) -> Self {
-        let fan_in = in_channels * kernel_size;
-        let weight = fan_in_uniform(&[out_channels, in_channels, kernel_size], fan_in, DType::Float32);
-        let bias = has_bias.then(|| zeros(&[out_channels], DType::Float32));
-        Self { conv: Conv1d::new(weight, bias).with_stride(stride), norm, kernel_size }
+        let bias = if has_bias { Bias::Zero } else { Bias::None };
+        let conv = conv1d(in_channels, out_channels, kernel_size, bias, DType::Float32).with_stride(stride);
+        Self { conv, norm, kernel_size }
     }
 
     /// Forward in `NCT` layout: input `(B, C_in, T_in)` → output `(B, C_out, T_out)`.

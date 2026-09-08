@@ -57,9 +57,8 @@ fn embedding_output_shape() {
     assert!(v.iter().all(|x| x.is_finite()));
 }
 
-/// Every key a 2-layer tiny backbone emits, in the published `Qwen3Model`
-/// naming — captured from the hand-written `HasStateDict` impl this model was
-/// migrated from. Drift here is a checkpoint-compatibility break.
+/// Every key `#[derive(Module)]` emits for a 2-layer tiny backbone, in the
+/// published `Qwen3Model` naming. Drift here is a checkpoint-compatibility break.
 fn expected_keys() -> Vec<String> {
     let mut keys = vec!["embed_tokens.weight".to_string(), "norm.weight".to_string()];
     for i in 0..2 {

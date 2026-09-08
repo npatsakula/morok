@@ -635,10 +635,9 @@ fn state_dict_round_trip() {
     model2.load_state_dict(&sd, "").unwrap();
 }
 
-/// Key set of the hand-written `HasStateDict` impls the `#[derive(Module)]`
-/// migration replaced, at both the root and a nested prefix. Whisper loads at
-/// the empty prefix, so a stray leading dot would silently break every
-/// checkpoint.
+/// The key set `#[derive(Module)]` emits, at both the root and a nested
+/// prefix. Whisper loads at the empty prefix, so a stray leading dot would
+/// silently break every checkpoint.
 fn expected_state_dict_keys(dims: &ModelDimensions, prefix: &str) -> BTreeSet<String> {
     let join = |a: &str, b: &str| if a.is_empty() { b.to_string() } else { format!("{a}.{b}") };
     let mut keys = BTreeSet::new();

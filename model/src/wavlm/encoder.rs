@@ -23,13 +23,12 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, LayerNorm, Linear, Module};
 
-use crate::init::{fan_in_uniform, zeros};
+use crate::init::{Bias, fan_in_uniform, layer_norm, linear};
 
 use super::attention::compute_position_bias;
 use super::config::WavLmConfig;
 use super::encoder_layer::EncoderLayer;
 use super::error::Result;
-use super::layer_norm;
 use super::pos_conv::ConvolutionalPositionalEmbedding;
 
 #[derive(Clone, Module)]
@@ -69,18 +68,15 @@ impl Encoder {
             num_buckets: config.encoder_num_buckets,
             max_distance: config.encoder_max_distance,
 
-            feature_projection_norm: layer_norm(extractor_out),
-            feature_projection: Linear::new(
-                fan_in_uniform(&[embed_dim, extractor_out], extractor_out, DType::Float32),
-                Some(zeros(&[embed_dim], DType::Float32)),
-            ),
+            feature_projection_norm: layer_norm(extractor_out, DType::Float32),
+            feature_projection: linear(extractor_out, embed_dim, Bias::Zero, DType::Float32),
 
             pos_conv_embed: ConvolutionalPositionalEmbedding::empty(
                 embed_dim,
                 config.encoder_pos_conv_kernel,
                 config.encoder_pos_conv_groups,
             ),
-            layer_norm: layer_norm(embed_dim),
+            layer_norm: layer_norm(embed_dim, DType::Float32),
             layers: (0..config.encoder_num_layers).map(|i| EncoderLayer::empty(config, i)).collect(),
 
             rel_attn_embed: fan_in_uniform(

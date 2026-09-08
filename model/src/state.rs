@@ -6,7 +6,7 @@ use svod_dtype::DType;
 use svod_ir::origin::{self, OriginScope};
 use svod_tensor::Tensor;
 
-pub type StateDict = HashMap<String, Tensor>;
+pub use svod_tensor::nn::{StateDict, get_tensor, prefixed};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -111,16 +111,6 @@ fn convert_dtype(dt: safetensors::Dtype) -> Result<DType> {
     }
 }
 
-pub trait HasStateDict {
-    fn state_dict(&self, prefix: &str) -> StateDict;
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> Result<()>;
-}
-
-/// Helper: get a tensor from a state dict by key, returning an error if missing.
-pub fn get_tensor(sd: &StateDict, key: &str) -> Result<Tensor> {
-    sd.get(key).cloned().ok_or_else(|| Error::MissingKey { key: key.to_string() })
-}
-
 /// Cast every tensor in a state dict to `dtype`, leaving any tensor that cannot
 /// be cast (e.g. an int embedding key) at its original dtype. Shared by the
 /// ModernBERT backbone and MLM loaders so weight casting stays in one place.
@@ -131,11 +121,6 @@ pub fn cast_all(sd: &StateDict, dtype: DType) -> StateDict {
             (k.clone(), t)
         })
         .collect()
-}
-
-/// Helper: format a prefixed key.
-pub fn prefixed(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() { name.to_string() } else { format!("{prefix}.{name}") }
 }
 
 /// Build a child module's graph under its own origin scope, named by the same
@@ -164,32 +149,4 @@ pub fn scoped_index<T>(name: &str, index: usize, f: impl FnOnce() -> T) -> T {
 #[inline]
 pub fn scope_index(name: &str, index: usize) -> OriginScope {
     if origin::enabled() { OriginScope::module(format!("{name}.{index}")) } else { origin::install(origin::current()) }
-}
-
-/// Insert each named field of `$self` into the state dict under
-/// `<prefix>.<field>`. Field idents are used verbatim as keys.
-#[macro_export]
-macro_rules! state_field {
-    ($sd:expr, $prefix:expr, $self:ident, [$($field:ident),+ $(,)?]) => {
-        $(
-            $sd.insert(
-                $crate::state::prefixed($prefix, stringify!($field)),
-                $self.$field.clone(),
-            );
-        )+
-    };
-}
-
-/// Load each named field of `$self` from the state dict under
-/// `<prefix>.<field>`. Mirrors [`state_field!`].
-#[macro_export]
-macro_rules! load_state_field {
-    ($self:ident, $sd:expr, $prefix:expr, [$($field:ident),+ $(,)?]) => {
-        $(
-            $self.$field = $crate::state::get_tensor(
-                $sd,
-                &$crate::state::prefixed($prefix, stringify!($field)),
-            )?;
-        )+
-    };
 }

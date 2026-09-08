@@ -24,7 +24,7 @@ use svod_dtype::DType;
 use svod_tensor::nn::{Layer, LayerNorm, Linear, Module, StateDict};
 use svod_tensor::{Tensor, s};
 
-use crate::init::{fan_in_uniform, ones, zeros};
+use crate::init::{Bias, fan_in_uniform, layer_norm, linear};
 use crate::wavlm::{WavLm, drop_inert_keys};
 
 use super::config::DiariZenConfig;
@@ -78,14 +78,12 @@ impl DiariZenSegmentationModel {
         let attn_in = config.attention_in;
         let k = config.powerset_class_count();
 
-        let linear = |out: usize, inp: usize| {
-            Linear::new(fan_in_uniform(&[out, inp], inp, DType::Float32), Some(zeros(&[out], DType::Float32)))
-        };
+        let linear = |inp: usize, out: usize| linear(inp, out, Bias::Zero, DType::Float32);
         Self {
             wavlm,
             weight_sum: fan_in_uniform(&[1, lnum], lnum, DType::Float32),
-            proj: linear(attn_in, feat_dim),
-            lnorm: LayerNorm::new(ones(&[attn_in], DType::Float32), Some(zeros(&[attn_in], DType::Float32)), 1e-5),
+            proj: linear(feat_dim, attn_in),
+            lnorm: layer_norm(attn_in, DType::Float32),
             conformer: ConformerEncoder::empty(
                 attn_in,
                 config.ffn_hidden,
@@ -93,7 +91,7 @@ impl DiariZenSegmentationModel {
                 config.num_layer,
                 config.kernel_size,
             ),
-            classifier: linear(k, attn_in),
+            classifier: linear(attn_in, k),
             config,
         }
     }

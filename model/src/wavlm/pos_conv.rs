@@ -24,7 +24,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv1d, Layer, Module, StateDict, get_tensor, prefixed};
 
-use crate::init::{fan_in_uniform, zeros};
+use crate::init::{Bias, conv1d};
 
 use super::error::Result;
 
@@ -38,13 +38,11 @@ pub struct ConvolutionalPositionalEmbedding {
 impl ConvolutionalPositionalEmbedding {
     pub fn empty(embed_dim: usize, kernel_size: usize, groups: usize) -> Self {
         assert!(groups > 0 && embed_dim.is_multiple_of(groups), "groups must divide embed_dim");
-        let in_per_group = embed_dim / groups;
-        let fan_in = in_per_group * kernel_size;
-        let weight = fan_in_uniform(&[embed_dim, in_per_group, kernel_size], fan_in, DType::Float32);
-        let bias = zeros(&[embed_dim], DType::Float32);
         let padding = (kernel_size / 2) as isize;
         Self {
-            conv: Conv1d::new(weight, Some(bias)).with_groups(groups).with_padding((padding, padding)),
+            conv: conv1d(embed_dim / groups, embed_dim, kernel_size, Bias::Zero, DType::Float32)
+                .with_groups(groups)
+                .with_padding((padding, padding)),
             num_remove: usize::from(kernel_size.is_multiple_of(2)),
         }
     }

@@ -15,8 +15,8 @@ pub mod remap;
 mod stage;
 
 pub use basic_block::{BasicBlock, BlockKind};
-pub use batchnorm::{BN_EPS, BatchNormWeights, batchnorm2d};
+pub use batchnorm::{BN_EPS, batchnorm2d};
 pub use bottleneck::Bottleneck;
-pub use conv::{Conv2dWeights, conv2d, conv2d_grouped};
+pub use conv::{conv2d, conv2d_grouped};
 pub use error::{Error, Result};
 pub use stage::{Block, ResidualStage};

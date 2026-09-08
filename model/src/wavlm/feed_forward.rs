@@ -7,7 +7,7 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, Linear, Module};
 
-use crate::init::{fan_in_uniform, zeros};
+use crate::init::{Bias, linear};
 
 use super::error::Result;
 
@@ -21,12 +21,10 @@ pub struct FeedForward {
 
 impl FeedForward {
     pub fn empty(io_features: usize, intermediate_features: usize) -> Self {
-        let linear = |out: usize, inp: usize| {
-            Linear::new(fan_in_uniform(&[out, inp], inp, DType::Float32), Some(zeros(&[out], DType::Float32)))
-        };
+        let linear = |inp: usize, out: usize| linear(inp, out, Bias::Zero, DType::Float32);
         Self {
-            intermediate: linear(intermediate_features, io_features),
-            output: linear(io_features, intermediate_features),
+            intermediate: linear(io_features, intermediate_features),
+            output: linear(intermediate_features, io_features),
         }
     }
 

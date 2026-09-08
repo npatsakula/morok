@@ -6,7 +6,7 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Embedding, Layer, LayerNorm, Module};
 
-use crate::init::fan_in_uniform;
+use crate::init::embedding;
 
 use super::error::Result;
 
@@ -18,8 +18,8 @@ pub struct Embeddings {
 
 impl Embeddings {
     pub fn empty(vocab_size: usize, hidden_size: usize, eps: f64, dtype: DType) -> Self {
-        let weight = fan_in_uniform(&[vocab_size, hidden_size], hidden_size, dtype.clone());
-        Self { tok_embeddings: Embedding::new(weight), norm: LayerNorm::with_dims(hidden_size, false, eps, dtype) }
+        let tok_embeddings = embedding(vocab_size, hidden_size, dtype.clone());
+        Self { tok_embeddings, norm: LayerNorm::with_dims(hidden_size, false, eps, dtype) }
     }
 
     /// Forward. `input_ids`: `(B, L)` int64 → `(B, L, D)`.

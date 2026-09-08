@@ -1,47 +1,12 @@
-//! Whisper building blocks: constructors for the [`svod_tensor::nn`] layers with
-//! OpenAI's initialization, the mixed-precision linear epilogue, and the
-//! sinusoidal positional embedding.
+//! Whisper building blocks: the mixed-precision linear epilogue and the
+//! sinusoidal positional embedding. The layer constructors live in
+//! [`crate::init`].
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
-use svod_tensor::nn::{Conv1d, LayerNorm, Linear};
-
-use crate::init::{fan_in_uniform, ones, zeros};
+use svod_tensor::nn::Linear;
 
 use super::error::Result;
-
-/// `nn.Linear(in, out, bias)` with PyTorch's fan-in uniform initialization.
-/// Whisper's key projection is the one without a bias.
-pub(crate) fn linear(in_features: usize, out_features: usize, bias: bool, dtype: DType) -> Linear {
-    Linear::new(
-        fan_in_uniform(&[out_features, in_features], in_features, dtype.clone()),
-        bias.then(|| fan_in_uniform(&[out_features], in_features, dtype)),
-    )
-}
-
-/// Affine `nn.LayerNorm(size)` over the last axis, at Whisper's epsilon.
-pub(crate) fn layer_norm(size: usize, dtype: DType) -> LayerNorm {
-    LayerNorm::new(ones(&[size], dtype.clone()), Some(zeros(&[size], dtype)), 1e-5)
-}
-
-/// `nn.Conv1d(in, out, kernel, stride, padding)` with symmetric padding.
-pub(crate) fn conv1d(
-    in_channels: usize,
-    out_channels: usize,
-    kernel: usize,
-    stride: usize,
-    padding: usize,
-    bias: bool,
-    dtype: DType,
-) -> Conv1d {
-    let fan_in = in_channels * kernel;
-    Conv1d::new(
-        fan_in_uniform(&[out_channels, in_channels, kernel], fan_in, dtype.clone()),
-        bias.then(|| fan_in_uniform(&[out_channels], fan_in, dtype)),
-    )
-    .with_stride(stride)
-    .with_padding((padding as isize, padding as isize))
-}
 
 /// Whisper's linear forward. OpenAI keeps the matmul accumulator *and* the bias
 /// addition in FP32 when activation and weight are both half precision, so the

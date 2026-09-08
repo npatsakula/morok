@@ -5,7 +5,7 @@ use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, LayerNorm, Linear, Module, StateDict, get_tensor, prefixed};
 
-use crate::init::{fan_in_uniform, ones, zeros};
+use crate::init::{Bias, fan_in_uniform, layer_norm, ones, zeros};
 use crate::state::{scoped, scoped_index};
 
 use super::error::TkSnafu;
@@ -42,12 +42,9 @@ fn linear(x: &Tensor, weight: &Tensor, bias: &Tensor, weight_scale: Option<&Tens
     }
 }
 
-fn affine_norm(size: usize) -> LayerNorm {
-    LayerNorm::new(ones(&[size], DType::Float32), Some(zeros(&[size], DType::Float32)), 1e-5)
-}
-
-fn plain_linear(out: usize, inp: usize) -> Linear {
-    Linear::new(fan_in_uniform(&[out, inp], inp, DType::Float32), Some(fan_in_uniform(&[out], inp, DType::Float32)))
+/// Every `Linear` in this encoder carries PyTorch's own fan-in uniform bias.
+fn plain_linear(inp: usize, out: usize) -> Linear {
+    crate::init::linear(inp, out, Bias::FanIn, DType::Float32)
 }
 
 /// The bias every `Linear` in this encoder carries.
@@ -77,9 +74,9 @@ impl FeedForward {
     pub fn empty(config: &GigaAmConfig) -> Self {
         let (d, d_ff) = (config.d_model, config.d_ff);
         Self {
-            norm: affine_norm(d),
-            linear1: plain_linear(d_ff, d),
-            linear2: plain_linear(d, d_ff),
+            norm: layer_norm(d, DType::Float32),
+            linear1: plain_linear(d, d_ff),
+            linear2: plain_linear(d_ff, d),
             linear1_scale: None,
             linear2_scale: None,
         }
@@ -133,7 +130,7 @@ impl MultiHeadSelfAttention {
         let proj = || fan_in_uniform(&[d, d], d, DType::Float32);
         let bias = || fan_in_uniform(&[d], d, DType::Float32);
         Self {
-            norm: affine_norm(d),
+            norm: layer_norm(d, DType::Float32),
             q_proj: proj(),
             q_bias: bias(),
             k_proj: proj(),
@@ -282,7 +279,7 @@ impl ConvModule {
     pub fn empty(config: &GigaAmConfig) -> Self {
         let (d, k) = (config.d_model, config.conv_kernel);
         let conv_norm = match &config.conv_norm_type {
-            ConvNormType::LayerNorm => ConvNorm::LayerNorm(affine_norm(d)),
+            ConvNormType::LayerNorm => ConvNorm::LayerNorm(layer_norm(d, DType::Float32)),
             ConvNormType::BatchNorm => ConvNorm::BatchNorm {
                 scale: ones(&[d], DType::Float32),
                 bias: zeros(&[d], DType::Float32),
@@ -291,7 +288,7 @@ impl ConvModule {
             },
         };
         Self {
-            norm: affine_norm(d),
+            norm: layer_norm(d, DType::Float32),
             pw1_weight: fan_in_uniform(&[2 * d, d, 1], d, DType::Float32),
             pw1_bias: fan_in_uniform(&[2 * d], d, DType::Float32),
             dw_weight: fan_in_uniform(&[d, 1, k], k, DType::Float32),
@@ -556,7 +553,7 @@ impl ConformerLayer {
             mhsa: MultiHeadSelfAttention::empty(config),
             conv: ConvModule::empty(config),
             ffn2: FeedForward::empty(config),
-            final_norm: affine_norm(config.d_model),
+            final_norm: layer_norm(config.d_model, DType::Float32),
         }
     }
 

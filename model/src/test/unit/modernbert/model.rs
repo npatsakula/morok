@@ -55,9 +55,9 @@ fn forward_output_shape() {
     }
 }
 
-/// Every key a 2-layer tiny backbone emits, in the published checkpoint's
-/// naming — captured from the hand-written `HasStateDict` impl this model was
-/// migrated from. Drift here is a checkpoint-compatibility break.
+/// Every key `#[derive(Module)]` emits for a 2-layer tiny backbone, in the
+/// published checkpoint's naming. Drift here is a checkpoint-compatibility
+/// break.
 fn expected_keys() -> Vec<String> {
     let mut keys = vec![
         "model.embeddings.tok_embeddings.weight".to_string(),

@@ -22,7 +22,7 @@ use svod_tensor::Tensor;
 use svod_tensor::nn::{BatchNorm2d, Conv2d, Layer, Linear, Module};
 
 use crate::blocks::{ResidualStage, batchnorm2d, conv2d};
-use crate::init::fan_in_uniform;
+use crate::init::{Bias, linear};
 use crate::state::{self, StateDict};
 
 use super::config::{OutputMode, ResNetConfig, ResNetDepth};
@@ -73,10 +73,7 @@ impl ResNet {
         let head = match &config.output {
             OutputMode::Classification { num_classes } => {
                 let fan_in = 512 * expansion;
-                Some(Linear::new(
-                    fan_in_uniform(&[*num_classes, fan_in], fan_in, DType::Float32),
-                    Some(fan_in_uniform(&[*num_classes], fan_in, DType::Float32)),
-                ))
+                Some(linear(fan_in, *num_classes, Bias::FanIn, DType::Float32))
             }
             OutputMode::Features => None,
         };

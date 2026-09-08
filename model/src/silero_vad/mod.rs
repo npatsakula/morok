@@ -23,7 +23,7 @@ use svod_macros::jit_wrapper;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv1d, LSTMCell, Layer, PadMode};
 
-use crate::init::fan_in_uniform;
+use crate::init::{Bias, conv1d, fan_in_uniform};
 use crate::state;
 
 #[derive(Debug, Snafu)]
@@ -100,26 +100,23 @@ impl SileroVad {
     /// const-folding so the JIT pipeline can be exercised without a checkpoint.
     pub fn with_random_weights() -> Self {
         let dt = DType::Float32;
-        let mk_conv = |shape: [usize; 3], has_bias: bool, configure: fn(Conv1d) -> Conv1d| -> Conv1d {
-            let fan_in = shape[1] * shape[2];
-            let weight = fan_in_uniform(&shape, fan_in, dt.clone());
-            let bias = has_bias.then(|| fan_in_uniform(&[shape[0]], fan_in, dt.clone()));
-            configure(Conv1d::new(weight, bias))
+        let mk_conv = |[out, inp, k]: [usize; 3], bias: Bias, configure: fn(Conv1d) -> Conv1d| -> Conv1d {
+            configure(conv1d(inp, out, k, bias, dt.clone()))
         };
 
         Self {
-            stft_conv: mk_conv([258, 1, 256], false, |c| c.with_stride(128)),
-            conv1: mk_conv([128, 129, 3], true, |c| c.with_padding((1, 1))),
-            conv2: mk_conv([64, 128, 3], true, |c| c.with_stride(2).with_padding((1, 1))),
-            conv3: mk_conv([64, 64, 3], true, |c| c.with_stride(2).with_padding((1, 1))),
-            conv4: mk_conv([128, 64, 3], true, |c| c.with_padding((1, 1))),
+            stft_conv: mk_conv([258, 1, 256], Bias::None, |c| c.with_stride(128)),
+            conv1: mk_conv([128, 129, 3], Bias::FanIn, |c| c.with_padding((1, 1))),
+            conv2: mk_conv([64, 128, 3], Bias::FanIn, |c| c.with_stride(2).with_padding((1, 1))),
+            conv3: mk_conv([64, 64, 3], Bias::FanIn, |c| c.with_stride(2).with_padding((1, 1))),
+            conv4: mk_conv([128, 64, 3], Bias::FanIn, |c| c.with_padding((1, 1))),
             lstm: LSTMCell::new(
                 fan_in_uniform(&[4 * HIDDEN, HIDDEN], HIDDEN, dt.clone()),
                 fan_in_uniform(&[4 * HIDDEN, HIDDEN], HIDDEN, dt.clone()),
                 fan_in_uniform(&[4 * HIDDEN], HIDDEN, dt.clone()),
                 fan_in_uniform(&[4 * HIDDEN], HIDDEN, dt.clone()),
             ),
-            final_conv: mk_conv([1, 128, 1], true, |c| c),
+            final_conv: mk_conv([1, 128, 1], Bias::FanIn, |c| c),
         }
     }
 

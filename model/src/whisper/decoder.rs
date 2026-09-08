@@ -4,11 +4,11 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, LayerNorm, Linear, Module};
 
-use crate::init::fan_in_uniform;
+use crate::init::{Bias, fan_in_uniform, layer_norm, linear};
 use crate::state::{scope_index, scoped, scoped_index};
 
 use super::attention::MultiHeadAttention;
-use super::blocks::{layer_norm, linear, linear_forward};
+use super::blocks::linear_forward;
 use super::config::ModelDimensions;
 use super::error::{Result, tk_launch_error};
 
@@ -85,8 +85,8 @@ impl DecoderBlock {
             attn_ln: layer_norm(n_state, dtype.clone()),
             cross_attn: MultiHeadAttention::empty_dtype(n_state, n_head, dtype.clone()),
             cross_attn_ln: layer_norm(n_state, dtype.clone()),
-            mlp0: linear(n_state, mlp, true, dtype.clone()),
-            mlp2: linear(mlp, n_state, true, dtype.clone()),
+            mlp0: linear(n_state, mlp, Bias::FanIn, dtype.clone()),
+            mlp2: linear(mlp, n_state, Bias::FanIn, dtype.clone()),
             mlp_ln: layer_norm(n_state, dtype),
             n_state,
         }

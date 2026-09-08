@@ -30,11 +30,10 @@ fn forward_output_shape() {
     assert!(v.iter().all(|x| x.is_finite()));
 }
 
-/// Every key a 2-layer tiny backbone emits, in the published `BAAI/bge-m3`
-/// naming — captured from the hand-written `HasStateDict` impl this model was
-/// migrated from. Drift here is a checkpoint-compatibility break. Norm biases
-/// are absent from a freshly-built model and loaded only when the checkpoint
-/// carries them.
+/// Every key `#[derive(Module)]` emits for a 2-layer tiny backbone, in the
+/// published `BAAI/bge-m3` naming. Drift here is a checkpoint-compatibility
+/// break. Norm biases are absent from a freshly-built model and loaded only
+/// when the checkpoint carries them.
 pub fn expected_keys() -> Vec<String> {
     let mut keys: Vec<String> = ["word_embeddings", "position_embeddings", "token_type_embeddings"]
         .iter()

@@ -13,7 +13,7 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Embedding, Layer, LayerNorm, Module};
 
-use crate::init::fan_in_uniform;
+use crate::init::embedding;
 
 use super::error::Result;
 
@@ -39,7 +39,7 @@ impl XlmRobertaEmbeddings {
         pad_token_id: usize,
         dtype: DType,
     ) -> Self {
-        let table = |rows: usize| Embedding::new(fan_in_uniform(&[rows, hidden_size], hidden_size, dtype.clone()));
+        let table = |rows: usize| embedding(rows, hidden_size, dtype.clone());
         Self {
             word_embeddings: table(vocab_size),
             position_embeddings: table(max_position_embeddings),

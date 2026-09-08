@@ -8,7 +8,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, Linear, Module};
 
-use crate::init::fan_in_uniform;
+use crate::init::{Bias, linear};
 use crate::state::StateDict;
 
 use super::backbone::YoloBackboneCls;
@@ -33,10 +33,7 @@ impl ClassifyHead {
     pub fn empty(in_ch: usize, nc: usize) -> Self {
         Self {
             conv: YoloConv::empty(in_ch, HIDDEN, 1, 1, true),
-            linear: Linear::new(
-                fan_in_uniform(&[nc, HIDDEN], HIDDEN, DType::Float32),
-                Some(fan_in_uniform(&[nc], HIDDEN, DType::Float32)),
-            ),
+            linear: linear(HIDDEN, nc, Bias::FanIn, DType::Float32),
         }
     }
 

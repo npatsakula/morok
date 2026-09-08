@@ -29,9 +29,7 @@ pub struct Qwen3Model {
 impl Qwen3Model {
     pub fn empty(config: Qwen3Config) -> Self {
         let dtype = config.dtype.clone();
-        let weight =
-            crate::init::fan_in_uniform(&[config.vocab_size, config.hidden_size], config.hidden_size, dtype.clone());
-        let embeddings = Embedding::new(weight);
+        let embeddings = crate::init::embedding(config.vocab_size, config.hidden_size, dtype.clone());
         let layers = (0..config.num_hidden_layers).map(|_| Qwen3DecoderLayer::empty(&config)).collect();
         let norm = RmsNorm::with_dims(config.hidden_size, config.rms_norm_eps, dtype);
         Self { config, embeddings, layers, norm }

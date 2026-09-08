@@ -11,9 +11,10 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Linear, Module};
 
+use crate::init::{Bias, linear};
 use crate::state::scoped;
 
-use super::blocks::{linear, linear_forward};
+use super::blocks::linear_forward;
 use super::error::{Result, tk_launch_error};
 
 const MIN_PADDED_FA_SEQUENCE: usize = 1024;
@@ -46,10 +47,10 @@ impl MultiHeadAttention {
 
     pub fn empty_dtype(n_state: usize, n_head: usize, dtype: DType) -> Self {
         Self {
-            query: linear(n_state, n_state, true, dtype.clone()),
-            key: linear(n_state, n_state, false, dtype.clone()),
-            value: linear(n_state, n_state, true, dtype.clone()),
-            out: linear(n_state, n_state, true, dtype),
+            query: linear(n_state, n_state, Bias::FanIn, dtype.clone()),
+            key: linear(n_state, n_state, Bias::None, dtype.clone()),
+            value: linear(n_state, n_state, Bias::FanIn, dtype.clone()),
+            out: linear(n_state, n_state, Bias::FanIn, dtype),
             n_head,
         }
     }

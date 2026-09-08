@@ -22,26 +22,20 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{BatchNorm2d, Conv1d, Layer, LayerNorm, Linear, Module};
 
-use crate::init::{fan_in_uniform, zeros};
+use crate::init::{Bias, layer_norm};
 
 use super::error::Result;
 
-/// PyTorch's `nn.BatchNorm1d` / `nn.LayerNorm` default epsilon.
+/// PyTorch's `nn.BatchNorm1d` default epsilon.
 const EPS: f64 = 1e-5;
 
-fn linear(out: usize, inp: usize) -> Linear {
-    Linear::new(fan_in_uniform(&[out, inp], inp, DType::Float32), Some(zeros(&[out], DType::Float32)))
+/// Every `Linear` and `Conv1d` here is zero-biased, as upstream initializes them.
+fn linear(inp: usize, out: usize) -> Linear {
+    crate::init::linear(inp, out, Bias::Zero, DType::Float32)
 }
 
-fn layer_norm(size: usize) -> LayerNorm {
-    LayerNorm::new(crate::init::ones(&[size], DType::Float32), Some(zeros(&[size], DType::Float32)), EPS)
-}
-
-/// `(out, in / groups, k)` conv with a zero bias, `SAME`-style padding applied
-/// by the caller.
-fn conv1d(out: usize, in_per_group: usize, kernel: usize) -> Conv1d {
-    let weight = fan_in_uniform(&[out, in_per_group, kernel], in_per_group * kernel, DType::Float32);
-    Conv1d::new(weight, Some(zeros(&[out], DType::Float32)))
+fn conv1d(in_per_group: usize, out: usize, kernel: usize) -> Conv1d {
+    crate::init::conv1d(in_per_group, out, kernel, Bias::Zero, DType::Float32)
 }
 
 // ---------------------------------------------------------------------------
@@ -60,7 +54,11 @@ pub struct PositionwiseFeedForward {
 
 impl PositionwiseFeedForward {
     pub fn empty(in_size: usize, ffn_hidden: usize) -> Self {
-        Self { ln_norm: layer_norm(in_size), w1: linear(ffn_hidden, in_size), w2: linear(in_size, ffn_hidden) }
+        Self {
+            ln_norm: layer_norm(in_size, DType::Float32),
+            w1: linear(in_size, ffn_hidden),
+            w2: linear(ffn_hidden, in_size),
+        }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -120,7 +118,10 @@ pub struct ConformerMHA {
 
 impl ConformerMHA {
     pub fn empty(in_size: usize, num_head: usize) -> Self {
-        Self { ln_norm: layer_norm(in_size), mha: PlainMultiHeadSelfAttention::empty(in_size, num_head) }
+        Self {
+            ln_norm: layer_norm(in_size, DType::Float32),
+            mha: PlainMultiHeadSelfAttention::empty(in_size, num_head),
+        }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -153,9 +154,9 @@ impl ConvolutionModule {
         assert!(!kernel_size.is_multiple_of(2), "kernel_size must be odd for SAME padding");
         let pad = ((kernel_size - 1) / 2) as isize;
         Self {
-            ln_norm: layer_norm(channels),
-            pointwise1: conv1d(2 * channels, channels, 1),
-            depthwise: conv1d(channels, 1, kernel_size).with_groups(channels).with_padding((pad, pad)),
+            ln_norm: layer_norm(channels, DType::Float32),
+            pointwise1: conv1d(channels, 2 * channels, 1),
+            depthwise: conv1d(1, channels, kernel_size).with_groups(channels).with_padding((pad, pad)),
             bn_norm: BatchNorm2d::with_dims(channels, EPS, DType::Float32),
             pointwise2: conv1d(channels, channels, 1),
         }
@@ -192,7 +193,7 @@ impl ConformerBlock {
             mha: ConformerMHA::empty(in_size, num_head),
             conv: ConvolutionModule::empty(in_size, kernel_size),
             ffn2: PositionwiseFeedForward::empty(in_size, ffn_hidden),
-            ln_norm: layer_norm(in_size),
+            ln_norm: layer_norm(in_size, DType::Float32),
         }
     }
 
