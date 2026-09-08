@@ -5,8 +5,6 @@
 //! plan (like `GigaAmCtcJit`), keeping activations on-device and reading back
 //! only the `(B, L, V)` logits.
 
-extern crate self as svod_model;
-
 use svod_macros::jit_wrapper;
 
 use super::head::ModernBertForMaskedLm;
@@ -17,12 +15,11 @@ jit_wrapper! {
         input_ids: Tensor,
         attention_mask: Tensor,
 
-        vars {
-            b: (1, model.config.max_batch_size),
-        }
+        batch_var b: (1, model.config.max_batch_size),
+        outputs { hidden }
 
-        build(input_ids, attention_mask, b) {
-            model.forward_batch(input_ids, Some(attention_mask), &b)
+        build(input_ids, attention_mask) {
+            model.forward(input_ids, Some(attention_mask))
         }
     }
 }
@@ -32,12 +29,11 @@ jit_wrapper! {
         input_ids: Tensor,
         attention_mask: Tensor,
 
-        vars {
-            b: (1, model.bert.config.max_batch_size),
-        }
+        batch_var b: (1, model.bert.config.max_batch_size),
+        outputs { logits }
 
-        build(input_ids, attention_mask, b) {
-            model.forward_batch(input_ids, Some(attention_mask), &b)
+        build(input_ids, attention_mask) {
+            model.forward(input_ids, Some(attention_mask))
         }
     }
 }

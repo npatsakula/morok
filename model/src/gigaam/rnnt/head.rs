@@ -1,11 +1,11 @@
 //! RNN-T head = predictor + joint. Composed similarly to Python `RNNTHead`.
 
-use crate::state::{self, HasStateDict, StateDict, prefixed};
+use svod_tensor::nn::Module;
 
 use super::joint::RnntJoint;
 use super::predictor::RnntPredictor;
 
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct RnntHead {
     pub predictor: RnntPredictor,
     pub joint: RnntJoint,
@@ -31,19 +31,5 @@ impl RnntHead {
             joint_hidden,
             num_classes,
         }
-    }
-}
-
-impl HasStateDict for RnntHead {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.predictor.state_dict(&prefixed(prefix, "predictor"));
-        sd.extend(self.joint.state_dict(&prefixed(prefix, "joint")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.predictor.load_state_dict(sd, &prefixed(prefix, "predictor"))?;
-        self.joint.load_state_dict(sd, &prefixed(prefix, "joint"))?;
-        Ok(())
     }
 }

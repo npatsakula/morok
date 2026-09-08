@@ -18,9 +18,9 @@ fn prepare_and_execute_at_max_batch() {
     let max_batch = 2;
     let mut jit = build_classifier_jit(max_batch, 5);
     jit.prepare(InputSpec::f32(&[max_batch, 3, 32, 32])).unwrap();
-    jit.execute_with_vars(&[("b", max_batch as i64)]).unwrap();
-    let out = jit.output().unwrap();
-    assert_eq!(out.size(), 2 * 5 * std::mem::size_of::<f32>());
+    jit.execute_bound(max_batch as i64).unwrap();
+    assert_eq!(jit.logits_shape().unwrap(), vec![max_batch, 5]);
+    assert_eq!(jit.logits_to_vec::<f32>().unwrap().len(), max_batch * 5);
 }
 
 #[test]
@@ -30,10 +30,10 @@ fn rebind_batch_without_reprepare() {
     let mut jit = build_classifier_jit(max_batch, 3);
     jit.prepare(InputSpec::f32(&[max_batch, 3, 32, 32])).unwrap();
 
+    // The live output shape tracks `b` without a re-prepare.
     for b in [1, 2, 4] {
-        jit.execute_with_vars(&[("b", b as i64)]).unwrap();
-        let out = jit.output().unwrap();
-        assert!(out.size() > 0, "output buffer empty for b={b}");
+        jit.execute_bound(b as i64).unwrap();
+        assert_eq!(jit.logits_shape().unwrap(), vec![b, 3], "logits shape for b={b}");
     }
 }
 
@@ -45,7 +45,6 @@ fn features_mode_returns_spatial_map() {
     let model = ResNet::with_zero_weights(config);
     let mut jit = ResNetJit::new(model);
     jit.prepare(InputSpec::f32(&[max_batch, 3, 32, 32])).unwrap();
-    jit.execute_with_vars(&[("b", 1)]).unwrap();
-    let out = jit.output().unwrap();
-    assert_eq!(out.size(), 512 * std::mem::size_of::<f32>());
+    jit.execute_bound(1).unwrap();
+    assert_eq!(jit.logits_shape().unwrap(), vec![1, 512, 1, 1]);
 }

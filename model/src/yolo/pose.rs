@@ -6,25 +6,28 @@
 //!
 //! Forward returns `[B, 4+nc+nk, A]` — boxes + scores + decoded keypoints.
 
-use snafu::{OptionExt, ResultExt};
 use svod_ir::SInt;
-use svod_tensor::{BoundVariable, Tensor};
+use svod_tensor::Tensor;
+use svod_tensor::nn::{Conv2d, Layer, Module};
 
-use crate::state::{self, HasStateDict, StateDict, prefixed};
+use crate::state::StateDict;
 
 use super::backbone::YoloBackbone;
-use super::blocks::conv::{Conv2dBias, YoloConv};
+use super::blocks::conv::{YoloConv, conv2d_bias};
 use super::config::DETECT_STRIDES;
-use super::error::{Result, StateSnafu, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::head::{BoxBranch, ClsBranch, dist2bbox, make_anchors};
 use super::loader;
 use super::neck::YoloNeck;
 
 /// Pose shared feature extractor: Conv(k3) → Conv(k3).
 /// State-dict keys: `0.*`, `1.*`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct PoseFeatBranch {
+    #[module(key = "0")]
     pub conv0: YoloConv,
+    #[module(key = "1")]
     pub conv1: YoloConv,
 }
 
@@ -39,29 +42,19 @@ impl PoseFeatBranch {
     }
 }
 
-impl HasStateDict for PoseFeatBranch {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.conv0.state_dict(&prefixed(prefix, "0"));
-        sd.extend(self.conv1.state_dict(&prefixed(prefix, "1")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.conv0.load_state_dict(sd, &prefixed(prefix, "0"))?;
-        self.conv1.load_state_dict(sd, &prefixed(prefix, "1"))?;
-        Ok(())
-    }
-}
-
 /// Pose26 head: Detect box+cls + shared pose features + keypoint prediction.
 ///
 /// Forward returns `[B, 4+nc+nk, A]` — boxes + scores + decoded keypoints.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Pose26 {
+    #[module(key = "one2one_cv2")]
     pub cv2: Vec<BoxBranch>,
+    #[module(key = "one2one_cv3")]
     pub cv3: Vec<ClsBranch>,
+    #[module(key = "one2one_cv4")]
     pub cv4: Vec<PoseFeatBranch>,
-    pub cv4_kpts: Vec<Conv2dBias>,
+    #[module(key = "one2one_cv4_kpts")]
+    pub cv4_kpts: Vec<Conv2d>,
     pub nc: usize,
     pub reg_max: usize,
     pub kpt_shape: (usize, usize),
@@ -79,7 +72,7 @@ impl Pose26 {
             cv2: ch.iter().map(|&c| BoxBranch::empty(c, hidden_box, reg_max)).collect(),
             cv3: ch.iter().map(|&c| ClsBranch::empty(c, hidden_cls, nc)).collect(),
             cv4: ch.iter().map(|&c| PoseFeatBranch::empty(c, c4)).collect(),
-            cv4_kpts: ch.iter().map(|_| Conv2dBias::empty(c4, nk, 1, 1)).collect(),
+            cv4_kpts: ch.iter().map(|_| conv2d_bias(c4, nk, 1, 1)).collect(),
             nc,
             reg_max,
             kpt_shape,
@@ -88,7 +81,7 @@ impl Pose26 {
     }
 
     pub fn forward(&self, feats: &[Tensor]) -> Result<Tensor> {
-        let shape = feats[0].shape().context(TensorSnafu)?;
+        let shape = feats[0].shape()?;
         let b = shape[0].clone();
 
         let mut boxes_list: Vec<Tensor> = Vec::with_capacity(feats.len());
@@ -97,45 +90,41 @@ impl Pose26 {
         let mut feat_sizes: Vec<(usize, usize)> = Vec::with_capacity(feats.len());
 
         for (i, feat) in feats.iter().enumerate() {
-            let fshape = feat.shape().context(TensorSnafu)?;
-            let h: usize = fshape[2].as_const().context(SymbolicShapeSnafu { what: "pose H" })?;
-            let w: usize = fshape[3].as_const().context(SymbolicShapeSnafu { what: "pose W" })?;
+            let h = feat.dim_const(2)?;
+            let w = feat.dim_const(3)?;
             feat_sizes.push((h, w));
             let hw = h * w;
 
             let box_out = self.cv2[i].forward(feat)?;
-            boxes_list.push(
-                box_out.try_reshape([b.clone(), SInt::from(4 * self.reg_max), SInt::from(hw)]).context(TensorSnafu)?,
-            );
+            boxes_list.push(box_out.try_reshape([b.clone(), SInt::from(4 * self.reg_max), SInt::from(hw)])?);
 
             let cls_out = self.cv3[i].forward(feat)?;
-            scores_list
-                .push(cls_out.try_reshape([b.clone(), SInt::from(self.nc), SInt::from(hw)]).context(TensorSnafu)?);
+            scores_list.push(cls_out.try_reshape([b.clone(), SInt::from(self.nc), SInt::from(hw)])?);
 
             let features = self.cv4[i].forward(feat)?;
             let kpts = self.cv4_kpts[i].forward(&features)?;
-            kpts_list.push(kpts.try_reshape([b.clone(), SInt::from(self.nk), SInt::from(hw)]).context(TensorSnafu)?);
+            kpts_list.push(kpts.try_reshape([b.clone(), SInt::from(self.nk), SInt::from(hw)])?);
         }
 
         let boxes_refs: Vec<&Tensor> = boxes_list.iter().collect();
         let scores_refs: Vec<&Tensor> = scores_list.iter().collect();
         let kpts_refs: Vec<&Tensor> = kpts_list.iter().collect();
 
-        let boxes = Tensor::cat(&boxes_refs, 2).context(TensorSnafu)?;
-        let scores = Tensor::cat(&scores_refs, 2).context(TensorSnafu)?;
-        let kpts = Tensor::cat(&kpts_refs, 2).context(TensorSnafu)?;
+        let boxes = Tensor::cat(&boxes_refs, 2)?;
+        let scores = Tensor::cat(&scores_refs, 2)?;
+        let kpts = Tensor::cat(&kpts_refs, 2)?;
 
         let num_anchors: usize = feat_sizes.iter().map(|&(h, w)| h * w).sum();
-        let (anchors, strides) = make_anchors(&feat_sizes, &DETECT_STRIDES);
+        let (anchors, strides) = make_anchors(&feat_sizes, &DETECT_STRIDES)?;
 
         let dbox = dist2bbox(&boxes, &anchors, &strides, num_anchors)?;
-        let scores = scores.sigmoid().context(TensorSnafu)?;
+        let scores = scores.sigmoid()?;
 
         // kpts_decode (Pose26 export path): y = kpts.view(bs, num_kpts, ndim, -1)
         // a = (y[:,:,:2] + anchors) * strides; vis = sigmoid(y[:,:,2:3])
         let decoded_kpts = kpts_decode(&kpts, &anchors, &strides, self.kpt_shape.0, self.kpt_shape.1, num_anchors)?;
 
-        Tensor::cat(&[&dbox, &scores, &decoded_kpts], 1).context(TensorSnafu)
+        Ok(Tensor::cat(&[&dbox, &scores, &decoded_kpts], 1)?)
     }
 }
 
@@ -152,87 +141,46 @@ fn kpts_decode(
     ndim: usize,
     num_anchors: usize,
 ) -> Result<Tensor> {
-    let b = kpts.shape().context(TensorSnafu)?[0].clone();
+    let b = kpts.shape()?[0].clone();
 
     // [B, nk, A] → [B, num_kpts, ndim, A]
-    let y = kpts
-        .try_reshape([b.clone(), SInt::from(num_kpts), SInt::from(ndim), SInt::from(num_anchors)])
-        .context(TensorSnafu)?;
+    let y = kpts.try_reshape([b.clone(), SInt::from(num_kpts), SInt::from(ndim), SInt::from(num_anchors)])?;
 
     // xy: [B, num_kpts, 2, A] = y[:,:,:2,:]
-    let xy =
-        y.slice_with().starts(&[0, 0, 0, 0]).ends(&[i64::MAX, i64::MAX, 2, i64::MAX]).call().context(TensorSnafu)?;
+    let xy = y.slice_with().starts(&[0, 0, 0, 0]).ends(&[i64::MAX, i64::MAX, 2, i64::MAX]).call()?;
 
     // anchors [2,A] → [1,1,2,A], strides [1,A] → [1,1,1,A]
-    let anchors_4d = anchors
-        .try_reshape([SInt::from(1isize), SInt::from(1isize), SInt::from(2isize), SInt::from(num_anchors)])
-        .context(TensorSnafu)?;
-    let strides_4d = strides
-        .try_reshape([SInt::from(1isize), SInt::from(1isize), SInt::from(1isize), SInt::from(num_anchors)])
-        .context(TensorSnafu)?;
+    let anchors_4d =
+        anchors.try_reshape([SInt::from(1isize), SInt::from(1isize), SInt::from(2isize), SInt::from(num_anchors)])?;
+    let strides_4d =
+        strides.try_reshape([SInt::from(1isize), SInt::from(1isize), SInt::from(1isize), SInt::from(num_anchors)])?;
 
-    let xy = xy.try_add(&anchors_4d).context(TensorSnafu)?;
-    let xy = xy.try_mul(&strides_4d).context(TensorSnafu)?;
+    let xy = xy.try_add(&anchors_4d)?;
+    let xy = xy.try_mul(&strides_4d)?;
 
     if ndim == 3 {
         // vis: [B, num_kpts, 1, A] = y[:,:,2:3,:]
-        let vis = y
-            .slice_with()
-            .starts(&[0, 0, 2, 0])
-            .ends(&[i64::MAX, i64::MAX, 3, i64::MAX])
-            .call()
-            .context(TensorSnafu)?;
-        let vis = vis.sigmoid().context(TensorSnafu)?;
-        let cat = Tensor::cat(&[&xy, &vis], 2).context(TensorSnafu)?;
-        cat.try_reshape([b, SInt::from(num_kpts * ndim), SInt::from(num_anchors)]).context(TensorSnafu)
+        let vis = y.slice_with().starts(&[0, 0, 2, 0]).ends(&[i64::MAX, i64::MAX, 3, i64::MAX]).call()?;
+        let vis = vis.sigmoid()?;
+        let cat = Tensor::cat(&[&xy, &vis], 2)?;
+        Ok(cat.try_reshape([b, SInt::from(num_kpts * ndim), SInt::from(num_anchors)])?)
     } else {
-        xy.try_reshape([b, SInt::from(num_kpts * ndim), SInt::from(num_anchors)]).context(TensorSnafu)
-    }
-}
-
-impl HasStateDict for Pose26 {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        for (i, br) in self.cv2.iter().enumerate() {
-            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv2.{i}"))));
-        }
-        for (i, br) in self.cv3.iter().enumerate() {
-            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv3.{i}"))));
-        }
-        for (i, br) in self.cv4.iter().enumerate() {
-            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv4.{i}"))));
-        }
-        for (i, kpt) in self.cv4_kpts.iter().enumerate() {
-            sd.extend(kpt.state_dict(&prefixed(prefix, &format!("one2one_cv4_kpts.{i}"))));
-        }
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        for (i, br) in self.cv2.iter_mut().enumerate() {
-            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv2.{i}")))?;
-        }
-        for (i, br) in self.cv3.iter_mut().enumerate() {
-            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv3.{i}")))?;
-        }
-        for (i, br) in self.cv4.iter_mut().enumerate() {
-            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv4.{i}")))?;
-        }
-        for (i, kpt) in self.cv4_kpts.iter_mut().enumerate() {
-            kpt.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv4_kpts.{i}")))?;
-        }
-        Ok(())
+        Ok(xy.try_reshape([b, SInt::from(num_kpts * ndim), SInt::from(num_anchors)])?)
     }
 }
 
 /// YOLO v26 pose estimation model.
 ///
 /// Forward returns `[B, 4+nc+nk, A]` — boxes + scores + decoded keypoints.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Yolo26Pose {
+    #[module(skip)]
     pub config: super::config::YoloConfig,
+    #[module(key = "")]
     pub backbone: YoloBackbone,
+    #[module(key = "")]
     pub neck: YoloNeck,
+    #[module(key = "23")]
     pub head: Pose26,
 }
 
@@ -264,30 +212,13 @@ impl Yolo26Pose {
 
     pub fn from_state_dict(sd: &StateDict, config: super::config::YoloConfig) -> Result<Self> {
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "").context(StateSnafu)?;
+        model.load_state_dict(sd, "")?;
         Ok(model)
     }
 
-    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        let x = loader::shrink_batch(images, batch)?;
-        let (l4, l6, l10) = self.backbone.forward(&x)?;
+    pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let (l4, l6, l10) = self.backbone.forward(images)?;
         let (p3, p4, p5) = self.neck.forward(&l4, &l6, &l10)?;
         self.head.forward(&[p3, p4, p5])
-    }
-}
-
-impl HasStateDict for Yolo26Pose {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.backbone.state_dict(prefix);
-        sd.extend(self.neck.state_dict(prefix));
-        sd.extend(self.head.state_dict(&prefixed(prefix, "23")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.backbone.load_state_dict(sd, prefix)?;
-        self.neck.load_state_dict(sd, prefix)?;
-        self.head.load_state_dict(sd, &prefixed(prefix, "23"))?;
-        Ok(())
     }
 }

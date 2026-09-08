@@ -43,10 +43,10 @@ use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
-    let OnnxModel { mut outputs, .. } = importer.import("model.onnx", &[])?;
+    let OnnxModel { outputs, .. } = importer.import("model.onnx", &[])?;
 
     // सभी आउटपुट एक साथ शेड्यूल करें, एक ही पास में एक्ज़ीक्यूट करें
-    let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    let outs: Vec<&Tensor> = outputs.values().collect();
     Tensor::realize_batch(outs)?;
 
     for (name, tensor) in &outputs {
@@ -66,7 +66,7 @@ use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
-    let OnnxModel { mut inputs, mut outputs, .. } = importer.import("model.onnx", &[])?;
+    let OnnxModel { mut inputs, outputs, .. } = importer.import("model.onnx", &[])?;
 
     // इनपुट डेटा असाइन करें (lazy — अभी कोई एलोकेशन नहीं)
     let input = inputs.remove("input").unwrap();
@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // सभी आउटपुट एक साथ शेड्यूल करें, एक ही पास में एक्ज़ीक्यूट करें
     // (इनपुट के assign को इंटरनली रिज़ॉल्व करता है — अलग से realize की ज़रूरत नहीं)
-    let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    let outs: Vec<&Tensor> = outputs.values().collect();
     Tensor::realize_batch(outs)?;
     Ok(())
 }
@@ -125,14 +125,14 @@ x.conv()
     .call()?
 ```
 
-**मल्टी-स्टेप डीकम्पोज़िशन** — BatchNormalization, Attention, और Mod जैसे ऑपरेटरों को बीच में कई कैलकुलेशन करनी पड़ती हैं। जैसे, Python-स्टाइल integer `Mod` ट्रंकेशन mod + साइन एडजस्टमेंट में टूटता है:
+**मल्टी-स्टेप डीकम्पोज़िशन** — BatchNormalization, Attention, और Mod जैसे ऑपरेटरों को बीच में कई कैलकुलेशन करनी पड़ती हैं। `Mod` `fmod` एट्रिब्यूट और इनपुट dtype के आधार पर चार डीकम्पोज़िशन में से एक चुनता है; फ़्लोटिंग-पॉइंट Python-स्टाइल ब्रांच `x - floor(x / y) * y` है:
 
 ```rust
-let trunc_mod = x.try_mod(y)?;
-let signs_differ = trunc_mod.bitwise_xor(y)?.try_lt(&zero)?;
-let needs_adj = mod_ne_zero.bitwise_and(&signs_differ)?;
-trunc_mod.try_add(&y.where_(&needs_adj, &zero)?)?
+let div = x.try_div(y)?;
+x.try_sub(&div.floor().try_mul(y)?)?
 ```
+
+`floor()` पर ध्यान दें — कोई `?` नहीं। यूनरी राउंडिंग ऑप्स (`floor`, `ceil`, `round`, `trunc`), साथ ही `cast`, `neg`, `abs`, `square` और `sign`, फ़ेल नहीं हो सकते और सादा `Tensor` लौटाते हैं। `BitwiseAnd`/`Or`/`Xor` और `BitShift` जिन बिटवाइज़ ऑपरेटरों का उपयोग करते हैं वे `try_bitand`, `try_bitor`, `try_bitxor`, `try_shl` और `try_shr` हैं (इन्हें `&`, `|`, `^`, `<<`, `>>` के रूप में भी लिखा जा सकता है, जो `Result<Tensor>` लौटाते हैं)।
 
 ### एट्रिब्यूट वैलिडेशन
 
@@ -221,6 +221,8 @@ ONNX:    if condition { then_branch } else { else_branch }
 Svod:   then_result.where_(&condition, &else_result)
 ```
 
+`where_` को ऐसे पढ़ें: "जहाँ कंडीशन सही है वहाँ `self` रखो"; `condition.select(&then_result, &else_result)` वही ऑप है, बस mask की तरफ़ से लिखा गया, और कोई भी ब्रांच सादा scalar हो सकती है।
+
 यह **एक बार ट्रेस करो, कई बार चलाओ** सक्षम करता है — कम्पाइल्ड ग्राफ़ रनटाइम पर किसी भी कंडीशन वैल्यू को हैंडल करता है। लेकिन इसकी एक कठोर बाधा है: **दोनों ब्रांचों को समान आउटपुट शेप और DType प्रोड्यूस करना चाहिए।** शेप-पॉलीमॉर्फ़िक ब्रांचों वाले मॉडल (जहाँ then-ब्रांच `[3, 4]` और else-ब्रांच `[5, 6]` प्रोड्यूस करती है) को ट्रेस नहीं किया जा सकता।
 
 व्यवहार में, `If` नोड वाले अधिकांश ONNX मॉडल इस बाधा को पूरा करते हैं क्योंकि वे कंडीशनल लॉजिक का उपयोग वैल्यू सिलेक्शन के लिए करते हैं, शेप-बदलने वाले कंट्रोल फ़्लो के लिए नहीं।
@@ -236,7 +238,7 @@ Svod:   then_result.where_(&condition, &else_result)
 
 ```rust
 // Realize all outputs at once (shares compilation and execution)
-let outputs: Vec<&mut Tensor> = model.outputs.values_mut().collect();
+let outputs: Vec<&Tensor> = model.outputs.values().collect();
 Tensor::realize_batch(outputs)?;
 ```
 
@@ -244,7 +246,7 @@ Tensor::realize_batch(outputs)?;
 (`tensor/src/test/unit/variable.rs::test_prepare_execute_loop` में टेस्ट किया गया):
 
 ```rust
-let OnnxModel { mut inputs, mut outputs, variables } =
+let OnnxModel { mut inputs, outputs, variables } =
     importer.import("model.onnx", &[("batch", 1)])?;
 
 // 1. Assign initial data (lazy — no allocation yet)
@@ -252,7 +254,7 @@ let input = inputs.remove("audio").unwrap();
 input.assign(&Tensor::from_slice(&first_frame));
 
 // 2. Compile the execution plan (resolves assigns, allocates buffers)
-let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+let outs: Vec<&Tensor> = outputs.values().collect();
 let mut plan = Tensor::prepare_batch(outs)?;
 plan.execute()?;  // first run
 
@@ -278,7 +280,7 @@ plan.execute_with_vars(&[bound.as_var_val()])?;
 | क्वांटाइज़ेशन | DequantizeLinear, QuantizeLinear | IR में क्वांटाइज़्ड DType सपोर्ट आवश्यक |
 | सीक्वेंस ऑप्स | SequenceConstruct, SequenceAt | नॉन-tensor टाइप Svod के टाइप सिस्टम में नहीं हैं |
 | रैंडम | RandomNormal, RandomUniform | स्टेटफ़ुल RNG अभी तक इम्प्लीमेंट नहीं |
-| सिग्नल प्रोसेसिंग | DFT, STFT, MelWeightMatrix | कम प्राथमिकता; विशिष्ट उपयोग |
+| सिग्नल प्रोसेसिंग | DFT, STFT, MelWeightMatrix | इम्पोर्टर से जुड़ा नहीं है (tensor क्रेट में स्वयं `stft` / `istft` मौजूद हैं) |
 | टेक्स्ट | StringNormalizer, TfIdfVectorizer | स्ट्रिंग टाइप समर्थित नहीं |
 
 इन ऑपरेटरों वाले मॉडलों के लिए `ort` (ONNX Runtime रैपर) इस्तेमाल करें, जो पूरा स्पेक कवर करता है।
@@ -306,7 +308,8 @@ let model = importer.import("model.onnx", &[])?;
 
 println!("Inputs:");
 for (name, tensor) in &model.inputs {
-    println!("  {name}: {:?}", tensor.shape());
+    // Tensor's Debug prints shape, dtype, device and whether it is realized
+    println!("  {name}: {tensor:?}");
 }
 
 println!("Outputs: {:?}", model.outputs.keys().collect::<Vec<_>>());

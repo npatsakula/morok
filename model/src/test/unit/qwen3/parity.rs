@@ -47,7 +47,7 @@ fn load_model() -> Qwen3Model {
 fn load_golden_vec(key: &str) -> Vec<f32> {
     let golden_path = resolve_file("golden.safetensors");
     let sd = state::load_safetensors(&golden_path).expect("load golden");
-    let mut t = sd.get(key).unwrap_or_else(|| panic!("missing golden key: {key}")).clone();
+    let t = sd.get(key).unwrap_or_else(|| panic!("missing golden key: {key}")).clone();
     t.realize().unwrap();
     t.as_vec::<f32>().unwrap()
 }
@@ -55,7 +55,7 @@ fn load_golden_vec(key: &str) -> Vec<f32> {
 fn load_golden_i64(key: &str) -> Vec<i64> {
     let golden_path = resolve_file("golden.safetensors");
     let sd = state::load_safetensors(&golden_path).expect("load golden");
-    let mut t = sd.get(key).unwrap_or_else(|| panic!("missing golden key: {key}")).clone();
+    let t = sd.get(key).unwrap_or_else(|| panic!("missing golden key: {key}")).clone();
     t.realize().unwrap();
     t.as_vec::<i64>().unwrap()
 }
@@ -95,7 +95,7 @@ fn last_hidden_state_matches_pytorch() {
     let ids = Tensor::from_slice(&ids_vec).try_reshape([batch as isize, seq_len as isize]).unwrap();
     let mask = Tensor::from_slice(&mask_vec).try_reshape([batch as isize, seq_len as isize]).unwrap();
 
-    let mut out = model.forward(&ids, Some(&mask)).unwrap();
+    let out = model.forward(&ids, Some(&mask)).unwrap();
     out.realize().unwrap();
     let got = out.as_vec::<f32>().unwrap();
 
@@ -123,7 +123,7 @@ fn embeddings_match_pytorch() {
     let ids = Tensor::from_slice(&ids_vec).try_reshape([batch as isize, seq_len as isize]).unwrap();
     let mask = Tensor::from_slice(&mask_vec).try_reshape([batch as isize, seq_len as isize]).unwrap();
 
-    let mut out = emb.encode(&ids, &mask).unwrap();
+    let out = emb.encode(&ids, &mask).unwrap();
     out.realize().unwrap();
     let got = out.as_vec::<f32>().unwrap();
 
@@ -148,7 +148,7 @@ fn ignoring_padding_diverges_from_golden() {
     let ones_mask =
         Tensor::from_slice(vec![1i64; batch * seq_len]).try_reshape([batch as isize, seq_len as isize]).unwrap();
 
-    let mut out = model.forward(&ids, Some(&ones_mask)).unwrap();
+    let out = model.forward(&ids, Some(&ones_mask)).unwrap();
     out.realize().unwrap();
     let got = out.as_vec::<f32>().unwrap();
 
@@ -191,7 +191,7 @@ fn reranker_scores_match_pytorch() {
     let sd = state::load_safetensors(&golden_path).expect("load golden reranker");
 
     let shape_vec = {
-        let mut t = sd.get("input_ids_shape").unwrap().clone();
+        let t = sd.get("input_ids_shape").unwrap().clone();
         t.realize().unwrap();
         t.as_vec::<i64>().unwrap()
     };
@@ -199,12 +199,12 @@ fn reranker_scores_match_pytorch() {
     let seq_len = shape_vec[1] as usize;
 
     let ids_vec = {
-        let mut t = sd.get("input_ids").unwrap().clone();
+        let t = sd.get("input_ids").unwrap().clone();
         t.realize().unwrap();
         t.as_vec::<i64>().unwrap()
     };
     let mask_vec = {
-        let mut t = sd.get("attention_mask").unwrap().clone();
+        let t = sd.get("attention_mask").unwrap().clone();
         t.realize().unwrap();
         t.as_vec::<i64>().unwrap()
     };
@@ -212,12 +212,12 @@ fn reranker_scores_match_pytorch() {
     let ids = Tensor::from_slice(ids_vec).try_reshape([batch as isize, seq_len as isize]).unwrap();
     let mask = Tensor::from_slice(mask_vec).try_reshape([batch as isize, seq_len as isize]).unwrap();
 
-    let mut out = reranker.forward(&ids, &mask).unwrap();
+    let out = reranker.forward(&ids, &mask).unwrap();
     out.realize().unwrap();
     let got = out.as_vec::<f32>().unwrap();
 
     let want = {
-        let mut t = sd.get("scores").unwrap().clone();
+        let t = sd.get("scores").unwrap().clone();
         t.realize().unwrap();
         t.as_vec::<f32>().unwrap()
     };

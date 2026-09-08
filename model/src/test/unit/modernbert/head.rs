@@ -1,8 +1,9 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
+use svod_tensor::nn::{Module, StateDict};
+
 use crate::modernbert::{ModernBertConfig, ModernBertForMaskedLm};
-use crate::state::{HasStateDict, StateDict};
 
 /// Tiny config matching `model::tiny_cfg` but with a smaller vocab so the
 /// `(B, L, V)` logits forward stays cheap.
@@ -35,13 +36,13 @@ fn head_weight_shapes() {
     let d = cfg.hidden_size;
     let v = cfg.vocab_size;
     let m = ModernBertForMaskedLm::empty(cfg);
-    assert_eq!(m.head.dense_weight.shape().unwrap()[0].as_const().unwrap(), d);
-    assert_eq!(m.head.dense_weight.shape().unwrap()[1].as_const().unwrap(), d);
-    assert_eq!(m.head.norm.weight.shape().unwrap()[0].as_const().unwrap(), d);
-    assert_eq!(m.head.decoder_weight.shape().unwrap()[0].as_const().unwrap(), v);
-    assert_eq!(m.head.decoder_weight.shape().unwrap()[1].as_const().unwrap(), d);
+    assert_eq!(m.head.dense_weight.dim_const(0).unwrap(), d);
+    assert_eq!(m.head.dense_weight.dim_const(1).unwrap(), d);
+    assert_eq!(m.head.norm.weight.dim_const(0).unwrap(), d);
+    assert_eq!(m.head.decoder_weight.dim_const(0).unwrap(), v);
+    assert_eq!(m.head.decoder_weight.dim_const(1).unwrap(), d);
     let bias = m.head.decoder_bias.expect("decoder_bias=true");
-    assert_eq!(bias.shape().unwrap()[0].as_const().unwrap(), v);
+    assert_eq!(bias.dim_const(0).unwrap(), v);
 }
 
 /// The head's `state_dict` → `load_state_dict` round-trip reproduces the exact
@@ -87,7 +88,7 @@ fn head_forward_output_shape() {
     let hidden = Tensor::from_slice((0..(2 * 5 * d) as i32).map(|i| i as f32).collect::<Vec<_>>())
         .try_reshape([2, 5, d])
         .unwrap();
-    let mut logits = m.head.forward(&hidden).unwrap();
+    let logits = m.head.forward(&hidden).unwrap();
     logits.realize().unwrap();
     let vals = logits.as_vec::<f32>().unwrap();
     assert_eq!(vals.len(), 2 * 5 * v, "(B,L,V) = (2,5,{v})");
@@ -154,6 +155,24 @@ fn mlm_model_state_dict_round_trip() {
     assert_eq!(sd.keys().collect::<std::collections::HashSet<_>>(), sd2.keys().collect());
 }
 
+/// The composite key set is exactly the backbone's plus the head's, and a
+/// non-empty prefix nests all of them without growing a leading dot.
+#[test]
+fn mlm_state_dict_keys_nest_under_a_prefix() {
+    let m = ModernBertForMaskedLm::empty(tiny_cfg());
+    let mut want: Vec<String> = m.state_dict("").keys().cloned().collect();
+    want.sort();
+    // The head contributes exactly these three on top of the backbone's.
+    for key in ["head.dense.weight", "head.norm.weight", "decoder.bias"] {
+        assert!(want.iter().any(|k| k == key), "missing head key: {key}");
+    }
+
+    let mut got: Vec<String> = m.state_dict("m").keys().cloned().collect();
+    got.sort();
+    let want_nested: Vec<String> = want.iter().map(|k| format!("m.{k}")).collect();
+    assert_eq!(got, want_nested);
+}
+
 /// `ModernBertForMaskedLm::forward` runs the full backbone + head end-to-end
 /// and returns `(B, L, V)` logits.
 #[test]
@@ -162,7 +181,7 @@ fn mlm_forward_output_shape() {
     let v = cfg.vocab_size;
     let m = ModernBertForMaskedLm::empty(cfg);
     let ids = Tensor::from_slice((0..10i64).collect::<Vec<_>>()).try_reshape([2isize, 5]).unwrap();
-    let mut logits = m.forward(&ids, None).unwrap();
+    let logits = m.forward(&ids, None).unwrap();
     logits.realize().unwrap();
     let vals = logits.as_vec::<f32>().unwrap();
     assert_eq!(vals.len(), 2 * 5 * v, "(B,L,V) = (2,5,{v})");
@@ -172,7 +191,7 @@ fn mlm_forward_output_shape() {
 }
 
 fn realize_vec_f32(t: &svod_tensor::Tensor) -> Vec<f32> {
-    let mut t = t.clone();
+    let t = t.clone();
     t.realize().unwrap();
     t.as_vec::<f32>().unwrap()
 }

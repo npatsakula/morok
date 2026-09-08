@@ -7,6 +7,7 @@
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::{CoordinateTransformMode, NearestMode, ResizeMode};
 
 use crate::wespeaker::WeSpeakerResNet34;
 
@@ -17,20 +18,12 @@ use crate::wespeaker::WeSpeakerResNet34;
 fn forward_zero_weights_shape() {
     let model = WeSpeakerResNet34::with_zero_weights(crate::wespeaker::WeSpeakerConfig::new().with_max_batch_size(1));
 
-    let feats = Tensor::zeros(&[1, 1598, 80], DType::Float32).unwrap();
-    let weights = Tensor::ones(&[1, 799], DType::Float32).unwrap();
+    let feats = Tensor::zeros(&[1, 1598, 80], DType::Float32);
+    let weights = Tensor::ones(&[1, 799], DType::Float32);
 
-    let var = svod_tensor::Variable::new("b", 1, 1);
-    let b = var.bind(1).unwrap();
+    let out = model.forward(&feats, &weights).unwrap();
 
-    let out = model.forward(&feats, &weights, &b).unwrap();
-
-    let shape: Vec<usize> = out
-        .shape()
-        .unwrap()
-        .iter()
-        .map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete or symbolic-max shape"))
-        .collect();
+    let shape = crate::test::max_dims(&out);
     assert_eq!(shape, vec![1, 256]);
 }
 
@@ -42,20 +35,37 @@ fn forward_zero_weights_shape() {
 fn forward_zero_weights_realize() {
     let model = WeSpeakerResNet34::with_zero_weights(crate::wespeaker::WeSpeakerConfig::new().with_max_batch_size(1));
 
-    let feats = Tensor::zeros(&[1, 1598, 80], DType::Float32).unwrap();
-    let weights = Tensor::ones(&[1, 799], DType::Float32).unwrap();
+    let feats = Tensor::zeros(&[1, 1598, 80], DType::Float32);
+    let weights = Tensor::ones(&[1, 799], DType::Float32);
 
-    let var = svod_tensor::Variable::new("b", 1, 1);
-    let b = var.bind(1).unwrap();
-
-    let mut out = model.forward(&feats, &weights, &b).unwrap();
+    let out = model.forward(&feats, &weights).unwrap();
     out.realize().unwrap();
 
-    let shape: Vec<usize> = out
-        .shape()
-        .unwrap()
-        .iter()
-        .map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete or symbolic-max shape"))
-        .collect();
+    let shape = crate::test::max_dims(&out);
     assert_eq!(shape, vec![1, 256]);
+}
+
+/// The nearest-mode resample the TSTP head runs on the attention weights must
+/// reproduce `F.interpolate(..., mode="nearest")` index-for-index — an
+/// asymmetric coordinate transform with floor rounding, i.e. the one-hot map
+/// `src = floor(o * T_in / T_out)` this head used to build by hand.
+#[test]
+fn nearest_resample_matches_floor_index_map() {
+    let (t_in, t_out) = (799usize, 200usize);
+    let src: Vec<f32> = (0..t_in).map(|i| i as f32).collect();
+    let weights = Tensor::from_slice(&src).try_reshape([1, t_in as isize]).unwrap();
+
+    let resampled = weights
+        .resize()
+        .axes(&[1])
+        .sizes(&[t_out])
+        .mode(ResizeMode::Nearest)
+        .nearest_mode(NearestMode::Floor)
+        .coordinate_transformation_mode(CoordinateTransformMode::Asymmetric)
+        .call()
+        .unwrap();
+
+    // The ramp carries its own source index, so the output *is* the index map.
+    let expected: Vec<f32> = (0..t_out).map(|o| ((o * t_in) / t_out) as f32).collect();
+    assert_eq!(resampled.to_vec::<f32>().unwrap(), expected);
 }

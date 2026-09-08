@@ -3,19 +3,32 @@
 mod conv;
 mod conv1d;
 mod grid_sample;
+mod layers;
 mod linear;
 mod lstm_cell;
+pub mod module;
 mod norm;
 pub mod pad;
 mod pool;
 mod quantize;
 mod resize;
 mod rnn;
+pub mod stft;
 
+pub use conv::Pad1d;
 pub use conv1d::Conv1d;
+pub use layers::{BatchNorm2d, Conv2d, ConvTranspose2d, Embedding, LayerNorm, RmsNorm};
 pub use linear::Linear;
-pub use lstm_cell::LSTMCell;
-pub use rnn::{GruOutput, LstmOutput, RnnOutput};
+pub use lstm_cell::{LSTMCell, LstmCell};
+pub use module::{Module, StateDict, get_tensor, prefixed};
+pub use rnn::{
+    GruCell, GruDirection, GruOutput, LinearBeforeReset, LstmOutput, RecurrentCell, RnnCell, RnnDirection, RnnLayout,
+    RnnOutput, RnnStack,
+};
+pub use stft::Window;
+/// Derive [`Module`](trait@Module): the trait lives in the type namespace and
+/// this derive in the macro namespace, so one name serves both.
+pub use svod_macros::Module;
 
 /// A neural network layer.
 pub trait Layer {
@@ -40,7 +53,8 @@ use svod_ir::SInt;
 
 use crate::Tensor;
 use crate::error::{
-    DivisibilitySnafu, NdimExactSnafu, NdimMinimumSnafu, ParamRangeSnafu, SymbolicShapeUnsupportedSnafu, UOpSnafu,
+    DivisibilitySnafu, KindResult, NdimExactSnafu, NdimMinimumSnafu, ParamRangeSnafu, SymbolicShapeUnsupportedSnafu,
+    UOpSnafu,
 };
 use crate::reduce::AxisSpec;
 
@@ -212,7 +226,7 @@ impl Tensor {
     /// # use ndarray::array;
     /// let logprobs = Tensor::from_ndarray(&array![[-0.5f32, -1.0, -2.0]]);
     /// let target = Tensor::from_slice([0i64]);
-    /// let mut loss = logprobs.nll_loss().target(&target).call().unwrap();
+    /// let loss = logprobs.nll_loss().target(&target).call().unwrap();
     /// loss.realize().unwrap();
     /// let val = loss.as_vec::<f32>().unwrap();
     /// // -(-0.5) = 0.5
@@ -227,7 +241,7 @@ impl Tensor {
     /// # use ndarray::array;
     /// let logprobs = Tensor::from_ndarray(&array![[-0.5f32, -1.0], [-2.0, -0.3]]);
     /// let target = Tensor::from_slice([0i64, 1]);
-    /// let mut loss = logprobs.nll_loss().target(&target).reduction(Reduction::Sum).call().unwrap();
+    /// let loss = logprobs.nll_loss().target(&target).reduction(Reduction::Sum).call().unwrap();
     /// loss.realize().unwrap();
     /// let val = loss.as_vec::<f32>().unwrap();
     /// // sum of 0.5 + 0.3 = 0.8
@@ -246,7 +260,7 @@ impl Tensor {
         let ndim = self.ndim()?;
         snafu::ensure!(ndim >= 2, NdimMinimumSnafu { op: "nll_loss", min: 2_usize, actual: ndim });
         // Gather log-probs at target class, negate
-        let nll = self.gather(1, &target.try_unsqueeze(1)?)?.try_squeeze(Some(1))?.try_neg()?;
+        let nll = self.gather(1, &target.try_unsqueeze(1)?)?.try_squeeze(Some(1))?.neg();
 
         // Per-sample weight: weight[target] or ones
         let sample_weight = match weight {
@@ -258,15 +272,15 @@ impl Tensor {
             }
             None => {
                 let shape = svod_ir::shape::to_vec_usize(&target.shape()?).context(UOpSnafu)?;
-                Tensor::full(&shape, 1.0, self.uop().dtype())?
+                Tensor::full(&shape, 1.0, self.uop().dtype())
             }
         };
 
         // Mask out ignore_index
         let masked_weight = match ignore_index {
             Some(idx) => {
-                let mask = target.try_ne(&Tensor::const_(idx as f64, target.uop().dtype()))?;
-                sample_weight.try_mul(&mask.cast(sample_weight.uop().dtype())?)?
+                let mask = target.try_ne(Tensor::const_(idx as f64, target.uop().dtype()))?;
+                sample_weight.try_mul(mask.cast(sample_weight.uop().dtype()))?
             }
             None => sample_weight,
         };
@@ -312,11 +326,11 @@ impl Tensor {
         let _ = p;
         let shape = svod_ir::shape::to_vec_usize(&self.shape()?).context(UOpSnafu)?;
         if !training {
-            let mask = Tensor::full(&shape, true, DType::Bool)?;
+            let mask = Tensor::full(&shape, true, DType::Bool);
             return Ok((self.clone(), mask));
         }
         // Training mode deferred (needs RNG: rand_like / Threefry)
-        let mask = Tensor::full(&shape, true, DType::Bool)?;
+        let mask = Tensor::full(&shape, true, DType::Bool);
         Ok((self.clone(), mask))
     }
     /// Convolution with ONNX-style parameters.
@@ -334,7 +348,7 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let mut y = x.conv().weight(&w).call().unwrap();
+    /// let y = x.conv().weight(&w).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 3, 3]);
@@ -349,7 +363,7 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let mut y = x.conv().weight(&w).pads(&[1, 1, 1, 1]).strides(&[2, 2]).call().unwrap();
+    /// let y = x.conv().weight(&w).pads(&[1, 1, 1, 1]).strides(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 3, 3]);
@@ -375,7 +389,7 @@ impl Tensor {
             None => w_shape[2..]
                 .iter()
                 .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv" }))
-                .collect::<Result<Vec<_>>>()?,
+                .collect::<KindResult<Vec<_>>>()?,
         };
         let n = kernel.len();
         let strides_u: Vec<usize> =
@@ -411,7 +425,7 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let mut y = x.conv_transpose().weight(&w).call().unwrap();
+    /// let y = x.conv_transpose().weight(&w).call().unwrap();
     /// y.realize().unwrap();
     /// let vals = y.as_vec::<f32>().unwrap();
     /// assert_eq!(vals.len(), 16); // 4x4 output
@@ -425,7 +439,7 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let mut y = x.conv_transpose().weight(&w).strides(&[2, 2]).call().unwrap();
+    /// let y = x.conv_transpose().weight(&w).strides(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let vals = y.as_vec::<f32>().unwrap();
     /// assert_eq!(vals.len(), 25); // 5x5 output
@@ -452,7 +466,7 @@ impl Tensor {
             None => w_shape[2..]
                 .iter()
                 .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv_transpose" }))
-                .collect::<Result<Vec<_>>>()?,
+                .collect::<KindResult<Vec<_>>>()?,
         };
         let n = kernel.len();
         let x_shape = self.shape()?;
@@ -470,7 +484,7 @@ impl Tensor {
         let input_spatial_c: Vec<usize> = input_spatial
             .iter()
             .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv_transpose" }))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KindResult<Vec<_>>>()?;
 
         // Path 1: output_shape provided → derive total pads, apply auto_pad
         if let Some(os) = output_shape {
@@ -533,7 +547,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let mut y = x.avg_pool().kernel_shape(&[2, 2]).call().unwrap();
+    /// let y = x.avg_pool().kernel_shape(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 3, 3]);
@@ -547,7 +561,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let mut y = x.avg_pool().kernel_shape(&[2, 2]).strides(&[2, 2]).call().unwrap();
+    /// let y = x.avg_pool().kernel_shape(&[2, 2]).strides(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 2, 2]);
@@ -603,7 +617,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let mut y = x.lp_pool().kernel_shape(&[2, 2]).call().unwrap();
+    /// let y = x.lp_pool().kernel_shape(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 3, 3]);
@@ -645,7 +659,7 @@ impl Tensor {
         let dtype = self.uop().dtype();
         let p_tensor = Tensor::const_(p_f, dtype.clone());
         let inv_p = Tensor::const_(1.0 / p_f, dtype);
-        let x_abs_p = self.try_abs()?.try_pow(&p_tensor)?;
+        let x_abs_p = self.abs().try_pow(&p_tensor)?;
 
         // Pad, pool (create windows), then sum over kernel axes.
         // This computes sum(|x|^p) directly — correct for all padding/ceil modes
@@ -681,7 +695,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 4, 1, 1), 1.0f32));
-    /// let mut y = x.depth_to_space().blocksize(2).call().unwrap();
+    /// let y = x.depth_to_space().blocksize(2).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 2, 2]);
@@ -695,7 +709,7 @@ impl Tensor {
     /// # use svod_tensor::nn::DepthToSpaceMode;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 4, 1, 1), 1.0f32));
-    /// let mut y = x.depth_to_space().blocksize(2).mode(DepthToSpaceMode::Crd).call().unwrap();
+    /// let y = x.depth_to_space().blocksize(2).mode(DepthToSpaceMode::Crd).call().unwrap();
     /// y.realize().unwrap();
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 4]);
     /// ```
@@ -769,7 +783,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let mut y = x.space_to_depth(2).unwrap();
+    /// let y = x.space_to_depth(2).unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 4, 2, 2]);
@@ -898,9 +912,9 @@ impl Tensor {
             .ceil_mode(ceil_mode)
             .call()?;
         let indices = if storage_order == 1 {
-            indices.try_transpose(-2, -1)?.cast(DType::Int64)?
+            indices.try_transpose(-2, -1)?.cast(DType::Int64)
         } else {
-            indices.cast(DType::Int64)?
+            indices.cast(DType::Int64)
         };
         Ok((values, indices))
     }
@@ -957,7 +971,7 @@ impl Tensor {
             shape[2].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "lrn" })?,
             shape[3].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "lrn" })?,
         );
-        let x_sq = self.square()?;
+        let x_sq = self.square();
         let x_sq = x_sq.try_reshape([b as isize, 1, c as isize, (h * w) as isize])?;
         let pad_before = ((size - 1) / 2) as isize;
         let pad_after = (size / 2) as isize;
@@ -966,9 +980,9 @@ impl Tensor {
         let pooled = pooled.try_reshape([b as isize, c as isize, h as isize, w as isize])?;
         let dtype = self.uop().dtype();
         let scale = pooled
-            .try_mul(&Tensor::const_(alpha, dtype.clone()))?
-            .try_add(&Tensor::const_(bias, dtype.clone()))?
-            .try_pow(&Tensor::const_(beta, dtype))?;
+            .try_mul(Tensor::const_(alpha, dtype.clone()))?
+            .try_add(Tensor::const_(bias, dtype.clone()))?
+            .try_pow(Tensor::const_(beta, dtype))?;
         self.try_div(&scale)
     }
 }

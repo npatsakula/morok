@@ -138,11 +138,14 @@ macro_rules! __s_collect {
 // =========================================================================
 
 fn idx_err(details: impl Into<String>) -> Error {
-    Error::IrConstruction { details: details.into() }
+    ErrorKind::IrConstruction { details: details.into() }.into()
 }
 
 fn concrete(shape: &svod_ir::shape::Shape, d: usize, what: &str) -> Result<usize> {
-    shape[d].as_const().ok_or_else(|| Error::SymbolicShapeUnsupported { operation: what.to_string() })
+    shape[d]
+        .as_const()
+        .ok_or_else(|| ErrorKind::SymbolicShapeUnsupported { operation: what.to_string() })
+        .map_err(Into::into)
 }
 
 /// Resolve a (possibly negative) integer index against a concrete dim.
@@ -479,7 +482,7 @@ impl Tensor {
         if p.newaxis || !p.fancy.is_empty() {
             return Err(idx_err("set supports only Full / range / integer indices (no NewAxis or fancy)"));
         }
-        let sym = || Error::SymbolicShapeUnsupported { operation: "set on a symbolic dim".to_string() };
+        let sym = || ErrorKind::SymbolicShapeUnsupported { operation: "set on a symbolic dim".to_string() };
         let bounds: Vec<Option<(usize, usize)>> = p
             .bounds
             .iter()
@@ -535,8 +538,8 @@ impl Tensor {
             ar_shape[d] = dim as isize;
             let ar = ar.try_reshape(&ar_shape)?;
             let dt = ar.uop().dtype();
-            let lo = ar.try_ge(&Tensor::const_(ConstValue::Int(*s as i64), dt.clone()))?;
-            let hi = ar.try_lt(&Tensor::const_(ConstValue::Int(*e as i64), dt))?;
+            let lo = ar.try_ge(Tensor::const_(ConstValue::Int(*s as i64), dt.clone()))?;
+            let hi = ar.try_lt(Tensor::const_(ConstValue::Int(*e as i64), dt))?;
             let cond = lo.try_bitand(&hi)?;
             mask = Some(match mask {
                 None => cond,

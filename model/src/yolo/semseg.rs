@@ -3,61 +3,55 @@
 //! Full backbone (layers 0–10) + partial FPN top-down (layers 11–16) +
 //! Conv→Conv2d classifier on P3. Forward returns `[B, nc, H/8, W/8]` logits.
 
-use snafu::ResultExt;
-use svod_tensor::{BoundVariable, Tensor};
+use svod_tensor::Tensor;
+use svod_tensor::nn::{Conv2d, Layer, Module, ResizeMode};
 
-use crate::state::{self, HasStateDict, StateDict, prefixed};
+use crate::state::StateDict;
 
-use super::backbone::{YoloBackbone, upsample_nearest_2x};
-use super::blocks::conv::{Conv2dBias, YoloConv};
+use super::backbone::YoloBackbone;
+use super::blocks::conv::{YoloConv, conv2d_bias};
 use super::blocks::csp::C3k2;
 use super::config::{YoloConfig, make_depth};
-use super::error::{Result, StateSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::loader;
 
 /// Semantic segmentation classifier: Conv(k3) → Conv2d(k1, bias).
 ///
 /// State-dict keys: `classifier.0.{conv,bn}.*`, `classifier.2.{weight,bias}`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct SemSegClassifier {
+    #[module(key = "0")]
     pub conv0: YoloConv,
-    pub conv2: Conv2dBias,
+    #[module(key = "2")]
+    pub conv2: Conv2d,
 }
 
 impl SemSegClassifier {
     pub fn empty(in_ch: usize, nc: usize) -> Self {
-        Self { conv0: YoloConv::empty(in_ch, in_ch, 3, 1, true), conv2: Conv2dBias::empty(in_ch, nc, 1, 1) }
+        Self { conv0: YoloConv::empty(in_ch, in_ch, 3, 1, true), conv2: conv2d_bias(in_ch, nc, 1, 1) }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.conv0.forward(x)?;
-        self.conv2.forward(&x)
-    }
-}
-
-impl HasStateDict for SemSegClassifier {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.conv0.state_dict(&prefixed(prefix, "0"));
-        sd.extend(self.conv2.state_dict(&prefixed(prefix, "2")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.conv0.load_state_dict(sd, &prefixed(prefix, "0"))?;
-        self.conv2.load_state_dict(sd, &prefixed(prefix, "2"))?;
-        Ok(())
+        Ok(self.conv2.forward(&x)?)
     }
 }
 
 /// YOLO v26 semantic segmentation model.
 ///
 /// Forward returns `[B, nc, H/8, W/8]` per-pixel logits.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Yolo26SemSeg {
+    #[module(skip)]
     pub config: YoloConfig,
+    #[module(key = "")]
     pub backbone: YoloBackbone,
+    #[module(key = "13")]
     pub c3k2_13: C3k2,
+    #[module(key = "16")]
     pub c3k2_16: C3k2,
+    #[module(key = "17.classifier")]
     pub classifier: SemSegClassifier,
 }
 
@@ -92,43 +86,24 @@ impl Yolo26SemSeg {
 
     pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "").context(StateSnafu)?;
+        model.load_state_dict(sd, "")?;
         Ok(model)
     }
 
     /// Run the full network. Returns `[B, nc, H/8, W/8]` per-pixel logits.
-    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        let x = loader::shrink_batch(images, batch)?;
-        let (l4, l6, l10) = self.backbone.forward(&x)?;
+    pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let (l4, l6, l10) = self.backbone.forward(images)?;
 
         // Partial FPN top-down (layers 11–16)
-        let up = upsample_nearest_2x(&l10)?;
-        let cat = Tensor::cat(&[&up, &l6], 1).context(TensorSnafu)?;
+        let up = l10.upsample(&[2, 2], ResizeMode::Nearest)?;
+        let cat = Tensor::cat(&[&up, &l6], 1)?;
         let l13 = self.c3k2_13.forward(&cat)?;
 
-        let up = upsample_nearest_2x(&l13)?;
-        let cat = Tensor::cat(&[&up, &l4], 1).context(TensorSnafu)?;
+        let up = l13.upsample(&[2, 2], ResizeMode::Nearest)?;
+        let cat = Tensor::cat(&[&up, &l4], 1)?;
         let l16 = self.c3k2_16.forward(&cat)?;
 
         // Classifier on P3
         self.classifier.forward(&l16)
-    }
-}
-
-impl HasStateDict for Yolo26SemSeg {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.backbone.state_dict(prefix);
-        sd.extend(self.c3k2_13.state_dict(&prefixed(prefix, "13")));
-        sd.extend(self.c3k2_16.state_dict(&prefixed(prefix, "16")));
-        sd.extend(self.classifier.state_dict(&prefixed(prefix, "17.classifier")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.backbone.load_state_dict(sd, prefix)?;
-        self.c3k2_13.load_state_dict(sd, &prefixed(prefix, "13"))?;
-        self.c3k2_16.load_state_dict(sd, &prefixed(prefix, "16"))?;
-        self.classifier.load_state_dict(sd, &prefixed(prefix, "17.classifier"))?;
-        Ok(())
     }
 }

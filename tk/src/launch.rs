@@ -632,7 +632,7 @@ where
     // Outputs are allocated fresh by `realize_buffer` below.
     for t in ins.iter() {
         // Inputs are immutable refs; realize via a clone that shares the entry/buffer.
-        let mut t = (*t).clone();
+        let t = (*t).clone();
         t.realize().context(RealizeSnafu)?;
     }
 
@@ -694,12 +694,13 @@ pub fn realize_buffer(t: &Tensor) -> Result<Buffer> {
     // BUFFER UOp's device, then register it so `t.buffer()` resolves it.
     let base = t.uop().base();
     let svod_ir::Op::Buffer(ops::Buffer { arg, .. }) = base.op() else {
-        return Err(RealizeSnafu.into_error(svod_tensor::error::Error::NoBuffer));
+        return Err(RealizeSnafu.into_error(svod_tensor::error::ErrorKind::NoBuffer.into()));
     };
     let Some(spec) = arg.device.as_ref() else {
-        return Err(RealizeSnafu.into_error(svod_tensor::error::Error::NoBuffer));
+        return Err(RealizeSnafu.into_error(svod_tensor::error::ErrorKind::NoBuffer.into()));
     };
-    let size = base.buffer_size().ok_or_else(|| RealizeSnafu.into_error(svod_tensor::error::Error::NoBuffer))?;
+    let size =
+        base.buffer_size().ok_or_else(|| RealizeSnafu.into_error(svod_tensor::error::ErrorKind::NoBuffer.into()))?;
     let dtype = base.dtype();
     let shape: Vec<usize> = t
         .shape()

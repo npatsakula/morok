@@ -191,14 +191,12 @@ fn sq_attention_packed_validates_head_geometry() {
     let k = Tensor::empty(&[1, 5, 4, 64], DType::Float32);
     let v = Tensor::empty(&[1, 5, 4, 64], DType::Float32);
     let err = crate::single_query_attention_packed(&q, &k, &v, 2, SqAttentionOpts::default())
-        .err()
-        .expect("out-of-range heads");
+        .expect_err("out-of-range heads");
     assert!(matches!(err, crate::LaunchError::OperandDimMismatch { .. }));
 
     let bad_v = Tensor::empty(&[1, 5, 5, 64], DType::Float32);
     let err = crate::single_query_attention_packed(&q, &k, &bad_v, 1, SqAttentionOpts::default())
-        .err()
-        .expect("mismatched total heads");
+        .expect_err("mismatched total heads");
     assert!(matches!(err, crate::LaunchError::OperandDimMismatch { .. }));
 }
 
@@ -246,9 +244,9 @@ fn sq_attention_numerical_gpu() {
         return;
     }
     let (b, n, h, h_total, d, head_offset) = (2, 20, 3, 7, 64, 2);
-    let mut q = Tensor::randn(&[b, 1, h, d]).expect("q");
-    let mut k = Tensor::randn(&[b, n, h_total, d]).expect("k");
-    let mut v = Tensor::randn(&[b, n, h_total, d]).expect("v");
+    let q = Tensor::randn(&[b, 1, h, d]).expect("q");
+    let k = Tensor::randn(&[b, n, h_total, d]).expect("k");
+    let v = Tensor::randn(&[b, n, h_total, d]).expect("v");
     q.realize().expect("realize q");
     k.realize().expect("realize k");
     v.realize().expect("realize v");
@@ -263,7 +261,7 @@ fn sq_attention_numerical_gpu() {
                 t.realize().expect("realize lens");
             }
             let opts = SqAttentionOpts { key_lens: lens_t.as_ref(), include_last: lens.is_some(), split };
-            let mut got = crate::single_query_attention_packed(&q, &k, &v, head_offset, opts)
+            let got = crate::single_query_attention_packed(&q, &k, &v, head_offset, opts)
                 .expect("sq attention")
                 .expect("supported");
             got.realize().expect("realize output");
@@ -277,9 +275,9 @@ fn sq_attention_numerical_gpu() {
     // Production cross-cache geometry. A 150-key chunk leaves a ragged width-8
     // tile on both wave64 (8 groups) and wave32 (4 groups).
     let (b, n, h, h_total, d, head_offset) = (5, 1500, 20, 24, 64, 2);
-    let mut q = Tensor::randn(&[b, 1, h, d]).expect("production q");
-    let mut k = Tensor::randn(&[b, n, h_total, d]).expect("production k");
-    let mut v = Tensor::randn(&[b, n, h_total, d]).expect("production v");
+    let q = Tensor::randn(&[b, 1, h, d]).expect("production q");
+    let k = Tensor::randn(&[b, n, h_total, d]).expect("production k");
+    let v = Tensor::randn(&[b, n, h_total, d]).expect("production v");
     q.realize().expect("realize production q");
     k.realize().expect("realize production k");
     v.realize().expect("realize production v");
@@ -291,7 +289,7 @@ fn sq_attention_numerical_gpu() {
         head_offset,
         None,
     );
-    let mut got = crate::single_query_attention_packed(
+    let got = crate::single_query_attention_packed(
         &q,
         &k,
         &v,
@@ -315,9 +313,9 @@ fn sq_attention_numerical_gpu() {
 #[test]
 fn undivisible_head_dim_declines_instead_of_erroring() {
     let (b, n, h, d) = (1usize, 3usize, 2usize, 4usize);
-    let q = Tensor::zeros(&[b, 1, h, d], DType::Float32).expect("q");
-    let k = Tensor::zeros(&[b, n, h, d], DType::Float32).expect("k");
-    let v = Tensor::zeros(&[b, n, h, d], DType::Float32).expect("v");
+    let q = Tensor::zeros(&[b, 1, h, d], DType::Float32);
+    let k = Tensor::zeros(&[b, n, h, d], DType::Float32);
+    let v = Tensor::zeros(&[b, n, h, d], DType::Float32);
     let out = crate::single_query_attention(&q, &k, &v, SqAttentionOpts::default()).expect("declines, not errors");
     assert!(out.is_none(), "head dim 4 divides no supported wave size (32/64); the launch must fall back");
 }

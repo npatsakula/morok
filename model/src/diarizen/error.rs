@@ -5,34 +5,24 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("tensor op failed"))]
+    #[snafu(display("{source}"), context(false))]
     Tensor {
         #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
         source: Box<svod_tensor::error::Error>,
     },
-    #[snafu(display("state-dict op failed"))]
-    State {
-        #[snafu(source(from(crate::state::Error, Box::new)))]
-        source: Box<crate::state::Error>,
-    },
-    #[snafu(display("WavLM error"))]
-    WavLm {
-        #[snafu(source(from(crate::wavlm::Error, Box::new)))]
-        source: Box<crate::wavlm::Error>,
-    },
-    #[snafu(display("HF Hub op failed"))]
+    #[snafu(display("HF Hub op failed"), context(false))]
     Hub { source: hf_hub::HFError },
     #[snafu(display("pickle loader failed"))]
     Pickle {
         #[snafu(source(from(crate::wespeaker::pickle::Error, Box::new)))]
         source: Box<crate::wespeaker::pickle::Error>,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Jit {
         #[snafu(source(from(crate::jit::JitError, Box::new)))]
         source: Box<crate::jit::JitError>,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Device {
         #[snafu(source(from(svod_device::error::Error, Box::new)))]
         source: Box<svod_device::error::Error>,
@@ -46,18 +36,8 @@ impl From<crate::wavlm::Error> for Error {
         use crate::wavlm::Error as W;
         match e {
             W::Tensor { source } => Error::Tensor { source },
-            W::State { source } => Error::State { source },
             W::Pickle { source } => Error::Pickle { source },
             W::Hub { source } => Error::Hub { source },
-            other => Error::WavLm { source: Box::new(other) },
-        }
-    }
-}
-
-impl From<crate::blocks::Error> for Error {
-    fn from(e: crate::blocks::Error) -> Self {
-        match e {
-            crate::blocks::Error::Tensor { source } => Error::Tensor { source },
         }
     }
 }

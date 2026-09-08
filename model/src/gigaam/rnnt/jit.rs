@@ -2,38 +2,28 @@
 //! (`super::block::forward_block`): all loop state device-local; the host
 //! reads three tapes + one flag per block.
 
-extern crate self as svod_model;
-
 use svod_macros::jit_wrapper;
 
 use crate::gigaam::model::GigaAm;
 
-#[allow(clippy::too_many_arguments)]
-mod block_jit {
-    use super::*;
-    jit_wrapper! {
-        RnntBlockJit(GigaAm) {
-            enc: Tensor,
-            time: Tensor,
-            prev: Tensor,
-            symbols: Tensor,
-            valid: Tensor,
-            h_in: Tensor,
-            c_in: Tensor,
+jit_wrapper! {
+    RnntBlockJit(GigaAm) {
+        inputs { enc: Tensor, valid: Tensor }
+        // The five carried states recycle in the JIT's own input buffers:
+        // `execute()` stores each block's final value where the next block's
+        // step 0 reads it, so no host copy and no device->device recycle.
+        state { time: Tensor, prev: Tensor, symbols: Tensor, h: Tensor, c: Tensor }
+        outputs { tape, emit, frame, active_any }
 
-            outputs { tape, emit, frame, active_any, time_out, prev_out, symbols_out, h_out, c_out },
-
-            build(enc, time, prev, symbols, valid, h_in, c_in) {
-                // WIND decode window. Byte-identical output for any W>=1 (a pure
-                // perf knob, optimum is GPU-dependent); 4 is the validated default.
-                let out: crate::gigaam::error::Result<_> =
-                    crate::gigaam::rnnt::block::forward_block::<4>(model, enc, time, prev, symbols, valid, h_in, c_in);
-                out
-            }
+        build(enc, valid, time, prev, symbols, h, c) {
+            // WIND decode window. Byte-identical output for any W>=1 (a pure
+            // perf knob, optimum is GPU-dependent); 4 is the validated default.
+            let out: crate::gigaam::error::Result<_> =
+                crate::gigaam::rnnt::block::forward_block::<4>(model, enc, time, prev, symbols, valid, h, c);
+            out
         }
     }
 }
-pub(crate) use block_jit::RnntBlockJit;
 
 jit_wrapper! {
     RnntEncProjJit(GigaAm) {

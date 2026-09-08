@@ -26,32 +26,32 @@ fn forward_step_fixed_batch_keeps_batch_concrete() {
     let (batch, n_audio_ctx) = (2usize, 8usize);
     let d_head = dims.n_text_state / dims.n_text_head;
     let layer_heads = dims.n_text_layer * dims.n_text_head;
-    let token = Tensor::zeros(&[batch, 1], DType::Int32).unwrap();
-    let pos_emb = Tensor::zeros(&[batch, 1, dims.n_text_state], DType::Float32).unwrap();
-    let self_k = Tensor::zeros(&[batch, dims.n_text_ctx, layer_heads, d_head], DType::Float32).unwrap();
-    let self_v = Tensor::zeros(&[batch, dims.n_text_ctx, layer_heads, d_head], DType::Float32).unwrap();
-    let cross_k = Tensor::zeros(&[batch, n_audio_ctx, layer_heads, d_head], DType::Float32).unwrap();
-    let cross_v = Tensor::zeros(&[batch, n_audio_ctx, layer_heads, d_head], DType::Float32).unwrap();
-    let key_lens = Tensor::zeros(&[batch], DType::Int32).unwrap();
+    let token = Tensor::zeros(&[batch, 1], DType::Int32);
+    let pos_emb = Tensor::zeros(&[batch, 1, dims.n_text_state], DType::Float32);
+    let self_k = Tensor::zeros(&[batch, dims.n_text_ctx, layer_heads, d_head], DType::Float32);
+    let self_v = Tensor::zeros(&[batch, dims.n_text_ctx, layer_heads, d_head], DType::Float32);
+    let cross_k = Tensor::zeros(&[batch, n_audio_ctx, layer_heads, d_head], DType::Float32);
+    let cross_v = Tensor::zeros(&[batch, n_audio_ctx, layer_heads, d_head], DType::Float32);
+    let key_lens = Tensor::zeros(&[batch], DType::Int32);
 
-    let (mut logits, new_k, new_v) =
+    let (logits, new_k, new_v) =
         model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens).unwrap();
-    assert_eq!(logits.shape().unwrap()[0].as_const(), Some(batch));
-    assert_eq!(new_k.shape().unwrap()[0].as_const(), Some(batch));
-    assert_eq!(new_v.shape().unwrap()[0].as_const(), Some(batch));
-    logits.realize().unwrap();
-    assert!(logits.as_vec::<f32>().unwrap().into_iter().all(f32::is_finite));
+    assert_eq!(logits.dim_const(0).unwrap(), batch);
+    assert_eq!(new_k.dim_const(0).unwrap(), batch);
+    assert_eq!(new_v.dim_const(0).unwrap(), batch);
+    assert!(logits.to_vec::<f32>().unwrap().into_iter().all(f32::is_finite));
 }
 
+/// `true` = attend: the cached prefix each lane filled, plus the key this step
+/// appended at the end of the cache.
 #[test]
-fn cached_step_key_lengths_mask_only_prefix_and_appended_key() {
+fn cached_step_key_lengths_admit_only_prefix_and_appended_key() {
     let key_lens = Tensor::from_slice([0i32, 3]);
-    let mut mask = cached_step_mask(&key_lens, 2, 6).unwrap();
-    assert_eq!(mask.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(), [2, 1, 1, 6]);
-    mask.realize().unwrap();
+    let valid = cached_step_mask(&key_lens, 6).unwrap();
+    assert_eq!(valid.dims().unwrap(), [2, 6]);
     assert_eq!(
-        mask.as_vec::<bool>().unwrap(),
-        [true, true, true, true, true, false, false, false, false, true, true, false]
+        valid.to_vec::<bool>().unwrap(),
+        [false, false, false, false, false, true, true, true, true, false, false, true]
     );
 }
 
@@ -84,7 +84,7 @@ fn decoder_step_attention_modes_match_generic_gpu_sdpa() {
     let cross_v = Tensor::randn(&[batch, dims.n_audio_ctx, layer_heads, d_head]).unwrap();
     let key_lens = Tensor::from_slice([2i32, 5]);
 
-    let mut outputs = [
+    let outputs = [
         StepAttentionMode::Generic,
         StepAttentionMode::CustomSelf,
         StepAttentionMode::CustomCross { split: 1 },
@@ -99,7 +99,7 @@ fn decoder_step_attention_modes_match_generic_gpu_sdpa() {
             .unwrap()
             .0
     });
-    Tensor::realize_batch(outputs.iter_mut()).unwrap();
+    Tensor::realize_batch(outputs.iter()).unwrap();
     let reference = outputs[0].as_vec::<f32>().unwrap();
     for (mode, output) in [
         StepAttentionMode::CustomSelf,

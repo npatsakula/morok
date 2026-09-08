@@ -42,16 +42,15 @@ use ndarray::array;
 let a = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
 let b = Tensor::from_ndarray(&array![[5.0f32, 6.0], [7.0, 8.0]]);
 
-// Lazy — nothing executes yet
-let mut c = &a + &b;
+// Lazy — nothing executes yet; the operator returns `Result<Tensor>`
+let c = (&a + &b)?;
 
-// Compile and execute, then extract as ndarray
-c.realize()?;
-let result = c.as_ndarray::<f32>()?;
+// Compile and execute, then extract as ndarray (`to_*` realizes on demand)
+let result = c.to_ndarray::<f32>()?;
 assert_eq!(result, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
 
-// Or extract as flat Vec
-let flat = c.as_vec::<f32>()?;
+// Or extract as flat Vec — already realized, so this just reads the buffer
+let flat = c.to_vec::<f32>()?;
 assert_eq!(flat, vec![6.0, 8.0, 10.0, 12.0]);
 ```
 

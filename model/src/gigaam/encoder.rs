@@ -1,109 +1,55 @@
-use ndarray::Array4;
 use snafu::ResultExt;
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::SInt;
 use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
+use svod_tensor::nn::{Layer, LayerNorm, Linear, Module, StateDict, get_tensor, prefixed};
 
-use crate::init::{fan_in_uniform, ones, zeros};
-use crate::state::{
-    self, HasStateDict, StateDict, TensorSnafu as StateTensorSnafu, get_tensor, prefixed, scoped, scoped_index,
-};
-use crate::{load_state_field, state_field};
+use crate::init::{Bias, fan_in_uniform, layer_norm, ones, zeros};
+use crate::state::{scoped, scoped_index};
 
-use super::error::{StateSnafu, TensorSnafu, TkSnafu};
-use super::{ConvNormType, GigaAmConfig, SubsamplingMode};
+use super::error::TkSnafu;
 
-/// Precompute RoPE cos/sin cache tensors. Returns `(cos, sin)` each of shape
-/// `[max_encoder_frames, 1, 1, d_k/2]` where `d_k = d_model / n_heads`. Upstream
-/// GigaAM passes `pos_emb_max_len` as both cache length and RoPE base.
+use super::{ConvNormType, GigaAmConfig, SubsamplingMode, subsampled_len};
+
+/// PyTorch's `BatchNorm1d` default epsilon. The checkpoint carries no eps, and
+/// the affine is folded into the depthwise conv at load, so this is the only
+/// place it appears.
+const BN_EPS: f64 = 1e-5;
+
+/// RoPE cos/sin cache, `[max_encoder_frames, 1, 1, d_k/2]`. Upstream GigaAM
+/// passes `pos_emb_max_len` as both cache length and RoPE base, and rotates a
+/// position-major `[T, B, H, d_k]` tensor — hence the permute off
+/// [`Tensor::rope_table`]'s `[1, 1, L, d_k/2]`.
 fn build_rope_cache(config: &GigaAmConfig) -> (Tensor, Tensor) {
     let d_k = config.d_model / config.n_heads;
-    let half_d = d_k / 2;
-    let max_len = config.max_encoder_frames;
-    let base = config.max_encoder_frames as f32;
-
-    let inv_freq: Vec<f32> = (0..half_d).map(|i| 1.0 / base.powf(2.0 * i as f32 / d_k as f32)).collect();
-
-    let mut cos_arr = Array4::<f32>::zeros((max_len, 1, 1, half_d));
-    let mut sin_arr = Array4::<f32>::zeros((max_len, 1, 1, half_d));
-
-    for pos in 0..max_len {
-        for i in 0..half_d {
-            let angle = pos as f32 * inv_freq[i];
-            cos_arr[[pos, 0, 0, i]] = angle.cos();
-            sin_arr[[pos, 0, 0, i]] = angle.sin();
-        }
-    }
-
-    (Tensor::from_ndarray(&cos_arr), Tensor::from_ndarray(&sin_arr))
+    let (cos, sin) =
+        Tensor::rope_table(config.max_encoder_frames as f64, config.max_encoder_frames, d_k, DType::Float32)
+            .expect("validated config: even head dim, non-empty cache");
+    let position_major = |t: Tensor| t.try_permute(&[2, 0, 1, 3]).expect("4-D rope table");
+    (position_major(cos), position_major(sin))
 }
 
 type Result<T> = super::Result<T>;
 
-#[derive(Clone)]
-pub struct DynamicQuantization {
-    pub weight_scale: Tensor,
-}
-
-fn load_dynamic_quantization(
-    sd: &StateDict,
-    weight: &Tensor,
-    weight_scale_key: &str,
-) -> std::result::Result<Option<DynamicQuantization>, state::Error> {
-    if !weight.uop().dtype().is_signed() {
-        return Ok(None);
-    }
-    Ok(Some(DynamicQuantization { weight_scale: get_tensor(sd, weight_scale_key)? }))
-}
-
-fn linear(x: &Tensor, weight: &Tensor, bias: &Tensor, quantization: Option<&DynamicQuantization>) -> Result<Tensor> {
-    match quantization {
-        Some(quantization) => x
-            .dynamic_quantized_linear()
-            .weight(weight)
-            .weight_scale(&quantization.weight_scale)
-            .bias(bias)
-            .call()
-            .context(TensorSnafu),
-        None => x.linear().weight(weight).bias(bias).call().context(TensorSnafu),
+/// `nn::Linear` with an optional dynamic-quantization scale. The scale's
+/// presence is a property of the *weight dtype*, not of the state dict, so the
+/// pair is loaded together by the owner's `Module` impl rather than derived.
+fn linear(x: &Tensor, weight: &Tensor, bias: &Tensor, weight_scale: Option<&Tensor>) -> Result<Tensor> {
+    match weight_scale {
+        Some(scale) => Ok(x.dynamic_quantized_linear().weight(weight).weight_scale(scale).bias(bias).call()?),
+        None => Ok(x.linear().weight(weight).bias(bias).call()?),
     }
 }
 
-// ---------------------------------------------------------------------------
-// LayerNormWeights
-// ---------------------------------------------------------------------------
-
-/// Affine layer normalization: `layernorm(x) * weight + bias`.
-#[derive(Clone)]
-pub struct LayerNormWeights {
-    pub weight: Tensor,
-    pub bias: Tensor,
-    pub eps: f64,
+/// Every `Linear` in this encoder carries PyTorch's own fan-in uniform bias.
+fn plain_linear(inp: usize, out: usize) -> Linear {
+    crate::init::linear(inp, out, Bias::FanIn, DType::Float32)
 }
 
-impl LayerNormWeights {
-    pub fn empty(size: usize) -> Self {
-        Self { weight: ones(&[size], DType::Float32), bias: zeros(&[size], DType::Float32), eps: 1e-5 }
-    }
-
-    pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
-        let normed = x.layernorm(-1, self.eps).context(TensorSnafu)?;
-        normed.try_mul(&self.weight).context(TensorSnafu)?.try_add(&self.bias).context(TensorSnafu)
-    }
-}
-
-impl HasStateDict for LayerNormWeights {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        state_field!(sd, prefix, self, [weight, bias]);
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), crate::state::Error> {
-        load_state_field!(self, sd, prefix, [weight, bias]);
-        Ok(())
-    }
+/// The bias every `Linear` in this encoder carries.
+fn bias_of(linear: &Linear) -> &Tensor {
+    linear.bias.as_ref().expect("GigaAM linears are always biased")
 }
 
 // ---------------------------------------------------------------------------
@@ -113,28 +59,26 @@ impl HasStateDict for LayerNormWeights {
 /// Conformer FFN: LayerNorm -> Linear(d->4d) -> SiLU -> Linear(4d->d).
 ///
 /// Does NOT apply residual or 0.5 scaling — caller handles that.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct FeedForward {
-    pub norm: LayerNormWeights,
-    pub linear1_weight: Tensor,
-    pub linear1_bias: Tensor,
-    pub linear2_weight: Tensor,
-    pub linear2_bias: Tensor,
-    pub linear1_quantization: Option<DynamicQuantization>,
-    pub linear2_quantization: Option<DynamicQuantization>,
+    pub norm: LayerNorm,
+    pub linear1: Linear,
+    pub linear2: Linear,
+    #[module(key = "linear1.weight_scale", optional = "self.linear1.weight.dtype().is_signed()")]
+    pub linear1_scale: Option<Tensor>,
+    #[module(key = "linear2.weight_scale", optional = "self.linear2.weight.dtype().is_signed()")]
+    pub linear2_scale: Option<Tensor>,
 }
 
 impl FeedForward {
     pub fn empty(config: &GigaAmConfig) -> Self {
         let (d, d_ff) = (config.d_model, config.d_ff);
         Self {
-            norm: LayerNormWeights::empty(d),
-            linear1_weight: fan_in_uniform(&[d_ff, d], d, DType::Float32),
-            linear1_bias: fan_in_uniform(&[d_ff], d, DType::Float32),
-            linear2_weight: fan_in_uniform(&[d, d_ff], d_ff, DType::Float32),
-            linear2_bias: fan_in_uniform(&[d], d_ff, DType::Float32),
-            linear1_quantization: None,
-            linear2_quantization: None,
+            norm: layer_norm(d, DType::Float32),
+            linear1: plain_linear(d, d_ff),
+            linear2: plain_linear(d_ff, d),
+            linear1_scale: None,
+            linear2_scale: None,
         }
     }
 
@@ -142,40 +86,10 @@ impl FeedForward {
         // The two-linear FFN lowers to GEMM1+silu → h → GEMM2 (two reduces force `h`
         // to realize between them), which the generic optimizer fuses + (with BEAM)
         // tunes as well as a hand kernel — so the FFN stays plain graph ops.
-        let y = scoped("norm", || self.norm.apply(x))?;
-        let y = linear(&y, &self.linear1_weight, &self.linear1_bias, self.linear1_quantization.as_ref())?;
-        let y = y.silu().context(TensorSnafu)?;
-        linear(&y, &self.linear2_weight, &self.linear2_bias, self.linear2_quantization.as_ref())
-    }
-}
-
-impl HasStateDict for FeedForward {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.norm.state_dict(&prefixed(prefix, "norm"));
-        sd.insert(prefixed(prefix, "linear1.weight"), self.linear1_weight.clone());
-        sd.insert(prefixed(prefix, "linear1.bias"), self.linear1_bias.clone());
-        sd.insert(prefixed(prefix, "linear2.weight"), self.linear2_weight.clone());
-        sd.insert(prefixed(prefix, "linear2.bias"), self.linear2_bias.clone());
-        if let Some(quantization) = &self.linear1_quantization {
-            sd.insert(prefixed(prefix, "linear1.weight_scale"), quantization.weight_scale.clone());
-        }
-        if let Some(quantization) = &self.linear2_quantization {
-            sd.insert(prefixed(prefix, "linear2.weight_scale"), quantization.weight_scale.clone());
-        }
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), crate::state::Error> {
-        self.norm.load_state_dict(sd, &prefixed(prefix, "norm"))?;
-        self.linear1_weight = get_tensor(sd, &prefixed(prefix, "linear1.weight"))?;
-        self.linear1_bias = get_tensor(sd, &prefixed(prefix, "linear1.bias"))?;
-        self.linear2_weight = get_tensor(sd, &prefixed(prefix, "linear2.weight"))?;
-        self.linear2_bias = get_tensor(sd, &prefixed(prefix, "linear2.bias"))?;
-        self.linear1_quantization =
-            load_dynamic_quantization(sd, &self.linear1_weight, &prefixed(prefix, "linear1.weight_scale"))?;
-        self.linear2_quantization =
-            load_dynamic_quantization(sd, &self.linear2_weight, &prefixed(prefix, "linear2.weight_scale"))?;
-        Ok(())
+        let y = scoped("norm", || self.norm.forward(x))?;
+        let y = linear(&y, &self.linear1.weight, bias_of(&self.linear1), self.linear1_scale.as_ref())?;
+        let y = y.silu()?;
+        linear(&y, &self.linear2.weight, bias_of(&self.linear2), self.linear2_scale.as_ref())
     }
 }
 
@@ -184,9 +98,12 @@ impl HasStateDict for FeedForward {
 // ---------------------------------------------------------------------------
 
 /// Multi-head self-attention with rotary position embeddings.
-#[derive(Clone)]
+///
+/// Projections stay as bare `[out, in]` tensors rather than `nn::Linear`: the
+/// checkpoint keys the pair `q_proj` / `q_bias`, not `q.weight` / `q.bias`.
+#[derive(Clone, Module)]
 pub struct MultiHeadSelfAttention {
-    pub norm: LayerNormWeights,
+    pub norm: LayerNorm,
     pub q_proj: Tensor,
     pub q_bias: Tensor,
     pub k_proj: Tensor,
@@ -195,10 +112,14 @@ pub struct MultiHeadSelfAttention {
     pub v_bias: Tensor,
     pub out_proj: Tensor,
     pub out_bias: Tensor,
-    pub q_quantization: Option<DynamicQuantization>,
-    pub k_quantization: Option<DynamicQuantization>,
-    pub v_quantization: Option<DynamicQuantization>,
-    pub out_quantization: Option<DynamicQuantization>,
+    #[module(optional = "self.q_proj.dtype().is_signed()")]
+    pub q_weight_scale: Option<Tensor>,
+    #[module(optional = "self.k_proj.dtype().is_signed()")]
+    pub k_weight_scale: Option<Tensor>,
+    #[module(optional = "self.v_proj.dtype().is_signed()")]
+    pub v_weight_scale: Option<Tensor>,
+    #[module(optional = "self.out_proj.dtype().is_signed()")]
+    pub out_weight_scale: Option<Tensor>,
     pub n_heads: usize,
     pub d_model: usize,
 }
@@ -206,20 +127,22 @@ pub struct MultiHeadSelfAttention {
 impl MultiHeadSelfAttention {
     pub fn empty(config: &GigaAmConfig) -> Self {
         let d = config.d_model;
+        let proj = || fan_in_uniform(&[d, d], d, DType::Float32);
+        let bias = || fan_in_uniform(&[d], d, DType::Float32);
         Self {
-            norm: LayerNormWeights::empty(d),
-            q_proj: fan_in_uniform(&[d, d], d, DType::Float32),
-            q_bias: fan_in_uniform(&[d], d, DType::Float32),
-            k_proj: fan_in_uniform(&[d, d], d, DType::Float32),
-            k_bias: fan_in_uniform(&[d], d, DType::Float32),
-            v_proj: fan_in_uniform(&[d, d], d, DType::Float32),
-            v_bias: fan_in_uniform(&[d], d, DType::Float32),
-            out_proj: fan_in_uniform(&[d, d], d, DType::Float32),
-            out_bias: fan_in_uniform(&[d], d, DType::Float32),
-            q_quantization: None,
-            k_quantization: None,
-            v_quantization: None,
-            out_quantization: None,
+            norm: layer_norm(d, DType::Float32),
+            q_proj: proj(),
+            q_bias: bias(),
+            k_proj: proj(),
+            k_bias: bias(),
+            v_proj: proj(),
+            v_bias: bias(),
+            out_proj: proj(),
+            out_bias: bias(),
+            q_weight_scale: None,
+            k_weight_scale: None,
+            v_weight_scale: None,
+            out_weight_scale: None,
             n_heads: config.n_heads,
             d_model: d,
         }
@@ -231,54 +154,48 @@ impl MultiHeadSelfAttention {
     /// mask; when the hand kernel doesn't apply it returns `None` and [`sdpa_attention`]
     /// runs the same masked attention, so the result is correct on any device.
     pub fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, key_lens: Option<&Tensor>) -> Result<Tensor> {
-        let shape = x.shape().context(TensorSnafu)?;
+        let shape = x.shape()?;
         let b = shape[0].clone();
         let t = shape[1].clone();
         let d_model = self.d_model;
         let d_k = d_model / self.n_heads;
         let h = self.n_heads;
 
-        let y = scoped("norm", || self.norm.apply(x))?;
+        let y = scoped("norm", || self.norm.forward(x))?;
 
         // RoPE expects [T, B, H, d_k] (PyTorch ordering). Rotate once, then
         // materialise back as [B, T, d_model] so the Q/K projections share
         // a single rotated buffer.
-        let y_heads = y
-            .try_transpose(0, 1)
-            .context(TensorSnafu)?
-            .try_reshape([t.clone(), b.clone(), SInt::Const(h), SInt::Const(d_k)])
-            .context(TensorSnafu)?;
+        let y_heads = y.try_transpose(0, 1)?.try_reshape([t.clone(), b.clone(), SInt::Const(h), SInt::Const(d_k)])?;
         // The table is shared by every layer, so its cast is built outside the
         // layer's origin scope and hash-conses across layers.
-        let rope_dtype = y_heads.uop().dtype();
+        let rope_dtype = y_heads.dtype();
         let (cos, sin) = {
             let _shared = OriginScope::suspend();
-            (cos.cast(rope_dtype.clone()).context(TensorSnafu)?, sin.cast(rope_dtype).context(TensorSnafu)?)
+            (cos.cast(rope_dtype.clone()), sin.cast(rope_dtype))
         };
         let qk_input = y_heads
-            .apply_rotary_emb(&cos, &sin, false)
-            .context(TensorSnafu)?
-            .try_reshape([t.clone(), b.clone(), SInt::Const(d_model)])
-            .context(TensorSnafu)?
-            .try_transpose(0, 1)
-            .context(TensorSnafu)?
+            .apply_rotary_emb(&cos, &sin, false)?
+            .try_reshape([t.clone(), b.clone(), SInt::Const(d_model)])?
+            .try_transpose(0, 1)?
             .contiguous();
 
-        let q = linear(&qk_input, &self.q_proj, &self.q_bias, self.q_quantization.as_ref())?;
-        let k = linear(&qk_input, &self.k_proj, &self.k_bias, self.k_quantization.as_ref())?;
-        let v = linear(&y, &self.v_proj, &self.v_bias, self.v_quantization.as_ref())?;
+        let q = linear(&qk_input, &self.q_proj, &self.q_bias, self.q_weight_scale.as_ref())?;
+        let k = linear(&qk_input, &self.k_proj, &self.k_bias, self.k_weight_scale.as_ref())?;
+        let v = linear(&y, &self.v_proj, &self.v_bias, self.v_weight_scale.as_ref())?;
 
         // Head-split into `[B, T, H, d_k]` — the layout `flash_attention_with`
-        // consumes directly (seq second, head third, head_dim last). No
-        // `transpose(1,2)` to `[B, H, T, d_k]`: the hand kernel and the SDPA
-        // fallback both take/return `[B, T, H, d_k]`.
-        let q = split_heads(&q, b.clone(), t.clone(), h, d_k)?;
-        let k = split_heads(&k, b.clone(), t.clone(), h, d_k)?;
-        let v = split_heads(&v, b.clone(), t.clone(), h, d_k)?;
+        // consumes directly (seq second, head third, head_dim last). Not
+        // `Tensor::split_heads`, which lands head-major `[B, H, T, d_k]`: the
+        // hand kernel and the SDPA fallback both take/return `[B, T, H, d_k]`.
+        let split = |p: Tensor| -> Result<Tensor> {
+            Ok(p.try_reshape([b.clone(), t.clone(), SInt::Const(h), SInt::Const(d_k)])?)
+        };
+        let (q, k, v) = (split(q)?, split(k)?, split(v)?);
 
         // The hand FA kernel when it applies (a supported GPU + tiling shape), else this model's
         // own SDPA — tk no longer falls back silently; the policy lives here.
-        let attn = if matches!(q.uop().dtype().base(), ScalarDType::Float16 | ScalarDType::BFloat16) {
+        let attn = if matches!(q.dtype().base(), ScalarDType::Float16 | ScalarDType::BFloat16) {
             match svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens })
                 .context(TkSnafu)?
             {
@@ -288,8 +205,10 @@ impl MultiHeadSelfAttention {
         } else {
             sdpa_attention(&q, &k, &v, key_lens)?
         };
-        let out = merge_heads(&attn, b, t, d_model)?;
-        linear(&out, &self.out_proj, &self.out_bias, self.out_quantization.as_ref())
+        // Head-merge is a plain reshape here: the attention output is already
+        // seq-major, so there is no transpose to undo.
+        let out = attn.try_reshape([b, t, SInt::Const(d_model)])?;
+        linear(&out, &self.out_proj, &self.out_bias, self.out_weight_scale.as_ref())
     }
 }
 
@@ -299,23 +218,15 @@ impl MultiHeadSelfAttention {
 /// padded KEY positions only (`kv_pos ≥ key_lens[b]`). Permutes to the
 /// `[B, H, T, d_k]` SDPA wants and back.
 fn sdpa_attention(q: &Tensor, k: &Tensor, v: &Tensor, key_lens: Option<&Tensor>) -> Result<Tensor> {
-    let perm = |t: &Tensor| t.try_permute(&[0, 2, 1, 3]).context(TensorSnafu);
+    let perm = |t: &Tensor| -> Result<Tensor> { Ok(t.try_permute(&[0, 2, 1, 3])?) };
     let (qp, kp, vp) = (perm(q)?, perm(k)?, perm(v)?);
-    let mask = match key_lens {
+    let valid = match key_lens {
+        // `[B, N]` key validity, true = attend. A property of `key_lens`, shared
+        // by every layer: built outside the layer's origin scope so the layers
+        // share one mask.
         Some(lens) => {
-            let qs = q.shape().expect("q shape");
-            let dim = |i: usize| qs[i].as_const().expect("concrete dim");
-            let (b, n) = (dim(0), dim(1));
-            // [B, 1, 1, N] bool key mask: true (masked) where arange(N) ≥ key_lens[b].
-            // A property of `key_lens`, shared by every layer: built outside the
-            // layer's origin scope so the layers share one mask.
             let _shared = OriginScope::suspend();
-            let range = Tensor::arange(n as i64, None, None)
-                .context(TensorSnafu)?
-                .try_reshape([1usize, 1, 1, n])
-                .context(TensorSnafu)?;
-            let lens = lens.cast(DType::Int32).context(TensorSnafu)?.try_reshape([b, 1, 1, 1]).context(TensorSnafu)?;
-            Some(range.try_ge(&lens).context(TensorSnafu)?)
+            Some(Tensor::sequence_mask(lens, q.dim_const(1)?)?)
         }
         None => None,
     };
@@ -324,50 +235,9 @@ fn sdpa_attention(q: &Tensor, k: &Tensor, v: &Tensor, key_lens: Option<&Tensor>)
         .key(&kp)
         .value(&vp)
         .is_causal(false)
-        .maybe_attn_mask(mask.as_ref())
-        .call()
-        .context(TensorSnafu)?;
-    out.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)
-}
-
-/// `[B, T, H*d_k] → [B, T, H, d_k]`. Leaves the seq-major layout that
-/// `flash_attention_with` consumes (no `transpose(1,2)` to head-major).
-fn split_heads(x: &Tensor, b: SInt, t: SInt, h: usize, d_k: usize) -> Result<Tensor> {
-    x.try_reshape([b, t, SInt::Const(h), SInt::Const(d_k)]).context(TensorSnafu)
-}
-
-/// `[B, T, H, d_k] → [B, T, d_model]`. The attention output is already
-/// seq-major, so this is a plain head-merge reshape (no transpose).
-fn merge_heads(x: &Tensor, b: SInt, t: SInt, d_model: usize) -> Result<Tensor> {
-    x.try_reshape([b, t, SInt::Const(d_model)]).context(TensorSnafu)
-}
-
-impl HasStateDict for MultiHeadSelfAttention {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.norm.state_dict(&prefixed(prefix, "norm"));
-        state_field!(sd, prefix, self, [q_proj, q_bias, k_proj, k_bias, v_proj, v_bias, out_proj, out_bias]);
-        for (name, quantization) in [
-            ("q", &self.q_quantization),
-            ("k", &self.k_quantization),
-            ("v", &self.v_quantization),
-            ("out", &self.out_quantization),
-        ] {
-            if let Some(quantization) = quantization {
-                sd.insert(prefixed(prefix, &format!("{name}_weight_scale")), quantization.weight_scale.clone());
-            }
-        }
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), crate::state::Error> {
-        self.norm.load_state_dict(sd, &prefixed(prefix, "norm"))?;
-        load_state_field!(self, sd, prefix, [q_proj, q_bias, k_proj, k_bias, v_proj, v_bias, out_proj, out_bias]);
-        self.q_quantization = load_dynamic_quantization(sd, &self.q_proj, &prefixed(prefix, "q_weight_scale"))?;
-        self.k_quantization = load_dynamic_quantization(sd, &self.k_proj, &prefixed(prefix, "k_weight_scale"))?;
-        self.v_quantization = load_dynamic_quantization(sd, &self.v_proj, &prefixed(prefix, "v_weight_scale"))?;
-        self.out_quantization = load_dynamic_quantization(sd, &self.out_proj, &prefixed(prefix, "out_weight_scale"))?;
-        Ok(())
-    }
+        .maybe_key_padding_mask(valid.as_ref())
+        .call()?;
+    Ok(out.try_permute(&[0, 2, 1, 3])?)
 }
 
 // ---------------------------------------------------------------------------
@@ -376,16 +246,16 @@ impl HasStateDict for MultiHeadSelfAttention {
 
 #[derive(Clone)]
 pub enum ConvNorm {
-    LayerNorm(LayerNormWeights),
+    LayerNorm(LayerNorm),
     BatchNorm {
         scale: Tensor,
         bias: Tensor,
         mean: Tensor,
-        invstd: Tensor,
+        var: Tensor,
     },
     /// Inference-time BatchNorm fold: the affine collapsed into the depthwise
     /// conv at load (`w *= s`, `b = b*s + bias - mean*s` with
-    /// `s = scale*invstd`), so the norm op vanishes from the graph.
+    /// `s = scale / sqrt(var + eps)`), so the norm op vanishes from the graph.
     Folded,
 }
 
@@ -393,7 +263,7 @@ pub enum ConvNorm {
 /// LayerNorm -> Conv1d(d,2d,k=1) -> GLU -> DepthwiseConv1d -> Norm -> SiLU -> Conv1d(d,d,k=1)
 #[derive(Clone)]
 pub struct ConvModule {
-    pub norm: LayerNormWeights,
+    pub norm: LayerNorm,
     pub pw1_weight: Tensor,
     pub pw1_bias: Tensor,
     pub dw_weight: Tensor,
@@ -409,16 +279,16 @@ impl ConvModule {
     pub fn empty(config: &GigaAmConfig) -> Self {
         let (d, k) = (config.d_model, config.conv_kernel);
         let conv_norm = match &config.conv_norm_type {
-            ConvNormType::LayerNorm => ConvNorm::LayerNorm(LayerNormWeights::empty(d)),
+            ConvNormType::LayerNorm => ConvNorm::LayerNorm(layer_norm(d, DType::Float32)),
             ConvNormType::BatchNorm => ConvNorm::BatchNorm {
                 scale: ones(&[d], DType::Float32),
                 bias: zeros(&[d], DType::Float32),
                 mean: zeros(&[d], DType::Float32),
-                invstd: ones(&[d], DType::Float32),
+                var: ones(&[d], DType::Float32),
             },
         };
         Self {
-            norm: LayerNormWeights::empty(d),
+            norm: layer_norm(d, DType::Float32),
             pw1_weight: fan_in_uniform(&[2 * d, d, 1], d, DType::Float32),
             pw1_bias: fan_in_uniform(&[2 * d], d, DType::Float32),
             dw_weight: fan_in_uniform(&[d, 1, k], k, DType::Float32),
@@ -431,113 +301,111 @@ impl ConvModule {
         }
     }
 
-    pub fn forward(&self, x: &Tensor, pad_mask: Option<&Tensor>) -> Result<Tensor> {
-        let activation_dtype = x.uop().dtype();
-        let y = scoped("norm", || self.norm.apply(x))?;
+    /// `pad_valid` (`[B, T]` bool, true = real frame) zeroes padded rows before
+    /// the depthwise conv so they cannot leak into valid ones.
+    pub fn forward(&self, x: &Tensor, pad_valid: Option<&Tensor>) -> Result<Tensor> {
+        let activation_dtype = x.dtype();
+        let y = scoped("norm", || self.norm.forward(x))?;
 
-        let y = y.try_transpose(-1, -2).context(TensorSnafu)?;
+        let y = y.try_transpose(-1, -2)?;
 
-        let y = y.conv2d().weight(&self.pw1_weight).bias(&self.pw1_bias).call().context(TensorSnafu)?;
+        let mut y = y.conv1d().weight(&self.pw1_weight).bias(&self.pw1_bias).call()?.glu(1)?;
 
-        let mut y = y.glu(1).context(TensorSnafu)?;
-
-        if let Some(mask) = pad_mask {
-            let valid = mask.logical_not().context(TensorSnafu)?;
-            let valid = valid.try_unsqueeze(1).context(TensorSnafu)?;
-            let zeros = y.zero().context(TensorSnafu)?;
-            y = y.where_(&valid, &zeros).context(TensorSnafu)?;
+        if let Some(valid) = pad_valid {
+            y = y.where_(&valid.try_unsqueeze(1)?, 0.0)?;
         }
 
         let pad = ((self.conv_kernel - 1) / 2) as isize;
-        let y = y
-            .conv2d()
-            .weight(&self.dw_weight)
-            .bias(&self.dw_bias)
-            .groups(self.d_model)
-            .padding(&[(pad, pad)])
-            .call()
-            .context(TensorSnafu)?;
+        let y = y.conv1d().weight(&self.dw_weight).bias(&self.dw_bias).groups(self.d_model).padding(pad).call()?;
 
         let y = match &self.conv_norm {
             ConvNorm::LayerNorm(ln) => {
-                let y = y.try_transpose(-1, -2).context(TensorSnafu)?;
-                let y = scoped("conv_norm", || ln.apply(&y))?;
-                y.try_transpose(-1, -2).context(TensorSnafu)?
+                let y = y.try_transpose(-1, -2)?;
+                let y = scoped("conv_norm", || ln.forward(&y))?;
+                y.try_transpose(-1, -2)?
             }
-            ConvNorm::BatchNorm { scale, bias, mean, invstd } => {
-                y.batchnorm().scale(scale).bias(bias).mean(mean).invstd(invstd).call().context(TensorSnafu)?
+            ConvNorm::BatchNorm { scale, bias, mean, var } => {
+                y.batchnorm().scale(scale).bias(bias).mean(mean).var(var).eps(BN_EPS).call()?
             }
             ConvNorm::Folded => y,
         };
-        // BN/LN params (scale, bias, mean, invstd) are stored fp32; broadcasting promotes
-        // the norm output. Re-cast to the activation dtype so SiLU/pw2 stay in the right
-        // precision, matching Python's BatchNorm1d dtype semantics. No-op when types match.
-        let y = if y.uop().dtype() != activation_dtype { y.cast(activation_dtype).context(TensorSnafu)? } else { y };
+        // BN params are stored fp32; broadcasting promotes the norm output. Re-cast
+        // to the activation dtype so SiLU/pw2 stay in the right precision, matching
+        // Python's BatchNorm1d dtype semantics. No-op when types match.
+        let y = if y.dtype() != activation_dtype { y.cast(activation_dtype) } else { y };
 
-        let y = y.silu().context(TensorSnafu)?;
+        let y = y.silu()?.conv1d().weight(&self.pw2_weight).bias(&self.pw2_bias).call()?;
 
-        let y = y.conv2d().weight(&self.pw2_weight).bias(&self.pw2_bias).call().context(TensorSnafu)?;
+        Ok(y.try_transpose(-1, -2)?)
+    }
 
-        y.try_transpose(-1, -2).context(TensorSnafu)
+    /// Fold BatchNorm into the depthwise conv: with `s = scale / sqrt(var + eps)`,
+    /// `y_bn = conv(x)·s + (bias - mean·s)` — a per-channel scale on the conv
+    /// weight rows plus a corrected bias. Removes the norm op from the graph.
+    fn fold_batchnorm(
+        &mut self,
+        scale: &Tensor,
+        bias: &Tensor,
+        mean: &Tensor,
+        var: &Tensor,
+    ) -> svod_tensor::error::Result<()> {
+        let s = scale.try_div(&var.try_add(BN_EPS)?.try_sqrt()?)?;
+        self.dw_weight = self.dw_weight.try_mul(&s.try_reshape([self.d_model as isize, 1, 1])?)?;
+        self.dw_bias = self.dw_bias.try_mul(&s)?.try_add(bias)?.try_sub(&mean.try_mul(&s)?)?;
+        self.conv_norm = ConvNorm::Folded;
+        Ok(())
     }
 }
 
-impl HasStateDict for ConvModule {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.norm.state_dict(&prefixed(prefix, "norm"));
-        state_field!(sd, prefix, self, [pw1_weight, pw1_bias, dw_weight, dw_bias, pw2_weight, pw2_bias]);
+/// Hand-written: the load *changes the variant* (`BatchNorm` → `Folded`), which
+/// no derive can express.
+impl Module for ConvModule {
+    fn write_state(&self, prefix: &str, out: &mut StateDict) {
+        for (name, tensor) in [
+            ("pw1_weight", &self.pw1_weight),
+            ("pw1_bias", &self.pw1_bias),
+            ("dw_weight", &self.dw_weight),
+            ("dw_bias", &self.dw_bias),
+            ("pw2_weight", &self.pw2_weight),
+            ("pw2_bias", &self.pw2_bias),
+        ] {
+            out.insert(prefixed(prefix, name), tensor.clone());
+        }
+        self.norm.write_state(&prefixed(prefix, "norm"), out);
         match &self.conv_norm {
-            ConvNorm::LayerNorm(ln) => sd.extend(ln.state_dict(&prefixed(prefix, "conv_norm"))),
-            ConvNorm::BatchNorm { scale, bias, mean, invstd } => {
-                for (name, t) in [("bn_scale", scale), ("bn_bias", bias), ("bn_mean", mean), ("bn_invstd", invstd)] {
-                    sd.insert(prefixed(prefix, name), t.clone());
+            ConvNorm::LayerNorm(ln) => ln.write_state(&prefixed(prefix, "conv_norm"), out),
+            ConvNorm::BatchNorm { scale, bias, mean, var } => {
+                for (name, t) in [("bn_scale", scale), ("bn_bias", bias), ("bn_mean", mean), ("bn_var", var)] {
+                    out.insert(prefixed(prefix, name), t.clone());
                 }
             }
             // Folded weights live in dw_weight/dw_bias; the BN params are gone.
             ConvNorm::Folded => {}
         }
-        sd
     }
 
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), crate::state::Error> {
+    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> svod_tensor::error::Result<()> {
+        for (name, field) in [
+            ("pw1_weight", &mut self.pw1_weight),
+            ("pw1_bias", &mut self.pw1_bias),
+            ("dw_weight", &mut self.dw_weight),
+            ("dw_bias", &mut self.dw_bias),
+            ("pw2_weight", &mut self.pw2_weight),
+            ("pw2_bias", &mut self.pw2_bias),
+        ] {
+            *field = get_tensor(sd, &prefixed(prefix, name))?;
+        }
         self.norm.load_state_dict(sd, &prefixed(prefix, "norm"))?;
-        load_state_field!(self, sd, prefix, [pw1_weight, pw1_bias, dw_weight, dw_bias, pw2_weight, pw2_bias]);
         match &mut self.conv_norm {
             ConvNorm::LayerNorm(ln) => ln.load_state_dict(sd, &prefixed(prefix, "conv_norm"))?,
             // Folded round-trips (e.g. `cast_weights`) carry no BN keys — the
             // affine already lives in dw_weight/dw_bias.
             ConvNorm::Folded if !sd.contains_key(&prefixed(prefix, "bn_scale")) => {}
             ConvNorm::BatchNorm { .. } | ConvNorm::Folded => {
-                // Fold BN into the depthwise conv at load: with s = scale*invstd,
-                // y_bn = conv(x)*s + (bias - mean*s) — per-channel scale folds
-                // into the conv weight rows + a corrected bias. Removes the
-                // norm op from the encoder graph.
-                let scale = get_tensor(sd, &prefixed(prefix, "bn_scale"))?;
-                let bias = get_tensor(sd, &prefixed(prefix, "bn_bias"))?;
-                let mean = get_tensor(sd, &prefixed(prefix, "bn_mean"))?;
-                let invstd = get_tensor(sd, &prefixed(prefix, "bn_invstd"))?;
-                let fold = || -> std::result::Result<(Tensor, Tensor), state::Error> {
-                    let d = self.d_model as isize;
-                    let s = scale.try_mul(&invstd).context(StateTensorSnafu)?;
-                    let w = self
-                        .dw_weight
-                        .try_mul(&s.try_reshape([d, 1, 1]).context(StateTensorSnafu)?)
-                        .context(StateTensorSnafu)?;
-                    let scaled_mean = mean.try_mul(&s).context(StateTensorSnafu)?;
-                    let b = self
-                        .dw_bias
-                        .try_mul(&s)
-                        .context(StateTensorSnafu)?
-                        .try_add(&bias)
-                        .context(StateTensorSnafu)?
-                        .try_sub(&scaled_mean)
-                        .context(StateTensorSnafu)?;
-                    Ok((w, b))
-                };
-                let (w, b) = fold()?;
-                self.dw_weight = w;
-                self.dw_bias = b;
-                self.conv_norm = ConvNorm::Folded;
+                let param = |name: &str| get_tensor(sd, &prefixed(prefix, name));
+                let (scale, bias) = (param("bn_scale")?, param("bn_bias")?);
+                let (mean, var) = (param("bn_mean")?, param("bn_var")?);
+                self.fold_batchnorm(&scale, &bias, &mean, &var)?;
             }
         }
         Ok(())
@@ -555,16 +423,19 @@ impl HasStateDict for ConvModule {
 /// - **conv2d**: `Conv2d(1→d, 3x3, stride=2)` x2 + `Linear(d * n_mels/4, d)`.
 ///
 /// Input: `[B, T, n_mels]` -> Output: `[B, T/4, d_model]`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct StridingSubsampling {
     pub conv1_weight: Tensor,
     pub conv1_bias: Tensor,
     pub conv2_weight: Tensor,
     pub conv2_bias: Tensor,
+    #[module(optional = "self.is_conv2d()")]
     pub linear_weight: Option<Tensor>,
+    #[module(optional = "self.is_conv2d()")]
     pub linear_bias: Option<Tensor>,
     n_mels: usize,
     d_model: usize,
+    #[module(skip)]
     mode: SubsamplingMode,
     kernel_size: usize,
 }
@@ -610,13 +481,14 @@ impl StridingSubsampling {
         }
     }
 
+    /// Whether the linear projection exists — the `Module` derive's predicate
+    /// for the two optional parameters.
+    fn is_conv2d(&self) -> bool {
+        matches!(self.mode, SubsamplingMode::Conv2d)
+    }
+
     pub fn output_length(&self, input_length: usize) -> usize {
-        let pad = (self.kernel_size - 1) / 2;
-        let mut len = input_length;
-        for _ in 0..2 {
-            len = (len + 2 * pad - self.kernel_size) / 2 + 1;
-        }
-        len
+        subsampled_len(self.kernel_size, input_length)
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -627,85 +499,35 @@ impl StridingSubsampling {
     }
 
     fn forward_conv1d(&self, x: &Tensor) -> Result<Tensor> {
-        let x = x.try_transpose(-1, -2).context(TensorSnafu)?;
+        let x = x.try_transpose(-1, -2)?;
 
         let pad = (self.kernel_size / 2) as isize;
-        let x = x
-            .conv2d()
-            .weight(&self.conv1_weight)
-            .bias(&self.conv1_bias)
-            .stride(&[2])
-            .padding(&[(pad, pad)])
-            .call()
-            .context(TensorSnafu)?;
-        let x = x.relu().context(TensorSnafu)?;
+        let stage = |x: &Tensor, weight: &Tensor, bias: &Tensor| -> Result<Tensor> {
+            Ok(x.conv1d().weight(weight).bias(bias).stride(2).padding(pad).call()?.relu()?)
+        };
+        let x = stage(&x, &self.conv1_weight, &self.conv1_bias)?;
+        let x = stage(&x, &self.conv2_weight, &self.conv2_bias)?;
 
-        let x = x
-            .conv2d()
-            .weight(&self.conv2_weight)
-            .bias(&self.conv2_bias)
-            .stride(&[2])
-            .padding(&[(pad, pad)])
-            .call()
-            .context(TensorSnafu)?;
-        let x = x.relu().context(TensorSnafu)?;
-
-        x.try_transpose(-1, -2).context(TensorSnafu)
+        Ok(x.try_transpose(-1, -2)?)
     }
 
     fn forward_conv2d(&self, x: &Tensor) -> Result<Tensor> {
-        let shape = x.shape().context(TensorSnafu)?;
-        let b = shape[0].clone();
+        let b = x.dim(0)?;
 
-        let x = x.try_unsqueeze(1).context(TensorSnafu)?;
+        let x = x.try_unsqueeze(1)?;
 
-        let x = x
-            .conv2d()
-            .weight(&self.conv1_weight)
-            .bias(&self.conv1_bias)
-            .stride(&[2, 2])
-            .padding(&[(1, 1), (1, 1)])
-            .call()
-            .context(TensorSnafu)?;
-        let x = x.relu().context(TensorSnafu)?;
+        let stage = |x: &Tensor, weight: &Tensor, bias: &Tensor| -> Result<Tensor> {
+            Ok(x.conv2d().weight(weight).bias(bias).stride(&[2, 2]).padding(&[(1, 1), (1, 1)]).call()?.relu()?)
+        };
+        let x = stage(&x, &self.conv1_weight, &self.conv1_bias)?;
+        let x = stage(&x, &self.conv2_weight, &self.conv2_bias)?;
 
-        let x = x
-            .conv2d()
-            .weight(&self.conv2_weight)
-            .bias(&self.conv2_bias)
-            .stride(&[2, 2])
-            .padding(&[(1, 1), (1, 1)])
-            .call()
-            .context(TensorSnafu)?;
-        let x = x.relu().context(TensorSnafu)?;
-
-        let x = x.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
-        let x = x.try_reshape([b, SInt::Infer, SInt::Const(self.d_model * self.n_mels / 4)]).context(TensorSnafu)?;
+        let x = x.try_permute(&[0, 2, 1, 3])?;
+        let x = x.try_reshape([b, SInt::Infer, SInt::Const(self.d_model * self.n_mels / 4)])?;
 
         let lw = self.linear_weight.as_ref().expect("conv2d mode requires linear_weight");
         let lb = self.linear_bias.as_ref().expect("conv2d mode requires linear_bias");
-        x.linear().weight(lw).bias(lb).call().context(TensorSnafu)
-    }
-}
-
-impl HasStateDict for StridingSubsampling {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        state_field!(sd, prefix, self, [conv1_weight, conv1_bias, conv2_weight, conv2_bias]);
-        if let (Some(lw), Some(lb)) = (&self.linear_weight, &self.linear_bias) {
-            sd.insert(prefixed(prefix, "linear_weight"), lw.clone());
-            sd.insert(prefixed(prefix, "linear_bias"), lb.clone());
-        }
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), crate::state::Error> {
-        load_state_field!(self, sd, prefix, [conv1_weight, conv1_bias, conv2_weight, conv2_bias]);
-        if matches!(self.mode, SubsamplingMode::Conv2d) {
-            self.linear_weight = Some(get_tensor(sd, &prefixed(prefix, "linear_weight"))?);
-            self.linear_bias = Some(get_tensor(sd, &prefixed(prefix, "linear_bias"))?);
-        }
-        Ok(())
+        Ok(x.linear().weight(lw).bias(lb).call()?)
     }
 }
 
@@ -715,13 +537,13 @@ impl HasStateDict for StridingSubsampling {
 
 /// One Conformer layer (Macaron-style):
 /// FFN1(x0.5) + MHSA + Conv + FFN2(x0.5) + LayerNorm
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct ConformerLayer {
     pub ffn1: FeedForward,
     pub mhsa: MultiHeadSelfAttention,
     pub conv: ConvModule,
     pub ffn2: FeedForward,
-    pub final_norm: LayerNormWeights,
+    pub final_norm: LayerNorm,
 }
 
 impl ConformerLayer {
@@ -731,13 +553,13 @@ impl ConformerLayer {
             mhsa: MultiHeadSelfAttention::empty(config),
             conv: ConvModule::empty(config),
             ffn2: FeedForward::empty(config),
-            final_norm: LayerNormWeights::empty(config.d_model),
+            final_norm: layer_norm(config.d_model, DType::Float32),
         }
     }
 
     /// `key_lens` is the optional per-batch valid encoder-frame count (`[B]`
     /// `i32`) used as a key-only padding mask in MHSA (see
-    /// [`MultiHeadSelfAttention::forward`]). `pad_mask` independently zeros
+    /// [`MultiHeadSelfAttention::forward`]). `pad_valid` independently zeros
     /// padded rows in the conv module.
     pub fn forward(
         &self,
@@ -745,49 +567,26 @@ impl ConformerLayer {
         cos: &Tensor,
         sin: &Tensor,
         key_lens: Option<&Tensor>,
-        pad_mask: Option<&Tensor>,
+        pad_valid: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let half = Tensor::from_const(0.5f64).cast(x.uop().dtype()).context(TensorSnafu)?;
-
         // FFN1 half-step
         let ffn1 = scoped("ffn1", || self.ffn1.forward(x))?;
-        let x = x.try_add(&ffn1.try_mul(&half).context(TensorSnafu)?).context(TensorSnafu)?;
+        let x = x.try_add(&ffn1.try_mul(0.5)?)?;
 
         // MHSA
         let mhsa = scoped("mhsa", || self.mhsa.forward(&x, cos, sin, key_lens))?;
-        let x = x.try_add(&mhsa).context(TensorSnafu)?;
+        let x = x.try_add(&mhsa)?;
 
         // Convolution
-        let conv = scoped("conv", || self.conv.forward(&x, pad_mask))?;
-        let x = x.try_add(&conv).context(TensorSnafu)?;
+        let conv = scoped("conv", || self.conv.forward(&x, pad_valid))?;
+        let x = x.try_add(&conv)?;
 
         // FFN2 half-step
         let ffn2 = scoped("ffn2", || self.ffn2.forward(&x))?;
-        let x = x.try_add(&ffn2.try_mul(&half).context(TensorSnafu)?).context(TensorSnafu)?;
+        let x = x.try_add(&ffn2.try_mul(0.5)?)?;
 
         // Final layer norm
-        scoped("final_norm", || self.final_norm.apply(&x))
-    }
-}
-
-impl HasStateDict for ConformerLayer {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        sd.extend(self.ffn1.state_dict(&prefixed(prefix, "ffn1")));
-        sd.extend(self.mhsa.state_dict(&prefixed(prefix, "mhsa")));
-        sd.extend(self.conv.state_dict(&prefixed(prefix, "conv")));
-        sd.extend(self.ffn2.state_dict(&prefixed(prefix, "ffn2")));
-        sd.extend(self.final_norm.state_dict(&prefixed(prefix, "final_norm")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), crate::state::Error> {
-        self.ffn1.load_state_dict(sd, &prefixed(prefix, "ffn1"))?;
-        self.mhsa.load_state_dict(sd, &prefixed(prefix, "mhsa"))?;
-        self.conv.load_state_dict(sd, &prefixed(prefix, "conv"))?;
-        self.ffn2.load_state_dict(sd, &prefixed(prefix, "ffn2"))?;
-        self.final_norm.load_state_dict(sd, &prefixed(prefix, "final_norm"))?;
-        Ok(())
+        Ok(scoped("final_norm", || self.final_norm.forward(&x))?)
     }
 }
 
@@ -832,7 +631,7 @@ impl Encoder {
     /// isn't itself a float type — should never happen in practice but
     /// avoids producing an integer dtype here.
     pub fn input_dtype(&self) -> DType {
-        let dtype = self.subsampling.conv1_weight.uop().dtype();
+        let dtype = self.subsampling.conv1_weight.dtype();
         if dtype.is_float() { dtype } else { DType::Float32 }
     }
 
@@ -846,21 +645,19 @@ impl Encoder {
             (SInt::Const(0), SInt::Const(1)),
             (SInt::Const(0), SInt::Const(d_half)),
         ];
-        let cos = self.cos_cache.try_shrink(shrink.clone()).context(TensorSnafu)?;
-        let sin = self.sin_cache.try_shrink(shrink).context(TensorSnafu)?;
+        let cos = self.cos_cache.try_shrink(shrink.clone())?;
+        let sin = self.sin_cache.try_shrink(shrink)?;
         Ok((cos, sin))
     }
 
     /// Encoder pass on a single mel batch with no padding mask.
     /// Input: tensor `[B, n_mels, T]`. Output: lazy tensor `[B, d_model, T/4]`.
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
-        let x = mel.try_transpose(-1, -2).context(TensorSnafu)?;
-        let x = x.cast(self.input_dtype()).context(TensorSnafu)?;
+        let x = mel.try_transpose(-1, -2)?;
+        let x = x.cast(self.input_dtype());
         let x = scoped("subsampling", || self.subsampling.forward(&x))?;
 
-        let shape = x.shape().context(TensorSnafu)?;
-        let seq_len = shape[1].clone();
-        let (cos, sin) = self.slice_rope(seq_len)?;
+        let (cos, sin) = self.slice_rope(x.dim(1)?)?;
 
         // Single-batch path realizes `T` at the actual subsampled frame count of
         // this mel (no bucketing / no padding), so every key position is valid:
@@ -870,7 +667,7 @@ impl Encoder {
             x = scoped_index("layers", index, || layer.forward(&x, &cos, &sin, None, None))?;
         }
 
-        x.try_transpose(-1, -2).context(TensorSnafu)
+        Ok(x.try_transpose(-1, -2)?)
     }
 
     /// Batched encoder path over the full, constant-shaped mel buffer.
@@ -885,50 +682,32 @@ impl Encoder {
     /// `pad_valid` is all-false for them and the validity masks zero their output;
     /// the caller never reads those lanes.
     pub fn forward_batch(&self, mel: &Tensor, lengths: &Tensor) -> Result<Tensor> {
-        let mel_shape = mel.shape().context(TensorSnafu)?;
-        let b = mel_shape[0].clone();
-
-        let lengths = lengths.cast(DType::Int32).context(TensorSnafu)?;
-
-        let two_t = Tensor::const_(2i32, DType::Int32);
-        let one_t = Tensor::const_(1i32, DType::Int32);
-
-        let mut lengths_sub = lengths;
+        // Two stride-2 stages: `len = (len + 1) / 2` each, in integer arithmetic.
+        let mut lengths_sub = lengths.cast(DType::Int32);
         for _ in 0..2 {
-            lengths_sub = lengths_sub.try_add(&one_t).context(TensorSnafu)?.try_div(&two_t).context(TensorSnafu)?;
+            lengths_sub = lengths_sub.try_add(1i32)?.try_div(2i32)?;
         }
 
-        let x = mel.try_transpose(-1, -2).context(TensorSnafu)?;
-        let x = x.cast(self.input_dtype()).context(TensorSnafu)?;
+        let x = mel.try_transpose(-1, -2)?;
+        let x = x.cast(self.input_dtype());
         let x = scoped("subsampling", || self.subsampling.forward(&x))?;
 
-        let shape = x.shape().context(TensorSnafu)?;
-        let t_sub = shape[1].clone();
+        let t_sub = x.dim(1)?;
 
         // `key_lens` = subsampled valid-frame counts as a realized `[B]` `i32`
-        // tensor — attention's key-only padding mask. Keep `lengths_sub` in the
-        // same concrete dtype for the `pad_valid` comparison (the conv `pad_mask`).
-        let key_lens =
-            lengths_sub.cast(DType::Int32).context(TensorSnafu)?.try_reshape([b.clone()]).context(TensorSnafu)?;
-
-        let range = Tensor::arange(self.max_encoder_frames as i64, None, None).context(TensorSnafu)?;
-        let range = range.cast(DType::Int32).context(TensorSnafu)?;
-        let range = range.try_shrink([(SInt::Const(0), t_sub.clone())]).context(TensorSnafu)?;
-        let range = range.try_reshape([SInt::Const(1), t_sub.clone()]).context(TensorSnafu)?;
-        let lens = lengths_sub;
-        let lens = lens.try_reshape([b.clone(), SInt::Const(1)]).context(TensorSnafu)?;
-        let pad_valid = range.try_lt(&lens).context(TensorSnafu)?;
-
-        let pad_mask = pad_valid.logical_not().context(TensorSnafu)?;
+        // tensor — attention's key-only padding mask. The same lengths drive the
+        // conv module's per-row validity mask.
+        let key_lens = lengths_sub.try_reshape([mel.dim(0)?])?;
+        let pad_valid = Tensor::sequence_mask(&key_lens, x.dim_const(1)?)?;
 
         let (cos, sin) = self.slice_rope(t_sub)?;
 
         let mut x = x;
         for (index, layer) in self.layers.iter().enumerate() {
-            x = scoped_index("layers", index, || layer.forward(&x, &cos, &sin, Some(&key_lens), Some(&pad_mask)))?;
+            x = scoped_index("layers", index, || layer.forward(&x, &cos, &sin, Some(&key_lens), Some(&pad_valid)))?;
         }
 
-        x.try_transpose(-1, -2).context(TensorSnafu)
+        Ok(x.try_transpose(-1, -2)?)
     }
 
     pub fn subsampling_output_length(&self, mel_frames: usize) -> usize {
@@ -941,12 +720,12 @@ impl Encoder {
         let (cos_cache, sin_cache) = build_rope_cache(config);
 
         let mut subsampling = StridingSubsampling::empty(config);
-        subsampling.load_state_dict(sd, "subsampling").context(StateSnafu)?;
+        subsampling.load_state_dict(sd, "subsampling")?;
 
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
             let mut layer = ConformerLayer::empty(config);
-            layer.load_state_dict(sd, &format!("layers.{i}")).context(StateSnafu)?;
+            layer.load_state_dict(sd, &format!("layers.{i}"))?;
             layers.push(layer);
         }
 

@@ -3,30 +3,36 @@
 //! Takes four P6 backbone features `(l4, l6, l8, l12)` at strides 8, 16, 32,
 //! 64 and produces four detection feature maps `(P3, P4, P5, P6)`.
 
-use snafu::ResultExt;
 use svod_tensor::Tensor;
-
-use crate::state::{self, HasStateDict, StateDict, prefixed};
+use svod_tensor::nn::{Module, ResizeMode};
 
 use crate::yolo::backbone::p6::p6_scaled_channels;
-use crate::yolo::backbone::upsample_nearest_2x;
 use crate::yolo::blocks::conv::YoloConv;
 use crate::yolo::blocks::csp::C3k2;
 use crate::yolo::config::{YoloScale, make_depth};
-use crate::yolo::error::{Result, TensorSnafu};
+use crate::yolo::error::Result;
 
 /// P6 neck (layers 13–30). Takes four backbone features `(l4, l6, l8, l12)`
 /// and produces `(P3, P4, P5, P6)` at strides 8, 16, 32, 64.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct YoloNeckP6 {
+    #[module(key = "15")]
     pub c3k2_15: C3k2,
+    #[module(key = "18")]
     pub c3k2_18: C3k2,
+    #[module(key = "21")]
     pub c3k2_21: C3k2,
+    #[module(key = "22")]
     pub conv22: YoloConv,
+    #[module(key = "24")]
     pub c3k2_24: C3k2,
+    #[module(key = "25")]
     pub conv25: YoloConv,
+    #[module(key = "27")]
     pub c3k2_27: C3k2,
+    #[module(key = "28")]
     pub conv28: YoloConv,
+    #[module(key = "30")]
     pub c3k2_30: C3k2,
 }
 
@@ -65,61 +71,31 @@ impl YoloNeckP6 {
         l12: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         // FPN top-down: l12 → up → cat(l8) → c3k2_15 → up → cat(l6) → c3k2_18 → up → cat(l4) → c3k2_21
-        let up = upsample_nearest_2x(l12)?;
-        let cat = Tensor::cat(&[&up, l8], 1).context(TensorSnafu)?;
+        let up = l12.upsample(&[2, 2], ResizeMode::Nearest)?;
+        let cat = Tensor::cat(&[&up, l8], 1)?;
         let l15 = self.c3k2_15.forward(&cat)?;
 
-        let up = upsample_nearest_2x(&l15)?;
-        let cat = Tensor::cat(&[&up, l6], 1).context(TensorSnafu)?;
+        let up = l15.upsample(&[2, 2], ResizeMode::Nearest)?;
+        let cat = Tensor::cat(&[&up, l6], 1)?;
         let l18 = self.c3k2_18.forward(&cat)?;
 
-        let up = upsample_nearest_2x(&l18)?;
-        let cat = Tensor::cat(&[&up, l4], 1).context(TensorSnafu)?;
+        let up = l18.upsample(&[2, 2], ResizeMode::Nearest)?;
+        let cat = Tensor::cat(&[&up, l4], 1)?;
         let l21 = self.c3k2_21.forward(&cat)?;
 
         // PAN bottom-up: l21 → conv22 → cat(l18) → c3k2_24 → conv25 → cat(l15) → c3k2_27 → conv28 → cat(l12) → c3k2_30
         let l22 = self.conv22.forward(&l21)?;
-        let cat = Tensor::cat(&[&l22, &l18], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&l22, &l18], 1)?;
         let l24 = self.c3k2_24.forward(&cat)?;
 
         let l25 = self.conv25.forward(&l24)?;
-        let cat = Tensor::cat(&[&l25, &l15], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&l25, &l15], 1)?;
         let l27 = self.c3k2_27.forward(&cat)?;
 
         let l28 = self.conv28.forward(&l27)?;
-        let cat = Tensor::cat(&[&l28, l12], 1).context(TensorSnafu)?;
+        let cat = Tensor::cat(&[&l28, l12], 1)?;
         let l30 = self.c3k2_30.forward(&cat)?;
 
         Ok((l21, l24, l27, l30))
-    }
-}
-
-impl HasStateDict for YoloNeckP6 {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let p = |i: usize| prefixed(prefix, &i.to_string());
-        let mut sd = self.c3k2_15.state_dict(&p(15));
-        sd.extend(self.c3k2_18.state_dict(&p(18)));
-        sd.extend(self.c3k2_21.state_dict(&p(21)));
-        sd.extend(self.conv22.state_dict(&p(22)));
-        sd.extend(self.c3k2_24.state_dict(&p(24)));
-        sd.extend(self.conv25.state_dict(&p(25)));
-        sd.extend(self.c3k2_27.state_dict(&p(27)));
-        sd.extend(self.conv28.state_dict(&p(28)));
-        sd.extend(self.c3k2_30.state_dict(&p(30)));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        let p = |i: usize| prefixed(prefix, &i.to_string());
-        self.c3k2_15.load_state_dict(sd, &p(15))?;
-        self.c3k2_18.load_state_dict(sd, &p(18))?;
-        self.c3k2_21.load_state_dict(sd, &p(21))?;
-        self.conv22.load_state_dict(sd, &p(22))?;
-        self.c3k2_24.load_state_dict(sd, &p(24))?;
-        self.conv25.load_state_dict(sd, &p(25))?;
-        self.c3k2_27.load_state_dict(sd, &p(27))?;
-        self.conv28.load_state_dict(sd, &p(28))?;
-        self.c3k2_30.load_state_dict(sd, &p(30))?;
-        Ok(())
     }
 }

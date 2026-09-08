@@ -11,38 +11,35 @@
 //! suitable for long-form ASR — see the `svod-arch::vad` module for
 //! tunable knobs (min/max chunk duration, alignment, padding, etc.).
 
-extern crate self as svod_model;
-
 mod splitter;
 
 pub use splitter::{SileroVadSplitter, SileroVadSplitterError};
 
 use std::path::Path;
 
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 use svod_dtype::DType;
-use svod_ir::SInt;
 use svod_macros::jit_wrapper;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv1d, LSTMCell, Layer, PadMode};
 
-use crate::init::fan_in_uniform;
+use crate::init::{Bias, conv1d, fan_in_uniform};
 use crate::state;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Tensor {
         #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
         source: Box<svod_tensor::error::Error>,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     State {
         #[snafu(source(from(crate::state::Error, Box::new)))]
         source: Box<crate::state::Error>,
     },
-    #[snafu(display("hub error: {source}"))]
+    #[snafu(display("hub error: {source}"), context(false))]
     Hub { source: hf_hub::HFError },
 }
 
@@ -70,13 +67,13 @@ pub struct SileroVad {
 
 impl SileroVad {
     pub fn from_hub() -> Result<Self> {
-        let repo = crate::hub::HubRepo::open("vpermilp/silero-vad", "main").context(HubSnafu)?;
-        let path = repo.get("silero_vad_16k.safetensors").context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open("vpermilp/silero-vad", "main")?;
+        let path = repo.get("silero_vad_16k.safetensors")?;
         Self::from_safetensors(&path)
     }
 
     pub fn from_safetensors(path: &Path) -> Result<Self> {
-        let sd = state::load_safetensors(path).context(StateSnafu)?;
+        let sd = state::load_safetensors(path)?;
         Ok(Self {
             stft_conv: Conv1d::new(get(&sd, "stft_conv.weight")?, None).with_stride(128),
             conv1: Conv1d::new(get(&sd, "conv1.weight")?, Some(get(&sd, "conv1.bias")?)).with_padding((1, 1)),
@@ -103,26 +100,23 @@ impl SileroVad {
     /// const-folding so the JIT pipeline can be exercised without a checkpoint.
     pub fn with_random_weights() -> Self {
         let dt = DType::Float32;
-        let mk_conv = |shape: [usize; 3], has_bias: bool, configure: fn(Conv1d) -> Conv1d| -> Conv1d {
-            let fan_in = shape[1] * shape[2];
-            let weight = fan_in_uniform(&shape, fan_in, dt.clone());
-            let bias = has_bias.then(|| fan_in_uniform(&[shape[0]], fan_in, dt.clone()));
-            configure(Conv1d::new(weight, bias))
+        let mk_conv = |[out, inp, k]: [usize; 3], bias: Bias, configure: fn(Conv1d) -> Conv1d| -> Conv1d {
+            configure(conv1d(inp, out, k, bias, dt.clone()))
         };
 
         Self {
-            stft_conv: mk_conv([258, 1, 256], false, |c| c.with_stride(128)),
-            conv1: mk_conv([128, 129, 3], true, |c| c.with_padding((1, 1))),
-            conv2: mk_conv([64, 128, 3], true, |c| c.with_stride(2).with_padding((1, 1))),
-            conv3: mk_conv([64, 64, 3], true, |c| c.with_stride(2).with_padding((1, 1))),
-            conv4: mk_conv([128, 64, 3], true, |c| c.with_padding((1, 1))),
+            stft_conv: mk_conv([258, 1, 256], Bias::None, |c| c.with_stride(128)),
+            conv1: mk_conv([128, 129, 3], Bias::FanIn, |c| c.with_padding((1, 1))),
+            conv2: mk_conv([64, 128, 3], Bias::FanIn, |c| c.with_stride(2).with_padding((1, 1))),
+            conv3: mk_conv([64, 64, 3], Bias::FanIn, |c| c.with_stride(2).with_padding((1, 1))),
+            conv4: mk_conv([128, 64, 3], Bias::FanIn, |c| c.with_padding((1, 1))),
             lstm: LSTMCell::new(
                 fan_in_uniform(&[4 * HIDDEN, HIDDEN], HIDDEN, dt.clone()),
                 fan_in_uniform(&[4 * HIDDEN, HIDDEN], HIDDEN, dt.clone()),
                 fan_in_uniform(&[4 * HIDDEN], HIDDEN, dt.clone()),
                 fan_in_uniform(&[4 * HIDDEN], HIDDEN, dt.clone()),
             ),
-            final_conv: mk_conv([1, 128, 1], true, |c| c),
+            final_conv: mk_conv([1, 128, 1], Bias::FanIn, |c| c),
         }
     }
 
@@ -137,39 +131,22 @@ impl SileroVad {
             .pad_with()
             .padding(&[(0, 0), (0, STFT_PAD as isize)])
             .mode(PadMode::Reflect)
-            .call()
-            .context(TensorSnafu)?
-            .try_unsqueeze(1)
-            .context(TensorSnafu)?;
+            .call()?
+            .try_unsqueeze(1)?;
 
-        let x = self.stft_conv.forward(&x).context(TensorSnafu)?;
+        // `stft_conv` IS `Tensor::stft`'s `[2F, 1, n_fft]` analysis kernel with
+        // Silero's window baked in, and the reflect pad above is the (right-only)
+        // framing `center = false` wants — so the transform is that conv, and only
+        // the `[B, 2F, T] -> [B, F, T, 2]` regroup and the modulus come from the
+        // STFT helpers. Rebuilding the basis in-graph from `stft()` would discard
+        // the checkpoint's own kernel.
+        let x = self.stft_conv.forward(&x)?;
+        let x = x.unflatten(1, &[2, CUTOFF as isize])?.try_permute(&[0, 2, 3, 1])?.complex_abs()?;
 
-        // Keep the full (symbolic) batch dim (`None`); split STFT real/imag
-        // channels and the fixed 4 time frames.
-        let real = x
-            .try_shrink([None, Some((SInt::Const(0), SInt::Const(CUTOFF))), Some((SInt::Const(0), SInt::Const(4)))])
-            .context(TensorSnafu)?;
-        let imag = x
-            .try_shrink([None, Some((SInt::Const(CUTOFF), SInt::Const(258))), Some((SInt::Const(0), SInt::Const(4)))])
-            .context(TensorSnafu)?;
-        let x = real
-            .square()
-            .context(TensorSnafu)?
-            .try_add(&imag.square().context(TensorSnafu)?)
-            .context(TensorSnafu)?
-            .try_sqrt()
-            .context(TensorSnafu)?;
-
-        let x = self.conv1.forward(&x).context(TensorSnafu)?.relu().context(TensorSnafu)?;
-        let x = self.conv2.forward(&x).context(TensorSnafu)?.relu().context(TensorSnafu)?;
-        let x = self.conv3.forward(&x).context(TensorSnafu)?.relu().context(TensorSnafu)?;
-        self.conv4
-            .forward(&x)
-            .context(TensorSnafu)?
-            .relu()
-            .context(TensorSnafu)?
-            .try_squeeze(Some(-1))
-            .context(TensorSnafu)
+        let x = self.conv1.forward(&x)?.relu()?;
+        let x = self.conv2.forward(&x)?.relu()?;
+        let x = self.conv3.forward(&x)?.relu()?;
+        Ok(self.conv4.forward(&x)?.relu()?.try_squeeze(Some(-1))?)
     }
 
     /// Conv front-end + the LSTM's non-recurrent input projection, batched:
@@ -179,41 +156,31 @@ impl SileroVad {
     /// `W_hh·h` and activations. Bias order: `(feat·W_ihᵀ + b_ih) + b_hh`.
     pub fn forward_gates(&self, chunks: &Tensor) -> Result<Tensor> {
         let feat = self.forward_features(chunks)?;
-        feat.linear()
-            .weight(&self.lstm.weight_ih)
-            .bias(&self.lstm.bias_ih)
-            .call()
-            .context(TensorSnafu)?
-            .try_add(&self.lstm.bias_hh)
-            .context(TensorSnafu)
+        Ok(feat.linear().weight(&self.lstm.weight_ih).bias(&self.lstm.bias_ih).call()?.try_add(&self.lstm.bias_hh)?)
     }
 
     pub fn forward_chunk(&self, chunk: &Tensor, state_h: &Tensor, state_c: &Tensor) -> Result<Tensor> {
         let x = self.forward_features(chunk)?;
 
-        let (new_h, new_c) = self.lstm.step(&x, state_h, state_c).context(TensorSnafu)?;
+        let (new_h, new_c) = self.lstm.step(&x, state_h, state_c)?;
 
-        let prob = new_h.try_unsqueeze(-1).context(TensorSnafu)?.relu().context(TensorSnafu)?;
+        let prob = new_h.try_unsqueeze(-1)?.relu()?;
         let prob = self
             .final_conv
-            .forward(&prob)
-            .context(TensorSnafu)?
-            .sigmoid()
-            .context(TensorSnafu)?
-            .try_squeeze(Some(-1))
-            .context(TensorSnafu)?
+            .forward(&prob)?
+            .sigmoid()?
+            .try_squeeze(Some(-1))?
             .mean_with()
             .axes(-1isize)
             .keepdim(true)
-            .call()
-            .context(TensorSnafu)?;
+            .call()?;
 
-        Tensor::cat(&[&prob, &new_h, &new_c], 1).context(TensorSnafu)
+        Ok(Tensor::cat(&[&prob, &new_h, &new_c], 1)?)
     }
 }
 
 fn get(sd: &state::StateDict, key: &str) -> Result<Tensor> {
-    state::get_tensor(sd, key).context(StateSnafu)
+    Ok(state::get_tensor(sd, key)?)
 }
 
 /// Max windows per batched conv-front-end dispatch. Larger = fewer dispatches
@@ -314,14 +281,11 @@ impl svod_arch::pipelines::audio::Vad for VadInference {
 
 impl VadInference {
     pub fn new(vad: SileroVad) -> crate::jit::Result<Self> {
-        use crate::jit::{InputSpec, TensorSnafu};
+        use crate::jit::InputSpec;
+
         let h = HIDDEN;
         // Pull the recurrent weights to host before `vad` moves into the JIT.
-        let to_vec = |t: &Tensor| -> crate::jit::Result<Vec<f32>> {
-            let mut t = t.clone();
-            t.realize().context(TensorSnafu)?;
-            t.as_vec::<f32>().context(TensorSnafu)
-        };
+        let to_vec = |t: &Tensor| -> crate::jit::Result<Vec<f32>> { Ok(t.to_vec::<f32>()?) };
         let w_hh = ndarray::Array2::from_shape_vec((4 * h, h), to_vec(&vad.lstm.weight_hh)?).expect("w_hh shape");
         let final_w = ndarray::Array1::from_vec(to_vec(&vad.final_conv.weight)?); // [1,H,1] flat = H
         let final_b = match &vad.final_conv.bias {
@@ -334,9 +298,10 @@ impl VadInference {
         // Device-local output: the [FEATURE_BATCH, 4*HIDDEN] gates readback
         // (8 MiB per dispatch) goes over the SDMA copy queue instead of the
         // ~21 MB/s host-mapped BAR — same pattern as the encoder output.
-        let mut config = svod_tensor::PrepareConfig::from_env();
-        config.device_local_outputs = true;
-        jit.prepare_with_config(InputSpec::f32(&[FEATURE_BATCH, CHUNK_LEN]), &config)?;
+        jit.prepare_with_config(
+            InputSpec::f32(&[FEATURE_BATCH, CHUNK_LEN]),
+            &svod_tensor::PrepareConfig::device_local(),
+        )?;
         Ok(Self { jit, head })
     }
 
@@ -367,8 +332,7 @@ impl VadInference {
         while done < n_chunks {
             let b = (n_chunks - done).min(FEATURE_BATCH);
             {
-                let buf = self.jit.chunks_mut()?;
-                let mut view = buf.as_array_mut::<f32>().context(crate::jit::DeviceSnafu)?;
+                let mut view = self.jit.chunks_view_mut::<f32>()?;
                 let slice = view.as_slice_mut().expect("contiguous chunks");
                 for i in 0..b {
                     let start = (done + i) * NUM_SAMPLES;
@@ -378,7 +342,7 @@ impl VadInference {
             self.jit.execute()?;
             // Device-local output: SDMA-stage only the valid rows out.
             let dst = &mut gates[done * 4 * h..(done + b) * 4 * h];
-            self.jit.output()?.copyout_prefix(bytemuck::cast_slice_mut(dst)).context(crate::jit::DeviceSnafu)?;
+            self.jit.output()?.copyout_prefix(bytemuck::cast_slice_mut(dst))?;
             done += b;
         }
         let feature_ms = t_feat.elapsed().as_secs_f64() * 1e3;

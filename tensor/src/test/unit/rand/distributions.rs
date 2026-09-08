@@ -235,7 +235,7 @@ fn shape_validators_reject_empty_shape() {
 fn uniform_realizes_for_any_numel(shape: &[usize]) {
     let _g = RAND_TEST_LOCK.lock();
     manual_seed(7);
-    let mut t = Tensor::uniform(shape, -1.0, 1.0).unwrap();
+    let t = Tensor::uniform(shape, -1.0, 1.0).unwrap();
     t.realize().expect("realize");
     let v = t.as_vec::<f32>().expect("read");
     assert_eq!(v.len(), shape.iter().product::<usize>());

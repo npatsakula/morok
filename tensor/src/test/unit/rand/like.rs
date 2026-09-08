@@ -98,7 +98,7 @@ crate::codegen_tests! {
         let _g = RAND_TEST_LOCK.lock();
         manual_seed(3);
         let template = Tensor::empty(&[0, 5], DType::Float32);
-        let mut r = template.rand_like().unwrap();
+        let r = template.rand_like().unwrap();
         assert_eq!(shape_to_usize(&r.shape().unwrap()), vec![0, 5]);
         r.realize_with(&config).expect("realize empty tensor");
         assert_eq!(r.numel().unwrap(), 0);
@@ -123,7 +123,7 @@ crate::codegen_tests! {
         let _g = RAND_TEST_LOCK.lock();
         manual_seed(9);
         let template = Tensor::empty(&[32], DType::Int64);
-        let mut r = template.randint_like(0, 1000).unwrap();
+        let r = template.randint_like(0, 1000).unwrap();
         assert_eq!(r.uop().dtype(), DType::Int64);
         r.realize_with(&config).expect("realize");
         let v = r.as_vec::<i64>().expect("read");
@@ -137,7 +137,7 @@ crate::codegen_tests! {
         let _g = RAND_TEST_LOCK.lock();
         manual_seed(10);
         let template = Tensor::empty(&[4096], DType::Int32);
-        let mut r = template.randint_like(-5, 8).unwrap();
+        let r = template.randint_like(-5, 8).unwrap();
         r.realize_with(&config).expect("realize");
         let v = r.as_vec::<i32>().expect("read");
         for (i, &x) in v.iter().enumerate() {

@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use smallvec::smallvec;
 use snafu::{OptionExt, ResultExt};
-use svod_device::Buffer;
 use svod_dtype::DType;
 use svod_dtype::ext::HasDType;
 use svod_ir::ops;
@@ -64,7 +63,6 @@ use error::*;
 pub mod activation;
 pub mod arithmetic;
 pub mod beam_worker;
-pub mod bitwise;
 pub mod broadcast;
 pub mod conditional;
 pub mod config;
@@ -74,10 +72,12 @@ pub use svod_dtype::default_device;
 pub mod einsum;
 pub mod index;
 pub mod indexing;
+pub mod jit;
 pub mod math;
 pub mod matmul;
 pub mod memory_planner;
 pub mod nn;
+pub mod operand;
 pub mod rand;
 pub mod realize;
 pub mod reduce;
@@ -94,6 +94,7 @@ pub mod variable;
 pub use config::{PrepareConfig, device_supports_storage_dtype};
 pub use index::{Idx, IndexSpec};
 pub use memory_planner::PlannerMode;
+pub use operand::Operand;
 pub use svod_dtype::default_device::{clear_default_device, default_device, set_default_device, with_default_device};
 pub use svod_runtime::CpuBackend;
 pub use tensor_registry::apply_map_to_tensors;
@@ -158,9 +159,9 @@ pub struct KernelInfo {
 ///
 /// # Buffer Ownership (RAII)
 ///
-/// Tensors own their buffers via `Arc<Buffer>`. When all Tensor clones referencing
-/// a buffer are dropped, the buffer is automatically freed. This provides RAII
-/// cleanup without manual buffer management.
+/// A realized buffer is held by the registry entry the Tensor points at, so
+/// every clone shares one `Arc<Buffer>`. When the last handle to an entry is
+/// dropped the buffer goes with it — RAII cleanup without manual management.
 ///
 /// # Examples
 ///
@@ -168,20 +169,35 @@ pub struct KernelInfo {
 /// # use svod_tensor::Tensor;
 /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
 /// let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
-/// let mut c = &a + &b;  // Lazy - only builds UOp graph
+/// let c = (&a + &b).unwrap();  // Lazy - only builds UOp graph
 /// c.realize().unwrap();  // Executes the computation
 /// ```
+///
+/// Cloning shares the entry, so a realized buffer is visible through every
+/// clone — realization is recorded in the registry, not per handle.
+#[derive(Clone)]
 pub struct Tensor {
-    /// Registry entry holding the computation graph (supports global substitution)
+    /// Registry entry holding the computation graph and its realized buffer
+    /// (supports global substitution).
     entry: Arc<tensor_registry::TensorEntry>,
-    /// Owned buffer for RAII cleanup. None for lazy tensors.
-    buffer: Option<Arc<Buffer>>,
 }
 
-// Manual Clone impl to share Arc<Buffer> across clones
-impl Clone for Tensor {
-    fn clone(&self) -> Self {
-        Self { entry: Arc::clone(&self.entry), buffer: self.buffer.clone() }
+/// Metadata only — never the data, which would force a device read.
+impl std::fmt::Debug for Tensor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shape = match self.shape() {
+            Ok(shape) => {
+                svod_ir::shape::to_vec_usize(&shape).map_or_else(|_| "symbolic".to_string(), |dims| format!("{dims:?}"))
+            }
+            Err(_) => "unknown".to_string(),
+        };
+        let realized = self.entry.buffer().is_some() || tensor_registry::get_buffer_arc(self.uop().base().id).is_some();
+        f.debug_struct("Tensor")
+            .field("shape", &format_args!("{shape}"))
+            .field("dtype", &self.dtype())
+            .field("device", &self.device())
+            .field("realized", &realized)
+            .finish()
     }
 }
 
@@ -208,8 +224,7 @@ pub(crate) fn ceildiv_uop(num: &Arc<UOp>, amt: &Arc<UOp>) -> Arc<UOp> {
 impl Tensor {
     /// Create tensor without buffer (for lazy computation graphs).
     fn new(uop: Arc<UOp>) -> Self {
-        let entry = tensor_registry::register_tensor(uop);
-        Self { entry, buffer: None }
+        Self { entry: tensor_registry::register_tensor(uop) }
     }
 
     /// Create a lazy tensor from a UOp graph (no buffer allocated).
@@ -229,9 +244,9 @@ impl Tensor {
         Ok(Self::new(buffer_uop))
     }
 
-    /// Create tensor with existing buffer (for input tensors and realize results).
-    pub(crate) fn with_buffer(entry: Arc<tensor_registry::TensorEntry>, buffer: Arc<Buffer>) -> Self {
-        Self { entry, buffer: Some(buffer) }
+    /// Adopt a registry entry that already carries its buffer.
+    pub(crate) fn with_entry(entry: Arc<tensor_registry::TensorEntry>) -> Self {
+        Self { entry }
     }
 
     /// Check if this tensor has zero total elements (any shape dimension is 0).
@@ -245,8 +260,8 @@ impl Tensor {
     /// Ensure buffer is attached if the UOp has buffer identity.
     ///
     /// When `apply_map_to_tensors` substitutes a tensor's UOp with a realized
-    /// BUFFER+RESHAPE, the Tensor struct's `buffer` field isn't updated.
-    /// This method looks up the buffer from the registry and attaches it.
+    /// BUFFER+RESHAPE, the entry's buffer isn't updated. This method looks it
+    /// up in the registry and attaches it.
     pub(crate) fn ensure_buffer(&self) {
         let buffer_id = self.uop().base().id;
         if let Some(buf_arc) = tensor_registry::get_buffer_arc(buffer_id) {
@@ -310,26 +325,29 @@ impl Tensor {
 
     /// Create a tensor filled with a constant value, broadcast to the given shape.
     #[track_caller]
-    pub fn full(shape: &[usize], value: impl Into<ConstValue>, dtype: DType) -> Result<Self> {
+    pub fn full(shape: &[usize], value: impl Into<ConstValue>, dtype: DType) -> Self {
         origin_call!("full");
         let scalar = Self::const_(value, dtype);
         if shape.is_empty() {
-            return Ok(scalar);
+            return scalar;
         }
         let expand_shape: Vec<isize> = shape.iter().map(|&d| d as isize).collect();
-        scalar.try_reshape(vec![1; shape.len()])?.try_expand(&expand_shape)
+        scalar
+            .try_reshape(vec![1; shape.len()])
+            .and_then(|t| t.try_expand(&expand_shape))
+            .expect("a scalar constant always reshapes and expands to a concrete shape")
     }
 
     /// Create a zero-filled tensor with the given concrete shape.
     #[track_caller]
-    pub fn zeros(shape: &[usize], dtype: DType) -> Result<Self> {
+    pub fn zeros(shape: &[usize], dtype: DType) -> Self {
         origin_call!("zeros");
         Self::full(shape, ConstValue::zero(dtype.base()), dtype)
     }
 
     /// Create a one-filled tensor with the given concrete shape.
     #[track_caller]
-    pub fn ones(shape: &[usize], dtype: DType) -> Result<Self> {
+    pub fn ones(shape: &[usize], dtype: DType) -> Self {
         origin_call!("ones");
         Self::full(shape, ConstValue::one(dtype.base()), dtype)
     }
@@ -386,9 +404,9 @@ impl Tensor {
         let shape = self.shape()?;
         let ndim = shape.len();
         let axis_idx = Self::normalize_axis(axis, ndim)?;
-        let n = shape[axis_idx]
-            .as_const()
-            .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "_cumalu".to_string() })?;
+        let n = shape[axis_idx].as_const().ok_or_else(|| ErrorKind::SymbolicShapeUnsupported {
+            operation: "cumsum/cumprod over a symbolic axis".to_string(),
+        })?;
 
         if n <= 1 {
             return Ok(self.clone());
@@ -460,7 +478,7 @@ impl Tensor {
                 return Ok(Self::empty_zero(dtype));
             }
 
-            Self::full(&[ceildiv as usize], *s, dtype.clone())?
+            Self::full(&[ceildiv as usize], *s, dtype.clone())
         } else {
             let ceildiv = ceildiv_uop(&stop.sub(&start), &step);
             let output_len_sint = SInt::from(ceildiv.clone());
@@ -472,7 +490,7 @@ impl Tensor {
 
         let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
         let offset = Self::new(start.sub(&step));
-        cumsum.try_add(&offset)?.cast(dtype)
+        Ok(cumsum.try_add(&offset)?.cast(dtype))
     }
 
     /// Create 1D tensor with evenly spaced Int32 values.
@@ -493,17 +511,17 @@ impl Tensor {
     pub fn arange_f64(start: f64, stop: f64, step: f64, dtype: DType) -> Result<Self> {
         origin_call!("arange");
         if step == 0.0 {
-            return Err(Error::SymbolicShapeUnsupported { operation: "arange with step=0".to_string() });
+            return Err(ErrorKind::SymbolicShapeUnsupported { operation: "arange with step=0".to_string() }.into());
         }
         let count = ((stop - start) / step).ceil() as i64;
         if count <= 0 {
             return Ok(Self::empty_zero(dtype));
         }
         let count = count as usize;
-        let step_tensor = Self::full(&[count], ConstValue::Float(step), dtype.clone())?;
+        let step_tensor = Self::full(&[count], ConstValue::Float(step), dtype.clone());
         let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
         let offset = Self::const_(ConstValue::Float(start - step), dtype.clone());
-        cumsum.try_add(&offset)?.cast(dtype)
+        Ok(cumsum.try_add(&offset)?.cast(dtype))
     }
 
     /// Create 1D tensor with `steps` evenly spaced values from `start` to `end` (inclusive).
@@ -514,12 +532,12 @@ impl Tensor {
             return Ok(Self::empty_zero(dtype));
         }
         if steps == 1 {
-            return Self::full(&[1], start, dtype);
+            return Ok(Self::full(&[1], start, dtype));
         }
         let t = Self::arange(steps as i64, None, None)?;
         let scale = Self::const_((end - start) / (steps as f64 - 1.0), DType::Float64);
         let offset = Tensor::const_(start, DType::Float64);
-        t.cast(DType::Float64)?.try_mul(&scale)?.try_add(&offset)?.cast(dtype)
+        Ok(t.cast(DType::Float64).try_mul(&scale)?.try_add(&offset)?.cast(dtype))
     }
 
     // === Constant Constructors ===
@@ -567,6 +585,18 @@ impl Tensor {
         Self::const_(value, dtype)
     }
 
+    /// Element type of this tensor.
+    ///
+    /// # Examples
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// # use svod_dtype::DType;
+    /// assert_eq!(Tensor::from_slice(&[1.0f32, 2.0]).dtype(), DType::Float32);
+    /// ```
+    pub fn dtype(&self) -> DType {
+        self.uop().dtype()
+    }
+
     /// Get device specification from underlying UOp graph.
     ///
     /// Returns the device where this tensor's data resides.
@@ -590,7 +620,7 @@ impl Tensor {
     /// # Examples
     /// ```ignore
     /// let cpu_tensor = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    /// let mut gpu_tensor = cpu_tensor.to(DeviceSpec::Cuda { device_id: 0 });
+    /// let gpu_tensor = cpu_tensor.to(DeviceSpec::Cuda { device_id: 0 });
     /// gpu_tensor.realize()?;  // Actually transfers data
     /// ```
     #[track_caller]
@@ -609,13 +639,12 @@ impl Tensor {
     /// # Examples
     /// ```ignore
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    /// let t_int = t.cast(DType::Int32)?;
+    /// let t_int = t.cast(DType::Int32);
     /// ```
     #[track_caller]
-    pub fn cast(&self, dtype: svod_dtype::DType) -> Result<Self> {
+    pub fn cast(&self, dtype: svod_dtype::DType) -> Self {
         origin_call!("cast");
-        let casted = self.uop().cast(dtype);
-        Ok(Self::new(casted))
+        Self::new(self.uop().cast(dtype))
     }
 
     /// Build and apply a custom UOp kernel over this tensor and additional inputs.
@@ -683,10 +712,10 @@ impl Tensor {
     pub fn bitcast(&self, dtype: svod_dtype::DType) -> Result<Self> {
         origin_call!("bitcast");
         let src_dt = self.uop().dtype();
-        let src_scalar = src_dt.scalar().ok_or_else(|| Error::SymbolicShapeUnsupported {
+        let src_scalar = src_dt.scalar().ok_or_else(|| ErrorKind::SymbolicShapeUnsupported {
             operation: "bitcast: non-scalar source dtype".to_string(),
         })?;
-        let dst_scalar = dtype.scalar().ok_or_else(|| Error::SymbolicShapeUnsupported {
+        let dst_scalar = dtype.scalar().ok_or_else(|| ErrorKind::SymbolicShapeUnsupported {
             operation: "bitcast: non-scalar destination dtype".to_string(),
         })?;
         let src_size = src_scalar.bytes();
@@ -697,16 +726,17 @@ impl Tensor {
         }
 
         let shape = self.shape()?;
-        let last_dim = shape.last().and_then(|s| s.as_const()).ok_or_else(|| Error::SymbolicShapeUnsupported {
+        let last_dim = shape.last().and_then(|s| s.as_const()).ok_or_else(|| ErrorKind::SymbolicShapeUnsupported {
             operation: "bitcast with size change on symbolic last dim".to_string(),
         })?;
         if last_dim * src_size % dst_size != 0 {
-            return Err(Error::ReshapeSizeMismatch {
+            return Err(ErrorKind::ReshapeSizeMismatch {
                 operation: format!(
                     "bitcast {src_scalar:?}({src_size}B) → {dst_scalar:?}({dst_size}B): \
                      last dim {last_dim} × {src_size} not divisible by {dst_size}"
                 ),
-            });
+            }
+            .into());
         }
 
         let src_uint = DType::Scalar(uint_for_bytes(src_size));
@@ -733,7 +763,7 @@ impl Tensor {
                     std::iter::repeat_n(None, new_shape.len() - 1).collect();
                 shrink_ranges.push(Some((i as isize, (i + 1) as isize)));
                 let slice = reshaped.try_shrink(shrink_ranges)?;
-                let widened = slice.cast(dst_uint.clone())?;
+                let widened = slice.cast(dst_uint.clone());
                 let shift_amount = 8 * i * src_size;
                 let term = if shift_amount == 0 {
                     widened
@@ -742,7 +772,7 @@ impl Tensor {
                         &svod_ir::shape::to_vec_usize(&widened.shape()?).context(UOpSnafu)?,
                         ConstValue::UInt(shift_amount as u64),
                         dst_uint.clone(),
-                    )?;
+                    );
                     widened.try_shl(&shift_t)?
                 };
                 acc = Some(match acc {
@@ -767,7 +797,7 @@ impl Tensor {
                         &svod_ir::shape::to_vec_usize(&tmp.shape()?).context(UOpSnafu)?,
                         ConstValue::UInt(shift_amount as u64),
                         src_uint.clone(),
-                    )?;
+                    );
                     tmp.try_shr(&shift_t)?
                 };
                 shifted.push(s);
@@ -782,7 +812,7 @@ impl Tensor {
             new_shape.truncate(nd - 2);
             new_shape.push(trailing);
             let flat = stacked.try_reshape(&new_shape)?;
-            flat.cast(dst_uint.clone())?
+            flat.cast(dst_uint.clone())
         };
 
         // Final reinterpretation at equal size (e.g. u16 → f16).
@@ -820,24 +850,26 @@ impl Tensor {
         origin_call!("assign");
         let target_uop = self.uop();
         if self.device().is_disk() {
-            return Err(Error::IrConstruction {
+            return Err(ErrorKind::IrConstruction {
                 details: "assign to DISK tensors is not supported by Svod runtime".to_string(),
-            });
+            }
+            .into());
         }
 
         let target_shape = self.shape()?;
         let value_shape = value.shape()?;
         let value = if target_shape != value_shape { value.broadcast_to(&target_shape)? } else { value.clone() };
         if self.device() != value.device() {
-            return Err(Error::IrConstruction {
+            return Err(ErrorKind::IrConstruction {
                 details: format!("assign device mismatch {:?} != {:?}", self.device(), value.device()),
-            });
+            }
+            .into());
         }
 
         let target_dtype = target_uop.dtype();
         let value_dtype = value.uop().dtype();
         if target_dtype != value_dtype {
-            return Err(Error::TypeMismatch { expected: target_dtype, actual: value_dtype });
+            return Err(ErrorKind::TypeMismatch { expected: target_dtype, actual: value_dtype }.into());
         }
 
         let value_uop = value.uop();
@@ -888,7 +920,7 @@ impl Tensor {
     /// # Examples
     /// ```ignore
     /// // Force a constant to be materialized
-    /// let mut c = Tensor::const_(5.0f32, DType::Float32).contiguous();
+    /// let c = Tensor::const_(5.0f32, DType::Float32).contiguous();
     /// c.realize()?;
     /// assert!(c.buffer().is_some());
     /// ```
@@ -934,7 +966,7 @@ impl Tensor {
         origin_call!("eye");
         let rows = Self::arange(n as i64, None, None)?.try_unsqueeze(-1)?;
         let cols = Self::arange(m as i64, None, None)?;
-        rows.try_eq(&cols)?.cast(dtype)
+        Ok(rows.try_eq(&cols)?.cast(dtype))
     }
 }
 
@@ -958,18 +990,17 @@ impl Tensor {
             result = result.flip(&[axis_idx as isize])?;
         }
         if exclusive {
-            let dim_size =
-                shape[axis_idx].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "cumsum" })? as isize;
+            let dim_size = shape[axis_idx]
+                .as_const()
+                .context(SymbolicShapeUnsupportedSnafu { operation: "exclusive cumsum over a symbolic axis" })?;
             let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); ndim];
             pad_spec[axis_idx] = (1, 0);
             result = result.try_pad(&pad_spec)?;
-            let mut shrink_spec: Vec<(isize, isize)> = result
-                .shape()?
-                .iter()
-                .map(|s| Ok((0, s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "cumsum" })? as isize)))
-                .collect::<Result<_>>()?;
-            shrink_spec[axis_idx] = (0, dim_size);
-            result = result.try_shrink(&shrink_spec)?;
+            // `None` keeps a dim whole, so only the (concrete) cum axis is sliced
+            // and every other dim may stay symbolic.
+            let mut shrink_spec: Vec<Option<(SInt, SInt)>> = vec![None; ndim];
+            shrink_spec[axis_idx] = Some((SInt::Const(0), SInt::Const(dim_size)));
+            result = result.try_shrink(shrink_spec)?;
         }
         result = result.cumsum(axis_idx as isize)?;
         if reverse {
@@ -996,20 +1027,17 @@ impl Tensor {
             result = result.flip(&[axis_idx as isize])?;
         }
         if exclusive {
-            let dim_size =
-                shape[axis_idx].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "cumprod" })? as isize;
+            let dim_size = shape[axis_idx]
+                .as_const()
+                .context(SymbolicShapeUnsupportedSnafu { operation: "exclusive cumprod over a symbolic axis" })?;
             let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); ndim];
             pad_spec[axis_idx] = (1, 0);
             result = result.try_pad_value(&pad_spec, 1.0)?;
-            let mut shrink_spec: Vec<(isize, isize)> = result
-                .shape()?
-                .iter()
-                .map(|s| {
-                    Ok((0, s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "cumprod" })? as isize))
-                })
-                .collect::<Result<_>>()?;
-            shrink_spec[axis_idx] = (0, dim_size);
-            result = result.try_shrink(&shrink_spec)?;
+            // `None` keeps a dim whole, so only the (concrete) cum axis is sliced
+            // and every other dim may stay symbolic.
+            let mut shrink_spec: Vec<Option<(SInt, SInt)>> = vec![None; ndim];
+            shrink_spec[axis_idx] = Some((SInt::Const(0), SInt::Const(dim_size)));
+            result = result.try_shrink(shrink_spec)?;
         }
         result = result.cumprod(axis_idx as isize)?;
         if reverse {

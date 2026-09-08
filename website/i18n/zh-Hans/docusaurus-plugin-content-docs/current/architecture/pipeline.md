@@ -29,12 +29,11 @@ Svod 中的 `Tensor` 非常轻量：
 
 ```rust
 pub struct Tensor {
-    entry: Arc<TensorEntry>,      // Computation graph
-    buffer: Option<Arc<Buffer>>,  // Materialized data (if any)
+    entry: Arc<TensorEntry>,  // Computation graph + its realized buffer
 }
 ```
 
-`entry` 持有包含 UOp 图的 `TensorEntry`——即这个张量所代表的计算。`buffer` 是可选的：惰性张量没有 buffer，只有 realize 后的张量才有。
+`entry` 持有包含 UOp 图的 `TensorEntry`——即这个张量所代表的计算——以及由 realize 填入的 `OnceLock` buffer。惰性张量还没有 buffer，realize 之后的张量才有；而且由于 buffer 存放在共享的 entry 中而不是句柄里，克隆一个张量也就共享了它的 realize 结果。这正是 `realize()`、`prepare()` 和 `profile()` 都接受 `&self` 的原因。
 
 ### 三种创建张量的方式
 

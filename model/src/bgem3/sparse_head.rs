@@ -10,20 +10,20 @@
 //! Weights are loaded from `sparse_linear.pt` (PyTorch pickle with bare
 //! `weight` / `bias` keys).
 
-use snafu::{OptionExt, ResultExt};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::indexing::ScatterReduction;
+use svod_tensor::nn::Module;
 
 use crate::init::{fan_in_uniform, zeros};
-use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
-use crate::xlm_roberta::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use crate::state::{self, StateDict};
+use crate::xlm_roberta::error::Result;
 
 /// XLM-RoBERTa special token IDs — always zeroed in sparse output.
 /// `<s>`=0, `<pad>`=1, `</s>`=2, `<unk>`=3.
 const XLM_R_SPECIAL_IDS: &[usize] = &[0, 1, 2, 3];
 
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct SparseHead {
     pub weight: Tensor,
     pub bias: Tensor,
@@ -50,62 +50,35 @@ impl SparseHead {
     pub fn from_state_dict(sd: &StateDict, prefix: &str, vocab_size: usize, dtype: DType) -> Result<Self> {
         let sd = state::cast_all(sd, dtype.clone());
         let mut head = Self::empty(0, vocab_size, dtype);
-        head.load_state_dict(&sd, prefix).map_err(|e| crate::xlm_roberta::Error::State { source: Box::new(e) })?;
+        head.load_state_dict(&sd, prefix)?;
         Ok(head)
     }
 
     /// Forward. `hidden`: `(B, L, D)`, `input_ids`: `(B, L)` int.
     /// Returns `(B, vocab_size)` sparse embedding with special-token positions zeroed.
     pub fn forward(&self, hidden: &Tensor, input_ids: &Tensor) -> Result<Tensor> {
-        let shape = hidden.shape().context(TensorSnafu)?;
-        let b: usize = shape[0].as_const().context(SymbolicShapeSnafu { what: "sparse_head" })?;
+        let b = hidden.dim_const(0)?;
 
-        let token_weights = hidden
-            .linear()
-            .weight(&self.weight)
-            .bias(&self.bias)
-            .call()
-            .context(TensorSnafu)?
-            .relu()
-            .context(TensorSnafu)?;
+        let token_weights = hidden.linear().weight(&self.weight).bias(&self.bias).call()?.relu()?;
 
-        let token_weights = token_weights.try_squeeze(Some(-1)).context(TensorSnafu)?;
+        let token_weights = token_weights.try_squeeze(Some(-1))?;
 
-        let zeros = Tensor::zeros(&[b, self.vocab_size], hidden.uop().dtype()).expect("non-empty shape");
-        let sparse =
-            zeros.scatter_reduce(-1, input_ids, &token_weights, ScatterReduction::Amax, true).context(TensorSnafu)?;
+        let zeros = Tensor::zeros(&[b, self.vocab_size], hidden.dtype());
+        let sparse = zeros.scatter_reduce(-1, input_ids, &token_weights, ScatterReduction::Amax, true)?;
 
-        let mask = self.unused_token_mask(hidden.uop().dtype())?;
-        sparse.try_mul(&mask).context(TensorSnafu)
+        let mask = self.unused_token_mask(hidden.dtype())?;
+        Ok(sparse.try_mul(&mask)?)
     }
 
+    /// `(1, vocab_size)` multiplier, `0.0` at every special-token id and `1.0`
+    /// elsewhere. Built in the graph from an `arange` over the vocabulary, so
+    /// no host-side `vocab_size`-long buffer is allocated or uploaded per call.
     fn unused_token_mask(&self, dtype: DType) -> Result<Tensor> {
-        let mut vals = vec![1.0f32; self.vocab_size];
-        for &id in XLM_R_SPECIAL_IDS {
-            if id < self.vocab_size {
-                vals[id] = 0.0;
-            }
+        let ids = Tensor::arange(0, Some(self.vocab_size as i64), None)?;
+        let mut keep = ids.try_ne(XLM_R_SPECIAL_IDS[0] as i64)?;
+        for &id in &XLM_R_SPECIAL_IDS[1..] {
+            keep = keep.try_bitand(&ids.try_ne(id as i64)?)?;
         }
-        let mask = Tensor::from_slice(&vals)
-            .try_reshape([1isize, self.vocab_size as isize])
-            .context(TensorSnafu)?
-            .cast(dtype)
-            .context(TensorSnafu)?;
-        Ok(mask)
-    }
-}
-
-impl HasStateDict for SparseHead {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        sd.insert(prefixed(prefix, "weight"), self.weight.clone());
-        sd.insert(prefixed(prefix, "bias"), self.bias.clone());
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.weight = get_tensor(sd, &prefixed(prefix, "weight"))?;
-        self.bias = get_tensor(sd, &prefixed(prefix, "bias"))?;
-        Ok(())
+        Ok(keep.cast(dtype).try_unsqueeze(0)?)
     }
 }

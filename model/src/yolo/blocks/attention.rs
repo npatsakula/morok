@@ -1,11 +1,9 @@
-use snafu::{OptionExt, ResultExt};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
-
-use crate::state::{self, HasStateDict, StateDict, prefixed};
+use svod_tensor::nn::Module;
 
 use super::conv::YoloConv;
-use crate::yolo::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use crate::yolo::error::Result;
 
 /// Multi-head attention with a depthwise-conv positional encoding.
 ///
@@ -14,7 +12,7 @@ use crate::yolo::error::{Result, SymbolicShapeSnafu, TensorSnafu};
 /// All projections are 1×1 convs (no activation).
 ///
 /// State-dict keys: `qkv.{conv,bn}.*`, `proj.{conv,bn}.*`, `pe.{conv,bn}.*`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Attention {
     pub qkv: YoloConv,
     pub proj: YoloConv,
@@ -30,8 +28,7 @@ impl Attention {
         let head_dim = dim / num_heads;
         let key_dim = (head_dim as f64 * attn_ratio) as usize;
         let scale = (key_dim as f64).powf(-0.5) as f32;
-        let nh_kd = key_dim * num_heads;
-        let qkv_out = dim + nh_kd * 2;
+        let qkv_out = dim + key_dim * num_heads * 2;
 
         Self {
             qkv: YoloConv::empty(dim, qkv_out, 1, 1, false),
@@ -45,92 +42,44 @@ impl Attention {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let shape = x.shape().context(TensorSnafu)?;
-        let b = shape[0].clone();
-        let nh = self.num_heads;
-        let kd = self.key_dim;
-        let hd = self.head_dim;
-        let kkd = kd * 2 + hd;
-
-        let h: usize = shape[2].as_const().context(SymbolicShapeSnafu { what: "yolo attention H" })?;
-        let w: usize = shape[3].as_const().context(SymbolicShapeSnafu { what: "yolo attention W" })?;
+        let b = x.dim(0)?;
+        let (nh, kd, hd) = (self.num_heads, self.key_dim, self.head_dim);
+        let h = x.dim_const(2)?;
+        let w = x.dim_const(3)?;
         let hw = h * w;
 
-        // QKV 1×1 conv: [B, C, H, W] → [B, nh*kkd, H, W]
+        // QKV 1×1 conv, then flatten spatial and separate heads:
+        // [B, C, H, W] → [B, nh*(2kd+hd), H, W] → [B, nh, 2kd+hd, H*W]
         let qkv = self.qkv.forward(x)?;
+        let qkv = qkv.try_reshape([b.clone(), SInt::from(nh), SInt::from(kd * 2 + hd), SInt::from(hw)])?;
 
-        // Flatten spatial then separate heads:
-        // [B, nh*kkd, H, W] → [B, nh*kkd, H*W] → [B, nh, kkd, N]
-        let qkv = qkv
-            .try_reshape([b.clone(), SInt::from(nh * kkd), SInt::from(hw)])
-            .context(TensorSnafu)?
-            .try_reshape([b.clone(), SInt::from(nh), SInt::from(kkd), SInt::from(hw)])
-            .context(TensorSnafu)?;
+        // q [B,nh,kd,N], k [B,nh,kd,N], v [B,nh,hd,N]
+        let parts = qkv.split(&[kd, kd, hd], 2)?;
+        let (q, k, v) = (&parts[0], &parts[1], &parts[2]);
 
-        // Split into q [B,nh,kd,N], k [B,nh,kd,N], v [B,nh,hd,N]
-        let parts = qkv.split(&[kd, kd, hd], 2).context(TensorSnafu)?;
-        let q = &parts[0];
-        let k = &parts[1];
-        let v = &parts[2];
+        // attn = softmax(q^T @ k) : [B, nh, N, N]
+        let attn = q.try_mul(self.scale)?.try_transpose(-2, -1)?.matmul(k)?.softmax(-1)?;
 
-        // Scale q
-        let scale_t = Tensor::from_slice([self.scale]);
-        let q = q.try_mul(&scale_t).context(TensorSnafu)?;
+        // out = v @ attn^T : [B, nh, hd, N], reshaped back to [B, C, H, W]
+        let spatial = |t: &Tensor| t.try_reshape([b.clone(), SInt::from(nh * hd), SInt::from(h), SInt::from(w)]);
+        let out = spatial(&v.matmul(&attn.try_transpose(-2, -1)?)?)?;
 
-        // attn = q^T @ k : [B, nh, N, kd] @ [B, nh, kd, N] = [B, nh, N, N]
-        let q_t = q.try_transpose(-2, -1).context(TensorSnafu)?;
-        let attn = q_t.matmul(k).context(TensorSnafu)?;
-        let attn = attn.softmax(-1).context(TensorSnafu)?;
+        // Positional encoding: depthwise conv on v reshaped to spatial.
+        let pe = self.pe.forward(&spatial(v)?)?;
 
-        // out = v @ attn^T : [B, nh, hd, N] @ [B, nh, N, N] = [B, nh, hd, N]
-        let attn_t = attn.try_transpose(-2, -1).context(TensorSnafu)?;
-        let out = v.matmul(&attn_t).context(TensorSnafu)?;
-
-        // Reshape back to spatial: [B, nh, hd, N] → [B, C, H, W]
-        let c = nh * hd;
-        let out = out
-            .try_reshape([b.clone(), SInt::from(c), SInt::from(hw)])
-            .context(TensorSnafu)?
-            .try_reshape([b.clone(), SInt::from(c), SInt::from(h), SInt::from(w)])
-            .context(TensorSnafu)?;
-
-        // Positional encoding: depthwise conv on v reshaped to spatial
-        let v_spatial = v
-            .try_reshape([b.clone(), SInt::from(c), SInt::from(hw)])
-            .context(TensorSnafu)?
-            .try_reshape([b.clone(), SInt::from(c), SInt::from(h), SInt::from(w)])
-            .context(TensorSnafu)?;
-        let pe = self.pe.forward(&v_spatial)?;
-
-        let out = out.try_add(&pe).context(TensorSnafu)?;
-
-        self.proj.forward(&out)
-    }
-}
-
-impl HasStateDict for Attention {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.qkv.state_dict(&prefixed(prefix, "qkv"));
-        sd.extend(self.proj.state_dict(&prefixed(prefix, "proj")));
-        sd.extend(self.pe.state_dict(&prefixed(prefix, "pe")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.qkv.load_state_dict(sd, &prefixed(prefix, "qkv"))?;
-        self.proj.load_state_dict(sd, &prefixed(prefix, "proj"))?;
-        self.pe.load_state_dict(sd, &prefixed(prefix, "pe"))?;
-        Ok(())
+        self.proj.forward(&out.try_add(&pe)?)
     }
 }
 
 /// Position-Sensitive Attention block: attention + FFN, both with residual.
 ///
 /// State-dict keys: `attn.*`, `ffn.0.{conv,bn}.*`, `ffn.1.{conv,bn}.*`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct PSABlock {
     pub attn: Attention,
+    #[module(key = "ffn.0")]
     pub ffn0: YoloConv,
+    #[module(key = "ffn.1")]
     pub ffn1: YoloConv,
 }
 
@@ -144,26 +93,9 @@ impl PSABlock {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let attn_out = self.attn.forward(x)?;
-        let x = x.try_add(&attn_out).context(TensorSnafu)?;
+        let x = x.try_add(&self.attn.forward(x)?)?;
         let ffn_out = self.ffn1.forward(&self.ffn0.forward(&x)?)?;
-        x.try_add(&ffn_out).context(TensorSnafu)
-    }
-}
-
-impl HasStateDict for PSABlock {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.attn.state_dict(&prefixed(prefix, "attn"));
-        sd.extend(self.ffn0.state_dict(&prefixed(prefix, "ffn.0")));
-        sd.extend(self.ffn1.state_dict(&prefixed(prefix, "ffn.1")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.attn.load_state_dict(sd, &prefixed(prefix, "attn"))?;
-        self.ffn0.load_state_dict(sd, &prefixed(prefix, "ffn.0"))?;
-        self.ffn1.load_state_dict(sd, &prefixed(prefix, "ffn.1"))?;
-        Ok(())
+        Ok(x.try_add(&ffn_out)?)
     }
 }
 
@@ -171,7 +103,7 @@ impl HasStateDict for PSABlock {
 /// concat, project back.
 ///
 /// State-dict keys: `cv1.{conv,bn}.*`, `cv2.{conv,bn}.*`, `m.{i}.*`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct C2PSA {
     pub cv1: YoloConv,
     pub cv2: YoloConv,
@@ -194,33 +126,9 @@ impl C2PSA {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let y = self.cv1.forward(x)?;
-        let parts = y.split(&[self.c_hidden, self.c_hidden], 1).context(TensorSnafu)?;
-        let a = &parts[0];
-        let mut b = parts[1].clone();
-        for blk in &self.m {
-            b = blk.forward(&b)?;
-        }
-        let cat = Tensor::cat(&[a, &b], 1).context(TensorSnafu)?;
-        self.cv2.forward(&cat)
-    }
-}
-
-impl HasStateDict for C2PSA {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.cv1.state_dict(&prefixed(prefix, "cv1"));
-        sd.extend(self.cv2.state_dict(&prefixed(prefix, "cv2")));
-        for (i, blk) in self.m.iter().enumerate() {
-            sd.extend(blk.state_dict(&prefixed(prefix, &format!("m.{i}"))));
-        }
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.cv1.load_state_dict(sd, &prefixed(prefix, "cv1"))?;
-        self.cv2.load_state_dict(sd, &prefixed(prefix, "cv2"))?;
-        for (i, blk) in self.m.iter_mut().enumerate() {
-            blk.load_state_dict(sd, &prefixed(prefix, &format!("m.{i}")))?;
-        }
-        Ok(())
+        let a = y.narrow(1, 0usize, self.c_hidden)?;
+        let b = y.narrow(1, self.c_hidden, self.c_hidden)?;
+        let b = self.m.iter().try_fold(b, |acc, blk| blk.forward(&acc))?;
+        self.cv2.forward(&Tensor::cat(&[&a, &b], 1)?)
     }
 }

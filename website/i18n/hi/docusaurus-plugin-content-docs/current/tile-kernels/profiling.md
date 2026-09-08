@@ -77,7 +77,7 @@ report के columns इस हिसाब से ढलते हैं क�
 
 ```rust
 // tensor/src/realize.rs — realizes the tensor as a side effect, like realize()
-pub fn profile(&mut self, opts: &ProfileOptions) -> Result<RunProfile>
+pub fn profile(&self, opts: &ProfileOptions) -> Result<RunProfile>
 
 // runtime/src/execution_plan.rs — profile an already-prepared plan
 pub fn profile(&self, opts: &ProfileOptions) -> Result<RunProfile>
@@ -92,7 +92,7 @@ pub fn profile(&self, opts: &ProfileOptions) -> Result<RunProfile>
 use svod_runtime::ProfileOptions;
 
 // Any Tensor — a tk kernel here, but a pure graph computation works identically.
-let mut out = svod_tk::flash_attention(&q, &k, &v)?;
+let out = svod_tk::flash_attention(&q, &k, &v)?;
 let report = out.profile(&ProfileOptions::default())?;
 
 // The library NEVER prints. render_table() returns a String; the caller decides.

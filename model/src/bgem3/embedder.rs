@@ -8,13 +8,13 @@
 //! Loads from HuggingFace Hub: `config.json` + `pytorch_model.bin` (backbone)
 //! + `sparse_linear.pt` + `colbert_linear.pt` (heads).
 
-use snafu::{OptionExt, ResultExt};
-use svod_tensor::{BoundVariable, Tensor};
+use snafu::OptionExt;
+use svod_tensor::Tensor;
 
 use crate::xlm_roberta::config::XlmRobertaConfig;
-use crate::xlm_roberta::error::{HubSnafu, Result, SymbolicShapeSnafu, TensorSnafu};
+use crate::xlm_roberta::error::{MissingHeadSnafu, Result};
+
 use crate::xlm_roberta::model::XlmRobertaModel;
-use crate::xlm_roberta::pooling::cls;
 
 use super::colbert_head::ColbertHead;
 use super::sparse_head::SparseHead;
@@ -72,16 +72,15 @@ impl BgeM3 {
         let mut out = BgeM3Output::default();
 
         if opts.return_dense {
-            let dense = cls(&hidden)?;
-            out.dense_vecs =
-                Some(if self.normalize_dense { dense.lp_normalize(-1, 2).context(TensorSnafu)? } else { dense });
+            let dense = hidden.take_index(1, 0)?;
+            out.dense_vecs = Some(if self.normalize_dense { dense.lp_normalize(-1, 2)? } else { dense });
         }
         if opts.return_sparse {
-            let head = self.sparse_head.as_ref().context(SymbolicShapeSnafu { what: "sparse_head" })?;
+            let head = self.sparse_head.as_ref().context(MissingHeadSnafu { head: "sparse" })?;
             out.sparse_vecs = Some(head.forward(&hidden, input_ids)?);
         }
         if opts.return_colbert {
-            let head = self.colbert_head.as_ref().context(SymbolicShapeSnafu { what: "colbert_head" })?;
+            let head = self.colbert_head.as_ref().context(MissingHeadSnafu { head: "colbert" })?;
             out.colbert_vecs = Some(head.forward(&hidden, Some(attention_mask))?);
         }
         Ok(out)
@@ -90,26 +89,14 @@ impl BgeM3 {
     /// Dense-only forward (most common path). Returns `(B, D)`.
     pub fn encode_dense(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let hidden = self.model.forward(input_ids, Some(attention_mask))?;
-        let dense = cls(&hidden)?;
-        if self.normalize_dense { dense.lp_normalize(-1, 2).context(TensorSnafu) } else { Ok(dense) }
+        let dense = hidden.take_index(1, 0)?;
+        if self.normalize_dense { Ok(dense.lp_normalize(-1, 2)?) } else { Ok(dense) }
     }
 
-    /// JIT-path dense forward with rebindable batch. Returns `(B, D)`.
-    pub fn encode_dense_batch(&self, input_ids: &Tensor, attention_mask: &Tensor, b: &BoundVariable) -> Result<Tensor> {
-        let hidden = self.model.forward_batch(input_ids, Some(attention_mask), b)?;
-        let dense = cls(&hidden)?;
-        if self.normalize_dense { dense.lp_normalize(-1, 2).context(TensorSnafu) } else { Ok(dense) }
-    }
-
-    /// JIT-path ColBERT forward with rebindable batch. Returns `(B, L-1, Dc)`.
-    pub fn encode_colbert_batch(
-        &self,
-        input_ids: &Tensor,
-        attention_mask: &Tensor,
-        b: &BoundVariable,
-    ) -> Result<Tensor> {
-        let hidden = self.model.forward_batch(input_ids, Some(attention_mask), b)?;
-        let head = self.colbert_head.as_ref().context(SymbolicShapeSnafu { what: "colbert_head" })?;
+    /// ColBERT-only forward. Returns `(B, L-1, Dc)`.
+    pub fn encode_colbert(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+        let hidden = self.model.forward(input_ids, Some(attention_mask))?;
+        let head = self.colbert_head.as_ref().context(MissingHeadSnafu { head: "colbert" })?;
         head.forward(&hidden, Some(attention_mask))
     }
 
@@ -119,13 +106,13 @@ impl BgeM3 {
     }
 
     pub fn from_hub_with_revision(model_id: &str, revision: &str, config: &mut XlmRobertaConfig) -> Result<Self> {
-        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open(model_id, revision)?;
 
-        let cfg_path = repo.get("config.json").context(HubSnafu)?;
+        let cfg_path = repo.get("config.json")?;
         let parsed = XlmRobertaConfig::from_json(&cfg_path)?;
         config.merge_structural_from(&parsed);
 
-        let weights_path = repo.get("pytorch_model.bin").context(HubSnafu)?;
+        let weights_path = repo.get("pytorch_model.bin")?;
         let dtype = config.dtype.clone();
         let model = XlmRobertaModel::from_pytorch_bin(&weights_path, config.clone())?;
 

@@ -1,15 +1,13 @@
-use snafu::ResultExt;
 use svod_tensor::Tensor;
-
-use crate::state::{self, HasStateDict, StateDict, prefixed};
+use svod_tensor::nn::Module;
 
 use super::conv::YoloConv;
-use crate::yolo::error::{Result, TensorSnafu};
+use crate::yolo::error::Result;
 
 /// Standard YOLO bottleneck: two Conv+BN+SiLU layers with optional residual.
 ///
 /// State-dict keys: `cv1.{conv,bn}.*`, `cv2.{conv,bn}.*`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct YoloBottleneck {
     pub cv1: YoloConv,
     pub cv2: YoloConv,
@@ -31,20 +29,6 @@ impl YoloBottleneck {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let out = self.cv2.forward(&self.cv1.forward(x)?)?;
-        if self.add { out.try_add(x).context(TensorSnafu) } else { Ok(out) }
-    }
-}
-
-impl HasStateDict for YoloBottleneck {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.cv1.state_dict(&prefixed(prefix, "cv1"));
-        sd.extend(self.cv2.state_dict(&prefixed(prefix, "cv2")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.cv1.load_state_dict(sd, &prefixed(prefix, "cv1"))?;
-        self.cv2.load_state_dict(sd, &prefixed(prefix, "cv2"))?;
-        Ok(())
+        if self.add { Ok(out.try_add(x)?) } else { Ok(out) }
     }
 }

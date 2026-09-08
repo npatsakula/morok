@@ -14,7 +14,7 @@ crate::codegen_tests! {
 
     fn test_getitem_range(config) {
         let t = Tensor::from_slice([0f32, 1., 2., 3., 4., 5.]).try_reshape([2, 3]).unwrap();
-        let mut r = t.getitem(s![1..2, ..]).unwrap().contiguous();
+        let r = t.getitem(s![1..2, ..]).unwrap().contiguous();
         r.realize_with(&config).unwrap();
         assert_eq!(get_shape(&r), vec![1, 3]);
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![3., 4., 5.]);
@@ -22,7 +22,7 @@ crate::codegen_tests! {
 
     fn test_getitem_int_collapse(config) {
         let t = Tensor::from_slice([0f32, 1., 2., 3., 4., 5.]).try_reshape([2, 3]).unwrap();
-        let mut r = t.getitem(s![1, ..]).unwrap().contiguous();
+        let r = t.getitem(s![1, ..]).unwrap().contiguous();
         r.realize_with(&config).unwrap();
         assert_eq!(get_shape(&r), vec![3]);
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![3., 4., 5.]);
@@ -31,7 +31,7 @@ crate::codegen_tests! {
     fn test_getitem_multi_axis(config) {
         let t = Tensor::from_slice((0..12).map(|x| x as f32).collect::<Vec<_>>())
             .try_reshape([3, 4]).unwrap();
-        let mut r = t.getitem(s![1..3, 1..3]).unwrap().contiguous();
+        let r = t.getitem(s![1..3, 1..3]).unwrap().contiguous();
         r.realize_with(&config).unwrap();
         assert_eq!(get_shape(&r), vec![2, 2]);
         // rows 1,2 cols 1,2 → [[5,6],[9,10]]
@@ -40,7 +40,7 @@ crate::codegen_tests! {
 
     fn test_getitem_step(config) {
         let t = Tensor::from_slice([0f32, 1., 2., 3., 4., 5.]);
-        let mut r = t.getitem(s![0..6;2]).unwrap().contiguous();
+        let r = t.getitem(s![0..6;2]).unwrap().contiguous();
         r.realize_with(&config).unwrap();
         assert_eq!(get_shape(&r), vec![3]);
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![0., 2., 4.]);
@@ -48,21 +48,21 @@ crate::codegen_tests! {
 
     fn test_getitem_reverse(config) {
         let t = Tensor::from_slice([0f32, 1., 2., 3.]);
-        let mut r = t.getitem(s![..;-1]).unwrap().contiguous();
+        let r = t.getitem(s![..;-1]).unwrap().contiguous();
         r.realize_with(&config).unwrap();
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![3., 2., 1., 0.]);
     }
 
     fn test_getitem_neg_index(config) {
         let t = Tensor::from_slice([0f32, 1., 2., 3.]);
-        let mut r = t.getitem(s![-1]).unwrap().contiguous();
+        let r = t.getitem(s![-1]).unwrap().contiguous();
         r.realize_with(&config).unwrap();
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![3.]);
     }
 
     fn test_getitem_ellipsis(config) {
         let t = Tensor::from_slice([0f32, 1., 2., 3., 4., 5.]).try_reshape([2, 3]).unwrap();
-        let mut r = t.getitem(s![Ellipsis, 0]).unwrap().contiguous(); // first column
+        let r = t.getitem(s![Ellipsis, 0]).unwrap().contiguous(); // first column
         r.realize_with(&config).unwrap();
         assert_eq!(get_shape(&r), vec![2]);
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![0., 3.]);
@@ -70,7 +70,7 @@ crate::codegen_tests! {
 
     fn test_getitem_newaxis(config) {
         let t = Tensor::from_slice([1f32, 2., 3.]);
-        let mut r = t.getitem(s![NewAxis, ..]).unwrap().contiguous();
+        let r = t.getitem(s![NewAxis, ..]).unwrap().contiguous();
         r.realize_with(&config).unwrap();
         assert_eq!(get_shape(&r), vec![1, 3]);
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![1., 2., 3.]);
@@ -86,11 +86,11 @@ crate::codegen_tests! {
         ]); // [2, 4]
         let heads = vec![0usize, 2, 3];
 
-        let mut got = data.getitem(s![.., heads.clone()]).unwrap().contiguous();
+        let got = data.getitem(s![.., heads.clone()]).unwrap().contiguous();
         got.realize_with(&config).unwrap();
 
         let head_t = Tensor::from_slice([0i64, 2, 3]);
-        let mut want = data.index_select(1, &head_t).unwrap().contiguous();
+        let want = data.index_select(1, &head_t).unwrap().contiguous();
         want.realize_with(&config).unwrap();
 
         assert_eq!(get_shape(&got), vec![2, 3]);
@@ -107,7 +107,7 @@ crate::codegen_tests! {
         let rows = Tensor::from_slice([0i64, 2]);
         let cols = Tensor::from_slice([1i64, 0]);
 
-        let mut got = data.getitem(s![rows.clone(), cols.clone()]).unwrap().contiguous();
+        let got = data.getitem(s![rows.clone(), cols.clone()]).unwrap().contiguous();
         got.realize_with(&config).unwrap();
         // diagonal-style pick: (0,1)=11, (2,0)=30
         assert_eq!(get_shape(&got), vec![2]);
@@ -121,7 +121,7 @@ crate::codegen_tests! {
             .try_reshape([2, 3, 4]).unwrap(); // t[a,i,j] = 12a + 4i + j
         let rows = vec![0i64, 2];
         let cols = vec![1i64, 3];
-        let mut r = t.getitem(s![.., rows, cols]).unwrap().contiguous();
+        let r = t.getitem(s![.., rows, cols]).unwrap().contiguous();
         r.realize_with(&config).unwrap();
         assert_eq!(get_shape(&r), vec![2, 2]);
         // a=0: t[0,0,1]=1, t[0,2,3]=11 ; a=1: t[1,0,1]=13, t[1,2,3]=23
@@ -140,12 +140,12 @@ crate::codegen_tests! {
         ]); // [3, 4, 2]
 
         let b = Variable::new("gisb", 1, 3).bind(3).unwrap();
-        let mut manual =
+        let manual =
             data.try_shrink([Some((SInt::Const(0), b.as_sint())), None, None]).unwrap().contiguous();
         manual.realize_with(&config).unwrap();
         let want: Vec<f32> = manual.array_view::<f32>().unwrap().iter().copied().collect();
 
-        let mut got = data.getitem(s![Idx::sint(SInt::Const(0), b.as_sint()), .., ..]).unwrap().contiguous();
+        let got = data.getitem(s![Idx::sint(SInt::Const(0), b.as_sint()), .., ..]).unwrap().contiguous();
         got.realize_with(&config).unwrap();
         let got_flat: Vec<f32> = got.array_view::<f32>().unwrap().iter().copied().collect();
 
@@ -158,7 +158,7 @@ crate::codegen_tests! {
         let t = Tensor::from_slice((0..12).map(|x| x as f32).collect::<Vec<_>>())
             .try_reshape([3, 4]).unwrap();
         let block = Tensor::from_slice([100f32, 101., 102., 103.]).try_reshape([1, 4]).unwrap();
-        let mut r = t.set(s![1..2, ..], &block).unwrap().contiguous();
+        let r = t.set(s![1..2, ..], &block).unwrap().contiguous();
         r.realize_with(&config).unwrap();
         assert_eq!(get_shape(&r), vec![3, 4]);
         assert_eq!(
@@ -171,7 +171,7 @@ crate::codegen_tests! {
         let t = Tensor::from_slice((0..6).map(|x| x as f32).collect::<Vec<_>>())
             .try_reshape([2, 3]).unwrap();
         let row = Tensor::from_slice([7f32, 8., 9.]);
-        let mut r = t.set(s![0, ..], &row).unwrap().contiguous();
+        let r = t.set(s![0, ..], &row).unwrap().contiguous();
         r.realize_with(&config).unwrap();
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![7., 8., 9., 3., 4., 5.]);
     }
@@ -181,7 +181,7 @@ crate::codegen_tests! {
     fn test_set_scalar_into_collapsed_column(config) {
         let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([2, 2]).unwrap();
         let scalar = Tensor::const_(9.0, svod_dtype::DType::Float32);
-        let mut r = t.set(s![.., 0], &scalar).unwrap().contiguous();
+        let r = t.set(s![.., 0], &scalar).unwrap().contiguous();
         r.realize_with(&config).unwrap();
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![9.0, 2.0, 9.0, 4.0]);
     }
@@ -190,7 +190,7 @@ crate::codegen_tests! {
         let t = Tensor::from_slice((0..6).map(|x| x as f32).collect::<Vec<_>>())
             .try_reshape([2, 3]).unwrap();
         let zero = Tensor::from_slice([0f32]); // broadcast into the column
-        let mut r = t.set(s![.., 1..2], &zero).unwrap().contiguous();
+        let r = t.set(s![.., 1..2], &zero).unwrap().contiguous();
         r.realize_with(&config).unwrap();
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![0., 0., 2., 3., 0., 5.]);
     }
@@ -200,7 +200,7 @@ crate::codegen_tests! {
         let t = Tensor::from_slice([0f32, 0., 0., 0.]).try_reshape([1, 4]).unwrap();
         let idx = Tensor::from_slice([1i64, 1, 3]); // index 1 written twice
         let vals = Tensor::from_slice([5f32, 9., 7.]).try_reshape([1, 3]).unwrap();
-        let mut r = t.set(s![.., idx.clone()], &vals).unwrap().contiguous();
+        let r = t.set(s![.., idx.clone()], &vals).unwrap().contiguous();
         r.realize_with(&config).unwrap();
         // position 1 gets the LAST write (9), position 3 gets 7.
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![0., 9., 0., 7.]);
@@ -214,9 +214,9 @@ crate::codegen_tests! {
         let data: Vec<f32> = (0..n).map(|x| x as f32).collect();
         let t = Tensor::from_slice(data);
 
-        let mut viafn = t.getitem(s![a as i64 .. b as i64]).unwrap().contiguous();
+        let viafn = t.getitem(s![a as i64 .. b as i64]).unwrap().contiguous();
         viafn.realize_with(&config).unwrap();
-        let mut shrink = t.try_shrink([(a as isize, b as isize)]).unwrap().contiguous();
+        let shrink = t.try_shrink([(a as isize, b as isize)]).unwrap().contiguous();
         shrink.realize_with(&config).unwrap();
 
         assert_eq!(viafn.as_vec::<f32>().unwrap(), shrink.as_vec::<f32>().unwrap());

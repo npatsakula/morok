@@ -34,8 +34,8 @@ mod loader;
 pub(crate) mod profile;
 
 pub use aligner::{WhisperAligner, WhisperAlignmentInput};
-pub use attention::{MultiHeadAttention, causal_mask};
-pub use blocks::{Conv1dWeights, LayerNormWeights, LinearWeights, sinusoids};
+pub use attention::MultiHeadAttention;
+pub use blocks::sinusoids;
 pub use config::{ModelDimensions, WhisperSize};
 pub use decode::{
     DecodeOptions, DecodeResult, DecodeStrategy, FallbackPolicy, LanguageDetection, WhisperTask, detect_language,

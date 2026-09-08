@@ -57,18 +57,18 @@ fn segmenter_runs_multiple_batches() {
     assert_eq!(chunk_plan(n, window, hop), 3);
     let wav: Vec<f32> = (0..n).map(|i| ((i % 23) as f32) * 0.013 - 0.1).collect();
 
-    let mut out = seg.segment(&wav, cfg.sample_rate).expect("segment");
+    let out = seg.segment(&wav, cfg.sample_rate).expect("segment");
     assert_eq!(out.num_chunks, 3);
     assert!(out.frames_per_chunk > 0);
 
     let k = cfg.powerset_class_count();
-    let shape: Vec<usize> = out.logits.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let shape = out.logits.dims().unwrap();
     assert_eq!(shape, vec![3, out.frames_per_chunk, k]);
 
     // Reusing the same prepared plan is deterministic (stateless reuse).
     out.logits.realize().expect("realize logits");
     let first = out.logits.as_vec::<f32>().expect("read logits");
-    let mut again = seg.segment(&wav, cfg.sample_rate).expect("segment again");
+    let again = seg.segment(&wav, cfg.sample_rate).expect("segment again");
     again.logits.realize().expect("realize again");
     assert_eq!(first, again.logits.as_vec::<f32>().expect("read again"));
 

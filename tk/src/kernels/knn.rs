@@ -583,7 +583,7 @@ fn pad16(x: usize) -> usize {
 /// }
 /// ```
 pub fn knn(x: &Tensor, c: &Tensor, k: usize) -> crate::LaunchResult<Option<(Tensor, Tensor)>> {
-    use snafu::{ResultExt, ensure};
+    use snafu::ensure;
 
     let xd = crate::launch::concrete_dims(x, "knn", "x", 2)?;
     let cd = crate::launch::concrete_dims(c, "knn", "c", 2)?;
@@ -617,14 +617,14 @@ pub fn knn(x: &Tensor, c: &Tensor, k: usize) -> crate::LaunchResult<Option<(Tens
 
     // f32 copies for the exact-distance tail (corpus stays unpadded — the tail gathers
     // TRUE D-rows; the query keeps its N rows).
-    let x_f32 = x.cast(f32.clone()).context(crate::launch::OperandSnafu)?;
-    let c_f32 = c.cast(f32.clone()).context(crate::launch::OperandSnafu)?;
+    let x_f32 = x.cast(f32.clone());
+    let c_f32 = c.cast(f32.clone());
 
     // Kernel bf16 operands, zero-padded to the WMMA edge. Zeros contribute 0 to ⟨x,c⟩
     // and to ‖c‖², so the score is unchanged; padded query rows produce junk top-Ks the
     // tail slices off. `try_pad` pads with zeros.
-    let x_bf = pad_operand(&x.cast(bf16.clone()).context(crate::launch::OperandSnafu)?, n, dx, n_pad, d_pad)?;
-    let c_bf = pad_operand(&c.cast(bf16.clone()).context(crate::launch::OperandSnafu)?, m, dc, m, d_pad)?;
+    let x_bf = pad_operand(&x.cast(bf16.clone()), n, dx, n_pad, d_pad)?;
+    let c_bf = pad_operand(&c.cast(bf16.clone()), m, dc, m, d_pad)?;
 
     // c_sq[m] = Σ_d c[m,d]² in f32 (query-independent), replicated to the kernel's
     // [1,1,M,BLK] (one query-block width — every query block reads the same slice).

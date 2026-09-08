@@ -1,18 +1,19 @@
 //! Temporal-Statistical Pooling (TSTP) head from WeSpeaker.
 //!
 //! Takes a 4D backbone feature map `[B, C, H, T]` plus per-frame attention
-//! weights `[B, T_w]`, interpolates the weights to `T` with nearest mode (as
+//! weights `[B, T_w]`, resamples the weights to `T` with nearest mode (as
 //! pyannote's `StatsPool` does internally), and returns the weighted mean
 //! and (unbiased, Bessel-corrected) standard deviation concatenated along the
 //! feature axis: `[B, 2 * C * H]`. The exact arithmetic — including the
 //! `v1 - v2/v1 + 1e-8` denominator and `1e-8` epsilon on `v1` — matches
 //! `pyannote.audio.models.blocks.pooling.StatsPool._pool`.
 
-use snafu::ResultExt;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
+use svod_tensor::error::{Error, ErrorKind};
+use svod_tensor::nn::{CoordinateTransformMode, NearestMode, ResizeMode};
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 /// Numerical epsilon — same value pyannote's `_pool` uses
 /// (`weights.sum + 1e-8`, denominator `+ 1e-8`).
@@ -23,98 +24,42 @@ const EPS: f64 = 1e-8;
 /// time stride sequence at `prepare()` time). Returns `[B, 2 * C * H]`
 /// = `concat(mean, std)` along the feature axis.
 pub fn tstp_forward(features: &Tensor, weights: &Tensor) -> Result<Tensor> {
-    let shape = features.shape().context(TensorSnafu)?;
-    if shape.len() != 4 {
-        return Err(super::error::Error::Tensor {
-            source: Box::new(svod_tensor::error::Error::IrConstruction {
-                details: format!("TSTP expects 4D features, got {}D", shape.len()),
-            }),
-        });
+    let ndim = features.ndim()?;
+    if ndim != 4 {
+        return Err(Error::from(ErrorKind::NdimExact { op: "tstp", expected: 4, actual: ndim }).into());
     }
-    let t_back = shape[3].as_const().ok_or_else(|| super::error::Error::Tensor {
-        source: Box::new(svod_tensor::error::Error::IrConstruction {
-            details: "TSTP requires concrete T (backbone time dim) — symbolic not supported".into(),
-        }),
-    })?;
+    let t_back = features.dim_const(3)?;
 
-    // weights: [B, T_w] → [B, T_back] via a constant one-hot nearest matrix,
-    // then unsqueeze to [B, 1, 1, T_back] for 4D broadcasting against features.
-    // The matrix is precomputed so weights stays a simple matmul; we can't use
-    // tensor::resize() here because it requires every shape dim to be concrete
-    // and our batch dim is symbolic.
-    let t_w = weights.shape().context(TensorSnafu)?[1].as_const().ok_or_else(|| super::error::Error::Tensor {
-        source: Box::new(svod_tensor::error::Error::IrConstruction {
-            details: "TSTP requires concrete T_w (weight time dim)".into(),
-        }),
-    })?;
-    let mat = nearest_interp_matrix(t_w, t_back);
-    let w = weights.linear().weight(&mat).call().context(TensorSnafu)?;
-    let w = w.try_unsqueeze(1).context(TensorSnafu)?;
-    let w = w.try_unsqueeze(2).context(TensorSnafu)?;
+    // `F.interpolate(weights, size=T, mode="nearest")`: an asymmetric
+    // coordinate transform with floor rounding. Only the time axis resizes, so
+    // the symbolic batch dim passes through; the result is unsqueezed to
+    // `[B, 1, 1, T]` to broadcast against the feature map.
+    let w = weights
+        .resize()
+        .axes(&[1])
+        .sizes(&[t_back])
+        .mode(ResizeMode::Nearest)
+        .nearest_mode(NearestMode::Floor)
+        .coordinate_transformation_mode(CoordinateTransformMode::Asymmetric)
+        .call()?
+        .try_unsqueeze(1)?
+        .try_unsqueeze(2)?;
 
-    let dtype = features.uop().dtype();
-    let eps = Tensor::const_(EPS, dtype.clone());
+    let sum_t = |t: &Tensor| t.sum_with().axes(3isize).keepdim(true).call();
 
-    // v1 = weights.sum(dim=3, keepdim=True) + eps              [B, 1, 1, 1]
-    let v1_raw = w.sum_with().axes(3isize).keepdim(true).call().context(TensorSnafu)?;
-    let v1 = v1_raw.try_add(&eps).context(TensorSnafu)?;
+    // v1 = weights.sum(-1) + eps                               [B, 1, 1, 1]
+    let v1 = sum_t(&w)?.try_add(EPS)?;
+    // mean = (features * w).sum(-1) / v1                       [B, C, H, 1]
+    let mean = sum_t(&features.try_mul(&w)?)?.try_div(&v1)?;
+    // denom = v1 - (w^2).sum(-1) / v1 + eps                    [B, 1, 1, 1]
+    let denom = v1.try_sub(&sum_t(&w.square())?.try_div(&v1)?)?.try_add(EPS)?;
+    // std = sqrt(((features - mean)^2 * w).sum(-1) / denom)    [B, C, H, 1]
+    let dx2 = features.try_sub(&mean)?.square();
+    let std = sum_t(&dx2.try_mul(&w)?)?.try_div(&denom)?.try_sqrt()?;
 
-    // mean = (features * w).sum(dim=3, keepdim=True) / v1      [B, C, H, 1]
-    let xw = features.try_mul(&w).context(TensorSnafu)?;
-    let xw_sum = xw.sum_with().axes(3isize).keepdim(true).call().context(TensorSnafu)?;
-    let mean = xw_sum.try_div(&v1).context(TensorSnafu)?;
-
-    // dx2 = (features - mean)^2
-    let centered = features.try_sub(&mean).context(TensorSnafu)?;
-    let dx2 = centered.square().context(TensorSnafu)?;
-
-    // v2 = (w^2).sum(dim=3, keepdim=True)                      [B, 1, 1, 1]
-    let w_sq = w.square().context(TensorSnafu)?;
-    let v2 = w_sq.sum_with().axes(3isize).keepdim(true).call().context(TensorSnafu)?;
-
-    // denom = v1 - v2/v1 + eps                                 [B, 1, 1, 1]
-    let denom = v1.try_sub(&v2.try_div(&v1).context(TensorSnafu)?).context(TensorSnafu)?;
-    let denom = denom.try_add(&eps).context(TensorSnafu)?;
-
-    // var = (dx2 * w).sum(dim=3, keepdim=True) / denom         [B, C, H, 1]
-    let var_num = dx2.try_mul(&w).context(TensorSnafu)?;
-    let var_num = var_num.sum_with().axes(3isize).keepdim(true).call().context(TensorSnafu)?;
-    let var = var_num.try_div(&denom).context(TensorSnafu)?;
-    let std = var.try_sqrt().context(TensorSnafu)?;
-
-    // Squeeze the trailing time dim and flatten (C, H) → C*H
-    // mean / std are [B, C, H, 1] → flatten dims 1..4 (i.e., 1,2,3 → C*H*1 = C*H).
-    let b = shape[0].clone();
-    let c = shape[1].as_const().ok_or_else(|| super::error::Error::Tensor {
-        source: Box::new(svod_tensor::error::Error::IrConstruction {
-            details: "TSTP requires concrete C (channel dim)".into(),
-        }),
-    })?;
-    let h = shape[2].as_const().ok_or_else(|| super::error::Error::Tensor {
-        source: Box::new(svod_tensor::error::Error::IrConstruction {
-            details: "TSTP requires concrete H (freq dim)".into(),
-        }),
-    })?;
-    let stats_dim = SInt::Const(c * h);
-
-    let mean_flat = mean.try_reshape([b.clone(), stats_dim.clone()]).context(TensorSnafu)?;
-    let std_flat = std.try_reshape([b, stats_dim]).context(TensorSnafu)?;
-
-    Tensor::cat(&[&mean_flat, &std_flat], 1).context(TensorSnafu)
-}
-
-/// One-hot interpolation matrix `[t_out, t_in]` such that `dst = src @ M.T`
-/// performs PyTorch's `F.interpolate(..., mode="nearest")` along the trailing
-/// axis (asymmetric coordinate transform, floor rounding).
-///
-/// For each output position `o ∈ [0, t_out)` the source position is
-/// `floor(o * t_in / t_out)`. Integer math here matches the float-arithmetic
-/// floor exactly because `o * t_in` is a non-negative integer.
-fn nearest_interp_matrix(t_in: usize, t_out: usize) -> Tensor {
-    let mut m = vec![0.0f32; t_out * t_in];
-    for o in 0..t_out {
-        let src = (o * t_in) / t_out;
-        m[o * t_in + src] = 1.0;
-    }
-    Tensor::from_slice(&m).try_reshape([t_out as isize, t_in as isize]).expect("nearest interp matrix reshape")
+    // Drop the trailing time dim and flatten (C, H, 1) → C*H.
+    let stats = [features.dim(0)?, SInt::Const(features.dim_const(1)? * features.dim_const(2)?)];
+    let mean = mean.try_reshape(stats.clone())?;
+    let std = std.try_reshape(stats)?;
+    Ok(Tensor::cat(&[&mean, &std], 1)?)
 }

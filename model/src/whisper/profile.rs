@@ -3,11 +3,10 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use snafu::ResultExt;
 use svod_device::Buffer;
 use svod_runtime::{KernelProfile, StageProfile};
 
-use super::error::{DeviceSnafu, Result};
+use super::error::Result;
 
 #[derive(Debug, Default)]
 pub(crate) struct GraphProfile {
@@ -161,10 +160,10 @@ pub(crate) fn timed_d2d<T>(enabled: bool, fence: &Buffer, work: impl FnOnce() ->
     if !enabled {
         return work().map(|value| (value, Duration::ZERO));
     }
-    fence.synchronize().context(DeviceSnafu)?;
+    fence.synchronize()?;
     let started = Instant::now();
     let value = work()?;
-    fence.synchronize().context(DeviceSnafu)?;
+    fence.synchronize()?;
     Ok((value, started.elapsed()))
 }
 
@@ -175,6 +174,6 @@ pub(crate) fn begin_host_copy(enabled: bool, buffer: &Buffer) -> Result<Option<I
     if !enabled {
         return Ok(None);
     }
-    buffer.synchronize().context(DeviceSnafu)?;
+    buffer.synchronize()?;
     Ok(Some(Instant::now()))
 }

@@ -32,10 +32,10 @@ fn dummy_buffers(n: usize) -> Vec<Arc<UOp>> {
 fn matmul_non_rank2_operand_is_operand_shape_err() {
     let sq = Tensor::randn(&[64, 64]).expect("randn");
     let a1 = Tensor::randn(&[64]).expect("randn"); // operand a: rank 1
-    let e = matmul(&a1, &sq).err().expect("rank-1 a must error, not panic");
+    let e = matmul(&a1, &sq).expect_err("rank-1 a must error, not panic");
     assert!(matches!(e, crate::launch::Error::OperandRank { operand: "a", .. }), "got {e:?}");
     let b3 = Tensor::randn(&[2, 64, 64]).expect("randn"); // operand b: rank 3
-    let e = matmul(&sq, &b3).err().expect("rank-3 b must error, not panic");
+    let e = matmul(&sq, &b3).expect_err("rank-3 b must error, not panic");
     assert!(matches!(e, crate::launch::Error::OperandRank { operand: "b", .. }), "got {e:?}");
 }
 
@@ -405,8 +405,7 @@ fn matmul_inputs(n: usize) -> (svod_tensor::Tensor, svod_tensor::Tensor) {
 
 /// f32 ground-truth `a·b` over the bf16-rounded operands.
 fn matmul_reference(a: &svod_tensor::Tensor, b: &svod_tensor::Tensor) -> Vec<f32> {
-    let mut reference =
-        a.cast(DType::Float32).expect("a→f32").matmul(&b.cast(DType::Float32).expect("b→f32")).expect("ref matmul");
+    let reference = a.cast(DType::Float32).matmul(&b.cast(DType::Float32)).expect("ref matmul");
     reference.realize().expect("realize reference");
     reference.as_vec::<f32>().expect("read reference")
 }
@@ -435,11 +434,11 @@ fn test_matmul_rdna_computes_ab() {
     let (a, b) = matmul_inputs(n);
     let got = launch_matmul("matmul_diag", n, SMALL_CFG, |ker| build_matmul_cfg(ker, n, SMALL_CFG), &a, &b);
 
-    let f = |t: &Tensor| t.cast(DType::Float32).expect("→f32");
+    let f = |t: &Tensor| t.cast(DType::Float32);
     let (af, bf) = (f(&a), f(&b));
     let tr = |x: &Tensor| x.try_permute(&[1, 0]).expect("transpose");
     let mm = |x: &Tensor, y: &Tensor| x.matmul(y).expect("matmul");
-    let vec = |mut x: Tensor| {
+    let vec = |x: Tensor| {
         x.realize().expect("realize");
         x.as_vec::<f32>().expect("read")
     };
@@ -483,9 +482,8 @@ fn test_matmul_rdna_grid() {
         a_data[i * n + i] = 1.0; // identity
     }
     let b_data: Vec<f32> = (0..n * n).map(|p| (((p / n) % 16) * 16 + (p % n) % 16) as f32).collect();
-    let mk =
-        |d: &[f32]| Tensor::from_slice(d).try_reshape([n, n]).expect("reshape").cast(DType::BFloat16).expect("→bf16");
-    let (mut a, mut b) = (mk(&a_data), mk(&b_data));
+    let mk = |d: &[f32]| Tensor::from_slice(d).try_reshape([n, n]).expect("reshape").cast(DType::BFloat16);
+    let (a, b) = (mk(&a_data), mk(&b_data));
     a.realize().expect("realize a");
     b.realize().expect("realize b");
     let got = launch_matmul("matmul_grid", n, SMALL_CFG, |ker| build_matmul_cfg(ker, n, SMALL_CFG), &a, &b);
@@ -545,9 +543,8 @@ fn test_matmul_cuda_grid() {
         a_data[i * n + i] = 1.0;
     }
     let b_data: Vec<f32> = (0..n * n).map(|p| (((p / n) % 16) * 16 + (p % n) % 16) as f32).collect();
-    let mk =
-        |d: &[f32]| Tensor::from_slice(d).try_reshape([n, n]).expect("reshape").cast(DType::BFloat16).expect("→bf16");
-    let (mut a, mut b) = (mk(&a_data), mk(&b_data));
+    let mk = |d: &[f32]| Tensor::from_slice(d).try_reshape([n, n]).expect("reshape").cast(DType::BFloat16);
+    let (a, b) = (mk(&a_data), mk(&b_data));
     a.realize().expect("realize a");
     b.realize().expect("realize b");
     let cfg = SM80_SMALL_CFG;
@@ -575,7 +572,7 @@ fn test_mma_variants_cuda() {
     let (a, b) = matmul_inputs_dt(n, DType::BFloat16);
     let expected = matmul_reference(&a, &b);
     let tr = |x: &Tensor| {
-        let mut t = x.try_permute(&[1, 0]).expect("transpose").contiguous();
+        let t = x.try_permute(&[1, 0]).expect("transpose").contiguous();
         t.realize().expect("realize");
         t
     };
@@ -616,8 +613,8 @@ fn test_mma_variants_cuda() {
 
 /// Realized `(a, b)` inputs of `dtype` so kernel + reference see identical rounding.
 fn matmul_inputs_dt(n: usize, dtype: DType) -> (Tensor, Tensor) {
-    let mut a = Tensor::rand(&[n, n]).expect("rand a").cast(dtype.clone()).expect("cast a");
-    let mut b = Tensor::rand(&[n, n]).expect("rand b").cast(dtype).expect("cast b");
+    let a = Tensor::rand(&[n, n]).expect("rand a").cast(dtype.clone());
+    let b = Tensor::rand(&[n, n]).expect("rand b").cast(dtype);
     a.realize().expect("realize a");
     b.realize().expect("realize b");
     (a, b)
@@ -668,7 +665,7 @@ fn test_matmul_graph_gpu() {
         let cfg = cfg_for_arch(arch, n);
         let direct = launch_matmul("matmul_direct", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
 
-        let mut g = crate::kernels::matmul::matmul(&a, &b).expect("graph matmul").expect("matmul kernel applies");
+        let g = crate::kernels::matmul::matmul(&a, &b).expect("graph matmul").expect("matmul kernel applies");
         g.realize().expect("realize graph matmul");
         let graph = g.as_vec::<f32>().expect("read graph matmul");
 

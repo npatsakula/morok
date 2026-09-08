@@ -7,26 +7,30 @@
 //! out_proj`), and optionally sigmoid-normalizes.
 //!
 //! Same backbone as [`crate::xlm_roberta::XlmRobertaModel`] — only the head
-//! differs. Loads from `model.safetensors` with `roberta.` prefix on backbone
-//! keys.
+//! differs. Loads from `model.safetensors`, whose backbone keys carry the
+//! `roberta.` prefix this module nests the backbone under.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
-use svod_tensor::{BoundVariable, Tensor};
+use svod_tensor::Tensor;
+use svod_tensor::nn::Module;
 
 use crate::init::{fan_in_uniform, zeros};
-use crate::state::{self, HasStateDict, StateDict, cast_all, get_tensor, prefixed};
+use crate::state::{StateDict, cast_all};
 use crate::xlm_roberta::config::XlmRobertaConfig;
-use crate::xlm_roberta::error::{HubSnafu, Result, StateSnafu, TensorSnafu};
+use crate::xlm_roberta::error::Result;
+
 use crate::xlm_roberta::model::XlmRobertaModel;
-use crate::xlm_roberta::pooling::cls;
 
 /// `RobertaClassificationHead`: `dense(D, D) → tanh → out_proj(D, num_labels)`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct ClassificationHead {
+    #[module(key = "dense.weight")]
     pub dense_weight: Tensor,
+    #[module(key = "dense.bias")]
     pub dense_bias: Tensor,
+    #[module(key = "out_proj.weight")]
     pub out_proj_weight: Tensor,
+    #[module(key = "out_proj.bias")]
     pub out_proj_bias: Tensor,
 }
 
@@ -42,34 +46,16 @@ impl ClassificationHead {
 
     /// Forward: `CLS → dense → tanh → out_proj → (B, num_labels)`.
     pub fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
-        let cls_emb = cls(hidden)?;
-        let h = cls_emb.linear().weight(&self.dense_weight).bias(&self.dense_bias).call().context(TensorSnafu)?;
-        let h = h.tanh().context(TensorSnafu)?;
-        h.linear().weight(&self.out_proj_weight).bias(&self.out_proj_bias).call().context(TensorSnafu)
+        let cls = hidden.take_index(1, 0)?;
+        let h = cls.linear().weight(&self.dense_weight).bias(&self.dense_bias).call()?;
+        let h = h.tanh()?;
+        Ok(h.linear().weight(&self.out_proj_weight).bias(&self.out_proj_bias).call()?)
     }
 }
 
-impl HasStateDict for ClassificationHead {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        sd.insert(prefixed(prefix, "dense.weight"), self.dense_weight.clone());
-        sd.insert(prefixed(prefix, "dense.bias"), self.dense_bias.clone());
-        sd.insert(prefixed(prefix, "out_proj.weight"), self.out_proj_weight.clone());
-        sd.insert(prefixed(prefix, "out_proj.bias"), self.out_proj_bias.clone());
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.dense_weight = get_tensor(sd, &prefixed(prefix, "dense.weight"))?;
-        self.dense_bias = get_tensor(sd, &prefixed(prefix, "dense.bias"))?;
-        self.out_proj_weight = get_tensor(sd, &prefixed(prefix, "out_proj.weight"))?;
-        self.out_proj_bias = get_tensor(sd, &prefixed(prefix, "out_proj.bias"))?;
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct BgeRerankerV2M3 {
+    #[module(key = "roberta")]
     pub model: XlmRobertaModel,
     pub classifier: ClassificationHead,
 }
@@ -90,18 +76,7 @@ impl BgeRerankerV2M3 {
     /// Score with optional sigmoid normalization. Returns `(B, 1)`.
     pub fn compute_score(&self, input_ids: &Tensor, attention_mask: &Tensor, normalize: bool) -> Result<Tensor> {
         let logits = self.forward(input_ids, Some(attention_mask))?;
-        if normalize { logits.sigmoid().context(TensorSnafu) } else { Ok(logits) }
-    }
-
-    /// JIT-path forward with rebindable batch. Returns `(B, 1)`.
-    pub fn forward_batch(
-        &self,
-        input_ids: &Tensor,
-        attention_mask: Option<&Tensor>,
-        b: &BoundVariable,
-    ) -> Result<Tensor> {
-        let hidden = self.model.forward_batch(input_ids, attention_mask, b)?;
-        self.classifier.forward(&hidden)
+        if normalize { Ok(logits.sigmoid()?) } else { Ok(logits) }
     }
 
     /// Download from HuggingFace Hub and load.
@@ -110,53 +85,28 @@ impl BgeRerankerV2M3 {
     }
 
     pub fn from_hub_with_revision(model_id: &str, revision: &str, config: &mut XlmRobertaConfig) -> Result<Self> {
-        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open(model_id, revision)?;
 
-        let cfg_path = repo.get("config.json").context(HubSnafu)?;
+        let cfg_path = repo.get("config.json")?;
         let parsed = XlmRobertaConfig::from_json(&cfg_path)?;
         config.merge_structural_from(&parsed);
 
-        let weights_path = repo.get("model.safetensors").context(HubSnafu)?;
+        let weights_path = repo.get("model.safetensors")?;
         Self::from_safetensors(&weights_path, config.clone())
     }
 
-    /// Load from a `model.safetensors` checkpoint. Strips the `roberta.`
-    /// prefix from backbone keys.
+    /// Load from a `model.safetensors` checkpoint (backbone keys under
+    /// `roberta.`, head keys under `classifier.`).
     pub fn from_safetensors(path: &std::path::Path, config: XlmRobertaConfig) -> Result<Self> {
-        let sd = crate::state::load_safetensors(path).context(StateSnafu)?;
+        let sd = crate::state::load_safetensors(path)?;
         Self::from_state_dict(&sd, config)
     }
 
-    /// Build from a preloaded state dict. Strips `roberta.` prefix.
+    /// Build from a preloaded state dict in the published key layout.
     pub fn from_state_dict(sd: &StateDict, config: XlmRobertaConfig) -> Result<Self> {
         let dtype = config.dtype.clone();
-        let stripped = strip_roberta_prefix(sd);
-        let sd_cast = cast_all(&stripped, dtype);
         let mut model = Self::empty(config);
-        model.load_state_dict(&sd_cast, "").context(StateSnafu)?;
+        model.load_state_dict(&cast_all(sd, dtype), "")?;
         Ok(model)
     }
-}
-
-impl HasStateDict for BgeRerankerV2M3 {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.model.state_dict(prefix);
-        sd.extend(self.classifier.state_dict(&prefixed(prefix, "classifier")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.model.load_state_dict(sd, prefix)?;
-        self.classifier.load_state_dict(sd, &prefixed(prefix, "classifier"))?;
-        Ok(())
-    }
-}
-
-fn strip_roberta_prefix(sd: &StateDict) -> StateDict {
-    sd.iter()
-        .map(|(k, v)| {
-            let stripped = k.strip_prefix("roberta.").unwrap_or(k);
-            (stripped.to_string(), v.clone())
-        })
-        .collect()
 }

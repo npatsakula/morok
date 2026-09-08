@@ -30,15 +30,8 @@
 //!   the loader renames `.shortcut.` → `.downsample.` in every key on the
 //!   way in.
 //!
-//! # TSTP / interpolation gotcha
-//!
-//! pyannote's `StatsPool` `F.interpolate(weights, size=T, mode="nearest")`
-//! is implemented in [`tstp`] as a precomputed one-hot matmul instead of via
-//! [`svod_tensor::Tensor::resize`]. Reason: `resize()` (and its siblings
-//! `gather` / `index_select`) call `to_vec_usize(full_shape)` and abort on
-//! any symbolic dim, even when only the spatial dims are actually consumed.
-//! Once that's relaxed in the tensor crate (search `TODO(symbolic-batch)`)
-//! we can move back to `resize().mode(Nearest).nearest_mode(Floor).coordinate_transformation_mode(Asymmetric).axes(&[3])`.
+//! Everything else loads key-for-key: the layers read PyTorch's own parameter
+//! names, so no value transform happens at load time.
 
 mod error;
 mod jit;

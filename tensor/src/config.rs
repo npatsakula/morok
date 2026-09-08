@@ -25,7 +25,7 @@ struct EnvResolver;
 
 impl DeviceResolver for EnvResolver {
     fn resolve(&self, spec: &DeviceSpec, registry: &DeviceRegistry) -> crate::Result<Arc<Device>> {
-        svod_runtime::DEVICE_FACTORIES.device(spec, registry).context(DeviceFactorySnafu)
+        svod_runtime::DEVICE_FACTORIES.device(spec, registry).context(DeviceFactorySnafu).map_err(Into::into)
     }
 }
 
@@ -36,8 +36,10 @@ struct CpuBackendResolver(CpuBackend);
 impl DeviceResolver for CpuBackendResolver {
     fn resolve(&self, spec: &DeviceSpec, registry: &DeviceRegistry) -> crate::Result<Arc<Device>> {
         match spec {
-            DeviceSpec::Cpu => svod_runtime::cpu_device_with_backend(registry, self.0).context(DeviceSnafu),
-            _ => svod_runtime::DEVICE_FACTORIES.device(spec, registry).context(DeviceFactorySnafu),
+            DeviceSpec::Cpu => {
+                svod_runtime::cpu_device_with_backend(registry, self.0).context(DeviceSnafu).map_err(Into::into)
+            }
+            _ => svod_runtime::DEVICE_FACTORIES.device(spec, registry).context(DeviceFactorySnafu).map_err(Into::into),
         }
     }
 }
@@ -111,6 +113,14 @@ impl PrepareConfig {
             device_local_outputs: false,
             threads: svod_schedule::thread_budget(),
         }
+    }
+
+    /// [`from_env`](Self::from_env) with device-local output buffers: results
+    /// are read back with `copyout` over the copy engine instead of through an
+    /// uncached host mapping. The default for JIT plans whose outputs are read
+    /// in bulk (or not at all, as with recurrent state).
+    pub fn device_local() -> Self {
+        Self { device_local_outputs: true, ..Self::from_env() }
     }
 
     /// Convenience constructor: specific CPU backend with optimizer settings
@@ -228,7 +238,7 @@ impl From<OptimizerConfig> for PrepareConfig {
 /// ```ignore
 /// codegen_tests! {
 ///     fn test_add(config) {
-///         let mut a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+///         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
 ///         a.realize_with(&config).unwrap();
 ///         let result: Vec<f32> = a.as_vec().unwrap();
 ///     }
@@ -241,7 +251,7 @@ impl From<OptimizerConfig> for PrepareConfig {
 /// codegen_tests! {
 ///     #[test_case(128, 0.5; "128x128")]
 ///     fn test_matmul(config, size: usize, tol: f32) {
-///         let mut result = run_matmul(size);
+///         let result = run_matmul(size);
 ///         result.realize_with(&config).unwrap();
 ///         assert_close(&result, tol);
 ///     }
@@ -254,7 +264,7 @@ impl From<OptimizerConfig> for PrepareConfig {
 /// codegen_tests! {
 ///     #[proptest_config(ProptestConfig::with_cases(50))]
 ///     fn test_sort_random(config, data in proptest::collection::vec(-100.0f32..100.0, 1..=16)) {
-///         let mut t = Tensor::from_slice(&data);
+///         let t = Tensor::from_slice(&data);
 ///         let (sorted, _) = t.sort(-1, false).unwrap();
 ///         // ...
 ///     }

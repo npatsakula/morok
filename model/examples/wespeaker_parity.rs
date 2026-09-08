@@ -165,18 +165,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Execute and read out
     // -----------------------------------------------------------------------
     let t_exec = Instant::now();
-    jit.execute_with_vars(&[("b", b as i64)])?;
+    jit.execute_bound(b as i64)?;
     println!("Execute (b={b}): {:.2}s", t_exec.elapsed().as_secs_f64());
 
-    let out_buf = jit.output()?;
-    let n_floats = out_buf.size() / std::mem::size_of::<f32>();
-    let mut out_flat = vec![0f32; n_floats];
-    out_buf.copyout(bytemuck::cast_slice_mut(&mut out_flat))?;
-
-    // Output layout: [max_batch, 256]; we used the first b rows.
-    if n_floats < b * 256 {
-        return Err(format!("output too small: got {n_floats} floats, need {}", b * 256).into());
-    }
+    // The buffer is sized for `max_batch`; the declared output's live shape is
+    // `[b, 256]`, so the read-back is exactly the rows we bound.
+    let out_flat = jit.embeddings_to_vec::<f32>()?;
 
     // -----------------------------------------------------------------------
     // Compare

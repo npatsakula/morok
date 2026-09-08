@@ -19,8 +19,6 @@
 //! field (±`HALO`) of real context and the stitched output equals a
 //! single full-length forward up to float reassociation.
 
-extern crate self as svod_model;
-
 mod fbank;
 mod splitter;
 mod stream;
@@ -34,7 +32,7 @@ pub use stream::{
 
 use std::path::Path;
 
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 use svod_dtype::DType;
 use svod_macros::jit_wrapper;
 use svod_tensor::Tensor;
@@ -45,17 +43,17 @@ use crate::state;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Tensor {
         #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
         source: Box<svod_tensor::error::Error>,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     State {
         #[snafu(source(from(crate::state::Error, Box::new)))]
         source: Box<crate::state::Error>,
     },
-    #[snafu(display("hub error: {source}"))]
+    #[snafu(display("hub error: {source}"), context(false))]
     Hub { source: hf_hub::HFError },
 }
 
@@ -89,8 +87,14 @@ pub(crate) const CORE: usize = CHUNK_T - 2 * HALO;
 /// ignores the rest.
 pub(crate) const BATCH: usize = 8;
 
+/// The checkpoint stores each FSMN time filter as a `[P, 1, 1, ORDER]`
+/// conv2d kernel over a fake height axis; `conv1d` takes `[P, 1, ORDER]`.
+pub(crate) fn time_filter(weight: &Tensor) -> Result<Tensor> {
+    Ok(weight.try_reshape([PROJ as isize, 1, ORDER as isize])?)
+}
+
 /// One FSMN memory layer: depthwise lookback + lookahead filters over time
-/// (weights `[P, 1, 1, ORDER]`), residual added by the caller-side formula
+/// (weights `[P, 1, ORDER]`), residual added by the caller-side formula
 /// `memory = x + lookback + lookahead`.
 #[derive(Clone)]
 struct Fsmn {
@@ -104,25 +108,26 @@ impl Fsmn {
     /// `t` then sums frames `[t+1, t+ORDER]`, with `t = T-1` falling entirely
     /// in the zero pad (the reference's appended zero).
     ///
-    /// `valid` (`[N, 1, 1, T]`, `{0, 1}`) zeroes pad rows before the convs —
+    /// `valid` (`[N, 1, T]`, `{0, 1}`) zeroes pad rows before the convs —
     /// the reference's `masked_fill` batch-padding path. Pointwise layers turn
     /// zero-filled pad rows into bias activations, so without the mask the
     /// convs would leak them into real frames; masked, a pad row contributes
     /// exactly what conv zero-padding would.
     fn forward(&self, x: &Tensor, valid: Option<&Tensor>) -> Result<Tensor> {
-        let t = |r: std::result::Result<Tensor, svod_tensor::error::Error>| r.context(TensorSnafu);
-        let len = x.shape().context(TensorSnafu)?[1].as_const().expect("time dim must be concrete") as isize;
+        let len = x.dim_const(1)?;
         let k = ORDER as isize;
-        // [N,T,P] -> [N,P,1,T]: conv2d wants (N, C, *spatial).
-        let mut xt = t(t(x.try_transpose(-1, -2))?.try_unsqueeze(2))?;
+        // [N,T,P] -> [N,P,T]: conv1d wants (N, C, L).
+        let mut xt = x.try_transpose(-1, -2)?;
         if let Some(valid) = valid {
-            xt = t(xt.try_mul(valid))?;
+            xt = xt.try_mul(valid)?;
         }
-        let lookback = t(xt.conv2d().weight(&self.lookback).groups(PROJ).padding(&[(0, 0), (k - 1, 0)]).call())?;
-        let lookahead = t(xt.conv2d().weight(&self.lookahead).groups(PROJ).padding(&[(0, 0), (0, k)]).call())?;
-        let lookahead = t(lookahead.try_shrink([None, None, None, Some((1, len + 1))]))?;
-        let memory = t(t(xt.try_add(&lookback))?.try_add(&lookahead))?;
-        t(t(memory.try_squeeze(Some(2)))?.try_transpose(-1, -2))
+        let filter = |weight: &Tensor, padding: (isize, isize)| -> Result<Tensor> {
+            Ok(xt.conv1d().weight(weight).groups(PROJ).padding(padding).call()?)
+        };
+        let lookback = filter(&self.lookback, (k - 1, 0))?;
+        let lookahead = filter(&self.lookahead, (0, k))?.narrow(-1, 1usize, len)?;
+        let memory = xt.try_add(&lookback)?.try_add(&lookahead)?;
+        Ok(memory.try_transpose(-1, -2)?)
     }
 }
 
@@ -137,16 +142,9 @@ struct DfsmnBlock {
 
 impl DfsmnBlock {
     fn forward(&self, x: &Tensor, valid: Option<&Tensor>) -> Result<Tensor> {
-        let h = x
-            .linear()
-            .weight(&self.fc1_weight)
-            .bias(&self.fc1_bias)
-            .call()
-            .context(TensorSnafu)?
-            .relu()
-            .context(TensorSnafu)?;
-        let p = h.linear().weight(&self.fc2_weight).call().context(TensorSnafu)?;
-        self.fsmn.forward(&p, valid)?.try_add(x).context(TensorSnafu)
+        let h = x.linear().weight(&self.fc1_weight).bias(&self.fc1_bias).call()?.relu()?;
+        let p = h.linear().weight(&self.fc2_weight).call()?;
+        Ok(self.fsmn.forward(&p, valid)?.try_add(x)?)
     }
 }
 
@@ -171,8 +169,8 @@ pub(crate) const HUB_REPO: &str = "vpermilp/firered_vad";
 
 /// Download a file from [`HUB_REPO`] into the local HF cache.
 pub(crate) fn hub_file(name: &str) -> Result<std::path::PathBuf> {
-    let repo = crate::hub::HubRepo::open(HUB_REPO, "main").context(HubSnafu)?;
-    repo.get(name).context(HubSnafu)
+    let repo = crate::hub::HubRepo::open(HUB_REPO, "main")?;
+    Ok(repo.get(name)?)
 }
 
 impl FireRedVad {
@@ -183,12 +181,12 @@ impl FireRedVad {
     /// Load from a safetensors produced by `scripts/convert_firered_vad.py`
     /// (model weights + `cmvn_means`/`cmvn_istd` stats).
     pub fn from_safetensors(path: &Path) -> Result<Self> {
-        let sd = state::load_safetensors(path).context(StateSnafu)?;
-        let get = |key: &str| -> Result<Tensor> { state::get_tensor(&sd, key).context(StateSnafu) };
+        let sd = state::load_safetensors(path)?;
+        let get = |key: &str| -> Result<Tensor> { Ok(state::get_tensor(&sd, key)?) };
         let fsmn = |prefix: &str| -> Result<Fsmn> {
             Ok(Fsmn {
-                lookback: get(&format!("{prefix}.lookback.weight"))?,
-                lookahead: get(&format!("{prefix}.lookahead.weight"))?,
+                lookback: time_filter(&get(&format!("{prefix}.lookback.weight"))?)?,
+                lookahead: time_filter(&get(&format!("{prefix}.lookahead.weight"))?)?,
             })
         };
         let blocks = (0..BLOCKS)
@@ -225,8 +223,8 @@ impl FireRedVad {
         let lin = |out: usize, inp: usize| fan_in_uniform(&[out, inp], inp, dt.clone());
         let bias = |out: usize, fan_in: usize| fan_in_uniform(&[out], fan_in, dt.clone());
         let fsmn = || Fsmn {
-            lookback: fan_in_uniform(&[PROJ, 1, 1, ORDER], ORDER, dt.clone()),
-            lookahead: fan_in_uniform(&[PROJ, 1, 1, ORDER], ORDER, dt.clone()),
+            lookback: fan_in_uniform(&[PROJ, 1, ORDER], ORDER, dt.clone()),
+            lookahead: fan_in_uniform(&[PROJ, 1, ORDER], ORDER, dt.clone()),
         };
         Self {
             fc1_weight: lin(HIDDEN, N_MELS),
@@ -259,22 +257,18 @@ impl FireRedVad {
     /// garbage but the valid rows match a pad-free forward exactly. `None`
     /// means all rows are real.
     pub fn forward(&self, feat: &Tensor, valid: Option<&Tensor>) -> Result<Tensor> {
-        let t = |r: std::result::Result<Tensor, svod_tensor::error::Error>| r.context(TensorSnafu);
-        // [B,T,1] -> [B,1,1,T], broadcast over P in the convs' (N,C,1,T) layout.
-        let valid = match valid {
-            Some(v) => Some(t(t(v.try_transpose(-1, -2))?.try_unsqueeze(2))?),
-            None => None,
-        };
-        let x = t(t(feat.try_sub(&self.cmvn_means))?.try_mul(&self.cmvn_istd))?;
-        let h = t(t(x.linear().weight(&self.fc1_weight).bias(&self.fc1_bias).call())?.relu())?;
-        let mut m = t(t(h.linear().weight(&self.fc2_weight).bias(&self.fc2_bias).call())?.relu())?;
+        // [B,T,1] -> [B,1,T], broadcast over P in the convs' (N,C,L) layout.
+        let valid = valid.map(|v| v.try_transpose(-1, -2)).transpose()?;
+        let x = feat.try_sub(&self.cmvn_means)?.try_mul(&self.cmvn_istd)?;
+        let h = x.linear().weight(&self.fc1_weight).bias(&self.fc1_bias).call()?.relu()?;
+        let mut m = h.linear().weight(&self.fc2_weight).bias(&self.fc2_bias).call()?.relu()?;
         m = self.fsmn1.forward(&m, valid.as_ref())?;
         for block in &self.blocks {
             m = block.forward(&m, valid.as_ref())?;
         }
-        let d = t(t(m.linear().weight(&self.dnn_weight).bias(&self.dnn_bias).call())?.relu())?;
-        let logits = t(d.linear().weight(&self.out_weight).bias(&self.out_bias).call())?;
-        t(t(logits.sigmoid())?.try_squeeze(Some(-1)))
+        let d = m.linear().weight(&self.dnn_weight).bias(&self.dnn_bias).call()?.relu()?;
+        let logits = d.linear().weight(&self.out_weight).bias(&self.out_bias).call()?;
+        Ok(logits.sigmoid()?.try_squeeze(Some(-1))?)
     }
 }
 
@@ -301,12 +295,10 @@ impl FireRedVadInference {
     pub fn new(model: FireRedVad) -> crate::jit::Result<Self> {
         use crate::jit::InputSpec;
         let mut jit = FireRedVadJit::new(model);
-        let mut config = svod_tensor::PrepareConfig::from_env();
-        config.device_local_outputs = true;
         jit.prepare_with_config(
             InputSpec::f32(&[BATCH, CHUNK_T, N_MELS]),
             InputSpec::f32(&[BATCH, CHUNK_T, 1]),
-            &config,
+            &svod_tensor::PrepareConfig::device_local(),
         )?;
         Ok(Self { jit })
     }
@@ -319,7 +311,6 @@ impl FireRedVadInference {
     /// only the core region is kept — so the stitched result equals a
     /// single full-length forward up to float reassociation.
     pub fn probs(&mut self, feat: &[f32], n_frames: usize) -> crate::jit::Result<Vec<f32>> {
-        use snafu::ResultExt;
         debug_assert_eq!(feat.len(), n_frames * N_MELS, "feat shape");
         if n_frames == 0 {
             return Ok(Vec::new());
@@ -341,8 +332,7 @@ impl FireRedVadInference {
                 (src_lo, src_hi, (src_lo as isize - start) as usize)
             };
             {
-                let buf = self.jit.feat_mut()?;
-                let mut view = buf.as_array_mut::<f32>().context(crate::jit::DeviceSnafu)?;
+                let mut view = self.jit.feat_view_mut::<f32>()?;
                 let slice = view.as_slice_mut().expect("contiguous feat");
                 slice[..b * CHUNK_T * N_MELS].fill(0.0);
                 for i in 0..b {
@@ -353,8 +343,7 @@ impl FireRedVadInference {
                 }
             }
             {
-                let buf = self.jit.valid_mut()?;
-                let mut view = buf.as_array_mut::<f32>().context(crate::jit::DeviceSnafu)?;
+                let mut view = self.jit.valid_view_mut::<f32>()?;
                 let slice = view.as_slice_mut().expect("contiguous valid");
                 slice[..b * CHUNK_T].fill(0.0);
                 for i in 0..b {
@@ -363,10 +352,7 @@ impl FireRedVadInference {
                 }
             }
             self.jit.execute()?;
-            self.jit
-                .output()?
-                .copyout_prefix(bytemuck::cast_slice_mut(&mut out[..b * CHUNK_T]))
-                .context(crate::jit::DeviceSnafu)?;
+            self.jit.output()?.copyout_prefix(bytemuck::cast_slice_mut(&mut out[..b * CHUNK_T]))?;
             for i in 0..b {
                 let core_lo = (done + i) * CORE;
                 let core_len = CORE.min(n_frames - core_lo);

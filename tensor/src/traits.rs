@@ -1,65 +1,83 @@
 use super::*;
 
-/// Macro to implement binary operation traits for Tensor.
+/// Operator sugar for the fallible binary ops.
 ///
-/// Generates all 4 ownership combinations:
-/// - &Tensor op &Tensor (primary implementation, calls try_* method)
-/// - Tensor op Tensor (forwards to &self op &other)
-/// - &Tensor op Tensor (forwards to self op &other)
-/// - Tensor op &Tensor (forwards to &self op other)
+/// Every operator returns [`Result<Tensor>`], so shape or dtype mismatches stay
+/// recoverable: `(&a + &b)?`. The right-hand side is any [`Operand`], so a
+/// tensor (owned or borrowed) and a bare scalar both work; the left-hand side
+/// may be an owned or borrowed [`Tensor`], or a scalar via [`impl_scalar_lhs`].
 macro_rules! impl_binary_op {
-    ($trait:ident, $method:ident, $try_method:ident, $error_msg:expr) => {
-        impl std::ops::$trait for &Tensor {
-            type Output = Tensor;
+    ($($trait:ident :: $method:ident => $try_method:ident),* $(,)?) => { $(
+        impl<'r, R: Into<Operand<'r>>> std::ops::$trait<R> for &Tensor {
+            type Output = Result<Tensor>;
 
             #[track_caller]
-            fn $method(self, other: &Tensor) -> Tensor {
-                self.$try_method(other).expect($error_msg)
+            fn $method(self, other: R) -> Self::Output {
+                self.$try_method(other)
             }
         }
 
-        impl std::ops::$trait for Tensor {
-            type Output = Tensor;
+        impl<'r, R: Into<Operand<'r>>> std::ops::$trait<R> for Tensor {
+            type Output = Result<Tensor>;
 
             #[track_caller]
-            fn $method(self, other: Tensor) -> Tensor {
-                (&self).$method(&other)
+            fn $method(self, other: R) -> Self::Output {
+                self.$try_method(other)
             }
         }
-
-        impl std::ops::$trait<Tensor> for &Tensor {
-            type Output = Tensor;
-
-            #[track_caller]
-            fn $method(self, other: Tensor) -> Tensor {
-                self.$method(&other)
-            }
-        }
-
-        impl std::ops::$trait<&Tensor> for Tensor {
-            type Output = Tensor;
-
-            #[track_caller]
-            fn $method(self, other: &Tensor) -> Tensor {
-                (&self).$method(other)
-            }
-        }
-    };
+    )* };
 }
 
-// Binary arithmetic operations
-impl_binary_op!(Add, add, try_add, "Addition failed");
-impl_binary_op!(Sub, sub, try_sub, "Subtraction failed");
-impl_binary_op!(Mul, mul, try_mul, "Multiplication failed");
-impl_binary_op!(Div, div, try_div, "Division failed");
+impl_binary_op! {
+    Add::add => try_add,
+    Sub::sub => try_sub,
+    Mul::mul => try_mul,
+    Div::div => try_div,
+    Rem::rem => try_mod,
+    BitAnd::bitand => try_bitand,
+    BitOr::bitor => try_bitor,
+    BitXor::bitxor => try_bitxor,
+    Shl::shl => try_shl,
+    Shr::shr => try_shr,
+}
 
-// Unary operations
+/// `2.0 * &t` — the scalar is materialized in the tensor's dtype, so the
+/// operation runs exactly as `t.dtype()` demands.
+macro_rules! impl_scalar_lhs {
+    ($($ty:ty),* $(,)?) => { $(
+        impl_scalar_lhs!(@ops $ty: Add::add => try_add, Sub::sub => try_sub, Mul::mul => try_mul,
+                                  Div::div => try_div, Rem::rem => try_mod);
+    )* };
+    (@ops $ty:ty: $($trait:ident :: $method:ident => $try_method:ident),* $(,)?) => { $(
+        impl std::ops::$trait<&Tensor> for $ty {
+            type Output = Result<Tensor>;
+
+            #[track_caller]
+            fn $method(self, other: &Tensor) -> Self::Output {
+                Tensor::const_(self, other.dtype()).$try_method(other)
+            }
+        }
+
+        impl std::ops::$trait<Tensor> for $ty {
+            type Output = Result<Tensor>;
+
+            #[track_caller]
+            fn $method(self, other: Tensor) -> Self::Output {
+                Tensor::const_(self, other.dtype()).$try_method(&other)
+            }
+        }
+    )* };
+}
+
+impl_scalar_lhs!(f32, f64, i32, i64);
+
+// Negation is infallible, so it stays a plain `Tensor`.
 impl std::ops::Neg for &Tensor {
     type Output = Tensor;
 
     #[track_caller]
     fn neg(self) -> Tensor {
-        self.try_neg().expect("Negation failed")
+        Tensor::neg(self)
     }
 }
 
@@ -68,6 +86,6 @@ impl std::ops::Neg for Tensor {
 
     #[track_caller]
     fn neg(self) -> Tensor {
-        (&self).neg()
+        Tensor::neg(&self)
     }
 }

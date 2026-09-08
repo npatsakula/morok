@@ -10,7 +10,7 @@ mod common;
 use common::{bench_plan, randn_bf16, requirements_met};
 
 fn randn_f32(shape: &[usize]) -> Tensor {
-    let mut t = randn_bf16(shape).cast(DType::Float32).expect("f32");
+    let t = randn_bf16(shape).cast(DType::Float32);
     t.realize().expect("realize");
     t
 }
@@ -29,7 +29,7 @@ fn bench_sq_attention(c: &mut Criterion) {
         let v = randn_f32(&[b, n, h, d]);
         let lens_values = if mode == "self_short" { [8i32, 9, 7, 8, 9] } else { [444i32, 445, 446, 447, 448] };
         let lens = mode.starts_with("self").then(|| {
-            let mut t = Tensor::from_slice(lens_values);
+            let t = Tensor::from_slice(lens_values);
             t.realize().expect("realize lens");
             t
         });
@@ -38,7 +38,7 @@ fn bench_sq_attention(c: &mut Criterion) {
         for &split in splits {
             let opts =
                 svod_tk::SqAttentionOpts { key_lens: lens.as_ref(), include_last: mode.starts_with("self"), split };
-            let mut tk = svod_tk::single_query_attention(&q, &k, &v, opts).expect("sq attention").expect("supported");
+            let tk = svod_tk::single_query_attention(&q, &k, &v, opts).expect("sq attention").expect("supported");
             let tk_plan = tk.prepare().expect("prepare tk");
             group.bench_with_input(BenchmarkId::new(format!("tk/{mode}/split_{split}"), n), &n, |bencher, _| {
                 bench_plan(bencher, &tk_plan)
@@ -53,7 +53,7 @@ fn bench_sq_attention(c: &mut Criterion) {
             Tensor::from_slice(values.as_slice()).try_reshape([b, 1, 1, n]).expect("self mask")
         });
         let sdpa = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(false);
-        let mut sdpa = match &mask {
+        let sdpa = match &mask {
             Some(mask) => sdpa.attn_mask(mask).call().expect("masked sdpa"),
             None => sdpa.call().expect("sdpa"),
         };

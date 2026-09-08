@@ -7,10 +7,11 @@
 //! one piece of new pure-logic — `ctc_frames_to_words` — is testable in
 //! isolation and lives here.
 
-use svod_arch::rnnt::Word;
+use svod_arch::rnnt::{BatchBlockStep, Word};
 
-use crate::gigaam::TranscribeOpts;
+use crate::gigaam::rnnt::RnntBlockBackend;
 use crate::gigaam::transcribe::ctc_frames_to_words;
+use crate::gigaam::{GigaAm, TranscribeOpts, TransducerConfig};
 
 #[test]
 fn ctc_frames_to_words_empty() {
@@ -82,4 +83,58 @@ fn transcribe_opts_builder_overrides_fields() {
     let opts = TranscribeOpts::builder().beam_decode(true).max_scores_mib(512).build();
     assert!(opts.beam_decode);
     assert_eq!(opts.max_scores_mib, 512);
+}
+
+// ─── RN-T device block ────────────────────────────────────────────────────
+
+/// The block JIT carries `time/prev/symbols/h/c` as `state { .. }` slots, so
+/// `execute()` stores each block's final value back into the buffer the next
+/// block reads. Both consequences are asserted here: a wave terminates (the
+/// frame cursor really advances across block boundaries), and `reset()` —
+/// zero-fill plus the blank seed for `prev` — returns the backend to the cold
+/// start, so a second wave over the same frames replays the first exactly.
+#[test]
+#[ignore = "heavy: RN-T block JIT compile + execute on random weights"]
+fn rnnt_block_state_recycles_across_blocks_and_resets() {
+    const LANES: usize = 2;
+    const MAX_T: usize = 96;
+
+    let mut cfg = super::batch::test_config();
+    cfg.transducer = Some(TransducerConfig {
+        pred_hidden: 32,
+        pred_rnn_layers: 1,
+        joint_hidden: 32,
+        num_classes: 8,
+        max_symbols_per_step: 3,
+        vocabulary: (0..7).map(|i| i.to_string()).collect(),
+        sentencepiece: false,
+    });
+    let d_model = cfg.d_model;
+    let model = GigaAm::with_random_weights(cfg);
+    let mut backend = RnntBlockBackend::from_model(model, LANES, MAX_T).expect("block backend");
+
+    let valid = [MAX_T, MAX_T - 5];
+    let frames: Vec<Vec<f32>> = valid
+        .iter()
+        .enumerate()
+        .map(|(lane, &n)| (0..n * d_model).map(|i| ((i + lane) % 17) as f32 * 0.01 - 0.08).collect())
+        .collect();
+
+    let wave = |backend: &mut RnntBlockBackend| -> Vec<(Vec<i32>, Vec<i32>, Vec<i32>)> {
+        backend.reset().expect("reset");
+        backend.bind_batch(&frames, &valid).expect("bind");
+        let mut blocks = Vec::new();
+        loop {
+            let tapes = backend.run_block().expect("block");
+            blocks.push((tapes.tokens.to_vec(), tapes.emit.to_vec(), tapes.frames.to_vec()));
+            if !tapes.active_any {
+                return blocks;
+            }
+            assert!(blocks.len() < 64, "wave never finished: the frame cursor is not carried across blocks");
+        }
+    };
+
+    let first = wave(&mut backend);
+    assert!(first.len() > 1, "expected a multi-block wave, got {}", first.len());
+    assert_eq!(first, wave(&mut backend), "reset did not restore the cold-start decode state");
 }

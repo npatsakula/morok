@@ -77,7 +77,7 @@ fn test_tensor_from_proto_f32() {
     let tensor = make_tensor_proto(raw, vec![2, 3], 1); // FLOAT
 
     let result = tensor_from_proto(&tensor).unwrap();
-    let dims: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let dims = result.dims().unwrap();
     assert_eq!(dims, vec![2, 3]);
     assert_eq!(result.as_vec::<f32>().unwrap(), [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
 }
@@ -135,7 +135,7 @@ fn test_create_tensor_float16() {
     let f16_bits: Vec<u16> = vec![0x3C00, 0x4000, 0x3800];
     let data: Vec<u8> = f16_bits.iter().flat_map(|v| v.to_le_bytes()).collect();
     let t = create_tensor_from_raw(&data, &[3], DType::Float16).unwrap();
-    let mut t_f32 = t.cast(DType::Float32).unwrap();
+    let t_f32 = t.cast(DType::Float32);
     t_f32.realize().unwrap();
     let vals = t_f32.as_vec::<f32>().unwrap();
     assert!((vals[0] - 1.0).abs() < 1e-3);
@@ -149,7 +149,7 @@ fn test_create_tensor_bfloat16() {
     let bf16_bits: Vec<u16> = vec![0x3F80, 0x4000, 0x3F00];
     let data: Vec<u8> = bf16_bits.iter().flat_map(|v| v.to_le_bytes()).collect();
     let t = create_tensor_from_raw(&data, &[3], DType::BFloat16).unwrap();
-    let mut t_f32 = t.cast(DType::Float32).unwrap();
+    let t_f32 = t.cast(DType::Float32);
     t_f32.realize().unwrap();
     let vals = t_f32.as_vec::<f32>().unwrap();
     assert!((vals[0] - 1.0).abs() < 1e-2);

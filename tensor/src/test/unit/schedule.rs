@@ -63,8 +63,8 @@ fn slice_is_resolved_to_alias_handle_before_runtime_planning() {
 }
 
 fn assert_ir_construction_error_contains(err: crate::Error, needle: &str) {
-    match err {
-        crate::Error::IrConstruction { details } => {
+    match err.kind() {
+        crate::ErrorKind::IrConstruction { details } => {
             assert!(details.contains(needle), "expected IrConstruction details to contain '{needle}', got '{details}'");
         }
         other => panic!("unexpected error: {other:?}"),
@@ -207,33 +207,39 @@ fn test_create_schedule_rejects_malformed_multi_device_calls() {
     };
 
     let err = reject(vec![mstack_of(&a).mselect(2)], zero.clone());
-    assert!(matches!(err, crate::Error::MultiSelectOutOfBounds { device_index: 2, lane_count: 2, .. }), "{err:?}");
+    assert!(
+        matches!(err.kind(), crate::ErrorKind::MultiSelectOutOfBounds { device_index: 2, lane_count: 2, .. }),
+        "{err:?}"
+    );
 
     let err = reject(vec![UOp::mstack(SmallVec::new())], zero.clone());
-    assert!(matches!(err, crate::Error::MultiEmptyLanes { source_index: 0, .. }), "{err:?}");
+    assert!(matches!(err.kind(), crate::ErrorKind::MultiEmptyLanes { source_index: 0, .. }), "{err:?}");
 
     let err = reject(vec![mstack_of(&a), mstack_of(&b)], zero.clone());
     assert!(
-        matches!(err, crate::Error::MultiLaneCountMismatch { source_index: 1, expected: 2, actual: 1, .. }),
+        matches!(err.kind(), crate::ErrorKind::MultiLaneCountMismatch { source_index: 1, expected: 2, actual: 1, .. }),
         "{err:?}"
     );
 
     // A DEVICE extent must match the lane count and be statically known.
     let err = reject(vec![mstack_of(&a)], device_axis(UOp::index_const(3)));
-    assert!(matches!(err, crate::Error::MultiDeviceExtentMismatch { expected: 2, actual: 3, .. }), "{err:?}");
+    assert!(
+        matches!(err.kind(), crate::ErrorKind::MultiDeviceExtentMismatch { expected: 2, actual: 3, .. }),
+        "{err:?}"
+    );
     let dynamic = device_axis(UOp::variable("device_count".into(), 1, 4, DType::Index));
-    assert!(matches!(reject(vec![mstack_of(&a)], dynamic), crate::Error::MultiDeviceExtentNotStatic { .. }));
+    assert!(matches!(reject(vec![mstack_of(&a)], dynamic).kind(), crate::ErrorKind::MultiDeviceExtentNotStatic { .. }));
 
     // A DEVICE axis without MSTACK lanes, and MSTACK lanes mixed with a plain
     // buffer, are both unexpanded forms.
     let err = reject(vec![ordinary.clone()], device_axis(UOp::index_const(1)));
-    assert!(matches!(err, crate::Error::MultiUnsupportedForm { .. }), "{err:?}");
+    assert!(matches!(err.kind(), crate::ErrorKind::MultiUnsupportedForm { .. }), "{err:?}");
     let err = reject(vec![mstack_of(&a), ordinary.clone()], zero.clone());
-    assert!(matches!(err, crate::Error::MultiUnsupportedForm { .. }), "{err:?}");
+    assert!(matches!(err.kind(), crate::ErrorKind::MultiUnsupportedForm { .. }), "{err:?}");
 
     let sliced = mstack_of(&[a[0].contiguous_slice(1, 0, DType::Float32), a[1].clone()]);
     let err = reject(vec![sliced], zero);
-    assert!(matches!(err, crate::Error::MultiLaneSliceAlias { source_index: 0, lane: 0, .. }), "{err:?}");
+    assert!(matches!(err.kind(), crate::ErrorKind::MultiLaneSliceAlias { source_index: 0, lane: 0, .. }), "{err:?}");
 }
 
 #[test]
@@ -247,8 +253,8 @@ fn test_create_schedule_rejects_device_binding_conflict() {
         &HashMap::from([("_device_num".into(), 0)]),
     ));
     assert!(matches!(
-        err,
-        crate::Error::MultiBindingConflict { ref name, existing: 0, incoming: 0, .. } if name == "_device_num"
+        err.kind(),
+        crate::ErrorKind::MultiBindingConflict { name, existing: 0, incoming: 0, .. } if name == "_device_num"
     ));
 }
 
@@ -596,8 +602,8 @@ fn test_create_schedule_rejects_non_callable_after_dependency() {
         Ok(_) => panic!("invalid AFTER dep should fail"),
         Err(err) => err,
     };
-    match err {
-        crate::Error::IrConstruction { details } => {
+    match err.kind() {
+        crate::ErrorKind::IrConstruction { details } => {
             assert!(details.contains("AFTER dependency must be CALL/END(CALL)/STORE/AFTER"));
         }
         other => panic!("unexpected error: {other:?}"),

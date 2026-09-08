@@ -15,11 +15,11 @@ fn metal_profile_reports_pipeline_limits() {
         eprintln!("skipped: default device is not a Metal GPU");
         return;
     };
-    let mut a = Tensor::randn(&[128, 128]).unwrap().cast(DType::Float16).unwrap();
-    let mut b = Tensor::randn(&[128, 128]).unwrap().cast(DType::Float16).unwrap();
+    let a = Tensor::randn(&[128, 128]).unwrap().cast(DType::Float16);
+    let b = Tensor::randn(&[128, 128]).unwrap().cast(DType::Float16);
     a.realize().unwrap();
     b.realize().unwrap();
-    let mut c = a.matmul_with().other(&b).dtype(DType::Float32).call().unwrap();
+    let c = a.matmul_with().other(&b).dtype(DType::Float32).call().unwrap();
     let plan = c.prepare_with(&config).unwrap();
     let report = plan.profile(&ProfileOptions::default()).unwrap();
 
@@ -48,11 +48,11 @@ fn cuda_profile_reports_function_attributes_and_gpu_stamps() {
         eprintln!("skipped: default device is not a CUDA GPU");
         return;
     };
-    let mut a = Tensor::randn(&[128, 128]).unwrap().cast(DType::Float16).unwrap();
-    let mut b = Tensor::randn(&[128, 128]).unwrap().cast(DType::Float16).unwrap();
+    let a = Tensor::randn(&[128, 128]).unwrap().cast(DType::Float16);
+    let b = Tensor::randn(&[128, 128]).unwrap().cast(DType::Float16);
     a.realize().unwrap();
     b.realize().unwrap();
-    let mut c = a.matmul_with().other(&b).dtype(DType::Float32).call().unwrap();
+    let c = a.matmul_with().other(&b).dtype(DType::Float32).call().unwrap();
     let plan = c.prepare_with(&config).unwrap();
     let report = plan.profile(&ProfileOptions::default()).unwrap();
 

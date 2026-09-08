@@ -1,55 +1,20 @@
 use svod_tensor::Tensor;
 
-use crate::blocks::remap::fold_batchnorm;
+use crate::blocks::remap::strip_metadata;
 use crate::state::StateDict;
 
-fn tensor_f32(values: &[f32]) -> Tensor {
-    Tensor::from_slice(values)
-}
-
+/// The only entry no layer reads is dropped; everything a `BatchNorm2d` loads
+/// survives untouched.
 #[test]
-fn fold_replaces_running_var_with_invstd() {
-    let mut sd = StateDict::new();
-    sd.insert("bn1.weight".into(), tensor_f32(&[1.0, 2.0]));
-    sd.insert("bn1.bias".into(), tensor_f32(&[0.0, 0.0]));
-    sd.insert("bn1.running_mean".into(), tensor_f32(&[0.0, 0.0]));
-    sd.insert("bn1.running_var".into(), tensor_f32(&[0.25, 1.0])); // var
-    sd.insert("bn1.num_batches_tracked".into(), tensor_f32(&[42.0]));
+fn strip_metadata_drops_only_num_batches_tracked() {
+    let keep = ["bn1.weight", "bn1.bias", "bn1.running_mean", "bn1.running_var"];
+    let mut sd: StateDict = keep.iter().map(|k| ((*k).to_string(), Tensor::from_slice([1.0f32]))).collect();
+    sd.insert("bn1.num_batches_tracked".into(), Tensor::from_slice([42.0f32]));
 
-    let folded = fold_batchnorm(sd).expect("fold");
-    assert!(!folded.contains_key("bn1.num_batches_tracked"), "num_batches_tracked must be dropped");
-    assert!(!folded.contains_key("bn1.running_var"), "running_var key must be renamed");
-    assert!(folded.contains_key("bn1.weight"), "non-BN-stats keys preserved");
+    let stripped = strip_metadata(sd);
 
-    let invstd = folded.get("bn1.invstd").expect("invstd key present after fold");
-    let invstd_vals = invstd.as_vec::<f32>().expect("read invstd");
-    // invstd = 1 / sqrt(var + 1e-5)
-    let expected = vec![1.0 / (0.25_f32 + 1e-5).sqrt(), 1.0 / (1.0_f32 + 1e-5).sqrt()];
-    assert!(
-        invstd_vals.iter().zip(&expected).all(|(a, b)| (a - b).abs() < 1e-6),
-        "got {:?}, expected {:?}",
-        invstd_vals,
-        expected
-    );
-}
-
-#[test]
-fn fold_handles_multiple_bn_layers() {
-    let mut sd = StateDict::new();
-    for prefix in ["bn1", "layer1.0.bn1", "layer4.2.downsample.1"] {
-        sd.insert(format!("{prefix}.weight"), tensor_f32(&[1.0]));
-        sd.insert(format!("{prefix}.bias"), tensor_f32(&[0.0]));
-        sd.insert(format!("{prefix}.running_mean"), tensor_f32(&[0.0]));
-        sd.insert(format!("{prefix}.running_var"), tensor_f32(&[1.0]));
-        sd.insert(format!("{prefix}.num_batches_tracked"), tensor_f32(&[1.0]));
-    }
-    let folded = fold_batchnorm(sd).expect("fold");
-    for prefix in ["bn1", "layer1.0.bn1", "layer4.2.downsample.1"] {
-        assert!(!folded.contains_key(&format!("{prefix}.num_batches_tracked")));
-        assert!(!folded.contains_key(&format!("{prefix}.running_var")), "running_var key renamed");
-        let invstd = folded.get(&format!("{prefix}.invstd")).unwrap();
-        let v = invstd.as_vec::<f32>().unwrap();
-        let expected = 1.0_f32 / (1.0_f32 + 1e-5).sqrt();
-        assert!((v[0] - expected).abs() < 1e-6);
+    assert!(!stripped.contains_key("bn1.num_batches_tracked"));
+    for key in keep {
+        assert!(stripped.contains_key(key), "missing key: {key}");
     }
 }

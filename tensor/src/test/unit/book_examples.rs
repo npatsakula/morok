@@ -14,10 +14,8 @@ crate::codegen_tests! {
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
         let b = Tensor::from_slice([10.0f32, 20.0, 30.0, 40.0]);
 
-        let sum = &a + &b;
-        let scaled = sum * Tensor::from_slice([0.1f32]);
-
-        let mut result = scaled;
+        let sum = (&a + &b).unwrap();
+        let result = (sum * Tensor::from_slice([0.1f32])).unwrap();
         result.realize_with(&config).unwrap();
         let data = result.as_vec::<f32>().unwrap();
 
@@ -52,7 +50,7 @@ crate::codegen_tests! {
         assert_eq!(transposed.shape().unwrap()[1].as_const(), Some(2));
 
         // Verify transposition is correct: [[1,2,3],[4,5,6]] -> [[1,4],[2,5],[3,6]]
-        let mut result = transposed;
+        let result = transposed;
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         assert_close_f32(&vals, &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0], 1e-6);
@@ -64,9 +62,9 @@ crate::codegen_tests! {
         // [3, 2] + [1, 2] → [3, 2]
         let transposed = Tensor::from_ndarray(&array![[1.0f32, 4.0], [2.0, 5.0], [3.0, 6.0]]);
         let bias = Tensor::from_ndarray(&array![[100.0f32, 200.0]]);
-        let biased = &transposed + &bias;
+        let biased = (&transposed + &bias).unwrap();
 
-        let mut result = biased;
+        let result = biased;
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
 
@@ -104,7 +102,7 @@ crate::codegen_tests! {
         assert_eq!(shape[0].as_const(), Some(4));
         assert_eq!(shape[1].as_const(), Some(2));
 
-        let mut result = output;
+        let result = output;
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
 
@@ -141,14 +139,14 @@ crate::codegen_tests! {
         // y = input @ weight.T + bias
         let weight_t = weight.try_transpose(0, 1).unwrap();
         let out = input.dot(&weight_t).unwrap();
-        let result_tensor = &out + &bias;
+        let result_tensor = (&out + &bias).unwrap();
 
         // Verify shape
         let shape = result_tensor.shape().unwrap();
         assert_eq!(shape[0].as_const(), Some(1));
         assert_eq!(shape[1].as_const(), Some(2));
 
-        let mut result = result_tensor;
+        let result = result_tensor;
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
 
@@ -182,12 +180,12 @@ crate::codegen_tests! {
 
         // Layer 1: linear + relu
         let h = input.dot(&w1.try_transpose(0, 1).unwrap()).unwrap();
-        let h = &h + &b1;
+        let h = (&h + &b1).unwrap();
         let h = h.relu().unwrap();
 
         // Layer 2: linear
         let logits = h.dot(&w2.try_transpose(0, 1).unwrap()).unwrap();
-        let logits = &logits + &b2;
+        let logits = (&logits + &b2).unwrap();
 
         // Verify shape: [1, 2]
         let shape = logits.shape().unwrap();
@@ -197,7 +195,7 @@ crate::codegen_tests! {
         // Softmax
         let probs = logits.softmax(-1).unwrap();
 
-        let mut result = probs;
+        let result = probs;
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
 
@@ -217,7 +215,7 @@ crate::codegen_tests! {
 
         // Simple test: [1, 4] with clear argmax
         let input = Tensor::from_ndarray(&array![[0.1f32, 0.9, 0.3, 0.5]]);
-        let mut result = input.argmax(Some(-1)).unwrap();
+        let result = input.argmax(Some(-1)).unwrap();
 
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<i32>().unwrap();
@@ -244,7 +242,7 @@ crate::codegen_tests! {
             [0.4, 0.5, 0.6, 0.7],
         ]);
         let bias = Tensor::from_slice([0.0f32, 0.0]);
-        let layer = nn::Linear::new(weight, bias);
+        let layer = nn::Linear::new(weight, Some(bias));
 
         let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
 
@@ -253,7 +251,7 @@ crate::codegen_tests! {
         assert_eq!(shape.len(), 1);
         assert_eq!(shape[0].as_const(), Some(2));
 
-        let mut result = output;
+        let result = output;
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
 
@@ -274,12 +272,12 @@ crate::codegen_tests! {
         let w1_data: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1 - 0.5).collect();
         let w1 = Tensor::from_ndarray(&ndarray::Array2::from_shape_vec((3, 4), w1_data).unwrap());
         let b1 = Tensor::from_slice([0.0f32; 3]);
-        let fc1 = nn::Linear::new(w1, b1);
+        let fc1 = nn::Linear::new(w1, Some(b1));
 
         let w2_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.1 - 0.3).collect();
         let w2 = Tensor::from_ndarray(&ndarray::Array2::from_shape_vec((2, 3), w2_data).unwrap());
         let b2 = Tensor::from_slice([0.0f32; 2]);
-        let fc2 = nn::Linear::new(w2, b2);
+        let fc2 = nn::Linear::new(w2, Some(b2));
 
         let input = Tensor::from_slice([0.5f32, -0.3, 0.8, 0.1]);
 
@@ -293,7 +291,7 @@ crate::codegen_tests! {
         // Softmax
         let probs = logits.softmax(-1).unwrap();
 
-        let mut result = probs;
+        let result = probs;
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
 
@@ -311,7 +309,7 @@ crate::codegen_tests! {
 fn test_example_6_ir_graph() {
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
 
     // Verify we can print the IR tree without crashing
     let tree = c.uop().tree();
@@ -328,7 +326,7 @@ crate::codegen_tests! {
 
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-        let mut c = &a + &b;
+        let c = (&a + &b).unwrap();
 
         let plan = c.prepare_with(&config).unwrap();
         assert!(plan.kernels().count() > 0, "should have at least 1 kernel");

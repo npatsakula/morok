@@ -102,7 +102,7 @@ fn test_masked_load_roundtrip_amd() {
     // Ragged input: unique positive values, so the 0.0 out-of-bounds fill is
     // unambiguous.
     let data: Vec<f32> = (0..rows * cols).map(|i| (i + 1) as f32).collect();
-    let mut a = Tensor::from_slice(&data).try_reshape([1usize, 1, rows, cols]).expect("reshape a");
+    let a = Tensor::from_slice(&data).try_reshape([1usize, 1, rows, cols]).expect("reshape a");
     a.realize().expect("realize a");
     let mut out = Tensor::empty(&[1, 1, 32, 32], DType::Float32);
 

@@ -1,17 +1,20 @@
 //! Forward shape + state-dict round-trip tests for Whisper model.
 
+use std::collections::BTreeSet;
+
 use svod_dtype::DType;
 use svod_ir::{AxisType, ConstValue, Op};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
 use crate::jit::InputSpec;
-use crate::state::HasStateDict;
+use crate::whisper::blocks::linear_forward;
 use crate::whisper::{
     DecodeOptions, DecodeResult, DecodeStrategy, FallbackPolicy, ModelDimensions, Whisper, WhisperAlignmentJit,
     WhisperAlignmentModel, WhisperCrossKvJit, WhisperDecoderJit, WhisperPlan, WhisperPrefillJit, WhisperSize,
 };
 use svod_ir::ops;
+use svod_tensor::nn::{Layer, Module};
 
 fn make_dims() -> ModelDimensions {
     ModelDimensions::for_size(WhisperSize::Tiny)
@@ -23,7 +26,7 @@ fn encoder_forward_shape() {
     let model = Whisper::empty(dims.clone());
 
     // mel: [1, n_mels, 3000]
-    let mel = Tensor::zeros(&[1, dims.n_mels, 3000], DType::Float32).unwrap();
+    let mel = Tensor::zeros(&[1, dims.n_mels, 3000], DType::Float32);
 
     let out = model.encode(&mel).unwrap();
     let shape = out.shape().unwrap();
@@ -40,7 +43,7 @@ fn decoder_forward_shape() {
     let model = Whisper::empty(dims.clone());
 
     // mel → encoder → features
-    let mel = Tensor::zeros(&[1, dims.n_mels, 3000], DType::Float32).unwrap();
+    let mel = Tensor::zeros(&[1, dims.n_mels, 3000], DType::Float32);
     let features = model.encode(&mel).unwrap();
 
     // tokens: [1, 4]
@@ -74,13 +77,14 @@ fn reference_cross_kv_projection(model: &Whisper, audio: &Tensor) -> (Tensor, Te
     let mut keys = Vec::with_capacity(model.decoder.blocks.len());
     let mut values = Vec::with_capacity(model.decoder.blocks.len());
     for block in &model.decoder.blocks {
-        let key = block.cross_attn.key.forward(audio).unwrap();
-        let value = block.cross_attn.value.forward(audio).unwrap();
-        keys.push(block.cross_attn.split_heads(&key).unwrap().try_permute(&[0, 2, 1, 3]).unwrap());
-        values.push(block.cross_attn.split_heads(&value).unwrap().try_permute(&[0, 2, 1, 3]).unwrap());
+        let heads = block.cross_attn.n_head;
+        let key = linear_forward(&block.cross_attn.key, audio).unwrap();
+        let value = linear_forward(&block.cross_attn.value, audio).unwrap();
+        keys.push(key.split_heads(heads).unwrap().try_permute(&[0, 2, 1, 3]).unwrap());
+        values.push(value.split_heads(heads).unwrap().try_permute(&[0, 2, 1, 3]).unwrap());
     }
-    let keys = Tensor::cat(&keys.iter().collect::<Vec<_>>(), 2).unwrap().cast(DType::Float32).unwrap();
-    let values = Tensor::cat(&values.iter().collect::<Vec<_>>(), 2).unwrap().cast(DType::Float32).unwrap();
+    let keys = Tensor::cat(&keys.iter().collect::<Vec<_>>(), 2).unwrap().cast(DType::Float32);
+    let values = Tensor::cat(&values.iter().collect::<Vec<_>>(), 2).unwrap().cast(DType::Float32);
     (keys, values)
 }
 
@@ -94,17 +98,14 @@ fn materialized_cross_kv_matches_reference_projection() {
         (0..2 * dims.n_audio_ctx * dims.n_text_state).map(|index| (index as f32 - 31.0) * 0.017).collect();
     let audio = Tensor::from_slice(audio_values).try_reshape([2usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
 
-    let (mut expected_k, mut expected_v) = reference_cross_kv_projection(&model, &audio);
-    let (mut actual_k, mut actual_v) = model.project_cross_kv(&audio).unwrap();
-    Tensor::realize_batch([&mut expected_k, &mut expected_v, &mut actual_k, &mut actual_v]).unwrap();
+    let (expected_k, expected_v) = reference_cross_kv_projection(&model, &audio);
+    let (actual_k, actual_v) = model.project_cross_kv(&audio).unwrap();
+    Tensor::realize_batch([&expected_k, &expected_v, &actual_k, &actual_v]).unwrap();
 
     let expected_shape = [2, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
     for (expected, actual) in [(&expected_k, &actual_k), (&expected_v, &actual_v)] {
-        assert_eq!(actual.uop().dtype(), DType::Float32);
-        assert_eq!(
-            actual.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(),
-            expected_shape
-        );
+        assert_eq!(actual.dtype(), DType::Float32);
+        assert_eq!(actual.dims().unwrap(), expected_shape);
         let expected = expected.as_vec::<f32>().unwrap();
         let actual = actual.as_vec::<f32>().unwrap();
         let max_delta = expected.iter().zip(&actual).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -121,25 +122,17 @@ fn low_precision_cross_projection_keeps_fp32_cache_storage() {
     let audio_values: Vec<f32> =
         (0..dims.n_audio_ctx * dims.n_text_state).map(|index| (index as f32 - 13.0) * 0.037).collect();
     let audio = Tensor::from_slice(audio_values).try_reshape([1usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
-    let native_audio = audio.cast(DType::Float16).unwrap();
+    let native_audio = audio.cast(DType::Float16);
 
-    let (mut expected_k, mut expected_v) = reference_cross_kv_projection(&model, &native_audio);
-    let (mut legacy_k, mut legacy_v) = reference_cross_kv_projection(&model, &audio);
-    let (mut actual_k, mut actual_v) = model.project_cross_kv(&audio).unwrap();
-    Tensor::realize_batch([
-        &mut expected_k,
-        &mut expected_v,
-        &mut legacy_k,
-        &mut legacy_v,
-        &mut actual_k,
-        &mut actual_v,
-    ])
-    .unwrap();
+    let (expected_k, expected_v) = reference_cross_kv_projection(&model, &native_audio);
+    let (legacy_k, legacy_v) = reference_cross_kv_projection(&model, &audio);
+    let (actual_k, actual_v) = model.project_cross_kv(&audio).unwrap();
+    Tensor::realize_batch([&expected_k, &expected_v, &legacy_k, &legacy_v, &actual_k, &actual_v]).unwrap();
 
     for ((expected, legacy), actual) in
         [(&expected_k, &legacy_k), (&expected_v, &legacy_v)].into_iter().zip([&actual_k, &actual_v])
     {
-        assert_eq!(actual.uop().dtype(), DType::Float32);
+        assert_eq!(actual.dtype(), DType::Float32);
         let expected = expected.as_vec::<f32>().unwrap();
         let legacy = legacy.as_vec::<f32>().unwrap();
         let actual = actual.as_vec::<f32>().unwrap();
@@ -160,14 +153,14 @@ fn low_precision_load_preserves_openai_fp32_parameters(compute: DType) {
     low_dims.dtype = compute.clone();
     let model = Whisper::from_state_dict(&source, low_dims).unwrap();
 
-    assert_eq!(model.encoder.conv1.weight.uop().dtype(), compute);
-    assert_eq!(model.encoder.blocks[0].attn.query.weight.uop().dtype(), compute);
-    assert_eq!(model.encoder.positional_embedding.uop().dtype(), DType::Float32);
-    assert_eq!(model.encoder.blocks[0].attn_ln.weight.uop().dtype(), DType::Float32);
-    assert_eq!(model.decoder.token_embedding.uop().dtype(), DType::Float32);
-    assert_eq!(model.decoder.positional_embedding.uop().dtype(), DType::Float32);
-    assert_eq!(model.decoder.blocks[0].cross_attn_ln.bias.uop().dtype(), DType::Float32);
-    assert_eq!(model.decoder.ln.weight.uop().dtype(), DType::Float32);
+    assert_eq!(model.encoder.conv1.weight.dtype(), compute);
+    assert_eq!(model.encoder.blocks[0].attn.query.weight.dtype(), compute);
+    assert_eq!(model.encoder.positional_embedding.dtype(), DType::Float32);
+    assert_eq!(model.encoder.blocks[0].attn_ln.weight.dtype(), DType::Float32);
+    assert_eq!(model.decoder.token_embedding.dtype(), DType::Float32);
+    assert_eq!(model.decoder.positional_embedding.dtype(), DType::Float32);
+    assert_eq!(model.decoder.blocks[0].cross_attn_ln.bias.as_ref().unwrap().dtype(), DType::Float32);
+    assert_eq!(model.decoder.ln.weight.dtype(), DType::Float32);
 }
 
 #[test]
@@ -185,12 +178,10 @@ fn quantized_weight_scale_scales_output_channels() {
     sd.insert(format!("{key}.weight_scale"), Tensor::from_slice(scale.clone()));
 
     let model = Whisper::from_state_dict(&sd, dims).unwrap();
-    let mut loaded = model.decoder.blocks[0].mlp0_w.contiguous();
-    Tensor::realize_batch([&mut loaded]).unwrap();
-
-    assert_eq!(loaded.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(), [out, inp]);
+    let loaded = model.decoder.blocks[0].mlp0.weight.contiguous();
+    assert_eq!(loaded.dims().unwrap(), [out, inp]);
     let expected: Vec<f32> = weight.iter().enumerate().map(|(index, value)| value * scale[index / inp]).collect();
-    assert_eq!(loaded.as_vec::<f32>().unwrap(), expected);
+    assert_eq!(loaded.to_vec::<f32>().unwrap(), expected);
 }
 
 #[test]
@@ -207,13 +198,12 @@ fn low_precision_prefill_does_not_inherit_fp32_cache_storage_dtype() {
     .unwrap();
     let tokens = Tensor::from_slice([1i32, 2, 3]).try_reshape([1usize, 3]).unwrap();
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
-    assert_eq!(cross_k.uop().dtype(), DType::Float32);
+    assert_eq!(cross_k.dtype(), DType::Float32);
 
-    let (mut actual, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
-    let (mut expected, _, _) = model
-        .decode_prefill(&tokens, &cross_k.cast(DType::Float16).unwrap(), &cross_v.cast(DType::Float16).unwrap(), 0)
-        .unwrap();
-    Tensor::realize_batch([&mut actual, &mut expected]).unwrap();
+    let (actual, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
+    let (expected, _, _) =
+        model.decode_prefill(&tokens, &cross_k.cast(DType::Float16), &cross_v.cast(DType::Float16), 0).unwrap();
+    Tensor::realize_batch([&actual, &expected]).unwrap();
     assert_eq!(actual.as_vec::<f32>().unwrap(), expected.as_vec::<f32>().unwrap());
 }
 
@@ -257,24 +247,20 @@ fn prepared_cross_kv_materializes_each_projection_before_packing() {
 fn projected_cross_kv_and_prefill_shapes_are_concrete() {
     let dims = small_decoder_dims();
     let model = Whisper::empty(dims.clone());
-    let audio = Tensor::zeros(&[1, dims.n_audio_ctx, dims.n_text_state], DType::Float32).unwrap();
+    let audio = Tensor::zeros(&[1, dims.n_audio_ctx, dims.n_text_state], DType::Float32);
     let tokens = Tensor::from_slice([1i32, 2, 3]).try_reshape([1usize, 3]).unwrap();
 
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
     let expected_cross = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
     for cache in [&cross_k, &cross_v] {
-        let shape = cache.shape().unwrap();
-        assert_eq!(shape.iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(), expected_cross);
+        assert_eq!(cache.dims().unwrap(), expected_cross);
     }
 
     let (logits, self_k, self_v) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
-    assert_eq!(
-        logits.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(),
-        [1, 3, dims.n_vocab]
-    );
+    assert_eq!(logits.dims().unwrap(), [1, 3, dims.n_vocab]);
     let expected_self = [1, 3, dims.n_text_layer * dims.n_text_head, 4];
     for cache in [&self_k, &self_v] {
-        assert_eq!(cache.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(), expected_self);
+        assert_eq!(cache.dims().unwrap(), expected_self);
     }
 }
 
@@ -286,11 +272,10 @@ fn prepared_cross_kv_prefill_matches_direct_decoder() {
     let audio = Tensor::from_slice(audio_values).try_reshape([1usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
     let tokens = Tensor::from_slice([1i32, 2, 3]).try_reshape([1usize, 3]).unwrap();
 
-    let mut direct = model.decode(&tokens, &audio, 0).unwrap();
+    let direct = model.decode(&tokens, &audio, 0).unwrap();
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
-    let (mut prepared, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
-    direct.realize().unwrap();
-    prepared.realize().unwrap();
+    let (prepared, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
+    Tensor::realize_batch([&direct, &prepared]).unwrap();
     let direct = direct.as_vec::<f32>().unwrap();
     let prepared = prepared.as_vec::<f32>().unwrap();
     let max_delta = direct.iter().zip(&prepared).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -310,8 +295,8 @@ fn cached_steps_match_teacher_forced_full_prefix() {
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
     let mut prefix = vec![1i32, 7, 3];
     let prefix_tensor = Tensor::from_slice(&prefix).try_reshape([1usize, prefix.len()]).unwrap();
-    let (_, mut prefill_k, mut prefill_v) = model.decode_prefill(&prefix_tensor, &cross_k, &cross_v, 0).unwrap();
-    Tensor::realize_batch([&mut prefill_k, &mut prefill_v]).unwrap();
+    let (_, prefill_k, prefill_v) = model.decode_prefill(&prefix_tensor, &cross_k, &cross_v, 0).unwrap();
+    Tensor::realize_batch([&prefill_k, &prefill_v]).unwrap();
 
     let mut cache_k = vec![0.0f32; cache_elements];
     let mut cache_v = vec![0.0f32; cache_elements];
@@ -319,8 +304,8 @@ fn cached_steps_match_teacher_forced_full_prefix() {
     cache_k[..prefill_elements].copy_from_slice(&prefill_k.as_vec::<f32>().unwrap());
     cache_v[..prefill_elements].copy_from_slice(&prefill_v.as_vec::<f32>().unwrap());
     assert_eq!(cache_k.len() * std::mem::size_of::<f32>(), dims.n_text_ctx * layer_heads * d_head * 4);
-    assert_eq!(cross_k.uop().dtype(), DType::Float32);
-    assert_eq!(prefill_k.uop().dtype(), DType::Float32);
+    assert_eq!(cross_k.dtype(), DType::Float32);
+    assert_eq!(prefill_k.dtype(), DType::Float32);
 
     for next_token in [5i32, 11] {
         let pos = prefix.len();
@@ -336,12 +321,12 @@ fn cached_steps_match_teacher_forced_full_prefix() {
         let self_v = Tensor::from_slice(&cache_v).try_reshape([1usize, dims.n_text_ctx, layer_heads, d_head]).unwrap();
         let key_lens = Tensor::from_slice([pos as i32]);
 
-        let (mut step_logits, mut new_k, mut new_v) =
+        let (step_logits, new_k, new_v) =
             model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens).unwrap();
         prefix.push(next_token);
         let full_tokens = Tensor::from_slice(&prefix).try_reshape([1usize, prefix.len()]).unwrap();
-        let mut teacher = model.decode_with_cross_kv(&full_tokens, &cross_k, &cross_v).unwrap();
-        Tensor::realize_batch([&mut step_logits, &mut new_k, &mut new_v, &mut teacher]).unwrap();
+        let teacher = model.decode_with_cross_kv(&full_tokens, &cross_k, &cross_v).unwrap();
+        Tensor::realize_batch([&step_logits, &new_k, &new_v, &teacher]).unwrap();
 
         let step = step_logits.as_vec::<f32>().unwrap();
         let teacher = teacher.as_vec::<f32>().unwrap();
@@ -368,9 +353,9 @@ fn one_token_language_logits_match_full_context_sot_logits() {
     let full_tokens = Tensor::from_slice(padded_tokens).try_reshape([1usize, dims.n_text_ctx]).unwrap();
     let one_token = Tensor::from_slice([1i32]).try_reshape([1usize, 1]).unwrap();
 
-    let mut full = model.decode_with_cross_kv(&full_tokens, &cross_k, &cross_v).unwrap();
-    let mut one = model.decode_with_cross_kv(&one_token, &cross_k, &cross_v).unwrap();
-    Tensor::realize_batch([&mut full, &mut one]).unwrap();
+    let full = model.decode_with_cross_kv(&full_tokens, &cross_k, &cross_v).unwrap();
+    let one = model.decode_with_cross_kv(&one_token, &cross_k, &cross_v).unwrap();
+    Tensor::realize_batch([&full, &one]).unwrap();
     let full = full.as_vec::<f32>().unwrap();
     let one = one.as_vec::<f32>().unwrap();
     let max_delta = full[..dims.n_vocab].iter().zip(&one).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -392,14 +377,11 @@ fn prepared_language_detector_has_one_token_and_one_logits_row() {
     let dims = small_decoder_dims();
     let cache_shape = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
     let model = Whisper::empty(dims.clone());
-    let audio = Tensor::zeros(&[1, dims.n_audio_ctx, dims.n_text_state], DType::Float32).unwrap();
+    let audio = Tensor::zeros(&[1, dims.n_audio_ctx, dims.n_text_state], DType::Float32);
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
     let token = Tensor::from_slice([1i32]).try_reshape([1usize, 1]).unwrap();
     let logits = model.decode_with_cross_kv(&token, &cross_k, &cross_v).unwrap();
-    assert_eq!(
-        logits.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(),
-        [1, 1, dims.n_vocab]
-    );
+    assert_eq!(logits.dims().unwrap(), [1, 1, dims.n_vocab]);
 
     let mut detector = WhisperDecoderJit::new(model);
     detector
@@ -424,8 +406,7 @@ fn prepared_cross_kv_graph_reuses_device_local_outputs() {
     let dims = small_decoder_dims();
     let model = Whisper::empty(dims.clone());
     let cache_shape = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
-    let mut config = svod_tensor::PrepareConfig::from_env();
-    config.device_local_outputs = true;
+    let config = svod_tensor::PrepareConfig::device_local();
 
     let mut cross = WhisperCrossKvJit::new(model.clone());
     cross.prepare_with_config(InputSpec::f32(&[1, dims.n_audio_ctx, dims.n_text_state]), &config).unwrap();
@@ -469,7 +450,7 @@ fn prepared_cross_kv_graph_reuses_device_local_outputs() {
 fn alignment_forward_exports_only_selected_heads() {
     let dims = make_dims();
     let model = Whisper::empty(dims.clone());
-    let features = Tensor::zeros(&[2, 8, dims.n_text_state], DType::Float32).unwrap();
+    let features = Tensor::zeros(&[2, 8, dims.n_text_state], DType::Float32);
     let tokens = Tensor::from_slice([50363i32, 50364, 50359, 50257, 50363, 50364, 50359, 50257])
         .try_reshape([2usize, 4])
         .unwrap();
@@ -497,13 +478,13 @@ fn alignment_compute_does_not_inherit_fp32_cache_storage_dtype() {
     let tokens = Tensor::from_slice([1i32, 2, 3, 4]).try_reshape([1usize, 4]).unwrap();
     let heads = [(0, 0), (1, 1)];
     let (cross_k, cross_v) = model.project_cross_kv(&features).unwrap();
-    assert_eq!(cross_k.uop().dtype(), DType::Float32);
+    assert_eq!(cross_k.dtype(), DType::Float32);
 
-    let mut actual = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
-    let low_k = cross_k.cast(DType::Float16).unwrap();
-    let low_v = cross_v.cast(DType::Float16).unwrap();
-    let mut expected = model.align_with_cross_kv(&tokens, &low_k, &low_v, &heads).unwrap();
-    Tensor::realize_batch([&mut actual, &mut expected]).unwrap();
+    let actual = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
+    let low_k = cross_k.cast(DType::Float16);
+    let low_v = cross_v.cast(DType::Float16);
+    let expected = model.align_with_cross_kv(&tokens, &low_k, &low_v, &heads).unwrap();
+    Tensor::realize_batch([&actual, &expected]).unwrap();
 
     let actual = actual.as_vec::<f32>().unwrap();
     let expected = expected.as_vec::<f32>().unwrap();
@@ -517,40 +498,38 @@ fn eager_audio_feature_alignment_reference(
     features: &Tensor,
     alignment_heads: &[(usize, usize)],
 ) -> Tensor {
-    let seq_len = tokens.shape().unwrap()[1].as_const().unwrap();
+    let seq_len = tokens.dim_const(1).unwrap();
     let tok_emb = model.decoder.token_embedding.embedding(tokens).unwrap();
     let pos_emb = model.decoder.positional_embedding.try_shrink([Some((0isize, seq_len as isize)), None]).unwrap();
-    let mut x = tok_emb.try_add(&pos_emb).unwrap().cast(features.uop().dtype()).unwrap();
-    let mask = crate::whisper::causal_mask(seq_len, x.uop().dtype().clone()).unwrap();
+    let mut x = tok_emb.try_add(&pos_emb).unwrap().cast(features.dtype());
+    let mask = Tensor::causal_mask(seq_len, x.dtype()).unwrap();
     let mut selected: Vec<Option<Tensor>> = (0..alignment_heads.len()).map(|_| None).collect();
 
     for (layer, block) in model.decoder.blocks.iter().enumerate() {
-        let h = block.attn_ln.apply(&x).unwrap();
-        x = x.try_add(&block.attn.forward(&h, None, Some(&mask)).unwrap()).unwrap();
+        let heads = block.cross_attn.n_head;
+        let h = block.attn_ln.forward(&x).unwrap();
+        x = x.try_add(block.attn.forward(&h, None, Some(&mask)).unwrap()).unwrap();
 
-        let h = block.cross_attn_ln.apply(&x).unwrap();
-        x = x.try_add(&block.cross_attn.forward(&h, Some(features), None).unwrap()).unwrap();
-        let q = block.cross_attn.split_heads(&block.cross_attn.query.forward(&h).unwrap()).unwrap();
-        let k = block.cross_attn.split_heads(&block.cross_attn.key.forward(features).unwrap()).unwrap();
+        let h = block.cross_attn_ln.forward(&x).unwrap();
+        x = x.try_add(block.cross_attn.forward(&h, Some(features), None).unwrap()).unwrap();
+        let q = linear_forward(&block.cross_attn.query, &h).unwrap().split_heads(heads).unwrap();
+        let k = linear_forward(&block.cross_attn.key, features).unwrap().split_heads(heads).unwrap();
         for (index, &(_, head)) in alignment_heads.iter().enumerate().filter(|&(_, &(l, _))| l == layer) {
-            let q = q.try_shrink([None, Some((head as isize, head as isize + 1)), None, None]).unwrap();
-            let k = k.try_shrink([None, Some((head as isize, head as isize + 1)), None, None]).unwrap();
+            let q = q.narrow(1, head, 1usize).unwrap();
+            let k = k.narrow(1, head, 1usize).unwrap();
             let scores = q.matmul(&k.try_transpose(-1, -2).unwrap()).unwrap();
-            let scale = Tensor::const_(
-                ConstValue::Float(1.0 / ((model.decoder.n_state / model.decoder.n_head) as f64).sqrt()),
-                scores.uop().dtype().clone(),
-            );
-            selected[index] = Some(scores.try_mul(&scale).unwrap());
+            let scale = ((model.decoder.n_state / model.decoder.n_head) as f64).sqrt().recip();
+            selected[index] = Some(scores.try_mul(scale).unwrap());
         }
 
-        let h = block.mlp_ln.apply(&x).unwrap();
-        let h = h.linear().weight(&block.mlp0_w).bias(&block.mlp0_b).call().unwrap().gelu_exact().unwrap();
-        let h = h.linear().weight(&block.mlp1_w).bias(&block.mlp1_b).call().unwrap();
+        let h = block.mlp_ln.forward(&x).unwrap();
+        let h = linear_forward(&block.mlp0, &h).unwrap().gelu_exact().unwrap();
+        let h = linear_forward(&block.mlp2, &h).unwrap();
         x = x.try_add(&h).unwrap();
     }
 
     let selected: Vec<_> = selected.into_iter().map(Option::unwrap).collect();
-    Tensor::cat(&selected.iter().collect::<Vec<_>>(), 1).unwrap().cast(DType::Float32).unwrap()
+    Tensor::cat(&selected.iter().collect::<Vec<_>>(), 1).unwrap().cast(DType::Float32)
 }
 
 #[test]
@@ -563,11 +542,10 @@ fn cached_cross_alignment_matches_audio_feature_reference() {
     let tokens = Tensor::from_slice([1i32, 2, 3, 4, 4, 3, 2, 1]).try_reshape([2usize, 4]).unwrap();
     let heads = [(1, 1), (0, 0)];
 
-    let mut reference = eager_audio_feature_alignment_reference(&model, &tokens, &features, &heads);
+    let reference = eager_audio_feature_alignment_reference(&model, &tokens, &features, &heads);
     let (cross_k, cross_v) = model.project_cross_kv(&features).unwrap();
-    let mut cached = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
-    reference.realize().unwrap();
-    cached.realize().unwrap();
+    let cached = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
+    Tensor::realize_batch([&reference, &cached]).unwrap();
     let reference = reference.as_vec::<f32>().unwrap();
     let cached = cached.as_vec::<f32>().unwrap();
     let max_delta = reference.iter().zip(&cached).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -580,8 +558,7 @@ fn recognition_cross_kv_seeds_prefill_and_alignment_device_locally() {
     let dims = small_decoder_dims();
     let model = Whisper::empty(dims.clone());
     let cache_shape = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
-    let mut config = svod_tensor::PrepareConfig::from_env();
-    config.device_local_outputs = true;
+    let config = svod_tensor::PrepareConfig::device_local();
 
     let mut cross = WhisperCrossKvJit::new(model.clone());
     cross.prepare_with_config(InputSpec::f32(&[1, dims.n_audio_ctx, dims.n_text_state]), &config).unwrap();
@@ -656,6 +633,58 @@ fn state_dict_round_trip() {
     // Reload into a fresh model
     let mut model2 = Whisper::empty(dims);
     model2.load_state_dict(&sd, "").unwrap();
+}
+
+/// The key set `#[derive(Module)]` emits, at both the root and a nested
+/// prefix. Whisper loads at the empty prefix, so a stray leading dot would
+/// silently break every checkpoint.
+fn expected_state_dict_keys(dims: &ModelDimensions, prefix: &str) -> BTreeSet<String> {
+    let join = |a: &str, b: &str| if a.is_empty() { b.to_string() } else { format!("{a}.{b}") };
+    let mut keys = BTreeSet::new();
+    let mut push = |key: String| {
+        keys.insert(join(prefix, &key));
+    };
+    for (tower, layers) in [("encoder", dims.n_audio_layer), ("decoder", dims.n_text_layer)] {
+        push(format!("{tower}.positional_embedding"));
+        for index in 0..layers {
+            let block = format!("{tower}.blocks.{index}");
+            let attentions: &[&str] = if tower == "encoder" { &["attn"] } else { &["attn", "cross_attn"] };
+            for attn in attentions {
+                for projection in ["query", "value", "out"] {
+                    push(format!("{block}.{attn}.{projection}.weight"));
+                    push(format!("{block}.{attn}.{projection}.bias"));
+                }
+                push(format!("{block}.{attn}.key.weight"));
+                push(format!("{block}.{attn}_ln.weight"));
+                push(format!("{block}.{attn}_ln.bias"));
+            }
+            for mlp in ["mlp.0", "mlp.2"] {
+                push(format!("{block}.{mlp}.weight"));
+                push(format!("{block}.{mlp}.bias"));
+            }
+            push(format!("{block}.mlp_ln.weight"));
+            push(format!("{block}.mlp_ln.bias"));
+        }
+    }
+    for conv in ["encoder.conv1", "encoder.conv2"] {
+        push(format!("{conv}.weight"));
+        push(format!("{conv}.bias"));
+    }
+    for norm in ["encoder.ln_post", "decoder.ln"] {
+        push(format!("{norm}.weight"));
+        push(format!("{norm}.bias"));
+    }
+    push("decoder.token_embedding.weight".into());
+    keys
+}
+
+#[test_case(""; "root prefix")]
+#[test_case("m"; "nested prefix")]
+fn derived_state_dict_keys_match_the_hand_written_impls(prefix: &str) {
+    let dims = small_decoder_dims();
+    let model = Whisper::empty(dims.clone());
+    let keys: BTreeSet<String> = model.state_dict(prefix).into_keys().collect();
+    assert_eq!(keys, expected_state_dict_keys(&dims, prefix));
 }
 
 #[test]

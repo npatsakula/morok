@@ -100,14 +100,14 @@ fn test_knn_score_amd() {
 
     for (corpus, query, d) in [(16usize, 16usize, 16usize), (32, 32, 32), (32, 16, 48)] {
         // Realized bf16 inputs so the kernel and the reference see identical rounding.
-        let mut x = Tensor::randn(&[query, d]).expect("randn x").cast(DType::BFloat16).expect("x→bf16");
-        let mut c = Tensor::randn(&[corpus, d]).expect("randn c").cast(DType::BFloat16).expect("c→bf16");
+        let x = Tensor::randn(&[query, d]).expect("randn x").cast(DType::BFloat16);
+        let c = Tensor::randn(&[corpus, d]).expect("randn c").cast(DType::BFloat16);
         x.realize().expect("realize x");
         c.realize().expect("realize c");
 
         // c_sq[m] = Σ_d c[m,d]² in f32, replicated to [corpus, query] (each (m,n) → c_sq[m]).
-        let cf = c.cast(DType::Float32).expect("c→f32");
-        let mut c_sq_rep = cf
+        let cf = c.cast(DType::Float32);
+        let c_sq_rep = cf
             .try_mul(&cf)
             .expect("c²")
             .sum_with()
@@ -128,10 +128,10 @@ fn test_knn_score_amd() {
         let got = score.as_vec::<f32>().expect("read score");
 
         // Reference: c_sq[m] − 2·⟨c[m], x[n]⟩, oriented score[m, n] (corpus row, query col).
-        let xf = x.cast(DType::Float32).expect("x→f32");
+        let xf = x.cast(DType::Float32);
         let cross = cf.matmul(&xf.try_permute(&[1, 0]).expect("xᵀ")).expect("c @ xᵀ"); // [corpus, query]
         let two = Tensor::from_slice([2.0f32]);
-        let mut refb = c_sq_rep.try_sub(&cross.try_mul(&two).expect("2·cross")).expect("c_sq − 2·cross");
+        let refb = c_sq_rep.try_sub(cross.try_mul(&two).expect("2·cross")).expect("c_sq − 2·cross");
         refb.realize().expect("realize ref");
         let exp = refb.as_vec::<f32>().expect("read ref");
 
@@ -252,8 +252,8 @@ fn test_knn_topk_amd() {
     ];
 
     for &(corpus, query, d, k, tie) in cases {
-        let mut x = Tensor::randn(&[query, d]).expect("randn x").cast(DType::BFloat16).expect("x→bf16");
-        let mut c = Tensor::randn(&[corpus, d]).expect("randn c").cast(DType::BFloat16).expect("c→bf16");
+        let mut x = Tensor::randn(&[query, d]).expect("randn x").cast(DType::BFloat16);
+        let mut c = Tensor::randn(&[corpus, d]).expect("randn c").cast(DType::BFloat16);
         x.realize().expect("realize x");
         c.realize().expect("realize c");
 
@@ -274,8 +274,8 @@ fn test_knn_topk_amd() {
         }
 
         // c_sq[m] = Σ_d c[m,d]² in f32, replicated to [corpus, query].
-        let cf = c.cast(DType::Float32).expect("c→f32");
-        let mut c_sq_rep = cf
+        let cf = c.cast(DType::Float32);
+        let c_sq_rep = cf
             .try_mul(&cf)
             .expect("c²")
             .sum_with()
@@ -298,12 +298,12 @@ fn test_knn_topk_amd() {
         let got_val = val_out.as_vec::<f32>().expect("read val");
 
         // Reference: x²-free score [corpus, query] → [query, corpus] → topk smallest.
-        let xf = x.cast(DType::Float32).expect("x→f32");
+        let xf = x.cast(DType::Float32);
         let cross = cf.matmul(&xf.try_permute(&[1, 0]).expect("xᵀ")).expect("c @ xᵀ");
         let two = Tensor::from_slice([2.0f32]);
-        let score = c_sq_rep.try_sub(&cross.try_mul(&two).expect("2·cross")).expect("score [corpus, query]");
+        let score = c_sq_rep.try_sub(cross.try_mul(&two).expect("2·cross")).expect("score [corpus, query]");
         let score_qc = score.try_permute(&[1, 0]).expect("→[query, corpus]");
-        let (mut ref_val, mut ref_idx) = score_qc.topk(k, -1, false).expect("ref topk");
+        let (ref_val, ref_idx) = score_qc.topk(k, -1, false).expect("ref topk");
         ref_val.realize().expect("realize ref_val");
         ref_idx.realize().expect("realize ref_idx");
         let exp_idx = ref_idx.as_vec::<i32>().expect("read ref idx");
@@ -360,20 +360,20 @@ fn test_knn_err_paths() {
     // D mismatch: x is [4, 8], c is [16, 6] → query/corpus dims disagree.
     let x = Tensor::randn(&[4, 8]).expect("x");
     let c_baddim = Tensor::randn(&[16, 6]).expect("c bad-d");
-    crate::knn(&x, &c_baddim, 2).err().expect("D mismatch must error, not None/panic");
+    crate::knn(&x, &c_baddim, 2).expect_err("D mismatch must error, not None/panic");
 
     // k > M: only 3 corpus rows but k = 4.
     let c_small = Tensor::randn(&[3, 8]).expect("c small");
-    crate::knn(&x, &c_small, 4).err().expect("k > M must error");
+    crate::knn(&x, &c_small, 4).expect_err("k > M must error");
 
     // k > 16 (and k == 0) are outside the kernel's 1..=16.
     let c = Tensor::randn(&[64, 8]).expect("c");
-    crate::knn(&x, &c, 17).err().expect("k > 16 must error");
-    crate::knn(&x, &c, 0).err().expect("k == 0 must error");
+    crate::knn(&x, &c, 17).expect_err("k > 16 must error");
+    crate::knn(&x, &c, 0).expect_err("k == 0 must error");
 
     // Non-rank-2 (rank-1 query) errors via `concrete_dims`, also device-independent.
     let x1 = Tensor::randn(&[8]).expect("x rank-1");
-    crate::knn(&x1, &c, 2).err().expect("rank-1 query must error");
+    crate::knn(&x1, &c, 2).expect_err("rank-1 query must error");
 }
 
 /// Device-gated **graph-shape** check (builds the lazy `(dists, idxs)` but does NOT
@@ -469,7 +469,7 @@ fn test_knn_amd() {
             x.realize().expect("realize tie x");
         }
 
-        let (mut dists, mut idxs) = crate::knn(&x, &c, k).expect("knn builds").expect("Ok(Some) on AMD");
+        let (dists, idxs) = crate::knn(&x, &c, k).expect("knn builds").expect("Ok(Some) on AMD");
         dists.realize().expect("realize dists");
         idxs.realize().expect("realize idxs");
         let got_dist = dists.as_vec::<f32>().expect("read dists");
@@ -536,21 +536,21 @@ fn test_knn_amd() {
 /// distances). Computed entirely in f32 (no kernel) — the independent oracle.
 fn knn_torch_naive(x: &svod_tensor::Tensor, c: &svod_tensor::Tensor, k: usize) -> (Vec<f32>, Vec<i32>, Vec<f32>) {
     use svod_tensor::Tensor;
-    let xf = x.cast(DType::Float32).expect("x→f32");
-    let cf = c.cast(DType::Float32).expect("c→f32");
+    let xf = x.cast(DType::Float32);
+    let cf = c.cast(DType::Float32);
     let x_sq = xf.try_mul(&xf).expect("x²").sum_with().axes(1isize).keepdim(true).call().expect("‖x‖²"); // [N,1]
     let c_sq = cf.try_mul(&cf).expect("c²").sum_with().axes(1isize).keepdim(true).call().expect("‖c‖²"); // [M,1]
     let cross = xf.matmul(&cf.try_permute(&[1, 0]).expect("cᵀ")).expect("x@cᵀ"); // [N,M]
     let two = Tensor::from_slice([2.0f32]);
     let c_sq_row = c_sq.try_permute(&[1, 0]).expect("‖c‖²ᵀ"); // [1,M]
-    let mut dist = x_sq
+    let dist = x_sq
         .try_add(&c_sq_row)
         .expect("‖x‖²+‖c‖²")
-        .try_sub(&cross.try_mul(&two).expect("2·cross"))
+        .try_sub(cross.try_mul(&two).expect("2·cross"))
         .expect("full ‖x−c‖²")
         .relu()
         .expect("clamp ≥ 0"); // [N,M], numerically ≥ 0
-    let (mut rd, mut ri) = dist.topk(k, -1, false).expect("ref topk");
+    let (rd, ri) = dist.topk(k, -1, false).expect("ref topk");
     rd.realize().expect("realize ref dist");
     ri.realize().expect("realize ref idx");
     dist.realize().expect("realize ref full dist");

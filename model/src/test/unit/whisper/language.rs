@@ -12,12 +12,12 @@ fn encoder_forward_for_detection() {
     let dims = ModelDimensions::for_size(WhisperSize::Tiny);
     let model = Whisper::empty(dims.clone());
 
-    let mel = Tensor::zeros(&[1, dims.n_mels, 3000], DType::Float32).unwrap();
+    let mel = Tensor::zeros(&[1, dims.n_mels, 3000], DType::Float32);
     let features = model.encode(&mel).unwrap();
 
     // Single SOT token, like detect_language does
     let sot = 50258i32; // <|startoftranscript|> for multilingual
-    let tokens = Tensor::from_slice([sot]).try_reshape([1usize, 1]).unwrap().cast(DType::Int32).unwrap();
+    let tokens = Tensor::from_slice([sot]).try_reshape([1usize, 1]).unwrap().cast(DType::Int32);
 
     let logits = model.decode(&tokens, &features, 0).unwrap();
     let shape = logits.shape().unwrap();

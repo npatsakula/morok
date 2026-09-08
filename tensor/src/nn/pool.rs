@@ -6,7 +6,7 @@ use svod_dtype::DType;
 use svod_ir::{ConstValue, SInt, UOp};
 
 use crate::Tensor;
-use crate::error::{DivisibilitySnafu, SymbolicShapeUnsupportedSnafu};
+use crate::error::{DivisibilitySnafu, KindResult, ParamRangeSnafu, SymbolicShapeUnsupportedSnafu};
 use crate::reduce::AxisSpec;
 
 use super::pad::apply_ceil_mode;
@@ -30,19 +30,22 @@ impl Tensor {
         let n_batch = ndim - n_spatial;
 
         if ndim < n_spatial {
-            return Err(crate::error::Error::IrConstruction {
+            return Err(crate::error::ErrorKind::IrConstruction {
                 details: format!("can't pool {ndim}D with {n_spatial}D kernel"),
-            });
+            }
+            .into());
         }
         if kernel.len() != stride.len() {
-            return Err(crate::error::Error::IrConstruction {
+            return Err(crate::error::ErrorKind::IrConstruction {
                 details: format!("kernel/stride length mismatch: {} vs {}", kernel.len(), stride.len()),
-            });
+            }
+            .into());
         }
         if kernel.len() != dilation.len() {
-            return Err(crate::error::Error::IrConstruction {
+            return Err(crate::error::ErrorKind::IrConstruction {
                 details: format!("kernel/dilation length mismatch: {} vs {}", kernel.len(), dilation.len()),
-            });
+            }
+            .into());
         }
 
         // Spatial dims as SInt — works for both concrete and symbolic.
@@ -53,14 +56,15 @@ impl Tensor {
             if let Some(i) = i_[j].as_const()
                 && dilation[j] * (kernel[j] - 1) >= i
             {
-                return Err(crate::error::Error::IrConstruction {
+                return Err(crate::error::ErrorKind::IrConstruction {
                     details: format!(
                         "kernel size {} (dilated {}) > input size {}",
                         kernel[j],
                         dilation[j] * (kernel[j] - 1) + 1,
                         i
                     ),
-                });
+                }
+                .into());
             }
         }
 
@@ -147,10 +151,75 @@ impl Tensor {
 
         Ok(x)
     }
+
+    /// Sliding windows along a single axis (torch `Tensor.unfold`).
+    ///
+    /// Axis `dim` becomes the window count `(dim_size - size) / step + 1` and a
+    /// trailing axis of extent `size` is appended:
+    /// `(..., d_dim, ...)` &rarr; `(..., n_windows, ..., size)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// let t = Tensor::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0]);
+    /// let w = t.unfold(0, 3, 2).unwrap();  // windows [0,1,2] and [2,3,4]
+    /// assert_eq!(w.dims().unwrap(), vec![2, 3]);
+    /// ```
+    #[track_caller]
+    pub fn unfold(&self, dim: isize, size: usize, step: usize) -> Result<Tensor> {
+        origin_call!("unfold");
+        snafu::ensure!(
+            size > 0,
+            ParamRangeSnafu { op: "unfold", param: "size", value: size.to_string(), constraint: "> 0" }
+        );
+        snafu::ensure!(
+            step > 0,
+            ParamRangeSnafu { op: "unfold", param: "step", value: step.to_string(), constraint: "> 0" }
+        );
+        let ndim = self.ndim()?;
+        let dim = Self::normalize_axis(dim, ndim)?;
+
+        // `pool` windows the trailing axes, so rotate `dim` last and undo after.
+        let trailing = dim + 1 == ndim;
+        let mut perm: Vec<isize> = (0..ndim as isize).filter(|&a| a != dim as isize).collect();
+        perm.push(dim as isize);
+        let x = if trailing { self.clone() } else { self.try_permute(&perm)? };
+
+        let pooled = x.pool(&[size], &[step], &[1])?;
+        if trailing {
+            return Ok(pooled);
+        }
+
+        // Undo the rotation; the window axis stays trailing.
+        let mut back: Vec<isize> =
+            (0..ndim).map(|i| perm.iter().position(|&p| p == i as isize).unwrap() as isize).collect();
+        back.push(ndim as isize);
+        pooled.try_permute(&back)
+    }
 }
 
 #[bon]
 impl Tensor {
+    /// [`pool`](Tensor::pool) with defaults: `stride` falls back to `kernel`
+    /// (non-overlapping windows) and `dilation` to all-ones.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let y = x.pool_with().kernel(&[2, 2]).call().unwrap();
+    /// assert_eq!(y.dims().unwrap(), vec![1, 1, 2, 2, 2, 2]);
+    /// ```
+    #[builder]
+    #[track_caller]
+    pub fn pool_with(&self, kernel: &[usize], stride: Option<&[usize]>, dilation: Option<&[usize]>) -> Result<Tensor> {
+        let ones: Vec<usize> = vec![1; kernel.len()];
+        self.pool(kernel, stride.unwrap_or(kernel), dilation.unwrap_or(&ones))
+    }
+
     /// Average pooling over spatial dimensions.
     ///
     /// Computes the mean of each sliding window. Supports padding, dilation,
@@ -167,7 +236,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let mut y = x.avg_pool2d().kernel_size(&[2, 2]).call().unwrap();
+    /// let y = x.avg_pool2d().kernel_size(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 2, 2]);
@@ -191,7 +260,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
-    /// let mut y = x.avg_pool2d()
+    /// let y = x.avg_pool2d()
     ///     .kernel_size(&[2, 2])
     ///     .stride(&[1, 1])
     ///     .padding(&[(1, 1), (1, 1)])
@@ -302,7 +371,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let mut y = x.max_pool2d().kernel_size(&[2, 2]).call().unwrap();
+    /// let y = x.max_pool2d().kernel_size(&[2, 2]).call().unwrap();
     /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 2, 2]);
@@ -315,7 +384,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let mut y = x.max_pool2d()
+    /// let y = x.max_pool2d()
     ///     .kernel_size(&[3, 3])
     ///     .stride(&[1, 1])
     ///     .padding(&[(1, 1), (1, 1)])
@@ -442,7 +511,7 @@ impl Tensor {
                     .as_const()
                     .context(SymbolicShapeUnsupportedSnafu { operation: "max_pool2d_with_indices" })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KindResult<Vec<_>>>()?;
         let spatial_sz: usize = spatial_dims_usize.iter().product();
 
         // Create reverse arange: spatial_sz, spatial_sz-1, ..., 1
@@ -467,7 +536,7 @@ impl Tensor {
         let mask = pooled.try_eq(&pooled_max)?;
 
         // Multiply mask * pooled_indices, take max → first-occurrence (via reverse index)
-        let masked_idx = mask.cast(DType::Int32)?.try_mul(&pooled_idx)?;
+        let masked_idx = mask.cast(DType::Int32).try_mul(&pooled_idx)?;
         let max_idx = masked_idx.max_with().axes(axes).keepdim(false).call()?;
 
         // spatial_sz - max_idx → convert reverse index to forward index
@@ -524,7 +593,7 @@ impl Tensor {
 
         let spatial_shape: Vec<usize> = (0..n_spatial)
             .map(|j| shape[n_batch + j].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "max_unpool2d" }))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KindResult<Vec<_>>>()?;
 
         // Inferred shape from inverse pooling formula: o = (i-1)*s - (pB+pA) + k
         let stride = stride.unwrap_or(kernel_size);
@@ -540,7 +609,7 @@ impl Tensor {
         let inferred_numel: usize = inferred_spatial.iter().product();
         let batch_sizes: Vec<usize> = (0..n_batch)
             .map(|j| shape[j].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "max_unpool2d" }))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<KindResult<Vec<_>>>()?;
         let bs: usize = batch_sizes.iter().product();
 
         // Flatten: (N, C, *spatial) → (N*C, 1, num_pooled)
@@ -549,7 +618,7 @@ impl Tensor {
         let idx_flat = indices.try_reshape([bs as isize, 1, num_pooled as isize])?;
 
         // One-hot: compare indices against arange(inferred_numel)
-        let arange = Tensor::arange(inferred_numel as i64, None, None)?.cast(indices.uop().dtype())?.try_reshape([
+        let arange = Tensor::arange(inferred_numel as i64, None, None)?.cast(indices.uop().dtype()).try_reshape([
             1,
             inferred_numel as isize,
             1,
@@ -599,7 +668,7 @@ impl Tensor {
     /// # use ndarray::Array3;
     /// // 1 batch, 1 channel, 2x2 block = 4 cols, 4 sliding positions
     /// let cols = Tensor::from_ndarray(&Array3::from_elem((1, 4, 4), 1.0f32));
-    /// let mut img = cols.col2im()
+    /// let img = cols.col2im()
     ///     .image_shape(&[4, 4])
     ///     .block_shape(&[2, 2])
     ///     .strides(&[2, 2])
@@ -669,7 +738,7 @@ impl Tensor {
         // Initialize output: [N*C, *padded_img] with zeros
         let mut out_dims: Vec<usize> = vec![nc];
         out_dims.extend_from_slice(&padded_img);
-        let mut result = Tensor::full(&out_dims, 0.0f64, self.uop().dtype())?;
+        let mut result = Tensor::full(&out_dims, 0.0f64, self.uop().dtype());
 
         // Iterate over all kernel positions in block_shape
         for be in 0..bl {

@@ -6,15 +6,15 @@
 //! Weights are loaded from `colbert_linear.pt` (PyTorch pickle with bare
 //! `weight` / `bias` keys).
 
-use snafu::{OptionExt, ResultExt};
 use svod_dtype::DType;
+use svod_tensor::nn::Module;
 use svod_tensor::{Tensor, s};
 
 use crate::init::{fan_in_uniform, zeros};
-use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
-use crate::xlm_roberta::error::{Result, SymbolicShapeSnafu, TensorSnafu};
+use crate::state::{self, StateDict};
+use crate::xlm_roberta::error::Result;
 
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct ColbertHead {
     pub weight: Tensor,
     pub bias: Tensor,
@@ -43,7 +43,7 @@ impl ColbertHead {
     pub fn from_state_dict(sd: &StateDict, prefix: &str, colbert_dim: usize, dtype: DType) -> Result<Self> {
         let sd = state::cast_all(sd, dtype.clone());
         let mut head = Self::empty(0, colbert_dim, dtype);
-        head.load_state_dict(&sd, prefix).map_err(|e| crate::xlm_roberta::Error::State { source: Box::new(e) })?;
+        head.load_state_dict(&sd, prefix)?;
         Ok(head)
     }
 
@@ -51,38 +51,19 @@ impl ColbertHead {
     /// where `true` = real token. Returns `(B, L-1, colbert_dim)` — the CLS
     /// token (position 0) is dropped.
     pub fn forward(&self, hidden: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
-        let shape = hidden.shape().context(TensorSnafu)?;
-        let _l: usize = shape[1].as_const().context(SymbolicShapeSnafu { what: "colbert_head" })?;
+        let hidden_no_cls = hidden.getitem(s![.., 1.., ..])?;
 
-        let hidden_no_cls = hidden.getitem(s![.., 1.., ..]).context(TensorSnafu)?;
-
-        let vecs = hidden_no_cls.linear().weight(&self.weight).bias(&self.bias).call().context(TensorSnafu)?;
+        let vecs = hidden_no_cls.linear().weight(&self.weight).bias(&self.bias).call()?;
 
         let vecs = match attention_mask {
             Some(m) => {
-                let m_no_cls = m.getitem(s![.., 1..]).context(TensorSnafu)?;
-                let m_3d =
-                    m_no_cls.cast(vecs.uop().dtype()).context(TensorSnafu)?.try_unsqueeze(-1).context(TensorSnafu)?;
-                vecs.try_mul(&m_3d).context(TensorSnafu)?
+                let m_no_cls = m.getitem(s![.., 1..])?;
+                let m_3d = m_no_cls.cast(vecs.dtype()).try_unsqueeze(-1)?;
+                vecs.try_mul(&m_3d)?
             }
             None => vecs,
         };
 
-        if self.normalize { vecs.lp_normalize(-1, 2).context(TensorSnafu) } else { Ok(vecs) }
-    }
-}
-
-impl HasStateDict for ColbertHead {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        sd.insert(prefixed(prefix, "weight"), self.weight.clone());
-        sd.insert(prefixed(prefix, "bias"), self.bias.clone());
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.weight = get_tensor(sd, &prefixed(prefix, "weight"))?;
-        self.bias = get_tensor(sd, &prefixed(prefix, "bias"))?;
-        Ok(())
+        if self.normalize { Ok(vecs.lp_normalize(-1, 2)?) } else { Ok(vecs) }
     }
 }

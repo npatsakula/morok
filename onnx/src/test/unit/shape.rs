@@ -14,8 +14,7 @@ fn test_reshape_allowzero_copy() {
     let node = NodeProto::default(); // allowzero defaults to 0
 
     let result = registry.dispatch_multi("Reshape", "", &inputs, &node, i64::MAX).unwrap();
-    let s = result[0].shape().unwrap();
-    assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![2, 3, 4]);
+    assert_eq!(result[0].dims().unwrap(), vec![2, 3, 4]);
 }
 
 #[test]
@@ -27,8 +26,7 @@ fn test_expand_broadcast() {
     let node = NodeProto::default();
 
     let result = registry.dispatch_multi("Expand", "", &inputs, &node, i64::MAX).unwrap();
-    let s = result[0].shape().unwrap();
-    assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![2, 3, 4]);
+    assert_eq!(result[0].dims().unwrap(), vec![2, 3, 4]);
 }
 
 #[test]
@@ -41,9 +39,7 @@ fn test_flatten_axis_variants() {
         node.attribute.push(make_attr_int("axis", axis));
 
         let result = registry.dispatch("Flatten", "", &[x], &node).unwrap();
-        let s = result.shape().unwrap();
-        let dims: Vec<usize> = s.iter().map(|d| d.as_const().unwrap()).collect();
-        assert_eq!(dims, expected_shape, "Flatten axis={axis}");
+        assert_eq!(result.dims().unwrap(), expected_shape, "Flatten axis={axis}");
     }
 }
 
@@ -55,9 +51,7 @@ fn test_flatten_negative_axis() {
     node.attribute.push(make_attr_int("axis", -1));
 
     let result = registry.dispatch("Flatten", "", &[x], &node).unwrap();
-    let s = result.shape().unwrap();
-    let dims: Vec<usize> = s.iter().map(|d| d.as_const().unwrap()).collect();
-    assert_eq!(dims, vec![6, 4]); // axis=-1 -> axis=2 -> pre=2*3=6, post=4
+    assert_eq!(result.dims().unwrap(), vec![6, 4]); // axis=-1 -> axis=2 -> pre=2*3=6, post=4
 }
 
 #[test]
@@ -70,8 +64,7 @@ fn test_pad_with_axes() {
     let node = NodeProto::default();
 
     let result = registry.dispatch_multi("Pad", "", &inputs, &node, i64::MAX).unwrap();
-    let s = result[0].shape().unwrap();
-    assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![2, 5]);
+    assert_eq!(result[0].dims().unwrap(), vec![2, 5]);
 }
 
 #[test]
@@ -85,7 +78,7 @@ fn test_split_remainder_distribution() {
 
     let result = registry.dispatch_multi("Split", "", &inputs, &node, i64::MAX).unwrap();
     assert_eq!(result.len(), 3);
-    let shapes: Vec<usize> = result.iter().map(|t| t.shape().unwrap()[0].as_const().unwrap()).collect();
+    let shapes: Vec<usize> = result.iter().map(|t| t.dim_const(0).unwrap()).collect();
     assert_eq!(shapes, vec![3, 2, 2]);
 }
 
@@ -97,8 +90,7 @@ fn test_center_crop_pad_crop() {
     let inputs = vec![Some(x), Some(shape)];
     let node = NodeProto::default();
     let result = registry.dispatch_multi("CenterCropPad", "", &inputs, &node, i64::MAX).unwrap();
-    let s = result[0].shape().unwrap();
-    assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![2, 2]);
+    assert_eq!(result[0].dims().unwrap(), vec![2, 2]);
 }
 
 // =========================================================================
@@ -112,7 +104,7 @@ svod_tensor::codegen_tests! {
         let mut node = NodeProto::default();
         node.attribute.push(make_attr_ints("perm", &[1, 0]));
 
-        let mut result = registry.dispatch("Transpose", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Transpose", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
@@ -122,7 +114,7 @@ svod_tensor::codegen_tests! {
         let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
         let node = NodeProto::default(); // axis defaults to 1
 
-        let mut result = registry.dispatch("Flatten", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Flatten", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
@@ -135,7 +127,7 @@ svod_tensor::codegen_tests! {
         node.attribute.push(make_attr_int("start", 1));
         node.attribute.push(make_attr_int("end", 3));
 
-        let mut result = registry.dispatch("Shape", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Shape", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<i64>().unwrap();
         assert_eq!(vals, vec![3, 4]);
@@ -147,7 +139,7 @@ svod_tensor::codegen_tests! {
         let mut node = NodeProto::default();
         node.attribute.push(make_attr_int("start", -1));
 
-        let mut result = registry.dispatch("Shape", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Shape", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<i64>().unwrap();
         assert_eq!(vals, vec![4]);
@@ -162,7 +154,7 @@ svod_tensor::codegen_tests! {
         node.attribute.push(make_attr_int("end", 1));
 
         let result = registry.dispatch_multi("Shape", "", &inputs, &node, i64::MAX).unwrap();
-        let mut r = result[0].clone();
+        let r = result[0].clone();
         r.realize_with(&config).unwrap();
         let vals = r.as_vec::<i64>().unwrap();
         assert!(vals.is_empty());
@@ -176,11 +168,8 @@ svod_tensor::codegen_tests! {
 
         let result = registry.dispatch_multi("Dropout", "", &inputs, &node, i64::MAX).unwrap();
         assert_eq!(result.len(), 2);
-        let mask_shape = result[1].shape().unwrap();
-        assert_eq!(mask_shape.len(), 2);
-        assert_eq!(mask_shape[0].as_const().unwrap(), 2);
-        assert_eq!(mask_shape[1].as_const().unwrap(), 3);
-        let mut r = result[1].clone();
+        assert_eq!(result[1].dims().unwrap(), vec![2, 3]);
+        let r = result[1].clone();
         r.realize_with(&config).unwrap();
         assert!(r.as_vec::<bool>().unwrap().iter().all(|&v| v));
     }
@@ -190,10 +179,8 @@ svod_tensor::codegen_tests! {
         let shape = Tensor::from_slice([0i64]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("ConstantOfShape", "", &[shape], &node).unwrap();
-        let s = result.shape().unwrap();
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].as_const().unwrap(), 0);
+        let result = registry.dispatch("ConstantOfShape", "", &[shape], &node).unwrap();
+        assert_eq!(result.dims().unwrap(), vec![0]);
         result.realize_with(&config).unwrap();
         assert_eq!(result.as_vec::<f32>().unwrap().len(), 0);
     }
@@ -202,9 +189,8 @@ svod_tensor::codegen_tests! {
         let registry = OpRegistry::new();
         let x = Tensor::from_ndarray(&Array2::<f32>::zeros((3, 3)));
         let node = NodeProto::default();
-        let mut result = registry.dispatch("EyeLike", "", &[x], &node).unwrap();
-        let s = result.shape().unwrap();
-        assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![3, 3]);
+        let result = registry.dispatch("EyeLike", "", &[x], &node).unwrap();
+        assert_eq!(result.dims().unwrap(), vec![3, 3]);
         result.realize_with(&config).unwrap();
         assert_eq!(result.as_vec::<f32>().unwrap(), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
     }
@@ -216,7 +202,7 @@ svod_tensor::codegen_tests! {
         let inputs = vec![Some(data), Some(condition)];
         let node = NodeProto::default();
         let result = registry.dispatch_multi("Compress", "", &inputs, &node, i64::MAX).unwrap();
-        let mut r = result[0].clone();
+        let r = result[0].clone();
         r.realize_with(&config).unwrap();
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![2.0, 3.0]);
     }

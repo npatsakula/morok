@@ -3,17 +3,17 @@ use snafu::Snafu;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Tensor {
         #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
         source: Box<svod_tensor::error::Error>,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     State {
         #[snafu(source(from(crate::state::Error, Box::new)))]
         source: Box<crate::state::Error>,
     },
-    #[snafu(display("hub error: {source}"))]
+    #[snafu(display("hub error: {source}"), context(false))]
     Hub { source: hf_hub::HFError },
     #[snafu(display("invalid resnet config: {message}"))]
     Config { message: String },

@@ -9,23 +9,21 @@
 //! `skip_first_prenorm = true` makes layer 0's `attn_norm` an identity (its
 //! state-dict key is absent), so `attn_norm` is `Option` and `None` for layer 0.
 
-use snafu::ResultExt;
 use svod_tensor::Tensor;
-
-use crate::state::{self, HasStateDict, StateDict};
+use svod_tensor::nn::{Layer, LayerNorm, Module};
 
 use super::attention::ModernBertAttention;
-use super::error::{Result, TensorSnafu};
-use super::mlp::ModernBertGlu;
-use super::normalization::LayerNormWeights;
-use super::rotary::RotaryTable;
+use super::error::Result;
 
-#[derive(Clone)]
+use super::mlp::ModernBertGlu;
+
+#[derive(Clone, Module)]
 pub struct EncoderLayer {
     /// `None` for layer 0 (`skip_first_prenorm`).
-    pub attn_norm: Option<LayerNormWeights>,
+    pub attn_norm: Option<LayerNorm>,
+    #[module(key = "attn")]
     pub attention: ModernBertAttention,
-    pub mlp_norm: LayerNormWeights,
+    pub mlp_norm: LayerNorm,
     pub mlp: ModernBertGlu,
 }
 
@@ -35,9 +33,8 @@ impl EncoderLayer {
         let eps = config.layer_norm_eps;
         let dtype = config.dtype.clone();
         let window = if config.is_global_layer(layer_id) { None } else { Some(config.local_window()) };
-        let attn_norm = (layer_id != 0).then(|| LayerNormWeights::with_eps(hidden, eps, dtype.clone()));
         Self {
-            attn_norm,
+            attn_norm: (layer_id != 0).then(|| LayerNorm::with_dims(hidden, false, eps, dtype.clone())),
             attention: ModernBertAttention::empty(
                 hidden,
                 config.num_attention_heads,
@@ -45,46 +42,19 @@ impl EncoderLayer {
                 window,
                 dtype.clone(),
             ),
-            mlp_norm: LayerNormWeights::with_eps(hidden, eps, dtype.clone()),
+            mlp_norm: LayerNorm::with_dims(hidden, false, eps, dtype.clone()),
             mlp: ModernBertGlu::empty(hidden, config.intermediate_size, dtype),
         }
     }
 
     /// Forward. `x`: `(B, L, D)` → `(B, L, D)`.
-    pub fn forward(&self, x: &Tensor, rotary: &RotaryTable, padding_mask: Option<&Tensor>) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor, rope: &(Tensor, Tensor), padding_mask: Option<&Tensor>) -> Result<Tensor> {
         let normed = match &self.attn_norm {
-            Some(ln) => ln.apply(x)?,
+            Some(ln) => ln.forward(x)?,
             None => x.clone(),
         };
-        let delta = self.attention.forward(&normed, rotary, padding_mask)?;
-        let mut h = x.try_add(&delta).context(TensorSnafu)?;
-
-        let normed = self.mlp_norm.apply(&h)?;
-        let delta = self.mlp.forward(&normed)?;
-        h = h.try_add(&delta).context(TensorSnafu)?;
-        Ok(h)
-    }
-}
-
-impl HasStateDict for EncoderLayer {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        if let Some(ln) = &self.attn_norm {
-            sd.extend(ln.state_dict(&format!("{prefix}.attn_norm")));
-        }
-        sd.extend(self.attention.state_dict(&format!("{prefix}.attn")));
-        sd.extend(self.mlp_norm.state_dict(&format!("{prefix}.mlp_norm")));
-        sd.extend(self.mlp.state_dict(&format!("{prefix}.mlp")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        if let Some(ln) = self.attn_norm.as_mut() {
-            ln.load_state_dict(sd, &format!("{prefix}.attn_norm"))?;
-        }
-        self.attention.load_state_dict(sd, &format!("{prefix}.attn"))?;
-        self.mlp_norm.load_state_dict(sd, &format!("{prefix}.mlp_norm"))?;
-        self.mlp.load_state_dict(sd, &format!("{prefix}.mlp"))?;
-        Ok(())
+        let h = x.try_add(&self.attention.forward(&normed, rope, padding_mask)?)?;
+        let delta = self.mlp.forward(&self.mlp_norm.forward(&h)?)?;
+        Ok(h.try_add(&delta)?)
     }
 }

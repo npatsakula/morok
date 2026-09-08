@@ -12,10 +12,10 @@ crate::codegen_tests! {
         setup_test_tracing();
         let t = Tensor::from_slice([3.0f32, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0]);
         let (sorted, indices) = t.sort(-1, false).unwrap();
-        let mut sorted = sorted;
+        let sorted = sorted;
         sorted.realize_with(&config).unwrap();
         assert_eq!(sorted.as_vec::<f32>().unwrap(), [1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 9.0]);
-        let mut indices = indices;
+        let indices = indices;
         indices.realize_with(&config).unwrap();
         assert_eq!(indices.as_vec::<i32>().unwrap(), [1, 3, 6, 0, 2, 4, 7, 5]);
     }
@@ -23,7 +23,7 @@ crate::codegen_tests! {
     fn test_sort_1d_descending(config) {
         let t = Tensor::from_slice([3.0f32, 1.0, 4.0, 1.0, 5.0]);
         let (sorted, _indices) = t.sort(-1, true).unwrap();
-        let mut sorted = sorted;
+        let sorted = sorted;
         sorted.realize_with(&config).unwrap();
         assert_eq!(sorted.as_vec::<f32>().unwrap(), [5.0, 4.0, 3.0, 1.0, 1.0]);
     }
@@ -35,15 +35,15 @@ crate::codegen_tests! {
         let t = Tensor::from_slice(data);
 
         let (sorted, indices) = t.sort(-1, false).unwrap();
-        let mut sorted = sorted;
+        let sorted = sorted;
         sorted.realize_with(&config).unwrap();
         assert_eq!(sorted.as_vec::<u64>().unwrap(), [2, 3, 10_000_000_000_000_000_000]);
-        let mut indices = indices;
+        let indices = indices;
         indices.realize_with(&config).unwrap();
         assert_eq!(indices.as_vec::<i32>().unwrap(), [2, 0, 1]);
 
         let (desc, _) = t.sort(-1, true).unwrap();
-        let mut desc = desc;
+        let desc = desc;
         desc.realize_with(&config).unwrap();
         assert_eq!(desc.as_vec::<u64>().unwrap(), [10_000_000_000_000_000_000, 3, 2]);
     }
@@ -52,12 +52,12 @@ crate::codegen_tests! {
         let t = Tensor::from_slice([true, false, true]);
 
         let (asc, _) = t.sort(-1, false).unwrap();
-        let mut asc = asc;
+        let asc = asc;
         asc.realize_with(&config).unwrap();
         assert_eq!(asc.as_vec::<bool>().unwrap(), [false, true, true]);
 
         let (desc, _) = t.sort(-1, true).unwrap();
-        let mut desc = desc;
+        let desc = desc;
         desc.realize_with(&config).unwrap();
         assert_eq!(desc.as_vec::<bool>().unwrap(), [true, true, false]);
     }
@@ -65,10 +65,10 @@ crate::codegen_tests! {
     fn test_topk_uint64_above_i64_max(config) {
         let t = Tensor::from_slice([3u64, 10_000_000_000_000_000_000, 2]);
         let (values, indices) = t.topk(2, -1, true).unwrap();
-        let mut values = values;
+        let values = values;
         values.realize_with(&config).unwrap();
         assert_eq!(values.as_vec::<u64>().unwrap(), [10_000_000_000_000_000_000, 3]);
-        let mut indices = indices;
+        let indices = indices;
         indices.realize_with(&config).unwrap();
         assert_eq!(indices.as_vec::<i32>().unwrap(), [1, 0]);
     }
@@ -76,7 +76,7 @@ crate::codegen_tests! {
     fn test_sort_power_of_2_size(config) {
         let t = Tensor::from_slice([4.0f32, 2.0, 1.0, 3.0]);
         let (sorted, _) = t.sort(-1, false).unwrap();
-        let mut sorted = sorted;
+        let sorted = sorted;
         sorted.realize_with(&config).unwrap();
         assert_eq!(sorted.as_vec::<f32>().unwrap(), [1.0, 2.0, 3.0, 4.0]);
     }
@@ -84,10 +84,10 @@ crate::codegen_tests! {
     fn test_sort_single_element(config) {
         let t = Tensor::from_slice([42.0f32]);
         let (sorted, indices) = t.sort(-1, false).unwrap();
-        let mut sorted = sorted;
+        let sorted = sorted;
         sorted.realize_with(&config).unwrap();
         assert_eq!(sorted.as_vec::<f32>().unwrap(), [42.0]);
-        let mut indices = indices;
+        let indices = indices;
         indices.realize_with(&config).unwrap();
         assert_eq!(indices.as_vec::<i32>().unwrap(), [0]);
     }
@@ -111,7 +111,7 @@ crate::codegen_tests! {
 
         // Stage-2 crossover at dim0 (WITH contiguous — triggers kernel)
         let halves_s2 = undo.split(&[1, 1], 0).unwrap();
-        let mut crossover = Tensor::cat(
+        let crossover = Tensor::cat(
             &[&halves_s2[0], &halves_s2[1].flip(&[-1, -2, -3]).unwrap()],
             0,
         ).unwrap().contiguous();
@@ -131,7 +131,7 @@ crate::codegen_tests! {
     fn test_sort_2d_dim1(config) {
         let t = Tensor::from_ndarray(&array![[3.0f32, 1.0, 2.0], [6.0, 4.0, 5.0]]);
         let (sorted, _) = t.sort(1, false).unwrap();
-        let mut sorted = sorted;
+        let sorted = sorted;
         sorted.realize_with(&config).unwrap();
         assert_eq!(get_shape(&sorted), vec![2, 3]);
         let view = sorted.array_view::<f32>().unwrap();
@@ -150,7 +150,7 @@ crate::codegen_tests! {
 
         let t = Tensor::from_slice(&data);
         let (sorted, _) = t.sort(-1, false).unwrap();
-        let mut sorted = sorted;
+        let sorted = sorted;
         sorted.realize_with(&config).unwrap();
         prop_assert_eq!(sorted.as_vec::<f32>().unwrap(), expected);
     }
@@ -162,7 +162,7 @@ crate::codegen_tests! {
 
         let t = Tensor::from_slice(&data);
         let (sorted, _) = t.sort(-1, true).unwrap();
-        let mut sorted = sorted;
+        let sorted = sorted;
         sorted.realize_with(&config).unwrap();
         prop_assert_eq!(sorted.as_vec::<f32>().unwrap(), expected);
     }

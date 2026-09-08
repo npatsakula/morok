@@ -11,8 +11,8 @@ plans.
 |---|---|
 | `jit` | `jit_wrapper!`-generated wrappers, `JitRecurrent<J>`, `InputSpec`, `JitError`. Build-once / run-many execution. See [JIT Graphs](../website/docs/architecture/jit-graphs.md). |
 | `audio` | Log-mel spectrogram, `Splitter` trait for long-form chunking (`FireRedVadSplitter`, `SileroVadSplitter`, `FixedLengthSplitter`). |
-| `state` | `HasStateDict` + `state_field!` macros for loading PyTorch / safetensors checkpoints into Rust weight structs. |
-| `blocks` | Shared `Conv2dWeights`, `BatchNormWeights`, `BasicBlock`, `Bottleneck`, `ResidualStage` reused by every ResNet-shaped backbone. timm/torchvision key convention. |
+| `state` | Safetensors loading (single-file and sharded), dtype casting, and the origin scopes that name a module's weights. The `StateDict` / `Module` contract itself lives in `svod_tensor::nn`. |
+| `blocks` | Shared `conv2d`, `batchnorm2d`, `BasicBlock`, `Bottleneck`, `ResidualStage` reused by every ResNet-shaped backbone. timm/torchvision key convention. |
 | `wavlm` | WavLM speech-representation backbone (Conv1d feature extractor + gated rel-pos Transformer, per-layer pruning) consumed by `diarizen`. |
 | `xlm_roberta` | XLM-RoBERTa text encoder backbone (absolute position embeddings, post-norm Transformer) consumed by `bgem3`. |
 | `qwen3` | Qwen3 decoder-only LLM backbone (causal attention, GQA, per-head Q/K RMSNorm, RoPE, SwiGLU) consumed by embedding models. |

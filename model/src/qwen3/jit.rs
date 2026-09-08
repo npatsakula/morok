@@ -3,8 +3,6 @@
 //! batch variable. The entire pipeline (backbone + last-token pooling +
 //! L2 normalize) runs in one JIT plan.
 
-extern crate self as svod_model;
-
 use svod_macros::jit_wrapper;
 
 use super::embedder::Qwen3Embedding;
@@ -15,12 +13,11 @@ jit_wrapper! {
         input_ids: Tensor,
         attention_mask: Tensor,
 
-        vars {
-            b: (1, model.model.config.max_batch_size),
-        }
+        batch_var b: (1, model.model.config.max_batch_size),
+        outputs { embeddings }
 
-        build(input_ids, attention_mask, b) {
-            model.encode_batch(input_ids, attention_mask, &b)
+        build(input_ids, attention_mask) {
+            model.encode(input_ids, attention_mask)
         }
     }
 }
@@ -30,12 +27,11 @@ jit_wrapper! {
         input_ids: Tensor,
         attention_mask: Tensor,
 
-        vars {
-            b: (1, model.model.config.max_batch_size),
-        }
+        batch_var b: (1, model.model.config.max_batch_size),
+        outputs { scores }
 
-        build(input_ids, attention_mask, b) {
-            model.forward_batch(input_ids, attention_mask, &b)
+        build(input_ids, attention_mask) {
+            model.forward(input_ids, attention_mask)
         }
     }
 }

@@ -1,7 +1,5 @@
 //! JIT wrappers for BGE-M3 and BGE-reranker-v2-m3.
 
-extern crate self as svod_model;
-
 use svod_macros::jit_wrapper;
 
 use super::embedder::BgeM3;
@@ -12,12 +10,11 @@ jit_wrapper! {
         input_ids: Tensor,
         attention_mask: Tensor,
 
-        vars {
-            b: (1, model.model.config.max_batch_size),
-        }
+        batch_var b: (1, model.model.config.max_batch_size),
+        outputs { dense }
 
-        build(input_ids, attention_mask, b) {
-            model.encode_dense_batch(input_ids, attention_mask, &b)
+        build(input_ids, attention_mask) {
+            model.encode_dense(input_ids, attention_mask)
         }
     }
 }
@@ -27,12 +24,11 @@ jit_wrapper! {
         input_ids: Tensor,
         attention_mask: Tensor,
 
-        vars {
-            b: (1, model.model.config.max_batch_size),
-        }
+        batch_var b: (1, model.model.config.max_batch_size),
+        outputs { colbert }
 
-        build(input_ids, attention_mask, b) {
-            model.encode_colbert_batch(input_ids, attention_mask, &b)
+        build(input_ids, attention_mask) {
+            model.encode_colbert(input_ids, attention_mask)
         }
     }
 }
@@ -42,12 +38,11 @@ jit_wrapper! {
         input_ids: Tensor,
         attention_mask: Tensor,
 
-        vars {
-            b: (1, model.model.config.max_batch_size),
-        }
+        batch_var b: (1, model.model.config.max_batch_size),
+        outputs { logits }
 
-        build(input_ids, attention_mask, b) {
-            model.forward_batch(input_ids, Some(attention_mask), &b)
+        build(input_ids, attention_mask) {
+            model.forward(input_ids, Some(attention_mask))
         }
     }
 }

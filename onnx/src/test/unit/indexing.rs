@@ -8,7 +8,7 @@ svod_tensor::codegen_tests! {
         let indices = Tensor::from_slice([0i64, 2, 4]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Gather", "", &[data, indices], &node).unwrap();
+        let result = registry.dispatch("Gather", "", &[data, indices], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
@@ -20,7 +20,7 @@ svod_tensor::codegen_tests! {
         let mut node = NodeProto::default();
         node.attribute.push(make_attr_int("axis", 1));
 
-        let mut result = registry.dispatch("Gather", "", &[data, indices], &node).unwrap();
+        let result = registry.dispatch("Gather", "", &[data, indices], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
@@ -31,7 +31,7 @@ svod_tensor::codegen_tests! {
         let indices = Tensor::from_slice([0i64, -1, 2, -2]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Gather", "", &[data, indices], &node).unwrap();
+        let result = registry.dispatch("Gather", "", &[data, indices], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert_eq!(result.as_vec::<f32>().unwrap(), vec![10.0, 50.0, 30.0, 40.0]);
     }
@@ -45,7 +45,7 @@ svod_tensor::codegen_tests! {
         let inputs = vec![Some(data), Some(indices)];
 
         let result = registry.dispatch_multi("GatherElements", "", &inputs, &node, i64::MAX).unwrap();
-        let mut r = result[0].clone();
+        let r = result[0].clone();
         r.realize_with(&config).unwrap();
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![2.0, 3.0, 1.0, 6.0, 4.0, 4.0, 7.0, 8.0, 8.0]);
     }
@@ -59,7 +59,7 @@ svod_tensor::codegen_tests! {
         let inputs = vec![Some(data), Some(indices)];
 
         let result = registry.dispatch_multi("GatherElements", "", &inputs, &node, i64::MAX).unwrap();
-        let mut r = result[0].clone();
+        let r = result[0].clone();
         r.realize_with(&config).unwrap();
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![3.0, 4.0]);
     }
@@ -72,7 +72,7 @@ svod_tensor::codegen_tests! {
         node.attribute.push(make_attr_int("upper", 1));
 
         let result = registry.dispatch_multi("Trilu", "", &inputs, &node, i64::MAX).unwrap();
-        let mut r = result[0].clone();
+        let r = result[0].clone();
         r.realize_with(&config).unwrap();
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 0.0, 5.0, 6.0, 0.0, 0.0, 9.0]);
     }
@@ -85,7 +85,7 @@ svod_tensor::codegen_tests! {
         node.attribute.push(make_attr_int("upper", 0));
 
         let result = registry.dispatch_multi("Trilu", "", &inputs, &node, i64::MAX).unwrap();
-        let mut r = result[0].clone();
+        let r = result[0].clone();
         r.realize_with(&config).unwrap();
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![1.0, 0.0, 0.0, 4.0, 5.0, 0.0, 7.0, 8.0, 9.0]);
     }
@@ -98,7 +98,7 @@ svod_tensor::codegen_tests! {
         let node = NodeProto::default(); // upper=1 by default
 
         let result = registry.dispatch_multi("Trilu", "", &inputs, &node, i64::MAX).unwrap();
-        let mut r = result[0].clone();
+        let r = result[0].clone();
         r.realize_with(&config).unwrap();
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![0.0, 2.0, 3.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0]);
     }
@@ -111,7 +111,7 @@ svod_tensor::codegen_tests! {
         let node = NodeProto::default();
 
         let result = registry.dispatch_multi("CumSum", "", &inputs, &node, i64::MAX).unwrap();
-        let mut r = result[0].clone();
+        let r = result[0].clone();
         r.realize_with(&config).unwrap();
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![1.0, 3.0, 6.0, 10.0]);
     }
@@ -126,7 +126,7 @@ svod_tensor::codegen_tests! {
         node.attribute.push(make_attr_int("reverse", 1));
 
         let result = registry.dispatch_multi("CumSum", "", &inputs, &node, i64::MAX).unwrap();
-        let mut r = result[0].clone();
+        let r = result[0].clone();
         r.realize_with(&config).unwrap();
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![9.0, 7.0, 4.0, 0.0]);
     }
@@ -141,7 +141,7 @@ svod_tensor::codegen_tests! {
         node.attribute.push(make_attr_int("axis", -1));
 
         let result = registry.dispatch_multi("OneHot", "", &inputs, &node, i64::MAX).unwrap();
-        let mut r = result[0].clone();
+        let r = result[0].clone();
         r.realize_with(&config).unwrap();
         assert_eq!(r.as_vec::<f32>().unwrap(), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
     }

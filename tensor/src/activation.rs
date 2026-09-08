@@ -5,9 +5,10 @@
 
 use bon::bon;
 use snafu::{OptionExt, ResultExt, ensure};
+use svod_dtype::DType;
 use svod_ir::{ConstValue, UOp};
 
-use crate::error::{DivisibilitySnafu, SymbolicShapeUnsupportedSnafu};
+use crate::error::{DivisibilitySnafu, ExclusiveParamsSnafu, SymbolicShapeUnsupportedSnafu};
 use crate::reduce::AxisSpec;
 use crate::{Result, Tensor, error::UOpSnafu};
 
@@ -415,7 +416,7 @@ impl Tensor {
     pub fn softsign(&self) -> Result<Self> {
         origin_call!("softsign");
         let one = self.one()?;
-        let denom = one.try_add(&self.try_abs()?)?;
+        let denom = one.try_add(self.abs())?;
         self.try_div(&denom)
     }
 
@@ -437,23 +438,29 @@ impl Tensor {
     /// where `invstd = 1 / sqrt(var + epsilon)`
     ///
     /// This is the inference mode batchnorm (no running stats update).
-    /// The caller provides pre-computed mean and inverse standard deviation.
+    /// The caller provides the running statistics: either a pre-computed
+    /// `invstd` (as ONNX carries it) or a running `var`, from which
+    /// `invstd = (var + eps).rsqrt()` is computed in-graph. Exactly one of the
+    /// two must be given.
     ///
     /// # Arguments
     /// * `scale` - Gamma/weight parameter (optional, defaults to 1)
     /// * `bias` - Beta parameter (optional, defaults to 0)
     /// * `mean` - Running mean
     /// * `invstd` - Inverse standard deviation (1 / sqrt(var + eps))
+    /// * `var` - Running variance, an alternative to `invstd`
+    /// * `eps` - Epsilon added to `var` (default: 1e-5, unused with `invstd`)
     /// * `axis` - Axis/axes to normalize over (default: 1 for NCHW)
     ///
     /// # Examples
-    /// ```ignore
-    /// let x = Tensor::randn(&[8, 4, 16, 16]);
-    /// let mean = x.mean(AxisSpec::Multiple(vec![0, 2, 3]))?;
-    /// let var = x.var(AxisSpec::Multiple(vec![0, 2, 3]))?;
-    /// let eps = Tensor::from_slice([1e-5]);
-    /// let invstd = var.try_add(&eps)?.try_rsqrt()?;
-    /// let normalized = x.batchnorm().mean(&mean).invstd(&invstd).call()?;
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// # use ndarray::Array2;
+    /// let x = Tensor::from_ndarray(&Array2::from_elem((1, 2), 3.0f32));
+    /// let mean = Tensor::from_slice([1.0f32, 1.0]);
+    /// let var = Tensor::from_slice([4.0f32, 4.0]);
+    /// let y = x.batchnorm().mean(&mean).var(&var).eps(0.0).call().unwrap();
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0, 1.0]);
     /// ```
     #[builder]
     #[track_caller]
@@ -462,10 +469,24 @@ impl Tensor {
         scale: Option<&Tensor>,
         bias: Option<&Tensor>,
         mean: &Tensor,
-        invstd: &Tensor,
+        invstd: Option<&Tensor>,
+        var: Option<&Tensor>,
+        #[builder(default = 1e-5)] eps: f64,
         #[builder(default = AxisSpec::Single(1))] axis: AxisSpec,
     ) -> Result<Self> {
         origin_call!("batchnorm");
+        let invstd = match (invstd, var) {
+            (Some(invstd), None) => invstd.clone(),
+            // f16 cannot hold a 1e-5 epsilon, so derive invstd in f32 and round
+            // back: a zero-variance channel then still yields a finite invstd.
+            (None, Some(var)) => {
+                let dtype = var.uop().dtype();
+                let v32 = if dtype == DType::Float32 { var.clone() } else { var.cast(DType::Float32) };
+                let invstd = v32.try_add(Tensor::const_(eps, DType::Float32))?.try_rsqrt()?;
+                if dtype == DType::Float32 { invstd } else { invstd.cast(dtype) }
+            }
+            _ => ExclusiveParamsSnafu { op: "batchnorm", options: "invstd, var" }.fail()?,
+        };
         let shape = self.shape()?;
 
         // Build broadcast shape: keep axis dimensions, others become 1

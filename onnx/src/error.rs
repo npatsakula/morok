@@ -32,14 +32,11 @@ pub enum Error {
     #[snafu(display("Empty model - no graph found"))]
     EmptyModel,
 
-    #[snafu(display("Tensor operation error: {source}"))]
-    Tensor { source: Box<svod_tensor::error::Error> },
-}
-
-impl From<svod_tensor::error::Error> for Error {
-    fn from(source: svod_tensor::error::Error) -> Self {
-        Error::Tensor { source: Box::new(source) }
-    }
+    #[snafu(display("Tensor operation error: {source}"), context(false))]
+    Tensor {
+        #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
+        source: Box<svod_tensor::error::Error>,
+    },
 }
 
 impl From<svod_ir::error::Error> for Error {

@@ -21,7 +21,7 @@ crate::codegen_tests! {
 
         let step1 = x.try_reshape([1, 1, 2, 2, 3, 2]).unwrap();
         let step2 = step1.try_permute(&[0, 3, 5, 1, 2, 4]).unwrap();
-        let mut result = step2.try_reshape([1, 4, 2, 3]).unwrap();
+        let result = step2.try_reshape([1, 4, 2, 3]).unwrap();
 
         let expected: Vec<f32> = (0..24).map(|i| i as f32).collect();
         result.realize_with(&config).unwrap();
@@ -36,21 +36,21 @@ crate::codegen_tests! {
         crate::test::helpers::test_setup();
         let f32_dt = crate::DType::Scalar(svod_dtype::ScalarDType::Float32);
         // Two realized channel-dim buffers
-        let mut a = Tensor::full(&[1, 4, 3, 3], 1.0f32, f32_dt.clone()).unwrap();
+        let a = Tensor::full(&[1, 4, 3, 3], 1.0f32, f32_dt.clone());
         a.realize_with(&config).unwrap();
-        let mut b = Tensor::full(&[1, 2, 3, 3], 2.0f32, f32_dt.clone()).unwrap();
+        let b = Tensor::full(&[1, 2, 3, 3], 2.0f32, f32_dt.clone());
         b.realize_with(&config).unwrap();
 
         // Concat along channel dim (lazy)
         let cat = Tensor::cat(&[&a, &b], 1).unwrap();
         // Elementwise (lazy)
-        let half = Tensor::full(&[1, 6, 1, 1], 0.5f32, f32_dt).unwrap();
+        let half = Tensor::full(&[1, 6, 1, 1], 0.5f32, f32_dt);
         let added = cat.try_add(&half).unwrap();
         let relu = added.relu().unwrap();
         // Reduce over spatial dims (like GlobalAveragePool)
         let pooled = relu.mean(vec![2isize, 3]).unwrap();
 
-        let mut pooled = pooled;
+        let pooled = pooled;
         pooled.realize_with(&config).unwrap();
         let result = pooled.as_vec::<f32>().unwrap();
 
@@ -69,16 +69,16 @@ crate::codegen_tests! {
     fn test_cat_fused_with_reduce_large(config) {
         crate::test::helpers::test_setup();
         let f32_dt = crate::DType::Scalar(svod_dtype::ScalarDType::Float32);
-        let mut a = Tensor::full(&[1, 32, 7, 7], 1.0f32, f32_dt.clone()).unwrap();
+        let a = Tensor::full(&[1, 32, 7, 7], 1.0f32, f32_dt.clone());
         a.realize_with(&config).unwrap();
-        let mut b = Tensor::full(&[1, 8, 7, 7], 3.0f32, f32_dt.clone()).unwrap();
+        let b = Tensor::full(&[1, 8, 7, 7], 3.0f32, f32_dt.clone());
         b.realize_with(&config).unwrap();
 
         let cat = Tensor::cat(&[&a, &b], 1).unwrap();
-        let one = Tensor::full(&[1, 40, 1, 1], 1.0f32, f32_dt).unwrap();
+        let one = Tensor::full(&[1, 40, 1, 1], 1.0f32, f32_dt);
         let added = cat.try_add(&one).unwrap();
         let relu = added.relu().unwrap();
-        let mut pooled = relu.mean(vec![2isize, 3]).unwrap();
+        let pooled = relu.mean(vec![2isize, 3]).unwrap();
 
         pooled.realize_with(&config).unwrap();
         let result = pooled.as_vec::<f32>().unwrap();
@@ -711,7 +711,7 @@ fn equal_size_cat_keeps_slice_order(count: usize, dim: isize, shape: Vec<usize>,
         .map(|i| Tensor::from_slice([i as f32 * 10.0, i as f32 * 10.0 + 1.0, i as f32 * 10.0 + 2.0]))
         .map(|t| t.try_reshape([1, 3]).unwrap())
         .collect();
-    let mut c = Tensor::cat(&parts.iter().collect::<Vec<_>>(), dim).unwrap();
+    let c = Tensor::cat(&parts.iter().collect::<Vec<_>>(), dim).unwrap();
     assert_eq!(get_shape(&c), shape);
     c.realize().unwrap();
     assert_eq!(c.as_vec::<f32>().unwrap(), expected);
@@ -829,7 +829,7 @@ fn test_chunk_zero_chunks_is_err() {
 #[test]
 fn test_chunk_empty_dim_returns_zero_sized_chunks() {
     // dim_size==0 → `chunks` zero-sized tensors.
-    let x = Tensor::full(&[3, 0], 0.0f32, svod_dtype::DType::Float32).unwrap();
+    let x = Tensor::full(&[3, 0], 0.0f32, svod_dtype::DType::Float32);
     let chunks = x.chunk(2, 1).unwrap();
     assert_eq!(chunks.len(), 2);
     for c in &chunks {
@@ -845,7 +845,7 @@ fn test_chunk_values_1d() {
     assert_eq!(chunks.len(), 3);
     let expected: [Vec<f32>; 3] = [vec![10.0, 11.0], vec![12.0, 13.0], vec![14.0, 15.0]];
     for (i, c) in chunks.into_iter().enumerate() {
-        let mut c = c;
+        let c = c;
         c.realize().unwrap();
         assert_eq!(get_shape(&c), vec![2], "chunk {i} shape");
         assert_eq!(c.as_vec::<f32>().unwrap(), expected[i], "chunk {i} values");
@@ -860,7 +860,7 @@ fn test_chunk_values_2d_along_dim1() {
     assert_eq!(chunks.len(), 2);
     let expected: [Vec<f32>; 2] = [vec![0.0, 1.0, 4.0, 5.0], vec![2.0, 3.0, 6.0, 7.0]];
     for (i, c) in chunks.into_iter().enumerate() {
-        let mut c = c;
+        let c = c;
         c.realize().unwrap();
         assert_eq!(get_shape(&c), vec![2, 2], "chunk {i} shape");
         assert_eq!(c.as_vec::<f32>().unwrap(), expected[i], "chunk {i} values");

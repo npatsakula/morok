@@ -10,6 +10,25 @@ use crate::{
 
 crate::codegen_tests! {
     // ========================================================================
+    // Shared handles
+    // ========================================================================
+
+    /// `realize` takes `&self`, so a clone taken while the graph was still lazy
+    /// observes the result — both handles share one registry entry.
+    fn realize_is_visible_through_a_shared_clone(config) {
+        test_setup();
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let sum = (&a + &a).unwrap();
+        let alias = sum.clone();
+
+        alias.realize_with(&config).unwrap();
+
+        assert_eq!(sum.as_vec::<f32>().unwrap(), vec![2.0, 4.0, 6.0], "realized through the clone");
+        assert_eq!(alias.as_vec::<f32>().unwrap(), vec![2.0, 4.0, 6.0]);
+        assert!(sum.buffer().is_some(), "the original handle sees the buffer");
+    }
+
+    // ========================================================================
     // Addition Tests
     // ========================================================================
 
@@ -17,7 +36,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-        let mut c = &a + &b;
+        let c = (&a + &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let expected = add_f32(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]);
@@ -28,7 +47,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([-1.0f32, -2.0, -3.0]);
         let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-        let mut c = &a + &b;
+        let c = (&a + &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -40,7 +59,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([0.0f32, 0.0, 0.0]);
-        let mut c = &a + &b;
+        let c = (&a + &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -52,7 +71,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([1e6f32, 2e6, 3e6]);
         let b = Tensor::from_slice([4e6f32, 5e6, 6e6]);
-        let mut c = &a + &b;
+        let c = (&a + &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -68,7 +87,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([5.0f32, 6.0, 7.0]);
         let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-        let mut c = &a - &b;
+        let c = (&a - &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -80,7 +99,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([5.0f32, 6.0, 7.0]);
-        let mut c = &a - &b;
+        let c = (&a - &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -92,7 +111,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-        let mut c = &a - &b;
+        let c = (&a - &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -108,7 +127,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([2.0f32, 3.0, 4.0]);
         let b = Tensor::from_slice([5.0f32, 6.0, 7.0]);
-        let mut c = &a * &b;
+        let c = (&a * &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -120,7 +139,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([0.0f32, 0.0, 0.0]);
-        let mut c = &a * &b;
+        let c = (&a * &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -132,7 +151,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([2.0f32, -3.0, 4.0]);
         let b = Tensor::from_slice([-5.0f32, 6.0, -7.0]);
-        let mut c = &a * &b;
+        let c = (&a * &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -144,7 +163,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([0.5f32, 0.25, 0.125]);
         let b = Tensor::from_slice([2.0f32, 4.0, 8.0]);
-        let mut c = &a * &b;
+        let c = (&a * &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -160,7 +179,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([10.0f32, 20.0, 30.0]);
         let b = Tensor::from_slice([2.0f32, 4.0, 5.0]);
-        let mut c = &a / &b;
+        let c = (&a / &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -172,7 +191,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([1.0f32, 1.0, 1.0]);
-        let mut c = &a / &b;
+        let c = (&a / &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -184,7 +203,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([1.0f32, 1.0, 1.0]);
         let b = Tensor::from_slice([2.0f32, 4.0, 8.0]);
-        let mut c = &a / &b;
+        let c = (&a / &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -196,7 +215,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([10.0f32, -20.0, 30.0]);
         let b = Tensor::from_slice([-2.0f32, 4.0, -5.0]);
-        let mut c = &a / &b;
+        let c = (&a / &b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -212,7 +231,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([2.0f32, 3.0, 4.0]);
         let b = Tensor::from_slice([2.0f32, 2.0, 2.0]);
-        let mut c = a.try_pow(&b).unwrap();
+        let c = a.try_pow(&b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -224,7 +243,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([2.0f32, 3.0, 4.0]);
         let b = Tensor::from_slice([0.0f32, 0.0, 0.0]);
-        let mut c = a.try_pow(&b).unwrap();
+        let c = a.try_pow(&b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -236,7 +255,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([2.0f32, 3.0, 4.0]);
         let b = Tensor::from_slice([1.0f32, 1.0, 1.0]);
-        let mut c = a.try_pow(&b).unwrap();
+        let c = a.try_pow(&b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -248,7 +267,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([4.0f32, 9.0, 16.0]);
         let b = Tensor::from_slice([0.5f32, 0.5, 0.5]);
-        let mut c = a.try_pow(&b).unwrap();
+        let c = a.try_pow(&b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -260,7 +279,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([-2.0f32, -3.0, -4.0]);
         let b = Tensor::from_slice([2.0f32, 2.0, 2.0]);
-        let mut c = a.try_pow(&b).unwrap();
+        let c = a.try_pow(&b).unwrap();
 
         c.realize_with(&config).unwrap();
         let result = c.as_vec::<f32>().unwrap();
@@ -278,7 +297,7 @@ crate::codegen_tests! {
         let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
         let c = Tensor::from_slice([2.0f32, 2.0, 2.0]);
 
-        let mut tmp = (&a + &b) * &c;
+        let tmp = ((&a + &b).unwrap() * &c).unwrap();
         tmp.realize_with(&config).unwrap();
         let result = tmp.as_vec::<f32>().unwrap();
         let expected = vec![10.0, 14.0, 18.0];
@@ -291,7 +310,7 @@ crate::codegen_tests! {
         let b = Tensor::from_slice([5.0f32, 6.0, 7.0]);
         let c = Tensor::from_slice([1.0f32, 1.0, 1.0]);
 
-        let mut tmp = &a * &b + &c;
+        let tmp = ((&a * &b).unwrap() + &c).unwrap();
         tmp.realize_with(&config).unwrap();
         let result = tmp.as_vec::<f32>().unwrap();
         let expected = vec![11.0, 19.0, 29.0];
@@ -304,7 +323,7 @@ crate::codegen_tests! {
         let b = Tensor::from_slice([2.0f32, 4.0, 6.0]);
         let c = Tensor::from_slice([2.0f32, 2.0, 2.0]);
 
-        let mut tmp = (&a - &b) / &c;
+        let tmp = ((&a - &b).unwrap() / &c).unwrap();
         tmp.realize_with(&config).unwrap();
         let result = tmp.as_vec::<f32>().unwrap();
         let expected = vec![4.0, 8.0, 12.0];
@@ -319,7 +338,7 @@ crate::codegen_tests! {
         let d = Tensor::from_slice([1.0f32, 2.0]);
         let e = Tensor::from_slice([3.0f32, 4.0]);
 
-        let mut tmp = ((&a + &b) * &c - &d).try_div(&e).unwrap();
+        let tmp = ((&a + &b).unwrap() * &c).unwrap().try_sub(&d).unwrap().try_div(&e).unwrap();
         tmp.realize_with(&config).unwrap();
         let result = tmp.as_vec::<f32>().unwrap();
         let expected = vec![7.0 / 3.0, 2.5];

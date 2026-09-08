@@ -1,7 +1,7 @@
 use svod_dtype::DType;
-use svod_tensor::{Tensor, Variable};
+use svod_tensor::Tensor;
+use svod_tensor::nn::Module;
 
-use crate::state::HasStateDict;
 use crate::yolo::{Yolo26Pose, YoloConfig, YoloScale};
 
 #[test]
@@ -25,11 +25,9 @@ fn state_dict_round_trip_pose() {
 fn forward_shape_pose() {
     let cfg = YoloConfig::new(YoloScale::Nano, 1);
     let model = Yolo26Pose::with_zero_weights(cfg);
-    let images = Tensor::zeros(&[1, 3, 320, 320], DType::Float32).unwrap();
-    let var = Variable::new("b", 1, 1);
-    let b = var.bind(1).unwrap();
-    let out = model.forward(&images, &b).unwrap();
-    let shape: Vec<usize> = out.shape().unwrap().iter().map(|s| s.as_const().or_else(|| s.vmax()).unwrap()).collect();
+    let images = Tensor::zeros(&[1, 3, 320, 320], DType::Float32);
+    let out = model.forward(&images).unwrap();
+    let shape = crate::test::max_dims(&out);
     // 4 + 1 + 51 = 56 (boxes + cls + 17*3 keypoints), 2100 anchors
     assert_eq!(shape, vec![1, 56, 2100]);
 }

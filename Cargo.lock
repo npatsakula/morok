@@ -3990,6 +3990,7 @@ dependencies = [
  "svod-device",
  "svod-dtype",
  "svod-ir",
+ "svod-macros",
  "svod-runtime",
  "svod-schedule",
  "tempfile",

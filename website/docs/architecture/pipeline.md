@@ -29,12 +29,11 @@ A `Tensor` in Svod is surprisingly lightweight:
 
 ```rust
 pub struct Tensor {
-    entry: Arc<TensorEntry>,      // Computation graph
-    buffer: Option<Arc<Buffer>>,  // Materialized data (if any)
+    entry: Arc<TensorEntry>,  // Computation graph + its realized buffer
 }
 ```
 
-The `entry` holds a `TensorEntry` containing the UOp graph—the computation this tensor represents. The `buffer` is optional: lazy tensors don't have one, only realized tensors do.
+The `entry` holds a `TensorEntry` containing the UOp graph—the computation this tensor represents—and the `OnceLock` buffer that realization fills in. A lazy tensor has no buffer yet; a realized one does, and because the buffer lives in the shared entry rather than in the handle, cloning a tensor shares its realization. That is why `realize()`, `prepare()` and `profile()` take `&self`.
 
 ### Three Ways to Create Tensors
 

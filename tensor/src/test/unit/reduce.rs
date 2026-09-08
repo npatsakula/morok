@@ -312,9 +312,9 @@ crate::codegen_tests! {
     /// element follows the NaN.
     fn test_min_and_max_ignore_nan_alike(config) {
         let x = Tensor::from_slice([3.0f32, f32::NAN, 5.0, 4.0]);
-        let mut min = x.min(0).unwrap();
+        let min = x.min(0).unwrap();
         min.realize_with(&config).unwrap();
-        let mut max = x.max(0).unwrap();
+        let max = x.max(0).unwrap();
         max.realize_with(&config).unwrap();
         assert_eq!((min.as_vec::<f32>().unwrap(), max.as_vec::<f32>().unwrap()), (vec![3.0], vec![5.0]));
     }
@@ -352,7 +352,7 @@ crate::codegen_tests! {
     fn test_sum_keepdim_value(config) {
         test_setup();
         let t = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
-        let mut result = t.sum_with().axes(1).keepdim(true).call().unwrap();
+        let result = t.sum_with().axes(1).keepdim(true).call().unwrap();
         let shape = result.shape().unwrap();
         assert_eq!(shape[0].as_const().unwrap(), 2);
         assert_eq!(shape[1].as_const().unwrap(), 1);
@@ -363,11 +363,11 @@ crate::codegen_tests! {
     fn test_sum_empty_axis_preserves_nonreduced_shape(config) {
         test_setup();
         let t = Tensor::empty(&[0, 3], DType::Float32);
-        let mut squeezed = t.sum(0).unwrap();
+        let squeezed = t.sum(0).unwrap();
         assert_eq!(squeezed.shape().unwrap().as_slice(), &[SInt::Const(3)]);
         assert_eq!(squeezed.realize_with_and(&config).as_vec::<f32>().unwrap(), [0.0; 3]);
 
-        let mut kept = t.sum_with().axes(0).keepdim(true).call().unwrap();
+        let kept = t.sum_with().axes(0).keepdim(true).call().unwrap();
         assert_eq!(kept.shape().unwrap().as_slice(), &[SInt::Const(1), SInt::Const(3)]);
         assert_eq!(kept.realize_with_and(&config).as_vec::<f32>().unwrap(), [0.0; 3]);
     }
@@ -448,23 +448,23 @@ crate::codegen_tests! {
         // Simplest test: compare two tensors
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([1.0f32, 5.0, 3.0]);
-        let mut eq = a.try_eq(&b).unwrap();
+        let eq = a.try_eq(&b).unwrap();
         assert_eq!(eq.realize_with_and(&config).as_vec::<bool>().unwrap(), [true, false, true], "Simple eq failed");
 
         // Test with broadcast
         let c = Tensor::from_slice([1.0f32, 2.0, 3.0, 2.0]);
         let two = Tensor::from_slice([2.0f32]);
         let two_broadcast = two.try_expand([4]).unwrap();
-        let mut eq2 = c.try_eq(&two_broadcast).unwrap();
+        let eq2 = c.try_eq(&two_broadcast).unwrap();
         // Expected: [false, true, false, true] (positions 1 and 3 equal 2)
         assert_eq!(eq2.realize_with_and(&config).as_vec::<bool>().unwrap(), [false, true, false, true], "Broadcast eq failed");
 
         // Test expand of reduction result
         let d = Tensor::from_slice([1.0f32, 5.0, 3.0, 2.0]);
-        let mut d_max = d.max_with().axes(0).keepdim(true).call().unwrap();
+        let d_max = d.max_with().axes(0).keepdim(true).call().unwrap();
         d_max.realize_with(&config).unwrap();
         let d_max_expanded = d_max.try_expand([4]).unwrap();
-        let mut eq3 = d.try_eq(&d_max_expanded).unwrap();
+        let eq3 = d.try_eq(&d_max_expanded).unwrap();
         // Expected: [false, true, false, false] (only position 1 equals 5)
         assert_eq!(eq3.realize_with_and(&config).as_vec::<bool>().unwrap(), [false, true, false, false], "Reduction expand eq failed");
     }
@@ -489,11 +489,11 @@ crate::codegen_tests! {
         assert_eq!(indices.clone().realize_with_and(&config).as_vec::<i32>().unwrap(), [5i32, 4, 3, 2, 1], "Indices mismatch");
 
         // Step 5: Cast to int32
-        let mask_int = mask.cast(DType::Int32).unwrap();
+        let mask_int = mask.cast(DType::Int32);
         // Expected: [0, 0, 0, 1, 0]
         assert_eq!(mask_int.clone().realize_with_and(&config).as_vec::<i32>().unwrap(), [0, 0, 0, 1, 0], "Mask int mismatch");
 
-        let indices_i32 = indices.cast(DType::Int32).unwrap();
+        let indices_i32 = indices.cast(DType::Int32);
         assert_eq!(indices_i32.clone().realize_with_and(&config).as_vec::<i32>().unwrap(), [5, 4, 3, 2, 1], "Indices int32 mismatch");
 
         // Step 6: Multiply mask by indices
@@ -509,7 +509,7 @@ crate::codegen_tests! {
         // Step 8: n - max_idx
         let n_tensor = Tensor::from_slice([axis_size]);
         let n_scalar = n_tensor.try_reshape(&[] as &[isize]).unwrap();
-        let mut result = n_scalar.try_sub(&max_idx).unwrap();
+        let result = n_scalar.try_sub(&max_idx).unwrap();
         // Expected: [3]
         assert_eq!(result.realize_with_and(&config).as_vec::<i32>().unwrap(), [3], "Final result mismatch");
     }
@@ -621,10 +621,10 @@ crate::codegen_tests! {
     // order; only a float32 accumulator keeps mean finite (= 100.0, cast back to f16).
     fn test_mean_float16_accumulates_in_float32(config) {
         test_setup();
-        let t = Tensor::from_slice(vec![100.0f32; 1024]).cast(DType::Float16).unwrap();
+        let t = Tensor::from_slice(vec![100.0f32; 1024]).cast(DType::Float16);
         let m = t.mean(()).unwrap();
         assert_eq!(m.uop().dtype(), DType::Float16, "mean must cast back to input dtype");
-        let v = m.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        let v = m.cast(DType::Float32).realize_with_and(&config).as_vec::<f32>().unwrap();
         assert!(v[0].is_finite(), "float16 mean overflowed to {} — accumulated in float16, not float32", v[0]);
         assert_close_f32(&v, &[100.0], 1e-2);
     }
@@ -633,10 +633,10 @@ crate::codegen_tests! {
     // float32 squared-deviation accumulation and the cast-back to float16.
     fn test_var_float16_value(config) {
         test_setup();
-        let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]).cast(DType::Float16).unwrap();
+        let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]).cast(DType::Float16);
         let v = t.var(()).unwrap();
         assert_eq!(v.uop().dtype(), DType::Float16, "var must cast back to input dtype");
-        let r = v.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        let r = v.cast(DType::Float32).realize_with_and(&config).as_vec::<f32>().unwrap();
         assert_close_f32(&r, &[2.5], 1e-2);
     }
 
@@ -646,16 +646,16 @@ crate::codegen_tests! {
     fn test_var_float16_large_n_stays_finite(config) {
         test_setup();
         let data: Vec<f32> = (0..16384).map(|i| if i % 2 == 0 { 3.0 } else { -3.0 }).collect();
-        let t = Tensor::from_slice(data).cast(DType::Float16).unwrap();
+        let t = Tensor::from_slice(data).cast(DType::Float16);
 
         let v = t.var_with().axes(()).correction(0).call().unwrap();
         assert_eq!(v.uop().dtype(), DType::Float16, "var must cast back to input dtype");
-        let v = v.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        let v = v.cast(DType::Float32).realize_with_and(&config).as_vec::<f32>().unwrap();
         assert!(v[0].is_finite(), "float16 var overflowed to {}", v[0]);
         assert_close_f32(&v, &[9.0], 1e-3);
 
         let s = t.std_with().axes(()).correction(0).call().unwrap();
-        let s = s.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        let s = s.cast(DType::Float32).realize_with_and(&config).as_vec::<f32>().unwrap();
         assert_close_f32(&s, &[3.0], 1e-3);
     }
 
@@ -664,10 +664,10 @@ crate::codegen_tests! {
     fn test_var_float16_near_constant_row(config) {
         test_setup();
         let data: Vec<f32> = (0..8192).map(|i| if i % 2 == 0 { 1004.0 } else { 996.0 }).collect();
-        let t = Tensor::from_slice(data).try_reshape([1, 8192]).unwrap().cast(DType::Float16).unwrap();
+        let t = Tensor::from_slice(data).try_reshape([1, 8192]).unwrap().cast(DType::Float16);
 
         let v = t.var_with().axes(1isize).correction(0).call().unwrap();
-        let v = v.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        let v = v.cast(DType::Float32).realize_with_and(&config).as_vec::<f32>().unwrap();
         assert!(v[0].is_finite(), "float16 var overflowed to {}", v[0]);
         assert_close_f32(&v, &[16.0], 1e-3);
     }
@@ -794,17 +794,17 @@ crate::codegen_tests! {
         let values = Tensor::from_slice([5.0f32, 3.0, 1.0, 4.0, 2.0]);
 
         // Test neg first - does it produce correct values?
-        let mut inverted = -values.clone();
+        let inverted = -values.clone();
         assert_close_f32(&inverted.realize_with_and(&config).as_vec::<f32>().unwrap(), &[-5.0, -3.0, -1.0, -4.0, -2.0], 1e-6);
 
         // Test max of explicit negated (should be -1.0)
         let inverted2 = Tensor::from_slice([-5.0f32, -3.0, -1.0, -4.0, -2.0]);
-        let mut max_inv = inverted2.max_with().axes(0).keepdim(false).call().unwrap();
+        let max_inv = inverted2.max_with().axes(0).keepdim(false).call().unwrap();
         assert_close_f32(&max_inv.realize_with_and(&config).as_vec::<f32>().unwrap(), &[-1.0], 1e-6);
 
         // Test argmax of explicit negated values
         let inverted3 = Tensor::from_slice([-5.0f32, -3.0, -1.0, -4.0, -2.0]);
-        let mut argmax_inv = inverted3.argmax(0).unwrap();
+        let argmax_inv = inverted3.argmax(0).unwrap();
         assert_eq!(argmax_inv.realize_with_and(&config).as_vec::<i32>().unwrap()[0], 2); // -1.0 is at index 2
     }
 
@@ -814,7 +814,7 @@ crate::codegen_tests! {
 
         // Test max of lazy negated values
         let inverted = -values.clone(); // lazy neg
-        let mut max_lazy = inverted.max(()).unwrap();
+        let max_lazy = inverted.max(()).unwrap();
         assert_close_f32(&max_lazy.realize_with_and(&config).as_vec::<f32>().unwrap(), &[-1.0], 1e-6);
     }
 
@@ -824,7 +824,7 @@ crate::codegen_tests! {
 
         // Chain neg and argmax LAZILY (like argmin does internally)
         let inverted = -values; // lazy neg
-        let mut argmax_lazy = inverted.argmax(0).unwrap(); // lazy argmax of lazy neg
+        let argmax_lazy = inverted.argmax(0).unwrap(); // lazy argmax of lazy neg
         assert_eq!(argmax_lazy.realize_with_and(&config).as_vec::<i32>().unwrap()[0], 2);
     }
 
@@ -837,13 +837,13 @@ crate::codegen_tests! {
         // Create indices tensor [5, 4, 3, 2, 1]
         let indices = Tensor::arange(5, Some(0), Some(-1)).unwrap();
 
-        let mut indices_i32 = indices.cast(DType::Int32).unwrap();
+        let indices_i32 = indices.cast(DType::Int32);
         assert_eq!(indices_i32.realize_with_and(&config).as_vec::<i32>().unwrap(), [5, 4, 3, 2, 1]);
     }
 
     fn test_hardmax_basic(config) {
         let x = Tensor::from_ndarray(&array![[1.0f32, 3.0, 2.0], [5.0, 4.0, 0.0]]);
-        let mut result = x.hardmax(-1).unwrap();
+        let result = x.hardmax(-1).unwrap();
         assert_eq!(result.realize_with_and(&config).as_vec::<f32>().unwrap(), [0.0, 1.0, 0.0, 1.0, 0.0, 0.0]);
     }
 
@@ -851,17 +851,17 @@ crate::codegen_tests! {
         // 9 x 50 overflows int8; the promoted int32 accumulator keeps it exact.
         let x = Tensor::from_slice([50i8; 9]);
 
-        let mut promoted = x.sum_with().axes(()).call().unwrap();
+        let promoted = x.sum_with().axes(()).call().unwrap();
         assert_eq!(promoted.uop().dtype(), DType::Int32);
         assert_eq!(promoted.realize_with_and(&config).as_vec::<i32>().unwrap(), [450]);
 
         // Explicit opt-out keeps the narrow accumulator (450 wraps to -62).
-        let mut narrow = x.sum_with().axes(()).promote(false).call().unwrap();
+        let narrow = x.sum_with().axes(()).promote(false).call().unwrap();
         assert_eq!(narrow.uop().dtype(), DType::Int8);
         assert_eq!(narrow.realize_with_and(&config).as_vec::<i8>().unwrap(), [-62]);
 
         // An explicit dtype still wins over the default promotion.
-        let mut explicit = x.sum_with().axes(()).dtype(DType::Int64).call().unwrap();
+        let explicit = x.sum_with().axes(()).dtype(DType::Int64).call().unwrap();
         assert_eq!(explicit.uop().dtype(), DType::Int64);
         assert_eq!(explicit.realize_with_and(&config).as_vec::<i64>().unwrap(), [450]);
     }
@@ -871,8 +871,8 @@ crate::codegen_tests! {
 fn test_sum_with_rejects_dtype_and_promote() {
     let x = Tensor::from_slice([1i8, 2, 3]);
     assert!(matches!(
-        x.sum_with().axes(()).dtype(DType::Int64).promote(true).call(),
-        Err(crate::Error::ConflictingReductionOptions)
+        x.sum_with().axes(()).dtype(DType::Int64).promote(true).call().map_err(crate::error::Error::into_kind),
+        Err(crate::ErrorKind::ConflictingReductionOptions)
     ));
 }
 

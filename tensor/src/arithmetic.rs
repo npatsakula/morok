@@ -20,35 +20,36 @@ const fn op_name(name: &'static str) -> &'static str {
 /// Unified macro for implementing Tensor operations.
 ///
 /// Automatically handles:
-/// - Binary operations (with `other` parameter): Always use Result path
-/// - Unary operations with `@infallible` marker: Wrap in Ok()
-/// - Unary operations without marker: Use Result path
+/// - Binary operations: scalar-or-tensor rhs, broadcasting, `Result` path
+/// - `unary_infallible`: plain `Tensor` return
+/// - `unary_fallible`: `Result` path
 macro_rules! impl_tensor_ops {
     (
         binary { $($bin_method:ident => $bin_uop:ident),* $(,)? }
         unary_infallible { $($inf_method:ident => $inf_uop:ident),* $(,)? }
         unary_fallible { $($fall_method:ident => $fall_uop:ident),* $(,)? }
     ) => {
-        // Binary operations (with automatic broadcasting)
+        // Binary operations (scalar or tensor rhs, with automatic broadcasting)
         $(
             #[track_caller]
-            pub fn $bin_method(&self, other: &Tensor) -> Result<Tensor> {
+            pub fn $bin_method<'o>(&self, other: impl Into<Operand<'o>>) -> Result<Tensor> {
                 let _origin = OriginScope::outer_call(op_name(stringify!($bin_method)), Location::caller());
 
-                // Broadcast tensors to common shape
-                let (lhs, rhs) = self.broadcast_for_binop(other)?;
+                // Materialize a scalar rhs in self's dtype, then broadcast to a common shape
+                let other = self.operand(other);
+                let (lhs, rhs) = self.broadcast_for_binop(&other)?;
 
                 // Now call UOp operation with matching shapes
-                lhs.uop().$bin_uop(&rhs.uop()).map(Self::new).context(UOpSnafu)
+                lhs.uop().$bin_uop(&rhs.uop()).map(Self::new).context(UOpSnafu).map_err(Into::into)
             }
         )*
 
         // Unary infallible operations
         $(
             #[track_caller]
-            pub fn $inf_method(&self) -> Result<Tensor> {
+            pub fn $inf_method(&self) -> Tensor {
                 let _origin = OriginScope::outer_call(op_name(stringify!($inf_method)), Location::caller());
-                Ok(Self::new(self.uop().$inf_uop()))
+                Self::new(self.uop().$inf_uop())
             }
         )*
 
@@ -57,7 +58,7 @@ macro_rules! impl_tensor_ops {
             #[track_caller]
             pub fn $fall_method(&self) -> Result<Tensor> {
                 let _origin = OriginScope::outer_call(op_name(stringify!($fall_method)), Location::caller());
-                self.uop().$fall_uop().map(Self::new).context(UOpSnafu)
+                self.uop().$fall_uop().map(Self::new).context(UOpSnafu).map_err(Into::into)
             }
         )*
     };
@@ -87,8 +88,8 @@ impl Tensor {
             try_shr => try_shr_op,
         }
         unary_infallible {
-            try_neg => neg,
-            try_abs => abs,
+            neg => neg,
+            abs => abs,
         }
         unary_fallible {
             try_sqrt => try_sqrt,
@@ -116,25 +117,8 @@ impl Tensor {
     #[track_caller]
     pub fn logical_not(&self) -> Result<Tensor> {
         origin_call!("logical_not");
-        use svod_dtype::DType;
-
-        // Cast to bool (non-zero becomes true)
-        let as_bool = self.cast(DType::Bool)?;
-
-        // Create true constant tensor and broadcast to match shape
-        let true_scalar = Self::from_slice([true]);
-        let self_shape = as_bool.shape()?;
-
-        let true_broadcast = if self_shape.is_empty() {
-            // Input is scalar - reshape [1] to []
-            true_scalar.try_reshape(&[] as &[isize])?
-        } else {
-            // Broadcast to match non-scalar shape
-            true_scalar.broadcast_to(&self_shape)?
-        };
-
-        // Compare: !x ≡ (x != true)
-        as_bool.try_ne(&true_broadcast)
+        // !x ≡ (x != true), with the constant broadcast by the binop itself.
+        self.cast(svod_dtype::DType::Bool).try_ne(true)
     }
 
     /// Bitwise NOT for integer tensors.
@@ -154,30 +138,12 @@ impl Tensor {
     #[track_caller]
     pub fn bitwise_not(&self) -> Result<Tensor> {
         origin_call!("bitwise_not");
-
-        // Verify dtype is integer
         let dtype = self.uop().dtype();
-        if !dtype.is_int() {
-            return Err(Error::SymbolicShapeUnsupported {
-                operation: format!("bitwise_not on non-integer dtype {:?}", dtype),
-            });
-        }
-
-        // Bitwise NOT using two's complement: ~x = -x - 1
-        let negated = self.try_neg()?;
-        let one_scalar = Self::from_slice([1i32]).cast(dtype)?;
-
-        // Broadcast one to match self shape
-        let self_shape = self.shape()?;
-
-        let one_broadcast = if self_shape.is_empty() {
-            // Input is scalar - reshape [1] to []
-            one_scalar.try_reshape(&[] as &[isize])?
-        } else {
-            // Broadcast to match non-scalar shape
-            one_scalar.broadcast_to(&self_shape)?
-        };
-
-        negated.try_sub(&one_broadcast)
+        snafu::ensure!(
+            dtype.is_int(),
+            SymbolicShapeUnsupportedSnafu { operation: format!("bitwise_not on non-integer dtype {dtype:?}") }
+        );
+        // Two's complement: ~x = -x - 1.
+        self.neg().try_sub(1)
     }
 }

@@ -6,9 +6,9 @@
 
 use std::path::Path;
 
-use snafu::ResultExt;
+use svod_tensor::nn::Module;
 
-use crate::state::{self, HasStateDict, StateDict};
+use crate::state::{self, StateDict};
 
 use super::config::{ModelDimensions, WhisperSize};
 use super::error::{Error, Result};
@@ -37,21 +37,13 @@ impl Whisper {
                 .ok_or_else(|| Error::State { source: state::Error::MissingKey { key: weight_key.clone() } })?;
             // The scale is per output channel: reshape to `[out, 1, ..]` so it
             // broadcasts along the weight's input (and kernel) axes.
-            let shape = weight.shape().context(super::error::TensorSnafu)?;
+            let shape = weight.shape()?;
             let mut scale_shape = vec![1isize; shape.len()];
             scale_shape[0] = shape[0].as_const().ok_or_else(|| Error::Checkpoint {
                 msg: format!("quantized weight {weight_key} has a symbolic output dimension"),
             })? as isize;
-            let scale = scale
-                .cast(dtype.clone())
-                .context(super::error::TensorSnafu)?
-                .try_reshape(scale_shape)
-                .context(super::error::TensorSnafu)?;
-            let dequantized = weight
-                .cast(dtype.clone())
-                .context(super::error::TensorSnafu)?
-                .try_mul(&scale)
-                .context(super::error::TensorSnafu)?;
+            let scale = scale.cast(dtype.clone()).try_reshape(scale_shape)?;
+            let dequantized = weight.cast(dtype.clone()).try_mul(&scale)?;
             remapped.insert(weight_key, dequantized);
         }
         let mut sd = state::cast_all(&remapped, dtype);
@@ -61,7 +53,7 @@ impl Whisper {
             }
         }
         let mut model = Self::empty(dims);
-        model.load_state_dict(&sd, "").map_err(|e| Error::State { source: e })?;
+        model.load_state_dict(&sd, "")?;
         Ok(model)
     }
 

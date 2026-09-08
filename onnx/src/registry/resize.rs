@@ -114,15 +114,8 @@ fn resize_nearest(
         return Ok(x.clone());
     }
 
-    let shape = x.shape()?;
-    let input_shape: Vec<usize> = resized
-        .iter()
-        .map(|&i| {
-            shape[dims[i]]
-                .as_const()
-                .ok_or_else(|| Error::IrConstruction { details: "resize on a symbolic spatial dim".into() })
-        })
-        .collect::<Result<_>>()?;
+    let input_shape: Vec<usize> =
+        resized.iter().map(|&i| x.dim_const(dims[i] as isize)).collect::<std::result::Result<_, _>>()?;
 
     // `sizes` wins over `scales` when both are present, per the ONNX spec.
     let (output_sizes, out_scales): (Vec<usize>, Vec<f64>) = match &sizes {
@@ -182,14 +175,14 @@ fn resize_nearest(
     // extrapolation value instead of the (clamped) edge pixel.
     if !masks.is_empty() {
         let out_shape = out.shape()?.to_vec();
-        let extrap = Tensor::const_(extrapolation_value, out.uop().dtype());
+        let extrap = Tensor::const_(extrapolation_value, out.dtype());
         let mut combined: Option<Tensor> = None;
         for (dim, valid) in masks {
             let mut mask_shape = vec![1isize; ndim];
             mask_shape[dim] = valid.len() as isize;
             let mask = Tensor::from_slice(&valid).try_reshape(&mask_shape)?.try_expand(out_shape.clone())?;
             combined = Some(match combined {
-                Some(c) => c.bitwise_and(&mask)?,
+                Some(c) => c.try_bitand(&mask)?,
                 None => mask,
             });
         }

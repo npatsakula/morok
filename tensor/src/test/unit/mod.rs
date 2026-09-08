@@ -1,3 +1,4 @@
+pub mod accessors;
 pub mod activation;
 pub mod arithmetic;
 pub mod batch;
@@ -16,6 +17,7 @@ pub mod indexing;
 pub mod math;
 pub mod matmul;
 pub mod nn;
+pub mod operand;
 pub mod origin;
 pub mod origin_carriage;
 pub mod profile;
@@ -32,6 +34,15 @@ pub mod transformer;
 pub mod triangular;
 pub mod variable;
 
+mod attention_helpers;
+mod jit;
+mod layers;
+mod module;
+mod nn_affine;
+mod reduce_symbolic;
+mod rnn_v2;
 pub mod scatter_debug;
 pub mod schedule;
 pub mod schedule_cache;
+mod shape_helpers;
+mod stft;

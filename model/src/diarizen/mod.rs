@@ -10,7 +10,6 @@ mod error;
 mod jit;
 mod model;
 mod powerset;
-mod remap;
 mod segment;
 
 pub use config::{DiariZenConfig, chunk_plan, hop_samples, powerset_class_count, powerset_table, window_samples};
@@ -22,5 +21,4 @@ pub use error::{Error, Result};
 pub use jit::DiariZenSegmentationJit;
 pub use model::{DiariZenSegmentationModel, ForwardIntermediates};
 pub use powerset::powerset_to_multilabel;
-pub use remap::split_diarizen_state_dict;
 pub use segment::{DiariZenSegmenter, SegmentOutput, SlidingWindow};

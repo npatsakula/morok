@@ -12,32 +12,25 @@ mod attention;
 mod config;
 mod decoder_layer;
 mod embedder;
-mod embeddings;
 mod error;
 mod feed_forward;
 mod jit;
 mod model;
 mod reranker;
-mod rms_norm;
-mod rotary;
 
 pub use attention::Qwen3Attention;
 pub use config::{Qwen3Config, qwen3_embedding_0_6b};
 pub use decoder_layer::Qwen3DecoderLayer;
 pub use embedder::Qwen3Embedding;
-pub use embeddings::Qwen3Embeddings;
 pub use error::{Error, Result};
 pub use feed_forward::Qwen3MLP;
 pub use jit::{Qwen3EmbeddingJit, Qwen3RerankerJit};
 pub use model::Qwen3Model;
 pub use reranker::Qwen3Reranker;
-pub use rms_norm::RmsNormWeights;
-pub use rotary::RotaryTable;
 
 use std::path::PathBuf;
 
 use crate::hub::HubRepo;
-use snafu::ResultExt;
 
 /// Download all safetensors weight files from a HuggingFace repo into the
 /// hub cache and return the cache directory containing them.
@@ -51,7 +44,7 @@ pub(crate) fn download_safetensors(repo: &HubRepo) -> Result<PathBuf> {
     }
 
     // Multi-shard: parse the index to discover shard filenames.
-    let index_path = repo.get("model.safetensors.index.json").context(error::HubSnafu)?;
+    let index_path = repo.get("model.safetensors.index.json")?;
     let dir = index_path.parent().expect("non-root cache dir").to_path_buf();
 
     // The index file is already downloaded. But we need to ensure all shard
@@ -62,7 +55,7 @@ pub(crate) fn download_safetensors(repo: &HubRepo) -> Result<PathBuf> {
         .map_err(|e| Error::Config { message: format!("parsing safetensors index: {e}") })?;
 
     for shard in index.unique_shards() {
-        repo.get(&shard).context(error::HubSnafu)?;
+        repo.get(&shard)?;
     }
 
     Ok(dir)

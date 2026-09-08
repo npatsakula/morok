@@ -44,7 +44,7 @@ svod_tensor::codegen_tests! {
         let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Add", "", &[a, b], &node).unwrap();
+        let result = registry.dispatch("Add", "", &[a, b], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
@@ -54,7 +54,7 @@ svod_tensor::codegen_tests! {
         let x = Tensor::from_slice([-2.0f32, -1.0, 0.0, 1.0, 2.0]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Abs", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Abs", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
@@ -65,7 +65,7 @@ svod_tensor::codegen_tests! {
         let b = Tensor::from_slice([1.0f32, 0.0, 3.0]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Equal", "", &[a, b], &node).unwrap();
+        let result = registry.dispatch("Equal", "", &[a, b], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
@@ -77,7 +77,7 @@ svod_tensor::codegen_tests! {
         let y = Tensor::from_slice([10.0f32, 20.0, 30.0]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Where", "", &[condition, x, y], &node).unwrap();
+        let result = registry.dispatch("Where", "", &[condition, x, y], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
@@ -91,7 +91,7 @@ svod_tensor::codegen_tests! {
         let node = NodeProto::default();
 
         let result = registry.dispatch_multi("Max", "", &inputs, &node, i64::MAX).unwrap();
-        let mut r = result[0].clone();
+        let r = result[0].clone();
         r.realize_with(&config).unwrap();
         let vals = r.as_vec::<f32>().unwrap();
         assert_eq!(vals, vec![3.0, 5.0]);
@@ -104,7 +104,7 @@ svod_tensor::codegen_tests! {
         let node = NodeProto::default();
 
         let result = registry.dispatch_multi("Max", "", &inputs, &node, i64::MAX).unwrap();
-        let mut r = result[0].clone();
+        let r = result[0].clone();
         r.realize_with(&config).unwrap();
         let vals = r.as_vec::<f32>().unwrap();
         assert_eq!(vals, vec![7.0, 3.0]);
@@ -119,7 +119,7 @@ svod_tensor::codegen_tests! {
         let node = NodeProto::default();
 
         let result = registry.dispatch_multi("Min", "", &inputs, &node, i64::MAX).unwrap();
-        let mut r = result[0].clone();
+        let r = result[0].clone();
         r.realize_with(&config).unwrap();
         let vals = r.as_vec::<f32>().unwrap();
         assert_eq!(vals, vec![1.0, 1.0]);
@@ -132,7 +132,7 @@ svod_tensor::codegen_tests! {
         let delta = Tensor::from_slice([1.5f32]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Range", "", &[start, limit, delta], &node).unwrap();
+        let result = registry.dispatch("Range", "", &[start, limit, delta], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         assert_eq!(vals, vec![0.0, 1.5, 3.0, 4.5]);
@@ -145,7 +145,7 @@ svod_tensor::codegen_tests! {
         let delta = Tensor::from_slice([1i32]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Range", "", &[start, limit, delta], &node).unwrap();
+        let result = registry.dispatch("Range", "", &[start, limit, delta], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<i32>().unwrap();
         assert_eq!(vals, vec![0, 1, 2, 3, 4]);
@@ -161,12 +161,9 @@ svod_tensor::codegen_tests! {
             let y = Tensor::from_slice(ys).try_reshape(y_shape).unwrap();
             let node = NodeProto { attribute: vec![make_attr_int("fmod", fmod)], ..Default::default() };
 
-            let mut result = registry.dispatch("Mod", "", &[x, y], &node).unwrap();
+            let result = registry.dispatch("Mod", "", &[x, y], &node).unwrap();
             result.realize_with(&config).unwrap();
-            assert_eq!(
-                result.uop().shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect::<Vec<_>>(),
-                vec![3, 4]
-            );
+            assert_eq!(result.dims().unwrap(), vec![3, 4]);
             let expected = xs
                 .iter()
                 .enumerate()
@@ -179,7 +176,7 @@ svod_tensor::codegen_tests! {
         let node = NodeProto { attribute: vec![make_attr_int("fmod", 1)], ..Default::default() };
         let lhs = Tensor::from_slice(ys);
         let rhs = Tensor::from_slice(xs).try_reshape([3isize, 4]).unwrap();
-        let mut result = registry.dispatch("Mod", "", &[lhs, rhs], &node).unwrap();
+        let result = registry.dispatch("Mod", "", &[lhs, rhs], &node).unwrap();
         result.realize_with(&config).unwrap();
         let expected = xs.iter().enumerate().map(|(i, x)| ys[i % 4] % x).collect::<Vec<_>>();
         assert_eq!(result.as_vec::<i32>().unwrap(), expected);
@@ -191,7 +188,7 @@ svod_tensor::codegen_tests! {
         let b = Tensor::from_slice([true, false, true, false]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("And", "", &[a, b], &node).unwrap();
+        let result = registry.dispatch("And", "", &[a, b], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<bool>().unwrap();
         assert_eq!(vals, vec![true, false, false, false]);
@@ -203,7 +200,7 @@ svod_tensor::codegen_tests! {
         let b = Tensor::from_slice([true, false, true, false]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Or", "", &[a, b], &node).unwrap();
+        let result = registry.dispatch("Or", "", &[a, b], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<bool>().unwrap();
         assert_eq!(vals, vec![true, true, true, false]);
@@ -215,7 +212,7 @@ svod_tensor::codegen_tests! {
         let b = Tensor::from_slice([true, false, true, false]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Xor", "", &[a, b], &node).unwrap();
+        let result = registry.dispatch("Xor", "", &[a, b], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<bool>().unwrap();
         assert_eq!(vals, vec![false, true, true, false]);
@@ -226,7 +223,7 @@ svod_tensor::codegen_tests! {
         let x = Tensor::from_slice([1.0f32, f32::NAN, 3.0]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("IsNaN", "", &[x], &node).unwrap();
+        let result = registry.dispatch("IsNaN", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<bool>().unwrap();
         assert_eq!(vals, vec![false, true, false]);
@@ -237,7 +234,7 @@ svod_tensor::codegen_tests! {
         let x = Tensor::from_slice([1.0f32, f32::INFINITY, f32::NEG_INFINITY]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("IsInf", "", &[x], &node).unwrap();
+        let result = registry.dispatch("IsInf", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
@@ -247,7 +244,7 @@ svod_tensor::codegen_tests! {
         let x = Tensor::from_slice([-2.0f32, -0.3, 0.0, 0.3, 2.0]);
         let node = NodeProto::default();
 
-        let mut result = registry.dispatch("Shrink", "", &[x], &node).unwrap();
+        let result = registry.dispatch("Shrink", "", &[x], &node).unwrap();
         result.realize_with(&config).unwrap();
         let vals = result.as_vec::<f32>().unwrap();
         let expected = [-2.0f32, 0.0, 0.0, 0.0, 2.0];

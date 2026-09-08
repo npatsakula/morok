@@ -35,7 +35,7 @@ impl Tensor {
     pub fn randn_like_with_dtype(&self, dtype: DType) -> Result<Tensor> {
         origin_call!("randn_like");
         let shape = to_vec_usize(&self.shape()?).context(UOpSnafu)?;
-        Tensor::randn(&shape)?.cast(dtype)
+        Ok(Tensor::randn(&shape)?.cast(dtype))
     }
 
     /// Standard normal `N(0, 1)` random tensor with the same shape/dtype/device as `self`.
@@ -55,6 +55,6 @@ impl Tensor {
         origin_call!("randint_like");
         let shape = to_vec_usize(&self.shape()?).context(UOpSnafu)?;
         let r = Tensor::randint(&shape, low, high)?;
-        if r.uop().dtype() == self.uop().dtype() { Ok(r) } else { r.cast(self.uop().dtype()) }
+        Ok(if r.uop().dtype() == self.uop().dtype() { r } else { r.cast(self.uop().dtype()) })
     }
 }

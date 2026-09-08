@@ -47,14 +47,14 @@ fn read_prefix_f32(t: &Tensor, len: usize) -> Vec<f32> {
 fn test_output_length_matches_forward() {
     let model = GigaAm::with_random_weights(test_config());
 
-    let x = Tensor::full(&[1, 100, 64], 0.0f32, DType::Float32).unwrap();
+    let x = Tensor::full(&[1, 100, 64], 0.0f32, DType::Float32);
     let out = model.encoder.subsampling.forward(&x).unwrap();
-    let actual_t = out.shape().unwrap()[1].as_const().unwrap();
+    let actual_t = out.dim_const(1).unwrap();
     assert_eq!(model.encoder.subsampling_output_length(100), actual_t);
 
-    let x2 = Tensor::full(&[1, 50, 64], 0.0f32, DType::Float32).unwrap();
+    let x2 = Tensor::full(&[1, 50, 64], 0.0f32, DType::Float32);
     let out2 = model.encoder.subsampling.forward(&x2).unwrap();
-    let actual_t2 = out2.shape().unwrap()[1].as_const().unwrap();
+    let actual_t2 = out2.dim_const(1).unwrap();
     assert_eq!(model.encoder.subsampling_output_length(50), actual_t2);
 }
 
@@ -63,8 +63,8 @@ fn test_rope_cache_uses_encoder_bound() {
     let model = model_with_random_weights();
     let cfg = test_config();
 
-    assert_eq!(model.encoder.cos_cache.shape().unwrap()[0].as_const().unwrap(), cfg.max_encoder_frames);
-    assert_eq!(model.encoder.sin_cache.shape().unwrap()[0].as_const().unwrap(), cfg.max_encoder_frames);
+    assert_eq!(model.encoder.cos_cache.dim_const(0).unwrap(), cfg.max_encoder_frames);
+    assert_eq!(model.encoder.sin_cache.dim_const(0).unwrap(), cfg.max_encoder_frames);
     assert_ne!(cfg.max_encoder_frames, cfg.max_mel_frames);
 }
 
@@ -79,8 +79,9 @@ fn test_rope_cache_uses_pos_emb_max_len_as_base() {
     let angle = pos as f32 / (cfg.max_encoder_frames as f32).powf(2.0 * freq_idx as f32 / d_k as f32);
     let flat_idx = pos * half_d + freq_idx;
 
-    let cos = model.encoder.cos_cache.as_vec::<f32>().unwrap();
-    let sin = model.encoder.sin_cache.as_vec::<f32>().unwrap();
+    // The cache is a graph (`Tensor::rope_table`), not a host array: realize it.
+    let cos = model.encoder.cos_cache.to_vec::<f32>().unwrap();
+    let sin = model.encoder.sin_cache.to_vec::<f32>().unwrap();
 
     assert!((cos[flat_idx] - angle.cos()).abs() < 1e-6);
     assert!((sin[flat_idx] - angle.sin()).abs() < 1e-6);
@@ -111,10 +112,10 @@ fn test_encode_batch_near_max_mel_runs() {
     let cfg = test_config();
     let t = cfg.max_mel_frames;
 
-    let x = Tensor::full(&[1, cfg.n_mels, t], 0.1f32, DType::Float32).unwrap();
+    let x = Tensor::full(&[1, cfg.n_mels, t], 0.1f32, DType::Float32);
     let lengths = Tensor::from_slice([t as i32]);
 
-    let mut out = model.encoder.forward_batch(&x, &lengths).unwrap();
+    let out = model.encoder.forward_batch(&x, &lengths).unwrap();
     out.realize().unwrap();
     assert!(out.buffer().unwrap().size() > 0);
 }
@@ -128,23 +129,23 @@ fn test_single_vs_batch_consistency() {
     let t = 10;
     let t_sub = model.encoder.subsampling_output_length(t);
 
-    let x1 = Tensor::full(&[1, n_mels, t], 0.5f32, DType::Float32).unwrap();
-    let x2 = Tensor::full(&[1, n_mels, t], 0.3f32, DType::Float32).unwrap();
+    let x1 = Tensor::full(&[1, n_mels, t], 0.5f32, DType::Float32);
+    let x2 = Tensor::full(&[1, n_mels, t], 0.3f32, DType::Float32);
     let lengths_single = Tensor::from_slice([t as i32]);
 
-    let mut out1 = model.encoder.forward_batch(&x1, &lengths_single).unwrap();
+    let out1 = model.encoder.forward_batch(&x1, &lengths_single).unwrap();
     out1.realize().unwrap();
     let data1 = read_prefix_f32(&out1, d * t_sub);
 
-    let mut out2 = model.encoder.forward_batch(&x2, &lengths_single).unwrap();
+    let out2 = model.encoder.forward_batch(&x2, &lengths_single).unwrap();
     out2.realize().unwrap();
     let data2 = read_prefix_f32(&out2, d * t_sub);
 
     let batch = {
-        let mut x1r = x1.clone();
+        let x1r = x1.clone();
         x1r.realize().unwrap();
         let d1 = x1r.as_vec::<f32>().unwrap();
-        let mut x2r = x2.clone();
+        let x2r = x2.clone();
         x2r.realize().unwrap();
         let d2 = x2r.as_vec::<f32>().unwrap();
         let mut batch_data = vec![0.0f32; 2 * n_mels * t];
@@ -155,7 +156,7 @@ fn test_single_vs_batch_consistency() {
     let batch_tensor = Tensor::from_ndarray(&batch);
     let batch_lengths = Tensor::from_slice([t as i32, t as i32]);
 
-    let mut batch_out = model.encoder.forward_batch(&batch_tensor, &batch_lengths).unwrap();
+    let batch_out = model.encoder.forward_batch(&batch_tensor, &batch_lengths).unwrap();
     batch_out.realize().unwrap();
     let batch_data = read_prefix_f32(&batch_out, 2 * d * t_sub);
 
@@ -199,7 +200,7 @@ fn test_ragged_batch_keeps_full_lane_isolated_and_finite() {
     // Lane A (full length) run alone.
     let xa =
         Tensor::from_ndarray(&ndarray::Array3::from_shape_vec((1, n_mels, t_full), lane(0.5, t_full, t_full)).unwrap());
-    let mut solo_a = model.encoder.forward_batch(&xa, &Tensor::from_slice([t_full as i32])).unwrap();
+    let solo_a = model.encoder.forward_batch(&xa, &Tensor::from_slice([t_full as i32])).unwrap();
     solo_a.realize().unwrap();
     let solo_a = read_prefix_f32(&solo_a, d * t_sub_full);
 
@@ -209,7 +210,7 @@ fn test_ragged_batch_keeps_full_lane_isolated_and_finite() {
     bd[..n_mels * t_full].copy_from_slice(&lane(0.5, t_full, t_full));
     bd[n_mels * t_full..].copy_from_slice(&lane(0.3, t_short, t_full));
     let batch = Tensor::from_ndarray(&ndarray::Array3::from_shape_vec((2, n_mels, t_full), bd).unwrap());
-    let mut out = model.encoder.forward_batch(&batch, &Tensor::from_slice([t_full as i32, t_short as i32])).unwrap();
+    let out = model.encoder.forward_batch(&batch, &Tensor::from_slice([t_full as i32, t_short as i32])).unwrap();
     out.realize().unwrap();
     let all = read_prefix_f32(&out, 2 * d * t_sub_full);
 
@@ -227,10 +228,10 @@ fn test_encode_batch_full_lengths_finite() {
     let cfg = test_config();
     let t = 256usize;
 
-    let x = Tensor::full(&[2, cfg.n_mels, t], 0.1f32, DType::Float32).unwrap();
+    let x = Tensor::full(&[2, cfg.n_mels, t], 0.1f32, DType::Float32);
     let lengths = Tensor::from_slice([t as i32, t as i32]);
 
-    let mut out = model.encoder.forward_batch(&x, &lengths).unwrap();
+    let out = model.encoder.forward_batch(&x, &lengths).unwrap();
     out.realize().unwrap();
 
     let buf = out.buffer().unwrap();
@@ -291,11 +292,11 @@ fn encoder_forward_fa_eligible_finite() {
     let t_sub = model.encoder.subsampling_output_length(t);
     assert_eq!(t_sub, 128, "expected T_sub=128 for FA tile eligibility, got {t_sub}");
 
-    let x = Tensor::full(&[2, cfg.n_mels, t], 0.1f32, DType::Float32).unwrap();
+    let x = Tensor::full(&[2, cfg.n_mels, t], 0.1f32, DType::Float32);
     // Lane 0 partially valid (mel 300 -> shorter T_sub), lane 1 fully valid.
     let lengths = Tensor::from_slice([300i32, t as i32]);
 
-    let mut out = model.encoder.forward_batch(&x, &lengths).unwrap();
+    let out = model.encoder.forward_batch(&x, &lengths).unwrap();
     out.realize().unwrap();
 
     let buf = out.buffer().unwrap();

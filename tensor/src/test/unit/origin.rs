@@ -41,7 +41,7 @@ fn a_binary_op_records_the_caller_site() {
     let b = Tensor::from_slice([3.0f32, 4.0]);
 
     let line = line!() + 1;
-    let c = &a + &b;
+    let c = (&a + &b).unwrap();
 
     let calls: Vec<_> = calls(&c).into_iter().collect();
     assert_eq!(calls.len(), 1, "one public entry point, one frame: {calls:?}");
@@ -57,7 +57,7 @@ fn a_binary_op_records_the_caller_site() {
 fn capture_is_off_by_default() {
     let _capture = origin::capture_for_thread(false);
     let a = Tensor::from_slice([1.0f32, 2.0]);
-    let c = &a + &a;
+    let c = (&a + &a).unwrap();
     assert!(calls(&c).is_empty());
     assert!(c.uop().toposort().iter().all(|node| node.origin().is_none()));
 }
@@ -89,7 +89,8 @@ fn a_call_frame_nests_under_the_enclosing_module() {
         &a * &b
     };
 
-    let leaf = c.uop().toposort().iter().find_map(|node| node.origin()).expect("the product carries an origin");
+    let leaf =
+        c.unwrap().uop().toposort().iter().find_map(|node| node.origin()).expect("the product carries an origin");
     let rendered = origin::path(leaf);
     assert!(rendered.starts_with("encoder.layers.0 @ mul "), "unexpected path {rendered}");
 }
@@ -145,7 +146,7 @@ fn mask(shape: &[usize]) -> Tensor {
 #[test_case("permute", &|| operand(&[2, 3]).try_permute(&[1, 0]).unwrap() ; "permute")]
 #[test_case("pad", &|| operand(&[2, 3]).try_pad(&[(1, 1), (0, 0)]).unwrap() ; "pad")]
 #[test_case("cat", &|| Tensor::cat(&[&operand(&[2, 3]), &operand(&[2, 3])], 0).unwrap() ; "cat")]
-#[test_case("where", &|| operand(&[2, 3]).where_(&mask(&[2, 3]), &operand(&[2, 3])).unwrap() ; "where_op")]
+#[test_case("where", &|| operand(&[2, 3]).where_(&mask(&[2, 3]), operand(&[2, 3])).unwrap() ; "where_op")]
 #[test_case("exp", &|| operand(&[2, 3]).try_exp().unwrap() ; "exp")]
 #[test_case("sigmoid", &|| operand(&[2, 3]).sigmoid().unwrap() ; "sigmoid")]
 #[test_case("relu", &|| operand(&[2, 3]).relu().unwrap() ; "relu")]
@@ -160,7 +161,7 @@ fn mask(shape: &[usize]) -> Tensor {
         .unwrap()
 } ; "sdpa")]
 #[test_case("arange", &|| Tensor::arange(4, None, None).unwrap() ; "arange")]
-#[test_case("full", &|| Tensor::full(&[2, 2], 1.0f64, DType::Float32).unwrap() ; "full")]
+#[test_case("full", &|| Tensor::full(&[2, 2], 1.0f64, DType::Float32) ; "full")]
 #[test_case("matmul", &|| operand(&[2, 3]).matmul(&operand(&[3, 2])).unwrap() ; "matmul")]
 fn a_public_op_records_exactly_one_frame(op: &str, build: &dyn Fn() -> Tensor) {
     let _capture = origin::capture_for_thread(true);

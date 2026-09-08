@@ -110,7 +110,7 @@ fn test_remap_conv_batchnorm() {
     assert!(out.contains_key("layers.0.conv.bn_scale"));
     assert!(out.contains_key("layers.0.conv.bn_bias"));
     assert!(out.contains_key("layers.0.conv.bn_mean"));
-    assert!(out.contains_key("layers.0.conv.bn_invstd"));
+    assert!(out.contains_key("layers.0.conv.bn_var"));
     assert!(!out.contains_key("layers.0.conv.conv_norm.weight"));
     assert!(!out.contains_key("layers.0.conv.batch_norm.num_batches_tracked"));
 }

@@ -13,7 +13,7 @@ crate::codegen_tests! {
     fn test_rms_norm_basic(config) {
         // rms_norm(x) = x * rsqrt(mean(x^2) + eps)
         let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0, 4.0]]);
-        let mut result = x.rms_norm(-1, 1e-5).unwrap();
+        let result = x.rms_norm(-1, 1e-5).unwrap();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 4]);
@@ -29,7 +29,7 @@ crate::codegen_tests! {
     fn test_rms_norm_axis(config) {
         // (2, 3), normalize over last axis
         let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-        let mut result = x.rms_norm(-1, 1e-5).unwrap();
+        let result = x.rms_norm(-1, 1e-5).unwrap();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[2, 3]);
@@ -54,7 +54,7 @@ crate::codegen_tests! {
         let weight = Tensor::from_ndarray(&Array2::from_shape_vec((3, 4), weight_data).unwrap());
         // Indices: [2, 0] -> should return rows 2 and 0
         let indices = Tensor::from_slice([2i32, 0]);
-        let mut result = weight.embedding(&indices).unwrap();
+        let result = weight.embedding(&indices).unwrap();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[2, 4]);
@@ -71,7 +71,7 @@ crate::codegen_tests! {
         let weight = Tensor::from_ndarray(&array![[0.0f32, 1.0], [2.0, 3.0], [4.0, 5.0], [6.0, 7.0]]);
         // Indices: [2, 3] (batch=2, seq=3)
         let indices = Tensor::from_ndarray(&array![[0i32, 1, 2], [3, 2, 1]]);
-        let mut result = weight.embedding(&indices).unwrap();
+        let result = weight.embedding(&indices).unwrap();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[2, 3, 2]);
@@ -95,7 +95,7 @@ crate::codegen_tests! {
         let k = q.clone();
         let v = Tensor::from_ndarray(&array![[[[1.0f32, 2.0], [3.0, 4.0]]]]);
 
-        let mut result = q.scaled_dot_product_attention().key(&k).value(&v).call().unwrap();
+        let result = q.scaled_dot_product_attention().key(&k).value(&v).call().unwrap();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 1, 2, 2]);
@@ -108,7 +108,7 @@ crate::codegen_tests! {
         let k = q.clone();
         let v = Tensor::from_ndarray(&array![[[[1.0f32, 0.0], [0.0, 1.0], [0.0, 0.0]]]]);
 
-        let mut result = q.scaled_dot_product_attention().key(&k).value(&v).is_causal(true).call().unwrap();
+        let result = q.scaled_dot_product_attention().key(&k).value(&v).is_causal(true).call().unwrap();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 1, 3, 2]);
@@ -124,7 +124,7 @@ crate::codegen_tests! {
         let v = Tensor::from_ndarray(&array![[[[1.0f32, 0.0], [0.0, 1.0]]]]);
 
         // With softcap, large scores get capped via tanh
-        let mut result = q.scaled_dot_product_attention().key(&k).value(&v).softcap(1.0).call().unwrap();
+        let result = q.scaled_dot_product_attention().key(&k).value(&v).softcap(1.0).call().unwrap();
         result.realize_with(&config).unwrap();
         // Should still produce valid output (no NaN/Inf)
         for val in result.as_vec::<f32>().unwrap() {
@@ -140,7 +140,7 @@ crate::codegen_tests! {
         let k = q.clone();
         let v = Tensor::from_ndarray(&array![[[[1.0f32], [100.0]]]]);
 
-        let mut result = q
+        let result = q
             .scaled_dot_product_attention()
             .key(&k)
             .value(&v)
@@ -161,13 +161,13 @@ crate::codegen_tests! {
         let q_data: Vec<f32> = vec![100.0; 2 * 64];
         let mut k_data: Vec<f32> = vec![100.0; 64];
         k_data.extend(std::iter::repeat_n(99.0f32, 64));
-        let q = Tensor::from_slice(q_data).try_reshape([1, 1, 2, 64]).unwrap().cast(DType::Float16).unwrap();
-        let k = Tensor::from_slice(k_data).try_reshape([1, 1, 2, 64]).unwrap().cast(DType::Float16).unwrap();
-        let v = Tensor::from_slice([1.0f32, 100.0]).try_reshape([1, 1, 2, 1]).unwrap().cast(DType::Float16).unwrap();
+        let q = Tensor::from_slice(q_data).try_reshape([1, 1, 2, 64]).unwrap().cast(DType::Float16);
+        let k = Tensor::from_slice(k_data).try_reshape([1, 1, 2, 64]).unwrap().cast(DType::Float16);
+        let v = Tensor::from_slice([1.0f32, 100.0]).try_reshape([1, 1, 2, 1]).unwrap().cast(DType::Float16);
 
         let result = q.scaled_dot_product_attention().key(&k).value(&v).call().unwrap();
         assert_eq!(result.uop().dtype(), DType::Float16, "output must keep the query dtype");
-        let mut result = result.cast(DType::Float32).unwrap();
+        let result = result.cast(DType::Float32);
         result.realize_with(&config).unwrap();
         // Key 0 wins by 800 in score, so every query reads V[0] = 1.0.
         for value in result.as_vec::<f32>().unwrap() {
@@ -183,7 +183,7 @@ crate::codegen_tests! {
         // True means masked, False means visible.
         let mask = Tensor::from_ndarray(&array![[[[true, false]]]]);
 
-        let mut result = q
+        let result = q
             .scaled_dot_product_attention()
             .key(&k)
             .value(&v)
@@ -203,7 +203,7 @@ crate::codegen_tests! {
         let v = Tensor::from_ndarray(&array![[[[10.0f32, 1.0], [1.0, 10.0]]]]);
         let mask = Tensor::from_ndarray(&array![[[[true, true]]]]);
 
-        let mut result = q
+        let result = q
             .scaled_dot_product_attention()
             .key(&k)
             .value(&v)
@@ -222,7 +222,7 @@ crate::codegen_tests! {
         let v = Tensor::from_ndarray(&array![[[[10.0f32, 1.0], [1.0, 10.0]]]]);
         let mask = Tensor::from_ndarray(&array![[[[true, true], [true, true]]]]);
 
-        let mut result = q
+        let result = q
             .scaled_dot_product_attention()
             .key(&k)
             .value(&v)
@@ -249,19 +249,19 @@ crate::codegen_tests! {
             Ok(_) => panic!("expected query dtype error"),
             Err(err) => err,
         };
-        assert!(matches!(err_q, crate::Error::FloatDTypeRequired { arg: "query", .. }));
+        assert!(matches!(err_q.kind(), crate::ErrorKind::FloatDTypeRequired { arg: "query", .. }));
 
         let err_k = match qf.scaled_dot_product_attention().key(&ki).value(&vf).call() {
             Ok(_) => panic!("expected key dtype error"),
             Err(err) => err,
         };
-        assert!(matches!(err_k, crate::Error::FloatDTypeRequired { arg: "key", .. }));
+        assert!(matches!(err_k.kind(), crate::ErrorKind::FloatDTypeRequired { arg: "key", .. }));
 
         let err_v = match qf.scaled_dot_product_attention().key(&kf).value(&vi).call() {
             Ok(_) => panic!("expected value dtype error"),
             Err(err) => err,
         };
-        assert!(matches!(err_v, crate::Error::FloatDTypeRequired { arg: "value", .. }));
+        assert!(matches!(err_v.kind(), crate::ErrorKind::FloatDTypeRequired { arg: "value", .. }));
     }
 
     fn test_sdpa_window_masks_far_keys(config) {
@@ -273,7 +273,7 @@ crate::codegen_tests! {
         let k = q.clone();
         let v = Tensor::from_ndarray(&array![[[[0.0f32], [10.0], [20.0], [30.0]]]]);
 
-        let mut result = q
+        let result = q
             .scaled_dot_product_attention()
             .key(&k)
             .value(&v)
@@ -299,7 +299,7 @@ crate::codegen_tests! {
         let k = q.clone();
         let v = Tensor::from_ndarray(&array![[[[0.0f32], [10.0], [20.0], [30.0]]]]);
 
-        let mut result = q
+        let result = q
             .scaled_dot_product_attention()
             .key(&k)
             .value(&v)
@@ -329,7 +329,7 @@ crate::codegen_tests! {
             [[[false, true, true, true], [false, false, true, true], [false, false, true, true], [false, false, true, true]]]
         ]);
 
-        let mut result = q
+        let result = q
             .scaled_dot_product_attention()
             .key(&k)
             .value(&v)
@@ -356,7 +356,7 @@ crate::codegen_tests! {
         let cos = Tensor::from_ndarray(&array![[[1.0f32, 0.0]]]);
         let sin = Tensor::from_ndarray(&array![[[0.0f32, 0.0]]]);
 
-        let mut result = x.apply_rotary_emb(&cos, &sin, false).unwrap();
+        let result = x.apply_rotary_emb(&cos, &sin, false).unwrap();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 1, 4]);
@@ -381,7 +381,7 @@ crate::codegen_tests! {
         let cos = Tensor::from_ndarray(&array![[[1.0f32, 1.0]]]);
         let sin = Tensor::from_ndarray(&array![[[0.0f32, 0.0]]]);
 
-        let mut result = x.apply_rotary_emb(&cos, &sin, true).unwrap();
+        let result = x.apply_rotary_emb(&cos, &sin, true).unwrap();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 1, 4]);
@@ -401,7 +401,7 @@ crate::codegen_tests! {
         let cos = Tensor::from_ndarray(&array![[[0.0f32, 0.0]]]);
         let sin = Tensor::from_ndarray(&array![[[1.0f32, 1.0]]]);
 
-        let mut result = x.apply_rotary_emb(&cos, &sin, false).unwrap();
+        let result = x.apply_rotary_emb(&cos, &sin, false).unwrap();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         // x1 = [1, 0], x2 = [0, 1]
@@ -450,12 +450,12 @@ impl SdpaCase {
         build: impl Fn(&Tensor, &Tensor, &Tensor, &Tensor) -> Tensor,
     ) -> Vec<f32> {
         svod_dtype::default_device::with_default_device(device, || {
-            let realized = |mut x: Tensor| {
+            let realized = |x: Tensor| {
                 x.realize_with(inputs).unwrap();
                 x
             };
             let heads = |seed: usize| {
-                realized(Tensor::from_ndarray(&self.sample(seed)).cast(DType::Float16).unwrap())
+                realized(Tensor::from_ndarray(&self.sample(seed)).cast(DType::Float16))
                     .try_permute(&[0, 2, 1, 3])
                     .unwrap()
             };
@@ -463,7 +463,7 @@ impl SdpaCase {
             let lens = realized(Tensor::from_ndarray(&ndarray::Array1::from(self.key_lens())))
                 .try_reshape([self.b, 1, 1, 1])
                 .unwrap();
-            let mut out = build(&q, &k, &v, &lens);
+            let out = build(&q, &k, &v, &lens);
             out.realize_with(config).unwrap();
             out.as_vec::<f32>().unwrap()
         })
@@ -527,7 +527,6 @@ fn test_sdpa_cuda_masked_f16_matches_cpu(beam: bool) {
             .try_permute(&[0, 2, 1, 3])
             .unwrap()
             .cast(DType::Float32)
-            .unwrap()
     };
     let cpu = PrepareConfig::for_cpu_backend(CpuBackend::Llvm);
     let expected = case.run(DeviceSpec::Cpu, &cpu, &cpu, build);
@@ -571,8 +570,8 @@ fn test_sdpa_scores_cuda_tc_warp_with_three_locals_matches_cpu() {
         let keep = case.key_mask(lens).logical_not().unwrap();
         let kt = k.try_transpose(-1, -2).unwrap();
         let scores = q.matmul_with().other(&kt).dtype(DType::Float32).call().unwrap();
-        let scores = scores.try_mul(&Tensor::const_(0.125f64, DType::Float32)).unwrap();
-        scores.where_(&keep, &Tensor::const_(ConstValue::min(ScalarDType::Float32), DType::Float32)).unwrap()
+        let scores = scores.try_mul(Tensor::const_(0.125f64, DType::Float32)).unwrap();
+        scores.where_(&keep, Tensor::const_(ConstValue::min(ScalarDType::Float32), DType::Float32)).unwrap()
     };
     let cpu = PrepareConfig::for_cpu_backend(CpuBackend::Llvm);
     let expected = case.run(DeviceSpec::Cpu, &cpu, &cpu, build);

@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use svod_tensor::{Tensor, Variable};
+use svod_tensor::Tensor;
 
 use crate::state::StateDict;
 use crate::state::load_safetensors;
@@ -31,7 +31,7 @@ fn resolve_file(name: &str) -> PathBuf {
 }
 
 fn load_golden_vec<T: Clone + Default + svod_dtype::ext::HasDType>(sd: &StateDict, key: &str) -> Vec<T> {
-    let mut t = sd.get(key).unwrap_or_else(|| panic!("missing golden key: {key}")).clone();
+    let t = sd.get(key).unwrap_or_else(|| panic!("missing golden key: {key}")).clone();
     t.realize().unwrap();
     t.as_vec::<T>().unwrap()
 }
@@ -61,9 +61,7 @@ fn detect_output_matches_pytorch() {
         .try_reshape(image_shape.iter().map(|&d| d as isize).collect::<Vec<_>>())
         .unwrap();
 
-    let var = Variable::new("b", 1, 1);
-    let b = var.bind(1).unwrap();
-    let mut out = model.forward(&images, &b).expect("forward");
+    let out = model.forward(&images).expect("forward");
     out.realize().unwrap();
 
     let got = out.as_vec::<f32>().unwrap();

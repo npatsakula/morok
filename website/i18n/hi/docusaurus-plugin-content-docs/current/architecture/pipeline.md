@@ -29,12 +29,11 @@ Svod में `Tensor` काफ़ी हल्का होता है:
 
 ```rust
 pub struct Tensor {
-    entry: Arc<TensorEntry>,      // Computation graph
-    buffer: Option<Arc<Buffer>>,  // Materialized data (if any)
+    entry: Arc<TensorEntry>,  // Computation graph + its realized buffer
 }
 ```
 
-`entry` में `TensorEntry` होता है जिसमें UOp ग्राफ़ है — वो कम्प्यूटेशन जो यह tensor रिप्रेज़ेंट करता है। `buffer` ऑप्शनल है: lazy tensor के पास नहीं होता, सिर्फ़ realized tensor के पास होता है।
+`entry` में `TensorEntry` होता है जिसमें UOp ग्राफ़ है — वो कम्प्यूटेशन जो यह tensor रिप्रेज़ेंट करता है — और वो `OnceLock` बफ़र जिसे realization भरता है। Lazy tensor के पास अभी बफ़र नहीं होता; realized के पास होता है, और चूँकि बफ़र हैंडल में नहीं बल्कि शेयर्ड entry में रहता है, इसलिए tensor को clone करने पर उसका realization भी शेयर होता है। इसीलिए `realize()`, `prepare()` और `profile()` `&self` लेते हैं।
 
 ### Tensor बनाने के तीन तरीके
 

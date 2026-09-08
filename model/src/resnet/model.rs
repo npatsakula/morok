@@ -17,38 +17,40 @@
 
 use std::path::Path;
 
-use snafu::ResultExt;
 use svod_dtype::DType;
-use svod_ir::SInt;
-use svod_tensor::{BoundVariable, Tensor};
+use svod_tensor::Tensor;
+use svod_tensor::nn::{BatchNorm2d, Conv2d, Layer, Linear, Module};
 
-use crate::blocks::{BatchNormWeights, Conv2dWeights, ResidualStage, remap};
-use crate::init::fan_in_uniform;
-use crate::state::{self, HasStateDict, StateDict, get_tensor};
+use crate::blocks::{ResidualStage, batchnorm2d, conv2d};
+use crate::init::{Bias, linear};
+use crate::state::{self, StateDict};
 
 use super::config::{OutputMode, ResNetConfig, ResNetDepth};
-use super::error::{HubSnafu, Result, StateSnafu, TensorSnafu};
+use super::error::Result;
 
 /// Image classification / feature backbone. Construct via one of the loaders
 /// ([`ResNet::from_hub`], [`ResNet::from_safetensors`], or
 /// [`ResNet::from_state_dict`]) — the empty-tensor placeholders in the layer
 /// structs are not usable until weights are loaded.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct ResNet {
+    #[module(skip)]
     pub config: ResNetConfig,
-    stem_conv: Conv2dWeights,
-    stem_bn: BatchNormWeights,
+    #[module(key = "conv1")]
+    stem_conv: Conv2d,
+    #[module(key = "bn1")]
+    stem_bn: BatchNorm2d,
+    #[module(key = "layer1")]
     stage1: ResidualStage,
+    #[module(key = "layer2")]
     stage2: ResidualStage,
+    #[module(key = "layer3")]
     stage3: ResidualStage,
+    #[module(key = "layer4")]
     stage4: ResidualStage,
-    head: Option<HeadWeights>,
-}
-
-#[derive(Clone)]
-struct HeadWeights {
-    weight: Tensor,
-    bias: Tensor,
+    /// Present only in [`OutputMode::Classification`].
+    #[module(key = "fc")]
+    head: Option<Linear>,
 }
 
 impl ResNet {
@@ -71,18 +73,15 @@ impl ResNet {
         let head = match &config.output {
             OutputMode::Classification { num_classes } => {
                 let fan_in = 512 * expansion;
-                Some(HeadWeights {
-                    weight: fan_in_uniform(&[*num_classes, fan_in], fan_in, DType::Float32),
-                    bias: fan_in_uniform(&[*num_classes], fan_in, DType::Float32),
-                })
+                Some(linear(fan_in, *num_classes, Bias::FanIn, DType::Float32))
             }
             OutputMode::Features => None,
         };
 
         Self {
             config,
-            stem_conv: Conv2dWeights::empty(64, 3, 7, 2, 3),
-            stem_bn: BatchNormWeights::empty(64),
+            stem_conv: conv2d(64, 3, 7, 2, 3),
+            stem_bn: batchnorm2d(64),
             stage1,
             stage2,
             stage3,
@@ -114,36 +113,24 @@ impl ResNet {
         depth: ResNetDepth,
         output: OutputMode,
     ) -> Result<Self> {
-        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
-        let weights_path = repo.get("model.safetensors").context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open(model_id, revision)?;
+        let weights_path = repo.get("model.safetensors")?;
         Self::from_safetensors(&weights_path, depth, output)
     }
 
     /// Load from a local `model.safetensors`. The file must use the timm /
     /// torchvision key layout (see the module-level docs for the keys).
     pub fn from_safetensors(path: &Path, depth: ResNetDepth, output: OutputMode) -> Result<Self> {
-        let sd = state::load_safetensors(path).context(StateSnafu)?;
+        let sd = state::load_safetensors(path)?;
         Self::from_state_dict(&sd, ResNetConfig::new(depth, output))
     }
 
-    /// Build from a preloaded state dict. Runs [`remap::fold_batchnorm`] first
-    /// to translate `running_var` keys into `invstd` keys (and compute the
-    /// value transform) and drop `num_batches_tracked` — the loaded layer
-    /// structs read directly from the post-fold layout.
+    /// Build from a preloaded state dict in the timm / torchvision layout. The
+    /// keys are PyTorch's own, `num_batches_tracked` included — it is simply
+    /// not read.
     pub fn from_state_dict(sd: &StateDict, config: ResNetConfig) -> Result<Self> {
-        let sd = remap::fold_batchnorm(sd.clone())?;
         let mut model = Self::with_zero_weights(config);
-        model.stem_conv.load_state_dict(&sd, "conv1").context(StateSnafu)?;
-        model.stem_bn.load_state_dict(&sd, "bn1").context(StateSnafu)?;
-        model.stage1.load_state_dict(&sd, "layer1").context(StateSnafu)?;
-        model.stage2.load_state_dict(&sd, "layer2").context(StateSnafu)?;
-        model.stage3.load_state_dict(&sd, "layer3").context(StateSnafu)?;
-        model.stage4.load_state_dict(&sd, "layer4").context(StateSnafu)?;
-
-        if let Some(head) = model.head.as_mut() {
-            head.weight = get_tensor(&sd, "fc.weight").context(StateSnafu)?;
-            head.bias = get_tensor(&sd, "fc.bias").context(StateSnafu)?;
-        }
+        model.load_state_dict(sd, "")?;
         Ok(model)
     }
 
@@ -151,23 +138,12 @@ impl ResNet {
     // Forward
     // -----------------------------------------------------------------------
 
-    /// Run the full network on `images` `[max_b, 3, H, W]`, shrunk to the
-    /// `batch` variable's bound value before the stem. Returns either
+    /// Run the full network on `images` `[B, 3, H, W]`. Returns either
     /// classification logits `[B, num_classes]` or the final feature map
-    /// `[B, 512*exp, H/32, W/32]`, depending on
-    /// [`ResNetConfig::output`].
-    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        let b = batch.as_sint();
-
-        let x = images.try_shrink([Some((SInt::Const(0), b)), None, None, None]).context(TensorSnafu)?;
-        let x = self.stem_bn.forward(&self.stem_conv.forward(&x)?)?.relu().context(TensorSnafu)?;
-        let x = x
-            .max_pool2d()
-            .kernel_size(&[3, 3])
-            .stride(&[2, 2])
-            .padding(&[(1, 1), (1, 1)])
-            .call()
-            .context(TensorSnafu)?;
+    /// `[B, 512*exp, H/32, W/32]`, depending on [`ResNetConfig::output`].
+    pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let x = self.stem_bn.forward(&self.stem_conv.forward(images)?)?.relu()?;
+        let x = x.max_pool2d().kernel_size(&[3, 3]).stride(&[2, 2]).padding(&[(1, 1), (1, 1)]).call()?;
 
         let x = self.stage1.forward(&x)?;
         let x = self.stage2.forward(&x)?;
@@ -177,40 +153,10 @@ impl ResNet {
         match (&self.head, &self.config.output) {
             (Some(fc), OutputMode::Classification { .. }) => {
                 // Global average pool over the two spatial axes.
-                let pooled = x.mean_with().axes(vec![2isize, 3]).keepdim(false).call().context(TensorSnafu)?;
-                pooled.linear().weight(&fc.weight).bias(&fc.bias).call().context(TensorSnafu)
+                let pooled = x.mean_with().axes(vec![2isize, 3]).keepdim(false).call()?;
+                Ok(fc.forward(&pooled)?)
             }
             _ => Ok(x),
         }
-    }
-}
-
-impl HasStateDict for ResNet {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.stem_conv.state_dict(&state::prefixed(prefix, "conv1"));
-        sd.extend(self.stem_bn.state_dict(&state::prefixed(prefix, "bn1")));
-        sd.extend(self.stage1.state_dict(&state::prefixed(prefix, "layer1")));
-        sd.extend(self.stage2.state_dict(&state::prefixed(prefix, "layer2")));
-        sd.extend(self.stage3.state_dict(&state::prefixed(prefix, "layer3")));
-        sd.extend(self.stage4.state_dict(&state::prefixed(prefix, "layer4")));
-        if let Some(head) = &self.head {
-            sd.insert(state::prefixed(prefix, "fc.weight"), head.weight.clone());
-            sd.insert(state::prefixed(prefix, "fc.bias"), head.bias.clone());
-        }
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.stem_conv.load_state_dict(sd, &state::prefixed(prefix, "conv1"))?;
-        self.stem_bn.load_state_dict(sd, &state::prefixed(prefix, "bn1"))?;
-        self.stage1.load_state_dict(sd, &state::prefixed(prefix, "layer1"))?;
-        self.stage2.load_state_dict(sd, &state::prefixed(prefix, "layer2"))?;
-        self.stage3.load_state_dict(sd, &state::prefixed(prefix, "layer3"))?;
-        self.stage4.load_state_dict(sd, &state::prefixed(prefix, "layer4"))?;
-        if let Some(head) = self.head.as_mut() {
-            head.weight = get_tensor(sd, &state::prefixed(prefix, "fc.weight"))?;
-            head.bias = get_tensor(sd, &state::prefixed(prefix, "fc.bias"))?;
-        }
-        Ok(())
     }
 }

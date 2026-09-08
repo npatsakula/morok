@@ -1,7 +1,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::Module;
 
-use crate::state::HasStateDict;
 use crate::wavlm::{FeatureExtractor, wavlm_base, wavlm_large_s80_md};
 
 /// On `(1, 256000)` waveform, the s80-md-v2 feature extractor produces
@@ -13,10 +13,10 @@ fn s80_md_v2_feature_extractor_shape() {
     let fe = FeatureExtractor::empty(&cfg);
 
     let n_samples = 256_000;
-    let wav = Tensor::zeros(&[1, n_samples], DType::Float32).unwrap();
+    let wav = Tensor::zeros(&[1, n_samples], DType::Float32);
     let out = fe.forward(&wav).expect("symbolic forward");
 
-    let shape: Vec<usize> = out.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let shape = out.dims().unwrap();
     let expected_t = fe.num_frames(n_samples);
     assert_eq!(shape, vec![1, expected_t, 211]);
 

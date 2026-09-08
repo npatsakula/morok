@@ -21,7 +21,7 @@ use svod_ir::{CustomFunctionKind, Op, UOp};
 use tracing::{debug, trace};
 
 use crate::error::*;
-use crate::{Error, Result};
+use crate::{ErrorKind, Result};
 use snafu::ResultExt;
 use svod_ir::ops;
 
@@ -101,17 +101,19 @@ fn validate_mselect_bounds(items: &[PreScheduleItem]) -> Result<()> {
             reach.walk(source, |node| {
                 let Op::MSelect(ops::MSelect { buffer, device_index }) = node.op() else { return Ok(()) };
                 let Op::MStack(ops::MStack { buffers }) = buffer.op() else {
-                    return Err(Error::MultiUnsupportedForm {
+                    return Err(ErrorKind::MultiUnsupportedForm {
                         call_id: item.kernel.id,
                         details: format!("MSELECT {} must select from an explicit MSTACK", node.id),
-                    });
+                    }
+                    .into());
                 };
                 if *device_index >= buffers.len() {
-                    return Err(Error::MultiSelectOutOfBounds {
+                    return Err(ErrorKind::MultiSelectOutOfBounds {
                         source_id: node.id,
                         device_index: *device_index,
                         lane_count: buffers.len(),
-                    });
+                    }
+                    .into());
                 }
                 Ok(())
             })?;
@@ -140,46 +142,49 @@ fn device_lane_binding(call_id: u64, ast_nodes: &[Arc<UOp>], lane_count: Option<
         return Ok(false);
     }
     let Some(lane_count) = lane_count else {
-        return Err(Error::MultiUnsupportedForm {
+        return Err(ErrorKind::MultiUnsupportedForm {
             call_id,
             details: "DEVICE launch binding requires aligned MSTACK arguments".into(),
-        });
+        }
+        .into());
     };
     if marker_count != 1 {
-        return Err(Error::MultiUnsupportedForm {
+        return Err(ErrorKind::MultiUnsupportedForm {
             call_id,
             details: format!("expected exactly one DEVICE launch marker, found {marker_count}"),
-        });
+        }
+        .into());
     }
 
     let extent = if let Some(range) = device_ranges.first() {
         let Op::Range(ops::Range { end, .. }) = range.op() else { unreachable!() };
         let (Some(vmin), Some(vmax)) = (end.vmin().try_int(), end.vmax().try_int()) else {
-            return Err(Error::MultiDeviceExtentNotStatic { call_id });
+            return Err(ErrorKind::MultiDeviceExtentNotStatic { call_id }.into());
         };
         if vmin != vmax {
-            return Err(Error::MultiDeviceExtentNotStatic { call_id });
+            return Err(ErrorKind::MultiDeviceExtentNotStatic { call_id }.into());
         }
         vmin
     } else {
         let Op::Param(ops::Param { arg, .. }) = device_params[0].op() else { unreachable!() };
         let Some((vmin, vmax)) = &arg.vmin_vmax else {
-            return Err(Error::MultiDeviceExtentNotStatic { call_id });
+            return Err(ErrorKind::MultiDeviceExtentNotStatic { call_id }.into());
         };
         let (Some(vmin), Some(vmax)) = (vmin.0.try_int(), vmax.0.try_int()) else {
-            return Err(Error::MultiDeviceExtentNotStatic { call_id });
+            return Err(ErrorKind::MultiDeviceExtentNotStatic { call_id }.into());
         };
         if vmin != 0 {
-            return Err(Error::MultiUnsupportedForm {
+            return Err(ErrorKind::MultiUnsupportedForm {
                 call_id,
                 details: format!("_device_num bounds must start at zero, got {vmin}..={vmax}"),
-            });
+            }
+            .into());
         }
-        vmax.checked_add(1).ok_or(Error::MultiDeviceExtentNotStatic { call_id })?
+        vmax.checked_add(1).ok_or(ErrorKind::MultiDeviceExtentNotStatic { call_id })?
     };
 
     if extent != lane_count as i64 {
-        return Err(Error::MultiDeviceExtentMismatch { call_id, expected: lane_count, actual: extent });
+        return Err(ErrorKind::MultiDeviceExtentMismatch { call_id, expected: lane_count, actual: extent }.into());
     }
     Ok(true)
 }
@@ -202,11 +207,17 @@ fn expand_multi_sources(
     for (source_index, source) in sources.iter().enumerate() {
         let Op::MStack(ops::MStack { buffers }) = source.op() else { continue };
         if buffers.is_empty() {
-            return Err(Error::MultiEmptyLanes { call_id, source_index });
+            return Err(ErrorKind::MultiEmptyLanes { call_id, source_index }.into());
         }
         if let Some(expected) = lane_count {
             if buffers.len() != expected {
-                return Err(Error::MultiLaneCountMismatch { call_id, source_index, expected, actual: buffers.len() });
+                return Err(ErrorKind::MultiLaneCountMismatch {
+                    call_id,
+                    source_index,
+                    expected,
+                    actual: buffers.len(),
+                }
+                .into());
             }
         } else {
             lane_count = Some(buffers.len());
@@ -222,10 +233,11 @@ fn expand_multi_sources(
         _ => ast,
     };
     if matches!(effect.op(), Op::Slice(..)) {
-        return Err(Error::MultiUnsupportedForm {
+        return Err(ErrorKind::MultiUnsupportedForm {
             call_id,
             details: "SLICE calls cannot be expanded across lanes".into(),
-        });
+        }
+        .into());
     }
 
     let mut lanes = vec![Vec::with_capacity(sources.len()); lane_count];
@@ -234,13 +246,14 @@ fn expand_multi_sources(
             Op::MStack(ops::MStack { buffers }) => {
                 for (lane, buffer) in buffers.iter().enumerate() {
                     if buffer.toposort().iter().any(|node| matches!(node.op(), Op::Slice(..))) {
-                        return Err(Error::MultiLaneSliceAlias { call_id, source_index, lane });
+                        return Err(ErrorKind::MultiLaneSliceAlias { call_id, source_index, lane }.into());
                     }
                     if matches!(buffer.op(), Op::MStack(..)) {
-                        return Err(Error::MultiUnsupportedForm {
+                        return Err(ErrorKind::MultiUnsupportedForm {
                             call_id,
                             details: format!("MSTACK source {source_index} lane {lane} is a nested MSTACK"),
-                        });
+                        }
+                        .into());
                     }
                     lanes[lane].push(buffer.clone());
                 }
@@ -251,12 +264,12 @@ fn expand_multi_sources(
                 }
             }
             other => {
-                return Err(Error::MultiUnsupportedForm {
+                return Err(ErrorKind::MultiUnsupportedForm {
                     call_id,
                     details: format!(
                         "source {source_index} is {other:?}; every non-scalar CALL argument must be an MSTACK when any argument is multi"
                     ),
-                });
+                }.into());
             }
         }
     }
@@ -279,6 +292,7 @@ fn collect_callable_dep_ids(dep: &Arc<UOp>, out: &mut HashSet<u64>) -> Result<()
                     details: format!("AFTER dependency END must wrap CALL, got {:?}", computation.op()),
                 }
                 .fail()
+                .map_err(Into::into)
             }
         }
         Op::Store(..) => Ok(()),
@@ -291,7 +305,8 @@ fn collect_callable_dep_ids(dep: &Arc<UOp>, out: &mut HashSet<u64>) -> Result<()
         other => IrConstructionSnafu {
             details: format!("AFTER dependency must be CALL/END(CALL)/STORE/AFTER, got {other:?}"),
         }
-        .fail(),
+        .fail()
+        .map_err(Into::into),
     }
 }
 
@@ -302,7 +317,8 @@ fn split_after_dependencies(after: &Arc<UOp>) -> Result<AfterDependencySplit> {
         return IrConstructionSnafu {
             details: format!("expected AFTER when splitting dependencies, got {:?}", after.op()),
         }
-        .fail();
+        .fail()
+        .map_err(Into::into);
     };
 
     let mut kernels = Vec::new();
@@ -319,7 +335,8 @@ fn split_after_dependencies(after: &Arc<UOp>) -> Result<AfterDependencySplit> {
                 return IrConstructionSnafu {
                     details: format!("AFTER dependency must be CALL/END(CALL)/STORE/AFTER, got {other:?}"),
                 }
-                .fail();
+                .fail()
+                .map_err(Into::into);
             }
         }
     }
@@ -351,7 +368,8 @@ fn collect_source_dependency_callable_ids(src: &Arc<UOp>, out: &mut HashSet<u64>
         other => IrConstructionSnafu {
             details: format!("input to callable must resolve to AFTER/BUFFER/PARAM/MSELECT/MSTACK/BIND, got {other:?}"),
         }
-        .fail(),
+        .fail()
+        .map_err(Into::into),
     }
 }
 
@@ -385,7 +403,7 @@ fn collect_scheduled_range_ids(root: &Arc<UOp>, callable_ids: &HashSet<u64>) -> 
 
 fn collect_call_bound_ranges(callable: &Arc<UOp>, scheduled_range_ids: &HashSet<u64>) -> Result<Vec<BoundRangeRef>> {
     let Op::Call(ops::Call { args, .. }) = callable.op() else {
-        return ExpectedCallableOpSnafu.fail();
+        return ExpectedCallableOpSnafu.fail().map_err(Into::into);
     };
 
     let mut bound_ranges = Vec::new();
@@ -400,13 +418,14 @@ fn collect_call_bound_ranges(callable: &Arc<UOp>, scheduled_range_ids: &HashSet<
         let name = match var.op() {
             Op::DefineVar(ops::DefineVar { name, .. }) => name,
             Op::Param(ops::Param { arg, .. }) if arg.addrspace.is_none() => arg.name.as_ref().ok_or_else(|| {
-                Error::IrConstruction { details: "CALL BIND scalar PARAM source must have a name".to_string() }
+                ErrorKind::IrConstruction { details: "CALL BIND scalar PARAM source must have a name".to_string() }
             })?,
             _ => {
                 return IrConstructionSnafu {
                     details: format!("CALL BIND Range source must wrap a variable, got {:?}", var.op()),
                 }
-                .fail();
+                .fail()
+                .map_err(Into::into);
             }
         };
         // Only Ranges paired with an `END(Call)` are schedule-level wrappers;
@@ -450,7 +469,8 @@ fn collect_linear_sched_ops_internal(
                                 wrapper_ranges.len()
                             ),
                         }
-                        .fail();
+                        .fail()
+                        .map_err(Into::into);
                     }
                 }
             }
@@ -460,7 +480,8 @@ fn collect_linear_sched_ops_internal(
 
     if linear_ops.is_empty() {
         return IrConstructionSnafu { details: "strict scheduler produced empty linear control stream".to_string() }
-            .fail();
+            .fail()
+            .map_err(Into::into);
     }
     Ok(linear_ops)
 }
@@ -501,7 +522,8 @@ fn collect_kernel_invocations(
     for &rid in &declared_ranges {
         if !ended_ranges.contains(&rid) {
             return IrConstructionSnafu { details: format!("schedule range {rid} is missing END in strict scheduler") }
-                .fail();
+                .fail()
+                .map_err(Into::into);
         }
     }
     for item in items {
@@ -513,7 +535,8 @@ fn collect_kernel_invocations(
                         item.kernel.id, br.var_name, br.range_uop.id
                     ),
                 }
-                .fail();
+                .fail()
+                .map_err(Into::into);
             }
         }
     }
@@ -544,7 +567,8 @@ fn collect_kernel_invocations(
                     return IrConstructionSnafu {
                         details: format!("linear END references unknown CALL id {kernel_id}"),
                     }
-                    .fail();
+                    .fail()
+                    .map_err(Into::into);
                 }
                 let (_, vmax) = if let Some(bounds) = range_bounds.get(&range.id).copied() {
                     bounds
@@ -557,7 +581,8 @@ fn collect_kernel_invocations(
                     return IrConstructionSnafu {
                         details: format!("END references schedule range {} that is not active", range.id),
                     }
-                    .fail();
+                    .fail()
+                    .map_err(Into::into);
                 };
                 if *cur < vmax {
                     *cur += 1;
@@ -565,7 +590,8 @@ fn collect_kernel_invocations(
                         return IrConstructionSnafu {
                             details: format!("missing loop jump pointer for schedule range {}", range.id),
                         }
-                        .fail();
+                        .fail()
+                        .map_err(Into::into);
                     };
                     sched_ptr = jump_ptr;
                     continue;
@@ -576,7 +602,8 @@ fn collect_kernel_invocations(
                     return IrConstructionSnafu {
                         details: format!("linear CALL references unknown kernel id {kernel_id}"),
                     }
-                    .fail();
+                    .fail()
+                    .map_err(Into::into);
                 };
                 let mut fixedvars = HashMap::new();
                 for br in *bound_ranges {
@@ -587,7 +614,8 @@ fn collect_kernel_invocations(
                                 kernel_id, br.var_name, br.range_uop.id
                             ),
                         }
-                        .fail();
+                        .fail()
+                        .map_err(Into::into);
                     };
                     fixedvars.insert(br.var_name.clone(), value);
                 }
@@ -620,7 +648,8 @@ fn analyze_callable_dependencies(callables: &[Arc<UOp>], root: &Arc<UOp>) -> Res
                 return IrConstructionSnafu {
                     details: format!("callable dependency references unknown callable id {dep_id}"),
                 }
-                .fail();
+                .fail()
+                .map_err(Into::into);
             };
             if producer_idx != consumer_idx {
                 dependencies[consumer_idx].insert(producer_idx);
@@ -655,7 +684,8 @@ fn analyze_callable_dependencies(callables: &[Arc<UOp>], root: &Arc<UOp>) -> Res
                 return IrConstructionSnafu {
                     details: format!("AFTER dependency references unknown callable id {}", callable.id),
                 }
-                .fail();
+                .fail()
+                .map_err(Into::into);
             };
 
             let mut dep_ids = HashSet::new();
@@ -668,7 +698,8 @@ fn analyze_callable_dependencies(callables: &[Arc<UOp>], root: &Arc<UOp>) -> Res
                     return IrConstructionSnafu {
                         details: format!("callable dependency references unknown callable id {dep_id}"),
                     }
-                    .fail();
+                    .fail()
+                    .map_err(Into::into);
                 };
                 if producer_idx != consumer_idx {
                     dependencies[consumer_idx].insert(producer_idx);
@@ -901,7 +932,7 @@ fn sort_callables_by_dependencies(callables: &[Arc<UOp>], root: &Arc<UOp>) -> Re
     }
 
     if sorted_indices.len() < callables.len() {
-        return DependencyCyclesSnafu.fail();
+        return DependencyCyclesSnafu.fail().map_err(Into::into);
     }
 
     let sorted: Vec<Arc<UOp>> = sorted_indices.iter().map(|&idx| callables[idx].clone()).collect();
@@ -950,7 +981,7 @@ pub fn create_pre_schedule(transformed: Arc<UOp>) -> Result<PreSchedule> {
     }
 
     if callables.is_empty() {
-        return NoKernelsFoundSnafu.fail();
+        return NoKernelsFoundSnafu.fail().map_err(Into::into);
     }
 
     // Step 1.5: Sort callables by dependencies (producers before consumers)
@@ -1053,12 +1084,13 @@ pub fn instantiate_schedule(
                     if let Some(expected) = &expected
                         && expected != &actual
                     {
-                        return Err(Error::MultiLaneDeviceMismatch {
+                        return Err(ErrorKind::MultiLaneDeviceMismatch {
                             call_id: item.kernel.id,
                             lane,
                             expected: format!("{expected:?}"),
                             actual: format!("{actual:?}"),
-                        });
+                        }
+                        .into());
                     }
                     expected = Some(actual);
                 }
@@ -1070,12 +1102,15 @@ pub fn instantiate_schedule(
                 Op::Const(value) => value.0.try_int().and_then(|value| usize::try_from(value).ok()),
                 _ => None,
             }
-            .ok_or_else(|| Error::IrConstruction { details: "SLICE offset must be a non-negative constant".into() })?;
+            .ok_or_else(|| ErrorKind::IrConstruction {
+                details: "SLICE offset must be a non-negative constant".into(),
+            })?;
             if kb.buffers.len() < 2 || kb.uop_ids.len() < 2 {
                 return IrConstructionSnafu {
                     details: format!("SLICE call {} requires output and base buffers", item.kernel.id),
                 }
-                .fail();
+                .fail()
+                .map_err(Into::into);
             }
             let base = &kb.buffers[1];
             let view = base.view(offset * base.dtype().bytes(), size * effect.dtype().bytes()).context(DeviceSnafu)?;
@@ -1140,7 +1175,8 @@ pub fn instantiate_schedule(
             return IrConstructionSnafu {
                 details: format!("invocation references unknown kernel id {}", invocation.kernel_id),
             }
-            .fail();
+            .fail()
+            .map_err(Into::into);
         };
 
         let mut dependencies = HashSet::new();
@@ -1234,7 +1270,10 @@ fn find_first_input_buffer_device(
                 if device_spec.is_disk() {
                     continue;
                 }
-                return svod_runtime::DEVICE_FACTORIES.device(&device_spec, alloc_registry).context(DeviceFactorySnafu);
+                return svod_runtime::DEVICE_FACTORIES
+                    .device(&device_spec, alloc_registry)
+                    .context(DeviceFactorySnafu)
+                    .map_err(Into::into);
             }
         }
     }
@@ -1248,6 +1287,7 @@ fn find_first_input_buffer_device(
     svod_runtime::DEVICE_FACTORIES
         .device(&svod_dtype::default_device::default_device(), alloc_registry)
         .context(DeviceFactorySnafu)
+        .map_err(Into::into)
 }
 
 /// Collect buffers for a callable from its sources.
@@ -1309,7 +1349,7 @@ fn collect_callable_buffers(
                     uop_ids.push(buf_id);
                 } else {
                     trace!(buf_id, "after buffer not found in allocated_buffers or input_buffers");
-                    return Err(Error::BufferNotFound { uop_id: buf_id });
+                    return Err(ErrorKind::BufferNotFound { uop_id: buf_id }.into());
                 }
             }
             Op::MSelect(..) | Op::MStack(..) => {
@@ -1321,7 +1361,8 @@ fn collect_callable_buffers(
                             canonical_src.op()
                         ),
                     }
-                    .fail();
+                    .fail()
+                    .map_err(Into::into);
                 };
 
                 let existing =
@@ -1334,14 +1375,14 @@ fn collect_callable_buffers(
                     uop_ids.push(canonical_id);
                 } else {
                     trace!(canonical_id, "multi-device source buffer not found in allocated_buffers or input_buffers");
-                    return Err(Error::BufferNotFound { uop_id: canonical_id });
+                    return Err(ErrorKind::BufferNotFound { uop_id: canonical_id }.into());
                 }
             }
             // LOCAL/REG BUFFERs are compiler-managed and never runtime arguments.
             Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace != Some(svod_ir::AddrSpace::Global) => {}
             Op::Buffer(..) | Op::Param(..) => {
                 let size = match canonical_src.op() {
-                    Op::Buffer(..) => canonical_src.buffer_size().ok_or_else(|| Error::IrConstruction {
+                    Op::Buffer(..) => canonical_src.buffer_size().ok_or_else(|| ErrorKind::IrConstruction {
                         details: "BUFFER allocation requires a concrete shape".to_string(),
                     })?,
                     Op::Param(..) => canonical_src
@@ -1350,7 +1391,7 @@ fn collect_callable_buffers(
                         .flatten()
                         .and_then(svod_ir::shape::to_static)
                         .and_then(|shape| shape.into_iter().try_fold(1usize, usize::checked_mul))
-                        .ok_or_else(|| Error::IrConstruction {
+                        .ok_or_else(|| ErrorKind::IrConstruction {
                             details: "PARAM allocation requires a concrete shape".to_string(),
                         })?,
                     _ => unreachable!(),
@@ -1398,7 +1439,8 @@ fn collect_callable_buffers(
                 return IrConstructionSnafu {
                     details: format!("unsupported callable source op for buffer collection: {other:?}"),
                 }
-                .fail();
+                .fail()
+                .map_err(Into::into);
             }
         }
     }
@@ -1423,7 +1465,7 @@ fn insert_fixedvar_checked(
     incoming: i64,
 ) -> Result<()> {
     if let Some(&existing) = fixedvars.get(name) {
-        return Err(Error::MultiBindingConflict { call_id, name: name.to_string(), existing, incoming });
+        return Err(ErrorKind::MultiBindingConflict { call_id, name: name.to_string(), existing, incoming }.into());
     }
     fixedvars.insert(name.to_string(), incoming);
     Ok(())
@@ -1434,24 +1476,28 @@ fn schedule_range_bounds(range: &Arc<UOp>) -> Result<(i64, i64)> {
         return IrConstructionSnafu {
             details: format!("expected RANGE for schedule loop control, got {:?}", range.op()),
         }
-        .fail();
+        .fail()
+        .map_err(Into::into);
     };
 
     let Some(vmin) = range.vmin().try_int() else {
         return IrConstructionSnafu {
             details: format!("schedule range vmin must be concrete integer, got {:?}", range.vmin()),
         }
-        .fail();
+        .fail()
+        .map_err(Into::into);
     };
     let Some(vmax) = range.vmax().try_int() else {
         return IrConstructionSnafu {
             details: format!("schedule range vmax must be concrete integer, got {:?}", range.vmax()),
         }
-        .fail();
+        .fail()
+        .map_err(Into::into);
     };
     if vmax < vmin {
         return IrConstructionSnafu { details: format!("invalid schedule range bounds: vmin={vmin}, vmax={vmax}") }
-            .fail();
+            .fail()
+            .map_err(Into::into);
     }
     Ok((vmin, vmax))
 }

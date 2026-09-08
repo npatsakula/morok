@@ -6,9 +6,9 @@ fn test_safetensors_round_trip() {
     let path = dir.path().join("test.safetensors");
 
     // Create and realize tensors
-    let mut w = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([2, 2]).unwrap();
+    let w = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([2, 2]).unwrap();
     w.realize().unwrap();
-    let mut b = Tensor::from_slice([0.5f32, -0.5]);
+    let b = Tensor::from_slice([0.5f32, -0.5]);
     b.realize().unwrap();
 
     let w_data = w.as_vec::<f32>().unwrap();
@@ -34,12 +34,12 @@ fn test_safetensors_round_trip() {
     assert!(loaded.contains_key("weight"));
     assert!(loaded.contains_key("bias"));
 
-    let mut loaded_w = loaded["weight"].clone();
+    let loaded_w = loaded["weight"].clone();
     loaded_w.realize().unwrap();
     let loaded_vals = loaded_w.as_vec::<f32>().unwrap();
     assert_eq!(loaded_vals, vec![1.0, 2.0, 3.0, 4.0]);
 
-    let mut loaded_b = loaded["bias"].clone();
+    let loaded_b = loaded["bias"].clone();
     loaded_b.realize().unwrap();
     let loaded_bvals = loaded_b.as_vec::<f32>().unwrap();
     assert_eq!(loaded_bvals, vec![0.5, -0.5]);
@@ -57,7 +57,7 @@ fn test_load_safetensors_fp8() {
     safetensors::serialize_to_file(&tensors, None::<std::collections::HashMap<String, String>>, &path).unwrap();
 
     let loaded = crate::state::load_safetensors(&path).unwrap();
-    assert_eq!(loaded["weight"].uop().dtype(), svod_dtype::DType::FP8E4M3);
+    assert_eq!(loaded["weight"].dtype(), svod_dtype::DType::FP8E4M3);
 }
 
 /// Phase-3 acceptance: loading one checkpoint into two model instances
@@ -85,7 +85,7 @@ fn loading_same_checkpoint_twice_shares_immutable_storage() {
     assert!(writable.copyin(&[0u8; 16]).is_err(), "shared weights must refuse host writes");
 
     // Both instances still evaluate correctly through the shared storage.
-    let mut sum = &sd1["w"] + &sd2["w"];
+    let sum = (&sd1["w"] + &sd2["w"]).unwrap();
     sum.realize().unwrap();
     assert_eq!(sum.as_vec::<f32>().unwrap(), vec![2.0, 4.0, 6.0, 8.0]);
 }

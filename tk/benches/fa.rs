@@ -28,17 +28,17 @@ fn bench_fa(c: &mut Criterion) {
         let (q, k, v) = (randn_bf16(&[b, n, h, d]), randn_bf16(&[b, n, h, d]), randn_bf16(&[b, n, h, d]));
 
         // The model's exact call: non-causal, no key padding.
-        let mut fa = svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens: None })
+        let fa = svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens: None })
             .expect("flash_attention_with")
             .expect("FA kernel applies for bench shape");
         let fa_plan = fa.prepare().expect("prepare fa");
         group.bench_with_input(BenchmarkId::new("tk", n), &n, |bencher, _| bench_plan(bencher, &fa_plan));
 
         // The model's fallback: non-causal SDPA. SDPA wants `[B, H, T, d]`.
-        let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("perm");
+        let perm = |t: &Tensor| t.cast(DType::Float32).try_permute(&[0, 2, 1, 3]).expect("perm");
         let (qp, kp, vp) = (perm(&q), perm(&k), perm(&v));
         let refb = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(false).call().expect("sdpa");
-        let mut ref_t = refb.try_permute(&[0, 2, 1, 3]).expect("perm back");
+        let ref_t = refb.try_permute(&[0, 2, 1, 3]).expect("perm back");
         let ref_plan = ref_t.prepare().expect("prepare ref");
         group.bench_with_input(BenchmarkId::new("sdpa", n), &n, |bencher, _| bench_plan(bencher, &ref_plan));
     }

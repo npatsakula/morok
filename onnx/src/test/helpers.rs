@@ -151,12 +151,7 @@ pub(crate) fn run_onnx_light_test(model_path: &str, output_pb_path: &str, config
 
     // 3. Assign deterministic inputs: arange(n)/n (matches ONNX backend test runner)
     for (name, input_tensor) in &result.inputs {
-        let shape: Vec<usize> = input_tensor
-            .shape()
-            .unwrap_or_else(|e| panic!("{test_name}: input '{name}' shape: {e}"))
-            .iter()
-            .map(|d| d.as_const().unwrap_or_else(|| panic!("{test_name}: dynamic dim in '{name}'")))
-            .collect();
+        let shape = input_tensor.dims().unwrap_or_else(|e| panic!("{test_name}: input '{name}' shape: {e}"));
         let n: usize = shape.iter().product();
         let data: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
         let bytes: &[u8] = bytemuck::cast_slice(&data);
@@ -166,10 +161,9 @@ pub(crate) fn run_onnx_light_test(model_path: &str, output_pb_path: &str, config
     }
 
     // 5. Batch-realize ALL outputs (matches Tinygrad: all outputs in one SINK)
-    let mut outputs: Vec<(String, Tensor)> = result.outputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let outputs: Vec<(String, Tensor)> = result.outputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     {
-        let mut refs: Vec<&mut Tensor> = outputs.iter_mut().map(|(_, t)| t).collect();
-        Tensor::realize_batch_with(refs.iter_mut().map(|t| &mut **t), config)
+        Tensor::realize_batch_with(outputs.iter().map(|(_, t)| t), config)
             .unwrap_or_else(|e| panic!("{test_name}: realize failed: {e}"));
     }
 
@@ -182,13 +176,13 @@ pub(crate) fn run_onnx_light_test(model_path: &str, output_pb_path: &str, config
     let expected = tensor_from_proto_ext(&tensor_proto, None)
         .unwrap_or_else(|e| panic!("{test_name}: expected output conversion: {e}"));
 
-    let mut actual = outputs
-        .iter_mut()
+    let actual = outputs
+        .iter()
         .find(|(k, _)| *k == output_name)
         .unwrap_or_else(|| panic!("{test_name}: missing output '{output_name}'"))
         .1
         .clone();
-    assert_tensors_close(&mut actual, &expected, &test_name, config);
+    assert_tensors_close(&actual, &expected, &test_name, config);
 }
 
 // ---------------------------------------------------------------------------
@@ -238,17 +232,15 @@ macro_rules! assert_int_exact {
     }};
 }
 
-fn assert_tensors_close(actual: &mut Tensor, expected: &Tensor, label: &str, config: &PrepareConfig) {
-    let expected_dtype = expected.uop().dtype();
+fn assert_tensors_close(actual: &Tensor, expected: &Tensor, label: &str, config: &PrepareConfig) {
+    let expected_dtype = expected.dtype();
 
     // Cast actual to match expected dtype if they differ
-    let mut actual_cast;
-    let actual: &mut Tensor = if actual.uop().dtype() != expected_dtype {
-        actual_cast = actual.cast(expected_dtype.clone()).unwrap_or_else(|e| {
-            panic!("Output '{label}': dtype cast failed ({:?} -> {expected_dtype:?}): {e}", actual.uop().dtype())
-        });
+    let actual_cast;
+    let actual: &Tensor = if actual.dtype() != expected_dtype {
+        actual_cast = actual.cast(expected_dtype.clone());
         actual_cast.realize_with(config).unwrap_or_else(|e| panic!("Output '{label}': realize after cast failed: {e}"));
-        &mut actual_cast
+        &actual_cast
     } else {
         actual
     };
@@ -258,9 +250,9 @@ fn assert_tensors_close(actual: &mut Tensor, expected: &Tensor, label: &str, con
         ScalarDType::Float64 => assert_float_close!(actual, expected, label, 1e-3, 1e-7, f64),
         ScalarDType::Float16 | ScalarDType::BFloat16 | ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2 => {
             let f32_dtype = DType::Scalar(ScalarDType::Float32);
-            let mut a = actual.cast(f32_dtype.clone()).unwrap();
+            let a = actual.cast(f32_dtype.clone());
             a.realize_with(config).unwrap();
-            let mut e = expected.cast(f32_dtype).unwrap();
+            let e = expected.cast(f32_dtype);
             e.realize_with(config).unwrap();
             assert_float_close!(&a, &e, label, 1e-2, 1e-3, f32);
         }
@@ -387,9 +379,9 @@ pub(crate) fn run_onnx_node_test(test_dir: &str, config: &PrepareConfig) {
                 .unwrap_or_else(|e| panic!("{test_name}/{set_name}: expected output '{name}': {e}"));
             let actual =
                 result.outputs.get(name).unwrap_or_else(|| panic!("{test_name}/{set_name}: missing output '{name}'"));
-            let mut actual = actual.clone();
+            let actual = actual.clone();
             actual.realize_with(config).unwrap_or_else(|e| panic!("{test_name}/{set_name}: realize failed: {e}"));
-            assert_tensors_close(&mut actual, &expected, &format!("{test_name}/{set_name}:{name}"), config);
+            assert_tensors_close(&actual, &expected, &format!("{test_name}/{set_name}:{name}"), config);
         }
     }
 }

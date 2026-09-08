@@ -14,11 +14,10 @@
 //! indexes the zeroed row of the position embedding table. Position rows 0 and
 //! 1 are never used for real tokens.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 /// Compute XLM-RoBERTa position IDs from `input_ids`.
 ///
@@ -26,9 +25,8 @@ use super::error::{Result, TensorSnafu};
 /// tokens are numbered starting from `padding_idx + 1` and padding positions
 /// are set to `padding_idx`.
 pub fn position_ids_from_input_ids(input_ids: &Tensor, padding_idx: usize) -> Result<Tensor> {
-    let pad = Tensor::const_(padding_idx as i64, DType::Int32);
-    let mask = input_ids.try_ne(&pad).context(TensorSnafu)?.cast(DType::Int32).context(TensorSnafu)?;
-    let cumsum = mask.cumsum(-1).context(TensorSnafu)?;
-    let incremental = cumsum.try_mul(&mask).context(TensorSnafu)?;
-    incremental.try_add(&pad).context(TensorSnafu)
+    let pad = padding_idx as i64;
+    let mask = input_ids.try_ne(pad)?.cast(DType::Int32);
+    let incremental = mask.cumsum(-1)?.try_mul(&mask)?;
+    Ok(incremental.try_add(pad)?)
 }

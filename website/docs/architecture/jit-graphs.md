@@ -72,14 +72,18 @@ jit_wrapper! {
 |---|---|---|
 | `WrapperName(ModelType) { ... }` | name of the generated struct and the type of the model the build closure receives | yes |
 | `input_name: Tensor` lines | one per input the wrapper exposes; the `: Tensor` annotation is informational | optional (usually one or more) |
+| `inputs { ... }` | the same slots inside a block, where `#[unbatched]` and `[Tensor; N]` are also allowed | optional |
 | `vars { name: (min, max), ... }` | symbolic shape variables with compile-time bounds | optional |
+| `batch_var name: (min, max)` | a var that also shrinks every batched input's dim 0 to it | optional |
+| `state { name, ... }` | inputs the plan also writes, recycled in place between calls | optional |
 | `outputs { name, ... }` | one named buffer accessor per output; the `build` closure then returns a tuple of that many tensors, in this order | optional |
 | `build(args...) { ... }` | closure that builds the output tensor from inputs and vars; `model` is in scope | yes |
 
 The `build` arguments must each name either an input or a declared var (the
 macro rejects names that don't match at expansion time). Inside the block,
-each input is a `&Tensor` (the macro allocates a zero-initialized placeholder
-when `prepare()` runs), each var is a `svod_tensor::BoundVariable` already
+each input is a `&Tensor` — or a `[&Tensor; N]` for an array slot — (the macro
+allocates a zero-initialized placeholder per buffer when `prepare()` runs),
+each var is a `svod_tensor::BoundVariable` already
 bound to its upper bound — pass it on as `&name` — and `model` is a shared
 reference to the wrapper's owned model value. The closure returns
 `Result<Tensor, E>` for any `E: std::error::Error + Send + Sync + 'static`;
@@ -91,6 +95,54 @@ and each gets its own named `&Buffer` accessor, positioned by declaration
 order. If the scheduler fused or elided one of them the positional accessors
 would silently misalign, so `prepare()` fails with
 `JitError::OutputCountMismatch` instead.
+
+---
+
+## Array slots, batch variables and state
+
+The block forms of the declaration add three things a streaming model needs.
+All of them are optional; a wrapper written against the older flat form keeps
+working unchanged.
+
+```rust
+jit_wrapper! {
+    StepJit(StepModel) {
+        inputs {
+            x: Tensor,
+            #[unbatched] bias: Tensor,
+            taps: [Tensor; 3],
+        }
+        batch_var b: (1, 4),
+        state { h: Tensor, tail: [Tensor; 2] }
+        outputs { emitted }
+
+        // returns (emitted, h, tail): declared outputs first, then state
+        build(x, bias, taps, h, tail) {
+            model.step(x, bias, taps, h, tail)
+        }
+    }
+}
+```
+
+**`[Tensor; N]` slots** put N buffers behind one name: `prepare` takes
+`[InputSpec; N]`, the build closure receives `[&Tensor; N]`, and the generated
+accessors take a leaf index — `jit.taps_view_mut::<f32>(1)?`. Outputs may be
+arrays too.
+
+**`batch_var b: (min, max)`** declares a symbolic variable *and* shrinks every
+batched input's dim 0 to it once the placeholders are realized, so one plan
+serves a range of batch sizes. `#[unbatched]` opts an input out — a shared bias
+or a table whose leading axis is not the batch. Bind it per call with the
+generated `execute_bound(4)`.
+
+**`state { ... }`** slots are inputs the plan also writes. The build tuple
+carries a new value for each, the macro assigns it straight back into that
+slot's own device-local buffer, and the next `execute()` reads it there — a
+recurrence that never round-trips through the host. State slots are not
+exposed as outputs; `reset()` zeros all of them for a fresh sequence.
+
+The build tuple has one element per declared output slot plus one per state
+slot — and no tuple at all when there is exactly one of them.
 
 ---
 
@@ -118,10 +170,13 @@ in the range; a tighter range lets the optimizer specialize. Pin a var with
 when an outer caller advertises a smaller maximum than the model's hard
 ceiling.
 
-At execute time, pass actual values through `execute_with_vars`:
+At execute time, pass actual values through `execute_with_vars`, or through
+`execute_bound`, which takes one `i64` per declared variable in declaration
+order and forwards to it:
 
 ```rust
 jit.execute_with_vars(&[("b", batch as i64), ("t", time as i64)])?;
+jit.execute_bound(batch as i64, time as i64)?;   // same thing, positionally
 ```
 
 Each pair binds one var; vars not listed keep whatever they hold — their
@@ -142,9 +197,13 @@ The macro emits one method group per phase of the wrapper's life cycle:
 | `with_<var>_bound` / `with_<var>_min_bound` / `with_<var>_fixed` | between `new` and `prepare` | configure shape envelope |
 | `prepare(input1: InputSpec, ...)` | one-time | build graph, run patterns, compile kernels, allocate buffers; reads `PrepareConfig::from_env()` |
 | `prepare_with_config(..., &PrepareConfig)` | one-time | same as `prepare` with an explicit config |
-| `<input>_mut() -> Result<&mut Buffer>` | per step | typed accessor for each declared input |
+| `<input>_mut() -> Result<&mut Buffer>` | per step | raw buffer for each declared input |
+| `<input>_view_mut::<T>() -> Result<ArrayViewMutD<T>>` | per step | typed write view over that buffer, dtype-checked |
 | `output() -> Result<&Buffer>` | per step | output of the prepared graph |
+| `<output>_shape() / _view::<T>() / _to_vec::<T>()` | per step | live output shape and reads, resolved against the current variable bindings |
+| `reset() -> Result<()>` | per step | zero every `state` slot |
 | `execute() -> Result<()>` | per step | replay with current input buffers |
+| `execute_bound(v1, v2, ...) -> Result<()>` | per step | replay, binding each declared variable positionally |
 | `execute_with_vars(&[(name, value)]) -> Result<()>` | per step | replay and rebind one or more symbolic variables |
 | `execute_profiled` / `execute_with_vars_profiled` | optional | same as the non-profiled variants but return `Vec<KernelProfile>` |
 | `execute_profiled_static()` | optional | one profiled run through `ExecutionPlan::profile`, returning the last stage's kernels |
@@ -167,7 +226,12 @@ returns `JitError::NotPrepared`.
 
 ## `InputSpec`
 
-`prepare()` takes one `InputSpec` per declared input:
+`InputSpec`, `JitError` and the buffer helpers the macro expands to live in
+`svod_tensor::jit`, so a crate hosting a `jit_wrapper!` needs only that
+dependency (`svod_model::jit` re-exports them for the historical paths).
+
+`prepare()` takes one `InputSpec` per declared input — or one `[InputSpec; N]`
+per array slot:
 
 ```rust
 pub struct InputSpec {
@@ -191,55 +255,42 @@ tensor before invoking the build closure. Callers do not construct
 `Tensor::zeros(...).realize()` placeholders themselves. The shape becomes the
 maximum input size; symbolic variables shrink it at execute time through
 operations like `try_shrink` — a coding pattern, not a runtime contract
-enforced by the wrapper. `device_local()` drops the host mapping for inputs the
-host only writes through `copyin` or refills on-device — recurrent state the
-host never needs to observe per step.
+enforced by the wrapper. `InputSpec::device_local()` drops the host mapping for inputs the host only
+writes through `copyin` or refills on-device; `state` slots are allocated that
+way automatically. On the output side, `PrepareConfig::device_local()` is the
+same idea for the plan's outputs — it is `from_env()` with
+`device_local_outputs` set.
 
 ---
 
 ## Recurrent execution
 
-Recurrent models reuse a host-side LSTM state across calls. The wrapper for
-that pattern is `JitRecurrent<J>`. It takes a `jit_wrapper!`-generated JIT
-that also implements the `RecurrentJit` trait, plus an initial `LstmState`
-and the head length in `f32` elements:
+A recurrent model's state stays on the device: declare it in `state { ... }`
+and every step is one `execute()`, with no host round trip and no packing
+helper.
 
 ```rust
-pub struct LstmState {
-    pub h: Vec<f32>,
-    pub c: Vec<f32>,
-}
-
-pub trait RecurrentJit {
-    fn pack_state(&mut self, state: &LstmState) -> Result<()>;
-    fn execute_step(&mut self) -> Result<()>;
-    fn output_buffer(&self) -> Result<&Buffer>;
+jit.reset()?;                                    // zero the state, new sequence
+for chunk in chunks {
+    for (slot, v) in jit.x_view_mut::<f32>()?.iter_mut().zip(chunk) {
+        *slot = v;                               // per-step input, written in place
+    }
+    jit.execute()?;                              // reads state, writes it back
+    let frame = jit.emitted_to_vec::<f32>()?;    // only the emitted head crosses
 }
 ```
 
-:::tip[Output layout contract]
-The JIT's output buffer must be a flat `f32` block of `[head | h_flat | c_flat]`
-along the last axis, where `h_flat` and `c_flat` each have length
-`state.h.len()` and `state.c.len()` respectively. `JitRecurrent::new` checks
-the output buffer's size once at construction against the declared head plus
-state size, and returns `JitError::OutputLayoutMismatch`
-if the math does not match. This catches build-closure drift at construction
-time rather than letting a silent mis-split corrupt downstream values.
+:::tip[Read-before-write ordering]
+Each state buffer is recycled in place, so a slot must not depend on another
+slot's *new* value inside one `build`: the per-buffer ordering is only
+unambiguous when every slot advances from the values the step was entered
+with. Derive the new values from the inputs and the old state, then return
+them all in the build tuple.
 :::
 
-Each call to `step(|jit| pack_inputs(jit))` runs one recurrent iteration:
-
-1. The closure writes per-step non-state inputs (audio chunk, token id,
-   encoder frame, ...) through the JIT's typed `*_mut` accessors.
-2. `RecurrentJit::pack_state` copies the current host state into the JIT's
-   state input buffers.
-3. `execute_step` replays the plan.
-4. The wrapper splits the output buffer into head, new `h`, new `c`, updates
-   the host state in place, and returns the head slice as `&[f32]`.
-
-`reset()` zeros the host state without touching the JIT, ready for a new
-sequence. `last_timing` exposes the most recent per-step `pack` / `exec` /
-`read` durations for profiling.
+The state buffers are allocated device-local, so nothing maps them to the
+host. Read back only what the caller actually needs — the declared outputs —
+through `<output>_to_vec` or `<output>_view`.
 
 ---
 
@@ -260,8 +311,9 @@ jit_wrapper! {
             // Permute [B, d_model, T_sub] → [B, T_sub, d_model] on-device: the
             // RN-T decoder consumes frame-major rows, and doing it here turns
             // a host-side strided transpose into one contiguous copyout.
-            out.cast(svod_dtype::DType::Float32).context(TensorSnafu)?
-                .try_permute(&[0, 2, 1]).context(TensorSnafu)
+            Ok::<_, super::error::Error>(
+                out.cast(svod_dtype::DType::Float32).try_permute(&[0, 2, 1])?
+            )
         }
     }
 }
@@ -273,6 +325,10 @@ mel length is rounded up to the next power of two so codegen sees a clean
 factorisation and clamped to `config.max_mel_frames`, and the batch is capped so
 the live SDPA score tiles stay inside `max_scores_mib`. Every chunk then
 replays the same plan through `execute()`.
+
+`cast` is infallible, so it needs no `?`, and the model's error type absorbs
+the tensor error with a plain `?` — the build closure returns
+`Result<_, E>` for any `E: std::error::Error + Send + Sync + 'static`.
 
 The `out.cast(DType::Float32)` is the fp32 boundary between the
 encoder and any downstream head. The encoder may run in fp16 or bf16 for
@@ -310,9 +366,10 @@ rather than the host mapping:
 
 ```rust
 let mut jit = SileroVadFeatureJit::new(vad);
-let mut config = svod_tensor::PrepareConfig::from_env();
-config.device_local_outputs = true;
-jit.prepare_with_config(InputSpec::f32(&[FEATURE_BATCH, CHUNK_LEN]), &config)?;
+jit.prepare_with_config(
+    InputSpec::f32(&[FEATURE_BATCH, CHUNK_LEN]),
+    &svod_tensor::PrepareConfig::device_local(),
+)?;
 ```
 
 `VadInference::probs` then walks the waveform in `FEATURE_BATCH`-sized
@@ -338,10 +395,12 @@ decision, not a runtime one.
   `prepare()` from scratch — full graph build plus kernel compile. Host-side
   scratch buffers (for example `ndarray::Array3`) are the right choice for
   per-step setup that the JIT does not need to see.
-- The idiomatic way to handle dynamic shape inside the JIT is `try_shrink`
-  on a maximum-sized input with a var-bound length, paired with
-  `execute_with_vars` at the call site. ResNet and YOLO both shrink the batch
-  dimension this way.
+- The idiomatic way to handle a dynamic batch is `batch_var`, which shrinks
+  dim 0 of every batched input for you; bind it per call with
+  `execute_bound`. ResNet and YOLO are both one `images` input, one
+  `batch_var b: (1, max_batch_size)` and one output. For any other dynamic
+  axis, `try_shrink` on a maximum-sized input with a var-bound length plus
+  `execute_with_vars` at the call site is the manual equivalent.
 :::
 
 Violating the contract produces one of two failure modes: wrong results,
@@ -366,8 +425,10 @@ unrecoverable and indicate a usage bug rather than a transient condition.
 | `Build` | the build closure returned `Err`; the inner error is preserved as `Box<dyn Error + Send + Sync>` |
 | `Tensor` | tensor op failed during `prepare` or in the build closure |
 | `Device` | a device or buffer operation failed |
-| `OutputLayoutMismatch` | `JitRecurrent::new` saw an output element count different from the declared head plus state size |
-| `OutputCountMismatch` | a multi-output wrapper declared N outputs but the compiled plan kept a different number |
+| `OutputCountMismatch` | a wrapper declared N output plus state slots but the compiled plan kept a different number |
+| `DtypeMismatch` | a typed view or read asked for a dtype the buffer does not hold |
+| `ViewOutOfBounds` | a live output shape needs more elements than its buffer holds — the bound variables exceed what the plan was compiled for |
+| `InferredOutputDim` | an output shape carried a `-1` dimension, which has no live value to substitute |
 | `Runtime` | kernel execution failed |
 
 Configuration mistakes on the symbolic-variable setters (`with_<var>_*`)

@@ -3,16 +3,17 @@
 //! Detection head + angle prediction branch per scale. Boxes decoded as
 //! rotated boxes via `dist2rbox`. Returns `[B, 4+nc+1, A]`.
 
-use snafu::{OptionExt, ResultExt};
 use svod_ir::SInt;
-use svod_tensor::{BoundVariable, Tensor};
+use svod_tensor::Tensor;
+use svod_tensor::nn::{Conv2d, Layer, Module};
 
-use crate::state::{self, HasStateDict, StateDict, prefixed};
+use crate::state::StateDict;
 
 use super::backbone::YoloBackbone;
-use super::blocks::conv::{Conv2dBias, YoloConv};
+use super::blocks::conv::{YoloConv, conv2d_bias};
 use super::config::DETECT_STRIDES;
-use super::error::{Result, StateSnafu, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::head::{BoxBranch, ClsBranch, make_anchors};
 use super::loader;
 use super::neck::YoloNeck;
@@ -20,11 +21,14 @@ use super::neck::YoloNeck;
 /// Angle branch: Conv(k3) → Conv(k3) → Conv2d(k1, bias). Outputs 1 channel.
 ///
 /// State-dict keys: `0.*`, `1.*`, `2.weight`, `2.bias`.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct AngleBranch {
+    #[module(key = "0")]
     pub conv0: YoloConv,
+    #[module(key = "1")]
     pub conv1: YoloConv,
-    pub conv2: Conv2dBias,
+    #[module(key = "2")]
+    pub conv2: Conv2d,
 }
 
 impl AngleBranch {
@@ -33,30 +37,14 @@ impl AngleBranch {
         Self {
             conv0: YoloConv::empty(in_ch, hidden, 3, 1, true),
             conv1: YoloConv::empty(hidden, hidden, 3, 1, true),
-            conv2: Conv2dBias::empty(hidden, ne, 1, 1),
+            conv2: conv2d_bias(hidden, ne, 1, 1),
         }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.conv0.forward(x)?;
         let x = self.conv1.forward(&x)?;
-        self.conv2.forward(&x)
-    }
-}
-
-impl HasStateDict for AngleBranch {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.conv0.state_dict(&prefixed(prefix, "0"));
-        sd.extend(self.conv1.state_dict(&prefixed(prefix, "1")));
-        sd.extend(self.conv2.state_dict(&prefixed(prefix, "2")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.conv0.load_state_dict(sd, &prefixed(prefix, "0"))?;
-        self.conv1.load_state_dict(sd, &prefixed(prefix, "1"))?;
-        self.conv2.load_state_dict(sd, &prefixed(prefix, "2"))?;
-        Ok(())
+        Ok(self.conv2.forward(&x)?)
     }
 }
 
@@ -64,10 +52,13 @@ impl HasStateDict for AngleBranch {
 ///
 /// Reuses Detect's box+cls branches and adds an angle branch.
 /// Forward returns `[B, 4+nc+ne, A]` — rotated boxes + scores + angles.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct OBB26 {
+    #[module(key = "one2one_cv2")]
     pub cv2: Vec<BoxBranch>,
+    #[module(key = "one2one_cv3")]
     pub cv3: Vec<ClsBranch>,
+    #[module(key = "one2one_cv4")]
     pub cv4: Vec<AngleBranch>,
     pub nc: usize,
     pub reg_max: usize,
@@ -89,7 +80,7 @@ impl OBB26 {
     }
 
     pub fn forward(&self, feats: &[Tensor]) -> Result<Tensor> {
-        let shape = feats[0].shape().context(TensorSnafu)?;
+        let shape = feats[0].shape()?;
         let b = shape[0].clone();
 
         let mut boxes_list: Vec<Tensor> = Vec::with_capacity(feats.len());
@@ -98,72 +89,38 @@ impl OBB26 {
         let mut feat_sizes: Vec<(usize, usize)> = Vec::with_capacity(feats.len());
 
         for (i, feat) in feats.iter().enumerate() {
-            let fshape = feat.shape().context(TensorSnafu)?;
-            let h: usize = fshape[2].as_const().context(SymbolicShapeSnafu { what: "obb H" })?;
-            let w: usize = fshape[3].as_const().context(SymbolicShapeSnafu { what: "obb W" })?;
+            let h = feat.dim_const(2)?;
+            let w = feat.dim_const(3)?;
             feat_sizes.push((h, w));
             let hw = h * w;
 
             let box_out = self.cv2[i].forward(feat)?;
-            boxes_list.push(
-                box_out.try_reshape([b.clone(), SInt::from(4 * self.reg_max), SInt::from(hw)]).context(TensorSnafu)?,
-            );
+            boxes_list.push(box_out.try_reshape([b.clone(), SInt::from(4 * self.reg_max), SInt::from(hw)])?);
 
             let cls_out = self.cv3[i].forward(feat)?;
-            scores_list
-                .push(cls_out.try_reshape([b.clone(), SInt::from(self.nc), SInt::from(hw)]).context(TensorSnafu)?);
+            scores_list.push(cls_out.try_reshape([b.clone(), SInt::from(self.nc), SInt::from(hw)])?);
 
             let angle_out = self.cv4[i].forward(feat)?;
-            angle_list
-                .push(angle_out.try_reshape([b.clone(), SInt::from(self.ne), SInt::from(hw)]).context(TensorSnafu)?);
+            angle_list.push(angle_out.try_reshape([b.clone(), SInt::from(self.ne), SInt::from(hw)])?);
         }
 
         let boxes_refs: Vec<&Tensor> = boxes_list.iter().collect();
         let scores_refs: Vec<&Tensor> = scores_list.iter().collect();
         let angle_refs: Vec<&Tensor> = angle_list.iter().collect();
 
-        let boxes = Tensor::cat(&boxes_refs, 2).context(TensorSnafu)?;
-        let scores = Tensor::cat(&scores_refs, 2).context(TensorSnafu)?;
-        let angles = Tensor::cat(&angle_refs, 2).context(TensorSnafu)?;
+        let boxes = Tensor::cat(&boxes_refs, 2)?;
+        let scores = Tensor::cat(&scores_refs, 2)?;
+        let angles = Tensor::cat(&angle_refs, 2)?;
 
         let num_anchors: usize = feat_sizes.iter().map(|&(h, w)| h * w).sum();
-        let (anchors, strides) = make_anchors(&feat_sizes, &DETECT_STRIDES);
+        let (anchors, strides) = make_anchors(&feat_sizes, &DETECT_STRIDES)?;
 
         // dist2rbox decode (consumes angles for box rotation)
         let dbox = dist2rbox(&boxes, &angles, &anchors, &strides, num_anchors)?;
-        let scores = scores.sigmoid().context(TensorSnafu)?;
+        let scores = scores.sigmoid()?;
 
         // Cat: [B, 4+nc+ne, A] = dbox + scores + raw_angles
-        Tensor::cat(&[&dbox, &scores, &angles], 1).context(TensorSnafu)
-    }
-}
-
-impl HasStateDict for OBB26 {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        for (i, br) in self.cv2.iter().enumerate() {
-            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv2.{i}"))));
-        }
-        for (i, br) in self.cv3.iter().enumerate() {
-            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv3.{i}"))));
-        }
-        for (i, br) in self.cv4.iter().enumerate() {
-            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv4.{i}"))));
-        }
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        for (i, br) in self.cv2.iter_mut().enumerate() {
-            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv2.{i}")))?;
-        }
-        for (i, br) in self.cv3.iter_mut().enumerate() {
-            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv3.{i}")))?;
-        }
-        for (i, br) in self.cv4.iter_mut().enumerate() {
-            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv4.{i}")))?;
-        }
-        Ok(())
+        Ok(Tensor::cat(&[&dbox, &scores, &angles], 1)?)
     }
 }
 
@@ -176,51 +133,48 @@ fn dist2rbox(
     strides: &Tensor,
     num_anchors: usize,
 ) -> Result<Tensor> {
-    let parts = boxes.split(&[2, 2], 1).context(TensorSnafu)?;
+    let parts = boxes.split(&[2, 2], 1)?;
     let lt = &parts[0];
     let rb = &parts[1];
 
-    let cos = angles.cos().context(TensorSnafu)?;
-    let sin = angles.sin().context(TensorSnafu)?;
+    let cos = angles.cos()?;
+    let sin = angles.sin()?;
 
     // xf, yf = (rb - lt) / 2
-    let diff = rb.try_sub(lt).context(TensorSnafu)?;
-    let diff_halves = diff.split(&[1, 1], 1).context(TensorSnafu)?;
-    let xf = &diff_halves[0];
-    let yf = &diff_halves[1];
-    let half = Tensor::from_slice([0.5f32]);
-    let xf = xf.try_mul(&half).context(TensorSnafu)?;
-    let yf = yf.try_mul(&half).context(TensorSnafu)?;
+    let diff = rb.try_sub(lt)?;
+    let diff_halves = diff.split(&[1, 1], 1)?;
+    let xf = diff_halves[0].try_mul(0.5)?;
+    let yf = diff_halves[1].try_mul(0.5)?;
 
     // x = xf*cos - yf*sin, y = xf*sin + yf*cos
-    let x = xf.try_mul(&cos)?.try_sub(&yf.try_mul(&sin)?).context(TensorSnafu)?;
-    let y = xf.try_mul(&sin)?.try_add(&yf.try_mul(&cos)?).context(TensorSnafu)?;
-    let xy = Tensor::cat(&[&x, &y], 1).context(TensorSnafu)?;
+    let x = xf.try_mul(&cos)?.try_sub(&yf.try_mul(&sin)?)?;
+    let y = xf.try_mul(&sin)?.try_add(&yf.try_mul(&cos)?)?;
+    let xy = Tensor::cat(&[&x, &y], 1)?;
 
     // xy += anchors (broadcast [2,A] → [1,2,A])
-    let anchors_3d = anchors
-        .try_reshape([SInt::from(1isize), SInt::from(2isize), SInt::from(num_anchors as isize)])
-        .context(TensorSnafu)?;
-    let xy = xy.try_add(&anchors_3d).context(TensorSnafu)?;
+    let anchors_3d = anchors.try_reshape([SInt::from(1isize), SInt::from(2isize), SInt::from(num_anchors as isize)])?;
+    let xy = xy.try_add(&anchors_3d)?;
 
     // wh = lt + rb
-    let wh = lt.try_add(rb).context(TensorSnafu)?;
-    let bbox = Tensor::cat(&[&xy, &wh], 1).context(TensorSnafu)?;
+    let wh = lt.try_add(rb)?;
+    let bbox = Tensor::cat(&[&xy, &wh], 1)?;
 
-    let strides_3d = strides
-        .try_reshape([SInt::from(1isize), SInt::from(1isize), SInt::from(num_anchors as isize)])
-        .context(TensorSnafu)?;
-    bbox.try_mul(&strides_3d).context(TensorSnafu)
+    let strides_3d = strides.try_reshape([SInt::from(1isize), SInt::from(1isize), SInt::from(num_anchors as isize)])?;
+    Ok(bbox.try_mul(&strides_3d)?)
 }
 
 /// YOLO v26 OBB model.
 ///
 /// Forward returns `[B, 4+nc+1, A]` — rotated boxes + scores + angle.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Yolo26Obb {
+    #[module(skip)]
     pub config: super::config::YoloConfig,
+    #[module(key = "")]
     pub backbone: YoloBackbone,
+    #[module(key = "")]
     pub neck: YoloNeck,
+    #[module(key = "23")]
     pub head: OBB26,
 }
 
@@ -252,30 +206,13 @@ impl Yolo26Obb {
 
     pub fn from_state_dict(sd: &StateDict, config: super::config::YoloConfig) -> Result<Self> {
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "").context(StateSnafu)?;
+        model.load_state_dict(sd, "")?;
         Ok(model)
     }
 
-    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
-        let x = loader::shrink_batch(images, batch)?;
-        let (l4, l6, l10) = self.backbone.forward(&x)?;
+    pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let (l4, l6, l10) = self.backbone.forward(images)?;
         let (p3, p4, p5) = self.neck.forward(&l4, &l6, &l10)?;
         self.head.forward(&[p3, p4, p5])
-    }
-}
-
-impl HasStateDict for Yolo26Obb {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = self.backbone.state_dict(prefix);
-        sd.extend(self.neck.state_dict(prefix));
-        sd.extend(self.head.state_dict(&prefixed(prefix, "23")));
-        sd
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.backbone.load_state_dict(sd, prefix)?;
-        self.neck.load_state_dict(sd, prefix)?;
-        self.head.load_state_dict(sd, &prefixed(prefix, "23"))?;
-        Ok(())
     }
 }

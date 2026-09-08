@@ -40,7 +40,7 @@ use svod_schedule::{KernelNaming, apply_post_optimization_with_config, finalize_
 use tracing::{debug, trace};
 
 use crate::{
-    PrepareConfig, Result, Tensor,
+    Error, PrepareConfig, Result, Tensor,
     error::{
         BatchOutputMismatchSnafu, CompileKernelSnafu, CreateProgramSnafu, DeviceSnafu, EmptyScheduleSnafu,
         ExecutionSnafu, IrConstructionSnafu, KernelGraphSnafu, OptimizeSnafu, RangeifySnafu, RenderKernelSnafu,
@@ -61,7 +61,7 @@ use svod_runtime::{
     ProfileOptions, RunProfile,
 };
 
-fn collect_pending_indices(tensors: &[&mut Tensor]) -> Vec<usize> {
+fn collect_pending_indices(tensors: &[&Tensor]) -> Vec<usize> {
     tensors
         .iter()
         .enumerate()
@@ -106,15 +106,15 @@ impl Tensor {
     /// tensor's graph to its realized BUFFER (`apply_map_to_tensors`
     /// broadcast) between the entry check and scheduling — the pipeline then
     /// sees an empty schedule. That is success, not failure: adopt the buffer.
-    fn adopt_concurrently_realized(&mut self, error: crate::error::Error) -> Result<()> {
-        if matches!(error, crate::error::Error::NoKernelsFound) && self.uop().has_buffer_identity() {
+    fn adopt_concurrently_realized(&self, error: crate::error::Error) -> Result<()> {
+        if matches!(error.kind(), crate::error::ErrorKind::NoKernelsFound) && self.uop().has_buffer_identity() {
             self.ensure_buffer();
             return Ok(());
         }
         Err(error)
     }
 
-    pub fn realize(&mut self) -> Result<()> {
+    pub fn realize(&self) -> Result<()> {
         if self.uop().has_buffer_identity() {
             self.ensure_buffer();
             return Ok(());
@@ -171,7 +171,7 @@ impl Tensor {
     /// );
     /// let c = c.realize_with(&config)?;
     /// ```
-    pub fn realize_with(&mut self, config: &PrepareConfig) -> Result<()> {
+    pub fn realize_with(&self, config: &PrepareConfig) -> Result<()> {
         if self.uop().has_buffer_identity() {
             self.ensure_buffer();
             return Ok(());
@@ -216,7 +216,7 @@ impl Tensor {
     /// enabled), finalizes the result so the tensor is realized like
     /// [`realize`](Self::realize), and returns the per-kernel [`RunProfile`].
     /// Render it with [`RunProfile::render_table`].
-    pub fn profile(&mut self, opts: &ProfileOptions) -> Result<RunProfile> {
+    pub fn profile(&self, opts: &ProfileOptions) -> Result<RunProfile> {
         // Nothing to dispatch for already-buffer / const / empty tensors.
         if self.uop().has_buffer_identity() {
             self.ensure_buffer();
@@ -249,7 +249,7 @@ impl Tensor {
     /// Note: intermediate buffer cleanup is deferred to `realize()` so it
     /// runs AFTER `apply_map_to_tensors`. This ensures other tensors can still
     /// find buffers during the substitution window.
-    fn finalize_realize(&mut self, plan: &ExecutionPlan, uop: &Arc<UOp>) -> Result<()> {
+    fn finalize_realize(&self, plan: &ExecutionPlan, uop: &Arc<UOp>) -> Result<()> {
         let output_buf = plan.output_buffer().expect("realized plan must have an output buffer").clone();
 
         trace!(
@@ -280,8 +280,7 @@ impl Tensor {
         );
 
         self.set_uop(realized_uop);
-        self.entry.set_buffer(Arc::clone(&output_buf_arc));
-        self.buffer = Some(output_buf_arc);
+        self.entry.set_buffer(output_buf_arc);
         Ok(())
     }
 
@@ -302,7 +301,7 @@ impl Tensor {
     /// ```ignore
     /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
     /// let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
-    /// let mut c = &a + &b;
+    /// let c = (&a + &b)?;
     ///
     /// // One-time preparation (wires output tensor to plan buffer)
     /// let plan = c.prepare()?;
@@ -321,7 +320,7 @@ impl Tensor {
     /// - No kernels found after scheduling
     /// - Kernel compilation fails
     /// - Buffer allocation fails
-    pub fn prepare(&mut self) -> Result<ExecutionPlan> {
+    pub fn prepare(&self) -> Result<ExecutionPlan> {
         self.prepare_with(&PrepareConfig::from_env())
     }
 
@@ -349,7 +348,7 @@ impl Tensor {
     /// let plan = tensor.prepare_with(&config)?;
     /// plan.execute()?;
     /// ```
-    pub fn prepare_with(&mut self, config: &PrepareConfig) -> Result<ExecutionPlan> {
+    pub fn prepare_with(&self, config: &PrepareConfig) -> Result<ExecutionPlan> {
         let uop = self.uop();
         let plan = self.prepare_plan_with(config)?;
 
@@ -372,7 +371,7 @@ impl Tensor {
         Ok(plan)
     }
 
-    fn wire_output_tensor(&mut self, plan: &ExecutionPlan, uop: &Arc<UOp>) -> Result<()> {
+    fn wire_output_tensor(&self, plan: &ExecutionPlan, uop: &Arc<UOp>) -> Result<()> {
         if plan.num_outputs() > 0 {
             let buf = Arc::new(plan.output_buffer().expect("plan with num_outputs > 0 must expose output").clone());
             let dtype = uop.dtype();
@@ -381,8 +380,7 @@ impl Tensor {
             crate::tensor_registry::register_buffer(buffer_uop.id, self.entry.id, buf.clone());
             let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
             self.set_uop(buffer_uop.try_reshape(shape).context(UOpSnafu)?);
-            self.entry.set_buffer(buf.clone());
-            self.buffer = Some(buf);
+            self.entry.set_buffer(buf);
         }
         Ok(())
     }
@@ -396,29 +394,26 @@ impl Tensor {
     /// Merges all tensor computation graphs into one SINK, enabling the scheduler
     /// to share kernels across outputs. More efficient than calling `realize()`
     /// individually when tensors share subgraphs.
-    pub fn realize_batch<'a>(tensors: impl IntoIterator<Item = &'a mut Tensor>) -> Result<()> {
+    pub fn realize_batch<'a>(tensors: impl IntoIterator<Item = &'a Tensor>) -> Result<()> {
         Self::realize_batch_with(tensors, &PrepareConfig::from_env())
     }
 
     /// Realize multiple tensors with custom configuration.
-    pub fn realize_batch_with<'a>(
-        tensors: impl IntoIterator<Item = &'a mut Tensor>,
-        config: &PrepareConfig,
-    ) -> Result<()> {
-        let mut tensors: Vec<&mut Tensor> = tensors.into_iter().collect();
+    pub fn realize_batch_with<'a>(tensors: impl IntoIterator<Item = &'a Tensor>, config: &PrepareConfig) -> Result<()> {
+        let tensors: Vec<&Tensor> = tensors.into_iter().collect();
         if tensors.is_empty() {
             return Ok(());
         }
 
         // Handle already-realized tensors
-        for t in &mut tensors {
+        for t in &tensors {
             if t.uop().has_buffer_identity() {
                 t.ensure_buffer();
             }
         }
 
         // Wrap pure constants in CONTIGUOUS to force materialization (matches realize())
-        for t in &mut tensors {
+        for t in &tensors {
             if !t.uop().has_buffer_identity() && is_any_const(&t.uop()) {
                 let contiguous_uop = t.uop().contiguous();
                 t.set_uop(contiguous_uop);
@@ -432,7 +427,18 @@ impl Tensor {
             return Ok(());
         }
 
-        let old_uops: Vec<Arc<UOp>> = pending_indices.iter().map(|&i| tensors[i].uop()).collect();
+        // Hash-consing makes structurally identical graphs one node, so tensors
+        // sharing a uop share one plan output.
+        let mut old_uops: Vec<Arc<UOp>> = Vec::new();
+        let mut output_slot: Vec<usize> = Vec::with_capacity(pending_indices.len());
+        for &i in &pending_indices {
+            let uop = tensors[i].uop();
+            let slot = old_uops.iter().position(|u| Arc::ptr_eq(u, &uop)).unwrap_or_else(|| {
+                old_uops.push(uop);
+                old_uops.len() - 1
+            });
+            output_slot.push(slot);
+        }
 
         // Create merged SINK(CONTIGUOUS(t1), ..., CONTIGUOUS(tN))
         let contiguouses: Vec<Arc<UOp>> = old_uops.iter().map(|u| u.contiguous()).collect();
@@ -449,35 +455,33 @@ impl Tensor {
         let plan = prepare_execution_plan(&schedule_result, config)?;
         let prep_ms = t_prep.elapsed().as_millis();
         snafu::ensure!(
-            plan.num_outputs() == pending_indices.len(),
-            BatchOutputMismatchSnafu { expected: pending_indices.len(), actual: plan.num_outputs() }
+            plan.num_outputs() == old_uops.len(),
+            BatchOutputMismatchSnafu { expected: old_uops.len(), actual: plan.num_outputs() }
         );
         let t_exec = std::time::Instant::now();
         plan.execute().context(ExecutionSnafu)?;
         let exec_ms = t_exec.elapsed().as_millis();
-        debug!(prep_ms, exec_ms, num_outputs = pending_indices.len(), "realize_batch complete");
+        debug!(prep_ms, exec_ms, num_outputs = old_uops.len(), "realize_batch complete");
 
-        // Finalize each pending tensor in-place + build batched becomes_map
+        // Finalize each plan output once, then wire every tensor that shares it.
         let mut becomes_map = HashMap::new();
-        for (buf_idx, &orig_idx) in pending_indices.iter().enumerate() {
+        let mut realized: Vec<(u64, Arc<UOp>, Arc<Buffer>)> = Vec::with_capacity(old_uops.len());
+        for (buf_idx, old_uop) in old_uops.iter().enumerate() {
             let output_buf = plan.output_buffer_at(buf_idx).expect("buf_idx in range").clone();
-            let old_uop = &old_uops[buf_idx];
-
             let output_dtype = old_uop.dtype();
             let output_device = output_buf.allocator().device_spec();
             let num_elements = output_buf.size() / output_dtype.bytes();
             let buffer_uop = UOp::new_buffer(output_device, num_elements, output_dtype);
-            let buf_arc = Arc::new(output_buf);
-
-            let t = &mut tensors[orig_idx];
-            crate::tensor_registry::register_buffer(buffer_uop.id, t.entry.id, buf_arc.clone());
             let shape = old_uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
             let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;
+            becomes_map.insert(UOpKey(old_uop.clone()), realized_uop.clone());
+            realized.push((buffer_uop.id, realized_uop, Arc::new(output_buf)));
+        }
+        for (&orig_idx, &slot) in pending_indices.iter().zip(&output_slot) {
+            let (buffer_id, realized_uop, buf_arc) = &realized[slot];
+            let t = tensors[orig_idx];
+            crate::tensor_registry::register_buffer(*buffer_id, t.entry.id, buf_arc.clone());
             t.set_uop(realized_uop.clone());
-            t.entry.set_buffer(Arc::clone(&buf_arc));
-            t.buffer = Some(buf_arc);
-
-            becomes_map.insert(UOpKey(old_uop.clone()), realized_uop);
         }
 
         // Single batched apply_map (one global walk instead of N)
@@ -490,18 +494,18 @@ impl Tensor {
     ///
     /// Output tensors are wired to plan buffers — after `execute`/`execute_with_vars`,
     /// results are readable directly via `tensor.as_vec()` or `tensor.array_view()`.
-    pub fn prepare_batch<'a>(tensors: impl IntoIterator<Item = &'a mut Tensor>) -> Result<ExecutionPlan> {
+    pub fn prepare_batch<'a>(tensors: impl IntoIterator<Item = &'a Tensor>) -> Result<ExecutionPlan> {
         Self::prepare_batch_with(tensors, &PrepareConfig::from_env())
     }
 
     /// Prepare a batch execution plan with custom configuration.
     pub fn prepare_batch_with<'a>(
-        tensors: impl IntoIterator<Item = &'a mut Tensor>,
+        tensors: impl IntoIterator<Item = &'a Tensor>,
         config: &PrepareConfig,
     ) -> Result<ExecutionPlan> {
-        let mut tensors: Vec<&mut Tensor> = tensors.into_iter().collect();
+        let tensors: Vec<&Tensor> = tensors.into_iter().collect();
         if tensors.is_empty() {
-            return EmptyScheduleSnafu.fail();
+            return EmptyScheduleSnafu.fail().map_err(Into::into);
         }
 
         // Keep tensor state unchanged until the complete plan has been validated.
@@ -513,7 +517,7 @@ impl Tensor {
             .collect();
 
         if pending_indices.is_empty() {
-            return EmptyScheduleSnafu.fail();
+            return EmptyScheduleSnafu.fail().map_err(Into::into);
         }
 
         // Collect UOps from pending tensors only
@@ -544,7 +548,7 @@ impl Tensor {
             BatchOutputMismatchSnafu { expected: pending_indices.len(), actual: plan.num_outputs() }
         );
 
-        for t in &mut tensors {
+        for t in &tensors {
             if t.uop().has_buffer_identity() {
                 t.ensure_buffer();
             }
@@ -560,13 +564,12 @@ impl Tensor {
             let output_device = buf_arc.allocator().device_spec();
             let num_elements = buf_arc.size() / output_dtype.bytes();
             let buffer_uop = UOp::new_buffer(output_device, num_elements, output_dtype);
-            let t = &mut tensors[orig_idx];
+            let t = tensors[orig_idx];
             crate::tensor_registry::register_buffer(buffer_uop.id, t.entry.id, buf_arc.clone());
             let shape = old_uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
             let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;
             t.set_uop(realized_uop);
-            t.entry.set_buffer(Arc::clone(&buf_arc));
-            t.buffer = Some(buf_arc);
+            t.entry.set_buffer(buf_arc);
         }
 
         Ok(plan)
@@ -597,7 +600,9 @@ fn insert_var_val_checked(var_vals: &mut HashMap<String, i64>, name: &str, val: 
     match try_bind_var_val(var_vals, name, val) {
         Ok(()) => Ok(()),
         Err((prev, val)) => {
-            IrConstructionSnafu { details: format!("bind mismatch on {name}, {prev} != {val} ({context})") }.fail()
+            IrConstructionSnafu { details: format!("bind mismatch on {name}, {prev} != {val} ({context})") }
+                .fail()
+                .map_err(Into::into)
         }
     }
 }
@@ -671,7 +676,7 @@ fn schedule_result_from_sink_with_cache(
             let new_entry = Arc::new(crate::schedule_cache::CachedSchedule { pre_schedule: Arc::new(pre_schedule) });
             let guard = cache.guard();
             cache.insert(sched_key.clone(), Arc::clone(&new_entry), &guard);
-            Ok(new_entry)
+            Ok::<_, Error>(new_entry)
         },
     )?;
 
@@ -805,7 +810,7 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
     let normalized = graph_rewrite_preserve_calls(&matcher, sink.clone(), &mut ctx);
 
     if let Some(details) = ctx.bind_mismatch.take() {
-        return IrConstructionSnafu { details }.fail();
+        return IrConstructionSnafu { details }.fail().map_err(Into::into);
     }
 
     // Normalize standalone UNIQUE identity to deterministic LUNIQUE slots.
@@ -977,13 +982,15 @@ fn build_schedule_input_buffers(pre_schedule: &crate::schedule::PreSchedule) -> 
 
 fn output_indices_from_program_metadata(globals: &[usize], outs: &[usize], num_buffers: usize) -> Result<Vec<usize>> {
     if num_buffers == 0 {
-        return IrConstructionSnafu { details: "cannot map outputs for kernel with zero buffers".to_string() }.fail();
+        return IrConstructionSnafu { details: "cannot map outputs for kernel with zero buffers".to_string() }
+            .fail()
+            .map_err(Into::into);
     }
     if globals.is_empty() {
-        return IrConstructionSnafu { details: "ProgramSpec.globals is empty".to_string() }.fail();
+        return IrConstructionSnafu { details: "ProgramSpec.globals is empty".to_string() }.fail().map_err(Into::into);
     }
     if outs.is_empty() {
-        return IrConstructionSnafu { details: "ProgramSpec.outs is empty".to_string() }.fail();
+        return IrConstructionSnafu { details: "ProgramSpec.outs is empty".to_string() }.fail().map_err(Into::into);
     }
 
     let slot_to_position: HashMap<usize, usize> =
@@ -995,7 +1002,8 @@ fn output_indices_from_program_metadata(globals: &[usize], outs: &[usize], num_b
             return IrConstructionSnafu {
                 details: format!("ProgramSpec.outs slot {slot} not found in ProgramSpec.globals={globals:?}"),
             }
-            .fail();
+            .fail()
+            .map_err(Into::into);
         };
         if position >= num_buffers {
             return IrConstructionSnafu {
@@ -1003,7 +1011,8 @@ fn output_indices_from_program_metadata(globals: &[usize], outs: &[usize], num_b
                     "ProgramSpec output index {position} (slot {slot}) out of range for {num_buffers} buffers"
                 ),
             }
-            .fail();
+            .fail()
+            .map_err(Into::into);
         }
         output_indices.push(position);
     }
@@ -1011,7 +1020,9 @@ fn output_indices_from_program_metadata(globals: &[usize], outs: &[usize], num_b
     output_indices.sort_unstable();
     output_indices.dedup();
     if output_indices.is_empty() {
-        return IrConstructionSnafu { details: "ProgramSpec output mapping resolved to empty set".to_string() }.fail();
+        return IrConstructionSnafu { details: "ProgramSpec output mapping resolved to empty set".to_string() }
+            .fail()
+            .map_err(Into::into);
     }
 
     Ok(output_indices)
@@ -1026,7 +1037,8 @@ fn input_indices_from_program_metadata(globals: &[usize], ins: &[usize], num_buf
             return IrConstructionSnafu {
                 details: format!("ProgramSpec.ins slot {slot} not found in ProgramSpec.globals={globals:?}"),
             }
-            .fail();
+            .fail()
+            .map_err(Into::into);
         };
         if position >= num_buffers {
             return IrConstructionSnafu {
@@ -1034,7 +1046,8 @@ fn input_indices_from_program_metadata(globals: &[usize], ins: &[usize], num_buf
                     "ProgramSpec input index {position} (slot {slot}) out of range for {num_buffers} buffers"
                 ),
             }
-            .fail();
+            .fail()
+            .map_err(Into::into);
         }
         input_indices.push(position);
     }
@@ -1047,7 +1060,7 @@ fn resolve_item_buffer_indices(item: &ScheduleItem, uop_id_to_idx: &HashMap<u64,
     let mut indices = Vec::with_capacity(item.buffer_uop_ids.len());
     for &uop_id in &item.buffer_uop_ids {
         let Some(idx) = uop_id_to_idx.get(&uop_id).copied() else {
-            return Err(crate::error::Error::BufferNotFound { uop_id });
+            return Err(crate::error::ErrorKind::BufferNotFound { uop_id }.into());
         };
         indices.push(idx);
     }
@@ -1070,7 +1083,8 @@ fn resolve_compiled_kernel_buffer_indices(
                 item.buffer_uop_ids
             ),
         }
-        .fail();
+        .fail()
+        .map_err(Into::into);
     }
     Ok(buffer_indices)
 }
@@ -1212,6 +1226,7 @@ impl KernelSite {
                 KernelNaming::Deferred,
             )
             .context(OptimizeSnafu)
+            .map_err(Into::into)
         }
     }
 
@@ -1235,7 +1250,7 @@ impl KernelSite {
                     self.device.compiler.as_ref(),
                 )?;
                 let program = (self.device.runtime)(&compiled).context(CreateProgramSnafu)?;
-                Ok(CachedKernel {
+                Ok::<_, Error>(CachedKernel {
                     program,
                     device: codegen.to_string(),
                     code: spec.src,
@@ -1628,17 +1643,18 @@ fn prepare_execution_plan(
     let mut output_buffer_indices = Vec::with_capacity(schedule_result.output_uop_ids.len());
     for &uop_id in &schedule_result.output_uop_ids {
         let Some(idx) = uop_id_to_idx.get(&uop_id).copied() else {
-            return Err(crate::error::Error::BufferNotFound { uop_id });
+            return Err(crate::error::ErrorKind::BufferNotFound { uop_id }.into());
         };
         output_buffer_indices.push(idx);
     }
     if output_buffer_indices.is_empty() {
         return IrConstructionSnafu { details: "prepare_execution_plan produced no output buffer indices".to_string() }
-            .fail();
+            .fail()
+            .map_err(Into::into);
     }
     builder.set_output_buffers(output_buffer_indices);
 
-    builder.build().context(ExecutionSnafu)
+    builder.build().context(ExecutionSnafu).map_err(Into::into)
 }
 
 fn collect_output_buffer_ids<'a>(
@@ -1734,7 +1750,8 @@ fn compile_with_program_pipeline_components(
                 kernel_ast.op()
             ),
         }
-        .fail();
+        .fail()
+        .map_err(Into::into);
     }
     // `do_render` validates the SOURCE specification it returns and `do_compile`
     // the BINARY it attaches, so neither stage is re-read through `from_uop`.
@@ -2050,7 +2067,9 @@ fn beam_search_optimize(
     // Apply post-optimization to final result with renderer so pm_add_gpudims runs
     // (Thread → core_id, Global → SPECIAL).
     let raw_ast = result.scheduler.get_optimized_ast_with_naming(KernelNaming::Deferred);
-    apply_post_optimization_with_config(raw_ast, renderer, &post_optimizer_config).context(OptimizeSnafu)
+    apply_post_optimization_with_config(raw_ast, renderer, &post_optimizer_config)
+        .context(OptimizeSnafu)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]

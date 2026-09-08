@@ -38,39 +38,39 @@ fn test_trig_error_on_int() {
 #[test]
 fn test_floor_basic() {
     let t = Tensor::from_slice([1.2f32, -1.2, 2.8]);
-    let result = t.floor().unwrap();
+    let result = t.floor();
     assert_eq!(result.uop().dtype(), DType::Float32);
 }
 
 #[test]
 fn test_ceil_basic() {
     let t = Tensor::from_slice([1.2f32, -1.2, 2.8]);
-    let result = t.ceil().unwrap();
+    let result = t.ceil();
     assert_eq!(result.uop().dtype(), DType::Float32);
 }
 
 #[test]
 fn test_round_basic() {
     let t = Tensor::from_slice([1.2f32, 1.5, 2.5]);
-    let result = t.round().unwrap();
+    let result = t.round();
     assert_eq!(result.uop().dtype(), DType::Float32);
 }
 
 #[test]
 fn test_trunc_basic() {
     let t = Tensor::from_slice([1.2f32, -1.2, 2.8]);
-    let result = t.trunc().unwrap();
+    let result = t.trunc();
     assert_eq!(result.uop().dtype(), DType::Float32);
 }
 
 #[test]
 fn test_rounding_on_int() {
     let t = Tensor::from_slice([1i32, 2, 3]);
-    // Rounding operations should work on integers (no-op)
-    assert!(t.floor().is_ok());
-    assert!(t.ceil().is_ok());
-    assert!(t.round().is_ok());
-    assert!(t.trunc().is_ok());
+    // Rounding operations are a no-op on integers.
+    for rounded in [t.floor(), t.ceil(), t.round(), t.trunc()] {
+        rounded.realize().unwrap();
+        assert_eq!(rounded.to_vec::<i32>().unwrap(), vec![1, 2, 3]);
+    }
 }
 
 // Advanced math tests
@@ -98,28 +98,28 @@ fn test_reciprocal_basic() {
 #[test]
 fn test_square_basic() {
     let t = Tensor::from_slice([1.0f32, 2.0, -3.0]);
-    let result = t.square().unwrap();
+    let result = t.square();
     assert_eq!(result.uop().dtype(), DType::Float32);
 }
 
 #[test]
 fn test_square_int() {
     let t = Tensor::from_slice([1i32, 2, -3]);
-    let result = t.square().unwrap();
+    let result = t.square();
     assert_eq!(result.uop().dtype(), DType::Int32);
 }
 
 #[test]
 fn test_sign_basic() {
     let t = Tensor::from_slice([-5.0f32, 0.0, 3.0]);
-    let result = t.sign().unwrap();
+    let result = t.sign();
     assert_eq!(result.uop().dtype(), DType::Float32);
 }
 
 #[test]
 fn test_sign_int() {
     let t = Tensor::from_slice([-5i32, 0, 3]);
-    let result = t.sign().unwrap();
+    let result = t.sign();
     assert_eq!(result.uop().dtype(), DType::Int32);
 }
 
@@ -142,11 +142,11 @@ crate::codegen_tests! {
     /// Half builtins must round to half on every backend: the C backend computes
     /// them at f32 and used to hand the f32 result straight to the consumer.
     fn test_float16_builtins_round_to_float16(config) {
-        let x = Tensor::from_slice([0.5f32, 100.0]).cast(DType::Float16).unwrap();
-        let mut sqrt = x.try_sqrt().unwrap().cast(DType::Float32).unwrap();
+        let x = Tensor::from_slice([0.5f32, 100.0]).cast(DType::Float16);
+        let sqrt = x.try_sqrt().unwrap().cast(DType::Float32);
         sqrt.realize_with(&config).unwrap();
         assert_eq!(sqrt.as_vec::<f32>().unwrap()[0], 0.70703125);
-        let mut exp2 = x.try_exp2().unwrap().cast(DType::Float32).unwrap();
+        let exp2 = x.try_exp2().unwrap().cast(DType::Float32);
         exp2.realize_with(&config).unwrap();
         assert!(exp2.as_vec::<f32>().unwrap()[1].is_infinite(), "exp2(100) must overflow float16");
     }
@@ -234,7 +234,7 @@ crate::codegen_tests! {
     fn test_cholesky_2x2(config) {
         // A = [[4,2],[2,3]] → L = [[2,0],[1,√2]]
         let a = Tensor::from_slice([4.0f32, 2.0, 2.0, 3.0]).try_reshape([2, 2]).unwrap();
-        let mut l = a.cholesky().unwrap();
+        let l = a.cholesky().unwrap();
         assert_close_f32(
             &l.realize_with_and(&config).as_vec::<f32>().unwrap(),
             &[2.0, 0.0, 1.0, std::f32::consts::SQRT_2],
@@ -247,7 +247,7 @@ crate::codegen_tests! {
         let vals = [4.0f32, 2.0, 2.0, 2.0, 5.0, 3.0, 2.0, 3.0, 6.0];
         let a = Tensor::from_slice(vals).try_reshape([3, 3]).unwrap();
         let l = a.cholesky().unwrap();
-        let mut recon = l.matmul(&l.try_transpose(-2, -1).unwrap()).unwrap();
+        let recon = l.matmul(&l.try_transpose(-2, -1).unwrap()).unwrap();
         assert_close_f32(&recon.realize_with_and(&config).as_vec::<f32>().unwrap(), &vals, 1e-4);
     }
 
@@ -256,9 +256,9 @@ crate::codegen_tests! {
         let vals = [12.0f32, -51.0, 4.0, 6.0, 167.0, -68.0, -4.0, 24.0, -41.0];
         let a = Tensor::from_slice(vals).try_reshape([3, 3]).unwrap();
         let (q, r) = a.qr().unwrap();
-        let mut recon = q.matmul(&r).unwrap();
+        let recon = q.matmul(&r).unwrap();
         assert_close_f32(&recon.realize_with_and(&config).as_vec::<f32>().unwrap(), &vals, 1e-3);
-        let mut qtq = q.try_transpose(-2, -1).unwrap().matmul(&q).unwrap();
+        let qtq = q.try_transpose(-2, -1).unwrap().matmul(&q).unwrap();
         assert_close_f32(
             &qtq.realize_with_and(&config).as_vec::<f32>().unwrap(),
             &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
@@ -274,7 +274,7 @@ crate::codegen_tests! {
         ];
         let a = Tensor::from_slice(vals).try_reshape([2, 3, 3]).unwrap();
         let (q, r) = a.qr().unwrap();
-        let mut recon = q.matmul(&r).unwrap();
+        let recon = q.matmul(&r).unwrap();
         assert_close_f32(&recon.realize_with_and(&config).as_vec::<f32>().unwrap(), &vals, 1e-3);
     }
 }

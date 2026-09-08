@@ -22,7 +22,7 @@ use svod_tensor::Tensor;
 use zip::ZipArchive;
 use zip::result::ZipError;
 
-use crate::state::StateDict;
+use svod_tensor::nn::StateDict;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -41,7 +41,7 @@ pub enum Error {
     UnsupportedDtype { dtype: String },
     #[snafu(display("compressed storage is not supported"))]
     CompressedStorage,
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Tensor {
         #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
         source: Box<svod_tensor::error::Error>,
@@ -216,7 +216,7 @@ fn load_pytorch_bin_with_state_dict_key(
         let mut buf = vec![0u8; byte_length];
         raw_file.read_exact(&mut buf).context(IoSnafu)?;
 
-        let tensor = Tensor::from_raw_bytes(&buf, &shape, dtype).context(TensorSnafu)?;
+        let tensor = Tensor::from_raw_bytes(&buf, &shape, dtype)?;
         let final_name = name.strip_prefix(strip_prefix).unwrap_or(name).to_string();
         sd.insert(final_name, tensor);
     }

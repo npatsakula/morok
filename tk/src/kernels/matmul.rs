@@ -213,7 +213,7 @@ pub const MATMUL_SUPPORTED_ARCHS: crate::ArchSet =
 /// }
 /// ```
 pub fn matmul(a: &Tensor, b: &Tensor) -> crate::LaunchResult<Option<Tensor>> {
-    use snafu::{ResultExt, ensure};
+    use snafu::ensure;
 
     let ad = crate::launch::concrete_dims(a, "matmul", "a", 2)?;
     let bd = crate::launch::concrete_dims(b, "matmul", "b", 2)?;
@@ -243,8 +243,8 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> crate::LaunchResult<Option<Tensor>> {
             );
             // Operands → bf16 (the matrix-engine operand dtype); a no-op when already
             // bf16, so the ABI's bf16 globals bind directly. Output stays f32 (accumulator).
-            let a_bf = a.cast(DType::BFloat16).context(crate::launch::OperandSnafu)?;
-            let b_bf = b.cast(DType::BFloat16).context(crate::launch::OperandSnafu)?;
+            let a_bf = a.cast(DType::BFloat16);
+            let b_bf = b.cast(DType::BFloat16);
             let out = Tensor::empty(&[n, n], DType::Float32);
             crate::graph_launch(
                 "matmul",

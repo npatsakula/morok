@@ -59,7 +59,7 @@ fn load_fixture() -> (BgeM3, StateDict) {
 }
 
 fn load_golden_vec<T: Clone + Default + svod_dtype::ext::HasDType>(sd: &StateDict, key: &str) -> Vec<T> {
-    let mut t = sd.get(key).unwrap_or_else(|| panic!("missing golden key: {key}")).clone();
+    let t = sd.get(key).unwrap_or_else(|| panic!("missing golden key: {key}")).clone();
     t.realize().unwrap();
     t.as_vec::<T>().unwrap()
 }
@@ -84,7 +84,7 @@ fn prep_inputs(golden: &StateDict) -> (Tensor, Tensor) {
 fn last_hidden_state_matches_pytorch() {
     let (model, golden) = load_fixture();
     let (ids, mask) = prep_inputs(&golden);
-    let mut out = model.model.forward(&ids, Some(&mask)).unwrap();
+    let out = model.model.forward(&ids, Some(&mask)).unwrap();
     out.realize().unwrap();
     let delta = max_abs_delta(&out.as_vec::<f32>().unwrap(), &load_golden_vec(&golden, "last_hidden_state"));
     assert!(delta < 1e-3, "last_hidden_state max |delta| = {delta:.6}");
@@ -95,7 +95,7 @@ fn last_hidden_state_matches_pytorch() {
 fn dense_vecs_match_pytorch() {
     let (model, golden) = load_fixture();
     let (ids, mask) = prep_inputs(&golden);
-    let mut dense = model.encode_dense(&ids, &mask).unwrap();
+    let dense = model.encode_dense(&ids, &mask).unwrap();
     dense.realize().unwrap();
     let delta = max_abs_delta(&dense.as_vec::<f32>().unwrap(), &load_golden_vec(&golden, "dense_vecs"));
     assert!(delta < 1e-3, "dense_vecs max |delta| = {delta:.6}");
@@ -113,7 +113,7 @@ fn sparse_vecs_match_pytorch() {
     let out = model
         .encode(&ids, &mask, EncodeOpts { return_dense: false, return_sparse: true, return_colbert: false })
         .unwrap();
-    let mut sparse = out.sparse_vecs.unwrap();
+    let sparse = out.sparse_vecs.unwrap();
     sparse.realize().unwrap();
     let delta = max_abs_delta(&sparse.as_vec::<f32>().unwrap(), &load_golden_vec(&golden, "sparse_vecs"));
     assert!(delta < 1e-3, "sparse_vecs max |delta| = {delta:.6}");
@@ -131,7 +131,7 @@ fn colbert_vecs_match_pytorch() {
     let out = model
         .encode(&ids, &mask, EncodeOpts { return_dense: false, return_sparse: false, return_colbert: true })
         .unwrap();
-    let mut colbert = out.colbert_vecs.unwrap();
+    let colbert = out.colbert_vecs.unwrap();
     colbert.realize().unwrap();
     let delta = max_abs_delta(&colbert.as_vec::<f32>().unwrap(), &load_golden_vec(&golden, "colbert_vecs"));
     assert!(delta < 1e-2, "colbert_vecs max |delta| = {delta:.6}");
@@ -144,7 +144,7 @@ fn ignoring_padding_diverges_from_golden() {
     let (ids, _) = prep_inputs(&golden);
     let t = load_golden_vec::<i64>(&golden, "input_ids_shape")[1] as usize;
     let mask = Tensor::from_slice(vec![1i64; t]).try_reshape([1isize, t as isize]).unwrap();
-    let mut out = model.model.forward(&ids, Some(&mask)).unwrap();
+    let out = model.model.forward(&ids, Some(&mask)).unwrap();
     out.realize().unwrap();
     let delta = max_abs_delta(&out.as_vec::<f32>().unwrap(), &load_golden_vec(&golden, "last_hidden_state"));
     assert!(delta > 1e-2, "all-ones mask did NOT diverge (delta={delta:.6})");
@@ -165,7 +165,7 @@ fn load_reranker_fixture() -> (BgeRerankerV2M3, StateDict) {
 fn reranker_logits_match_pytorch() {
     let (model, golden) = load_reranker_fixture();
     let (ids, mask) = prep_inputs(&golden);
-    let mut out = model.forward(&ids, Some(&mask)).unwrap();
+    let out = model.forward(&ids, Some(&mask)).unwrap();
     out.realize().unwrap();
     let delta = max_abs_delta(&out.as_vec::<f32>().unwrap(), &load_golden_vec(&golden, "logits"));
     assert!(delta < 1e-3, "reranker logits max |delta| = {delta:.6}");

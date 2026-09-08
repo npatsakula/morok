@@ -1,3 +1,3 @@
 mod config;
-mod model;
+pub(crate) mod model;
 mod position_ids;

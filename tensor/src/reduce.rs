@@ -4,12 +4,12 @@
 //! with ergonomic APIs that match PyTorch/NumPy conventions.
 
 use bon::bon;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::{ReduceOp, SInt, UOp};
 
 use crate::{
-    Error, Result, Tensor,
+    ErrorKind, Result, Tensor,
     error::{SymbolicShapeUnsupportedSnafu, UOpSnafu},
 };
 
@@ -182,7 +182,7 @@ impl Tensor {
     ) -> Result<Self> {
         origin_call!("sum");
         if dtype.is_some() && promote == Some(true) {
-            return Err(Error::ConflictingReductionOptions);
+            return Err(ErrorKind::ConflictingReductionOptions.into());
         }
         let promote = promote.unwrap_or(dtype.is_none());
         reduce_internal(self, ReduceOp::Add, axes.into(), keepdim, dtype, promote)
@@ -405,7 +405,7 @@ impl Tensor {
     fn inverse(&self) -> Result<Self> {
         let dtype = self.uop().dtype();
         if dtype.is_float() {
-            self.try_neg()
+            Ok(self.neg())
         } else if dtype.is_int() {
             self.bitwise_not()
         } else if matches!(dtype.scalar(), Some(ScalarDType::Bool)) {
@@ -465,16 +465,17 @@ impl Tensor {
         let shape = self.shape()?;
         let ndim = shape.len();
         let norm_axis = Self::normalize_axis(axis, ndim)?;
-        let axis_size = shape[norm_axis].as_const().ok_or_else(|| crate::error::Error::SymbolicShapeUnsupported {
-            operation: format!("hardmax axis {norm_axis}"),
+        let axis_size = shape[norm_axis].as_const().ok_or_else(|| {
+            crate::error::ErrorKind::SymbolicShapeUnsupported { operation: format!("hardmax axis {norm_axis}") }
         })?;
-        self.argmax_with()
+        Ok(self
+            .argmax_with()
             .axis(Some(axis))
             .keepdim(false)
             .call()?
             .try_unsqueeze(axis)?
             .one_hot_along_dim(axis_size, axis)?
-            .cast(self.uop().dtype())
+            .cast(self.uop().dtype()))
     }
 
     /// Index of minimum value along axis.
@@ -553,69 +554,45 @@ impl Tensor {
 }
 
 /// Internal argmax implementation.
+///
+/// Only the reduced axis has to be concrete — the tie-break needs a descending
+/// index ramp `[N, N-1, .., 1]` of exactly that extent. Every other axis is
+/// carried as an `SInt`, so a symbolic batch flows through untouched.
 fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Tensor> {
-    // Handle None axis: flatten and call argmax on axis 0
-    let (working_tensor, working_axis) =
-        if let Some(ax) = axis { (tensor.clone(), ax) } else { (tensor.flatten()?, 0) };
+    // `axis = None` folds *every* axis into the reduced one, so all of them must
+    // be concrete for the ramp above to exist.
+    let (working_tensor, working_axis) = match axis {
+        Some(ax) => (tensor.clone(), ax),
+        None => {
+            snafu::ensure!(
+                tensor.shape()?.iter().all(|dim| dim.is_const()),
+                SymbolicShapeUnsupportedSnafu { operation: "argmax/argmin over a flattened symbolic shape" }
+            );
+            (tensor.flatten()?, 0)
+        }
+    };
 
     let shape = working_tensor.shape()?;
     let normalized_axis = Tensor::normalize_axis(working_axis, shape.len())?;
     let axis_size = shape[normalized_axis]
         .as_const()
-        .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "argmax".to_string() })?;
+        .context(SymbolicShapeUnsupportedSnafu { operation: "argmax/argmin over a symbolic axis" })?;
 
-    // Convert shape to isize vec once for reuse in expand operations
-    let shape_vec = svod_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
+    // Mask of the positions holding the per-axis maximum.
+    let max_vals = working_tensor.max_with().axes(working_axis).keepdim(true).call()?.try_expand(shape.clone())?;
+    let mask = working_tensor.try_eq(&max_vals)?.cast(DType::Int32);
 
-    // Step 1: Find maximum values along axis (with keepdim for broadcasting)
-    let max_vals_keepdim = working_tensor.max_with().axes(working_axis).keepdim(true).call()?;
+    // Descending ramp [N, N-1, .., 1] laid along `normalized_axis`, so the
+    // largest masked value — and thus the max below — is the *first* occurrence.
+    let mut ramp_shape: Vec<SInt> = vec![SInt::Const(1); shape.len()];
+    ramp_shape[normalized_axis] = SInt::Const(axis_size);
+    let ramp = Tensor::arange(axis_size as i64, Some(0), Some(-1))?.try_reshape(ramp_shape)?.try_expand(shape)?;
 
-    // Step 2: Create mask where values equal the max
-    // Need to broadcast max_vals to match working_tensor shape
-    let max_vals_broadcast = max_vals_keepdim.try_expand(&shape_vec)?;
+    let max_idx = mask.try_mul(&ramp)?.max_with().axes(working_axis).keepdim(keepdim).call()?;
 
-    let mask = working_tensor.try_eq(&max_vals_broadcast)?;
-
-    // Step 3: Create descending index tensor [N, N-1, ..., 1]
-    // This ensures ties go to first occurrence
-    let indices = Tensor::arange(axis_size as i64, Some(0), Some(-1))?;
-
-    // Step 4: Reshape indices to broadcast along the target axis
-    // E.g., for axis=1 with 3D tensor: [axis_size] -> [1, axis_size, 1]
-    let mut idx_shape = vec![1isize; shape.len()];
-    idx_shape[normalized_axis] = axis_size as isize;
-    let indices_reshaped = indices.try_reshape(&idx_shape)?;
-
-    // Expand indices to match working_tensor shape
-    let indices_broadcast = indices_reshaped.try_expand(&shape_vec)?;
-
-    // Step 5: Multiply mask by indices (0 where not max, index where max)
-    let mask_int = mask.cast(DType::Int32)?;
-    let masked_indices = mask_int.try_mul(&indices_broadcast)?;
-
-    // Step 6: Take max of masked indices (gives highest index, which is first occurrence)
-    let max_idx = masked_indices.max_with().axes(working_axis).keepdim(keepdim).call()?;
-
-    // Step 7: Invert: N - max_idx gives actual index
-    let n_tensor = Tensor::from_slice([axis_size as i32]);
-
-    // Broadcast n_tensor to match max_idx shape if needed
-    let max_idx_shape = max_idx.shape()?;
-    let result = if !max_idx_shape.is_empty() {
-        // Non-scalar result: broadcast n_tensor
-        let max_idx_shape_vec = svod_ir::shape::to_vec_isize(&max_idx_shape).context(UOpSnafu)?;
-        let ones_shape = vec![1isize; max_idx_shape.len()];
-        let n_reshaped = n_tensor.try_reshape(&ones_shape)?;
-        let n_broadcast = n_reshaped.try_expand(&max_idx_shape_vec)?;
-        n_broadcast.try_sub(&max_idx)?
-    } else {
-        // Scalar result: reshape n_tensor to scalar too
-        let n_scalar = n_tensor.try_reshape(&[] as &[isize])?;
-        n_scalar.try_sub(&max_idx)?
-    };
-
-    // Cast final result to Int32 (like Tinygrad)
-    result.cast(DType::Int32)
+    // Invert the ramp: N - max_idx is the actual index.
+    let n = Tensor::new(UOp::const_(DType::Int32, svod_ir::ConstValue::Int(axis_size as i64)));
+    Ok(n.broadcast_to(&max_idx.shape()?)?.try_sub(&max_idx)?.cast(DType::Int32))
 }
 
 /// Internal argmin implementation.
@@ -628,7 +605,7 @@ fn argmin_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
 /// Internal any implementation.
 fn any_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool) -> Result<Tensor> {
     // Cast to bool (non-zero becomes true)
-    let as_bool = tensor.cast(DType::Bool)?;
+    let as_bool = tensor.cast(DType::Bool);
 
     // Max reduction on bool is logical OR
     reduce_internal(&as_bool, ReduceOp::Max, axes, keepdim, None, false)
@@ -654,7 +631,7 @@ fn reduce_internal(
 ) -> Result<Tensor> {
     // Validate conflicting options
     if dtype.is_some() && promote {
-        return Err(Error::ConflictingReductionOptions);
+        return Err(ErrorKind::ConflictingReductionOptions.into());
     }
 
     let shape = tensor.shape()?;
@@ -679,7 +656,7 @@ fn reduce_internal(
     };
 
     // Cast to accumulation dtype if needed
-    let working_tensor = if acc_dtype != original_dtype { tensor.cast(acc_dtype.clone())? } else { tensor.clone() };
+    let working_tensor = if acc_dtype != original_dtype { tensor.cast(acc_dtype.clone()) } else { tensor.clone() };
 
     // Perform reduction
     let reduced = working_tensor.uop().try_reduce_axis(op, resolved_axes.clone()).context(UOpSnafu)?;
@@ -699,7 +676,7 @@ fn reduce_internal(
     // Cast back to the input dtype whenever we accumulated in a wider type
     // (fp16/bf16/fp8), whether via `promote` or the float32 sum-acc upcast above.
     if dtype.is_none() && acc_dtype != original_dtype && Tensor::should_cast_back_after_sum(&original_dtype) {
-        result.cast(original_dtype)
+        Ok(result.cast(original_dtype))
     } else {
         Ok(result)
     }
@@ -717,7 +694,7 @@ fn mean_impl(tensor: &Tensor, axes: impl Into<AxisSpec>, keepdim: bool) -> Resul
         if let Some(dim_size) = shape[axis].as_const() {
             count *= dim_size as i64;
         } else {
-            return SymbolicShapeUnsupportedSnafu { operation: "mean" }.fail();
+            return SymbolicShapeUnsupportedSnafu { operation: "mean over a symbolic axis" }.fail().map_err(Into::into);
         }
     }
 
@@ -733,8 +710,8 @@ fn mean_impl(tensor: &Tensor, axes: impl Into<AxisSpec>, keepdim: bool) -> Resul
     let sum = reduce_internal(tensor, ReduceOp::Add, axes, keepdim, Some(acc_dtype.clone()), false)?;
 
     let count_tensor = Tensor::new(UOp::const_(acc_dtype.clone(), svod_ir::ConstValue::Float(count as f64)));
-    let mean = &sum / &count_tensor;
-    if acc_dtype != output_dtype { mean.cast(output_dtype) } else { Ok(mean) }
+    let mean = (&sum / &count_tensor)?;
+    Ok(if acc_dtype != output_dtype { mean.cast(output_dtype) } else { mean })
 }
 
 /// Variance implementation using the numerically-stable `(X - E[X])²` formula.
@@ -760,7 +737,9 @@ fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool, correction: i64
         if let Some(dim_size) = shape[axis].as_const() {
             count *= dim_size as i64;
         } else {
-            return SymbolicShapeUnsupportedSnafu { operation: "variance" }.fail();
+            return SymbolicShapeUnsupportedSnafu { operation: "variance over a symbolic axis" }
+                .fail()
+                .map_err(Into::into);
         }
     }
 
@@ -785,7 +764,7 @@ fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool, correction: i64
     };
 
     // Square the deviations: (X - E[X])²
-    let squared_dev = deviation.square()?;
+    let squared_dev = deviation.square();
 
     // Accumulate *and* divide in `sum_acc_dtype` like `mean_impl`, casting to the
     // output dtype only at the end: a float16 sum of squares cast back before the
@@ -801,12 +780,12 @@ fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool, correction: i64
         // svod's `/` rejects a constant-zero divisor, so express the IEEE result as
         // `reduced * inf` (0*inf = NaN, k*inf = +inf).
         let inf = Tensor::new(UOp::const_(acc_dtype.clone(), svod_ir::ConstValue::Float(f64::INFINITY)));
-        &sum_sq_dev * &inf
+        (&sum_sq_dev * &inf)?
     } else {
         let denom_tensor = Tensor::new(UOp::const_(acc_dtype.clone(), svod_ir::ConstValue::Float(denom as f64)));
-        &sum_sq_dev / &denom_tensor
+        (&sum_sq_dev / &denom_tensor)?
     };
-    let variance = if acc_dtype != output_dtype { variance.cast(output_dtype)? } else { variance };
+    let variance = if acc_dtype != output_dtype { variance.cast(output_dtype) } else { variance };
 
     Ok((variance, mean))
 }

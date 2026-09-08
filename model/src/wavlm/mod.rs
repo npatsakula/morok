@@ -10,7 +10,6 @@ mod error;
 mod feature_extractor;
 mod feed_forward;
 mod jit;
-mod layer_norm;
 mod model;
 mod pos_conv;
 
@@ -19,9 +18,9 @@ pub use config::{ConvLayerConfig, ExtractorMode, WavLmConfig, wavlm_base, wavlm_
 pub use encoder::Encoder;
 pub use encoder_layer::EncoderLayer;
 pub use error::{Error, Result};
-pub use feature_extractor::{BlockNorm, ConvLayerBlock, FeatureExtractor, NormKind};
-pub use feed_forward::FeedForwardWeights;
+pub use feature_extractor::{BlockNorm, ConvLayerBlock, FeatureExtractor, GroupNorm};
+pub use feed_forward::FeedForward;
 pub use jit::WavLmJit;
-pub use layer_norm::LayerNormWeights;
 pub use model::WavLm;
+pub(crate) use model::drop_inert_keys;
 pub use pos_conv::ConvolutionalPositionalEmbedding;

@@ -139,7 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- JIT: compile once, run many -------------------------------------
     // `prepare` bakes the image size (H, W) into the execution plan. The
     // batch dimension is a symbolic variable bound at runtime via
-    // `execute_with_vars`, so the same plan handles any batch ≤ max_batch_size.
+    // `execute_bound`, so the same plan handles any batch ≤ max_batch_size.
     let mut jit = Yolo26DetectJit::new(model);
     jit.prepare(InputSpec::new(&[1, 3, side, side], DType::Float32))?;
 
@@ -148,24 +148,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Execute with batch = 1.
     let t0 = std::time::Instant::now();
-    jit.execute_with_vars(&[("b", 1)])?;
+    jit.execute_bound(1)?;
     let elapsed = t0.elapsed();
 
     // --- Read output -----------------------------------------------------
-    // `output()` returns the JIT plan's output buffer. `as_array` gives a
-    // typed ndarray view in one call; `as_slice` gets the flat f32 data.
-    let out = jit.output()?;
-    let arr = out.as_array::<f32>()?;
-    let buf_shape = arr.shape();
-    let data = arr.as_slice().expect("contiguous output");
+    // The wrapper knows the declared output's live shape ([1, 4+nc, A] —
+    // decoded xyxy boxes + sigmoid'd class scores) with `b` substituted, so
+    // there is no buffer-size arithmetic to do here.
+    let shape = jit.predictions_shape()?;
+    let data = jit.predictions_to_vec::<f32>()?;
 
-    // Output: [1, 4+nc, A] — decoded xyxy boxes + sigmoid'd class scores.
-    // The JIT output buffer may be flattened; derive logical shape if needed.
-    let out_ch = 4 + args.classes;
-    let shape: Vec<usize> =
-        if buf_shape.len() == 3 { buf_shape.to_vec() } else { vec![1, out_ch, data.len() / out_ch] };
-
-    let detections = postprocess_raw(data, &shape, args.classes, args.max_det)?;
+    let detections = postprocess_raw(&data, &shape, args.classes, args.max_det)?;
     let dets = &detections[0];
 
     // --- Print results ---------------------------------------------------

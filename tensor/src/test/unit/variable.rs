@@ -92,7 +92,7 @@ fn test_full_dynamic_binary_op_shape() {
     let shape = [bound.as_sint(), SInt::from(3)];
     let c = Tensor::full_dynamic(&shape, 2.0f32, DType::Float32)
         .unwrap()
-        .try_add(&Tensor::full_dynamic(&shape, 3.0f32, DType::Float32).unwrap())
+        .try_add(Tensor::full_dynamic(&shape, 3.0f32, DType::Float32).unwrap())
         .unwrap();
     let s = c.shape().unwrap();
     assert!(s[0].is_symbolic());
@@ -131,25 +131,25 @@ crate::codegen_tests! {
     fn test_full_dynamic_realize(config, shape: &[usize], value: f32, expected: &[f32]) {
         test_setup();
         let sint_shape: Vec<SInt> = shape.iter().map(|&s| SInt::from(s)).collect();
-        let mut t = Tensor::full_dynamic(&sint_shape, value, DType::Float32).unwrap();
+        let t = Tensor::full_dynamic(&sint_shape, value, DType::Float32).unwrap();
         assert_close_f32(&t.realize_with_and(&config).as_vec::<f32>().unwrap(), expected, 1e-6);
     }
 
     fn test_full_dynamic_realize_int(config) {
         test_setup();
-        let mut t = Tensor::full_dynamic(&[SInt::from(5)], ConstValue::Int(42), DType::Int32).unwrap();
+        let t = Tensor::full_dynamic(&[SInt::from(5)], ConstValue::Int(42), DType::Int32).unwrap();
         assert_eq!(t.realize_with_and(&config).as_vec::<i32>().unwrap(), vec![42; 5]);
     }
 
     fn test_full_dynamic_scalar(config) {
         test_setup();
-        let mut t = Tensor::full_dynamic(&[], 3.14f32, DType::Float32).unwrap();
+        let t = Tensor::full_dynamic(&[], 3.14f32, DType::Float32).unwrap();
         assert_close_f32(&t.realize_with_and(&config).as_vec::<f32>().unwrap(), &[3.14], 1e-5);
     }
 
     fn test_full_dynamic_zero_elements(config) {
         test_setup();
-        let mut t = Tensor::full_dynamic(&[SInt::from(0)], 1.0f32, DType::Float32).unwrap();
+        let t = Tensor::full_dynamic(&[SInt::from(0)], 1.0f32, DType::Float32).unwrap();
         t.realize_with(&config).unwrap();
         assert!(t.as_vec::<f32>().unwrap().is_empty());
     }
@@ -161,7 +161,7 @@ crate::codegen_tests! {
         let shape = [SInt::from(4)];
         let a = Tensor::full_dynamic(&shape, 2.0f32, DType::Float32).unwrap();
         let b = Tensor::full_dynamic(&shape, 3.0f32, DType::Float32).unwrap();
-        let mut c = &a + &b;
+        let c = (&a + &b).unwrap();
         assert_eq!(c.realize_with_and(&config).as_vec::<f32>().unwrap(), vec![5.0; 4]);
     }
 
@@ -171,7 +171,7 @@ crate::codegen_tests! {
         let a = Tensor::full_dynamic(&shape, 2.0f32, DType::Float32).unwrap();
         let b = Tensor::full_dynamic(&shape, 3.0f32, DType::Float32).unwrap();
         let c = Tensor::full_dynamic(&shape, 1.0f32, DType::Float32).unwrap();
-        let mut r = (&a + &b) * &c;
+        let r = ((&a + &b).unwrap() * &c).unwrap();
         assert_close_f32(&r.realize_with_and(&config).as_vec::<f32>().unwrap(), &[5.0; 4], 1e-6);
     }
 
@@ -179,21 +179,21 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
         let b = Tensor::full_dynamic(&[SInt::from(4)], 10.0f32, DType::Float32).unwrap();
-        let mut c = &a + &b;
+        let c = (&a + &b).unwrap();
         assert_close_f32(&c.realize_with_and(&config).as_vec::<f32>().unwrap(), &[11.0, 12.0, 13.0, 14.0], 1e-6);
     }
 
     fn test_full_dynamic_sum(config) {
         test_setup();
         let t = Tensor::full_dynamic(&[SInt::from(4)], 3.0f32, DType::Float32).unwrap();
-        let mut sum = t.sum(()).unwrap();
+        let sum = t.sum(()).unwrap();
         assert_close_f32(&sum.realize_with_and(&config).as_vec::<f32>().unwrap(), &[12.0], 1e-5);
     }
 
     fn test_full_dynamic_reshape(config) {
         test_setup();
         let t = Tensor::full_dynamic(&[SInt::from(2), SInt::from(3)], 1.0f32, DType::Float32).unwrap();
-        let mut r = t.try_reshape([6]).unwrap();
+        let r = t.try_reshape([6]).unwrap();
         assert_eq!(r.realize_with_and(&config).as_vec::<f32>().unwrap(), vec![1.0; 6]);
     }
 
@@ -203,7 +203,7 @@ crate::codegen_tests! {
 
     fn test_empty_assign_realize(config) {
         test_setup();
-        let mut t = Tensor::empty(&[4], DType::Float32);
+        let t = Tensor::empty(&[4], DType::Float32);
         t.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]));
         assert_close_f32(&t.realize_with_and(&config).as_vec::<f32>().unwrap(), &[1.0, 2.0, 3.0, 4.0], 1e-6);
     }
@@ -212,7 +212,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([0.0f32, 0.0, 0.0]);
         let b = Tensor::from_slice([10.0f32, 20.0, 30.0]);
-        let mut output = &a + &b;
+        let output = (&a + &b).unwrap();
         a.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0]));
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[10.0, 20.0, 30.0], 1e-6);
     }
@@ -220,7 +220,7 @@ crate::codegen_tests! {
     fn test_assign_downstream_sum_built_before_assign(config) {
         test_setup();
         let a = Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
-        let mut sum = a.sum(()).unwrap();
+        let sum = a.sum(()).unwrap();
         a.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]));
         assert_close_f32(&sum.realize_with_and(&config).as_vec::<f32>().unwrap(), &[0.0], 1e-5);
     }
@@ -229,7 +229,7 @@ crate::codegen_tests! {
         test_setup();
         let a = Tensor::from_slice([0.0f32, 0.0, 0.0]);
         let b = Tensor::from_slice([0.0f32, 0.0, 0.0]);
-        let mut output = &a * &b;
+        let output = (&a * &b).unwrap();
         a.assign(&Tensor::from_slice([2.0f32, 3.0, 4.0]));
         b.assign(&Tensor::from_slice([5.0f32, 6.0, 7.0]));
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[0.0, 0.0, 0.0], 1e-6);
@@ -240,7 +240,7 @@ crate::codegen_tests! {
         let a = Tensor::from_slice([0.0f32, 0.0, 0.0]);
         let b = Tensor::from_slice([10.0f32, 20.0, 30.0]);
         a.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0]));
-        let mut output = &a + &b;
+        let output = (&a + &b).unwrap();
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[11.0, 22.0, 33.0], 1e-6);
     }
 
@@ -249,8 +249,8 @@ crate::codegen_tests! {
         let a = Tensor::empty(&[3], DType::Float32);
         let b = Tensor::empty(&[3], DType::Float32);
         a.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0]));
-        b.assign(&(&a + &Tensor::from_slice([10.0f32, 20.0, 30.0])));
-        let mut sum = b.sum(()).unwrap();
+        b.assign(&(&a + &Tensor::from_slice([10.0f32, 20.0, 30.0])).unwrap());
+        let sum = b.sum(()).unwrap();
         sum.realize_with(&config).unwrap();
         assert_close_f32(&sum.as_vec::<f32>().unwrap(), &[66.0], 1e-5);
     }
@@ -264,7 +264,7 @@ crate::codegen_tests! {
         left.assign(&Tensor::from_slice([1.0f32, 2.0]));
         right.assign(&Tensor::from_slice([3.0f32, 4.0]));
 
-        let mut output = &left + &right;
+        let output = (&left + &right).unwrap();
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[4.0, 6.0], 1e-6);
     }
 
@@ -274,7 +274,7 @@ crate::codegen_tests! {
         let right = base.try_shrink([(2, 4)]).unwrap();
         right.assign(&Tensor::from_slice([3.0f32, 4.0]));
 
-        let mut output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        let output = (&base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0])).unwrap();
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[9.0, 9.0, 3.0, 4.0], 1e-6);
     }
 
@@ -287,7 +287,7 @@ crate::codegen_tests! {
         left.assign(&Tensor::from_slice([1.0f32, 2.0]));
         right.assign(&Tensor::from_slice([3.0f32, 4.0]));
 
-        let mut output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        let output = (&base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0])).unwrap();
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[1.0, 2.0, 3.0, 4.0], 1e-6);
     }
 
@@ -297,7 +297,7 @@ crate::codegen_tests! {
         base.try_shrink([(0, 3)]).unwrap().assign(&Tensor::from_slice([1.0f32, 2.0, 3.0]));
         base.try_shrink([(1, 4)]).unwrap().assign(&Tensor::from_slice([4.0f32, 5.0, 6.0]));
 
-        let mut output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        let output = (&base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0])).unwrap();
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[1.0, 4.0, 5.0, 6.0], 1e-6);
     }
 
@@ -308,7 +308,7 @@ crate::codegen_tests! {
         let dst = base.try_shrink([(1, 3)]).unwrap();
         dst.assign(&src);
 
-        let mut output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        let output = (&base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0])).unwrap();
         assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[1.0, 1.0, 2.0, 4.0], 1e-6);
     }
 
@@ -318,13 +318,13 @@ crate::codegen_tests! {
         let base = Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]).try_reshape([2, 2]).unwrap();
         let transposed = base.try_permute(&[1, 0]).unwrap();
         transposed.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([2, 2]).unwrap());
-        let mut transposed_output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]).try_reshape([2, 2]).unwrap();
+        let transposed_output = (&base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]).try_reshape([2, 2]).unwrap()).unwrap();
         assert_close_f32(&transposed_output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[1.0, 3.0, 2.0, 4.0], 1e-6);
 
         let base = Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
         let flipped = base.flip(&[0]).unwrap();
         flipped.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]));
-        let mut flipped_output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        let flipped_output = (&base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0])).unwrap();
         assert_close_f32(&flipped_output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[4.0, 3.0, 2.0, 1.0], 1e-6);
     }
 }
@@ -346,7 +346,7 @@ crate::codegen_tests! {
         let shape = [batch.bind(bind_val).unwrap().as_sint()];
         let input = Tensor::empty_dynamic(&shape, DType::Float32);
         input.assign(&Tensor::from_slice(data));
-        let mut sum = input.sum(()).unwrap();
+        let sum = input.sum(()).unwrap();
         sum.realize_with(&config).unwrap();
         assert_close_f32(&sum.as_vec::<f32>().unwrap(), &[expected], 1e-5);
     }
@@ -359,7 +359,7 @@ crate::codegen_tests! {
         let input = Tensor::empty_dynamic(&shape, DType::Float32);
         let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape([3, 2]).unwrap();
         input.assign(&data);
-        let mut result = input.sum(0).unwrap();
+        let result = input.sum(0).unwrap();
         result.realize_with(&config).unwrap();
         assert_close_f32(&result.as_vec::<f32>().unwrap(), &[9.0, 12.0], 1e-5);
     }
@@ -372,7 +372,7 @@ crate::codegen_tests! {
         let input = Tensor::empty_dynamic(&shape, DType::Float32);
         input.assign(&Tensor::from_slice([2.0f32, 4.0, 6.0, 8.0, 10.0]));
         let half = Tensor::full_dynamic(&shape, 0.5f32, DType::Float32).unwrap();
-        let mut sum = input.try_mul(&half).unwrap().sum(()).unwrap();
+        let sum = input.try_mul(&half).unwrap().sum(()).unwrap();
         sum.realize_with(&config).unwrap();
         assert_close_f32(&sum.as_vec::<f32>().unwrap(), &[15.0], 1e-5);
     }
@@ -395,7 +395,7 @@ crate::codegen_tests! {
         let shape3 = [batch.bind(3).unwrap().as_sint()];
         let t3 = Tensor::empty_dynamic(&shape3, DType::Float32);
         t3.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0]));
-        let mut sum3 = t3.sum(()).unwrap();
+        let sum3 = t3.sum(()).unwrap();
         sum3.realize_with(&config).unwrap();
         assert_close_f32(&sum3.as_vec::<f32>().unwrap(), &[6.0], 1e-5);
 
@@ -403,7 +403,7 @@ crate::codegen_tests! {
         let shape5 = [batch.bind(5).unwrap().as_sint()];
         let t5 = Tensor::empty_dynamic(&shape5, DType::Float32);
         t5.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]));
-        let mut sum5 = t5.sum(()).unwrap();
+        let sum5 = t5.sum(()).unwrap();
         sum5.realize_with(&config).unwrap();
         assert_close_f32(&sum5.as_vec::<f32>().unwrap(), &[15.0], 1e-5);
     }
@@ -419,7 +419,7 @@ crate::codegen_tests! {
         let shape = [batch.bind(n).unwrap().as_sint()];
         let input = Tensor::empty_dynamic(&shape, DType::Float32);
         input.assign(&Tensor::from_slice(data));
-        let mut sum = input.sum(()).unwrap();
+        let sum = input.sum(()).unwrap();
         sum.realize_with(&config).unwrap();
         assert_close_f32(&sum.as_vec::<f32>().unwrap(), &[expected_sum], 1e-5);
     }
@@ -435,7 +435,7 @@ crate::codegen_tests! {
             let input = Tensor::empty_dynamic(&shape, DType::Float32);
             input.assign(&Tensor::from_slice(&data));
             let two = Tensor::full_dynamic(&shape, 2.0f32, DType::Float32).unwrap();
-            let mut sum = input.try_mul(&two).unwrap().sum(()).unwrap();
+            let sum = input.try_mul(&two).unwrap().sum(()).unwrap();
             sum.realize_with(&config).unwrap();
             // sum(data * 2) = 2 * sum(0..n) = 2 * n*(n-1)/2 = n*(n-1)
             assert_close_f32(&sum.as_vec::<f32>().unwrap(), &[expected], 1e-5);
@@ -451,7 +451,7 @@ crate::codegen_tests! {
         let shape2 = [batch.bind(2).unwrap().as_sint(), SInt::from(2)];
         let t2 = Tensor::empty_dynamic(&shape2, DType::Float32);
         t2.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([2, 2]).unwrap());
-        let mut sum2 = t2.sum(0).unwrap();
+        let sum2 = t2.sum(0).unwrap();
         sum2.realize_with(&config).unwrap();
         assert_close_f32(&sum2.as_vec::<f32>().unwrap(), &[4.0, 6.0], 1e-5);
 
@@ -459,7 +459,7 @@ crate::codegen_tests! {
         let shape3 = [batch.bind(3).unwrap().as_sint(), SInt::from(2)];
         let t3 = Tensor::empty_dynamic(&shape3, DType::Float32);
         t3.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape([3, 2]).unwrap());
-        let mut sum3 = t3.sum(0).unwrap();
+        let sum3 = t3.sum(0).unwrap();
         sum3.realize_with(&config).unwrap();
         assert_close_f32(&sum3.as_vec::<f32>().unwrap(), &[9.0, 12.0], 1e-5);
     }
@@ -482,12 +482,12 @@ crate::codegen_tests! {
         //    In production this happens once at model load time.
         let input = Tensor::empty_dynamic(&shape, DType::Float32);
         input.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]));
-        let mut input_copy = input.clone();
+        let input_copy = input.clone();
         input_copy.realize_with(&config).unwrap();
 
         // 2. Build computation graph and prepare plan (wires output tensor to plan buffer)
-        let mut sum_result = input.sum(()).unwrap();
-        let mut plan = Tensor::prepare_batch_with([&mut sum_result], &config).unwrap();
+        let sum_result = input.sum(()).unwrap();
+        let mut plan = Tensor::prepare_batch_with([&sum_result], &config).unwrap();
 
         // 3. Execute loop with varying N and data
         for &(n, ref data, expected) in &[
@@ -519,8 +519,8 @@ crate::codegen_tests! {
         input.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]));
         input.clone().realize_with(&config).unwrap();
 
-        let mut sum = input.sum(()).unwrap();
-        let mut plan = Tensor::prepare_batch_with([&mut sum], &config).unwrap();
+        let sum = input.sum(()).unwrap();
+        let mut plan = Tensor::prepare_batch_with([&sum], &config).unwrap();
 
         // NOTE: numerics are not asserted here — a graph built from an *unbound*
         // variable still compiles a kernel that ignores the rebound value; the
@@ -547,7 +547,7 @@ crate::codegen_tests! {
         input.assign(&Tensor::from_ndarray(&data));
         let weight = Tensor::from_ndarray(&ndarray::Array4::from_elem((1, 1, 2, 2), 1.0f32));
         // Each 2x2 window of ones sums to 4.0. Output: [2, 1, 2, 2] all 4.0 → sum = 32.0
-        let mut result = input.conv2d().weight(&weight).call().unwrap().sum(()).unwrap();
+        let result = input.conv2d().weight(&weight).call().unwrap().sum(()).unwrap();
         result.realize_with(&config).unwrap();
         assert_close_f32(&result.as_vec::<f32>().unwrap(), &[32.0], 1e-5);
     }

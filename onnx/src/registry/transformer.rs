@@ -39,8 +39,7 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
     let softcap = if softcap_val > 0.0 { Some(softcap_val) } else { None };
     let softmax_precision = attrs.int("softmax_precision", 0);
 
-    let q_shape = q.shape()?;
-    let is_3d = q_shape.len() == 3;
+    let is_3d = q.ndim()? == 3;
 
     // Reshape 3D → 4D [B, S, hidden] → [B, H, S, D]
     let (q, k, v) = if is_3d {
@@ -50,15 +49,12 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
         if kv_num_heads == 0 {
             return Err(Error::IrConstruction { details: "kv_num_heads required for 3D input".into() });
         }
-        let q_hidden = q_shape[2].as_const().unwrap();
-        let q_head_dim = q_hidden / q_num_heads;
-        let k_shape = k.shape()?;
-        let k_head_dim = k_shape[2].as_const().unwrap() / kv_num_heads;
-        let v_shape = v.shape()?;
-        let v_head_dim = v_shape[2].as_const().unwrap() / kv_num_heads;
-        let batch = q_shape[0].as_const().unwrap() as isize;
-        let q_seq = q_shape[1].as_const().unwrap() as isize;
-        let k_seq = k_shape[1].as_const().unwrap() as isize;
+        let q_head_dim = q.dim_const(2)? / q_num_heads;
+        let k_head_dim = k.dim_const(2)? / kv_num_heads;
+        let v_head_dim = v.dim_const(2)? / kv_num_heads;
+        let batch = q.dim_const(0)? as isize;
+        let q_seq = q.dim_const(1)? as isize;
+        let k_seq = k.dim_const(1)? as isize;
 
         let q = q.try_reshape([batch, q_seq, q_num_heads as isize, q_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
         let k =
@@ -79,19 +75,16 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
 
     // GQA: repeat-interleave K/V heads to match Q head count
     // For 4D input, head counts come from shape dim 1 when attributes are unset
-    let q_s = q.shape()?;
-    let eff_q_heads = if q_num_heads > 0 { q_num_heads } else { q_s[1].as_const().unwrap() };
-    let eff_kv_heads = if kv_num_heads > 0 { kv_num_heads } else { k.shape()?[1].as_const().unwrap() };
+    let eff_q_heads = if q_num_heads > 0 { q_num_heads } else { q.dim_const(1)? };
+    let eff_kv_heads = if kv_num_heads > 0 { kv_num_heads } else { k.dim_const(1)? };
     let (k, v) = if eff_q_heads != eff_kv_heads {
         let ratio = eff_q_heads / eff_kv_heads;
-        let k_s = k.shape()?;
-        let b = k_s[0].as_const().unwrap() as isize;
+        let b = k.dim_const(0)? as isize;
         let kv_h = eff_kv_heads as isize;
         let r = ratio as isize;
-        let s_k = k_s[2].as_const().unwrap() as isize;
-        let d_k = k_s[3].as_const().unwrap() as isize;
-        let v_s = v.shape()?;
-        let d_v = v_s[3].as_const().unwrap() as isize;
+        let s_k = k.dim_const(2)? as isize;
+        let d_k = k.dim_const(3)? as isize;
+        let d_v = v.dim_const(3)? as isize;
         // [B, kv_h, S, D] → [B, kv_h, 1, S, D] → expand → [B, q_h, S, D]
         let k =
             k.try_unsqueeze(2)?.try_expand([b, kv_h, r, s_k, d_k])?.try_reshape([b, eff_q_heads as isize, s_k, d_k])?;
@@ -102,14 +95,12 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
         (k, v)
     };
 
-    let q_dtype = q.uop().dtype();
-    let q_s = q.shape()?;
-    let k_s = k.shape()?;
-    let head_dim = q_s[q_s.len() - 1].as_const().unwrap();
+    let q_dtype = q.dtype();
+    let head_dim = q.dim_const(-1)?;
     let scale_val = scale.unwrap_or(1.0 / (head_dim as f64).sqrt());
 
     // Handle nonpad_kv_seqlen: pad attn_mask to full K length and create padding mask
-    let full_k_len = k_s[k_s.len() - 2].as_const().unwrap();
+    let full_k_len = k.dim_const(-2)?;
     let attn_mask = if let Some(seqlen) = nonpad_kv_seqlen {
         // Padding mask: position >= seqlen[b] → -inf, else 0. Shape: [B, 1, 1, full_k]
         let range = Tensor::arange(full_k_len as i64, None, None)?;
@@ -120,16 +111,11 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
 
         // Pad existing attn_mask to full K length, then combine with padding mask
         if let Some(mask) = attn_mask {
-            let mask_k = mask.shape()?[mask.ndim()? - 1].as_const().unwrap();
+            let mask_k = mask.dim_const(-1)?;
             let padded_mask = if mask_k < full_k_len {
-                let mut pad_shape: Vec<isize> = mask.shape()?.iter().map(|d| d.as_const().unwrap() as isize).collect();
-                let pad_cols = full_k_len - mask_k;
-                *pad_shape.last_mut().unwrap() = pad_cols as isize;
-                let pad_fill = Tensor::full(
-                    &pad_shape.iter().map(|&d| d as usize).collect::<Vec<_>>(),
-                    0.0f64,
-                    mask.uop().dtype(),
-                )?;
+                let mut pad_shape = mask.dims()?;
+                *pad_shape.last_mut().expect("mask is not a scalar") = full_k_len - mask_k;
+                let pad_fill = Tensor::full(&pad_shape, 0.0f64, mask.dtype());
                 Tensor::cat(&[mask, &pad_fill], -1)?
             } else {
                 mask.clone()
@@ -154,16 +140,16 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
 
     // Causal mask: only restrict CURRENT K positions, past positions always attendable
     if is_causal {
-        let past_seq_len = past_key.map(|pk| pk.shape().unwrap()[2].as_const().unwrap()).unwrap_or(0);
-        let q_len = q_s[q_s.len() - 2].as_const().unwrap();
-        let causal = Tensor::full(&[q_len, full_k_len], true, DType::Bool)?.tril(past_seq_len as i64)?;
+        let past_seq_len = past_key.map(|pk| pk.dim_const(2)).transpose()?.unwrap_or(0);
+        let q_len = q.dim_const(-2)?;
+        let causal = Tensor::full(&[q_len, full_k_len], true, DType::Bool).tril(past_seq_len as isize)?;
         let neg_inf = Tensor::const_(f64::NEG_INFINITY, q_dtype.clone());
         scores = scores.where_(&causal, &neg_inf)?;
     }
 
     // Attention mask
     if let Some(mask) = attn_mask {
-        let mask_dtype = mask.uop().dtype();
+        let mask_dtype = mask.dtype();
         if mask_dtype == DType::Bool {
             let neg_inf = Tensor::const_(f64::NEG_INFINITY, q_dtype.clone());
             let zero = Tensor::const_(0.0f64, q_dtype.clone());
@@ -194,17 +180,17 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
             16 => DType::BFloat16,
             _ => DType::Float32,
         };
-        scores.cast(sm_dtype)?
+        scores.cast(sm_dtype)
     } else {
         scores
     };
 
-    let attn_weights = scores.softmax(-1isize)?.cast(q_dtype.clone())?;
+    let attn_weights = scores.softmax(-1isize)?.cast(q_dtype.clone());
 
     // Mode 3: after softmax
     let qk_mode3 = attn_weights.clone();
 
-    let output = attn_weights.matmul(&v)?.cast(q_dtype)?;
+    let output = attn_weights.matmul(&v)?.cast(q_dtype);
 
     let qk_return = match qk_matmul_output_mode {
         1 => qk_mode1,
@@ -215,9 +201,7 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
 
     // Reshape back to 3D if input was 3D
     let output = if is_3d {
-        let out_shape = output.shape()?;
-        let batch = out_shape[0].as_const().unwrap() as isize;
-        let seq = out_shape[2].as_const().unwrap() as isize;
+        let (batch, seq) = (output.dim_const(0)? as isize, output.dim_const(2)? as isize);
         output.try_permute(&[0, 2, 1, 3])?.try_reshape([batch, seq, -1])?
     } else {
         output
@@ -268,9 +252,8 @@ pub(crate) fn op_embed_layer_norm(inputs: &[Option<Tensor>], attrs: &mut Attrs) 
     let pos_ids = match position_ids {
         Some(ids) => ids.clone(),
         None => {
-            let id_shape = input_ids.shape()?;
-            let seq_len = id_shape[1].as_const().unwrap() as i64;
-            let batch = id_shape[0].as_const().unwrap() as isize;
+            let seq_len = input_ids.dim_const(1)? as i64;
+            let batch = input_ids.dim_const(0)? as isize;
             let pos = Tensor::arange(seq_len, None, None)?;
             pos.try_unsqueeze(0)?.try_expand([batch, seq_len as isize])?
         }
@@ -311,8 +294,7 @@ fn rotary_embedding_impl(
     let num_heads = attrs.int("num_heads", 0) as usize;
     let rotary_embedding_dim = attrs.int("rotary_embedding_dim", 0) as usize;
 
-    let x_shape = x.shape()?;
-    let x_ndim = x_shape.len();
+    let x_ndim = x.ndim()?;
 
     // Normalize shape to [B, S, H, D]
     let x_work = if x_ndim == 4 {
@@ -322,15 +304,13 @@ fn rotary_embedding_impl(
         if num_heads == 0 {
             return Err(Error::IrConstruction { details: "num_heads must be provided for 3D input".into() });
         }
-        let hidden = x_shape[2].as_const().unwrap();
-        let head_dim = hidden / num_heads;
+        let head_dim = x.dim_const(2)? / num_heads;
         x.unflatten(-1, &[num_heads as isize, head_dim as isize])?
     } else {
         x.clone()
     };
 
-    let work_shape = x_work.shape()?;
-    let head_size = work_shape.last().unwrap().as_const().unwrap();
+    let head_size = x_work.dim_const(-1)?;
     let rot_dim = if rotary_embedding_dim > 0 { rotary_embedding_dim } else { head_size };
 
     // Split into x_rotate and x_pass
@@ -366,9 +346,7 @@ fn rotary_embedding_impl(
 
     // Restore original shape
     let output = if x_ndim == 3 {
-        let out_shape = output.shape()?;
-        let batch = out_shape[0].as_const().unwrap() as isize;
-        let seq = out_shape[1].as_const().unwrap() as isize;
+        let (batch, seq) = (output.dim_const(0)? as isize, output.dim_const(1)? as isize);
         output.try_reshape([batch, seq, -1])?
     } else {
         // [B, S, H, D] -> [B, H, S, D]
@@ -380,8 +358,7 @@ fn rotary_embedding_impl(
 
 /// Slice last dimension to `target` if it's larger, otherwise return as-is.
 fn slice_last_dim_if_needed(t: &Tensor, target: usize) -> Result<Tensor> {
-    let shape = t.shape()?;
-    let last = shape[shape.len() - 1].as_const().unwrap();
+    let last = t.dim_const(-1)?;
     if last > target {
         let parts = t.split(&[target, last - target], -1)?;
         Ok(parts[0].clone())
@@ -407,8 +384,7 @@ pub(crate) fn op_attention_contrib(inputs: &[Option<Tensor>], attrs: &mut Attrs)
     let unidirectional = attrs.int("unidirectional", 0) != 0;
 
     let qkv_hidden_sizes = attrs.ints("qkv_hidden_sizes");
-    let w_shape = weights.shape()?;
-    let total_hidden = w_shape[1].as_const().unwrap();
+    let total_hidden = weights.dim_const(1)?;
     let (q_hidden, k_hidden, v_hidden) = if qkv_hidden_sizes.is_empty() {
         let h = total_hidden / 3;
         (h, h, h)
@@ -427,9 +403,8 @@ pub(crate) fn op_attention_contrib(inputs: &[Option<Tensor>], attrs: &mut Attrs)
 
     // Split into Q, K, V
     let parts = qkv.split(&[q_hidden, k_hidden, v_hidden], -1)?;
-    let x_shape = x.shape()?;
-    let batch = x_shape[0].as_const().unwrap() as isize;
-    let seq_len = x_shape[1].as_const().unwrap();
+    let batch = x.dim_const(0)? as isize;
+    let seq_len = x.dim_const(1)?;
 
     // Reshape [B, S, hidden] -> [B, H, S, D]
     let q = parts[0]
@@ -454,19 +429,17 @@ pub(crate) fn op_attention_contrib(inputs: &[Option<Tensor>], attrs: &mut Attrs)
         v = Tensor::cat(&[&pv, &v], -2)?;
     }
 
-    let k_shape = k.shape()?;
-    let total_seq = k_shape[k_shape.len() - 2].as_const().unwrap();
+    let total_seq = k.dim_const(-2)?;
 
     // Build attention mask
-    let q_dtype = q.uop().dtype();
+    let q_dtype = q.dtype();
     let mut attn_mask: Option<Tensor> = None;
 
     if let Some(mi) = mask_index {
-        let mi_shape = mi.shape()?;
-        let mi_ndim = mi_shape.len();
+        let mi_ndim = mi.ndim()?;
         if mi_ndim > 1 {
             // nD mask: broadcast to [B, 1, Sq, Sk] or similar
-            let mask_dtype = mi.uop().dtype();
+            let mask_dtype = mi.dtype();
             if mask_dtype == DType::Bool {
                 let filter = Tensor::const_(mask_filter_value, q_dtype.clone());
                 let zero = Tensor::const_(0.0f64, q_dtype.clone());
@@ -476,7 +449,7 @@ pub(crate) fn op_attention_contrib(inputs: &[Option<Tensor>], attrs: &mut Attrs)
             }
         } else {
             // 1D mask: per-sample end positions
-            let mi_len = mi_shape[0].as_const().unwrap();
+            let mi_len = mi.dim_const(0)?;
             if mi_len == batch as usize {
                 // mask_index[b] = end position for sample b
                 let range = Tensor::arange(total_seq as i64, None, None)?.try_reshape([1, total_seq as isize])?;
@@ -507,7 +480,7 @@ pub(crate) fn op_attention_contrib(inputs: &[Option<Tensor>], attrs: &mut Attrs)
     // Unidirectional causal mask
     if unidirectional {
         let causal =
-            Tensor::full(&[seq_len, total_seq], true, DType::Bool)?.tril((total_seq as i64) - (seq_len as i64))?;
+            Tensor::full(&[seq_len, total_seq], true, DType::Bool).tril(total_seq as isize - seq_len as isize)?;
         let filter = Tensor::const_(mask_filter_value, q_dtype.clone());
         let zero = Tensor::const_(0.0f64, q_dtype.clone());
         let causal_additive = zero.where_(&causal, &filter)?;

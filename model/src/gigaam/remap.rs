@@ -1,39 +1,15 @@
-use snafu::ResultExt;
-use svod_tensor::Tensor;
-
 use crate::state::StateDict;
 
 use super::GigaAmConfig;
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 use super::ConvNormType;
 
+/// Rename a PyTorch GigaAM checkpoint's keys to svod's layout. Pure renaming:
+/// the BatchNorm affine is folded into the depthwise conv in the graph, by
+/// `ConvModule`'s loader, so `running_var` passes through untouched.
 pub fn remap_pytorch(sd: StateDict, config: &GigaAmConfig) -> Result<StateDict> {
-    let mut out = StateDict::new();
-    let mut bn_var_keys: Vec<(String, Tensor)> = Vec::new();
-
-    for (key, tensor) in sd {
-        let Some(mapped) = remap_key(&key, config) else {
-            continue;
-        };
-        if mapped.starts_with("__bn_var__.") {
-            let layer_idx = mapped.strip_prefix("__bn_var__.").unwrap().to_string();
-            bn_var_keys.push((layer_idx, tensor));
-            continue;
-        }
-        out.insert(mapped, tensor);
-    }
-
-    if matches!(config.conv_norm_type, ConvNormType::BatchNorm) {
-        for (layer_idx, var_tensor) in bn_var_keys {
-            let data = var_tensor.as_vec::<f32>().context(TensorSnafu)?;
-            let invstd: Vec<f32> = data.iter().map(|&v| 1.0 / (v + 1e-5).sqrt()).collect();
-            let invstd_tensor = Tensor::from_slice(&invstd);
-            out.insert(format!("layers.{layer_idx}.conv.bn_invstd"), invstd_tensor);
-        }
-    }
-
-    Ok(out)
+    Ok(sd.into_iter().filter_map(|(key, tensor)| Some((remap_key(&key, config)?, tensor))).collect())
 }
 
 fn remap_key(key: &str, config: &GigaAmConfig) -> Option<String> {
@@ -182,7 +158,7 @@ fn remap_bn_key(layer: &str, param: &str, config: &GigaAmConfig) -> Option<Strin
             "weight" => Some(format!("layers.{layer}.conv.bn_scale")),
             "bias" => Some(format!("layers.{layer}.conv.bn_bias")),
             "running_mean" => Some(format!("layers.{layer}.conv.bn_mean")),
-            "running_var" => Some(format!("__bn_var__.{layer}")),
+            "running_var" => Some(format!("layers.{layer}.conv.bn_var")),
             "num_batches_tracked" => None,
             _ => None,
         },

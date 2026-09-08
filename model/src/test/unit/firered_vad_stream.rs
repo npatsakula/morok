@@ -24,22 +24,20 @@ use super::firered_vad::{lcg, load_golden_vec, real_file, synthetic_waveform};
 // ---------------------------------------------------------------------------
 
 /// Streaming forward on a 16-frame chunk: probs `[1, 16]`, one updated
-/// `[1, P, 1, ORDER-1]` cache per FSMN layer. Catches axis/cat/shrink bugs
+/// `[1, P, ORDER-1]` cache per FSMN layer. Catches axis/cat/shrink bugs
 /// without any compile.
 #[test]
 fn stream_forward_shape() {
     let model = FireRedVadStream::with_random_weights();
-    let feat = Tensor::zeros(&[1, 16, N_MELS], DType::Float32).unwrap();
+    let feat = Tensor::zeros(&[1, 16, N_MELS], DType::Float32);
     let caches = FireRedVadStream::zero_caches().unwrap();
     let (probs, new_caches) = model.forward_stream(&feat, &caches).unwrap();
 
-    let shape = |t: &Tensor| -> Vec<usize> {
-        t.shape().unwrap().iter().map(|s| s.as_const().expect("concrete shape")).collect()
-    };
+    let shape = |t: &Tensor| -> Vec<usize> { t.dims().unwrap() };
     assert_eq!(shape(&probs), vec![1, 16]);
     assert_eq!(new_caches.len(), caches.len());
     for nc in &new_caches {
-        assert_eq!(shape(nc), vec![1, 128, 1, 19]);
+        assert_eq!(shape(nc), vec![1, 128, 19]);
     }
 }
 
@@ -163,7 +161,7 @@ fn streaming_chunks_match_full_causal() {
     let feat_t =
         Tensor::from_slice(feat.clone()).try_reshape([1isize, n_frames as isize, N_MELS as isize]).expect("reshape");
     let caches = FireRedVadStream::zero_caches().expect("caches");
-    let (mut full, _) = model.forward_stream(&feat_t, &caches).expect("forward");
+    let (full, _) = model.forward_stream(&feat_t, &caches).expect("forward");
     full.realize().expect("realize");
     let want = full.as_vec::<f32>().expect("readout");
 
@@ -173,6 +171,31 @@ fn streaming_chunks_match_full_causal() {
 
     let max_abs = max_abs_delta(streamer.raw_probs(), &want);
     assert!(max_abs < 1e-4, "streamed probs drifted from full causal forward: max |delta| = {max_abs}");
+}
+
+/// `reset()` zeros the JIT's `state { caches: [..] }` slots, so a second pass
+/// over the same features must reproduce the first bit for bit — the cold
+/// start is the zero cache, not a fresh `prepare`.
+#[test]
+#[ignore = "heavy: streaming JIT compile + execute on random weights"]
+fn reset_restores_the_cold_start_caches() {
+    let model = FireRedVadStream::with_random_weights();
+    let n_frames = 2 * 16 + 7;
+    let mut seed = 0xd15ea5e;
+    let feat: Vec<f32> = (0..n_frames * N_MELS).map(|_| lcg(&mut seed)).collect();
+
+    let mut streamer = FireRedVadStreamer::builder().model(model).build().expect("prepare");
+    streamer.push_feat(&feat).expect("push");
+    streamer.flush().expect("flush");
+    let first = streamer.raw_probs().to_vec();
+
+    // Flush poisons the caches with the zero-padded tail; reset must undo it.
+    streamer.reset().expect("reset");
+    assert!(streamer.raw_probs().is_empty(), "reset must clear the prob history");
+    streamer.push_feat(&feat).expect("push after reset");
+    streamer.flush().expect("flush after reset");
+
+    assert_eq!(streamer.raw_probs(), first.as_slice(), "reset run diverged from the cold start");
 }
 
 /// Sample-path exactness: pushing audio in awkward block sizes (framing
@@ -190,7 +213,7 @@ fn flush_tail_exactness() {
 
     let feat_t = Tensor::from_slice(feat).try_reshape([1isize, n_frames as isize, N_MELS as isize]).expect("reshape");
     let caches = FireRedVadStream::zero_caches().expect("caches");
-    let (mut full, _) = model.forward_stream(&feat_t, &caches).expect("forward");
+    let (full, _) = model.forward_stream(&feat_t, &caches).expect("forward");
     full.realize().expect("realize");
     let want = full.as_vec::<f32>().expect("readout");
 
@@ -223,7 +246,7 @@ fn stream_real_weights_match_golden() {
     let feat_t =
         Tensor::from_slice(feat.clone()).try_reshape([1isize, n_frames as isize, N_MELS as isize]).expect("reshape");
     let caches = FireRedVadStream::zero_caches().expect("caches");
-    let (mut full, _) = model.forward_stream(&feat_t, &caches).expect("forward");
+    let (full, _) = model.forward_stream(&feat_t, &caches).expect("forward");
     full.realize().expect("realize");
     let full_delta = max_abs_delta(&full.as_vec::<f32>().expect("readout"), &probs_full);
     assert!(full_delta < 1e-3, "full causal forward drifted from golden: max |delta| = {full_delta}");

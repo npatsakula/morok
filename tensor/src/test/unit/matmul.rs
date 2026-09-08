@@ -36,7 +36,7 @@ fn run_validated_square_matmul(size: usize, tol: f32) {
     let b = Tensor::from_ndarray(&b_nd);
 
     let config = env_config();
-    let mut c = a.matmul(&b).unwrap();
+    let c = a.matmul(&b).unwrap();
     c.realize_with(&config).unwrap();
 
     let expected = a_nd.dot(&b_nd);
@@ -55,7 +55,7 @@ fn run_validated_matmul(m: usize, k: usize, n: usize, tol: f32) {
     let b = Tensor::from_ndarray(&b_nd);
 
     let config = env_config();
-    let mut c = a.matmul(&b).unwrap();
+    let c = a.matmul(&b).unwrap();
     c.realize_with(&config).unwrap();
 
     let c_shape = c.shape().unwrap();
@@ -80,7 +80,7 @@ crate::codegen_tests! {
         // Compute with svod
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd);
-        let mut c = a.matmul(&b).unwrap();
+        let c = a.matmul(&b).unwrap();
     c.realize_with(&config).unwrap();
 
         // Compute reference with ndarray
@@ -95,11 +95,11 @@ crate::codegen_tests! {
         // int32 sum accumulator. [[1,2],[3,4]]·[[5,6],[7,8]] = [[19,22],[43,50]] (fit i8).
         let a = Tensor::from_ndarray(&Array2::from_shape_vec((2, 2), vec![1.0f32, 2.0, 3.0, 4.0]).unwrap())
             .cast(DType::Int8)
-            .unwrap();
+            ;
         let b = Tensor::from_ndarray(&Array2::from_shape_vec((2, 2), vec![5.0f32, 6.0, 7.0, 8.0]).unwrap())
             .cast(DType::Int8)
-            .unwrap();
-        let mut c = a.matmul(&b).unwrap();
+            ;
+        let c = a.matmul(&b).unwrap();
         assert_eq!(c.uop().dtype(), DType::Int8, "int8 matmul must return int8, not the int32 accumulator");
         c.realize_with(&config).unwrap();
         assert_eq!(c.as_vec::<i8>().unwrap(), vec![19i8, 22, 43, 50]);
@@ -114,7 +114,7 @@ crate::codegen_tests! {
         let b_nd = Array2::from_shape_vec((3, 3), b_data).unwrap();
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd);
-        let mut c = a.matmul(&b).unwrap();
+        let c = a.matmul(&b).unwrap();
     c.realize_with(&config).unwrap();
 
         let expected = a_nd.dot(&b_nd);
@@ -131,7 +131,7 @@ crate::codegen_tests! {
         let b_nd = Array2::from_shape_vec((3, 4), b_data).unwrap();
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd);
-        let mut c = a.matmul(&b).unwrap();
+        let c = a.matmul(&b).unwrap();
     c.realize_with(&config).unwrap();
 
         let expected = a_nd.dot(&b_nd);
@@ -148,7 +148,7 @@ crate::codegen_tests! {
         let b_nd = Array2::from_shape_vec((2, 5), b_data).unwrap();
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd);
-        let mut c = a.matmul(&b).unwrap();
+        let c = a.matmul(&b).unwrap();
     c.realize_with(&config).unwrap();
 
         let expected = a_nd.dot(&b_nd);
@@ -166,7 +166,7 @@ crate::codegen_tests! {
         let b_nd = Array2::from_shape_vec((SIZE, SIZE), b_data).unwrap();
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd);
-        let mut c = a.matmul(&b).unwrap();
+        let c = a.matmul(&b).unwrap();
     c.realize_with(&config).unwrap();
 
         let expected = a_nd.dot(&b_nd);
@@ -184,7 +184,7 @@ crate::codegen_tests! {
         let b_nd = Array2::from_shape_vec((SIZE, SIZE), b_data).unwrap();
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd);
-        let mut c = a.matmul(&b).unwrap();
+        let c = a.matmul(&b).unwrap();
     c.realize_with(&config).unwrap();
 
         let expected = a_nd.dot(&b_nd);
@@ -199,7 +199,7 @@ crate::codegen_tests! {
 
         let a = Tensor::from_slice(a_data);
         let b = Tensor::from_slice(b_data);
-        let mut c = a.dot(&b).unwrap();
+        let c = a.dot(&b).unwrap();
         c.realize_with(&config).unwrap();
 
         // Expected: 1*2 + 2*3 + 3*4 + 4*5 + 5*6 = 2 + 6 + 12 + 20 + 30 = 70
@@ -218,7 +218,7 @@ crate::codegen_tests! {
         let v = Tensor::from_slice(v_data);
         let m_nd = Array2::from_shape_vec((4, 3), m_data).unwrap();
         let m = Tensor::from_ndarray(&m_nd);
-        let mut c = v.dot(&m).unwrap();
+        let c = v.dot(&m).unwrap();
         c.realize_with(&config).unwrap();
 
         // ndarray: need to treat vector as [1, 4] @ [4, 3] -> [1, 3], then squeeze
@@ -240,7 +240,7 @@ crate::codegen_tests! {
         let m_nd = Array2::from_shape_vec((3, 4), m_data).unwrap();
         let m = Tensor::from_ndarray(&m_nd);
         let v = Tensor::from_slice(v_data);
-        let mut c = m.dot(&v).unwrap();
+        let c = m.dot(&v).unwrap();
         c.realize_with(&config).unwrap();
 
         let v_nd = ndarray::Array1::from_vec(v_data.to_vec());
@@ -262,7 +262,7 @@ crate::codegen_tests! {
         let i_nd = Array2::from_shape_vec((4, 4), identity_data).unwrap();
         let a = Tensor::from_ndarray(&a_nd);
         let i = Tensor::from_ndarray(&i_nd);
-        let mut c = a.matmul(&i).unwrap();
+        let c = a.matmul(&i).unwrap();
         c.realize_with(&config).unwrap();
         let svod_result = c.as_vec::<f32>().unwrap();
 
@@ -280,7 +280,7 @@ crate::codegen_tests! {
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd).try_transpose(0, 1).unwrap();
         let b = b.try_transpose(0, 1).unwrap(); // Back to [3, 2] but contiguous
-        let mut c = a.matmul(&b).unwrap();
+        let c = a.matmul(&b).unwrap();
     c.realize_with(&config).unwrap();
 
         let expected = a_nd.dot(&b_nd);
@@ -300,8 +300,8 @@ crate::codegen_tests! {
 #[test_case(&[2, 3], &[3], &[2]; "matrix times vector")]
 #[test_case(&[2, 3, 4], &[2, 4, 5], &[2, 3, 5]; "batched")]
 fn test_dot_output_shape(a: &[usize], b: &[usize], expected: &[usize]) {
-    let a = Tensor::zeros(a, DType::Float32).unwrap();
-    let b = Tensor::zeros(b, DType::Float32).unwrap();
+    let a = Tensor::zeros(a, DType::Float32);
+    let b = Tensor::zeros(b, DType::Float32);
     let shape = a.dot(&b).unwrap().shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>();
     assert_eq!(shape, expected);
 }
@@ -312,12 +312,12 @@ fn test_dot_output_shape(a: &[usize], b: &[usize], expected: &[usize]) {
 #[test_case(&[4, 3], &[2, 3], false, &[4, 2]; "batched")]
 #[test_case(&[3], &[3], false, &[3]; "1d weight")]
 fn test_linear_output_shape(input: &[usize], weight: &[usize], bias: bool, expected: &[usize]) {
-    let input = Tensor::zeros(input, DType::Float32).unwrap();
-    let weight = Tensor::zeros(weight, DType::Float32).unwrap();
+    let input = Tensor::zeros(input, DType::Float32);
+    let weight = Tensor::zeros(weight, DType::Float32);
     let result = match bias {
         true => {
             let out = weight.shape().unwrap()[0].as_const().unwrap();
-            let bias = Tensor::zeros(&[out], DType::Float32).unwrap();
+            let bias = Tensor::zeros(&[out], DType::Float32);
             input.linear().weight(&weight).bias(&bias).call().unwrap()
         }
         false => input.linear().weight(&weight).call().unwrap(),
@@ -377,7 +377,7 @@ crate::codegen_tests! {
     fn test_matmul_int8_products_do_not_wrap(config) {
         let a = Tensor::from_ndarray(&array![[127i8, -64, 32, 0]]);
         let b = Tensor::from_ndarray(&array![[2i8], [-1], [0], [1]]);
-        let mut c = a.matmul_with().other(&b).dtype(DType::Int32).call().unwrap();
+        let c = a.matmul_with().other(&b).dtype(DType::Int32).call().unwrap();
         assert_eq!(c.uop().dtype(), DType::Int32);
         c.realize_with(&config).unwrap();
         assert_eq!(c.as_vec::<i32>().unwrap(), vec![318]);
@@ -388,14 +388,14 @@ crate::codegen_tests! {
     /// evaluates `signed char` arithmetic at `int` width unless told otherwise.
     fn test_narrow_int_arithmetic_wraps_before_widening(config) {
         let realized = |t: Tensor| {
-            let mut t = t.cast(DType::Int32).unwrap();
+            let t = t.cast(DType::Int32);
             t.realize_with(&config).unwrap();
             t.as_vec::<i32>().unwrap()
         };
         let u8s = Tensor::from_slice([1u8, 2, 200]);
-        assert_eq!(realized(u8s.try_neg().unwrap()), vec![255, 254, 56]);
-        assert_eq!(realized(u8s.try_sub(&Tensor::from_slice([2u8, 1, 100])).unwrap()), vec![255, 1, 100]);
-        assert_eq!(realized(u8s.lshift(&Tensor::from_slice([4u8, 4, 4])).unwrap()), vec![16, 32, 128]);
+        assert_eq!(realized(u8s.neg()), vec![255, 254, 56]);
+        assert_eq!(realized(u8s.try_sub(Tensor::from_slice([2u8, 1, 100])).unwrap()), vec![255, 1, 100]);
+        assert_eq!(realized(u8s.try_shl(Tensor::from_slice([4u8, 4, 4])).unwrap()), vec![16, 32, 128]);
         let i8s = Tensor::from_slice([100i8, -128, 127]);
         assert_eq!(realized(i8s.try_add(&i8s).unwrap()), vec![-56, 0, -2]);
     }
@@ -405,7 +405,7 @@ crate::codegen_tests! {
     fn test_conv_int8_products_do_not_wrap(config) {
         let x = Tensor::from_ndarray(&Array4::from_shape_fn((1, 4, 1, 1), |(_, c, _, _)| [127i8, -64, 32, 0][c]));
         let w = Tensor::from_ndarray(&Array4::from_shape_fn((1, 4, 1, 1), |(_, c, _, _)| [2i8, -1, 0, 1][c]));
-        let mut y = x.conv2d().weight(&w).acc_dtype(DType::Int32).call().unwrap();
+        let y = x.conv2d().weight(&w).acc_dtype(DType::Int32).call().unwrap();
         y.realize_with(&config).unwrap();
         assert_eq!(y.as_vec::<i32>().unwrap(), vec![318]);
     }
@@ -435,7 +435,7 @@ crate::codegen_tests! {
             );
         }
 
-        let mut c = build();
+        let c = build();
         c.realize_with(&config).unwrap();
         assert_eq!(c.as_vec::<i32>().unwrap(), a_nd.dot(&b_nd).iter().copied().collect::<Vec<i32>>());
     }
@@ -948,8 +948,8 @@ fn test_matmul_m5_gfx1151_padded_wmma_amd() {
         })
         .collect::<Vec<_>>();
 
-    let a = Tensor::from_slice(&a_data).try_reshape([5, 16]).unwrap().cast(DType::Float16).unwrap();
-    let b = Tensor::from_slice(&b_data).try_reshape([16, 16]).unwrap().cast(DType::Float16).unwrap();
+    let a = Tensor::from_slice(&a_data).try_reshape([5, 16]).unwrap().cast(DType::Float16);
+    let b = Tensor::from_slice(&b_data).try_reshape([16, 16]).unwrap().cast(DType::Float16);
     assert_eq!(a.device(), device, "set SVOD_DEVICE=AMD:0; refusing to dispatch elsewhere");
     assert_eq!(b.device(), device, "set SVOD_DEVICE=AMD:0; refusing to dispatch elsewhere");
 
@@ -960,7 +960,7 @@ fn test_matmul_m5_gfx1151_padded_wmma_amd() {
         .build();
     let optimizer = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).heuristics(heuristics).build();
     let config = prep_config(optimizer);
-    let mut c = a.matmul_with().other(&b).dtype(DType::Float32).call().expect("tensor matmul");
+    let c = a.matmul_with().other(&b).dtype(DType::Float32).call().expect("tensor matmul");
     assert_eq!(c.device(), device);
 
     let plan = c.prepare_with(&config).expect("prepare padded WMMA on AMD:0");
@@ -1012,8 +1012,8 @@ fn test_matmul_cuda_tensor_core_matches_reference(in_dtype: DType, out_dtype: DT
     let size = 64;
     let a_nd = Array2::from_shape_fn((size, size), |(m, k)| ((m * 7 + k) % 7) as f32 - 3.0);
     let b_nd = Array2::from_shape_fn((size, size), |(k, n)| ((k * 5 + n) % 5) as f32 - 2.0);
-    let a = Tensor::from_ndarray(&a_nd).cast(in_dtype.clone()).unwrap();
-    let b = Tensor::from_ndarray(&b_nd).cast(in_dtype).unwrap();
+    let a = Tensor::from_ndarray(&a_nd).cast(in_dtype.clone());
+    let b = Tensor::from_ndarray(&b_nd).cast(in_dtype);
     let heuristics = HeuristicsConfig::builder().tc_select(TcSelect::Index(tc_index)).matvec_enabled(false).build();
     let optimizer = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).heuristics(heuristics).build();
     let config = PrepareConfig { optimizer, ..config };
@@ -1026,7 +1026,7 @@ fn test_matmul_cuda_tensor_core_matches_reference(in_dtype: DType, out_dtype: DT
         "the prepared plan must carry {mma}:\n{}",
         plan.kernels().map(|kernel| kernel.code.as_str()).collect::<Vec<_>>().join("\n")
     );
-    let mut c = build();
+    let c = build();
     assert_eq!(c.uop().dtype(), out_dtype);
     c.realize_with(&config).unwrap();
     let (actual, tolerance) = if out_dtype.is_float() {
@@ -1047,7 +1047,7 @@ fn test_beam_search_matmul() {
     let b = Tensor::from_ndarray(
         &Array2::from_shape_vec((size, size), (0..size * size).map(|i| (i as f32) * 0.01).collect()).unwrap(),
     );
-    let mut c = a.matmul(&b).unwrap();
+    let c = a.matmul(&b).unwrap();
 
     // Use width=2 for reasonable test time. Disable disk cache to avoid stale results
     // from previous runs affecting correctness (beam cache is keyed by AST hash, but
@@ -1069,7 +1069,7 @@ fn test_beam_search_matmul() {
 fn test_matmul_ones_is_exactly_the_inner_dimension(size: usize) {
     let a = Tensor::from_ndarray(&Array2::<f32>::ones((size, size)));
     let b = Tensor::from_ndarray(&Array2::<f32>::ones((size, size)));
-    let mut c = a.matmul(&b).unwrap();
+    let c = a.matmul(&b).unwrap();
     // from_env() so SVOD_OUTPUT_UPCAST and friends still steer the kernel.
     c.realize_with(&env_config()).unwrap();
 
@@ -1100,19 +1100,19 @@ fn validate_mfma_square(size: usize, in_dtype: DType, intrinsic: &str, tol: f32)
             .build(),
     );
     let build = || {
-        let a = Tensor::from_ndarray(&a_nd).cast(in_dtype.clone()).unwrap();
-        let b = Tensor::from_ndarray(&b_nd).cast(in_dtype.clone()).unwrap();
+        let a = Tensor::from_ndarray(&a_nd).cast(in_dtype.clone());
+        let b = Tensor::from_ndarray(&b_nd).cast(in_dtype.clone());
         a.matmul_with().other(&b).dtype(DType::Float32).call().unwrap()
     };
 
     // 1) The selected kernel must actually use the expected MFMA (not a fallback).
-    let mut probe = build();
+    let probe = build();
     let plan = probe.prepare_with(&beam).expect("prepare should succeed");
     let saw_mfma = plan.prepared_kernels().iter().any(|k| k.kernel.code.contains(intrinsic));
     assert!(saw_mfma, "BEAM did not select {intrinsic} for a {in_dtype:?} {size}x{size} matmul on gfx942");
 
     // 2) The MFMA result must match the f32 reference (exact for integer inputs).
-    let mut c = build();
+    let c = build();
     c.realize_with(&beam).unwrap();
     let expected = a_nd.dot(&b_nd);
     assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, tol);
@@ -1158,7 +1158,7 @@ fn test_matmul_validated_64x64() {
     let b = Tensor::from_ndarray(&b_nd);
 
     let config = env_config();
-    let mut c = a.matmul(&b).unwrap();
+    let c = a.matmul(&b).unwrap();
     c.realize_with(&config).unwrap();
 
     let expected = a_nd.dot(&b_nd);
@@ -1209,8 +1209,8 @@ fn test_matmul_cuda_padded_vocabulary_axis(rows: usize, dtype: DType, tol: f32) 
     // Zero-mean multiples of 1/32: exact in f16, so the f32 reference sees the same inputs.
     let a_nd = Array2::from_shape_fn((rows, k), |(m, i)| (((m * 17 + i) % 23) as f32 - 11.0) / 32.0);
     let b_nd = Array2::from_shape_fn((k, n), |(i, j)| (((i * 13 + j) % 29) as f32 - 14.0) / 32.0);
-    let mut a = Tensor::from_ndarray(&a_nd).cast(dtype.clone()).unwrap();
-    let mut b = Tensor::from_ndarray(&b_nd).cast(dtype).unwrap();
+    let a = Tensor::from_ndarray(&a_nd).cast(dtype.clone());
+    let b = Tensor::from_ndarray(&b_nd).cast(dtype);
     a.realize().unwrap();
     b.realize().unwrap();
 
@@ -1222,9 +1222,9 @@ fn test_matmul_cuda_padded_vocabulary_axis(rows: usize, dtype: DType, tol: f32) 
     let threads: i64 = local.iter().map(|dim| dim.vmax().try_int().expect("constant block dim")).product();
     assert!(threads >= 32, "{}: {threads} threads per block", reduce_kernels[0].entry_point);
 
-    let mut c = build();
+    let c = build();
     c.realize_with(&config).unwrap();
-    let mut c = c.cast(DType::Float32).unwrap();
+    let c = c.cast(DType::Float32);
     c.realize().unwrap();
     assert_matmul_close(&c.as_vec::<f32>().unwrap(), &a_nd.dot(&b_nd), tol);
 }

@@ -12,128 +12,86 @@
 //!   `dim=2` (kernel axis), `g.shape = (1, 1, k)` and `v.shape = (out, in/g, k)`.
 //!   The effective weight is `g * v / ||v||_{dims!=2}`, where `||·||_{...}` is
 //!   the L2 norm over all dims except the kernel dim. We reconstruct this
-//!   eagerly at load time so forward sees a plain `Conv1d`.
+//!   eagerly at load time so forward sees a plain `Conv1d` — which is why the
+//!   [`Module`] impl is hand-written rather than derived.
 //! - Even kernels (`k=128`) make the conv's output one frame longer than the
 //!   input; trim one trailing frame (`num_remove = 1`) to keep the length.
 //! - The pos-conv output is *added* to the input (residual-style), not
 //!   concatenated.
 
-use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
+use svod_tensor::nn::{Conv1d, Layer, Module, StateDict, get_tensor, prefixed};
 
-use crate::init::{fan_in_uniform, zeros};
-use crate::state::{self, HasStateDict, StateDict, TensorSnafu as StateTensorSnafu, get_tensor, prefixed};
+use crate::init::{Bias, conv1d};
 
-use super::error::{Result, TensorSnafu};
+use super::error::Result;
 
 #[derive(Clone)]
 pub struct ConvolutionalPositionalEmbedding {
-    pub embed_dim: usize,
-    pub kernel_size: usize,
-    pub groups: usize,
-    pub padding: usize,
+    pub conv: Conv1d,
+    /// Trailing frames to drop so the output length matches the input.
     pub num_remove: usize,
-    /// Effective conv weight `(out, in/groups, k)`, reconstructed from the
-    /// weight-norm `(g, v)` pair on load.
-    pub weight: Tensor,
-    pub bias: Tensor,
 }
 
 impl ConvolutionalPositionalEmbedding {
     pub fn empty(embed_dim: usize, kernel_size: usize, groups: usize) -> Self {
         assert!(groups > 0 && embed_dim.is_multiple_of(groups), "groups must divide embed_dim");
-        let in_per_group = embed_dim / groups;
-        let fan_in = in_per_group * kernel_size;
-        let weight = fan_in_uniform(&[embed_dim, in_per_group, kernel_size], fan_in, DType::Float32);
-        let bias = zeros(&[embed_dim], DType::Float32);
-        let padding = kernel_size / 2;
-        let num_remove = if kernel_size.is_multiple_of(2) { 1 } else { 0 };
-        Self { embed_dim, kernel_size, groups, padding, num_remove, weight, bias }
+        let padding = (kernel_size / 2) as isize;
+        Self {
+            conv: conv1d(embed_dim / groups, embed_dim, kernel_size, Bias::Zero, DType::Float32)
+                .with_groups(groups)
+                .with_padding((padding, padding)),
+            num_remove: usize::from(kernel_size.is_multiple_of(2)),
+        }
     }
 
     /// Forward on `(B, T, C)` (channels-last). Internally transposes to NCT
     /// for the conv, then transposes back.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // (B, T, C) → (B, C, T)
-        let xt = x.try_permute(&[0, 2, 1]).context(TensorSnafu)?;
-
-        let p = self.padding as isize;
-        let mut y = xt
-            .conv2d()
-            .weight(&self.weight)
-            .bias(&self.bias)
-            .groups(self.groups)
-            .stride(&[1])
-            .padding(&[(p, p)])
-            .call()
-            .context(TensorSnafu)?;
-
+        let y = self.conv.forward(&x.try_permute(&[0, 2, 1])?)?;
         // Trim the trailing `num_remove` frames so output length matches input.
-        if self.num_remove > 0 {
-            let t_full = y.shape().context(TensorSnafu)?[2].clone();
-            let keep = t_full - SInt::from(self.num_remove);
-            y = y.try_shrink([None, None, Some((SInt::Const(0), keep))]).context(TensorSnafu)?;
-        }
-
+        let keep = y.dim(2)? - SInt::from(self.num_remove);
+        let y = if self.num_remove > 0 { y.narrow(2, SInt::Const(0), keep)? } else { y };
         // Exact (erf-based) GELU matches PyTorch's `nn.functional.gelu`.
-        let y = y.gelu_exact().context(TensorSnafu)?;
-        // (B, C, T) → (B, T, C)
-        y.try_permute(&[0, 2, 1]).context(TensorSnafu)
+        Ok(y.gelu_exact()?.try_permute(&[0, 2, 1])?)
     }
 }
 
 /// Reconstruct `weight = g * v / ||v||_dim01` where the norm is L2 over the
 /// (out, in/groups) axes (i.e., over all dims except dim=2, the kernel dim).
 /// `g` is expected with shape `(1, 1, k)`, `v` with shape `(out, in/g, k)`.
-fn weight_norm_reconstruct(g: &Tensor, v: &Tensor) -> std::result::Result<Tensor, state::Error> {
-    // ||v||_{dim=0,1}: sum of squares over dims 0 and 1, then sqrt, keepdim.
-    let v_sq = v.try_mul(v).context(StateTensorSnafu)?;
-    let v_norm_sq = v_sq
-        .sum_with()
-        .axes(svod_tensor::reduce::AxisSpec::Multiple(vec![0, 1]))
-        .keepdim(true)
-        .call()
-        .context(StateTensorSnafu)?;
-    let v_norm = v_norm_sq.try_sqrt().context(StateTensorSnafu)?;
-    let v_dir = v.try_div(&v_norm).context(StateTensorSnafu)?;
-    g.try_mul(&v_dir).context(StateTensorSnafu)
+fn weight_norm_reconstruct(g: &Tensor, v: &Tensor) -> svod_tensor::error::Result<Tensor> {
+    let norm = v.try_mul(v)?.sum_with().axes(vec![0, 1]).keepdim(true).call()?.try_sqrt()?;
+    g.try_mul(&v.try_div(&norm)?)
 }
 
-impl HasStateDict for ConvolutionalPositionalEmbedding {
-    /// On save, we emit a single `conv.weight` (the reconstructed effective
-    /// weight) and `conv.bias`. We do NOT round-trip the original `(g, v)`
-    /// pair — that's only needed on the *load* path from torch checkpoints.
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        let mut sd = StateDict::new();
-        sd.insert(prefixed(prefix, "conv.weight"), self.weight.clone());
-        sd.insert(prefixed(prefix, "conv.bias"), self.bias.clone());
-        sd
+impl Module for ConvolutionalPositionalEmbedding {
+    /// Emits a single `conv.weight` (the reconstructed effective weight) and
+    /// `conv.bias`. The original `(g, v)` pair is *not* round-tripped — it is
+    /// only needed on the load path from torch checkpoints.
+    fn write_state(&self, prefix: &str, out: &mut StateDict) {
+        self.conv.write_state(&prefixed(prefix, "conv"), out);
     }
 
     /// Loads either the modern `parametrizations.weight.original{0,1}` form,
     /// the legacy `weight_g` / `weight_v` form, or a flat `weight`.
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.bias = get_tensor(sd, &prefixed(prefix, "conv.bias"))?;
+    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> svod_tensor::error::Result<()> {
+        self.conv.bias = Some(get_tensor(sd, &prefixed(prefix, "conv.bias"))?);
 
-        let modern_g = prefixed(prefix, "conv.parametrizations.weight.original0");
-        let modern_v = prefixed(prefix, "conv.parametrizations.weight.original1");
-        let legacy_g = prefixed(prefix, "conv.weight_g");
-        let legacy_v = prefixed(prefix, "conv.weight_v");
-        let flat = prefixed(prefix, "conv.weight");
+        let pair = [
+            ("conv.parametrizations.weight.original0", "conv.parametrizations.weight.original1"),
+            ("conv.weight_g", "conv.weight_v"),
+        ]
+        .into_iter()
+        .map(|(g, v)| (prefixed(prefix, g), prefixed(prefix, v)))
+        .find(|(g, v)| sd.contains_key(g) && sd.contains_key(v));
 
-        if sd.contains_key(&modern_g) && sd.contains_key(&modern_v) {
-            let g = get_tensor(sd, &modern_g)?;
-            let v = get_tensor(sd, &modern_v)?;
-            self.weight = weight_norm_reconstruct(&g, &v)?;
-        } else if sd.contains_key(&legacy_g) && sd.contains_key(&legacy_v) {
-            let g = get_tensor(sd, &legacy_g)?;
-            let v = get_tensor(sd, &legacy_v)?;
-            self.weight = weight_norm_reconstruct(&g, &v)?;
-        } else {
-            self.weight = get_tensor(sd, &flat)?;
-        }
+        self.conv.weight = match pair {
+            Some((g, v)) => weight_norm_reconstruct(&get_tensor(sd, &g)?, &get_tensor(sd, &v)?)?,
+            None => get_tensor(sd, &prefixed(prefix, "conv.weight"))?,
+        };
         Ok(())
     }
 }

@@ -29,7 +29,7 @@ fn linear(scale: f32) -> Tensor {
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
     let b = Tensor::from_slice([scale, scale, scale, scale]);
     let c = Tensor::from_slice([0.5f32, 0.5, 0.5, 0.5]);
-    &(&a * &b) + &c
+    (&(&a * &b).unwrap() + &c).unwrap()
 }
 
 fn kernels(plan: &ExecutionPlan) -> Vec<&svod_runtime::PreparedKernel> {
@@ -43,16 +43,16 @@ fn two_scopes_share_one_program_and_differ_in_origin() {
     crate::test::helpers::test_setup();
     let (left_id, right_id) = (module("carriage.left"), module("carriage.right"));
 
-    let mut left = {
+    let left = {
         let _scope = origin::install(Some(left_id));
         linear(2.0)
     };
-    let mut right = {
+    let right = {
         let _scope = origin::install(Some(right_id));
         linear(3.0)
     };
 
-    let plan = Tensor::prepare_batch([&mut left, &mut right]).expect("prepare batch");
+    let plan = Tensor::prepare_batch([&left, &right]).expect("prepare batch");
     let dispatches = kernels(&plan);
     assert!(dispatches.len() >= 2, "each scope contributes at least one dispatch");
 
@@ -102,7 +102,7 @@ fn scheduling_the_same_scoped_graph_twice_reproduces_its_origins() {
     let id = module("carriage.repeat");
 
     let origins_of_a_fresh_run = || {
-        let mut tensor = {
+        let tensor = {
             let _scope = origin::install(Some(id));
             linear(4.0)
         };
@@ -122,7 +122,7 @@ fn scheduling_the_same_scoped_graph_twice_reproduces_its_origins() {
 #[test]
 fn an_unscoped_graph_carries_no_module_attribution() {
     crate::test::helpers::test_setup();
-    let mut tensor = linear(5.0);
+    let tensor = linear(5.0);
     let plan = tensor.prepare().expect("prepare");
 
     for kernel in kernels(&plan) {
@@ -148,7 +148,7 @@ fn preparing_inside_a_live_scope_keeps_bodies_origin_free() {
 
     // The ONNX importer and the model stages realize with their scope still open.
     let _scope = origin::install(Some(id));
-    let mut tensor = linear(7.0);
+    let tensor = linear(7.0);
     let plan = tensor.prepare().expect("prepare inside a live scope");
 
     let dispatches = kernels(&plan);
@@ -168,7 +168,7 @@ fn preparing_inside_a_live_scope_keeps_bodies_origin_free() {
 fn profiles_carry_the_dispatch_origins() {
     crate::test::helpers::test_setup();
     let id = module("carriage.profiled");
-    let mut tensor = {
+    let tensor = {
         let _scope = origin::install(Some(id));
         linear(6.0)
     };
@@ -246,7 +246,7 @@ fn hand_lowered_kernel_bodies_dedup_across_scopes() {
 fn hand_lowered_kernel_inputs_are_materialised_once_per_producer() {
     use svod_ir::{Op, UOp, ops};
 
-    let shared = &Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]) * &Tensor::from_slice([2.0f32; 4]);
+    let shared = (&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]) * &Tensor::from_slice([2.0f32; 4])).unwrap();
     let launch = |scope: OriginId| {
         let _scope = origin::install(Some(scope));
         let out = Tensor::from_slice([0.0f32; 4]);
@@ -363,10 +363,10 @@ fn a_literal_split_by_call_frames_does_not_change_the_kernel_abi() {
 
     let scattered = |capture: bool| -> Vec<f32> {
         let _capture = origin::capture_for_thread(capture);
-        let target = Tensor::full(&[4], ConstValue::Float(0.0), DType::Float32).expect("full target");
+        let target = Tensor::full(&[4], ConstValue::Float(0.0), DType::Float32);
         let index = Tensor::from_slice([0i32, 0, 2, 2]);
-        let source = Tensor::full(&[4], ConstValue::Float(1.0), DType::Float32).expect("full source");
-        let mut out = target
+        let source = Tensor::full(&[4], ConstValue::Float(1.0), DType::Float32);
+        let out = target
             .scatter_reduce(0, &index, &source, ScatterReduction::Sum, false)
             .expect("scatter_reduce")
             .contiguous();

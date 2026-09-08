@@ -15,17 +15,19 @@
 
 use std::path::Path;
 
-use snafu::{OptionExt, ResultExt};
-use svod_tensor::{BoundVariable, Tensor, s};
+use svod_tensor::Tensor;
+use svod_tensor::nn::Module;
 
-use crate::state::{self, HasStateDict, StateDict};
+use crate::state::{self, StateDict};
 
 use super::config::Qwen3Config;
-use super::error::{HubSnafu, Result, StateSnafu, SymbolicShapeSnafu, TensorSnafu};
+use super::error::Result;
+
 use super::model::Qwen3Model;
 
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub struct Qwen3Embedding {
+    #[module(key = "")]
     pub model: Qwen3Model,
     pub normalize: bool,
 }
@@ -43,20 +45,10 @@ impl Qwen3Embedding {
         self.pool_and_normalize(&hidden)
     }
 
-    /// JIT-path variant with rebindable batch. Returns `(B, D)`.
-    pub fn encode_batch(&self, input_ids: &Tensor, attention_mask: &Tensor, b: &BoundVariable) -> Result<Tensor> {
-        let hidden = self.model.forward_batch(input_ids, Some(attention_mask), b)?;
-        self.pool_and_normalize(&hidden)
-    }
-
     fn pool_and_normalize(&self, hidden: &Tensor) -> Result<Tensor> {
-        let shape = hidden.shape().context(TensorSnafu)?;
-        let l: usize = shape[1].as_const().context(SymbolicShapeSnafu { what: "qwen3 pooling" })?;
-
         // Last-token pooling: take position L-1 (requires left-padding).
-        let pooled = hidden.getitem(s![.., (l - 1) as i64, ..]).context(TensorSnafu)?;
-
-        if self.normalize { pooled.lp_normalize(-1, 2).context(TensorSnafu) } else { Ok(pooled) }
+        let pooled = hidden.take_index(1, -1)?;
+        if self.normalize { Ok(pooled.lp_normalize(-1, 2)?) } else { Ok(pooled) }
     }
 
     pub fn from_hub(model_id: &str, mut config: Qwen3Config) -> Result<Self> {
@@ -64,8 +56,8 @@ impl Qwen3Embedding {
     }
 
     pub fn from_hub_with_revision(model_id: &str, revision: &str, config: &mut Qwen3Config) -> Result<Self> {
-        let repo = crate::hub::HubRepo::open(model_id, revision).context(HubSnafu)?;
-        let cfg_path = repo.get("config.json").context(HubSnafu)?;
+        let repo = crate::hub::HubRepo::open(model_id, revision)?;
+        let cfg_path = repo.get("config.json")?;
         let parsed = Qwen3Config::from_json(&cfg_path)?;
         config.merge_structural_from(&parsed);
 
@@ -74,30 +66,20 @@ impl Qwen3Embedding {
     }
 
     pub fn from_safetensors(path: &Path, config: Qwen3Config) -> Result<Self> {
-        let sd = state::load_safetensors(path).context(StateSnafu)?;
+        let sd = state::load_safetensors(path)?;
         Self::from_state_dict(&sd, config)
     }
 
     /// Load from a directory containing `model.safetensors` or multi-shard files.
     pub fn from_safetensors_dir(dir: &Path, config: Qwen3Config) -> Result<Self> {
-        let sd = state::load_safetensors_dir(dir).context(StateSnafu)?;
+        let sd = state::load_safetensors_dir(dir)?;
         Self::from_state_dict(&sd, config)
     }
 
     pub fn from_state_dict(sd: &StateDict, config: Qwen3Config) -> Result<Self> {
         let dtype = config.dtype.clone();
         let mut model = Self::empty(config);
-        model.load_state_dict(&state::cast_all(sd, dtype), "").context(StateSnafu)?;
+        model.load_state_dict(&state::cast_all(sd, dtype), "")?;
         Ok(model)
-    }
-}
-
-impl HasStateDict for Qwen3Embedding {
-    fn state_dict(&self, prefix: &str) -> StateDict {
-        self.model.state_dict(prefix)
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.model.load_state_dict(sd, prefix)
     }
 }

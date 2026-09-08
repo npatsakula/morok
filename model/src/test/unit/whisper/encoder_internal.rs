@@ -27,9 +27,9 @@ fn unsupported_device_keeps_original_encoder_sequence() {
     assert_eq!(encoder_padded_sequence_len(&DeviceSpec::Cpu, 1500), None);
 
     let encoder = AudioEncoder::empty(&encoder_dims(1));
-    let mel = Tensor::zeros(&[1, 4, 3000], DType::Float32).unwrap();
+    let mel = Tensor::zeros(&[1, 4, 3000], DType::Float32);
     let out = encoder.forward(&mel).unwrap();
-    assert_eq!(out.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), [1, 1500, 128]);
+    assert_eq!(out.dims().unwrap(), [1, 1500, 128]);
 }
 
 #[test]
@@ -43,9 +43,9 @@ fn padded_encoder_plan_has_one_flash_attention_per_block() {
         return;
     }
     let encoder = AudioEncoder::empty(&encoder_dims(32));
-    let mel = Tensor::zeros(&[1, 4, 3000], DType::Float32).unwrap();
-    let mut out = encoder.forward(&mel).unwrap();
-    assert_eq!(out.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), [1, 1500, 128]);
+    let mel = Tensor::zeros(&[1, 4, 3000], DType::Float32);
+    let out = encoder.forward(&mel).unwrap();
+    assert_eq!(out.dims().unwrap(), [1, 1500, 128]);
 
     let plan = out.prepare().unwrap();
     let flash_attention = plan.kernels().filter(|kernel| kernel.entry_point == "flash_attention").count();

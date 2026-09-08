@@ -42,7 +42,7 @@ impl Tensor {
     #[track_caller]
     pub fn sin(&self) -> Result<Tensor> {
         origin_call!("sin");
-        self.uop().try_sin().map(Self::new).context(UOpSnafu)
+        self.uop().try_sin().map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Cosine function: cos(x).
@@ -61,7 +61,7 @@ impl Tensor {
     #[track_caller]
     pub fn cos(&self) -> Result<Tensor> {
         origin_call!("cos");
-        self.uop().try_cos().map(Self::new).context(UOpSnafu)
+        self.uop().try_cos().map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Tangent function: tan(x).
@@ -80,7 +80,7 @@ impl Tensor {
     #[track_caller]
     pub fn tan(&self) -> Result<Tensor> {
         origin_call!("tan");
-        self.uop().try_tan().map(Self::new).context(UOpSnafu)
+        self.uop().try_tan().map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     // =========================================================================
@@ -95,12 +95,12 @@ impl Tensor {
     /// # Examples
     /// ```ignore
     /// let t = Tensor::from_slice(&[1.2f32, -1.2, 2.8, -2.8]);
-    /// let result = t.floor()?;  // [1.0, -2.0, 2.0, -3.0]
+    /// let result = t.floor();  // [1.0, -2.0, 2.0, -3.0]
     /// ```
     #[track_caller]
-    pub fn floor(&self) -> Result<Tensor> {
+    pub fn floor(&self) -> Tensor {
         origin_call!("floor");
-        Ok(Self::new(UOp::floor(self.uop())))
+        Self::new(UOp::floor(self.uop()))
     }
 
     /// Ceiling function: round towards +∞.
@@ -111,12 +111,12 @@ impl Tensor {
     /// # Examples
     /// ```ignore
     /// let t = Tensor::from_slice(&[1.2f32, -1.2, 2.8, -2.8]);
-    /// let result = t.ceil()?;  // [2.0, -1.0, 3.0, -2.0]
+    /// let result = t.ceil();  // [2.0, -1.0, 3.0, -2.0]
     /// ```
     #[track_caller]
-    pub fn ceil(&self) -> Result<Tensor> {
+    pub fn ceil(&self) -> Tensor {
         origin_call!("ceil");
-        Ok(Self::new(UOp::ceil(self.uop())))
+        Self::new(UOp::ceil(self.uop()))
     }
 
     /// Round function: round to nearest integer (half to even).
@@ -127,12 +127,12 @@ impl Tensor {
     /// # Examples
     /// ```ignore
     /// let t = Tensor::from_slice(&[1.2f32, 1.5, 2.5, -1.5]);
-    /// let result = t.round()?;  // [1.0, 2.0, 2.0, -2.0]
+    /// let result = t.round();  // [1.0, 2.0, 2.0, -2.0]
     /// ```
     #[track_caller]
-    pub fn round(&self) -> Result<Tensor> {
+    pub fn round(&self) -> Tensor {
         origin_call!("round");
-        Ok(Self::new(UOp::round(self.uop())))
+        Self::new(UOp::round(self.uop()))
     }
 
     /// Truncate function: round towards zero.
@@ -143,12 +143,12 @@ impl Tensor {
     /// # Examples
     /// ```ignore
     /// let t = Tensor::from_slice(&[1.2f32, -1.2, 2.8, -2.8]);
-    /// let result = t.trunc()?;  // [1.0, -1.0, 2.0, -2.0]
+    /// let result = t.trunc();  // [1.0, -1.0, 2.0, -2.0]
     /// ```
     #[track_caller]
-    pub fn trunc(&self) -> Result<Tensor> {
+    pub fn trunc(&self) -> Tensor {
         origin_call!("trunc");
-        Ok(Self::new(UOp::trunc(self.uop())))
+        Self::new(UOp::trunc(self.uop()))
     }
 
     // =========================================================================
@@ -171,7 +171,7 @@ impl Tensor {
     #[track_caller]
     pub fn erf(&self) -> Result<Tensor> {
         origin_call!("erf");
-        self.uop().erf().map(Self::new).context(UOpSnafu)
+        self.uop().erf().map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Reciprocal: 1/x.
@@ -186,7 +186,7 @@ impl Tensor {
     #[track_caller]
     pub fn reciprocal(&self) -> Result<Tensor> {
         origin_call!("reciprocal");
-        UOp::try_reciprocal(&self.uop()).map(Self::new).context(UOpSnafu)
+        UOp::try_reciprocal(&self.uop()).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Square: x².
@@ -196,12 +196,12 @@ impl Tensor {
     /// # Examples
     /// ```ignore
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, -4.0]);
-    /// let result = t.square()?;  // [1.0, 4.0, 9.0, 16.0]
+    /// let result = t.square();  // [1.0, 4.0, 9.0, 16.0]
     /// ```
     #[track_caller]
-    pub fn square(&self) -> Result<Tensor> {
+    pub fn square(&self) -> Tensor {
         origin_call!("square");
-        Ok(Self::new(self.uop().square()))
+        Self::new(self.uop().square())
     }
 
     /// Sign function: -1 for negative, 0 for zero, 1 for positive.
@@ -211,12 +211,12 @@ impl Tensor {
     /// # Examples
     /// ```ignore
     /// let t = Tensor::from_slice(&[-5.0f32, 0.0, 3.0, -0.0]);
-    /// let result = t.sign()?;  // [-1.0, 0.0, 1.0, 0.0]
+    /// let result = t.sign();  // [-1.0, 0.0, 1.0, 0.0]
     /// ```
     #[track_caller]
-    pub fn sign(&self) -> Result<Tensor> {
+    pub fn sign(&self) -> Tensor {
         origin_call!("sign");
-        Ok(Self::new(self.uop().sign()))
+        Self::new(self.uop().sign())
     }
 
     /// Linear interpolation: `self + (end - self) * weight`.
@@ -259,7 +259,7 @@ impl Tensor {
                 (DType::UInt64, 0x7FF0000000000000, 0xFFF0000000000000_u64 as i64, 0x7FFFFFFFFFFFFFFF)
             }
             // Non-float dtypes never have inf.
-            _ => return self.zero()?.cast(DType::Bool),
+            _ => return Ok(self.zero()?.cast(DType::Bool)),
         };
 
         let bits = self.bitcast(uint_dt)?;
@@ -268,14 +268,14 @@ impl Tensor {
             (true, true) => {
                 // (bits & abs_mask) == +inf bits → matches both +inf and -inf
                 let mask = bits.broadcast_scalar(ConstValue::Int(abs_mask))?;
-                bits.bitwise_and(&mask)?.try_eq(&pos_pat)
+                bits.try_bitand(&mask)?.try_eq(&pos_pat)
             }
             (true, false) => bits.try_eq(&pos_pat),
             (false, true) => {
                 let neg_pat = bits.broadcast_scalar(ConstValue::Int(neg_bits))?;
                 bits.try_eq(&neg_pat)
             }
-            (false, false) => self.zero()?.cast(DType::Bool),
+            (false, false) => Ok(self.zero()?.cast(DType::Bool)),
         }
     }
 
@@ -288,7 +288,7 @@ impl Tensor {
     pub fn sinh(&self) -> Result<Tensor> {
         origin_call!("sinh");
         let exp_pos = self.try_exp()?;
-        let exp_neg = self.try_neg()?.try_exp()?;
+        let exp_neg = self.neg().try_exp()?;
         let two = self.broadcast_scalar(ConstValue::Int(2))?;
         exp_pos.try_sub(&exp_neg)?.try_div(&two)
     }
@@ -298,7 +298,7 @@ impl Tensor {
     pub fn cosh(&self) -> Result<Tensor> {
         origin_call!("cosh");
         let exp_pos = self.try_exp()?;
-        let exp_neg = self.try_neg()?.try_exp()?;
+        let exp_neg = self.neg().try_exp()?;
         let two = self.broadcast_scalar(ConstValue::Int(2))?;
         exp_pos.try_add(&exp_neg)?.try_div(&two)
     }
@@ -312,7 +312,7 @@ impl Tensor {
     pub fn asinh(&self) -> Result<Tensor> {
         origin_call!("asinh");
         let one = self.one()?;
-        let inner = self.square()?.try_add(&one)?.try_sqrt()?;
+        let inner = self.square().try_add(&one)?.try_sqrt()?;
         self.try_add(&inner)?.try_log()
     }
 
@@ -321,7 +321,7 @@ impl Tensor {
     pub fn acosh(&self) -> Result<Tensor> {
         origin_call!("acosh");
         let one = self.one()?;
-        let inner = self.square()?.try_sub(&one)?.try_sqrt()?;
+        let inner = self.square().try_sub(&one)?.try_sqrt()?;
         self.try_add(&inner)?.try_log()
     }
 
@@ -354,13 +354,13 @@ impl Tensor {
             -0.2145988016,
             1.5707963050,
         ];
-        let abs_x = self.try_abs()?;
+        let abs_x = self.abs();
         let one = self.one()?;
         let half_pi = self.broadcast_scalar(ConstValue::Float(std::f64::consts::FRAC_PI_2))?;
         let sqrt_part = one.try_sub(&abs_x)?.try_sqrt()?;
         let poly = poly_n(&abs_x, &coefficients)?;
         let x = half_pi.try_sub(&sqrt_part.try_mul(&poly)?)?;
-        self.sign()?.try_mul(&x)
+        self.sign().try_mul(&x)
     }
 
     /// Arccosine: `π/2 - asin(x)`.
@@ -376,7 +376,7 @@ impl Tensor {
     pub fn atan(&self) -> Result<Tensor> {
         origin_call!("atan");
         let one = self.one()?;
-        let denom = one.try_add(&self.square()?)?.try_sqrt()?;
+        let denom = one.try_add(self.square())?.try_sqrt()?;
         self.try_div(&denom)?.asin()
     }
 
@@ -395,8 +395,8 @@ impl Tensor {
         let pos_lambd = Tensor::const_(lambd, dtype.clone());
         let bias_t = Tensor::const_(bias, dtype.clone());
         let neg_bias = Tensor::const_(-bias, dtype.clone());
-        let neg_part = self.try_lt(&neg_lambd)?.cast(dtype.clone())?.try_mul(&self.try_add(&bias_t)?)?;
-        let pos_part = self.try_gt(&pos_lambd)?.cast(dtype)?.try_mul(&self.try_add(&neg_bias)?)?;
+        let neg_part = self.try_lt(&neg_lambd)?.cast(dtype.clone()).try_mul(&self.try_add(&bias_t)?)?;
+        let pos_part = self.try_gt(&pos_lambd)?.cast(dtype).try_mul(&self.try_add(&neg_bias)?)?;
         neg_part.try_add(&pos_part)
     }
 
@@ -440,16 +440,16 @@ impl Tensor {
             let batch: Vec<usize> = shape[..ndim - 2]
                 .iter()
                 .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "det" }))
-                .collect::<Result<_>>()?;
+                .collect::<KindResult<_>>()?;
             return if batch.is_empty() {
                 Ok(Tensor::const_(1.0, float_dt))
             } else {
-                Tensor::full(&batch, 1.0, float_dt)
+                Ok(Tensor::full(&batch, 1.0, float_dt))
             };
         }
 
         // Cast to float for correct division in Gaussian elimination
-        let mut a = if dtype.is_float() { self.clone() } else { self.cast(float_dt.clone())? };
+        let mut a = if dtype.is_float() { self.clone() } else { self.cast(float_dt.clone()) };
         let mut det_val: Option<Tensor> = None;
         let neg_one = Tensor::const_(-1.0, float_dt.clone());
         let one = Tensor::const_(1.0, float_dt.clone());
@@ -462,7 +462,7 @@ impl Tensor {
             if cur_n > 1 {
                 // Partial pivoting: find row with max |a[..., :, 0]|
                 let col0 = shrink_last2(&a, ndim, (0, cni), (0, 1))?;
-                let max_idx = col0.try_abs()?.argmax_with().axis(Some(-2)).keepdim(true).call()?;
+                let max_idx = col0.abs().argmax_with().axis(Some(-2)).keepdim(true).call()?;
 
                 // Extract max_row via gather
                 let mut gather_shape: Vec<isize> = vec![-1; ndim - 2];
@@ -512,7 +512,7 @@ impl Tensor {
             // Use safe pivot: replace 0 with 1 to avoid div-by-zero NaN.
             // When pivot is 0 the matrix is singular (det=0), already captured
             // in det_val; the elimination result doesn't matter.
-            let pivot_is_zero = pivot.try_eq(&Tensor::const_(0.0, float_dt.clone()))?;
+            let pivot_is_zero = pivot.try_eq(Tensor::const_(0.0, float_dt.clone()))?;
             let pivot_safe = one.where_(&pivot_is_zero, &pivot)?;
             let col_below = shrink_last2(&a, ndim, (1, cni), (0, 1))?;
             let factors = col_below.try_div(&pivot_safe)?;
@@ -564,7 +564,7 @@ impl Tensor {
             // Full column = j zeros (upper triangle) ++ col_below, appended to L.
             let mut zshape: Vec<usize> = batch.to_vec();
             zshape.push(j as usize);
-            let zeros_above = Tensor::full(&zshape, 0.0, float_dt.clone())?;
+            let zeros_above = Tensor::full(&zshape, 0.0, float_dt.clone());
             let col = Tensor::cat(&[&zeros_above, &col_below], -1)?.try_unsqueeze(-1)?; // [.., n, 1]
             l = Tensor::cat(&[&l, &col], -1)?;
         }
@@ -589,13 +589,13 @@ impl Tensor {
             }
         );
         let cdim = |d: usize| {
-            shape[d].as_const().ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "qr".to_string() })
+            shape[d].as_const().ok_or_else(|| ErrorKind::SymbolicShapeUnsupported { operation: "qr".to_string() })
         };
         let (m, n) = (cdim(ndim - 2)?, cdim(ndim - 1)?);
         let batch: Vec<usize> = shape[..ndim - 2]
             .iter()
             .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "qr" }))
-            .collect::<Result<_>>()?;
+            .collect::<KindResult<_>>()?;
         let float_dt = if self.uop().dtype().is_float() { self.uop().dtype() } else { DType::Float32 };
 
         let mut r = to_float(self, &float_dt)?;
@@ -610,13 +610,13 @@ impl Tensor {
             let norm = x.try_mul(&x)?.sum(-1isize)?.try_sqrt()?; // [..]
             let x0 = x.getitem(s![Ellipsis, 0])?; // [..]
             let x0_nz = x0.try_ne(&zero)?;
-            let sgn = x0.sign()?.try_neg()?.where_(&x0_nz, &neg_one)?; // x0!=0 ? -sign(x0) : -1
+            let sgn = x0.sign().neg().where_(&x0_nz, &neg_one)?; // x0!=0 ? -sign(x0) : -1
             let u1 = x0.try_sub(&sgn.try_mul(&norm)?)?;
             let norm_nz = norm.try_ne(&zero)?;
             let denom = u1.where_(&norm_nz, &one)?.try_unsqueeze(-1)?.try_unsqueeze(-1)?; // [..,1,1]
             let mut w = x.try_unsqueeze(-1)?.try_div(&denom)?; // [.., m-i, 1]
             w = w.set(s![Ellipsis, 0, 0], &one)?;
-            let tau = sgn.try_neg()?.try_mul(&u1)?.try_div(&norm.where_(&norm_nz, &one)?)?;
+            let tau = sgn.neg().try_mul(&u1)?.try_div(&norm.where_(&norm_nz, &one)?)?;
             let tau = tau.try_unsqueeze(-1)?.try_unsqueeze(-1)?; // [..,1,1]
             let tau = tau.where_(&norm_nz.try_unsqueeze(-1)?.try_unsqueeze(-1)?, &zero)?;
 
@@ -647,8 +647,9 @@ impl Tensor {
                 actual: format!("{ndim}-D")
             }
         );
-        let to_dim =
-            |d: usize| shape[d].as_const().ok_or_else(|| Error::SymbolicShapeUnsupported { operation: op.to_string() });
+        let to_dim = |d: usize| {
+            shape[d].as_const().ok_or_else(|| ErrorKind::SymbolicShapeUnsupported { operation: op.to_string() })
+        };
         let (m, n) = (to_dim(ndim - 2)?, to_dim(ndim - 1)?);
         snafu::ensure!(
             m == n,
@@ -661,7 +662,7 @@ impl Tensor {
         let dims: Vec<usize> = shape
             .iter()
             .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: op.to_string() }))
-            .collect::<Result<_>>()?;
+            .collect::<KindResult<_>>()?;
         let dtype = self.uop().dtype();
         let float_dt = if dtype.is_float() { dtype } else { DType::Float32 };
         Ok((dims, n, float_dt))
@@ -682,7 +683,7 @@ fn shrink_last2(tensor: &Tensor, ndim: usize, row_range: (isize, isize), col_ran
 
 /// Cast to `float_dt` unless already float (used by the decompositions).
 fn to_float(t: &Tensor, float_dt: &DType) -> Result<Tensor> {
-    if t.uop().dtype().is_float() { Ok(t.clone()) } else { t.cast(float_dt.clone()) }
+    Ok(if t.uop().dtype().is_float() { t.clone() } else { t.cast(float_dt.clone()) })
 }
 
 /// A `[batch.., n, n]` identity (the eye broadcast across the leading batch dims).

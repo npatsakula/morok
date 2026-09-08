@@ -121,7 +121,7 @@ crate::codegen_tests! {
             })
             .expect("custom kernel should build");
 
-        let mut out = outputs.remove(0);
+        let out = outputs.remove(0);
         out.realize_with(&config).unwrap();
 
         let result = out.as_vec::<f32>().unwrap();
@@ -157,7 +157,7 @@ fn run_custom_op_numerical_test(backend: CpuBackend, mul_tpl: &str, add_tpl: &st
             })
             .expect("custom kernel should build");
 
-        let mut out = outputs.remove(0);
+        let out = outputs.remove(0);
         let config = PrepareConfig::for_cpu_backend(backend);
         out.realize_with(&config).unwrap();
 
@@ -214,7 +214,7 @@ fn test_custom_kernel_hand_ranged_loop_cpu() {
 
         let mut outputs = dst.custom_kernel(&[&src], hand_ranged_add1_body(n)).expect("custom kernel should build");
 
-        let mut out = outputs.remove(0);
+        let out = outputs.remove(0);
         out.realize_with(&PrepareConfig::for_cpu_backend(CpuBackend::Clang)).unwrap();
 
         let result = out.as_vec::<f32>().unwrap();
@@ -234,7 +234,7 @@ fn test_custom_kernel_hand_ranged_loop_amd() {
 
     let mut outputs = dst.custom_kernel(&[&src], hand_ranged_add1_body(n)).expect("custom kernel should build");
 
-    let mut out = outputs.remove(0);
+    let out = outputs.remove(0);
     out.realize_with(&PrepareConfig::from_env()).unwrap();
 
     let result = out.as_vec::<f32>().unwrap();
@@ -271,7 +271,7 @@ fn test_tensor_custom_op_amd_end_to_end() {
         })
         .expect("custom kernel should build");
 
-    let mut out = outputs.remove(0);
+    let out = outputs.remove(0);
     out.realize_with(&PrepareConfig::from_env()).unwrap();
 
     let result = out.as_vec::<f32>().unwrap();

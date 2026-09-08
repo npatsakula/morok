@@ -25,6 +25,55 @@ pub enum MeshgridIndexing {
     Xy,
 }
 
+/// End bounds for [`Tensor::slice_with`].
+///
+/// Built through `From` in the builder setter, so `&[i64]` (ONNX-style, where
+/// the `i64::MAX` sentinel still reads as "to the end"), `&[Option<i64>]`
+/// (`None` is "to the end") and owned `Vec`s of either all work. Omitting the
+/// `ends` setter slices every listed axis to its end.
+#[derive(Debug, Clone, Copy)]
+pub enum SliceEnds<'a> {
+    /// Plain bounds; values above `i64::MAX / 2` mean "to the end".
+    Bounds(&'a [i64]),
+    /// Per-axis bounds where `None` means "to the end".
+    Optional(&'a [Option<i64>]),
+}
+
+impl SliceEnds<'_> {
+    /// End bound of axis `i`, or `None` for "to the end".
+    fn get(&self, i: usize) -> Option<i64> {
+        match self {
+            Self::Bounds(b) => b.get(i).copied().filter(|&e| e <= i64::MAX / 2),
+            Self::Optional(o) => o.get(i).copied().flatten(),
+        }
+    }
+}
+
+macro_rules! impl_slice_ends_from {
+    ($variant:ident, $elem:ty) => {
+        impl<'a> From<&'a [$elem]> for SliceEnds<'a> {
+            fn from(v: &'a [$elem]) -> Self {
+                Self::$variant(v)
+            }
+        }
+
+        impl<'a> From<&'a Vec<$elem>> for SliceEnds<'a> {
+            fn from(v: &'a Vec<$elem>) -> Self {
+                Self::$variant(v)
+            }
+        }
+
+        impl<'a, const N: usize> From<&'a [$elem; N]> for SliceEnds<'a> {
+            fn from(v: &'a [$elem; N]) -> Self {
+                Self::$variant(v)
+            }
+        }
+    };
+}
+
+impl_slice_ends_from!(Bounds, i64);
+impl_slice_ends_from!(Optional, Option<i64>);
+
 impl Tensor {
     /// Reshape tensor to a new shape.
     ///
@@ -59,13 +108,13 @@ impl Tensor {
             let current_shape = self.shape()?;
             let total_elements =
                 current_shape.iter().try_fold(1usize, |acc, dim| dim.as_const().map(|v| acc * v)).ok_or_else(|| {
-                    Error::SymbolicShapeUnsupported { operation: "reshape with -1 inference".to_string() }
+                    ErrorKind::SymbolicShapeUnsupported { operation: "reshape with -1 inference".to_string() }
                 })?;
             let known_product: usize = dims
                 .iter()
                 .filter(|d| !d.is_infer())
-                .map(|d| d.as_const().expect("non-infer dims must be concrete for -1 inference"))
-                .product();
+                .map(|d| d.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "reshape with -1 inference" }))
+                .product::<KindResult<usize>>()?;
             snafu::ensure!(
                 known_product > 0 && total_elements % known_product == 0,
                 ReshapeSizeMismatchSnafu { operation: "reshape with inference".to_string() }
@@ -76,7 +125,7 @@ impl Tensor {
             dims.into()
         };
 
-        self.uop().try_reshape(&shape).map(Self::new).context(UOpSnafu)
+        self.uop().try_reshape(&shape).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Expand tensor to a new shape with mixed concrete/symbolic dimensions.
@@ -86,12 +135,17 @@ impl Tensor {
         let requested: Vec<SInt> = new_shape.into_iter().map(Into::into).collect();
         // Resolve Infer (-1) to current dimension (expand's "keep" semantics)
         let current_shape = self.shape()?;
+        let ndim = current_shape.len();
         let shape: Shape = requested
             .into_iter()
             .enumerate()
-            .map(|(i, s)| if s.is_infer() { current_shape[i].clone() } else { s })
-            .collect();
-        self.uop().try_expand(&shape).map(Self::new).context(UOpSnafu)
+            .map(|(i, s)| match s.is_infer() {
+                // `-1` keeps the current extent, so it needs one to keep.
+                true => current_shape.get(i).cloned().context(AxisOutOfRangeSnafu { axis: i as isize, ndim }),
+                false => Ok(s),
+            })
+            .collect::<KindResult<_>>()?;
+        self.uop().try_expand(&shape).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Permute (reorder) tensor dimensions.
@@ -122,7 +176,7 @@ impl Tensor {
         // Normalize negative indices and validate
         let normalized_axes = self.normalize_axes(axes, ndim)?;
 
-        self.uop().try_permute(normalized_axes).map(Self::new).context(UOpSnafu)
+        self.uop().try_permute(normalized_axes).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Transpose two dimensions.
@@ -156,7 +210,7 @@ impl Tensor {
         let mut axes: Vec<usize> = (0..ndim).collect();
         axes.swap(d0, d1);
 
-        self.uop().try_permute(axes).map(Self::new).context(UOpSnafu)
+        self.uop().try_permute(axes).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Expand (broadcast) dimensions.
@@ -212,7 +266,7 @@ impl Tensor {
                 // Check if dimension is size 1
                 let dim_size = shape[normalized_axis]
                     .as_const()
-                    .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "squeeze".to_string() })?;
+                    .ok_or_else(|| ErrorKind::SymbolicShapeUnsupported { operation: "squeeze".to_string() })?;
 
                 snafu::ensure!(dim_size == 1, SqueezeDimensionNotOneSnafu { dim: normalized_axis, size: dim_size });
 
@@ -225,7 +279,7 @@ impl Tensor {
             }
         };
 
-        self.uop().try_reshape(&new_shape).map(Self::new).context(UOpSnafu)
+        self.uop().try_reshape(&new_shape).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Add a dimension of size 1.
@@ -268,7 +322,7 @@ impl Tensor {
         let mut new_shape = shape.clone();
         new_shape.insert(normalized_dim, SInt::Const(1));
 
-        self.uop().try_reshape(&new_shape).map(Self::new).context(UOpSnafu)
+        self.uop().try_reshape(&new_shape).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Reverse elements along specified axes.
@@ -287,7 +341,7 @@ impl Tensor {
         let ndim = shape.len();
         let flip_spec: Vec<bool> =
             (0..ndim).map(|d| axes.iter().any(|&a| Self::normalize_axis(a, ndim).is_ok_and(|na| na == d))).collect();
-        self.uop().try_flip(flip_spec).map(Self::new).context(UOpSnafu)
+        self.uop().try_flip(flip_spec).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Split tensor into chunks along a dimension.
@@ -473,12 +527,14 @@ impl Tensor {
                 .iter()
                 .zip(shape.iter())
                 .map(|((b, e), s)| {
-                    let dim = s.as_const().expect("pad with negative values requires concrete shape") as isize;
+                    let dim =
+                        s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "pad with negative values" })?
+                            as isize;
                     let begin = (-*b).max(0);
                     let end = (dim + *e).min(dim);
-                    (begin, end)
+                    Ok((begin, end))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             self.try_shrink(&shrink_ranges)?
         } else {
             self.clone()
@@ -493,7 +549,7 @@ impl Tensor {
         let padding_sint: Vec<(SInt, SInt)> =
             pos_padding.iter().map(|(begin, end)| (SInt::Const(*begin as usize), SInt::Const(*end as usize))).collect();
 
-        base.uop().try_pad(&padding_sint).map(Self::new).context(UOpSnafu)
+        base.uop().try_pad(&padding_sint).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Concatenate tensors along an axis.
@@ -518,7 +574,7 @@ impl Tensor {
     pub fn cat(tensors: &[&Tensor], dim: isize) -> Result<Tensor> {
         origin_call!("cat");
         if tensors.is_empty() {
-            return Err(IrConstructionSnafu { details: "cat requires at least one tensor".to_string() }.build());
+            return Err(IrConstructionSnafu { details: "cat requires at least one tensor".to_string() }.build().into());
         }
 
         let first = tensors[0];
@@ -643,9 +699,10 @@ impl Tensor {
         origin_call!("unflatten");
         let shape = self.shape()?;
         let dim = Self::normalize_axis(dim, shape.len())?;
-        let mut new_shape = svod_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
-        new_shape.splice(dim..=dim, sizes.iter().copied());
-        self.try_reshape(&new_shape)
+        // Kept as `SInt` so untouched symbolic dims pass straight through.
+        let mut new_shape: Vec<SInt> = shape.iter().cloned().collect();
+        new_shape.splice(dim..=dim, sizes.iter().map(SInt::from));
+        self.try_reshape(new_shape)
     }
 
     /// Create coordinate grids from 1D tensors.
@@ -655,7 +712,7 @@ impl Tensor {
     pub fn meshgrid(tensors: &[&Tensor], indexing: MeshgridIndexing) -> Result<Vec<Tensor>> {
         origin_call!("meshgrid");
         let n = tensors.len();
-        let sizes: Vec<usize> = tensors.iter().map(|t| t.numel().unwrap()).collect();
+        let sizes: Vec<usize> = tensors.iter().map(|t| t.numel()).collect::<Result<_>>()?;
         // For "xy" indexing, swap the first two inputs
         let swapped: Vec<usize> = if indexing == MeshgridIndexing::Xy && n >= 2 {
             let mut s: Vec<usize> = (0..n).collect();
@@ -708,7 +765,7 @@ impl Tensor {
 
         // Mixed concrete/symbolic: create scalar tensors and cat
         let shape_sint: smallvec::SmallVec<[SInt; 4]> = smallvec::smallvec![SInt::from(1usize)];
-        let scalars: Result<Vec<Tensor>> = shape
+        let scalars: KindResult<Vec<Tensor>> = shape
             .iter()
             .map(|d| {
                 let uop = d.to_uop(svod_dtype::DType::Int64);
@@ -764,19 +821,47 @@ impl Tensor {
                 ShrinkRange::Sint(begin, end) => Ok((begin, end)),
                 ShrinkRange::Isize(begin, end) => {
                     let (nb, ne) = if begin < 0 || end < 0 {
-                        let dim_size = shape[dim_idx].as_const().ok_or_else(|| Error::SymbolicShapeUnsupported {
+                        let dim_size = shape[dim_idx].as_const().ok_or_else(|| ErrorKind::SymbolicShapeUnsupported {
                             operation: "shrink with negative indices".to_string(),
                         })? as isize;
                         (if begin < 0 { dim_size + begin } else { begin }, if end < 0 { dim_size + end } else { end })
                     } else {
                         (begin, end)
                     };
+                    // Still negative after normalization: `as usize` would wrap
+                    // to a huge extent instead of reporting the bad index.
+                    snafu::ensure!(nb >= 0, NegativeDimensionSnafu { dim: begin });
+                    snafu::ensure!(ne >= 0, NegativeDimensionSnafu { dim: end });
                     Ok((SInt::Const(nb as usize), SInt::Const(ne as usize)))
                 }
             })
             .collect::<Result<Vec<_>>>()?;
 
-        self.uop().try_shrink(&ranges_sint).map(Self::new).context(UOpSnafu)
+        self.uop().try_shrink(&ranges_sint).map(Self::new).context(UOpSnafu).map_err(Into::into)
+    }
+
+    /// Slice `len` elements starting at `start` along `dim` (torch `narrow`).
+    ///
+    /// Negative `dim` counts from the end; `start` and `len` may be symbolic.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0]);
+    /// let mid = t.narrow(0, 1usize, 3usize).unwrap();  // Elements [2, 3, 4]
+    /// assert_eq!(mid.dims().unwrap(), vec![3]);
+    /// ```
+    #[track_caller]
+    pub fn narrow(&self, dim: isize, start: impl Into<SInt>, len: impl Into<SInt>) -> Result<Tensor> {
+        origin_call!("narrow");
+        let ndim = self.ndim()?;
+        let dim = Self::normalize_axis(dim, ndim)?;
+        let start: SInt = start.into();
+        let end = &start + len.into();
+        let ranges: Vec<Option<(SInt, SInt)>> =
+            (0..ndim).map(|d| (d == dim).then(|| (start.clone(), end.clone()))).collect();
+        self.try_shrink(ranges)
     }
 
     /// Center-crop or center-pad each specified axis to the target size.
@@ -785,30 +870,32 @@ impl Tensor {
     /// For axes where `target > current`, pads symmetrically around the center.
     /// Axes where `target == current` are unchanged.
     ///
-    /// `axes` specifies which dimensions to apply (default: all).
+    /// `axes` selects the dimensions to apply (default: all); negative axes
+    /// count from the end. Untouched axes keep their extent, symbolic included.
     #[track_caller]
-    pub fn center_crop_pad(&self, target_shape: &[usize], axes: Option<&[usize]>) -> Result<Tensor> {
+    pub fn center_crop_pad(&self, target_shape: &[usize], axes: Option<&[isize]>) -> Result<Tensor> {
         origin_call!("center_crop_pad");
-        let shape = self.shape()?;
-        let ndim = shape.len();
-        let default_axes: Vec<usize> = (0..ndim).collect();
-        let axes = axes.unwrap_or(&default_axes);
+        let ndim = self.ndim()?;
+        let axes: Vec<usize> = match axes {
+            Some(a) => a.iter().map(|&ax| Self::normalize_axis(ax, ndim)).collect::<Result<_>>()?,
+            None => (0..ndim).collect(),
+        };
 
-        let mut shrink_arg: Vec<(isize, isize)> =
-            (0..ndim).map(|i| (0, shape[i].as_const().unwrap_or(1) as isize)).collect();
+        // `None` keeps the dim as-is, so symbolic axes outside `axes` survive.
+        let mut shrink_arg: Vec<Option<(isize, isize)>> = vec![None; ndim];
         let mut pad_arg: Vec<(isize, isize)> = vec![(0, 0); ndim];
 
         for (&s, &ax) in target_shape.iter().zip(axes.iter()) {
             let s = s as isize;
-            let tx = shape[ax].as_const().unwrap_or(1) as isize;
+            let tx = self.dim_const(ax as isize)? as isize;
             if s < tx {
-                shrink_arg[ax] = (tx / 2 - (s + 1) / 2, tx / 2 + s / 2);
+                shrink_arg[ax] = Some((tx / 2 - (s + 1) / 2, tx / 2 + s / 2));
             } else if s > tx {
                 pad_arg[ax] = ((s - tx) / 2, (s - tx + 1) / 2);
             }
         }
 
-        self.try_shrink(&shrink_arg)?.try_pad(&pad_arg)
+        self.try_shrink(shrink_arg)?.try_pad(&pad_arg)
     }
 
     // =========================================================================
@@ -817,7 +904,7 @@ impl Tensor {
 
     /// Get the concrete shape of this tensor.
     pub fn shape(&self) -> Result<Shape> {
-        self.uop().shape().context(UOpSnafu)?.cloned().ok_or(Error::ShapeUnknown)
+        self.uop().shape().context(UOpSnafu)?.cloned().ok_or(ErrorKind::ShapeUnknown.into())
     }
 
     /// Get the number of dimensions (rank).
@@ -827,9 +914,35 @@ impl Tensor {
 
     /// Total number of elements. Fails if any dimension is symbolic.
     pub fn numel(&self) -> Result<usize> {
-        self.shape()?.iter().try_fold(1usize, |acc, d| {
-            d.as_const().map(|v| acc * v).ok_or(Error::SymbolicShapeUnsupported { operation: "numel".into() })
-        })
+        self.shape()?
+            .iter()
+            .try_fold(1usize, |acc, d| {
+                d.as_const().map(|v| acc * v).ok_or(ErrorKind::SymbolicShapeUnsupported { operation: "numel".into() })
+            })
+            .map_err(Into::into)
+    }
+
+    /// Total number of elements, keeping symbolic dimensions in the product.
+    pub fn numel_sint(&self) -> Result<SInt> {
+        Ok(self.shape()?.iter().fold(SInt::Const(1), |acc, d| acc * d))
+    }
+
+    /// Concrete dimensions of this tensor.
+    ///
+    /// # Errors
+    ///
+    /// Fails if any dimension is symbolic; use [`shape`](Self::shape) to keep
+    /// symbolic dimensions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// let t = Tensor::from_slice(&[1.0f32; 6]).try_reshape(&[2, 3]).unwrap();
+    /// assert_eq!(t.dims().unwrap(), vec![2, 3]);
+    /// ```
+    pub fn dims(&self) -> Result<Vec<usize>> {
+        svod_ir::shape::to_vec_usize(&self.shape()?).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Get the size of a specific dimension.
@@ -839,21 +952,31 @@ impl Tensor {
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// let t = Tensor::from_slice([1.0f32; 6]).try_reshape(&[2, 3])?;
-    /// assert_eq!(t.dim(0)?.as_const(), Some(2));   // First dimension
-    /// assert_eq!(t.dim(1)?.as_const(), Some(3));   // Second dimension
-    /// assert_eq!(t.dim(-1)?.as_const(), Some(3));  // Last dimension (negative indexing)
-    /// assert_eq!(t.dim(-2)?.as_const(), Some(2));  // Second-to-last dimension
+    /// ```
+    /// # use svod_tensor::Tensor;
+    /// let t = Tensor::from_slice(&[1.0f32; 6]).try_reshape(&[2, 3]).unwrap();
+    /// assert_eq!(t.dim(0).unwrap().as_const(), Some(2)); // First dimension
+    /// assert_eq!(t.dim(-1).unwrap().as_const(), Some(3)); // Last dimension
     /// ```
     ///
     /// # Errors
     ///
     /// Returns error if axis is out of range.
-    pub(crate) fn dim(&self, axis: isize) -> Result<svod_ir::SInt> {
+    pub fn dim(&self, axis: isize) -> Result<svod_ir::SInt> {
         let shape = self.shape()?;
         let idx = Self::normalize_axis(axis, shape.len())?;
         Ok(shape[idx].clone())
+    }
+
+    /// Get the size of a specific dimension, requiring it to be concrete.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::AxisOutOfRange`] if `axis` is out of range,
+    /// [`ErrorKind::NonConstDim`] if the dimension is symbolic.
+    pub fn dim_const(&self, axis: isize) -> Result<usize> {
+        let dim = self.dim(axis)?;
+        dim.as_const().ok_or(ErrorKind::NonConstDim { axis, dim }.into())
     }
 
     /// Normalize a single axis index (handle negative indices).
@@ -898,28 +1021,28 @@ impl Tensor {
 
     /// Keep upper triangle, zero below.
     #[track_caller]
-    pub fn triu(&self, diagonal: i64) -> Result<Tensor> {
+    pub fn triu(&self, diagonal: isize) -> Result<Tensor> {
         origin_call!("triu");
         let shape = self.shape()?;
         let ndim = shape.len();
         snafu::ensure!(ndim >= 2, NdimMinimumSnafu { op: "triu", min: 2usize, actual: ndim });
         let r = shape[ndim - 2].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "triu" })? as i64;
         let c = shape[ndim - 1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "triu" })? as i64;
-        let mask = Self::tri(r, c, diagonal)?;
+        let mask = Self::tri(r, c, diagonal as i64)?;
         let zero = Tensor::new(self.uop().const_like(ConstValue::zero(self.uop().dtype().scalar().unwrap())));
         self.where_(&mask, &zero)
     }
 
     /// Keep lower triangle, zero above.
     #[track_caller]
-    pub fn tril(&self, diagonal: i64) -> Result<Tensor> {
+    pub fn tril(&self, diagonal: isize) -> Result<Tensor> {
         origin_call!("tril");
         let shape = self.shape()?;
         let ndim = shape.len();
         snafu::ensure!(ndim >= 2, NdimMinimumSnafu { op: "tril", min: 2usize, actual: ndim });
         let r = shape[ndim - 2].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "tril" })? as i64;
         let c = shape[ndim - 1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "tril" })? as i64;
-        let mask = Self::tri(r, c, diagonal + 1)?;
+        let mask = Self::tri(r, c, diagonal as i64 + 1)?;
         let zero = Tensor::new(self.uop().const_like(ConstValue::zero(self.uop().dtype().scalar().unwrap())));
         zero.where_(&mask, self)
     }
@@ -928,12 +1051,15 @@ impl Tensor {
 #[bon]
 impl Tensor {
     /// Slice tensor with Python-style indexing: negative indices, steps, and axis selection.
+    ///
+    /// `ends` is optional: an omitted setter, a `None` entry, or the ONNX
+    /// `i64::MAX` sentinel all mean "to the end of that axis".
     #[builder]
     #[track_caller]
     pub fn slice_with(
         &self,
         starts: &[i64],
-        ends: &[i64],
+        #[builder(into)] ends: Option<SliceEnds<'_>>,
         axes: Option<&[i64]>,
         steps: Option<&[i64]>,
     ) -> Result<Tensor> {
@@ -960,18 +1086,21 @@ impl Tensor {
         for (i, &axis) in axes.iter().enumerate() {
             let step = steps[i];
             if step == 0 {
-                return Err(crate::error::Error::IrConstruction { details: "Slice step cannot be 0".into() });
+                return Err(crate::error::ErrorKind::IrConstruction { details: "Slice step cannot be 0".into() }.into());
             }
+
+            let end = ends.and_then(|e| e.get(i));
 
             let d = match shape[axis].as_const() {
                 Some(d) => d as i64,
                 None => {
-                    if starts[i] <= 0 && ends[i] > (i64::MAX / 2) {
+                    if starts[i] <= 0 && end.is_none() {
                         continue;
                     }
-                    return Err(crate::error::Error::SymbolicShapeUnsupported {
+                    return Err(crate::error::ErrorKind::SymbolicShapeUnsupported {
                         operation: "slice_with on a symbolic dim".to_string(),
-                    });
+                    }
+                    .into());
                 }
             };
 
@@ -982,7 +1111,8 @@ impl Tensor {
             }
             let s = s.clamp(lower, upper);
 
-            let mut e = ends[i].clamp(-d - 1, d);
+            // Missing end → the full extent (or one past index 0 when stepping down).
+            let mut e = end.unwrap_or(if step > 0 { d } else { -d - 1 }).clamp(-d - 1, d);
             if e < 0 {
                 e += d;
             }
@@ -1009,7 +1139,7 @@ impl Tensor {
                 continue;
             }
             let cur = result.shape()?;
-            let size = cur[axis].as_const().ok_or_else(|| crate::error::Error::SymbolicShapeUnsupported {
+            let size = cur[axis].as_const().ok_or_else(|| crate::error::ErrorKind::SymbolicShapeUnsupported {
                 operation: "slice_with with step on a symbolic dim".to_string(),
             })?;
             let padded = size.div_ceil(abs_step) * abs_step;

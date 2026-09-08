@@ -18,8 +18,7 @@ fn dynamic_quantized_linear_matches_integer_reference() {
     let weight_scale = Tensor::from_slice([0.5f32, 1.0, 2.0]);
     let bias = Tensor::from_slice([1.0f32, -2.0, 0.5]);
 
-    let mut output =
-        x.dynamic_quantized_linear().weight(&weight).weight_scale(&weight_scale).bias(&bias).call().unwrap();
+    let output = x.dynamic_quantized_linear().weight(&weight).weight_scale(&weight_scale).bias(&bias).call().unwrap();
     output.realize().unwrap();
 
     assert_eq!(output.uop().dtype(), DType::Float32);
@@ -175,7 +174,7 @@ fn test_lrn_rejects_3d() {
 crate::codegen_tests! {
     fn test_pad_value_neg_inf(config) {
         let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-        let mut padded = x.try_pad_value(&[(1, 1)], f64::NEG_INFINITY).unwrap();
+        let padded = x.try_pad_value(&[(1, 1)], f64::NEG_INFINITY).unwrap();
         let result = padded.realize_with_and(&config).as_vec::<f32>().unwrap();
         assert_eq!(result.len(), 5);
         assert!(result[0].is_infinite() && result[0] < 0.0);
@@ -188,7 +187,7 @@ crate::codegen_tests! {
     fn test_pad_value_zero_delegates(config) {
         // pad_value with 0.0 should be identical to try_pad
         let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-        let mut padded = x.try_pad_value(&[(1, 1)], 0.0).unwrap();
+        let padded = x.try_pad_value(&[(1, 1)], 0.0).unwrap();
         let result = padded.realize_with_and(&config).as_vec::<f32>().unwrap();
         assert_eq!(result.len(), 5);
         assert_eq!(result[0], 0.0);
@@ -204,7 +203,7 @@ crate::codegen_tests! {
         let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 1, 3, 3), x_data).unwrap());
         let w = Tensor::from_ndarray(&array![[[[2.0f32]]]]);
         let result = x.conv2d().weight(&w).call().unwrap();
-        let mut result = result.contiguous();
+        let result = result.contiguous();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         let expected: Vec<f32> = (1..=9).map(|v| v as f32 * 2.0).collect();
@@ -221,7 +220,7 @@ crate::codegen_tests! {
         let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 1, 4, 4), x_data).unwrap());
         let w = Tensor::from_ndarray(&Array4::<f32>::ones((1, 1, 3, 3)));
         let result = x.conv2d().weight(&w).call().unwrap();
-        let mut result = result.contiguous();
+        let result = result.contiguous();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 1, 2, 2]);
@@ -241,7 +240,7 @@ crate::codegen_tests! {
         let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 1, 4, 4), x_data).unwrap());
         let w = Tensor::from_ndarray(&Array4::<f32>::ones((1, 1, 2, 2)));
         let result = x.conv2d().weight(&w).stride(&[2, 2]).call().unwrap();
-        let mut result = result.contiguous();
+        let result = result.contiguous();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 1, 2, 2]);
@@ -265,7 +264,7 @@ crate::codegen_tests! {
         let x = Tensor::from_ndarray(&Array4::<f32>::ones((1, 2, 3, 3)));
         let w = Tensor::from_ndarray(&array![[[[2.0f32]]], [[[3.0f32]]]]);
         let result = x.conv2d().weight(&w).groups(2).call().unwrap();
-        let mut result = result.contiguous();
+        let result = result.contiguous();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 2, 3, 3]);
@@ -280,7 +279,7 @@ crate::codegen_tests! {
         let w = Tensor::from_ndarray(&array![[[[1.0f32]]]]);
         let b = Tensor::from_slice([10.0f32]);
         let result = x.conv2d().weight(&w).bias(&b).call().unwrap();
-        let mut result = result.contiguous();
+        let result = result.contiguous();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 1, 2, 2]);
@@ -296,7 +295,7 @@ crate::codegen_tests! {
         let shape = result.shape().unwrap();
         let dims: Vec<usize> = shape.iter().map(|s| s.as_const().unwrap()).collect();
         assert_eq!(dims, vec![1, 1, 3, 3]);
-        let mut result = result.contiguous();
+        let result = result.contiguous();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         // Center element: all 9 values = 9.0
@@ -310,7 +309,7 @@ crate::codegen_tests! {
         let x_data: Vec<f32> = (0..16).map(|v| v as f32).collect();
         let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 1, 4, 4), x_data).unwrap());
         let result = x.avg_pool2d().kernel_size(&[2, 2]).stride(&[2, 2]).call().unwrap();
-        let mut result = result.contiguous();
+        let result = result.contiguous();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 1, 2, 2]);
@@ -330,7 +329,7 @@ crate::codegen_tests! {
             vec![-1.0, 2.0, 3.0, -4.0, 5.0, -6.0, 7.0, 8.0, 9.0, 10.0, -11.0, 12.0, 13.0, -14.0, 15.0, 16.0];
         let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 1, 4, 4), x_data).unwrap());
         let result = x.max_pool2d().kernel_size(&[2, 2]).stride(&[2, 2]).call().unwrap();
-        let mut result = result.contiguous();
+        let result = result.contiguous();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 1, 2, 2]);
@@ -348,7 +347,7 @@ crate::codegen_tests! {
         // Padding should fill with -inf, not 0
         // 3x3 kernel with padding=1 on 3x3 → 3x3, all values are negative
         let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), -5.0f32));
-        let mut result = x.max_pool2d().kernel_size(&[3, 3]).stride(&[1, 1]).padding(&[(1, 1), (1, 1)]).call().unwrap();
+        let result = x.max_pool2d().kernel_size(&[3, 3]).stride(&[1, 1]).padding(&[(1, 1), (1, 1)]).call().unwrap();
         result.realize_with(&config).unwrap();
         let result = result.as_vec::<f32>().unwrap();
         // All outputs should be -5.0 (not 0.0 which would happen with zero padding)
@@ -362,7 +361,7 @@ crate::codegen_tests! {
         // input, so out[i][j] is the element at (min(i, 2) + 2, min(j, 2) + 2).
         let x_data: Vec<f32> = (1..=25).map(|v| v as f32).collect();
         let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 1, 5, 5), x_data).unwrap());
-        let mut result =
+        let result =
             x.max_pool2d().kernel_size(&[5, 5]).stride(&[1, 1]).padding(&[(2, 2), (2, 2)]).call().unwrap();
         result.realize_with(&config).unwrap();
         assert_eq!(get_shape(&result), vec![1, 1, 5, 5]);
@@ -378,7 +377,7 @@ crate::codegen_tests! {
             vec![-1.0, 2.0, 3.0, -4.0, 5.0, -6.0, 7.0, 8.0, 9.0, 10.0, -11.0, 12.0, 13.0, -14.0, 15.0, 16.0];
         let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 1, 4, 4), x_data).unwrap());
         let (values, indices) = x.max_pool2d_with_indices().kernel_size(&[2, 2]).stride(&[2, 2]).call().unwrap();
-        let mut values = values.contiguous();
+        let values = values.contiguous();
         values.realize_with(&config).unwrap();
         let vals = values.array_view::<f32>().unwrap();
         assert_eq!(vals.shape(), &[1, 1, 2, 2]);
@@ -387,7 +386,7 @@ crate::codegen_tests! {
         // Top-right: max(3, -4, 7, 8) = 8 at flat index 7
         assert!((vals[[0, 0, 0, 1]] - 8.0).abs() < 1e-4);
 
-        let mut indices = indices.contiguous();
+        let indices = indices.contiguous();
         indices.realize_with(&config).unwrap();
         let idx = indices.array_view::<i32>().unwrap();
         assert_eq!(idx.shape(), &[1, 1, 2, 2]);
@@ -401,7 +400,7 @@ crate::codegen_tests! {
         // (2, 4), normalize over last axis
         let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]);
         let result = x.layernorm(-1, 1e-5).unwrap();
-        let mut result = result.contiguous();
+        let result = result.contiguous();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[2, 4]);
@@ -421,7 +420,7 @@ crate::codegen_tests! {
         let x_data: Vec<f32> = (0..24).map(|v| v as f32).collect();
         let x = Tensor::from_ndarray(&ndarray::Array3::from_shape_vec((2, 3, 4), x_data).unwrap());
         let result = x.layernorm(-2, 1e-5).unwrap();
-        let mut result = result.contiguous();
+        let result = result.contiguous();
         result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[2, 3, 4]);
@@ -441,14 +440,14 @@ crate::codegen_tests! {
 
     fn test_resize_nearest_upsample(config) {
         let t = Tensor::from_ndarray(&array![[[[1.0f32, 2.0], [3.0, 4.0]]]]);
-        let mut result = t.resize().scales(&[1.0, 1.0, 2.0, 2.0]).mode(ResizeMode::Nearest).call().unwrap();
+        let result = t.resize().scales(&[1.0, 1.0, 2.0, 2.0]).mode(ResizeMode::Nearest).call().unwrap();
         result.realize_with(&config).unwrap();
         assert_eq!(get_shape(&result), vec![1, 1, 4, 4]);
     }
 
     fn test_resize_linear_upsample(config) {
         let t = Tensor::from_ndarray(&array![[[[1.0f32, 2.0], [3.0, 4.0]]]]);
-        let mut result = t.resize().scales(&[1.0, 1.0, 2.0, 2.0]).mode(ResizeMode::Linear).call().unwrap();
+        let result = t.resize().scales(&[1.0, 1.0, 2.0, 2.0]).mode(ResizeMode::Linear).call().unwrap();
         result.realize_with(&config).unwrap();
         assert_eq!(get_shape(&result), vec![1, 1, 4, 4]);
     }
@@ -456,13 +455,13 @@ crate::codegen_tests! {
     fn test_resize_nearest_downsample(config) {
         let x_data: Vec<f32> = (1..=9).map(|v| v as f32).collect();
         let t = Tensor::from_ndarray(&Array4::from_shape_vec((1, 1, 3, 3), x_data).unwrap());
-        let mut result = t.resize().sizes(&[1, 1, 2, 2]).mode(ResizeMode::Nearest).call().unwrap();
+        let result = t.resize().sizes(&[1, 1, 2, 2]).mode(ResizeMode::Nearest).call().unwrap();
         result.realize_with(&config).unwrap();
         assert_eq!(get_shape(&result), vec![1, 1, 2, 2]);
     }
 
     fn test_linspace_basic(config) {
-        let mut t = Tensor::linspace(-1.0, 1.0, 5, svod_dtype::DType::Float32).unwrap();
+        let t = Tensor::linspace(-1.0, 1.0, 5, svod_dtype::DType::Float32).unwrap();
         assert_eq!(get_shape(&t), vec![5]);
         t.realize_with(&config).unwrap();
         let result = t.as_vec::<f32>().unwrap();
@@ -473,7 +472,7 @@ crate::codegen_tests! {
     }
 
     fn test_linspace_single(config) {
-        let mut t = Tensor::linspace(3.0, 7.0, 1, svod_dtype::DType::Float32).unwrap();
+        let t = Tensor::linspace(3.0, 7.0, 1, svod_dtype::DType::Float32).unwrap();
         assert_eq!(get_shape(&t), vec![1], "steps=1 must produce 1-D shape [1]");
         t.realize_with(&config).unwrap();
         let vals = t.as_vec::<f32>().unwrap();
@@ -488,7 +487,7 @@ crate::codegen_tests! {
             [-0.3, -1.5, -0.8],    // sample 1
         ]);
         let target = Tensor::from_slice([0i64, 2]); // class 0 for sample 0, class 2 for sample 1
-        let mut loss = log_probs.nll_loss().target(&target).call().unwrap();
+        let loss = log_probs.nll_loss().target(&target).call().unwrap();
         let val = loss.realize_with_and(&config).as_vec::<f32>().unwrap()[0];
         // NLL = -log_probs[i, target[i]]: sample0=-(-0.5)=0.5, sample1=-(-0.8)=0.8
         // mean = (0.5 + 0.8) / 2 = 0.65
@@ -501,7 +500,7 @@ crate::codegen_tests! {
             [-0.3, -1.5, -0.8],    // sample 1
         ]);
         let target = Tensor::from_slice([0i64, 2]);
-        let mut loss = log_probs.nll_loss().target(&target).reduction(Reduction::None).call().unwrap();
+        let loss = log_probs.nll_loss().target(&target).reduction(Reduction::None).call().unwrap();
         let vals = loss.realize_with_and(&config).as_vec::<f32>().unwrap();
         assert_eq!(vals.len(), 2);
         assert!((vals[0] - 0.5).abs() < 1e-4);
@@ -515,7 +514,7 @@ crate::codegen_tests! {
         ]);
         let target = Tensor::from_slice([0i64, 2]);
         let weight = Tensor::from_slice([2.0f32, 1.0, 3.0]); // class weights
-        let mut loss = log_probs.nll_loss().target(&target).weight(&weight).call().unwrap();
+        let loss = log_probs.nll_loss().target(&target).weight(&weight).call().unwrap();
         let val = loss.realize_with_and(&config).as_vec::<f32>().unwrap()[0];
         // weighted: sample0=0.5*2.0=1.0, sample1=0.8*3.0=2.4
         // mean = (1.0 + 2.4) / (2.0 + 3.0) = 3.4 / 5.0 = 0.68
@@ -529,7 +528,7 @@ crate::codegen_tests! {
         ]);
         let target = Tensor::from_slice([0i64, 2]);
         // Ignore class 2 — sample 1 is masked out
-        let mut loss = log_probs.nll_loss().target(&target).ignore_index(2).call().unwrap();
+        let loss = log_probs.nll_loss().target(&target).ignore_index(2).call().unwrap();
         let val = loss.realize_with_and(&config).as_vec::<f32>().unwrap()[0];
         // Only sample 0 contributes: 0.5 / 1.0 = 0.5
         assert!((val - 0.5).abs() < 1e-4, "got {val}");
@@ -537,7 +536,7 @@ crate::codegen_tests! {
 
     fn test_dropout_inference(config) {
         let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
-        let (mut output, mut mask) = x.dropout().p(0.5).call().unwrap();
+        let (output, mask) = x.dropout().p(0.5).call().unwrap();
         output.realize_with(&config).unwrap();
         assert_eq!(output.as_vec::<f32>().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
         mask.realize_with(&config).unwrap();
@@ -553,10 +552,10 @@ crate::codegen_tests! {
         let b = Tensor::from_slice([0.1f32, 0.2, 0.3]);
 
         let conv = Conv1d::new(w.clone(), Some(b.clone())).with_stride(2).with_padding((1, 1));
-        let mut got = conv.forward(&x).unwrap().contiguous();
+        let got = conv.forward(&x).unwrap().contiguous();
         got.realize_with(&config).unwrap();
 
-        let mut expected =
+        let expected =
             x.conv2d().weight(&w).bias(&b).stride(&[2]).padding(&[(1, 1)]).call().unwrap().contiguous();
         expected.realize_with(&config).unwrap();
 
@@ -569,10 +568,10 @@ crate::codegen_tests! {
         let w = Tensor::from_slice([0.5f32, 0.25]).try_reshape([1isize, 1, 2]).unwrap();
 
         let conv = Conv1d::new(w.clone(), None);
-        let mut got = conv.forward(&x).unwrap().contiguous();
+        let got = conv.forward(&x).unwrap().contiguous();
         got.realize_with(&config).unwrap();
 
-        let mut expected = x.conv2d().weight(&w).call().unwrap().contiguous();
+        let expected = x.conv2d().weight(&w).call().unwrap().contiguous();
         expected.realize_with(&config).unwrap();
 
         assert_eq!(got.as_vec::<f32>().unwrap(), expected.as_vec::<f32>().unwrap());
@@ -598,8 +597,8 @@ crate::codegen_tests! {
         let cell = LSTMCell::new(w_ih.clone(), w_hh.clone(), b_ih.clone(), b_hh.clone());
         assert_eq!(cell.hidden_size(), hidden);
         let (new_h, new_c) = cell.step(&x, &h0, &c0).unwrap();
-        let mut new_h = new_h.contiguous();
-        let mut new_c = new_c.contiguous();
+        let new_h = new_h.contiguous();
+        let new_c = new_c.contiguous();
         new_h.realize_with(&config).unwrap();
         new_c.realize_with(&config).unwrap();
 
@@ -612,10 +611,10 @@ crate::codegen_tests! {
         let f = parts[1].sigmoid().unwrap();
         let g = parts[2].tanh().unwrap();
         let o = parts[3].sigmoid().unwrap();
-        let exp_c = f.try_mul(&c0).unwrap().try_add(&i.try_mul(&g).unwrap()).unwrap();
-        let exp_h = o.try_mul(&exp_c.tanh().unwrap()).unwrap();
-        let mut exp_h = exp_h.contiguous();
-        let mut exp_c = exp_c.contiguous();
+        let exp_c = f.try_mul(&c0).unwrap().try_add(i.try_mul(&g).unwrap()).unwrap();
+        let exp_h = o.try_mul(exp_c.tanh().unwrap()).unwrap();
+        let exp_h = exp_h.contiguous();
+        let exp_c = exp_c.contiguous();
         exp_h.realize_with(&config).unwrap();
         exp_c.realize_with(&config).unwrap();
 
@@ -626,10 +625,10 @@ crate::codegen_tests! {
     fn test_mean_variance_normalize_float16_constant_row(config) {
         // A float16 `eps` is subnormal and flushes to zero, so a constant row
         // divided 0 by 0 and produced NaN; the f32 path returns zeros.
-        let x = Tensor::from_slice(vec![1000.0f32; 512]).try_reshape([1, 512]).unwrap().cast(DType::Float16).unwrap();
+        let x = Tensor::from_slice(vec![1000.0f32; 512]).try_reshape([1, 512]).unwrap().cast(DType::Float16);
         let y = x.mean_variance_normalize(&[1], 1e-5).unwrap();
         assert_eq!(y.uop().dtype(), DType::Float16);
-        let mut y = y.cast(DType::Float32).unwrap();
+        let y = y.cast(DType::Float32);
         let values = y.realize_with_and(&config).as_vec::<f32>().unwrap();
         assert!(values.iter().all(|v| *v == 0.0), "expected zeros, got {:?}", &values[..4]);
     }
@@ -638,11 +637,11 @@ crate::codegen_tests! {
         // Near-constant row: 1000 ± 4 in float16 must track the float32 result.
         let data: Vec<f32> = (0..512).map(|i| if i % 2 == 0 { 1004.0 } else { 996.0 }).collect();
         let x32 = Tensor::from_slice(data).try_reshape([1, 512]).unwrap();
-        let x16 = x32.cast(DType::Float16).unwrap();
+        let x16 = x32.cast(DType::Float16);
 
-        let mut reference = x32.mean_variance_normalize(&[1], 1e-5).unwrap();
+        let reference = x32.mean_variance_normalize(&[1], 1e-5).unwrap();
         let reference = reference.realize_with_and(&config).as_vec::<f32>().unwrap();
-        let mut actual = x16.mean_variance_normalize(&[1], 1e-5).unwrap().cast(DType::Float32).unwrap();
+        let actual = x16.mean_variance_normalize(&[1], 1e-5).unwrap().cast(DType::Float32);
         let actual = actual.realize_with_and(&config).as_vec::<f32>().unwrap();
 
         for (got, expected) in actual.iter().zip(reference.iter()) {
@@ -659,7 +658,7 @@ crate::codegen_tests! {
         let zero_u8 = Tensor::from_slice([0u8]);
 
         let saturated = |b_zero_point: &Tensor| {
-            let mut y = a
+            let y = a
                 .qlinear_matmul()
                 .a_scale(&one)
                 .a_zero_point(&zero_u8)
@@ -683,7 +682,7 @@ crate::codegen_tests! {
         let a = Tensor::from_ndarray(&Array2::from_elem((1, 3), 200u8));
         let b = Tensor::from_ndarray(&Array2::from_elem((3, 1), 1u8));
         let one = Tensor::from_slice([1.0f32]);
-        let mut y = a
+        let y = a
             .qlinear_matmul()
             .a_scale(&one)
             .a_zero_point(&Tensor::from_slice([0u8]))
@@ -704,10 +703,10 @@ crate::codegen_tests! {
             .try_reshape([1, 4])
             .unwrap()
             .cast(DType::Float16)
-            .unwrap();
+            ;
 
         // Reference from the float16-rounded activations, quantized in f32.
-        let mut widened = x.cast(DType::Float32).unwrap();
+        let widened = x.cast(DType::Float32);
         let values = widened.realize_with_and(&config).as_vec::<f32>().unwrap();
         let scale = (values.iter().fold(0.0f32, |acc, v| acc.max(v.abs())) / 127.0).max(1e-6);
         let expected: f32 = values.iter().map(|v| (v / scale).round().clamp(-127.0, 127.0)).sum::<f32>() * scale;
@@ -716,7 +715,7 @@ crate::codegen_tests! {
         let weight_scale = Tensor::from_slice([1.0f32]);
         let output = x.dynamic_quantized_linear().weight(&weight).weight_scale(&weight_scale).call().unwrap();
         assert_eq!(output.uop().dtype(), DType::Float16);
-        let mut output = output.cast(DType::Float32).unwrap();
+        let output = output.cast(DType::Float32);
         let got = output.realize_with_and(&config).as_vec::<f32>().unwrap()[0];
         assert!(got.is_finite(), "float16 activation scale overflowed: {got}");
         assert!((got - expected).abs() <= expected * 2e-2, "got {got}, expected {expected}");
@@ -725,9 +724,9 @@ crate::codegen_tests! {
     fn test_conv2d_int8_promotes_accumulator(config) {
         // 3x3 of 10 convolved with 3x3 of 5 sums to 450 — only representable
         // once the reduction promotes int8 to int32.
-        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 10.0f32)).cast(DType::Int8).unwrap();
-        let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 5.0f32)).cast(DType::Int8).unwrap();
-        let mut result = x.conv2d().weight(&w).call().unwrap().contiguous();
+        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 10.0f32)).cast(DType::Int8);
+        let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 5.0f32)).cast(DType::Int8);
+        let result = x.conv2d().weight(&w).call().unwrap().contiguous();
         result.realize_with(&config).unwrap();
         assert_eq!(result.uop().dtype(), DType::Int32);
         assert_eq!(result.as_vec::<i32>().unwrap(), vec![450]);
@@ -736,9 +735,9 @@ crate::codegen_tests! {
     fn test_conv2d_int8_explicit_acc_dtype_wins(config) {
         // An explicit `acc_dtype` still selects the accumulator (and suppresses
         // promotion) rather than conflicting with it.
-        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 10.0f32)).cast(DType::Int8).unwrap();
-        let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 5.0f32)).cast(DType::Int8).unwrap();
-        let mut result =
+        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 10.0f32)).cast(DType::Int8);
+        let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 5.0f32)).cast(DType::Int8);
+        let result =
             x.conv2d().weight(&w).acc_dtype(DType::Int64).call().unwrap().contiguous();
         result.realize_with(&config).unwrap();
         assert_eq!(result.uop().dtype(), DType::Int64);
@@ -747,15 +746,15 @@ crate::codegen_tests! {
 
     fn test_avg_pool2d_int8_promotes_accumulator(config) {
         // 2x2 window of 100 sums to 400: wraps to -112 (mean -28) in int8.
-        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 100.0f32)).cast(DType::Int8).unwrap();
+        let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 100.0f32)).cast(DType::Int8);
 
         // count_include_pad=false divides two promoted int32 sums.
-        let mut counted = x.avg_pool2d().kernel_size(&[2, 2]).count_include_pad(false).call().unwrap().contiguous();
+        let counted = x.avg_pool2d().kernel_size(&[2, 2]).count_include_pad(false).call().unwrap().contiguous();
         counted.realize_with(&config).unwrap();
         assert_eq!(counted.as_vec::<i32>().unwrap(), vec![100]);
 
         // ceil_mode=true takes the third path (sum / pooled-ones sum).
-        let mut ceil = x
+        let ceil = x
             .avg_pool2d()
             .kernel_size(&[2, 2])
             .count_include_pad(true)
@@ -767,7 +766,7 @@ crate::codegen_tests! {
         assert_eq!(ceil.as_vec::<i32>().unwrap(), vec![100]);
 
         // count_include_pad=true without ceil_mode goes through `mean` (float32).
-        let mut plain = x.avg_pool2d().kernel_size(&[2, 2]).call().unwrap().contiguous();
+        let plain = x.avg_pool2d().kernel_size(&[2, 2]).call().unwrap().contiguous();
         plain.realize_with(&config).unwrap();
         assert_eq!(plain.as_vec::<f32>().unwrap(), vec![100.0]);
     }
@@ -784,8 +783,12 @@ fn test_densenet_two_layer_kernel_count() {
         let var = Tensor::from_slice(vec![1.0f32; ch]);
         let gamma = Tensor::from_slice(vec![1.0f32; ch]);
         let beta = Tensor::from_slice(vec![0.0f32; ch]);
-        let invstd =
-            (&var + Tensor::const_(1e-5f64, svod_dtype::DType::Float32)).try_sqrt().unwrap().reciprocal().unwrap();
+        let invstd = (&var + Tensor::const_(1e-5f64, svod_dtype::DType::Float32))
+            .unwrap()
+            .try_sqrt()
+            .unwrap()
+            .reciprocal()
+            .unwrap();
         (mean, invstd, gamma, beta)
     };
 

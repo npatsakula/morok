@@ -1,9 +1,9 @@
 use svod_dtype::DType;
+use svod_tensor::nn::Module;
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
 use crate::resnet::{OutputMode, ResNet, ResNetConfig, ResNetDepth};
-use crate::state::HasStateDict;
 
 #[test]
 fn feature_channels_matches_depth_expansion() {
@@ -30,13 +30,13 @@ fn state_dict_round_trip_r18_classification() {
         "bn1.weight",
         "bn1.bias",
         "bn1.running_mean",
-        "bn1.invstd",
+        "bn1.running_var",
         "layer1.0.conv1.weight",
         "layer1.0.bn1.weight",
         "layer1.1.conv2.weight",
         "layer2.0.conv1.weight",
         "layer2.0.downsample.0.weight",
-        "layer2.0.downsample.1.invstd",
+        "layer2.0.downsample.1.running_var",
         "layer3.0.downsample.0.weight",
         "layer4.0.downsample.0.weight",
         "layer4.1.bn2.running_mean",
@@ -55,6 +55,20 @@ fn state_dict_round_trip_r18_classification() {
     empty.load_state_dict(&sd, "").expect("load round-trip");
 }
 
+/// A prefix must only prepend: `state_dict("m")` is `state_dict("")` with
+/// `m.` in front of every key, never a segment more or less.
+#[test]
+fn prefixed_state_dict_only_prepends() {
+    let cfg = ResNetConfig::new(ResNetDepth::R18, OutputMode::Classification { num_classes: 10 });
+    let model = ResNet::with_zero_weights(cfg);
+
+    let mut bare: Vec<String> = model.state_dict("").into_keys().map(|k| format!("m.{k}")).collect();
+    let mut nested: Vec<String> = model.state_dict("m").into_keys().collect();
+    bare.sort();
+    nested.sort();
+    assert_eq!(bare, nested);
+}
+
 /// State-dict round-trip on a Bottleneck-stack R50 in Features mode. Asserts
 /// the Bottleneck-specific `conv3`/`bn3` keys are present and the `fc.*` keys
 /// are absent (no head in Features mode).
@@ -70,7 +84,7 @@ fn state_dict_round_trip_r50_features() {
         "bn1.weight",
         "layer1.0.conv1.weight",
         "layer1.0.conv3.weight",
-        "layer1.0.bn3.invstd",
+        "layer1.0.bn3.running_var",
         "layer1.0.downsample.0.weight", // R50 stage1 downsamples (channel expansion).
         "layer2.0.downsample.0.weight",
         "layer4.2.conv3.weight",
@@ -94,17 +108,10 @@ fn forward_zero_weights_shape_check(depth: ResNetDepth, output: OutputMode, expe
     let cfg = ResNetConfig::new(depth, output).with_max_batch_size(1);
     let model = ResNet::with_zero_weights(cfg);
 
-    let images = Tensor::zeros(&[1, 3, 32, 32], DType::Float32).unwrap();
-    let var = Variable::new("b", 1, 1);
-    let b = var.bind(1).unwrap();
+    let images = Tensor::zeros(&[1, 3, 32, 32], DType::Float32);
 
-    let out = model.forward(&images, &b).unwrap();
-    let shape: Vec<usize> = out
-        .shape()
-        .unwrap()
-        .iter()
-        .map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete or symbolic-max shape"))
-        .collect();
+    let out = model.forward(&images).unwrap();
+    let shape = crate::test::max_dims(&out);
     assert_eq!(shape, expected);
 }
 
@@ -130,6 +137,24 @@ fn forward_shape_r50_features() {
     forward_zero_weights_shape_check(ResNetDepth::R50, OutputMode::Features, &[1, 2048, 1, 1]);
 }
 
+/// The batch dimension is symbolic again once the JIT's `batch_var` shrink is
+/// applied to the input: `forward` itself no longer takes a `BoundVariable`,
+/// so this checks that the shrunk extent still propagates end-to-end.
+#[test]
+fn symbolic_batch_propagates_through_the_graph() {
+    let cfg =
+        ResNetConfig::new(ResNetDepth::R18, OutputMode::Classification { num_classes: 10 }).with_max_batch_size(8);
+    let model = ResNet::with_zero_weights(cfg);
+
+    let images = Tensor::zeros(&[8, 3, 32, 32], DType::Float32);
+    let b = Variable::new("b", 1, 8).bind(3).unwrap();
+    let shrunk = svod_tensor::jit::shrink_batch(&images, &b).unwrap();
+
+    let out = model.forward(&shrunk).unwrap();
+    assert_eq!(crate::test::max_dims(&out), vec![8, 10]);
+    assert_eq!(out.shape().unwrap()[0].as_const(), None, "batch dim stayed symbolic");
+}
+
 /// `fc.weight` is `[num_classes, 512 * expansion]`. Catches off-by-one in the
 /// stage4→head arithmetic for every depth.
 #[test_case(ResNetDepth::R18,  512;  "r18")]
@@ -143,11 +168,11 @@ fn head_dimensions_per_depth(depth: ResNetDepth, expected_in: usize) {
 
     let sd = model.state_dict("");
     let fc_w = sd.get("fc.weight").expect("fc.weight present in classification mode");
-    let shape: Vec<usize> = fc_w.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let shape = fc_w.dims().unwrap();
     assert_eq!(shape, vec![1000, expected_in]);
 
     let fc_b = sd.get("fc.bias").unwrap();
-    let bias_shape: Vec<usize> = fc_b.shape().unwrap().iter().map(|s| s.as_const().unwrap()).collect();
+    let bias_shape = fc_b.dims().unwrap();
     assert_eq!(bias_shape, vec![1000]);
 }
 
@@ -160,21 +185,18 @@ fn head_dimensions_per_depth(depth: ResNetDepth, expected_in: usize) {
 #[ignore = "heavy: full ResNet-18 graph compile through the CPU backend"]
 fn features_r18_returns_512_channel_map() {
     use svod_dtype::DType;
-    use svod_tensor::{Tensor, Variable};
+    use svod_tensor::Tensor;
 
     let max_batch = 1;
     let config = ResNetConfig::new(ResNetDepth::R18, OutputMode::Features).with_max_batch_size(max_batch);
     let model = ResNet::with_zero_weights(config);
 
-    let images = Tensor::zeros(&[max_batch, 3, 32, 32], DType::Float32).unwrap();
-    let var = Variable::new("b", 1, max_batch as i64);
-    let b1 = var.bind(1).unwrap();
+    let images = Tensor::zeros(&[max_batch, 3, 32, 32], DType::Float32);
 
-    let mut out = model.forward(&images, &b1).unwrap();
+    let out = model.forward(&images).unwrap();
     out.realize().unwrap();
 
-    let shape: Vec<usize> =
-        out.shape().unwrap().iter().map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete dim")).collect();
+    let shape = crate::test::max_dims(&out);
     assert_eq!(shape, vec![1, 512, 1, 1]);
 }
 
@@ -182,20 +204,17 @@ fn features_r18_returns_512_channel_map() {
 #[ignore = "heavy: full ResNet-50 graph compile through the CPU backend"]
 fn features_r50_returns_2048_channel_map() {
     use svod_dtype::DType;
-    use svod_tensor::{Tensor, Variable};
+    use svod_tensor::Tensor;
 
     let max_batch = 1;
     let config = ResNetConfig::new(ResNetDepth::R50, OutputMode::Features).with_max_batch_size(max_batch);
     let model = ResNet::with_zero_weights(config);
 
-    let images = Tensor::zeros(&[max_batch, 3, 32, 32], DType::Float32).unwrap();
-    let var = Variable::new("b", 1, max_batch as i64);
-    let b1 = var.bind(1).unwrap();
+    let images = Tensor::zeros(&[max_batch, 3, 32, 32], DType::Float32);
 
-    let mut out = model.forward(&images, &b1).unwrap();
+    let out = model.forward(&images).unwrap();
     out.realize().unwrap();
 
-    let shape: Vec<usize> =
-        out.shape().unwrap().iter().map(|s| s.as_const().or_else(|| s.vmax()).expect("concrete dim")).collect();
+    let shape = crate::test::max_dims(&out);
     assert_eq!(shape, vec![1, 2048, 1, 1]);
 }

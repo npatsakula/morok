@@ -4,8 +4,6 @@
 //! intermediates that downstream segmentation heads consume via a
 //! per-layer-weighted sum.
 
-extern crate self as svod_model;
-
 use svod_macros::jit_wrapper;
 
 use super::model::WavLm;
@@ -14,12 +12,11 @@ jit_wrapper! {
     WavLmJit(WavLm) {
         waveform: Tensor,
 
-        vars {
-            b: (1, model.config.max_batch_size),
-        }
+        batch_var b: (1, model.config.max_batch_size),
+        outputs { features }
 
-        build(waveform, b) {
-            model.extract_features_stacked_batch(waveform, &b)
+        build(waveform) {
+            model.extract_features_stacked(waveform)
         }
     }
 }

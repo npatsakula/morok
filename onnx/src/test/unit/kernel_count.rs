@@ -14,12 +14,7 @@ fn count_kernels(model_path: &Path) -> usize {
     let result = importer.import(model_path, &[]).unwrap();
 
     for (name, input_tensor) in &result.inputs {
-        let shape: Vec<usize> = input_tensor
-            .shape()
-            .unwrap_or_else(|e| panic!("input '{name}' shape: {e}"))
-            .iter()
-            .map(|d| d.as_const().unwrap_or_else(|| panic!("dynamic dim in '{name}'")))
-            .collect();
+        let shape = input_tensor.dims().unwrap_or_else(|e| panic!("input '{name}' shape: {e}"));
         let n: usize = shape.iter().product();
         let data: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
         let real_tensor =
@@ -29,8 +24,8 @@ fn count_kernels(model_path: &Path) -> usize {
     }
 
     let config = PrepareConfig::for_cpu_backend(CpuBackend::Clang);
-    let mut outputs: Vec<Tensor> = result.outputs.values().cloned().collect();
-    let plan = Tensor::prepare_batch_with(outputs.iter_mut(), &config).unwrap();
+    let outputs: Vec<Tensor> = result.outputs.values().cloned().collect();
+    let plan = Tensor::prepare_batch_with(outputs.iter(), &config).unwrap();
     plan.prepared_kernels().len()
 }
 

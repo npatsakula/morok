@@ -32,10 +32,10 @@ fn window_set_per_layer_kind() {
 fn attention_weight_shapes() {
     let cfg = test_cfg();
     let attn = ModernBertAttention::empty(cfg.hidden_size, cfg.num_attention_heads, cfg.head_dim(), None, cfg.dtype);
-    let qkv = attn.qkv_weight.shape().unwrap();
-    let out = attn.out_weight.shape().unwrap();
-    assert_eq!(qkv[0].as_const().unwrap(), 3 * cfg.hidden_size);
-    assert_eq!(qkv[1].as_const().unwrap(), cfg.hidden_size);
-    assert_eq!(out[0].as_const().unwrap(), cfg.hidden_size);
-    assert_eq!(out[1].as_const().unwrap(), cfg.hidden_size);
+    let qkv = attn.qkv_weight.dims().unwrap();
+    let out = attn.out_weight.dims().unwrap();
+    assert_eq!(qkv[0], 3 * cfg.hidden_size);
+    assert_eq!(qkv[1], cfg.hidden_size);
+    assert_eq!(out[0], cfg.hidden_size);
+    assert_eq!(out[1], cfg.hidden_size);
 }

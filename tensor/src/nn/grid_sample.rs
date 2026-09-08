@@ -85,7 +85,7 @@ impl Tensor {
         for g in mesh.iter().rev() {
             components.push(g.try_reshape(flat_shape)?);
         }
-        components.push(Tensor::full(&[total_elements], 1.0, DType::Float32)?);
+        components.push(Tensor::full(&[total_elements], 1.0, DType::Float32));
 
         let comp_refs: Vec<&Tensor> = components.iter().collect();
         let base_grid = Tensor::cat(&comp_refs, 0)?
@@ -246,15 +246,15 @@ fn gs_denormalize(coord: &Tensor, dim_size: usize, align_corners: bool, dtype: &
     if align_corners {
         // x = (n + 1) / 2 * (dim_size - 1)
         coord
-            .try_add(&Tensor::const_(1.0, dtype.clone()))?
-            .try_mul(&Tensor::const_(0.5 * (dim_size - 1) as f64, dtype.clone()))
+            .try_add(Tensor::const_(1.0, dtype.clone()))?
+            .try_mul(Tensor::const_(0.5 * (dim_size - 1) as f64, dtype.clone()))
     } else {
         // x = ((n + 1) * dim_size - 1) / 2
         coord
-            .try_add(&Tensor::const_(1.0, dtype.clone()))?
-            .try_mul(&Tensor::const_(dim_size as f64, dtype.clone()))?
-            .try_sub(&Tensor::const_(1.0, dtype.clone()))?
-            .try_mul(&Tensor::const_(0.5, dtype.clone()))
+            .try_add(Tensor::const_(1.0, dtype.clone()))?
+            .try_mul(Tensor::const_(dim_size as f64, dtype.clone()))?
+            .try_sub(Tensor::const_(1.0, dtype.clone()))?
+            .try_mul(Tensor::const_(0.5, dtype.clone()))
     }
 }
 
@@ -271,7 +271,7 @@ fn gs_reflect(coord: &Tensor, dim_size: usize, align_corners: bool, dtype: &DTyp
 
     // Shift to [0, 2*rng) via positive modulo
     let shifted = coord.try_sub(&lo_t)?;
-    let t = shifted.try_sub(&shifted.try_div(&period_t)?.floor()?.try_mul(&period_t)?)?;
+    let t = shifted.try_sub(&shifted.try_div(&period_t)?.floor().try_mul(&period_t)?)?;
 
     // Reflect: if t > rng → 2*rng - t, else t
     let two_rng_t = Tensor::const_(2.0 * rng, dtype.clone());
@@ -297,9 +297,9 @@ fn build_flat_index(
         if padding_mode == GridSamplePaddingMode::Zeros {
             let zero_i = Tensor::const_(ConstValue::Int(0), DType::Int32);
             let max_i = Tensor::const_(ConstValue::Int(spatial[i] as i64), DType::Int32);
-            let v = idx.try_ge(&zero_i)?.bitwise_and(&idx.try_lt(&max_i)?)?;
+            let v = idx.try_ge(&zero_i)?.try_bitand(&idx.try_lt(&max_i)?)?;
             valid_mask = Some(match valid_mask {
-                Some(m) => m.bitwise_and(&v)?,
+                Some(m) => m.try_bitand(&v)?,
                 None => v,
             });
         }
@@ -330,7 +330,7 @@ fn gather_and_mask(
     let mut gathered = x_flat.gather(2, &expanded_idx)?;
     if let Some(mask) = valid_mask {
         let mask = mask.try_unsqueeze(1)?.try_expand([n as isize, c as isize, out_prod as isize])?;
-        gathered = gathered.try_mul(&mask.cast(dtype.clone())?)?;
+        gathered = gathered.try_mul(mask.cast(dtype.clone()))?;
     }
     Ok(gathered)
 }
@@ -348,7 +348,7 @@ fn interpolate_nearest(
     dtype: &DType,
 ) -> Result<Tensor> {
     // ONNX uses np.rint (round to nearest even); Tensor::round() implements this.
-    let rounded: Vec<Tensor> = coords.iter().map(|c| c.round()?.cast(DType::Int32)).collect::<Result<_>>()?;
+    let rounded: Vec<Tensor> = coords.iter().map(|c| c.round().cast(DType::Int32)).collect();
     let (flat_idx, valid_mask) = build_flat_index(&rounded, spatial, strides, padding_mode)?;
     gather_and_mask(x_flat, &flat_idx, valid_mask.as_ref(), n, c, out_prod, dtype)
 }
@@ -366,7 +366,7 @@ fn interpolate_linear(
     dtype: &DType,
 ) -> Result<Tensor> {
     let n_spatial = coords.len();
-    let floors: Vec<Tensor> = coords.iter().map(|c| c.floor()).collect::<Result<_>>()?;
+    let floors: Vec<Tensor> = coords.iter().map(|c| c.floor()).collect();
     let fracs: Vec<Tensor> = coords.iter().zip(&floors).map(|(c, f)| c.try_sub(f)).collect::<Result<_>>()?;
 
     // 2^n_spatial corners
@@ -380,10 +380,10 @@ fn interpolate_linear(
         for i in 0..n_spatial {
             let use_ceil = (combo >> i) & 1 == 1;
             let idx_f =
-                if use_ceil { floors[i].try_add(&Tensor::const_(1.0, dtype.clone()))? } else { floors[i].clone() };
+                if use_ceil { floors[i].try_add(Tensor::const_(1.0, dtype.clone()))? } else { floors[i].clone() };
             let w = if use_ceil { fracs[i].clone() } else { Tensor::const_(1.0, dtype.clone()).try_sub(&fracs[i])? };
             weight = weight.try_mul(&w)?;
-            corner_indices.push(idx_f.cast(DType::Int32)?);
+            corner_indices.push(idx_f.cast(DType::Int32));
         }
 
         let (flat_idx, valid_mask) = build_flat_index(&corner_indices, spatial, strides, padding_mode)?;
@@ -409,7 +409,7 @@ fn interpolate_cubic(
     dtype: &DType,
 ) -> Result<Tensor> {
     let n_spatial = coords.len();
-    let floors: Vec<Tensor> = coords.iter().map(|c| c.floor()).collect::<Result<_>>()?;
+    let floors: Vec<Tensor> = coords.iter().map(|c| c.floor()).collect();
     let fracs: Vec<Tensor> = coords.iter().zip(&floors).map(|(c, f)| c.try_sub(f)).collect::<Result<_>>()?;
 
     // Cubic coefficients for each spatial dim (4 weights per dim)
@@ -427,9 +427,9 @@ fn interpolate_cubic(
             let offset_idx = (combo / 4usize.pow(i as u32)) % 4;
             let offset = offset_idx as f64 - 1.0; // -1, 0, 1, 2
 
-            let idx_f = floors[i].try_add(&Tensor::const_(offset, dtype.clone()))?;
+            let idx_f = floors[i].try_add(Tensor::const_(offset, dtype.clone()))?;
             weight = weight.try_mul(&coeffs[i][offset_idx])?;
-            corner_indices.push(idx_f.cast(DType::Int32)?);
+            corner_indices.push(idx_f.cast(DType::Int32));
         }
 
         let (flat_idx, valid_mask) = build_flat_index(&corner_indices, spatial, strides, padding_mode)?;
@@ -452,18 +452,18 @@ fn gs_cubic_coeffs(s: &Tensor, a: f64, dtype: &DType) -> Result<[Tensor; 4]> {
     // c0 = ((a*(s+1) - 5a)*(s+1) + 8a)*(s+1) - 4a
     let sp1 = s.try_add(&one)?;
     let c0 = sp1
-        .try_mul(&Tensor::const_(a, dtype.clone()))?
-        .try_sub(&Tensor::const_(5.0 * a, dtype.clone()))?
+        .try_mul(Tensor::const_(a, dtype.clone()))?
+        .try_sub(Tensor::const_(5.0 * a, dtype.clone()))?
         .try_mul(&sp1)?
-        .try_add(&Tensor::const_(8.0 * a, dtype.clone()))?
+        .try_add(Tensor::const_(8.0 * a, dtype.clone()))?
         .try_mul(&sp1)?
-        .try_sub(&Tensor::const_(4.0 * a, dtype.clone()))?;
+        .try_sub(Tensor::const_(4.0 * a, dtype.clone()))?;
 
     // c1: |x| = s (center-left)
     // c1 = ((a+2)*s - (a+3))*s*s + 1
     let c1 = s
-        .try_mul(&Tensor::const_(a + 2.0, dtype.clone()))?
-        .try_sub(&Tensor::const_(a + 3.0, dtype.clone()))?
+        .try_mul(Tensor::const_(a + 2.0, dtype.clone()))?
+        .try_sub(Tensor::const_(a + 3.0, dtype.clone()))?
         .try_mul(s)?
         .try_mul(s)?
         .try_add(&one)?;
@@ -471,21 +471,21 @@ fn gs_cubic_coeffs(s: &Tensor, a: f64, dtype: &DType) -> Result<[Tensor; 4]> {
     // c2: |x| = 1-s (center-right)
     let sm1 = one.try_sub(s)?;
     let c2 = sm1
-        .try_mul(&Tensor::const_(a + 2.0, dtype.clone()))?
-        .try_sub(&Tensor::const_(a + 3.0, dtype.clone()))?
+        .try_mul(Tensor::const_(a + 2.0, dtype.clone()))?
+        .try_sub(Tensor::const_(a + 3.0, dtype.clone()))?
         .try_mul(&sm1)?
         .try_mul(&sm1)?
-        .try_add(&Tensor::const_(1.0, dtype.clone()))?;
+        .try_add(Tensor::const_(1.0, dtype.clone()))?;
 
     // c3: |x| = 2-s (far neighbor)
     let sm2 = two.try_sub(s)?;
     let c3 = sm2
-        .try_mul(&Tensor::const_(a, dtype.clone()))?
-        .try_sub(&Tensor::const_(5.0 * a, dtype.clone()))?
+        .try_mul(Tensor::const_(a, dtype.clone()))?
+        .try_sub(Tensor::const_(5.0 * a, dtype.clone()))?
         .try_mul(&sm2)?
-        .try_add(&Tensor::const_(8.0 * a, dtype.clone()))?
+        .try_add(Tensor::const_(8.0 * a, dtype.clone()))?
         .try_mul(&sm2)?
-        .try_sub(&Tensor::const_(4.0 * a, dtype.clone()))?;
+        .try_sub(Tensor::const_(4.0 * a, dtype.clone()))?;
 
     Ok([c0, c1, c2, c3])
 }

@@ -43,10 +43,10 @@ use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
-    let OnnxModel { mut outputs, .. } = importer.import("model.onnx", &[])?;
+    let OnnxModel { outputs, .. } = importer.import("model.onnx", &[])?;
 
     // Подготавливаем все выходы вместе, выполняем за один проход
-    let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    let outs: Vec<&Tensor> = outputs.values().collect();
     Tensor::realize_batch(outs)?;
 
     for (name, tensor) in &outputs {
@@ -66,7 +66,7 @@ use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
-    let OnnxModel { mut inputs, mut outputs, .. } = importer.import("model.onnx", &[])?;
+    let OnnxModel { mut inputs, outputs, .. } = importer.import("model.onnx", &[])?;
 
     // Назначаем входные данные (лениво — без аллокации)
     let input = inputs.remove("input").unwrap();
@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Подготавливаем все выходы вместе, выполняем за один проход
     // (внутренне резолвит assign входов — отдельный realize не нужен)
-    let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    let outs: Vec<&Tensor> = outputs.values().collect();
     Tensor::realize_batch(outs)?;
     Ok(())
 }
@@ -125,14 +125,14 @@ x.conv()
     .call()?
 ```
 
-**Многошаговые декомпозиции** — операторы вроде BatchNormalization, Attention и Mod требуют промежуточных вычислений. Например, целочисленный `Mod` в стиле Python раскладывается на truncation mod + поправку знака:
+**Многошаговые декомпозиции** — операторы вроде BatchNormalization, Attention и Mod требуют промежуточных вычислений. `Mod` выбирает одну из четырёх декомпозиций по атрибуту `fmod` и типу входа; ветка для чисел с плавающей точкой в стиле Python — это `x - floor(x / y) * y`:
 
 ```rust
-let trunc_mod = x.try_mod(y)?;
-let signs_differ = trunc_mod.bitwise_xor(y)?.try_lt(&zero)?;
-let needs_adj = mod_ne_zero.bitwise_and(&signs_differ)?;
-trunc_mod.try_add(&y.where_(&needs_adj, &zero)?)?
+let div = x.try_div(y)?;
+x.try_sub(&div.floor().try_mul(y)?)?
 ```
+
+Обратите внимание на `floor()` — без `?`. Унарные операции округления (`floor`, `ceil`, `round`, `trunc`), а также `cast`, `neg`, `abs`, `square` и `sign` не могут завершиться ошибкой и возвращают обычный `Tensor`. Побитовые операторы, которые используют `BitwiseAnd`/`Or`/`Xor` и `BitShift`, — это `try_bitand`, `try_bitor`, `try_bitxor`, `try_shl` и `try_shr` (доступны также как `&`, `|`, `^`, `<<`, `>>`, возвращающие `Result<Tensor>`).
 
 ### Валидация атрибутов
 
@@ -221,6 +221,8 @@ ONNX:    if condition { then_branch } else { else_branch }
 Svod:   then_result.where_(&condition, &else_result)
 ```
 
+`where_` читается как «оставить `self` там, где условие выполняется»; `condition.select(&then_result, &else_result)` — та же операция, записанная со стороны маски, и любая из веток может быть просто скаляром.
+
 Это даёт подход **«трассируй один раз — запускай многократно»** — скомпилированный граф обрабатывает любое значение условия в рантайме. Но есть жёсткое ограничение: **обе ветки должны возвращать одинаковые формы и типы данных.** Модели с shape-полиморфными ветками (then-ветка возвращает `[3, 4]`, а else-ветка — `[5, 6]`) трассировать нельзя.
 
 На практике большинство ONNX-моделей с узлами `If` укладываются в это ограничение — условная логика в них выбирает значения, а не меняет форму данных.
@@ -236,7 +238,7 @@ Svod:   then_result.where_(&condition, &else_result)
 
 ```rust
 // Realize all outputs at once (shares compilation and execution)
-let outputs: Vec<&mut Tensor> = model.outputs.values_mut().collect();
+let outputs: Vec<&Tensor> = model.outputs.values().collect();
 Tensor::realize_batch(outputs)?;
 ```
 
@@ -244,7 +246,7 @@ Tensor::realize_batch(outputs)?;
 `tensor/src/test/unit/variable.rs::test_prepare_execute_loop`):
 
 ```rust
-let OnnxModel { mut inputs, mut outputs, variables } =
+let OnnxModel { mut inputs, outputs, variables } =
     importer.import("model.onnx", &[("batch", 1)])?;
 
 // 1. Assign initial data (lazy — no allocation yet)
@@ -252,7 +254,7 @@ let input = inputs.remove("audio").unwrap();
 input.assign(&Tensor::from_slice(&first_frame));
 
 // 2. Compile the execution plan (resolves assigns, allocates buffers)
-let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+let outs: Vec<&Tensor> = outputs.values().collect();
 let mut plan = Tensor::prepare_batch(outs)?;
 plan.execute()?;  // first run
 
@@ -278,7 +280,7 @@ plan.execute_with_vars(&[bound.as_var_val()])?;
 | Квантизация | DequantizeLinear, QuantizeLinear | Нужна поддержка квантизованных типов в IR |
 | Операции с последовательностями | SequenceConstruct, SequenceAt | Нетензорные типы не входят в систему типов Svod |
 | Случайные числа | RandomNormal, RandomUniform | Stateful RNG пока не реализован |
-| Обработка сигналов | DFT, STFT, MelWeightMatrix | Низкий приоритет; узкоспециализированные задачи |
+| Обработка сигналов | DFT, STFT, MelWeightMatrix | Не подключены к импортёру (в самом крейте tensor есть `stft` / `istft`) |
 | Текст | StringNormalizer, TfIdfVectorizer | Строковые типы не поддерживаются |
 
 Для моделей с такими операторами используйте `ort` (обёртку над ONNX Runtime) — она покрывает полную спецификацию.
@@ -306,7 +308,8 @@ let model = importer.import("model.onnx", &[])?;
 
 println!("Inputs:");
 for (name, tensor) in &model.inputs {
-    println!("  {name}: {:?}", tensor.shape());
+    // Debug у Tensor печатает форму, dtype, устройство и признак реализованности
+    println!("  {name}: {tensor:?}");
 }
 
 println!("Outputs: {:?}", model.outputs.keys().collect::<Vec<_>>());

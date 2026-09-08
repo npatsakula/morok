@@ -15,9 +15,6 @@ mod head;
 mod jit;
 mod mlp;
 mod model;
-mod normalization;
-mod pooling;
-mod rotary;
 
 pub use attention::ModernBertAttention;
 pub use config::ModernBertConfig;
@@ -28,6 +25,3 @@ pub use head::{MlmHead, ModernBertForMaskedLm};
 pub use jit::{ModernBertJit, ModernBertMlmJit};
 pub use mlp::ModernBertGlu;
 pub use model::ModernBert;
-pub use normalization::LayerNormWeights;
-pub use pooling::{cls, masked_mean};
-pub use rotary::RotaryTable;

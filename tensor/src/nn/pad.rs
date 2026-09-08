@@ -135,7 +135,7 @@ impl Tensor {
     /// ```
     /// # use svod_tensor::Tensor;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    /// let mut y = x.try_pad_value(&[(1, 1)], 0.0).unwrap();
+    /// let y = x.try_pad_value(&[(1, 1)], 0.0).unwrap();
     /// y.realize().unwrap();
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0, 0.0]);
     /// ```
@@ -145,7 +145,7 @@ impl Tensor {
     /// ```
     /// # use svod_tensor::Tensor;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    /// let mut y = x.try_pad_value(&[(1, 0)], f64::NEG_INFINITY).unwrap();
+    /// let y = x.try_pad_value(&[(1, 0)], f64::NEG_INFINITY).unwrap();
     /// y.realize().unwrap();
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![f32::NEG_INFINITY, 1.0, 2.0, 3.0]);
     /// ```
@@ -207,7 +207,7 @@ impl Tensor {
     /// ```
     /// # use svod_tensor::Tensor;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    /// let mut y = x.pad_with().padding(&[(1, 1)]).call().unwrap();
+    /// let y = x.pad_with().padding(&[(1, 1)]).call().unwrap();
     /// y.realize().unwrap();
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0, 0.0]);
     /// ```
@@ -217,7 +217,7 @@ impl Tensor {
     /// ```
     /// # use svod_tensor::Tensor;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    /// let mut y = x.pad_with().padding(&[(1, 1)]).value(-f64::INFINITY).call().unwrap();
+    /// let y = x.pad_with().padding(&[(1, 1)]).value(-f64::INFINITY).call().unwrap();
     /// y.realize().unwrap();
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![f32::NEG_INFINITY, 1.0, 2.0, 3.0, f32::NEG_INFINITY]);
     /// ```
@@ -228,7 +228,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use svod_tensor::nn::PadMode;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    /// let mut y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Replicate).call().unwrap();
+    /// let y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Replicate).call().unwrap();
     /// y.realize().unwrap();
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0, 1.0, 1.0, 2.0, 3.0, 3.0, 3.0]);
     /// ```
@@ -239,7 +239,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use svod_tensor::nn::PadMode;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    /// let mut y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Reflect).call().unwrap();
+    /// let y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Reflect).call().unwrap();
     /// y.realize().unwrap();
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![3.0, 2.0, 1.0, 2.0, 3.0, 2.0, 1.0]);
     /// ```
@@ -250,7 +250,7 @@ impl Tensor {
     /// # use svod_tensor::Tensor;
     /// # use svod_tensor::nn::PadMode;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    /// let mut y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Circular).call().unwrap();
+    /// let y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Circular).call().unwrap();
     /// y.realize().unwrap();
     /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]);
     /// ```

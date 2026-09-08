@@ -1,5 +1,5 @@
-use crate::state::HasStateDict;
 use crate::wespeaker::{WeSpeakerConfig, WeSpeakerResNet34};
+use svod_tensor::nn::Module;
 
 /// State-dict round-trip: `with_zero_weights` produces a model whose
 /// `state_dict()` keys cover every layer the loader expects, and
@@ -17,12 +17,12 @@ fn state_dict_round_trip() {
         "bn1.weight",
         "bn1.bias",
         "bn1.running_mean",
-        "bn1.invstd",
+        "bn1.running_var",
         "layer1.0.conv1.weight",
         "layer1.0.bn1.weight",
         "layer1.2.conv2.weight",
         "layer2.0.downsample.0.weight",
-        "layer2.0.downsample.1.invstd",
+        "layer2.0.downsample.1.running_var",
         "layer3.0.downsample.0.weight",
         "layer4.0.downsample.0.weight",
         "layer4.2.bn2.weight",
@@ -56,10 +56,10 @@ fn shapes_match_pyannote_reference() {
     let sd = model.state_dict("");
 
     let seg_w = sd.get("seg_1.weight").unwrap();
-    let shape: Vec<usize> = seg_w.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let shape = seg_w.dims().unwrap();
     assert_eq!(shape, vec![256, 5120], "seg_1 weight must be (embed_dim=256, stats_dim*2=5120)");
 
     let seg_b = sd.get("seg_1.bias").unwrap();
-    let bias_shape: Vec<usize> = seg_b.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let bias_shape = seg_b.dims().unwrap();
     assert_eq!(bias_shape, vec![256]);
 }
