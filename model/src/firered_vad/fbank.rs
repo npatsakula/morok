@@ -3,32 +3,27 @@
 //! `snip_edges`, `dither = 0`, 80 bins): per-frame DC removal, per-frame
 //! pre-emphasis 0.97, Povey window, power spectrum over a 512-point FFT,
 //! triangular mel bins on `1127·ln(1 + f/700)` between 20 Hz and Nyquist,
-//! natural log floored at `f32::EPSILON` — in the graph, on
-//! [`Tensor::stft_padded`].
+//! natural log floored at `f32::EPSILON` — [`Tensor::mel_spectrogram`] with
+//! its Kaldi options (`preemphasis`, `remove_dc`, Kaldi's own `filterbank`).
 //!
-//! Everything before the power spectrum is linear in the frame, so Kaldi's
-//! per-frame chain folds onto a signal-level STFT:
-//!
-//! - the Povey window's leading weight is zero, so per-frame pre-emphasis,
-//!   whose first sample is special-cased, equals signal-level
-//!   `x[n] - 0.97·x[n - 1]` under the window;
-//! - removing a frame's mean `m` before pre-emphasis subtracts the constant
-//!   `(1 - 0.97)·m` from every emphasized sample, and
-//!   `DFT(w·(y - c)) = DFT(w·y) - c·DFT(w)`: the means come from a box
-//!   convolution at the frame stride, `0.03·DFT(w)` is a host constant.
-//!
+//! Kaldi left-aligns its 400-sample window in the 512-point frame, where the
+//! transform centers a short window [`CENTERING`] samples in; prepending that
+//! many zeros to the signal makes the centered placement read Kaldi's frames.
 //! `snip_edges` is `center = false` with Kaldi's frame count, which is the
 //! convolution's: `1 + (L - 400) / 160`.
 
 use svod_dtype::DType;
 use svod_macros::jit_wrapper;
-use svod_tensor::nn::Window;
+use svod_tensor::nn::{MelLog, Window};
 use svod_tensor::{PrepareConfig, Tensor};
 
 use super::{FRAME_LENGTH, FRAME_SHIFT, N_MELS};
 use crate::jit::InputSpec;
 
 const N_FFT: usize = 512; // next power of two >= FRAME_LENGTH
+const N_BINS: usize = N_FFT / 2 + 1;
+/// Where the transform places a `FRAME_LENGTH` window inside an `N_FFT` frame.
+const CENTERING: usize = (N_FFT - FRAME_LENGTH) / 2;
 const LOW_FREQ: f64 = 20.0;
 const SAMPLE_RATE: f64 = 16_000.0;
 /// Kaldi reads 16-bit PCM without normalization; Svod waveforms are `[-1, 1]`.
@@ -39,17 +34,16 @@ const PREEMPH: f64 = 0.97;
 /// pre-CMVN log-mel rows, `T = 1 + (L - FRAME_LENGTH) / FRAME_SHIFT`.
 #[derive(Clone)]
 pub struct KaldiFbank {
-    /// Kaldi's symmetric Povey window, zero-padded to `N_FFT` — the analysis
-    /// window in full, so the frames start where Kaldi's do rather than
-    /// centered in the FFT as torch places a short window.
+    /// Kaldi's symmetric Povey window.
     window: Vec<f32>,
+    /// Kaldi's `[N_MELS, N_BINS]` mel banks.
+    banks: Vec<f32>,
 }
 
 impl KaldiFbank {
     pub fn new() -> svod_tensor::error::Result<Self> {
-        let mut window = Tensor::window(&Window::Povey, FRAME_LENGTH, false, DType::Float32)?.to_vec::<f32>()?;
-        window.resize(N_FFT, 0.0);
-        Ok(Self { window })
+        let window = Tensor::window(&Window::Povey, FRAME_LENGTH, false, DType::Float32)?.to_vec::<f32>()?;
+        Ok(Self { window, banks: kaldi_mel_banks() })
     }
 
     /// `snip_edges` frame count: only complete 25 ms windows produce a frame.
@@ -65,70 +59,42 @@ impl KaldiFbank {
 
     /// `[B, L]` -> `[B, T, N_MELS]`, `L` covering [`samples`](Self::samples)`(T)`.
     pub fn forward_tensor(&self, samples: &Tensor) -> svod_tensor::error::Result<Tensor> {
-        let len = samples.dim_const(-1)?;
-        let previous = samples.try_pad(&[(0, 0), (1, 0)])?.narrow(-1, 0_usize, len)?;
-        let emphasized = samples.try_sub(&previous.try_mul(PREEMPH)?)?.try_mul(INT16_SCALE)?.contiguous();
-        let (spec, _, frames) = emphasized
-            .stft_padded()
+        let banks = Tensor::from_slice(self.banks.clone()).try_reshape([N_MELS as isize, N_BINS as isize])?;
+        samples
+            .try_mul(INT16_SCALE)?
+            .try_pad(&[(0, 0), (CENTERING as isize, 0)])?
+            .mel_spectrogram()
             .n_fft(N_FFT)
             .hop(FRAME_SHIFT)
+            .win_length(FRAME_LENGTH)
             .window(Window::Custom(Tensor::from_slice(self.window.clone())))
             .center(false)
-            .call()?;
-        let (bins, padded_frames) = (spec.dim_const(1)?, spec.dim_const(2)?);
-
-        // Frame means at the frame stride, padded to the STFT's frame count.
-        let box_kernel = Tensor::from_slice(vec![(INT16_SCALE / FRAME_LENGTH as f64) as f32; FRAME_LENGTH])
-            .try_reshape([1, 1, FRAME_LENGTH as isize])?;
-        let mean = samples.try_unsqueeze(1)?.conv1d().weight(&box_kernel).stride(FRAME_SHIFT).call()?;
-        let mean = mean
-            .narrow(-1, 0_usize, frames)?
-            .try_pad(&[(0, 0), (0, 0), (0, (padded_frames - frames) as isize)])?
-            .try_unsqueeze(-1)?;
-        let dc = Tensor::from_slice(self.window_dft(bins)).try_reshape([bins as isize, 1, 2])?;
-        let power = spec.try_sub(&mean.try_mul(&dc)?)?.power()?;
-
-        let banks = Tensor::from_slice(kaldi_mel_banks(bins)).try_reshape([bins as isize, N_MELS as isize])?;
-        let mel = power.try_transpose(-1, -2)?.matmul(&banks)?.maximum(f32::EPSILON as f64)?.try_log()?;
-        mel.narrow(1, 0_usize, frames)
-    }
-
-    /// `(1 - PREEMPH)·DFT(window)` as `[bins, 2]` `(re, im)` rows, zero past
-    /// the one-sided bins — the analysis kernel's own sign convention.
-    fn window_dft(&self, bins: usize) -> Vec<f32> {
-        let mut table = vec![0f32; bins * 2];
-        for k in 0..N_FFT / 2 + 1 {
-            let (re, im) = (0..N_FFT).fold((0.0, 0.0), |(re, im), n| {
-                let angle = std::f64::consts::TAU * ((k * n) % N_FFT) as f64 / N_FFT as f64;
-                let w = f64::from(self.window[n]);
-                (re + w * angle.cos(), im - w * angle.sin())
-            });
-            table[2 * k] = ((1.0 - PREEMPH) * re) as f32;
-            table[2 * k + 1] = ((1.0 - PREEMPH) * im) as f32;
-        }
-        table
+            .preemphasis(PREEMPH)
+            .remove_dc(true)
+            .filterbank(&banks)
+            .log(MelLog::Ln { min: f32::EPSILON as f64, max: f64::INFINITY })
+            .call()?
+            .try_transpose(-1, -2)
     }
 }
 
 /// Kaldi `MelBanks`: triangles on the `1127·ln(1 + f/700)` mel axis over the
 /// first `N_FFT/2` FFT bins (Nyquist bin excluded, as in Kaldi), 20 Hz to
-/// Nyquist, as a `[bins, N_MELS]` table the power spectrum contracts against
-/// (zero rows past the one-sided bins).
-fn kaldi_mel_banks(bins: usize) -> Vec<f32> {
+/// Nyquist, as a `[N_MELS, N_BINS]` table.
+fn kaldi_mel_banks() -> Vec<f32> {
     let mel = |f: f64| 1127.0 * (1.0 + f / 700.0).ln();
     let fft_bin_width = SAMPLE_RATE / N_FFT as f64;
     let (mel_low, mel_high) = (mel(LOW_FREQ), mel(SAMPLE_RATE / 2.0));
     let delta = (mel_high - mel_low) / (N_MELS + 1) as f64;
 
-    let mut table = vec![0f32; bins * N_MELS];
-    for m in 0..N_MELS {
+    let mut table = vec![0f32; N_MELS * N_BINS];
+    for (m, row) in table.chunks_mut(N_BINS).enumerate() {
         let (left, center, right) =
             (mel_low + m as f64 * delta, mel_low + (m + 1) as f64 * delta, mel_low + (m + 2) as f64 * delta);
-        for i in 0..N_FFT / 2 {
+        for (i, w) in row.iter_mut().enumerate().take(N_FFT / 2) {
             let mel_f = mel(i as f64 * fft_bin_width);
             if mel_f > left && mel_f < right {
-                let w = if mel_f <= center { (mel_f - left) / delta } else { (right - mel_f) / delta };
-                table[i * N_MELS + m] = w as f32;
+                *w = (if mel_f <= center { (mel_f - left) / delta } else { (right - mel_f) / delta }) as f32;
             }
         }
     }

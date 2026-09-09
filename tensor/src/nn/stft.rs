@@ -11,8 +11,8 @@
 //! buffer) the kernel is tabulated there in f64 and uploaded once, like the
 //! mel filterbank, so no launch rebuilds it per run. Both operands are also
 //! zero-padded to extents the optimizer can tile ([`FRAME_ALIGN`],
-//! [`BIN_ALIGN`]) and the surplus trimmed afterwards — or kept, through
-//! [`Tensor::stft_padded`], by a consumer whose own reduce wants them.
+//! [`BIN_ALIGN`]) and the surplus trimmed afterwards; the padded form never
+//! leaves this crate.
 //!
 //! ## Conventions
 //!
@@ -44,12 +44,15 @@
 use std::f64::consts::{LOG10_2, TAU};
 
 use bon::bon;
-use snafu::ensure;
+use snafu::{OptionExt, ensure};
 use svod_dtype::DType;
 use svod_ir::SInt;
 
 use crate::Tensor;
-use crate::error::{FloatDTypeRequiredSnafu, NdimExactSnafu, NdimMinimumSnafu, ParamRangeSnafu, ShapeMismatchSnafu};
+use crate::error::{
+    ExclusiveParamsSnafu, FloatDTypeRequiredSnafu, NdimExactSnafu, NdimMinimumSnafu, ParamRangeSnafu,
+    ShapeMismatchSnafu,
+};
 
 type Result<T> = crate::Result<T>;
 
@@ -63,20 +66,22 @@ type Result<T> = crate::Result<T>;
 /// those samples to zero instead of to infinity.
 const NOLA_EPS: f64 = 1e-11;
 
-/// Extents the [`Tensor::stft`] convolution is padded to: the frame axis `T`
-/// up to a multiple of `FRAME_ALIGN`, the bin axis `F` up to a multiple of
-/// `BIN_ALIGN` (the kernel's `2F'` channel axis to a multiple of 16). The
-/// optimizer tiles a reduce only along axes it can split evenly, and the
-/// natural extents rarely are: Whisper's 30 s is `T = 3001` (prime) frames of
-/// `2F = 402 = 2·3·67` channels, which gets a 2×3 register tile (25 ms on
-/// CPU); `3008 × 416` gets 16×4×4 (2.3 ms); and `F = 201` itself is prime,
-/// which a downstream contraction over the bins (the mel filterbank) suffers
-/// as well. Both padded operands are materialized before the convolution — a
-/// lazy pad fuses its bounds check into the multiply-add loop (+30% on CPU),
-/// and so is the convolution's result: a trim applied to it lazily would be
-/// pushed into the reduce and hand the natural extents back. The extra frames
-/// are masked to zero in the convolution's epilogue (they straddle the
-/// signal's tail); the extra bins are zero rows of the kernel.
+/// Extents the [`Tensor::stft`] / [`Tensor::istft`] convolutions are padded
+/// to: the frame axis `T` up to a multiple of `FRAME_ALIGN`, the bin axis `F`
+/// (and `istft`'s `hop` output channels) up to a multiple of `BIN_ALIGN`, so
+/// the kernel's `2F'` channel axis is a multiple of 16. The optimizer tiles a
+/// reduce only along axes it can split evenly, and the natural extents rarely
+/// are: Whisper's 30 s is `T = 3001` (prime) frames of `2F = 402 = 2·3·67`
+/// channels, which gets a 2×3 register tile (25 ms on CPU); `3008 × 416` gets
+/// 16×4×4 (2.3 ms); and `F = 201` itself is prime, which a downstream
+/// contraction over the bins (the mel filterbank) suffers as well. Both
+/// padded operands are materialized before the convolution — a lazy pad
+/// fuses its bounds check into the multiply-add loop (+30% on CPU), and so is
+/// the convolution's result: a trim applied to it lazily would be pushed into
+/// the reduce and hand the natural extents back. The extra frames are masked
+/// to zero in the convolution's epilogue (they straddle the signal's tail);
+/// the extra bins are zero rows of the kernel. The padding is a tiling detail
+/// of this module: every public op trims it before returning.
 const FRAME_ALIGN: usize = 8;
 const BIN_ALIGN: usize = 8;
 
@@ -377,15 +382,22 @@ fn analysis_kernel(n_fft: usize, n_bins: usize, padded_bins: usize, win: &Tensor
     Ok(Tensor::cat(&[&re, &im], 0)?.try_reshape([2 * padded_bins as isize, 1, n_fft as isize])?.cast(dtype))
 }
 
-/// `[2F, 1, n_fft]` synthesis kernel: the inverse DFT of a `[2F]` bin vector,
-/// already multiplied by the synthesis window, so one `conv_transpose` with
-/// `stride = hop` performs the frame IDFT *and* the overlap-add.
+/// `[2F', n_fft]` synthesis table: row `k` (`F' + k`) times the real
+/// (imaginary) part of bin `k` gives that bin's share of the windowed inverse
+/// DFT of a frame, the rows past `F` zero.
 ///
 /// Under `onesided`, bins `1..F-1` stand in for their conjugate partners and
 /// carry a factor of two; DC and (for even `n_fft`) Nyquist carry one, and
 /// their imaginary parts are dropped exactly as `irfft` — and therefore
 /// `torch.istft` — does.
-fn synthesis_kernel(n_fft: usize, n_bins: usize, onesided: bool, win: &Tensor, dtype: DType) -> Result<Tensor> {
+fn synthesis_kernel(
+    n_fft: usize,
+    n_bins: usize,
+    padded_bins: usize,
+    onesided: bool,
+    win: &Tensor,
+    dtype: DType,
+) -> Result<Tensor> {
     let (cos, sin) = dft_basis(n_fft, n_bins)?;
     let inv = 1.0 / n_fft as f64;
     let (re, im) = if onesided {
@@ -399,9 +411,74 @@ fn synthesis_kernel(n_fft: usize, n_bins: usize, onesided: bool, win: &Tensor, d
     } else {
         (Tensor::ones(&[1, 1], DType::Float32), Tensor::ones(&[1, 1], DType::Float32))
     };
-    let re = cos.try_mul(&re)?.try_mul(inv)?.try_mul(win)?;
-    let im = sin.try_mul(&im)?.try_mul(-inv)?.try_mul(win)?;
-    Ok(Tensor::cat(&[&re, &im], 0)?.try_reshape([2 * n_bins as isize, 1, n_fft as isize])?.cast(dtype))
+    let pad = [(0, (padded_bins - n_bins) as isize), (0, 0)];
+    let re = cos.try_mul(&re)?.try_mul(inv)?.try_mul(win)?.try_pad(&pad)?;
+    let im = sin.try_mul(&im)?.try_mul(-inv)?.try_mul(win)?.try_pad(&pad)?;
+    Ok(Tensor::cat(&[&re, &im], 0)?.cast(dtype))
+}
+
+/// Overlap-add as one convolution over the frame axis. A frame's `n_fft`
+/// synthesized samples span `taps = ⌈n_fft / hop⌉` output blocks of `hop`
+/// samples, and output block `m` sums block `k` of frame `m - k` over
+/// `k < taps`: with the frames zero-padded by `taps - 1` on the left, that is
+/// `conv1d` over `[B, rows, frames]` with a `[hop', rows, taps]` weight,
+/// `W[j, c, kk] = S[c, (taps - 1 - kk)·hop + j]` for a `[rows, n_fft]`
+/// synthesis table `S` (zero past `n_fft`), the rows past `hop` zero. The
+/// frame IDFT and the overlap-add are then a single reduce of `rows × taps`
+/// per output sample — `2F'·⌈n_fft/hop⌉`, against the `n_fft × 2F` of a
+/// stride-dilated `conv_transpose`.
+fn ola_table(table: &[f32], n_fft: usize, rows: usize, hop: usize, padded_hop: usize, taps: usize) -> Vec<f32> {
+    let mut w = vec![0f32; padded_hop * rows * taps];
+    for j in 0..hop {
+        for c in 0..rows {
+            for kk in 0..taps {
+                let n = (taps - 1 - kk) * hop + j;
+                if n < n_fft {
+                    w[(j * rows + c) * taps + kk] = table[c * n_fft + n];
+                }
+            }
+        }
+    }
+    w
+}
+
+/// Graph twin of [`ola_table`] over a `[rows, n_fft]` table.
+fn ola_weight(table: &Tensor, n_fft: usize, hop: usize, padded_hop: usize, taps: usize) -> Result<Tensor> {
+    let rows = table.dim_const(0)? as isize;
+    table
+        .try_pad(&[(0, 0), (0, (taps * hop - n_fft) as isize)])?
+        .try_reshape([rows, taps as isize, hop as isize])?
+        .flip(&[1])?
+        .try_pad(&[(0, 0), (0, 0), (0, (padded_hop - hop) as isize)])?
+        .try_permute(&[2, 0, 1])
+}
+
+/// `1 / max(Σ_t w²[n - t·hop], NOLA_EPS)` over samples `start..start + take`
+/// of the overlap-add buffer — the per-sample divisor of `torch.istft`.
+fn inverse_envelope(win: &[f64], hop: usize, frames: usize, start: usize, take: usize) -> Vec<f32> {
+    let mut envelope = vec![0f64; (frames - 1) * hop + win.len()];
+    for t in 0..frames {
+        for (n, w) in win.iter().enumerate() {
+            envelope[t * hop + n] += w * w;
+        }
+    }
+    envelope[start..start + take].iter().map(|&v| (1.0 / v.max(NOLA_EPS)) as f32).collect()
+}
+
+/// `scale · DFT(w)` as `[2·half]` `(re rows, im rows)` with the analysis
+/// kernel's sign convention, the rows past `n_bins` zero: what subtracting
+/// the constant `scale` from a frame subtracts from its windowed spectrum.
+fn window_dft(n_fft: usize, n_bins: usize, half: usize, win: &[f64], scale: f64) -> Vec<f32> {
+    let mut table = vec![0f32; 2 * half];
+    for k in 0..n_bins {
+        let (re, im) = win.iter().enumerate().fold((0.0, 0.0), |(re, im), (n, w)| {
+            let angle = TAU * ((k * n) % n_fft) as f64 / n_fft as f64;
+            (re + w * angle.cos(), im - w * angle.sin())
+        });
+        table[k] = (scale * re) as f32;
+        table[half + k] = (scale * im) as f32;
+    }
+    table
 }
 
 /// The window zero-padded to `n_fft`, centered as `torch.stft` centers it.
@@ -465,9 +542,9 @@ fn synthesis_weights(n_fft: usize, onesided: bool) -> impl Fn(usize) -> (f64, f6
     }
 }
 
-/// Upload a host table as a `[rows, 1, cols]` constant of `dtype`.
-fn upload(table: Vec<f32>, rows: usize, cols: usize, dtype: DType) -> Result<Tensor> {
-    let t = Tensor::from_slice(table).try_reshape([rows as isize, 1, cols as isize])?;
+/// Upload a host table as a `shape`d constant of `dtype`.
+fn upload(table: Vec<f32>, shape: &[usize], dtype: DType) -> Result<Tensor> {
+    let t = Tensor::from_slice(table).try_reshape(shape.iter().map(|&d| d as isize).collect::<Vec<_>>())?;
     Ok(if dtype == DType::Float32 { t } else { t.cast(dtype) })
 }
 
@@ -547,7 +624,7 @@ impl Tensor {
     ) -> Result<Tensor> {
         origin_call!("stft");
         let (spec, n_bins, frames) =
-            self.stft_aligned(n_fft, hop, win_length, &window, center, onesided, normalized)?;
+            self.stft_aligned(n_fft, hop, win_length, &window, center, onesided, normalized, None, false)?;
         let out = spec.narrow(1, 0_usize, n_bins)?.narrow(2, 0_usize, frames)?;
         if self.ndim()? == 1 { out.try_squeeze(Some(0)) } else { Ok(out) }
     }
@@ -560,32 +637,16 @@ impl Tensor {
     /// maps frames elementwise can keep the tileable extents and trim at the
     /// end, as [`mel_spectrogram`](Tensor::mel_spectrogram) does.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use svod_tensor::Tensor;
-    /// let x = Tensor::from_slice(vec![0.25f32; 64]);
-    /// let (spec, bins, frames) = x.stft_padded().n_fft(16).hop(4).call().unwrap();
-    /// assert_eq!((spec.dims().unwrap(), bins, frames), (vec![1, 16, 24, 2], 9, 17));
-    /// ```
-    #[builder]
-    #[track_caller]
-    pub fn stft_padded(
-        &self,
-        n_fft: usize,
-        hop: Option<usize>,
-        win_length: Option<usize>,
-        #[builder(default)] window: Window,
-        #[builder(default = true)] center: bool,
-        #[builder(default = true)] onesided: bool,
-        #[builder(default = false)] normalized: bool,
-    ) -> Result<(Tensor, usize, usize)> {
-        origin_call!("stft_padded");
-        self.stft_aligned(n_fft, hop, win_length, &window, center, onesided, normalized)
-    }
-
+    /// `preemphasis` filters the signal, `x[n] - a·x[n - 1]` (`x[-1] = 0`),
+    /// and `remove_dc` subtracts each frame's mean over the `win_length`
+    /// samples under the window before it — Kaldi's `preemph_coeff` and
+    /// `remove_dc_offset`, whose per-frame chain this equals wherever the
+    /// window's first weight is zero (Hann, Povey). The mean removal is a
+    /// spectral correction: `DFT(w·(x - c)) = DFT(w·x) - c·DFT(w)`, the means
+    /// coming from a box convolution at the frame stride and `(1 - a)·DFT(w)`
+    /// being a constant.
     #[allow(clippy::too_many_arguments)]
-    fn stft_aligned(
+    pub(crate) fn stft_aligned(
         &self,
         n_fft: usize,
         hop: Option<usize>,
@@ -594,6 +655,8 @@ impl Tensor {
         center: bool,
         onesided: bool,
         normalized: bool,
+        preemphasis: Option<f64>,
+        remove_dc: bool,
     ) -> Result<(Tensor, usize, usize)> {
         let (hop, win_length) = resolve("stft", n_fft, hop, win_length)?;
         let ndim = self.ndim()?;
@@ -613,17 +676,32 @@ impl Tensor {
         // Samples the padded frame count reads; the signal may already hold
         // more (a tail shorter than `hop`), which the convolution ignores.
         let padded_len = (padded_frames - 1) * hop + n_fft;
-        let x = if padded_len > len { x.try_pad(&[(0, 0), (0, (padded_len - len) as isize)])?.contiguous() } else { x };
+        let x = if padded_len > len { x.try_pad(&[(0, 0), (0, (padded_len - len) as isize)])? } else { x };
+        // The frame means read the raw signal, the transform the emphasized
+        // one; each convolution reads a plain buffer, never a pad gate.
+        let raw = if remove_dc { x.contiguous() } else { x };
+        let x = match preemphasis {
+            Some(a) => {
+                let previous = raw.try_pad(&[(0, 0), (1, 0)])?.narrow(-1, 0_usize, raw.dim_const(-1)?)?;
+                raw.try_sub(&previous.try_mul(a)?)?.contiguous()
+            }
+            None if padded_len > len => raw.contiguous(),
+            None => raw.clone(),
+        };
 
         let n_bins = if onesided { n_fft / 2 + 1 } else { n_fft };
         let padded_bins = n_bins.next_multiple_of(BIN_ALIGN);
-        let kernel = match host_framed_window(window, n_fft, win_length) {
-            Some(win) => {
-                upload(dft_table(n_fft, n_bins, padded_bins, &win, |_| (1.0, -1.0)), 2 * padded_bins, n_fft, dtype)?
-            }
+        let rows = 2 * padded_bins;
+        let dc_scale = 1.0 - preemphasis.unwrap_or(0.0);
+        let (kernel, dc) = match host_framed_window(window, n_fft, win_length) {
+            Some(win) => (
+                upload(dft_table(n_fft, n_bins, padded_bins, &win, |_| (1.0, -1.0)), &[rows, 1, n_fft], dtype.clone())?,
+                upload(window_dft(n_fft, n_bins, padded_bins, &win, dc_scale), &[rows, 1], dtype)?,
+            ),
             None => {
                 let win = framed_window(window, n_fft, win_length, dtype.clone())?;
-                analysis_kernel(n_fft, n_bins, padded_bins, &win, dtype)?.contiguous()
+                let kernel = analysis_kernel(n_fft, n_bins, padded_bins, &win, dtype)?.contiguous();
+                (kernel.clone(), kernel.sum(-1isize)?.try_mul(dc_scale)?)
             }
         };
 
@@ -632,9 +710,23 @@ impl Tensor {
         // host `[1, 1, T']` frame mask zeroes them in the convolution's
         // epilogue; it is an input buffer like the kernel, not a launch.
         let y = x.try_unsqueeze(1)?.conv1d().weight(&kernel).stride(hop).call()?;
+        let y = if remove_dc {
+            let left = (n_fft - win_length) / 2;
+            let taps =
+                (0..n_fft).map(|n| if (left..left + win_length).contains(&n) { 1.0 / win_length as f32 } else { 0.0 });
+            let mean = raw
+                .try_unsqueeze(1)?
+                .conv1d()
+                .weight(&upload(taps.collect(), &[1, 1, n_fft], y.dtype())?)
+                .stride(hop)
+                .call()?;
+            y.try_sub(&mean.try_mul(&dc)?)?
+        } else {
+            y
+        };
         let y = if padded_frames > frames {
             let valid = (0..padded_frames).map(|t| if t < frames { 1.0 } else { 0.0 }).collect();
-            y.try_mul(&upload(valid, 1, padded_frames, y.dtype())?)?
+            y.try_mul(&upload(valid, &[1, 1, padded_frames], y.dtype())?)?
         } else {
             y
         };
@@ -648,8 +740,11 @@ impl Tensor {
     ///
     /// Mirrors `torch.istft`: each frame is inverse-transformed, multiplied by
     /// the synthesis window, overlap-added, and divided by the overlap-add of
-    /// the squared window. Both steps are `conv_transpose` against constant
-    /// kernels, so this is two convolutions rather than a host-side loop.
+    /// the squared window. The first three steps are one `conv1d` over the
+    /// frame axis against a host-built `[hop, 2F, ⌈n_fft/hop⌉]` kernel (see
+    /// [`ola_table`]) and the divisor is a host-built `[L]` table, so the
+    /// transform is one reduce of `2F·⌈n_fft/hop⌉` per output sample plus an
+    /// elementwise epilogue.
     ///
     /// The parameters must match the [`stft`](Tensor::stft) that produced the
     /// input. Without `length`, the result is `(T - 1) · hop` samples under
@@ -702,45 +797,70 @@ impl Tensor {
             ParamRangeSnafu { op: "istft", param: "frames", value: frames.to_string(), constraint: "> 0" }
         );
 
-        // The synthesis kernel and the window² of the overlap-add divisor.
-        let (kernel, wsq) = match host_framed_window(&window, n_fft, win_length) {
-            Some(win) => (
-                upload(
-                    dft_table(n_fft, n_bins, n_bins, &win, synthesis_weights(n_fft, onesided)),
-                    2 * n_bins,
-                    n_fft,
-                    dtype.clone(),
-                )?,
-                upload(win.iter().map(|w| (w * w) as f32).collect(), 1, n_fft, dtype.clone())?,
-            ),
-            None => {
-                let win = framed_window(&window, n_fft, win_length, dtype.clone())?;
-                (
-                    synthesis_kernel(n_fft, n_bins, onesided, &win, dtype.clone())?.contiguous(),
-                    win.square().try_reshape([1, 1, n_fft as isize])?,
-                )
-            }
-        };
+        let taps = n_fft.div_ceil(hop);
+        let padded_bins = n_bins.next_multiple_of(BIN_ALIGN);
+        let padded_hop = hop.next_multiple_of(BIN_ALIGN);
+        let rows = 2 * padded_bins;
+        // Output blocks of `hop` samples: `frames + taps - 1` cover the
+        // overlap-add buffer, rounded up to a tileable count. The convolution
+        // reads `taps - 1` zero frames before the first and the surplus after
+        // the last, so the input needs no boundary gate.
+        let out_frames = (frames + taps - 1).next_multiple_of(FRAME_ALIGN);
+        let frame_pad = ((taps - 1) as isize, (out_frames - frames) as isize);
 
-        // [B, F, T, 2] -> [B, 2, F, T] -> [B, 2F, T]; the batch stays symbolic.
-        let z = x.try_permute(&[0, 3, 1, 2])?.try_reshape([
-            shape[0].clone(),
-            SInt::from(2 * n_bins),
-            SInt::from(frames),
-        ])?;
+        // [B, F, T, 2] -> [B, 2, F', T''] -> [B, 2F', T'']; the batch stays symbolic.
+        let z = x
+            .try_permute(&[0, 3, 1, 2])?
+            .try_pad(&[(0, 0), (0, 0), (0, (padded_bins - n_bins) as isize), frame_pad])?
+            .try_reshape([shape[0].clone(), SInt::from(rows), SInt::from(out_frames + taps - 1)])?;
         let z = if normalized { z.try_mul((n_fft as f64).sqrt())? } else { z };
-        let ola = z.conv_transpose2d().weight(&kernel).stride(&[hop]).call()?;
-
-        // Same overlap-add applied to window², giving the per-sample divisor.
-        let ones = Tensor::ones(&[1, 1, frames], dtype);
-        let norm = ones.conv_transpose2d().weight(&wsq).stride(&[hop]).call()?;
-        let y = ola.try_div(&norm.maximum(NOLA_EPS)?)?.try_squeeze(Some(1))?;
+        let z = z.contiguous();
 
         let out_len = (frames - 1) * hop + n_fft;
         let start = if center { n_fft / 2 } else { 0 };
         let keep = length.unwrap_or(out_len - 2 * start);
         let take = keep.min(out_len - start);
-        let y = y.narrow(-1, start, take)?;
+        // `[B, hop', M]` blocks -> `[B, M·hop]` samples -> the kept range.
+        let samples = |blocks: Tensor| -> Result<Tensor> {
+            let batch = blocks.shape()?[0].clone();
+            blocks
+                .try_permute(&[0, 2, 1])?
+                .narrow(2, 0_usize, hop)?
+                .try_reshape([batch, SInt::from(out_frames * hop)])?
+                .narrow(-1, start, take)
+        };
+
+        // The overlap-add weight and the inverse window envelope: host tables
+        // for a host-known window, otherwise built in-graph (the envelope by
+        // the same overlap-add of window² over a frame of ones).
+        let (weight, inverse) = match host_framed_window(&window, n_fft, win_length) {
+            Some(win) => {
+                let table = dft_table(n_fft, n_bins, padded_bins, &win, synthesis_weights(n_fft, onesided));
+                (
+                    upload(
+                        ola_table(&table, n_fft, rows, hop, padded_hop, taps),
+                        &[padded_hop, rows, taps],
+                        dtype.clone(),
+                    )?,
+                    upload(inverse_envelope(&win, hop, frames, start, take), &[1, take], dtype)?,
+                )
+            }
+            None => {
+                let win = framed_window(&window, n_fft, win_length, dtype.clone())?;
+                let table = synthesis_kernel(n_fft, n_bins, padded_bins, onesided, &win, dtype.clone())?;
+                let wsq = win.square().try_reshape([1, n_fft as isize])?;
+                let ones = Tensor::ones(&[1, 1, frames], dtype).try_pad(&[(0, 0), (0, 0), frame_pad])?;
+                let envelope = ones.conv1d().weight(&ola_weight(&wsq, n_fft, hop, padded_hop, taps)?).call()?;
+                (
+                    ola_weight(&table, n_fft, hop, padded_hop, taps)?.contiguous(),
+                    samples(envelope)?.maximum(NOLA_EPS)?.reciprocal()?,
+                )
+            }
+        };
+
+        // Materialized at `[B, hop', M]`: read lazily, the sample trim would be
+        // pushed into the reduce and hand it one flat, untileable sample axis.
+        let y = samples(z.conv1d().weight(&weight).call()?.contiguous())?.try_mul(&inverse)?;
         let y = if take < keep { y.try_pad(&[(0, 0), (0, (keep - take) as isize)])? } else { y };
         if ndim == 3 { y.try_squeeze(Some(0)) } else { Ok(y) }
     }
@@ -755,6 +875,16 @@ impl Tensor {
     /// power 2, `f_max = sample_rate / 2`); `MelScale::Slaney` with
     /// `MelNorm::Slaney` is `librosa.feature.melspectrogram`.
     ///
+    /// Kaldi's `fbank` is the same chain with `preemphasis` (`x[n] - a·x[n - 1]`
+    /// on the signal) and `remove_dc` (each frame's mean over the `win_length`
+    /// samples under the window subtracted before the pre-emphasis; both are
+    /// exact per-frame equivalents wherever the window's first weight is
+    /// zero), a `Window::Povey` and a `filterbank` of its own: a `[n_mels, F]`
+    /// table given in place of `n_mels` (`sample_rate`, `f_min`, `f_max`,
+    /// `mel_scale` and `norm` are then unused). A `filterbank` still in the
+    /// graph costs one launch per run to widen; a host-backed one is widened
+    /// on the host.
+    ///
     /// # Examples
     ///
     /// ```
@@ -767,13 +897,16 @@ impl Tensor {
     #[track_caller]
     pub fn mel_spectrogram(
         &self,
-        sample_rate: usize,
+        sample_rate: Option<usize>,
         n_fft: usize,
         hop: Option<usize>,
         win_length: Option<usize>,
         #[builder(default)] window: Window,
         #[builder(default = true)] center: bool,
-        n_mels: usize,
+        preemphasis: Option<f64>,
+        #[builder(default = false)] remove_dc: bool,
+        n_mels: Option<usize>,
+        filterbank: Option<&Tensor>,
         #[builder(default = 0.0)] f_min: f64,
         f_max: Option<f64>,
         #[builder(default)] mel_scale: MelScale,
@@ -782,9 +915,11 @@ impl Tensor {
         log: Option<MelLog>,
     ) -> Result<Tensor> {
         origin_call!("mel_spectrogram");
+        let op = "mel_spectrogram";
+        ensure!(power > 0.0, ParamRangeSnafu { op, param: "power", value: power.to_string(), constraint: "> 0" });
         ensure!(
-            power > 0.0,
-            ParamRangeSnafu { op: "mel_spectrogram", param: "power", value: power.to_string(), constraint: "> 0" }
+            n_mels.is_some() != filterbank.is_some(),
+            ExclusiveParamsSnafu { op, options: "`n_mels` and `filterbank`" }
         );
         // The STFT's padding bins and frames ride through the filterbank
         // contraction so it, too, gets tileable extents: the filterbank is
@@ -794,7 +929,8 @@ impl Tensor {
         // elementwise, and the Whisper per-signal maximum floors every value
         // at `log10(1e-10)`, the exact value of a zero frame, so those frames
         // never exceed the real maximum.
-        let (spec, _, frames) = self.stft_aligned(n_fft, hop, win_length, &window, center, true, false)?;
+        let (spec, n_bins, frames) =
+            self.stft_aligned(n_fft, hop, win_length, &window, center, true, false, preemphasis, remove_dc)?;
         let energy = spec.power()?;
         let energy = if power == 2.0 {
             energy
@@ -803,10 +939,53 @@ impl Tensor {
         } else {
             energy.try_pow(power / 2.0)?
         };
-        let f_max = f_max.unwrap_or(sample_rate as f64 / 2.0);
         let cols = energy.dim_const(1)?;
-        let fb =
-            Tensor::mel_filterbank_cols(sample_rate, n_fft, n_mels, f_min, f_max, mel_scale, norm, cols, self.dtype())?;
+        let fb = match (filterbank, n_mels) {
+            (Some(fb), _) => {
+                let ndim = fb.ndim()?;
+                ensure!(ndim == 2, NdimExactSnafu { op, expected: 2_usize, actual: ndim });
+                let (rows, bins) = (fb.dim_const(0)?, fb.dim_const(1)?);
+                ensure!(
+                    bins == n_bins,
+                    ShapeMismatchSnafu {
+                        context: op,
+                        expected: format!("[n_mels, {n_bins}]"),
+                        actual: format!("[{rows}, {bins}]")
+                    }
+                );
+                match fb.buffer().is_some().then(|| fb.as_vec::<f32>().ok()).flatten() {
+                    Some(host) => {
+                        let mut table = vec![0f32; rows * cols];
+                        for (wide, row) in table.chunks_mut(cols).zip(host.chunks(n_bins)) {
+                            wide[..n_bins].copy_from_slice(row);
+                        }
+                        upload(table, &[rows, cols], self.dtype())?
+                    }
+                    None => fb.try_pad(&[(0, 0), (0, (cols - n_bins) as isize)])?.cast(self.dtype()).contiguous(),
+                }
+            }
+            (None, n_mels) => {
+                let n_mels = n_mels.expect("exactly one of n_mels and filterbank is set");
+                let sample_rate = sample_rate.context(ParamRangeSnafu {
+                    op,
+                    param: "sample_rate",
+                    value: "none",
+                    constraint: "set when `n_mels` builds the filterbank",
+                })?;
+                let f_max = f_max.unwrap_or(sample_rate as f64 / 2.0);
+                Tensor::mel_filterbank_cols(
+                    sample_rate,
+                    n_fft,
+                    n_mels,
+                    f_min,
+                    f_max,
+                    mel_scale,
+                    norm,
+                    cols,
+                    self.dtype(),
+                )?
+            }
+        };
         let mel = fb.matmul(&energy)?;
         let mel = match log {
             Some(log) => mel.mel_log(log)?,

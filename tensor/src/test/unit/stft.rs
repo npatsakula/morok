@@ -227,19 +227,23 @@ fn lazy_custom_window_falls_back_to_in_graph_kernels() {
     let istft = |spec: &Tensor, w: Tensor| {
         spec.istft().n_fft(n_fft).hop(hop).window(Window::Custom(w)).length(len).call().unwrap()
     };
+    // The inverse builds its overlap-add weight in-graph; the window²
+    // envelope, a reduce over a frame of ones, fuses into the epilogue.
     let (back_host, back_lazy) = (istft(&spec_host, host), istft(&spec_host, lazy));
     assert_eq!(count_kernels(&back_lazy), count_kernels(&back_host) + 1);
     let expected: Vec<f64> = back_host.to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
     assert_close(&back_lazy.to_vec::<f32>().unwrap(), &expected, 1e-5);
 }
 
-/// The untrimmed form: bins and frames rounded up to multiples of 8, the
-/// true extents alongside, the prefix equal to `stft` and the surplus zero.
+/// The crate-internal untrimmed form: bins and frames rounded up to multiples
+/// of 8, the true extents alongside, the prefix equal to `stft` and the
+/// surplus zero.
 #[test_case(16, 4, 96; "9 bins -> 16, 25 frames -> 32")]
 #[test_case(32, 8, 120; "17 bins -> 24, 16 frames stay")]
-fn stft_padded_keeps_the_tileable_extents(n_fft: usize, hop: usize, len: usize) {
+fn stft_aligned_keeps_the_tileable_extents(n_fft: usize, hop: usize, len: usize) {
     let x = Tensor::from_slice(signal(len, 0.8).iter().map(|&v| v as f32).collect::<Vec<_>>());
-    let (spec, bins, frames) = x.stft_padded().n_fft(n_fft).hop(hop).call().unwrap();
+    let (spec, bins, frames) =
+        x.stft_aligned(n_fft, Some(hop), None, &Window::Hann, true, true, false, None, false).unwrap();
     let trimmed = x.stft().n_fft(n_fft).hop(hop).call().unwrap();
     assert_eq!((bins, frames), (n_fft / 2 + 1, len / hop + 1));
     let dims = spec.dims().unwrap();
@@ -318,6 +322,9 @@ fn stft_keeps_a_symbolic_batch_dimension() {
 #[test_case(64, 16, 256; "hann 64/16 75pct overlap")]
 #[test_case(32, 8, 192; "hann 32/8 75pct overlap")]
 #[test_case(16, 4, 128; "hann 16/4 75pct overlap")]
+#[test_case(40, 16, 400; "hann 40/16: n_fft not a hop multiple, 3 taps")]
+#[test_case(30, 7, 300; "hann 30/7: odd hop pads the block axis")]
+#[test_case(64, 32, 256; "hann 64/32 50pct overlap, 2 taps")]
 fn istft_reconstructs_the_signal(n_fft: usize, hop: usize, len: usize) {
     let x = signal(len, 0.42);
     let input = Tensor::from_slice(x.iter().map(|&v| v as f32).collect::<Vec<_>>());
@@ -585,14 +592,28 @@ fn count_kernels(t: &Tensor) -> usize {
 /// `[2F', 1, n_fft]` DFT kernel (an input buffer, not a launch), and one
 /// trims the result for a consumer that wants it materialized — trimming the
 /// convolution lazily would hand the natural extents back to the reduce. The
-/// inverse reads the trim as a view, so it adds its own convolution plus one
-/// launch for the window-square overlap-add divisor on top of the first two.
+/// inverse adds the overlap-add convolution — materialized at `[B, hop', M]`
+/// for the same reason — and the epilogue that reads those blocks as samples
+/// and applies the host-built envelope; chained, the forward trim and the
+/// inverse's re-pad to the tileable extents are one launch.
 #[test]
 fn stft_is_three_kernels_and_istft_is_five() {
     let x = Tensor::empty(&[4, 16000], DType::Float32);
     let spec = x.stft().n_fft(512).hop(256).call().unwrap();
     let back = spec.istft().n_fft(512).hop(256).call().unwrap();
     assert_eq!((count_kernels(&spec), count_kernels(&back)), (3, 5));
+}
+
+/// `istft` on its own, from a realized spectrogram: pad, overlap-add
+/// convolution, epilogue — whatever the tap count `⌈n_fft / hop⌉` and
+/// whether `hop` needs padding to a tileable block width.
+#[test_case(400, 160, 3001; "whisper 30 s: 3 taps")]
+#[test_case(512, 256, 63; "gtcrn: 2 taps")]
+#[test_case(400, 100, 481; "odd hop: 4 taps, hop padded to 104")]
+fn istft_is_three_kernels(n_fft: usize, hop: usize, frames: usize) {
+    let spec = Tensor::empty(&[2, n_fft / 2 + 1, frames, 2], DType::Float32);
+    let back = spec.istft().n_fft(n_fft).hop(hop).call().unwrap();
+    assert_eq!(count_kernels(&back), 3);
 }
 
 // =========================================================================
@@ -851,6 +872,113 @@ fn mel_spectrogram_rejects_bad_parameters() {
     assert!(matches!(err.kind(), ErrorKind::FloatDTypeRequired { .. }), "got {err}");
     let err = Tensor::from_slice(vec![0.1f32; 8]).mel_log(MelLog::Whisper).unwrap_err();
     assert!(matches!(err.kind(), ErrorKind::NdimMinimum { .. }), "got {err}");
+}
+
+/// Kaldi's per-frame chain (`snip_edges`, `remove_dc_offset`, `preemph_coeff`)
+/// as `kaldi-native-fbank` writes it: the mean over the `win_length` samples
+/// under the window removed from the frame, pre-emphasis with its first
+/// sample special-cased, the windowed DFT power against a `[n_mels, F]`
+/// table, `ln(max(x, eps))`. Flat `[n_mels, T]`.
+#[allow(clippy::too_many_arguments)]
+fn ref_kaldi_mel(
+    x: &[f64],
+    n_fft: usize,
+    hop: usize,
+    win_length: usize,
+    preemph: f64,
+    remove_dc: bool,
+    banks: &[f64],
+    eps: f64,
+) -> Vec<f64> {
+    let bins = n_fft / 2 + 1;
+    let n_mels = banks.len() / bins;
+    let frames = (x.len() - n_fft) / hop + 1;
+    let short = host_window(&Window::Hann, win_length);
+    let left = (n_fft - win_length) / 2;
+    let mut out = vec![0.0; n_mels * frames];
+    for t in 0..frames {
+        let frame = &x[t * hop..t * hop + n_fft];
+        let mean = if remove_dc { frame[left..left + win_length].iter().sum::<f64>() / win_length as f64 } else { 0.0 };
+        let y: Vec<f64> = (0..n_fft).map(|n| frame[n] - mean - preemph * (frame[n.saturating_sub(1)] - mean)).collect();
+        let power: Vec<f64> = (0..bins)
+            .map(|k| {
+                let (re, im) = short.iter().enumerate().fold((0.0, 0.0), |(re, im), (n, w)| {
+                    let angle = TAU * ((k * (left + n)) % n_fft) as f64 / n_fft as f64;
+                    let v = y[left + n] * w;
+                    (re + v * angle.cos(), im - v * angle.sin())
+                });
+                re * re + im * im
+            })
+            .collect();
+        for m in 0..n_mels {
+            let e: f64 = (0..bins).map(|k| banks[m * bins + k] * power[k]).sum();
+            out[m * frames + t] = e.max(eps).ln();
+        }
+    }
+    out
+}
+
+/// `preemphasis`, `remove_dc` and a custom `filterbank` reproduce Kaldi's
+/// per-frame chain on a signal with a DC offset — including a short window,
+/// whose mean is taken under the window rather than over the whole frame.
+#[test_case(64, Some(0.97), true; "pre-emphasis and dc removal")]
+#[test_case(48, Some(0.97), true; "short window: mean under the window")]
+#[test_case(64, None, true; "dc removal alone")]
+#[test_case(64, Some(0.97), false; "pre-emphasis alone")]
+fn mel_spectrogram_kaldi_options_match_the_per_frame_chain(win_length: usize, preemph: Option<f64>, remove_dc: bool) {
+    let (sr, n_fft, hop, n_mels, len, eps) = (8000usize, 64usize, 16usize, 12usize, 256usize, 1e-7f64);
+    let x: Vec<f64> = signal(len, 0.35).iter().map(|v| v + 0.5).collect();
+    let banks = ref_mel_filterbank(sr, n_fft, n_mels, 0.0, sr as f64 / 2.0, MelScale::Htk, None);
+    let expected = ref_kaldi_mel(&x, n_fft, hop, win_length, preemph.unwrap_or(0.0), remove_dc, &banks, eps);
+
+    let fb = Tensor::from_slice(banks.iter().map(|&w| w as f32).collect::<Vec<_>>())
+        .try_reshape([n_mels as isize, (n_fft / 2 + 1) as isize])
+        .unwrap();
+    let input = Tensor::from_slice(x.iter().map(|&v| v as f32).collect::<Vec<_>>());
+    let mel = input
+        .mel_spectrogram()
+        .sample_rate(sr)
+        .n_fft(n_fft)
+        .hop(hop)
+        .win_length(win_length)
+        .center(false)
+        .maybe_preemphasis(preemph)
+        .remove_dc(remove_dc)
+        .filterbank(&fb)
+        .log(MelLog::Ln { min: eps, max: f64::INFINITY })
+        .call()
+        .unwrap();
+    assert_eq!(mel.dims().unwrap(), vec![n_mels, (len - n_fft) / hop + 1]);
+    assert_close(&mel.to_vec::<f32>().unwrap(), &expected, 1e-3);
+}
+
+/// A filterbank still in the graph is widened by a launch of its own and
+/// agrees with the host-widened table; `n_mels` and `filterbank` are
+/// exclusive, and the table must span exactly the one-sided bins.
+#[test]
+fn mel_spectrogram_custom_filterbank_host_and_lazy_agree() {
+    let (sr, n_fft, n_mels, len) = (8000usize, 64usize, 12usize, 256usize);
+    let x = Tensor::from_slice(signal(len, 1.3).iter().map(|&v| v as f32).collect::<Vec<_>>());
+    let host = Tensor::mel_filterbank(sr, n_fft, n_mels, 0.0, 4000.0, MelScale::Htk, None, DType::Float32).unwrap();
+    let lazy = host.try_mul(1.0).unwrap();
+    assert!(lazy.buffer().is_none());
+    let mel = |fb: &Tensor| x.mel_spectrogram().n_fft(n_fft).filterbank(fb).call().unwrap();
+    let builtin = x.mel_spectrogram().sample_rate(sr).n_fft(n_fft).n_mels(n_mels).call().unwrap();
+    let (mel_host, mel_lazy) = (mel(&host), mel(&lazy));
+    assert_eq!(count_kernels(&mel_lazy), count_kernels(&mel_host) + 1);
+    let expected: Vec<f64> = builtin.to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
+    assert_close(&mel_host.to_vec::<f32>().unwrap(), &expected, 1e-6);
+    assert_close(&mel_lazy.to_vec::<f32>().unwrap(), &expected, 1e-6);
+
+    let err = x.mel_spectrogram().sample_rate(sr).n_fft(n_fft).n_mels(n_mels).filterbank(&host).call().unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::ExclusiveParams { .. }), "got {err}");
+    let err = x.mel_spectrogram().sample_rate(sr).n_fft(n_fft).call().unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::ExclusiveParams { .. }), "got {err}");
+    let err = x.mel_spectrogram().n_fft(n_fft).n_mels(n_mels).call().unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::ParamRange { .. }), "got {err}");
+    let narrow = host.narrow(1, 0_usize, 30_usize).unwrap();
+    let err = x.mel_spectrogram().sample_rate(sr).n_fft(n_fft).filterbank(&narrow).call().unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::ShapeMismatch { .. }), "got {err}");
 }
 
 /// A Whisper-sized front-end: the STFT's signal pad and conv (the DFT kernel
