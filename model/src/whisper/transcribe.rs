@@ -15,7 +15,7 @@ use svod_tensor::PrepareConfig;
 use crate::jit::InputSpec;
 
 use super::aligner::{AlignmentProfile, WhisperAligner, WhisperAlignmentInput};
-use super::config::{N_AUDIO_CTX, N_FRAMES, N_TEXT_CTX, SAMPLE_RATE};
+use super::config::{N_AUDIO_CTX, N_FRAMES, N_SAMPLES, N_TEXT_CTX, SAMPLE_RATE};
 use super::decode::{
     DecodeOptions, DecodeScheduleStats, attempt_strategies, detect_language_profile, prefill_decode_seed,
     run_fixed_slot_decode, strategy_width,
@@ -74,14 +74,12 @@ pub enum TranscribeError {
 /// Prepared timestamp-enabled recognizer. It owns only recognition graphs;
 /// word alignment is a separate [`WhisperAligner`] stage.
 pub struct WhisperRecognizer {
-    mel: WhisperMel,
-    /// Graph front-end (see [`crate::audio::use_graph_mel`]); `None` runs
-    /// `realfft` on the host and packs through the encoder's host mapping.
-    mel_jit: Option<WhisperMelJit>,
-    /// Host staging for the mel JIT's device-local `[max_batch, framed_len]`
+    /// Graph front-end; its device output feeds the encoder's mel input.
+    mel_jit: WhisperMelJit,
+    /// Host staging for the mel JIT's device-local `[max_batch, N_SAMPLES]`
     /// input: one `copyin` per batch instead of kernels reading pinned host
     /// memory over the bus.
-    framed: Vec<f32>,
+    samples: Vec<f32>,
     encoder_jit: WhisperEncoderJit,
     decoder_jit: WhisperDecoderJit,
     cross_kv_jit: WhisperCrossKvJit,
@@ -91,7 +89,6 @@ pub struct WhisperRecognizer {
     batched_step_jit: WhisperDecoderStepJit,
     tokenizer: WhisperTokenizer,
     options: DecodeOptions,
-    n_mels: usize,
     n_audio_state: usize,
     n_vocab: usize,
     n_text_ctx: usize,
@@ -145,38 +142,27 @@ impl WhisperRecognizer {
         let n_vocab = model.dims.n_vocab;
         let n_text_ctx = model.dims.n_text_ctx;
         let n_text_head = model.dims.n_text_head;
-        if max_chunk_samples > super::config::N_SAMPLES {
+        if max_chunk_samples > N_SAMPLES {
             return Err(TranscribeError::Model {
                 source: Box::new(super::error::Error::Decode {
-                    msg: format!(
-                        "Whisper decode windows are limited to {} samples, got {max_chunk_samples}",
-                        super::config::N_SAMPLES
-                    ),
+                    msg: format!("Whisper decode windows are limited to {N_SAMPLES} samples, got {max_chunk_samples}"),
                 }),
             });
         }
-        let mel = WhisperMel::new(n_mels)?;
-
         let max_batch = plan.encoder_batch;
 
         let prepare_config = PrepareConfig::from_env();
 
-        // Graph mel keeps the encoder's mel input device-local: it is only ever
-        // written by an on-device copy from the mel JIT's output.
-        let graph_mel = crate::audio::use_graph_mel();
-        let mel_jit = graph_mel
-            .then(|| {
-                let mut jit = WhisperMelJit::new(mel.clone());
-                let framed = InputSpec::f32(&[max_batch, mel.framed_len()]).device_local();
-                jit.prepare_with_config(framed, &PrepareConfig::device_local()).map(|()| jit)
-            })
-            .transpose()?;
-        let framed = vec![0.0f32; if graph_mel { max_batch * mel.framed_len() } else { 0 }];
+        let mut mel_jit = WhisperMelJit::new(WhisperMel::new(n_mels));
+        let samples_spec = InputSpec::f32(&[max_batch, N_SAMPLES]).device_local();
+        mel_jit.prepare_with_config(samples_spec, &PrepareConfig::device_local())?;
+        let samples = vec![0.0f32; max_batch * N_SAMPLES];
 
-        // Encoder JIT: [max_batch, n_mels, N_FRAMES], device-local output
+        // Encoder JIT: [max_batch, n_mels, N_FRAMES], device-local on both
+        // sides — the mel input is only ever written by an on-device copy
+        // from the mel JIT's output.
         let mut encoder_jit = WhisperEncoderJit::new(model.clone());
-        let mel_spec = InputSpec::f32(&[max_batch, n_mels, N_FRAMES]);
-        let mel_spec = if graph_mel { mel_spec.device_local() } else { mel_spec };
+        let mel_spec = InputSpec::f32(&[max_batch, n_mels, N_FRAMES]).device_local();
         encoder_jit.prepare_with_config(mel_spec, &PrepareConfig::device_local())?;
 
         let n_text_state = model.dims.n_text_state;
@@ -237,9 +223,8 @@ impl WhisperRecognizer {
         let pos_embedding = model.decoder.positional_embedding.cast(svod_dtype::DType::Float32).to_vec::<f32>()?;
 
         Ok(Self {
-            mel,
             mel_jit,
-            framed,
+            samples,
             encoder_jit,
             decoder_jit,
             cross_kv_jit,
@@ -247,7 +232,6 @@ impl WhisperRecognizer {
             batched_step_jit,
             tokenizer,
             options,
-            n_mels,
             n_audio_state,
             n_vocab,
             n_text_ctx,
@@ -273,17 +257,6 @@ impl WhisperRecognizer {
 
     pub fn plan(&self) -> &WhisperPlan {
         &self.plan
-    }
-
-    /// Compute mel spectrogram for a window, padded/trimmed to N_FRAMES.
-    fn compute_mel(&self, window: &[f32]) -> Vec<f32> {
-        let mel = self.mel.compute(window);
-        let total = self.n_mels * N_FRAMES;
-
-        let mut padded = vec![0.0f32; total];
-        let copy_len = mel.len().min(total);
-        padded[..copy_len].copy_from_slice(&mel[..copy_len]);
-        padded
     }
 }
 
@@ -466,9 +439,7 @@ impl WhisperRecognizer {
             return Ok((Vec::new(), profile.then(RunProfile::default), CopyProfile::default()));
         }
 
-        let n_mels = self.n_mels;
         let d = self.n_audio_state;
-        let mel_stride = n_mels * N_FRAMES;
         let item_stride = N_AUDIO_CTX * d;
         let max_batch = self.max_batch;
         let n_vocab = self.n_vocab;
@@ -488,43 +459,22 @@ impl WhisperRecognizer {
         for batch_start in (0..windows.len()).step_by(max_batch) {
             let b = (windows.len() - batch_start).min(max_batch);
 
-            // ── Mel: compute + pack into [b, n_mels, N_FRAMES] ──────────────
+            // ── Mel: pad-or-trim the windows, upload them to the mel JIT's
+            // device-local input, run it, and copy its output across on-device.
             let t = Instant::now();
-            if let Some(mel_jit) = &mut self.mel_jit {
-                // Graph path: frame the windows, upload them to the mel JIT's
-                // device-local input, run it, and copy its output across on-device.
-                let framed_len = self.mel.framed_len();
-                for (bi, row) in self.framed.chunks_mut(framed_len).enumerate() {
-                    match windows.get(batch_start + bi).filter(|_| bi < b) {
-                        Some(window) => self.mel.frame_into(window, row),
-                        None => row.fill(0.0),
-                    }
-                }
-                let src_bytes: &[u8] = bytemuck::cast_slice(&self.framed);
-                let copy_started = begin_host_copy(profile, mel_jit.framed_mut()?)
-                    .map_err(|source| TranscribeError::Model { source: Box::new(source) })?;
-                mel_jit.framed_mut()?.copyin(src_bytes)?;
-                if let Some(started) = copy_started {
-                    copies.h2d("mel_input", 1, src_bytes.len(), started.elapsed());
-                }
-                mel_jit.execute()?;
-                self.encoder_jit.mel_mut()?.copy_from(mel_jit.output()?)?;
-            } else {
-                let batch_mels: Vec<Vec<f32>> = (0..b).map(|bi| self.compute_mel(windows[batch_start + bi])).collect();
-                let mel_buf = self.encoder_jit.mel_mut()?;
-                let mut packed = vec![0f32; max_batch * mel_stride];
-                for bi in 0..b {
-                    packed[bi * mel_stride..(bi + 1) * mel_stride].copy_from_slice(&batch_mels[bi][..mel_stride]);
-                }
-                let copy_started = begin_host_copy(profile, mel_buf)
-                    .map_err(|source| TranscribeError::Model { source: Box::new(source) })?;
-                let dst = mel_buf.as_host_bytes_mut()?;
-                let src_bytes: &[u8] = bytemuck::cast_slice(&packed);
-                dst[..src_bytes.len()].copy_from_slice(src_bytes);
-                if let Some(started) = copy_started {
-                    copies.h2d("mel_input", 1, src_bytes.len(), started.elapsed());
-                }
+            for (bi, row) in self.samples.chunks_mut(N_SAMPLES).enumerate() {
+                let window = windows.get(batch_start + bi).filter(|_| bi < b).copied().unwrap_or(&[]);
+                WhisperMel::pad_or_trim_into(window, row);
             }
+            let src_bytes: &[u8] = bytemuck::cast_slice(&self.samples);
+            let copy_started = begin_host_copy(profile, self.mel_jit.samples_mut()?)
+                .map_err(|source| TranscribeError::Model { source: Box::new(source) })?;
+            self.mel_jit.samples_mut()?.copyin(src_bytes)?;
+            if let Some(started) = copy_started {
+                copies.h2d("mel_input", 1, src_bytes.len(), started.elapsed());
+            }
+            self.mel_jit.execute()?;
+            self.encoder_jit.mel_mut()?.copy_from(self.mel_jit.output()?)?;
             t_mel += t.elapsed();
 
             // ── Encode: one dispatch for b windows ───────────────────────────

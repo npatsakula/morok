@@ -27,15 +27,21 @@ fn signal(n: usize, seed: f64) -> Vec<f64> {
         .collect()
 }
 
+/// `(a0, a1, p)` of the cosine-sum window `(a0 - a1·cos(2πk/d))^p`.
+fn cosine_sum(kind: &Window) -> (f64, f64, f64) {
+    match kind {
+        Window::Rectangular => (1.0, 0.0, 1.0),
+        Window::Hann => (0.5, 0.5, 1.0),
+        Window::Hamming => (0.54, 0.46, 1.0),
+        Window::Povey => (0.5, 0.5, 0.85),
+        Window::Custom(_) => unreachable!("custom windows are supplied directly"),
+    }
+}
+
 /// Cosine-sum window, periodic form (denominator `n`).
 fn host_window(kind: &Window, n: usize) -> Vec<f64> {
-    let (a0, a1) = match kind {
-        Window::Rectangular => return vec![1.0; n],
-        Window::Hann => (0.5, 0.5),
-        Window::Hamming => (0.54, 0.46),
-        Window::Custom(_) => unreachable!("custom windows are supplied directly"),
-    };
-    (0..n).map(|k| a0 - a1 * (TAU * k as f64 / n as f64).cos()).collect()
+    let (a0, a1, p) = cosine_sum(kind);
+    (0..n).map(|k| (a0 - a1 * (TAU * k as f64 / n as f64).cos()).powf(p)).collect()
 }
 
 /// `torch.nn.functional.pad(mode="reflect")`: mirror without repeating edges.
@@ -94,16 +100,13 @@ fn assert_close(got: &[f32], expected: &[f64], tol: f64) {
 #[test_case(Window::Hann, 8, false; "hann symmetric")]
 #[test_case(Window::Hamming, 7, true; "hamming periodic")]
 #[test_case(Window::Hamming, 7, false; "hamming symmetric")]
+#[test_case(Window::Povey, 9, true; "povey periodic")]
+#[test_case(Window::Povey, 9, false; "povey symmetric (kaldi)")]
 #[test_case(Window::Rectangular, 5, true; "rectangular")]
 fn window_matches_torch(kind: Window, n: usize, periodic: bool) {
-    let (a0, a1) = match kind {
-        Window::Rectangular => (1.0, 0.0),
-        Window::Hann => (0.5, 0.5),
-        Window::Hamming => (0.54, 0.46),
-        Window::Custom(_) => unreachable!(),
-    };
+    let (a0, a1, p) = cosine_sum(&kind);
     let denom = if periodic || n == 1 { n } else { n - 1 };
-    let expected: Vec<f64> = (0..n).map(|k| a0 - a1 * (TAU * k as f64 / denom as f64).cos()).collect();
+    let expected: Vec<f64> = (0..n).map(|k| (a0 - a1 * (TAU * k as f64 / denom as f64).cos()).powf(p)).collect();
     let got = Tensor::window(&kind, n, periodic, DType::Float32).unwrap().to_vec::<f32>().unwrap();
     assert_close(&got, &expected, 1e-6);
 }
@@ -135,6 +138,7 @@ fn window_rejects_zero_length() {
 #[test_case(16, 4, Window::Hann, true, false, false; "hann 16/4 two-sided")]
 #[test_case(16, 4, Window::Hann, true, true, true; "hann 16/4 normalized")]
 #[test_case(64, 16, Window::Hann, true, true, false; "hann 64/16 center")]
+#[test_case(32, 8, Window::Povey, false, true, false; "povey 32/8 no center")]
 #[test_case(15, 5, Window::Hann, true, true, false; "odd n_fft 15/5")]
 fn stft_matches_naive_dft(n_fft: usize, hop: usize, kind: Window, center: bool, onesided: bool, normalized: bool) {
     let len = 96;
@@ -227,6 +231,33 @@ fn lazy_custom_window_falls_back_to_in_graph_kernels() {
     assert_eq!(count_kernels(&back_lazy), count_kernels(&back_host) + 1);
     let expected: Vec<f64> = back_host.to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
     assert_close(&back_lazy.to_vec::<f32>().unwrap(), &expected, 1e-5);
+}
+
+/// The untrimmed form: bins and frames rounded up to multiples of 8, the
+/// true extents alongside, the prefix equal to `stft` and the surplus zero.
+#[test_case(16, 4, 96; "9 bins -> 16, 25 frames -> 32")]
+#[test_case(32, 8, 120; "17 bins -> 24, 16 frames stay")]
+fn stft_padded_keeps_the_tileable_extents(n_fft: usize, hop: usize, len: usize) {
+    let x = Tensor::from_slice(signal(len, 0.8).iter().map(|&v| v as f32).collect::<Vec<_>>());
+    let (spec, bins, frames) = x.stft_padded().n_fft(n_fft).hop(hop).call().unwrap();
+    let trimmed = x.stft().n_fft(n_fft).hop(hop).call().unwrap();
+    assert_eq!((bins, frames), (n_fft / 2 + 1, len / hop + 1));
+    let dims = spec.dims().unwrap();
+    assert_eq!(dims, vec![1, bins.next_multiple_of(8), frames.next_multiple_of(8), 2]);
+
+    let (padded_bins, padded_frames) = (dims[1], dims[2]);
+    let got = spec.to_vec::<f32>().unwrap();
+    let want = trimmed.to_vec::<f32>().unwrap();
+    for k in 0..padded_bins {
+        for t in 0..padded_frames {
+            let pair = &got[(k * padded_frames + t) * 2..][..2];
+            if k < bins && t < frames {
+                assert_eq!(pair, &want[(k * frames + t) * 2..][..2], "bin {k} frame {t}");
+            } else {
+                assert_eq!(pair, &[0.0, 0.0], "surplus bin {k} frame {t} must be zero");
+            }
+        }
+    }
 }
 
 // =========================================================================

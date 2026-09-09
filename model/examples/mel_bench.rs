@@ -1,6 +1,6 @@
-//! Mel front-end benchmark: host `realfft` versus the graph path, for the
-//! Whisper (Slaney, 400/160, 80 mels) and GigaAM (HTK, 320/160, 64 mels)
-//! configurations over 30 s of 16 kHz audio.
+//! Mel front-end benchmark: the graph path's prepare and execute times, and
+//! its per-kernel profile, for the Whisper (Slaney, 400/160, 80 mels) and
+//! GigaAM (HTK, 320/160, 64 mels) configurations over 30 s of 16 kHz audio.
 //!
 //! Usage:
 //!   cargo run --release -p svod-model --example mel_bench
@@ -17,7 +17,7 @@ use svod_model::whisper::{N_SAMPLES, WhisperMel, WhisperMelJit};
 use svod_tensor::PrepareConfig;
 
 #[derive(Parser, Debug)]
-#[command(about = "Host realfft vs graph mel front-end", long_about = None)]
+#[command(about = "Graph mel front-end timings", long_about = None)]
 struct Args {
     /// Timed iterations per path (the median is reported).
     #[arg(long, default_value_t = 20)]
@@ -26,10 +26,6 @@ struct Args {
     /// 16 kHz mono WAV to use instead of the synthetic 30 s signal.
     #[arg(long)]
     wav: Option<PathBuf>,
-
-    /// Print the graph path's per-kernel times.
-    #[arg(long)]
-    profile: bool,
 }
 
 fn print_kernels(label: &str, kernels: &[svod_runtime::KernelProfile]) {
@@ -71,6 +67,15 @@ fn synthetic(len: usize) -> Vec<f32> {
         .collect()
 }
 
+fn row(label: &str, prepare: Duration, stage: Duration, execute: Duration) {
+    println!(
+        "| {label} | {:.0} ms | {:.2} ms | {:.2} ms |",
+        prepare.as_secs_f64() * 1e3,
+        stage.as_secs_f64() * 1e3,
+        execute.as_secs_f64() * 1e3
+    );
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let audio = match &args.wav {
@@ -85,47 +90,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let device = svod_dtype::default_device::default_device();
     println!("device: {device:?}; {} samples; median of {} runs\n", audio.len(), args.runs);
-    println!("| front-end | host realfft | graph prepare | graph execute |");
-    println!("|-----------|-------------:|--------------:|--------------:|");
+    println!("| front-end | prepare | host stage + upload | execute + sync |");
+    println!("|-----------|--------:|--------------------:|---------------:|");
 
     // ── Whisper ────────────────────────────────────────────────────────────
-    let whisper = WhisperMel::new(80)?;
-    let host = timed(args.runs, || {
-        std::hint::black_box(whisper.compute(&audio));
-    });
-    let mut jit = WhisperMelJit::new(whisper.clone());
+    let whisper = WhisperMel::new(80);
+    let mut jit = WhisperMelJit::new(whisper);
     let t = Instant::now();
-    jit.prepare_with_config(InputSpec::f32(&[1, whisper.framed_len()]).device_local(), &PrepareConfig::device_local())?;
+    jit.prepare_with_config(InputSpec::f32(&[1, N_SAMPLES]).device_local(), &PrepareConfig::device_local())?;
     let prepare = t.elapsed();
-    let mut framed = vec![0.0f32; whisper.framed_len()];
+    let mut samples = vec![0.0f32; N_SAMPLES];
+    let stage = timed(args.runs, || {
+        WhisperMel::pad_or_trim_into(&audio, &mut samples);
+        jit.samples_mut().unwrap().copyin(bytemuck::cast_slice(&samples)).unwrap();
+    });
     let execute = timed(args.runs, || {
-        whisper.frame_into(&audio, &mut framed);
-        jit.framed_mut().unwrap().copyin(bytemuck::cast_slice(&framed)).unwrap();
         jit.execute().unwrap();
         jit.output().unwrap().synchronize().unwrap();
     });
-    println!(
-        "| whisper 80 mel | {:.2} ms | {:.0} ms | {:.2} ms |",
-        host.as_secs_f64() * 1e3,
-        prepare.as_secs_f64() * 1e3,
-        execute.as_secs_f64() * 1e3
-    );
-    if args.profile {
-        let frame = timed(args.runs, || {
-            whisper.frame_into(&audio, &mut framed);
-            jit.framed_mut().unwrap().copyin(bytemuck::cast_slice(&framed)).unwrap();
-        });
-        let run = timed(args.runs, || {
-            jit.execute().unwrap();
-            jit.output().unwrap().synchronize().unwrap();
-        });
-        println!(
-            "  host framing {:.2} ms; execute + sync {:.2} ms",
-            frame.as_secs_f64() * 1e3,
-            run.as_secs_f64() * 1e3
-        );
-        print_kernels("whisper", &jit.execute_profiled()?);
-    }
+    row("whisper 80 mel", prepare, stage, execute);
+    print_kernels("whisper", &jit.execute_profiled()?);
 
     // ── GigaAM ─────────────────────────────────────────────────────────────
     let config = MelConfig {
@@ -137,12 +121,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         center: true,
         mel_scale: MelScale::Htk,
     };
-    let mel = MelSpectrogram::new(&config)?;
+    let mel = MelSpectrogram::new(&config);
     let frames = mel.num_frames(audio.len());
-    let mut out = ndarray::Array3::<f32>::zeros((1, 64, frames));
-    let host = timed(args.runs, || {
-        mel.forward_into(&audio, &mut out.view_mut().into_dyn());
-    });
     let framed_len = mel.framed_len(audio.len());
     let mut jit = MelJit::new(mel.clone());
     let t = Instant::now();
@@ -153,34 +133,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let prepare = t.elapsed();
     let mut framed = vec![0.0f32; framed_len];
-    let execute = timed(args.runs, || {
+    let stage = timed(args.runs, || {
         mel.frame_into(&audio, &mut framed);
         jit.framed_mut().unwrap().copyin(bytemuck::cast_slice(&framed)).unwrap();
         jit.frames_view_mut::<i32>().unwrap().as_slice_mut().unwrap()[0] = frames as i32;
+    });
+    let execute = timed(args.runs, || {
         jit.execute().unwrap();
         jit.output().unwrap().synchronize().unwrap();
     });
-    println!(
-        "| gigaam 64 mel | {:.2} ms | {:.0} ms | {:.2} ms |",
-        host.as_secs_f64() * 1e3,
-        prepare.as_secs_f64() * 1e3,
-        execute.as_secs_f64() * 1e3
-    );
-    if args.profile {
-        let frame = timed(args.runs, || {
-            mel.frame_into(&audio, &mut framed);
-            jit.framed_mut().unwrap().copyin(bytemuck::cast_slice(&framed)).unwrap();
-        });
-        let run = timed(args.runs, || {
-            jit.execute().unwrap();
-            jit.output().unwrap().synchronize().unwrap();
-        });
-        println!(
-            "  host framing {:.2} ms; execute + sync {:.2} ms",
-            frame.as_secs_f64() * 1e3,
-            run.as_secs_f64() * 1e3
-        );
-        print_kernels("gigaam", &jit.execute_profiled()?);
-    }
+    row("gigaam 64 mel", prepare, stage, execute);
+    print_kernels("gigaam", &jit.execute_profiled()?);
     Ok(())
 }

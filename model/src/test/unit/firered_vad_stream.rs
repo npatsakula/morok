@@ -206,10 +206,10 @@ fn reset_restores_the_cold_start_caches() {
 fn flush_tail_exactness() {
     let model = FireRedVadStream::with_random_weights();
     let waveform = synthetic_waveform(16_000);
-    let fbank = FireRedFbank::new();
+    let mut fbank = FireRedFbank::new(1, 16).expect("prepare");
     let n_frames = fbank.num_frames(waveform.len());
     assert_eq!(n_frames % 16, 2, "want a partial flush chunk");
-    let feat = fbank.forward(&waveform);
+    let feat = fbank.forward(&waveform).expect("fbank");
 
     let feat_t = Tensor::from_slice(feat).try_reshape([1isize, n_frames as isize, N_MELS as isize]).expect("reshape");
     let caches = FireRedVadStream::zero_caches().expect("caches");

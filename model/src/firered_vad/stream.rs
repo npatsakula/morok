@@ -468,18 +468,26 @@ pub struct StreamFlush {
 /// Stateful streaming VAD driver: 16 kHz samples in, [`VadEvent`]s out.
 ///
 /// Samples buffer host-side until a full fbank frame (400 samples, 160 hop)
-/// and then a full `chunk_frames` feature chunk is available; each chunk is
-/// one JIT dispatch with the conv caches recycling on-device. Latency is
-/// bounded by `chunk_frames` (default 16 -> 160 ms) plus the 240-sample
-/// fbank window overlap.
+/// is available and run through a `chunk_frames`-capacity fbank JIT; its
+/// feature rows land in the model JIT's input by on-device copies until a
+/// full `chunk_frames` chunk is resident, which is one dispatch with the
+/// conv caches recycling on-device. Latency is bounded by `chunk_frames`
+/// (default 16 -> 160 ms) plus the 240-sample fbank window overlap.
 pub struct FireRedVadStreamer {
     fbank: FireRedFbank,
-    jit: FireRedVadStreamJit,
-    chunk_frames: usize,
     /// Samples not yet covered by a complete fbank frame (< 400).
     remainder: Vec<f32>,
-    /// Feature rows awaiting a full chunk (< `chunk_frames * N_MELS`).
-    pending: Vec<f32>,
+    core: StreamCore,
+    flushed: bool,
+}
+
+/// The model side of the streamer, split from the fbank so a borrowed fbank
+/// output can be landed while the model dispatches.
+struct StreamCore {
+    jit: FireRedVadStreamJit,
+    chunk_frames: usize,
+    /// Feature rows resident in the JIT's input, awaiting a full chunk.
+    pending_rows: usize,
     /// Per-dispatch prob read-back scratch.
     scratch: Vec<f32>,
     /// All raw probs since the last reset (10 ms per entry; ~400 B/s — kept
@@ -488,8 +496,10 @@ pub struct FireRedVadStreamer {
     post: StreamVadPostprocessor,
     /// Closed segments `(start_frame, end_frame)`, 1-based.
     segments: Vec<(usize, usize)>,
-    flushed: bool,
 }
+
+/// Bytes per feature row in the model input.
+const ROW_BYTES: usize = N_MELS * size_of::<f32>();
 
 #[bon]
 impl FireRedVadStreamer {
@@ -504,21 +514,23 @@ impl FireRedVadStreamer {
         assert!(chunk_frames >= 1, "chunk_frames must be >= 1");
         let mut jit = FireRedVadStreamJit::new(model);
         jit.prepare_with_config(
-            InputSpec::f32(&[1, chunk_frames, N_MELS]),
+            InputSpec::f32(&[1, chunk_frames, N_MELS]).device_local(),
             std::array::from_fn(|_| InputSpec::f32(&[1, PROJ, STREAM_CACHE])),
             &svod_tensor::PrepareConfig::device_local(),
         )
         .context(StreamPrepareSnafu)?;
         Ok(Self {
-            fbank: FireRedFbank::new(),
-            jit,
-            chunk_frames,
+            fbank: FireRedFbank::new(1, chunk_frames).context(StreamPrepareSnafu)?,
             remainder: Vec::new(),
-            pending: Vec::new(),
-            scratch: vec![0.0; chunk_frames],
-            probs: Vec::new(),
-            post: StreamVadPostprocessor::new(vad),
-            segments: Vec::new(),
+            core: StreamCore {
+                jit,
+                chunk_frames,
+                pending_rows: 0,
+                scratch: vec![0.0; chunk_frames],
+                probs: Vec::new(),
+                post: StreamVadPostprocessor::new(vad),
+                segments: Vec::new(),
+            },
             flushed: false,
         })
     }
@@ -540,28 +552,47 @@ impl FireRedVadStreamer {
         snafu::ensure!(!self.flushed, StreamFlushedSnafu);
         self.remainder.extend_from_slice(samples);
         let n_frames = self.fbank.num_frames(self.remainder.len());
-        if n_frames == 0 {
-            return Ok(Vec::new());
+        let mut events = Vec::new();
+        for first in (0..n_frames).step_by(self.fbank.capacity()) {
+            let rows = (n_frames - first).min(self.fbank.capacity());
+            let out = self.fbank.forward_windows(&self.remainder, &[first as isize]).context(StreamStepSnafu)?;
+            self.core
+                .land(
+                    rows,
+                    |dst, dst_row, src_row, n| {
+                        Ok(dst.copy_region_from(dst_row * ROW_BYTES, out, src_row * ROW_BYTES, n * ROW_BYTES)?)
+                    },
+                    &mut events,
+                )
+                .context(StreamStepSnafu)?;
         }
-        let rows = self.fbank.forward(&self.remainder);
         // Frame n_frames starts at n_frames * FRAME_SHIFT; keep the
         // (< FRAME_LENGTH) overlap so framing matches a single whole-waveform
         // pass exactly.
         self.remainder.drain(..n_frames * FRAME_SHIFT);
-        self.push_feat(&rows)
+        Ok(events)
     }
 
     /// Feed pre-computed fbank rows (`[n * N_MELS]`, pre-CMVN), bypassing the
-    /// sample buffer — the feature-level entry behind [`push`](Self::push),
-    /// exposed for parity tests that isolate the model from the fbank.
+    /// fbank — the feature-level twin of [`push`](Self::push) for parity
+    /// tests that isolate the model.
+    #[cfg(test)]
     pub(crate) fn push_feat(&mut self, rows: &[f32]) -> std::result::Result<Vec<VadEvent>, FireRedVadStreamError> {
         snafu::ensure!(!self.flushed, StreamFlushedSnafu);
         debug_assert_eq!(rows.len() % N_MELS, 0, "whole feature rows");
-        self.pending.extend_from_slice(rows);
         let mut events = Vec::new();
-        while self.pending.len() >= self.chunk_frames * N_MELS {
-            self.dispatch(self.chunk_frames, &mut events).context(StreamStepSnafu)?;
-        }
+        self.core
+            .land(
+                rows.len() / N_MELS,
+                |dst, dst_row, src_row, n| {
+                    Ok(dst.copyin_at(
+                        dst_row * ROW_BYTES,
+                        bytemuck::cast_slice(&rows[src_row * N_MELS..(src_row + n) * N_MELS]),
+                    )?)
+                },
+                &mut events,
+            )
+            .context(StreamStepSnafu)?;
         Ok(events)
     }
 
@@ -573,19 +604,16 @@ impl FireRedVadStreamer {
     pub fn flush(&mut self) -> std::result::Result<StreamFlush, FireRedVadStreamError> {
         snafu::ensure!(!self.flushed, StreamFlushedSnafu);
         let mut events = Vec::new();
-        while self.pending.len() >= self.chunk_frames * N_MELS {
-            self.dispatch(self.chunk_frames, &mut events).context(StreamStepSnafu)?;
-        }
-        let tail = self.pending.len() / N_MELS;
+        let tail = self.core.pending_rows;
         if tail > 0 {
-            self.dispatch(tail, &mut events).context(StreamStepSnafu)?;
+            self.core.dispatch(tail, &mut events).context(StreamStepSnafu)?;
         }
         let before = events.len();
-        self.post.finalize(&mut events);
-        let final_events: Vec<VadEvent> = events[before..].to_vec();
-        self.record(&final_events);
+        self.core.post.finalize(&mut events);
+        self.core.record(&events[before..]);
         self.flushed = true;
         let timestamps = self
+            .core
             .segments
             .iter()
             .map(|&(s, e)| ((s - 1) as f32 / FRAMES_PER_SEC, (e - 1) as f32 / FRAMES_PER_SEC))
@@ -595,33 +623,54 @@ impl FireRedVadStreamer {
 
     /// Zero the on-device conv caches and all host state for a new stream.
     pub fn reset(&mut self) -> std::result::Result<(), FireRedVadStreamError> {
-        self.jit.reset().context(StreamStepSnafu)?;
+        self.core.jit.reset().context(StreamStepSnafu)?;
         self.remainder.clear();
-        self.pending.clear();
-        self.probs.clear();
-        self.segments.clear();
-        self.post.reset();
+        self.core.pending_rows = 0;
+        self.core.probs.clear();
+        self.core.segments.clear();
+        self.core.post.reset();
         self.flushed = false;
         Ok(())
     }
 
     /// All raw (pre-smoothing) per-frame probs since the last reset.
     pub fn raw_probs(&self) -> &[f32] {
-        &self.probs
+        &self.core.probs
+    }
+}
+
+impl StreamCore {
+    /// Land `rows` feature rows in the JIT's input through `copy(input,
+    /// dst_row, src_row, n)`, dispatching each chunk as it fills.
+    fn land(
+        &mut self,
+        rows: usize,
+        copy: impl Fn(&mut svod_device::Buffer, usize, usize, usize) -> crate::jit::Result<()>,
+        events: &mut Vec<VadEvent>,
+    ) -> crate::jit::Result<()> {
+        let mut src_row = 0;
+        while src_row < rows {
+            let n = (rows - src_row).min(self.chunk_frames - self.pending_rows);
+            copy(self.jit.feat_mut()?, self.pending_rows, src_row, n)?;
+            self.pending_rows += n;
+            src_row += n;
+            if self.pending_rows == self.chunk_frames {
+                self.dispatch(self.chunk_frames, events)?;
+            }
+        }
+        Ok(())
     }
 
-    /// One JIT dispatch over the first `n_real` pending rows (zero-filling
+    /// One JIT dispatch over the first `n_real` resident rows (zero-filling
     /// the chunk tail), feeding the FSM with the real frames only.
     fn dispatch(&mut self, n_real: usize, events: &mut Vec<VadEvent>) -> crate::jit::Result<()> {
-        {
-            let mut view = self.jit.feat_view_mut::<f32>()?;
-            let slice = view.as_slice_mut().expect("contiguous feat");
-            slice[..n_real * N_MELS].copy_from_slice(&self.pending[..n_real * N_MELS]);
-            slice[n_real * N_MELS..].fill(0.0);
+        if n_real < self.chunk_frames {
+            let zeros = vec![0u8; (self.chunk_frames - n_real) * ROW_BYTES];
+            self.jit.feat_mut()?.copyin_at(n_real * ROW_BYTES, &zeros)?;
         }
         self.jit.execute()?;
         self.jit.probs()?.copyout_prefix(bytemuck::cast_slice_mut(&mut self.scratch[..n_real]))?;
-        self.pending.drain(..n_real * N_MELS);
+        self.pending_rows = 0;
 
         self.probs.extend_from_slice(&self.scratch[..n_real]);
         let before = events.len();

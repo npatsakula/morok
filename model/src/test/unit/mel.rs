@@ -1,140 +1,14 @@
+//! Tests: the graph mel front-end against a naive host DFT written here, so
+//! the reference shares no transform code with the graph under test.
+
+use std::f64::consts::TAU;
+
+use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::{MelNorm, MelScale as FbScale};
 
-use crate::audio::mel::hann_window;
 use crate::audio::{MelConfig, MelScale, MelSpectrogram};
-use crate::whisper::WhisperMel;
-
-struct MelOutput {
-    data: ndarray::Array3<f32>,
-}
-
-impl MelOutput {
-    fn shape(&self) -> (usize, usize, usize) {
-        let s = self.data.shape();
-        (s[0], s[1], s[2])
-    }
-
-    fn as_slice(&self) -> &[f32] {
-        self.data.as_slice().expect("contiguous mel buffer")
-    }
-}
-
-fn run_mel(config: &MelConfig, waveform: &[f32]) -> MelOutput {
-    let mel = MelSpectrogram::new(config).unwrap();
-    let n_mels = mel.n_mels();
-    let n_frames = mel.num_frames(waveform.len());
-    let mut data = ndarray::Array3::<f32>::zeros((1, n_mels, n_frames));
-    let mut view = data.view_mut().into_dyn();
-    mel.forward_into(waveform, &mut view);
-    MelOutput { data }
-}
-
-#[test]
-fn test_mel_spectrogram_shape_center_true() {
-    let config = MelConfig {
-        sample_rate: 16000,
-        n_fft: 400,
-        hop_length: 160,
-        win_length: 400,
-        n_mels: 64,
-        center: true,
-        mel_scale: MelScale::Htk,
-    };
-
-    let waveform: Vec<f32> =
-        (0..16000).map(|i| (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16000.0).sin()).collect();
-    let output = run_mel(&config, &waveform);
-
-    assert_eq!(output.shape(), (1, 64, 101));
-}
-
-#[test]
-fn test_mel_spectrogram_shape_center_false() {
-    let config = MelConfig {
-        sample_rate: 16000,
-        n_fft: 320,
-        hop_length: 160,
-        win_length: 320,
-        n_mels: 64,
-        center: false,
-        mel_scale: MelScale::Htk,
-    };
-
-    let waveform: Vec<f32> =
-        (0..16000).map(|i| (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16000.0).sin()).collect();
-    let output = run_mel(&config, &waveform);
-
-    assert_eq!(output.shape(), (1, 64, 99));
-}
-
-#[test]
-fn test_mel_spectrogram_values_finite() {
-    let config = MelConfig {
-        sample_rate: 16000,
-        n_fft: 400,
-        hop_length: 160,
-        win_length: 400,
-        n_mels: 64,
-        center: true,
-        mel_scale: MelScale::Htk,
-    };
-
-    let waveform: Vec<f32> = vec![0.0; 1600];
-    let output = run_mel(&config, &waveform);
-
-    for v in output.as_slice() {
-        assert!(v.is_finite(), "mel output contains non-finite value: {v}");
-    }
-}
-
-#[test]
-fn test_mel_spectrogram_sine_wave() {
-    let config = MelConfig {
-        sample_rate: 16000,
-        n_fft: 400,
-        hop_length: 160,
-        win_length: 400,
-        n_mels: 64,
-        center: true,
-        mel_scale: MelScale::Htk,
-    };
-
-    let waveform: Vec<f32> =
-        (0..16000).map(|i| (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16000.0).sin()).collect();
-    let output = run_mel(&config, &waveform);
-
-    let vals = output.as_slice();
-    let (_, n_mels, n_frames) = output.shape();
-
-    let mut avg_energy: Vec<f32> = vec![0.0; n_mels];
-    for mel_idx in 0..n_mels {
-        for frame in 0..n_frames {
-            avg_energy[mel_idx] += vals[mel_idx * n_frames + frame];
-        }
-        avg_energy[mel_idx] /= n_frames as f32;
-    }
-
-    let lower_avg: f32 = avg_energy[..20].iter().sum::<f32>() / 20.0;
-    let upper_avg: f32 = avg_energy[40..].iter().sum::<f32>() / 24.0;
-    assert!(
-        lower_avg > upper_avg,
-        "Expected lower mel bins to have more energy for 440Hz sine: lower={lower_avg:.2}, upper={upper_avg:.2}"
-    );
-}
-
-#[test]
-fn test_hann_window_matches_torch_periodic_default() {
-    let window = hann_window(8, 8);
-    let expected = [0.0, 0.14644662, 0.5, 0.8535534, 1.0, 0.8535533, 0.5, 0.1464465];
-
-    for (got, want) in window.iter().zip(expected) {
-        assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
-    }
-}
-
-// =========================================================================
-// Graph path against the realfft host path
-// =========================================================================
+use crate::whisper::{N_FRAMES, N_SAMPLES, WhisperMel};
 
 fn gigaam_config() -> MelConfig {
     MelConfig {
@@ -145,6 +19,18 @@ fn gigaam_config() -> MelConfig {
         n_mels: 64,
         center: true,
         mel_scale: MelScale::Htk,
+    }
+}
+
+fn whisper_config() -> MelConfig {
+    MelConfig {
+        sample_rate: 16000,
+        n_fft: 400,
+        hop_length: 160,
+        win_length: 400,
+        n_mels: 80,
+        center: true,
+        mel_scale: MelScale::Slaney,
     }
 }
 
@@ -166,25 +52,115 @@ fn synthetic(len: usize, seed: u32) -> Vec<f32> {
         .collect()
 }
 
-/// `ru_clip_0.wav` from the repository root (16 kHz mono int16), if present.
+/// The first two seconds of `ru_clip_0.wav` from the repository root (16 kHz
+/// mono int16), if present.
 fn real_clip() -> Option<Vec<f32>> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ru_clip_0.wav");
     let mut reader = hound::WavReader::open(path).ok()?;
     let spec = reader.spec();
     assert_eq!((spec.channels, spec.sample_rate), (1, 16000), "real clip must be 16 kHz mono");
-    Some(reader.samples::<i16>().map(|s| s.unwrap() as f32 / 32768.0).collect())
+    Some(reader.samples::<i16>().take(16000 * 2).map(|s| s.unwrap() as f32 / 32768.0).collect())
 }
 
-fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+fn max_abs_diff(a: &[f32], b: &[f64]) -> f32 {
     assert_eq!(a.len(), b.len());
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter().zip(b).map(|(&x, &y)| (f64::from(x) - y).abs()).fold(0.0f64, f64::max) as f32
 }
 
-/// Host `forward_into` of each window (its own length) against one graph
-/// batch of host-framed rows; the graph's columns past a window's frame count
-/// must be zero, as `pack_mel_buffer` leaves them.
-fn assert_gigaam_parity(windows: &[&[f32]], label: &str) -> f32 {
-    let mel = MelSpectrogram::new(&gigaam_config()).unwrap();
+// =========================================================================
+// Host reference
+// =========================================================================
+
+/// `torch.nn.functional.pad(mode="reflect")`: mirror without repeating edges.
+fn reflect_pad(x: &[f64], pad: usize) -> Vec<f64> {
+    let n = x.len();
+    let mut out = Vec::with_capacity(n + 2 * pad);
+    out.extend((0..pad).rev().map(|j| x[j + 1]));
+    out.extend_from_slice(x);
+    out.extend((0..pad).map(|j| x[n - 2 - j]));
+    out
+}
+
+/// Naive mel power `[n_mels, T]`: reflect padding under `center`, periodic
+/// Hann, a windowed DFT per frame, `re² + im²`, the filterbank (the op's
+/// table, in f64). Frames of zeros are skipped — they hold zero power — so a
+/// short signal `pad_or_trim`med to 30 s stays cheap.
+fn ref_mel_power(x: &[f32], config: &MelConfig) -> Vec<f64> {
+    assert_eq!(config.win_length, config.n_fft, "the reference frames a full-length window");
+    let (n_fft, hop, n_mels) = (config.n_fft, config.hop_length, config.n_mels);
+    let n_bins = n_fft / 2 + 1;
+    let (scale, norm) = match config.mel_scale {
+        MelScale::Htk => (FbScale::Htk, None),
+        MelScale::Slaney => (FbScale::Slaney, Some(MelNorm::Slaney)),
+    };
+    let f_max = config.sample_rate as f64 / 2.0;
+    let fb: Vec<f64> =
+        Tensor::mel_filterbank(config.sample_rate, n_fft, n_mels, 0.0, f_max, scale, norm, DType::Float32)
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f64::from)
+            .collect();
+    let win: Vec<f64> = (0..n_fft).map(|k| 0.5 - 0.5 * (TAU * k as f64 / n_fft as f64).cos()).collect();
+
+    let raw: Vec<f64> = x.iter().map(|&v| f64::from(v)).collect();
+    let sig = if config.center { reflect_pad(&raw, n_fft / 2) } else { raw };
+    let frames = (sig.len() - n_fft) / hop + 1;
+    let mut out = vec![0.0; n_mels * frames];
+    for t in 0..frames {
+        let frame = &sig[t * hop..t * hop + n_fft];
+        if frame.iter().all(|&v| v == 0.0) {
+            continue;
+        }
+        let power: Vec<f64> = (0..n_bins)
+            .map(|k| {
+                let (re, im) = (0..n_fft).fold((0.0, 0.0), |(re, im), n| {
+                    let angle = TAU * ((k * n) % n_fft) as f64 / n_fft as f64;
+                    let v = frame[n] * win[n];
+                    (re + v * angle.cos(), im - v * angle.sin())
+                });
+                re * re + im * im
+            })
+            .collect();
+        for m in 0..n_mels {
+            out[m * frames + t] = (0..n_bins).map(|k| fb[m * n_bins + k] * power[k]).sum();
+        }
+    }
+    out
+}
+
+/// GigaAM's `torch.log(mel.clamp(1e-9, 1e9))`, `[n_mels, num_frames]`.
+fn ref_gigaam_log_mel(x: &[f32]) -> Vec<f64> {
+    ref_mel_power(x, &gigaam_config()).into_iter().map(|v| v.clamp(1e-9, 1e9).ln()).collect()
+}
+
+/// `whisper.audio.log_mel_spectrogram` after `pad_or_trim`: the trailing
+/// frame dropped, `log10(max(x, 1e-10))`, floored 8 below the maximum,
+/// `(x + 4) / 4`; `[80, N_FRAMES]`.
+fn ref_whisper_log_mel(x: &[f32]) -> Vec<f64> {
+    let mut padded = vec![0.0f32; N_SAMPLES];
+    WhisperMel::pad_or_trim_into(x, &mut padded);
+    let power = ref_mel_power(&padded, &whisper_config());
+    let frames = power.len() / 80;
+    assert_eq!(frames, N_FRAMES + 1);
+    let mut logged = Vec::with_capacity(80 * N_FRAMES);
+    for m in 0..80 {
+        logged.extend((0..N_FRAMES).map(|t| power[m * frames + t].max(1e-10).log10()));
+    }
+    let floor = logged.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - 8.0;
+    logged.into_iter().map(|v| (v.max(floor) + 4.0) / 4.0).collect()
+}
+
+// =========================================================================
+// Graph path against the reference
+// =========================================================================
+
+/// One graph batch of host-framed rows against the reference of each window
+/// on its own; the graph's columns past a window's frame count must be zero,
+/// as an encoder's mel input expects them.
+fn assert_gigaam_parity(windows: &[&[f32]], label: &str) {
+    let mel = MelSpectrogram::new(&gigaam_config());
     let max_frames = windows.iter().map(|w| mel.num_frames(w.len())).max().unwrap();
     let framed_len = (max_frames - 1) * 160 + 320;
     let mut framed = vec![0.0f32; windows.len() * framed_len];
@@ -204,74 +180,73 @@ fn assert_gigaam_parity(windows: &[&[f32]], label: &str) -> f32 {
     let mut worst = 0.0f32;
     for (bi, window) in windows.iter().enumerate() {
         let valid = frames[bi] as usize;
-        let mut host = ndarray::Array3::<f32>::zeros((1, 64, valid));
-        mel.forward_into(window, &mut host.view_mut().into_dyn());
-        let host = host.as_slice().unwrap();
+        let want = ref_gigaam_log_mel(window);
+        assert_eq!(want.len(), 64 * valid);
         let row = &graph[bi * 64 * max_frames..(bi + 1) * 64 * max_frames];
         for m in 0..64 {
             let got = &row[m * max_frames..m * max_frames + valid];
-            worst = worst.max(max_abs_diff(got, &host[m * valid..(m + 1) * valid]));
+            worst = worst.max(max_abs_diff(got, &want[m * valid..(m + 1) * valid]));
             assert!(row[m * max_frames + valid..(m + 1) * max_frames].iter().all(|&v| v == 0.0), "unmasked tail");
         }
     }
-    eprintln!("gigaam graph-vs-host log-mel max abs diff ({label}): {worst:.3e}");
+    eprintln!("gigaam graph-vs-naive log-mel max abs diff ({label}): {worst:.3e}");
     assert!(worst <= 1e-3, "{label}: max abs diff {worst}");
-    worst
 }
 
-fn assert_whisper_parity(windows: &[&[f32]], label: &str) -> f32 {
-    let mel = WhisperMel::new(80).unwrap();
-    let framed_len = mel.framed_len();
-    let mut framed = vec![0.0f32; windows.len() * framed_len];
-    for (row, window) in framed.chunks_mut(framed_len).zip(windows) {
-        mel.frame_into(window, row);
+fn assert_whisper_parity(windows: &[&[f32]], label: &str) {
+    let mel = WhisperMel::new(80);
+    let mut samples = vec![0.0f32; windows.len() * N_SAMPLES];
+    for (row, window) in samples.chunks_mut(N_SAMPLES).zip(windows) {
+        WhisperMel::pad_or_trim_into(window, row);
     }
     let graph = mel
-        .forward_tensor(&Tensor::from_slice(framed).try_reshape([windows.len() as isize, framed_len as isize]).unwrap())
+        .forward_tensor(&Tensor::from_slice(samples).try_reshape([windows.len() as isize, N_SAMPLES as isize]).unwrap())
         .unwrap();
-    assert_eq!(graph.dims().unwrap(), vec![windows.len(), 80, crate::whisper::N_FRAMES]);
+    assert_eq!(graph.dims().unwrap(), vec![windows.len(), 80, N_FRAMES]);
     let graph = graph.to_vec::<f32>().unwrap();
-    let per_row = 80 * crate::whisper::N_FRAMES;
+    let per_row = 80 * N_FRAMES;
     let worst = windows
         .iter()
         .enumerate()
-        .map(|(bi, window)| max_abs_diff(&graph[bi * per_row..(bi + 1) * per_row], &mel.compute(window)))
+        .map(|(bi, window)| max_abs_diff(&graph[bi * per_row..(bi + 1) * per_row], &ref_whisper_log_mel(window)))
         .fold(0.0, f32::max);
-    eprintln!("whisper graph-vs-host log-mel max abs diff ({label}): {worst:.3e}");
+    eprintln!("whisper graph-vs-naive log-mel max abs diff ({label}): {worst:.3e}");
     assert!(worst <= 1e-3, "{label}: max abs diff {worst}");
-    worst
 }
 
 #[test]
-fn graph_mel_matches_host_on_synthetic_windows() {
-    // Two VAD-style windows of different lengths share one framed batch.
-    let (long, short) = (synthetic(16000 * 3 + 77, 1), synthetic(16000 + 5, 2));
-    assert_gigaam_parity(&[&long, &short], "synthetic");
+fn num_frames_follows_torch_stft() {
+    let centered = MelSpectrogram::new(&whisper_config());
+    assert_eq!((centered.num_frames(16000), centered.framed_len(16000)), (101, 16400));
+    let snipped = MelSpectrogram::new(&MelConfig { center: false, ..gigaam_config() });
+    assert_eq!((snipped.num_frames(16000), snipped.num_frames(319)), (99, 0));
 }
 
 #[test]
-fn graph_whisper_mel_matches_host_on_synthetic_windows() {
-    // A full 30 s window and one that pad_or_trim zero-extends.
-    let (full, short) = (synthetic(crate::whisper::N_SAMPLES, 3), synthetic(16000 * 7, 4));
-    assert_whisper_parity(&[&full, &short], "synthetic");
+fn graph_mel_matches_naive_dft_on_synthetic_windows() {
+    // Two VAD-style windows of different lengths plus a silent one share one
+    // framed batch; silence must land on the clamp floor, `ln(1e-9)`.
+    let (long, short) = (synthetic(16000 * 2 + 77, 1), synthetic(16000 + 5, 2));
+    let silence = vec![0.0f32; 16000 / 2 + 3];
+    assert_gigaam_parity(&[&long, &short, &silence], "synthetic");
 }
 
 #[test]
-fn graph_mel_matches_host_on_real_clip() {
+fn graph_whisper_mel_matches_naive_dft_on_synthetic_windows() {
+    // Windows shorter than 30 s, which pad_or_trim zero-extends, and one
+    // longer, which it cuts.
+    let two_s = synthetic(16000 * 2, 3);
+    let mut long = synthetic(16000 * 3 / 2, 4);
+    long.resize(N_SAMPLES + 16000, 0.0);
+    assert_whisper_parity(&[&two_s, &long], "synthetic");
+}
+
+#[test]
+fn graph_mel_matches_naive_dft_on_real_clip() {
     let Some(clip) = real_clip() else {
         eprintln!("ru_clip_0.wav not found; skipping the real-clip parity check");
         return;
     };
-    // The whole clip as one window plus a VAD-sized cut, as the pipelines see them.
-    assert_gigaam_parity(&[&clip, &clip[16000 * 5..16000 * 12 + 321]], "ru_clip_0");
-    assert_whisper_parity(&[&clip, &clip[..16000 * 11]], "ru_clip_0");
-}
-
-#[test]
-fn use_graph_mel_follows_the_default_device_unless_overridden() {
-    // The env override is process-global, so only the unset default is checked here.
-    if std::env::var_os("SVOD_GRAPH_MEL").is_none() {
-        let on_cpu = matches!(svod_dtype::default_device::default_device(), svod_dtype::DeviceSpec::Cpu);
-        assert_eq!(crate::audio::use_graph_mel(), !on_cpu);
-    }
+    assert_gigaam_parity(&[&clip, &clip[16000 / 2..16000 + 321]], "ru_clip_0");
+    assert_whisper_parity(&[&clip], "ru_clip_0");
 }

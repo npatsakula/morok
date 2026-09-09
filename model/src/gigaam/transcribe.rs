@@ -25,7 +25,7 @@ use svod_tensor::PrepareConfig;
 
 pub use svod_arch::rnnt::Word;
 
-use crate::audio::{EncoderBounds, MelConfig, MelJit, MelSpectrogram, use_graph_mel};
+use crate::audio::{EncoderBounds, MelConfig, MelJit, MelSpectrogram};
 use crate::gigaam::ctc::GigaAmCtcJit;
 use crate::gigaam::jit::GigaAmEncoderJit;
 use crate::gigaam::model::{GigaAm, Head};
@@ -205,9 +205,9 @@ pub enum TranscribeError {
 pub struct GigaAmTranscriber {
     model: GigaAm,
     mel: MelSpectrogram,
-    /// Graph front-end (see [`use_graph_mel`]); `None` runs `realfft` on the
-    /// host and packs through the encoder's host mapping.
-    mel_jit: Option<MelJit>,
+    /// Graph front-end over host-framed windows; its device output feeds the
+    /// encoder's mel input.
+    mel_jit: MelJit,
     /// Host staging for the mel JIT's device-local `[max_batch, framed_len]`
     /// input: one `copyin` per batch instead of kernels reading pinned host
     /// memory over the bus.
@@ -232,7 +232,7 @@ impl GigaAmTranscriber {
             n_mels: model.config.n_mels,
             center: model.config.mel_center,
             mel_scale: crate::audio::MelScale::Htk,
-        })?;
+        });
 
         let subsampling_factor = model.config.subsampling_factor;
         let hop_length = model.config.hop_length;
@@ -261,28 +261,21 @@ impl GigaAmTranscriber {
         let max_batch = max_batch_by_memory.min(model.config.max_batch_size);
 
         let prepare_config = PrepareConfig::from_env();
-        let graph_mel = use_graph_mel();
-        // Graph mel keeps the encoder's mel input device-local: it is only ever
-        // written by an on-device copy from the mel JIT's output.
-        let mel_spec = InputSpec::f32(&[max_batch, model.config.n_mels, max_t_mel]);
-        let mel_spec = if graph_mel { mel_spec.device_local() } else { mel_spec };
+        // The encoder's mel input is device-local: it is only ever written by
+        // an on-device copy from the mel JIT's output.
+        let mel_spec = InputSpec::f32(&[max_batch, model.config.n_mels, max_t_mel]).device_local();
         let lengths_spec = InputSpec::i32(&[max_batch]);
         // Framed rows long enough for exactly `max_t_mel` frames.
         let framed_len = (max_t_mel - 1) * hop_length + model.config.n_fft;
-        let mel_jit = graph_mel
-            .then(|| {
-                let mut jit = MelJit::new(mel.clone());
-                scoped("mel", || {
-                    jit.prepare_with_config(
-                        InputSpec::f32(&[max_batch, framed_len]).device_local(),
-                        InputSpec::i32(&[max_batch]),
-                        &PrepareConfig::device_local(),
-                    )
-                })
-                .map(|()| jit)
-            })
-            .transpose()?;
-        let framed = vec![0.0f32; if graph_mel { max_batch * framed_len } else { 0 }];
+        let mut mel_jit = MelJit::new(mel.clone());
+        scoped("mel", || {
+            mel_jit.prepare_with_config(
+                InputSpec::f32(&[max_batch, framed_len]).device_local(),
+                InputSpec::i32(&[max_batch]),
+                &PrepareConfig::device_local(),
+            )
+        })?;
+        let framed = vec![0.0f32; max_batch * framed_len];
 
         // The standalone encoder JIT exists only for the RN-T path (it shares
         // the encoder with the predictor/joint step JITs). CTC fuses the
@@ -364,7 +357,6 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
             return Ok((Vec::new(), profile.then(RunProfile::default)));
         }
 
-        let n_mels = self.mel.n_mels();
         let sample_rate_hz = self.model.config.sample_rate;
         let d_model = self.model.config.d_model;
         let subs_kernel_size = match self.model.config.subsampling_mode {
@@ -379,7 +371,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
 
         let mel_lens: Vec<usize> = windows.iter().map(|w| self.mel.num_frames(w.len())).collect();
         // A window longer than the JIT was sized for would overrun the mel
-        // buffer in `pack_mel_buffer`; fail cleanly instead. `Asr::assemble`
+        // JIT's framed rows; fail cleanly instead. `Asr::assemble`
         // sizes the transcriber from the splitter, so this never fires there —
         // it guards a hand-mismatched splitter/transcriber pair.
         if let Some(&mel_frames) = mel_lens.iter().find(|&&m| m > max_t_mel) {
@@ -401,43 +393,18 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
             let b = (num_chunks - chunk_batch_start).min(max_batch);
             let chunk_lengths: Vec<usize> = (0..b).map(|bi| mel_lens[chunk_batch_start + bi]).collect();
 
+            // Frame the windows on the host, upload them to the mel JIT's
+            // device-local input and run it; the output is copied to the
+            // encoder on-device.
             let t_stage = Instant::now();
-            let batch_mels = match &mut self.mel_jit {
-                Some(mel_jit) => {
-                    // Graph path: frame the windows, upload them to the mel
-                    // JIT's device-local input and run it; the output is
-                    // copied to the encoder on-device.
-                    let framed_len = self.framed.len() / max_batch;
-                    for (bi, row) in self.framed.chunks_mut(framed_len).take(b).enumerate() {
-                        self.mel.frame_into(windows[chunk_batch_start + bi], row);
-                    }
-                    mel_jit.framed_mut()?.copyin(bytemuck::cast_slice(&self.framed))?;
-                    pack_lengths_buffer(mel_jit.frames_view_mut::<i32>()?, &chunk_lengths);
-                    mel_jit.execute()?;
-                    MelBatch::Device(mel_jit.output()?)
-                }
-                None => {
-                    // Chunks are independent and `forward_into` is `&self` over
-                    // shared read-only state — parallelize the batch; output is
-                    // bit-identical to the serial loop.
-                    use rayon::prelude::*;
-                    let mel = &self.mel;
-                    MelBatch::Host(
-                        (0..b)
-                            .into_par_iter()
-                            .map(|bi| {
-                                let valid = mel_lens[chunk_batch_start + bi];
-                                let mut chunk_mel = ndarray::Array3::<f32>::zeros((1, n_mels, valid));
-                                {
-                                    let mut view = chunk_mel.view_mut().into_dyn();
-                                    mel.forward_into(windows[chunk_batch_start + bi], &mut view);
-                                }
-                                chunk_mel.as_slice().expect("contiguous chunk mel").to_vec()
-                            })
-                            .collect(),
-                    )
-                }
-            };
+            let framed_len = self.framed.len() / max_batch;
+            for (bi, row) in self.framed.chunks_mut(framed_len).take(b).enumerate() {
+                self.mel.frame_into(windows[chunk_batch_start + bi], row);
+            }
+            self.mel_jit.framed_mut()?.copyin(bytemuck::cast_slice(&self.framed))?;
+            pack_lengths_buffer(self.mel_jit.frames_view_mut::<i32>()?, &chunk_lengths);
+            self.mel_jit.execute()?;
+            let batch_mels = self.mel_jit.output()?;
             t_mel += t_stage.elapsed();
 
             // CTC's `GigaAmCtcJit` is the fused encoder+head (log-probs, no host
@@ -445,7 +412,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
             match &mut self.head_decoder {
                 HeadDecoder::Ctc { jit, decoder } => {
                     let t_pack = Instant::now();
-                    batch_mels.feed(jit.mel_mut()?, &chunk_lengths, n_mels, max_t_mel)?;
+                    jit.mel_mut()?.copy_from(batch_mels)?;
                     pack_lengths_buffer(jit.lengths_view_mut::<i32>()?, &chunk_lengths);
                     t_mel += t_pack.elapsed();
 
@@ -485,7 +452,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                 HeadDecoder::Rnnt { .. } => {
                     let enc_jit = self.encoder_jit.as_mut().expect("RN-T path has a standalone encoder JIT");
                     let t_pack = Instant::now();
-                    batch_mels.feed(enc_jit.mel_mut()?, &chunk_lengths, n_mels, max_t_mel)?;
+                    enc_jit.mel_mut()?.copy_from(batch_mels)?;
                     pack_lengths_buffer(enc_jit.lengths_view_mut::<i32>()?, &chunk_lengths);
                     t_mel += t_pack.elapsed();
 
@@ -578,57 +545,6 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
         }
 
         Ok((transcripts, prof))
-    }
-}
-
-/// One encode batch's mel features, wherever they were computed.
-enum MelBatch<'a> {
-    /// The mel JIT's `[max_batch, n_mels, max_t_mel]` device output.
-    Device(&'a svod_device::Buffer),
-    /// Host `[n_mels, chunk_lengths[bi]]` blocks, one per chunk.
-    Host(Vec<Vec<f32>>),
-}
-
-impl MelBatch<'_> {
-    /// Deliver the batch into an encoder JIT's mel input: on-device copy for
-    /// the graph path, host packing for the `realfft` path.
-    fn feed(
-        &self,
-        dst: &mut svod_device::Buffer,
-        chunk_lengths: &[usize],
-        n_mels: usize,
-        max_t_mel: usize,
-    ) -> Result<(), TranscribeError> {
-        match self {
-            Self::Device(src) => Ok(dst.copy_from(src)?),
-            Self::Host(batch_mels) => {
-                pack_mel_buffer(svod_tensor::jit::view_mut::<f32>(dst)?, batch_mels, chunk_lengths, n_mels, max_t_mel);
-                Ok(())
-            }
-        }
-    }
-}
-
-/// Pack per-chunk mel features into a JIT mel input view
-/// `[max_batch, n_mels, max_t_mel]`, zero-padding unused rows/columns.
-/// `batch_mels[bi]` is a tight `[n_mels, chunk_lengths[bi]]` block; the row
-/// stride differs between source and destination, so the copy stays explicit.
-fn pack_mel_buffer(
-    mut view: ndarray::ArrayViewMutD<'_, f32>,
-    batch_mels: &[Vec<f32>],
-    chunk_lengths: &[usize],
-    n_mels: usize,
-    max_t_mel: usize,
-) {
-    let slice = view.as_slice_mut().expect("contiguous mel buffer");
-    slice.fill(0.0);
-    for (bi, &valid) in chunk_lengths.iter().enumerate() {
-        let chunk_mel = &batch_mels[bi];
-        for mel_bin in 0..n_mels {
-            let src = mel_bin * valid;
-            let dst = ((bi * n_mels) + mel_bin) * max_t_mel;
-            slice[dst..dst + valid].copy_from_slice(&chunk_mel[src..src + valid]);
-        }
     }
 }
 

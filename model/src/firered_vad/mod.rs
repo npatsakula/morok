@@ -2,10 +2,11 @@
 //!
 //! The DFSMN is purely feed-forward — the "memory" layers are depthwise
 //! convolutions over time, not recurrent state — so the **entire** model runs
-//! as one batched device JIT; the host only extracts fbank features and
-//! stitches window probabilities. The FSMN lookback/lookahead use asymmetric
-//! conv padding instead of the reference's symmetric-pad-then-slice (verified
-//! bit-identical by `scripts/convert_firered_vad.py --selfcheck`).
+//! as one batched device JIT behind a graph fbank; the host only stages
+//! samples and stitches window probabilities. The FSMN lookback/lookahead
+//! use asymmetric conv padding instead of the reference's
+//! symmetric-pad-then-slice (verified bit-identical by
+//! `scripts/convert_firered_vad.py --selfcheck`).
 //!
 //! Two variants ship: the non-streaming model below (lookback + lookahead,
 //! whole-utterance windowed inference behind [`FireRedVadSplitter`]) and the
@@ -23,7 +24,7 @@ mod fbank;
 mod splitter;
 mod stream;
 
-pub use fbank::FireRedFbank;
+pub use fbank::{FireRedFbank, KaldiFbank};
 pub use splitter::{FireRedVadSplitter, FireRedVadSplitterError};
 pub use stream::{
     FireRedVadStream, FireRedVadStreamError, FireRedVadStreamer, StreamFlush, StreamVadConfig, StreamVadPostprocessor,
@@ -296,26 +297,63 @@ impl FireRedVadInference {
         use crate::jit::InputSpec;
         let mut jit = FireRedVadJit::new(model);
         jit.prepare_with_config(
-            InputSpec::f32(&[BATCH, CHUNK_T, N_MELS]),
+            InputSpec::f32(&[BATCH, CHUNK_T, N_MELS]).device_local(),
             InputSpec::f32(&[BATCH, CHUNK_T, 1]),
             &svod_tensor::PrepareConfig::device_local(),
         )?;
         Ok(Self { jit })
     }
 
+    /// First frame of window `w` (negative at the true start: the leading
+    /// halo reads zeros) and the row span `src_lo..src_hi` of real frames it
+    /// holds at row offset `dst_lo`.
+    fn span(w: usize, n_frames: usize) -> (isize, usize, usize, usize) {
+        let start = (w * CORE) as isize - HALO as isize;
+        let src_lo = start.max(0) as usize;
+        let src_hi = (start + CHUNK_T as isize).min(n_frames as isize) as usize;
+        (start, src_lo, src_hi, (src_lo as isize - start) as usize)
+    }
+
     /// Speech probabilities for a pre-CMVN fbank `feat` (row-major
-    /// `[n_frames, N_MELS]`), one per frame. Frames are packed into
-    /// `CHUNK_T`-frame windows advancing by `CORE`; each window is padded
-    /// with `HALO` frames of neighbour context (zeros past the true edges,
-    /// matching the conv zero-padding a full-length forward would see), and
-    /// only the core region is kept — so the stitched result equals a
-    /// single full-length forward up to float reassociation.
+    /// `[n_frames, N_MELS]`), one per frame — the host-feature entry point;
+    /// [`FireRedVadProbs`] feeds the fbank JIT's output on-device instead.
     pub fn probs(&mut self, feat: &[f32], n_frames: usize) -> crate::jit::Result<Vec<f32>> {
         debug_assert_eq!(feat.len(), n_frames * N_MELS, "feat shape");
-        if n_frames == 0 {
-            return Ok(Vec::new());
-        }
+        let mut rows = vec![0.0f32; BATCH * CHUNK_T * N_MELS];
+        self.run(n_frames, |jit, done, b| {
+            rows.fill(0.0);
+            for (i, row) in rows.chunks_mut(CHUNK_T * N_MELS).take(b).enumerate() {
+                let (_, src_lo, src_hi, dst_lo) = Self::span(done + i, n_frames);
+                row[dst_lo * N_MELS..(dst_lo + src_hi - src_lo) * N_MELS]
+                    .copy_from_slice(&feat[src_lo * N_MELS..src_hi * N_MELS]);
+            }
+            Ok(jit.feat_mut()?.copyin(bytemuck::cast_slice(&rows))?)
+        })
+    }
 
+    /// Speech probabilities of a `[-1, 1]` waveform: each window's frames come
+    /// straight from `fbank` (a `[BATCH, CHUNK_T]` JIT) and are copied into
+    /// the model's input on-device.
+    pub fn probs_from_samples(&mut self, fbank: &mut FireRedFbank, waveform: &[f32]) -> crate::jit::Result<Vec<f32>> {
+        let n_frames = fbank.num_frames(waveform.len());
+        self.run(n_frames, |jit, done, b| {
+            let firsts: Vec<isize> = (0..b).map(|i| Self::span(done + i, n_frames).0).collect();
+            Ok(jit.feat_mut()?.copy_from(fbank.forward_windows(waveform, &firsts)?)?)
+        })
+    }
+
+    /// Windowed inference: frames are packed into `CHUNK_T`-frame windows
+    /// advancing by `CORE`, each padded with `HALO` frames of neighbour
+    /// context (zeros past the true edges, matching the conv zero-padding a
+    /// full-length forward would see), and only the core region is kept — so
+    /// the stitched result equals a single full-length forward up to float
+    /// reassociation. `load(jit, first_window, b)` fills the batch's feat
+    /// rows; the valid mask and the stitching are shared.
+    fn run(
+        &mut self,
+        n_frames: usize,
+        mut load: impl FnMut(&mut FireRedVadJit, usize, usize) -> crate::jit::Result<()>,
+    ) -> crate::jit::Result<Vec<f32>> {
         let n_windows = n_frames.div_ceil(CORE);
         let mut probs = vec![0.0f32; n_frames];
         let mut out = vec![0.0f32; BATCH * CHUNK_T];
@@ -323,31 +361,13 @@ impl FireRedVadInference {
         let mut done = 0usize;
         while done < n_windows {
             let b = (n_windows - done).min(BATCH);
-            // Window start in frame coords (negative at the true start) and
-            // the row span holding real frames.
-            let span = |i: usize| {
-                let start = ((done + i) * CORE) as isize - HALO as isize;
-                let src_lo = start.max(0) as usize;
-                let src_hi = (start + CHUNK_T as isize).min(n_frames as isize) as usize;
-                (src_lo, src_hi, (src_lo as isize - start) as usize)
-            };
-            {
-                let mut view = self.jit.feat_view_mut::<f32>()?;
-                let slice = view.as_slice_mut().expect("contiguous feat");
-                slice[..b * CHUNK_T * N_MELS].fill(0.0);
-                for i in 0..b {
-                    let (src_lo, src_hi, dst_lo) = span(i);
-                    let dst = &mut slice[i * CHUNK_T * N_MELS..];
-                    dst[dst_lo * N_MELS..(dst_lo + src_hi - src_lo) * N_MELS]
-                        .copy_from_slice(&feat[src_lo * N_MELS..src_hi * N_MELS]);
-                }
-            }
+            load(&mut self.jit, done, b)?;
             {
                 let mut view = self.jit.valid_view_mut::<f32>()?;
                 let slice = view.as_slice_mut().expect("contiguous valid");
-                slice[..b * CHUNK_T].fill(0.0);
+                slice.fill(0.0);
                 for i in 0..b {
-                    let (src_lo, src_hi, dst_lo) = span(i);
+                    let (_, src_lo, src_hi, dst_lo) = Self::span(done + i, n_frames);
                     slice[i * CHUNK_T + dst_lo..i * CHUNK_T + dst_lo + (src_hi - src_lo)].fill(1.0);
                 }
             }
@@ -369,7 +389,7 @@ impl FireRedVadInference {
 /// FireRedVAD's `VadPostprocessor` default.
 pub(crate) const DEFAULT_SMOOTH_WINDOW: usize = 5;
 
-/// Waveform-level FireRedVAD: host fbank → device DFSMN → trailing smoothing,
+/// Waveform-level FireRedVAD: fbank JIT → DFSMN JIT → trailing smoothing,
 /// yielding one speech probability per [`FRAME_SHIFT`] samples. Implements
 /// [`Vad`](svod_arch::pipelines::audio::Vad), so the arch
 /// [`VadSplitter`](svod_arch::pipelines::audio::VadSplitter) (assembled by
@@ -384,7 +404,7 @@ impl FireRedVadProbs {
     /// Wrap a loaded model into the waveform→probs front-end. `smooth_window`
     /// is the trailing moving-average span ([`DEFAULT_SMOOTH_WINDOW`] upstream).
     pub fn new(model: FireRedVad, smooth_window: usize) -> crate::jit::Result<Self> {
-        Ok(Self { fbank: FireRedFbank::new(), vad: FireRedVadInference::new(model)?, smooth_window })
+        Ok(Self { fbank: FireRedFbank::new(BATCH, CHUNK_T)?, vad: FireRedVadInference::new(model)?, smooth_window })
     }
 }
 
@@ -396,9 +416,7 @@ impl svod_arch::pipelines::audio::Vad for FireRedVadProbs {
     }
 
     fn probs(&mut self, waveform: &[f32]) -> std::result::Result<Vec<f32>, Self::Error> {
-        let feat = self.fbank.forward(waveform);
-        let n_frames = feat.len() / N_MELS;
-        let probs = self.vad.probs(&feat, n_frames)?;
+        let probs = self.vad.probs_from_samples(&mut self.fbank, waveform)?;
         Ok(smooth_trailing(&probs, self.smooth_window))
     }
 }
