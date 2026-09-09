@@ -290,6 +290,9 @@ jit_wrapper! {
 
 pub struct FireRedVadInference {
     jit: FireRedVadJit,
+    /// `[BATCH, CHUNK_T, N_MELS]` host staging for [`probs`](Self::probs):
+    /// one `copyin` of the filled rows per batch.
+    staging: Vec<f32>,
 }
 
 impl FireRedVadInference {
@@ -301,7 +304,7 @@ impl FireRedVadInference {
             InputSpec::f32(&[BATCH, CHUNK_T, 1]),
             &svod_tensor::PrepareConfig::device_local(),
         )?;
-        Ok(Self { jit })
+        Ok(Self { jit, staging: vec![0.0; BATCH * CHUNK_T * N_MELS] })
     }
 
     /// First frame of window `w` (negative at the true start: the leading
@@ -319,15 +322,16 @@ impl FireRedVadInference {
     /// [`FireRedVadProbs`] feeds the fbank JIT's output on-device instead.
     pub fn probs(&mut self, feat: &[f32], n_frames: usize) -> crate::jit::Result<Vec<f32>> {
         debug_assert_eq!(feat.len(), n_frames * N_MELS, "feat shape");
-        let mut rows = vec![0.0f32; BATCH * CHUNK_T * N_MELS];
-        self.run(n_frames, |jit, done, b| {
+        let staging = &mut self.staging;
+        Self::run(&mut self.jit, n_frames, |jit, done, b| {
+            let rows = &mut staging[..b * CHUNK_T * N_MELS];
             rows.fill(0.0);
-            for (i, row) in rows.chunks_mut(CHUNK_T * N_MELS).take(b).enumerate() {
+            for (i, row) in rows.chunks_mut(CHUNK_T * N_MELS).enumerate() {
                 let (_, src_lo, src_hi, dst_lo) = Self::span(done + i, n_frames);
                 row[dst_lo * N_MELS..(dst_lo + src_hi - src_lo) * N_MELS]
                     .copy_from_slice(&feat[src_lo * N_MELS..src_hi * N_MELS]);
             }
-            Ok(jit.feat_mut()?.copyin(bytemuck::cast_slice(&rows))?)
+            Ok(jit.feat_mut()?.copyin_at(0, bytemuck::cast_slice(rows))?)
         })
     }
 
@@ -335,10 +339,19 @@ impl FireRedVadInference {
     /// straight from `fbank` (a `[BATCH, CHUNK_T]` JIT) and are copied into
     /// the model's input on-device.
     pub fn probs_from_samples(&mut self, fbank: &mut FireRedFbank, waveform: &[f32]) -> crate::jit::Result<Vec<f32>> {
+        let shape = (fbank.batch(), fbank.capacity());
+        fbank::check(
+            shape == (BATCH, CHUNK_T),
+            "FireRedVadInference::probs_from_samples",
+            "fbank (batch, capacity)",
+            format!("{shape:?}"),
+            "FireRedFbank::new(BATCH, CHUNK_T)",
+        )?;
         let n_frames = fbank.num_frames(waveform.len());
-        self.run(n_frames, |jit, done, b| {
+        Self::run(&mut self.jit, n_frames, |jit, done, b| {
             let firsts: Vec<isize> = (0..b).map(|i| Self::span(done + i, n_frames).0).collect();
-            Ok(jit.feat_mut()?.copy_from(fbank.forward_windows(waveform, &firsts)?)?)
+            let windows = fbank.forward_windows(waveform, &firsts)?;
+            Ok(jit.feat_mut()?.copy_region_from(0, windows, 0, b * CHUNK_T * N_MELS * size_of::<f32>())?)
         })
     }
 
@@ -347,10 +360,12 @@ impl FireRedVadInference {
     /// context (zeros past the true edges, matching the conv zero-padding a
     /// full-length forward would see), and only the core region is kept — so
     /// the stitched result equals a single full-length forward up to float
-    /// reassociation. `load(jit, first_window, b)` fills the batch's feat
-    /// rows; the valid mask and the stitching are shared.
+    /// reassociation. `load(jit, first_window, b)` fills the batch's first
+    /// `b` feat rows; the valid mask and the stitching are shared. Rows past
+    /// `b` are stale, and neither read back nor mixed into the real rows —
+    /// every op in the graph is per row.
     fn run(
-        &mut self,
+        jit: &mut FireRedVadJit,
         n_frames: usize,
         mut load: impl FnMut(&mut FireRedVadJit, usize, usize) -> crate::jit::Result<()>,
     ) -> crate::jit::Result<Vec<f32>> {
@@ -361,9 +376,9 @@ impl FireRedVadInference {
         let mut done = 0usize;
         while done < n_windows {
             let b = (n_windows - done).min(BATCH);
-            load(&mut self.jit, done, b)?;
+            load(jit, done, b)?;
             {
-                let mut view = self.jit.valid_view_mut::<f32>()?;
+                let mut view = jit.valid_view_mut::<f32>()?;
                 let slice = view.as_slice_mut().expect("contiguous valid");
                 slice.fill(0.0);
                 for i in 0..b {
@@ -371,8 +386,8 @@ impl FireRedVadInference {
                     slice[i * CHUNK_T + dst_lo..i * CHUNK_T + dst_lo + (src_hi - src_lo)].fill(1.0);
                 }
             }
-            self.jit.execute()?;
-            self.jit.output()?.copyout_prefix(bytemuck::cast_slice_mut(&mut out[..b * CHUNK_T]))?;
+            jit.execute()?;
+            jit.output()?.copyout_prefix(bytemuck::cast_slice_mut(&mut out[..b * CHUNK_T]))?;
             for i in 0..b {
                 let core_lo = (done + i) * CORE;
                 let core_len = CORE.min(n_frames - core_lo);

@@ -4,7 +4,8 @@
 //! pre-emphasis 0.97, Povey window, power spectrum over a 512-point FFT,
 //! triangular mel bins on `1127·ln(1 + f/700)` between 20 Hz and Nyquist,
 //! natural log floored at `f32::EPSILON` — [`Tensor::mel_spectrogram`] with
-//! its Kaldi options (`preemphasis`, `remove_dc`, Kaldi's own `filterbank`).
+//! its Kaldi options (`preemphasis`, `remove_dc`, the symmetric `Povey`
+//! window, Kaldi's own `filterbank`).
 //!
 //! Kaldi left-aligns its 400-sample window in the 512-point frame, where the
 //! transform centers a short window [`CENTERING`] samples in; prepending that
@@ -12,8 +13,9 @@
 //! `snip_edges` is `center = false` with Kaldi's frame count, which is the
 //! convolution's: `1 + (L - 400) / 160`.
 
-use svod_dtype::DType;
+use snafu::ensure;
 use svod_macros::jit_wrapper;
+use svod_tensor::error::ParamRangeSnafu;
 use svod_tensor::nn::{MelLog, Window};
 use svod_tensor::{PrepareConfig, Tensor};
 
@@ -34,16 +36,19 @@ const PREEMPH: f64 = 0.97;
 /// pre-CMVN log-mel rows, `T = 1 + (L - FRAME_LENGTH) / FRAME_SHIFT`.
 #[derive(Clone)]
 pub struct KaldiFbank {
-    /// Kaldi's symmetric Povey window.
-    window: Vec<f32>,
     /// Kaldi's `[N_MELS, N_BINS]` mel banks.
     banks: Vec<f32>,
 }
 
+impl Default for KaldiFbank {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KaldiFbank {
-    pub fn new() -> svod_tensor::error::Result<Self> {
-        let window = Tensor::window(&Window::Povey, FRAME_LENGTH, false, DType::Float32)?.to_vec::<f32>()?;
-        Ok(Self { window, banks: kaldi_mel_banks() })
+    pub fn new() -> Self {
+        Self { banks: kaldi_mel_banks() }
     }
 
     /// `snip_edges` frame count: only complete 25 ms windows produce a frame.
@@ -54,7 +59,7 @@ impl KaldiFbank {
     /// Samples `frames` frames read: the window is zero past `FRAME_LENGTH`,
     /// but the transform frames `N_FFT` samples.
     pub fn samples(frames: usize) -> usize {
-        (frames - 1) * FRAME_SHIFT + N_FFT
+        frames.checked_sub(1).map_or(0, |last| last * FRAME_SHIFT + N_FFT)
     }
 
     /// `[B, L]` -> `[B, T, N_MELS]`, `L` covering [`samples`](Self::samples)`(T)`.
@@ -67,7 +72,8 @@ impl KaldiFbank {
             .n_fft(N_FFT)
             .hop(FRAME_SHIFT)
             .win_length(FRAME_LENGTH)
-            .window(Window::Custom(Tensor::from_slice(self.window.clone())))
+            .window(Window::Povey)
+            .periodic(false)
             .center(false)
             .preemphasis(PREEMPH)
             .remove_dc(true)
@@ -101,6 +107,19 @@ fn kaldi_mel_banks() -> Vec<f32> {
     table
 }
 
+/// `constraint` on a caller-supplied size the prepared JIT shape cannot bend
+/// to, as a tensor parameter error (`?` lifts it into the JIT's).
+pub(super) fn check(
+    ok: bool,
+    op: &'static str,
+    param: &'static str,
+    value: impl ToString,
+    constraint: &'static str,
+) -> svod_tensor::error::Result<()> {
+    ensure!(ok, ParamRangeSnafu { op, param, value: value.to_string(), constraint });
+    Ok(())
+}
+
 jit_wrapper! {
     KaldiFbankJit(KaldiFbank) {
         samples: Tensor,
@@ -118,21 +137,32 @@ jit_wrapper! {
 /// through the host on that path.
 pub struct FireRedFbank {
     jit: KaldiFbankJit,
-    /// `[batch, samples(capacity)]` host staging for the device-local input:
-    /// one `copyin` per execute.
+    /// `[batch, row]` host staging for the device-local input, `row` the
+    /// samples of `capacity` frames: one `copyin` of the filled rows per
+    /// execute.
     staging: Vec<f32>,
-    batch: usize,
+    row: usize,
     capacity: usize,
 }
 
 impl FireRedFbank {
     /// Prepare the JIT for `batch` windows of `capacity` frames per execute.
     pub fn new(batch: usize, capacity: usize) -> crate::jit::Result<Self> {
-        assert!(batch >= 1 && capacity >= 1, "fbank batch and capacity must be >= 1");
-        let mut jit = KaldiFbankJit::new(KaldiFbank::new()?);
+        check(
+            batch >= 1 && capacity >= 1,
+            "FireRedFbank::new",
+            "(batch, capacity)",
+            format!("({batch}, {capacity})"),
+            "both >= 1",
+        )?;
+        let mut jit = KaldiFbankJit::new(KaldiFbank::new());
         let row = KaldiFbank::samples(capacity);
         jit.prepare_with_config(InputSpec::f32(&[batch, row]).device_local(), &PrepareConfig::device_local())?;
-        Ok(Self { jit, staging: vec![0.0; batch * row], batch, capacity })
+        Ok(Self { jit, staging: vec![0.0; batch * row], row, capacity })
+    }
+
+    pub fn batch(&self) -> usize {
+        self.staging.len() / self.row
     }
 
     pub fn capacity(&self) -> usize {
@@ -144,26 +174,34 @@ impl FireRedFbank {
     }
 
     /// One execute: row `i` holds the `capacity` frames of `waveform` from
-    /// frame `first_frames[i]` on (frames outside the waveform read zeros),
-    /// rows past `first_frames.len()` are silence. Returns the
-    /// `[batch, capacity, N_MELS]` output buffer.
+    /// frame `first_frames[i]` on (frames outside the waveform read zeros).
+    /// Returns the `[batch, capacity, N_MELS]` output buffer; rows past
+    /// `first_frames.len()` are stale.
     pub fn forward_windows(
         &mut self,
         waveform: &[f32],
         first_frames: &[isize],
     ) -> crate::jit::Result<&svod_device::Buffer> {
-        assert!(first_frames.len() <= self.batch, "more windows than the fbank batch");
-        let row_len = KaldiFbank::samples(self.capacity);
-        self.staging.fill(0.0);
+        let (windows, batch) = (first_frames.len(), self.batch());
+        check(
+            windows <= batch,
+            "FireRedFbank::forward_windows",
+            "windows",
+            format!("{windows} (batch {batch})"),
+            "<= batch",
+        )?;
         let len = waveform.len() as isize;
-        for (row, &first) in self.staging.chunks_mut(row_len).zip(first_frames) {
+        for (row, &first) in self.staging.chunks_mut(self.row).zip(first_frames) {
             let start = first * FRAME_SHIFT as isize;
-            let (lo, hi) = (start.clamp(0, len), (start + row_len as isize).clamp(0, len));
-            if lo < hi {
-                row[(lo - start) as usize..][..(hi - lo) as usize].copy_from_slice(&waveform[lo as usize..hi as usize]);
-            }
+            let (lo, hi) = (start.clamp(0, len), (start + self.row as isize).clamp(0, len));
+            let head = (lo - start).clamp(0, self.row as isize) as usize;
+            let tail = head + (hi - lo) as usize;
+            row[..head].fill(0.0);
+            row[head..tail].copy_from_slice(&waveform[lo as usize..hi as usize]);
+            row[tail..].fill(0.0);
         }
-        self.jit.samples_mut()?.copyin(bytemuck::cast_slice(&self.staging))?;
+        let filled = &self.staging[..windows * self.row];
+        self.jit.samples_mut()?.copyin_at(0, bytemuck::cast_slice(filled))?;
         self.jit.execute()?;
         self.jit.output()
     }
@@ -174,10 +212,10 @@ impl FireRedFbank {
     /// execute.
     pub fn forward(&mut self, waveform: &[f32]) -> crate::jit::Result<Vec<f32>> {
         let mut feat = vec![0.0f32; KaldiFbank::num_frames(waveform.len()) * N_MELS];
-        let block = self.batch * self.capacity;
+        let block = self.batch() * self.capacity;
         for (k, rows) in feat.chunks_mut(block * N_MELS).enumerate() {
             let windows = (rows.len() / N_MELS).div_ceil(self.capacity);
-            let firsts: Vec<isize> = (0..windows).map(|i| ((k * self.batch + i) * self.capacity) as isize).collect();
+            let firsts: Vec<isize> = (0..windows).map(|i| ((k * self.batch() + i) * self.capacity) as isize).collect();
             self.forward_windows(waveform, &firsts)?.copyout_prefix(bytemuck::cast_slice_mut(rows))?;
         }
         Ok(feat)

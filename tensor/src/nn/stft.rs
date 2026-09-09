@@ -24,8 +24,9 @@
 //! - `F = n_fft / 2 + 1` when `onesided` (the default), else `n_fft`.
 //! - `T = (L' - n_fft) / hop + 1`, where `L'` is `L + n_fft` under
 //!   `center` (reflect padding of `n_fft / 2` on both sides) and `L` otherwise.
-//! - `window` is periodic (`torch.hann_window(periodic=true)`); a
-//!   `win_length` below `n_fft` is zero-padded symmetrically, as torch does.
+//! - `window` is periodic (`torch.hann_window(periodic=true)`) unless
+//!   `periodic(false)` asks for the symmetric form Kaldi uses; a `win_length`
+//!   below `n_fft` is zero-padded symmetrically, as torch does.
 //! - `normalized` scales the forward transform by `1 / sqrt(n_fft)`.
 //!
 //! The complex helpers ([`magnitude`](Tensor::magnitude),
@@ -87,10 +88,11 @@ const BIN_ALIGN: usize = 8;
 
 /// Analysis window for [`Tensor::stft`] / [`Tensor::istft`].
 ///
-/// The named windows are the periodic (`torch.*_window(periodic=true)`) forms
-/// when built through [`Tensor::window`] with `periodic = true`; `Custom`
-/// carries an explicit `[n]` tensor, which is used as is (a GTCRN-style
-/// `hann_window(n).sqrt()`, say).
+/// The named windows are cosine sums whose denominator `d` the `periodic`
+/// flag picks — `n` (`torch.*_window(periodic=true)`) or `n - 1` (the
+/// symmetric form, Kaldi's) — on [`Tensor::window`] and on the transforms'
+/// builders alike; `Custom` carries an explicit `[n]` tensor, which is used
+/// as is (a GTCRN-style `hann_window(n).sqrt()`, say).
 #[derive(Clone, Default)]
 pub enum Window {
     /// All ones — no tapering.
@@ -129,6 +131,22 @@ impl Window {
             _ => None,
         }
     }
+
+    /// `d` of the cosine-sum form: `n` (DFT-even) or `n - 1` (symmetric).
+    const fn denominator(n: usize, periodic: bool) -> usize {
+        if periodic || n == 1 { n } else { n - 1 }
+    }
+}
+
+/// A `Custom` window must be exactly `[n]`; the graph and host paths both
+/// check it here, so a `[1, n]` tensor is rejected whether or not it is
+/// realized.
+fn ensure_custom_shape(w: &Tensor, n: usize) -> Result<()> {
+    let ndim = w.ndim()?;
+    ensure!(ndim == 1, NdimExactSnafu { op: "window", expected: 1_usize, actual: ndim });
+    let len = w.dim_const(0)?;
+    ensure!(len == n, ShapeMismatchSnafu { context: "window", expected: format!("[{n}]"), actual: format!("[{len}]") });
+    Ok(())
 }
 
 impl Tensor {
@@ -154,21 +172,14 @@ impl Tensor {
         ensure!(n > 0, ParamRangeSnafu { op: "window", param: "n", value: n.to_string(), constraint: "> 0" });
         match kind {
             Window::Custom(w) => {
-                let ndim = w.ndim()?;
-                ensure!(ndim == 1, NdimExactSnafu { op: "window", expected: 1_usize, actual: ndim });
-                let len = w.dim_const(0)?;
-                ensure!(
-                    len == n,
-                    ShapeMismatchSnafu { context: "window", expected: format!("[{n}]"), actual: format!("[{len}]") }
-                );
+                ensure_custom_shape(w, n)?;
                 Ok(w.cast(dtype))
             }
             Window::Rectangular => Ok(Tensor::ones(&[n], dtype)),
             cosine => {
                 let (a0, a1, p) = cosine.cosine_sum().expect("Rectangular and Custom handled above");
-                let denom = if periodic || n == 1 { n } else { n - 1 };
                 let k = Tensor::arange_f64(0.0, n as f64, 1.0, DType::Float32)?;
-                let phase = k.try_mul(TAU / denom as f64)?;
+                let phase = k.try_mul(TAU / Window::denominator(n, periodic) as f64)?;
                 let w = phase.cos()?.try_mul(-a1)?.try_add(a0)?;
                 Ok(if p == 1.0 { w } else { w.try_pow(p)? }.cast(dtype))
             }
@@ -329,10 +340,7 @@ impl Tensor {
         ensure!(f_min >= 0.0, ParamRangeSnafu { op, param: "f_min", value: f_min.to_string(), constraint: ">= 0" });
         ensure!(f_max > f_min, ParamRangeSnafu { op, param: "f_max", value: f_max.to_string(), constraint: "> f_min" });
         ensure!(dtype.is_float(), FloatDTypeRequiredSnafu { op, arg: "dtype", dtype: dtype.clone() });
-        let table = mel_table(sample_rate, n_fft, n_mels, f_min, f_max, scale, norm, cols);
-        let array = ndarray::Array2::from_shape_vec((n_mels, cols), table).expect("table matches its shape");
-        let fb = Tensor::from_ndarray(&array);
-        Ok(if dtype == DType::Float32 { fb } else { fb.cast(dtype) })
+        upload(mel_table(sample_rate, n_fft, n_mels, f_min, f_max, scale, norm, cols), &[n_mels, cols], dtype)
     }
 
     /// The log compression of [`mel_spectrogram`](Tensor::mel_spectrogram) on
@@ -465,25 +473,9 @@ fn inverse_envelope(win: &[f64], hop: usize, frames: usize, start: usize, take: 
     envelope[start..start + take].iter().map(|&v| (1.0 / v.max(NOLA_EPS)) as f32).collect()
 }
 
-/// `scale · DFT(w)` as `[2·half]` `(re rows, im rows)` with the analysis
-/// kernel's sign convention, the rows past `n_bins` zero: what subtracting
-/// the constant `scale` from a frame subtracts from its windowed spectrum.
-fn window_dft(n_fft: usize, n_bins: usize, half: usize, win: &[f64], scale: f64) -> Vec<f32> {
-    let mut table = vec![0f32; 2 * half];
-    for k in 0..n_bins {
-        let (re, im) = win.iter().enumerate().fold((0.0, 0.0), |(re, im), (n, w)| {
-            let angle = TAU * ((k * n) % n_fft) as f64 / n_fft as f64;
-            (re + w * angle.cos(), im - w * angle.sin())
-        });
-        table[k] = (scale * re) as f32;
-        table[half + k] = (scale * im) as f32;
-    }
-    table
-}
-
 /// The window zero-padded to `n_fft`, centered as `torch.stft` centers it.
-fn framed_window(kind: &Window, n_fft: usize, win_length: usize, dtype: DType) -> Result<Tensor> {
-    let w = Tensor::window(kind, win_length, true, dtype)?;
+fn framed_window(kind: &Window, n_fft: usize, win_length: usize, periodic: bool, dtype: DType) -> Result<Tensor> {
+    let w = Tensor::window(kind, win_length, periodic, dtype)?;
     if win_length == n_fft {
         return Ok(w);
     }
@@ -494,23 +486,28 @@ fn framed_window(kind: &Window, n_fft: usize, win_length: usize, dtype: DType) -
 /// [`framed_window`] as host f64 values when no graph has to run for it: a
 /// named window, or a `Custom` one already backed by a Float32 buffer (a
 /// `from_slice` window). A lazy `Custom` window yields `None`, and its
-/// caller builds the DFT kernel in the graph instead.
-fn host_framed_window(kind: &Window, n_fft: usize, win_length: usize) -> Option<Vec<f64>> {
+/// caller builds the DFT kernel in the graph instead; its shape is checked
+/// here all the same.
+fn host_framed_window(kind: &Window, n_fft: usize, win_length: usize, periodic: bool) -> Result<Option<Vec<f64>>> {
     let w: Vec<f64> = match kind {
         Window::Custom(w) => {
-            let w = w.buffer().is_some().then(|| w.as_vec::<f32>().ok()).flatten()?;
-            (w.len() == win_length).then(|| w.into_iter().map(f64::from).collect())?
+            ensure_custom_shape(w, win_length)?;
+            match w.buffer().is_some().then(|| w.as_vec::<f32>().ok()).flatten() {
+                Some(host) => host.into_iter().map(f64::from).collect(),
+                None => return Ok(None),
+            }
         }
         Window::Rectangular => vec![1.0; win_length],
         cosine => {
             let (a0, a1, p) = cosine.cosine_sum().expect("Rectangular and Custom handled above");
-            (0..win_length).map(|k| (a0 - a1 * (TAU * k as f64 / win_length as f64).cos()).powf(p)).collect()
+            let denom = Window::denominator(win_length, periodic) as f64;
+            (0..win_length).map(|k| (a0 - a1 * (TAU * k as f64 / denom).cos()).powf(p)).collect()
         }
     };
     let mut framed = vec![0.0; n_fft];
     let left = (n_fft - win_length) / 2;
     framed[left..left + win_length].copy_from_slice(&w);
-    Some(framed)
+    Ok(Some(framed))
 }
 
 /// Host twin of [`analysis_kernel`] / [`synthesis_kernel`], `[2·half, n_fft]`
@@ -599,7 +596,9 @@ impl Tensor {
     /// symbolic.
     ///
     /// Defaults: `hop = n_fft / 4`, `win_length = n_fft`, periodic Hann window,
-    /// `center`, `onesided`, no normalization.
+    /// `center`, `onesided`, no normalization. `periodic(false)` builds a
+    /// named window in its symmetric form (denominator `win_length - 1`, as
+    /// Kaldi does); `Window::Custom` ignores the flag.
     ///
     /// # Examples
     ///
@@ -618,13 +617,14 @@ impl Tensor {
         hop: Option<usize>,
         win_length: Option<usize>,
         #[builder(default)] window: Window,
+        #[builder(default = true)] periodic: bool,
         #[builder(default = true)] center: bool,
         #[builder(default = true)] onesided: bool,
         #[builder(default = false)] normalized: bool,
     ) -> Result<Tensor> {
         origin_call!("stft");
         let (spec, n_bins, frames) =
-            self.stft_aligned(n_fft, hop, win_length, &window, center, onesided, normalized, None, false)?;
+            self.stft_aligned(n_fft, hop, win_length, &window, periodic, center, onesided, normalized, None, false)?;
         let out = spec.narrow(1, 0_usize, n_bins)?.narrow(2, 0_usize, frames)?;
         if self.ndim()? == 1 { out.try_squeeze(Some(0)) } else { Ok(out) }
     }
@@ -640,11 +640,15 @@ impl Tensor {
     /// `preemphasis` filters the signal, `x[n] - a·x[n - 1]` (`x[-1] = 0`),
     /// and `remove_dc` subtracts each frame's mean over the `win_length`
     /// samples under the window before it — Kaldi's `preemph_coeff` and
-    /// `remove_dc_offset`, whose per-frame chain this equals wherever the
-    /// window's first weight is zero (Hann, Povey). The mean removal is a
-    /// spectral correction: `DFT(w·(x - c)) = DFT(w·x) - c·DFT(w)`, the means
-    /// coming from a box convolution at the frame stride and `(1 - a)·DFT(w)`
-    /// being a constant.
+    /// `remove_dc_offset`. Kaldi filters each frame on its own, with the
+    /// frame's first sample as its own predecessor, so the signal-wide
+    /// filter equals it only where the window's first weight is zero: with
+    /// `preemphasis`, the window must be host-known and start at exactly
+    /// zero (Hann, Povey; not Hamming, not Rectangular, not a lazy `Custom`
+    /// one), and anything else is rejected. The mean removal is a spectral
+    /// correction: `DFT(w·(x - c)) = DFT(w·x) - c·DFT(w)`, the means coming
+    /// from a box convolution at the frame stride and `(1 - a)·DFT(w)` being
+    /// a constant.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn stft_aligned(
         &self,
@@ -652,6 +656,7 @@ impl Tensor {
         hop: Option<usize>,
         win_length: Option<usize>,
         window: &Window,
+        periodic: bool,
         center: bool,
         onesided: bool,
         normalized: bool,
@@ -663,6 +668,17 @@ impl Tensor {
         ensure!(ndim == 1 || ndim == 2, NdimExactSnafu { op: "stft", expected: 2_usize, actual: ndim });
         let dtype = self.dtype();
         ensure!(dtype.is_float(), FloatDTypeRequiredSnafu { op: "stft", arg: "input", dtype: dtype.clone() });
+        let left = (n_fft - win_length) / 2;
+        let host_win = host_framed_window(window, n_fft, win_length, periodic)?;
+        ensure!(
+            preemphasis.is_none() || host_win.as_ref().is_some_and(|w| w[left] == 0.0),
+            ParamRangeSnafu {
+                op: "stft",
+                param: "window",
+                value: format!("{window:?}"),
+                constraint: "a host-known window whose first weight is zero (Hann, Povey) under `preemphasis`",
+            }
+        );
 
         let x = if ndim == 1 { self.try_unsqueeze(0)? } else { self.clone() };
         let x = if center { reflect_pad_last(&x, n_fft / 2)? } else { x };
@@ -692,14 +708,21 @@ impl Tensor {
         let n_bins = if onesided { n_fft / 2 + 1 } else { n_fft };
         let padded_bins = n_bins.next_multiple_of(BIN_ALIGN);
         let rows = 2 * padded_bins;
+        // `dc` is `(1 - a)·DFT(w)` per row — the kernel's row sums — with the
+        // analysis sign convention: what subtracting a constant from a frame
+        // subtracts from its windowed spectrum.
         let dc_scale = 1.0 - preemphasis.unwrap_or(0.0);
-        let (kernel, dc) = match host_framed_window(window, n_fft, win_length) {
-            Some(win) => (
-                upload(dft_table(n_fft, n_bins, padded_bins, &win, |_| (1.0, -1.0)), &[rows, 1, n_fft], dtype.clone())?,
-                upload(window_dft(n_fft, n_bins, padded_bins, &win, dc_scale), &[rows, 1], dtype)?,
-            ),
+        let (kernel, dc) = match host_win {
+            Some(win) => {
+                let table = dft_table(n_fft, n_bins, padded_bins, &win, |_| (1.0, -1.0));
+                let dc = table
+                    .chunks(n_fft)
+                    .map(|row| (row.iter().map(|&v| f64::from(v)).sum::<f64>() * dc_scale) as f32)
+                    .collect();
+                (upload(table, &[rows, 1, n_fft], dtype.clone())?, upload(dc, &[rows, 1], dtype)?)
+            }
             None => {
-                let win = framed_window(window, n_fft, win_length, dtype.clone())?;
+                let win = framed_window(window, n_fft, win_length, periodic, dtype.clone())?;
                 let kernel = analysis_kernel(n_fft, n_bins, padded_bins, &win, dtype)?.contiguous();
                 (kernel.clone(), kernel.sum(-1isize)?.try_mul(dc_scale)?)
             }
@@ -711,7 +734,6 @@ impl Tensor {
         // epilogue; it is an input buffer like the kernel, not a launch.
         let y = x.try_unsqueeze(1)?.conv1d().weight(&kernel).stride(hop).call()?;
         let y = if remove_dc {
-            let left = (n_fft - win_length) / 2;
             let taps =
                 (0..n_fft).map(|n| if (left..left + win_length).contains(&n) { 1.0 / win_length as f32 } else { 0.0 });
             let mean = raw
@@ -746,7 +768,8 @@ impl Tensor {
     /// transform is one reduce of `2F·⌈n_fft/hop⌉` per output sample plus an
     /// elementwise epilogue.
     ///
-    /// The parameters must match the [`stft`](Tensor::stft) that produced the
+    /// The parameters (`periodic` included: the synthesis window is the
+    /// analysis one) must match the [`stft`](Tensor::stft) that produced the
     /// input. Without `length`, the result is `(T - 1) · hop` samples under
     /// `center` (the analysis padding is trimmed) and `(T - 1) · hop + n_fft`
     /// otherwise; with `length` it is trimmed or zero-padded to exactly that.
@@ -766,6 +789,7 @@ impl Tensor {
         hop: Option<usize>,
         win_length: Option<usize>,
         #[builder(default)] window: Window,
+        #[builder(default = true)] periodic: bool,
         #[builder(default = true)] center: bool,
         #[builder(default = true)] onesided: bool,
         #[builder(default = false)] normalized: bool,
@@ -833,7 +857,7 @@ impl Tensor {
         // The overlap-add weight and the inverse window envelope: host tables
         // for a host-known window, otherwise built in-graph (the envelope by
         // the same overlap-add of window² over a frame of ones).
-        let (weight, inverse) = match host_framed_window(&window, n_fft, win_length) {
+        let (weight, inverse) = match host_framed_window(&window, n_fft, win_length, periodic)? {
             Some(win) => {
                 let table = dft_table(n_fft, n_bins, padded_bins, &win, synthesis_weights(n_fft, onesided));
                 (
@@ -846,7 +870,7 @@ impl Tensor {
                 )
             }
             None => {
-                let win = framed_window(&window, n_fft, win_length, dtype.clone())?;
+                let win = framed_window(&window, n_fft, win_length, periodic, dtype.clone())?;
                 let table = synthesis_kernel(n_fft, n_bins, padded_bins, onesided, &win, dtype.clone())?;
                 let wsq = win.square().try_reshape([1, n_fft as isize])?;
                 let ones = Tensor::ones(&[1, 1, frames], dtype).try_pad(&[(0, 0), (0, 0), frame_pad])?;
@@ -876,14 +900,15 @@ impl Tensor {
     /// `MelNorm::Slaney` is `librosa.feature.melspectrogram`.
     ///
     /// Kaldi's `fbank` is the same chain with `preemphasis` (`x[n] - a·x[n - 1]`
-    /// on the signal) and `remove_dc` (each frame's mean over the `win_length`
-    /// samples under the window subtracted before the pre-emphasis; both are
-    /// exact per-frame equivalents wherever the window's first weight is
-    /// zero), a `Window::Povey` and a `filterbank` of its own: a `[n_mels, F]`
-    /// table given in place of `n_mels` (`sample_rate`, `f_min`, `f_max`,
-    /// `mel_scale` and `norm` are then unused). A `filterbank` still in the
-    /// graph costs one launch per run to widen; a host-backed one is widened
-    /// on the host.
+    /// on the signal, accepted only with a window whose first weight is
+    /// zero — Hann, Povey — so it equals Kaldi's per-frame filter exactly),
+    /// `remove_dc` (each frame's mean over the `win_length` samples under the
+    /// window subtracted before the pre-emphasis), a `Window::Povey` in its
+    /// symmetric form (`periodic(false)`) and a `filterbank` of its own: a
+    /// `[n_mels, F]` table given in place of `n_mels` (`sample_rate`, `f_min`,
+    /// `f_max`, `mel_scale` and `norm` are then unused). A `filterbank` still
+    /// in the graph costs one launch per run to widen; a host-backed one is
+    /// widened on the host.
     ///
     /// # Examples
     ///
@@ -902,6 +927,7 @@ impl Tensor {
         hop: Option<usize>,
         win_length: Option<usize>,
         #[builder(default)] window: Window,
+        #[builder(default = true)] periodic: bool,
         #[builder(default = true)] center: bool,
         preemphasis: Option<f64>,
         #[builder(default = false)] remove_dc: bool,
@@ -930,7 +956,7 @@ impl Tensor {
         // at `log10(1e-10)`, the exact value of a zero frame, so those frames
         // never exceed the real maximum.
         let (spec, n_bins, frames) =
-            self.stft_aligned(n_fft, hop, win_length, &window, center, true, false, preemphasis, remove_dc)?;
+            self.stft_aligned(n_fft, hop, win_length, &window, periodic, center, true, false, preemphasis, remove_dc)?;
         let energy = spec.power()?;
         let energy = if power == 2.0 {
             energy

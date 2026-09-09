@@ -209,8 +209,9 @@ pub struct GigaAmTranscriber {
     /// encoder's mel input.
     mel_jit: MelJit,
     /// Host staging for the mel JIT's device-local `[max_batch, framed_len]`
-    /// input: one `copyin` per batch instead of kernels reading pinned host
-    /// memory over the bus.
+    /// input: one `copyin` of the batch's rows instead of kernels reading
+    /// pinned host memory over the bus. Rows past the batch are stale; their
+    /// frame count is zero, so the mel graph masks them to zero.
     framed: Vec<f32>,
     head_decoder: HeadDecoder,
     encoder_jit: Option<GigaAmEncoderJit>,
@@ -401,7 +402,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
             for (bi, row) in self.framed.chunks_mut(framed_len).take(b).enumerate() {
                 self.mel.frame_into(windows[chunk_batch_start + bi], row);
             }
-            self.mel_jit.framed_mut()?.copyin(bytemuck::cast_slice(&self.framed))?;
+            self.mel_jit.framed_mut()?.copyin_at(0, bytemuck::cast_slice(&self.framed[..b * framed_len]))?;
             pack_lengths_buffer(self.mel_jit.frames_view_mut::<i32>()?, &chunk_lengths);
             self.mel_jit.execute()?;
             let batch_mels = self.mel_jit.output()?;

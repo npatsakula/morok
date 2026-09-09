@@ -77,8 +77,9 @@ pub struct WhisperRecognizer {
     /// Graph front-end; its device output feeds the encoder's mel input.
     mel_jit: WhisperMelJit,
     /// Host staging for the mel JIT's device-local `[max_batch, N_SAMPLES]`
-    /// input: one `copyin` per batch instead of kernels reading pinned host
-    /// memory over the bus.
+    /// input: one `copyin` of the batch's rows instead of kernels reading
+    /// pinned host memory over the bus. Rows past the batch are stale; the
+    /// mel and encoder graphs are per row and only the batch's rows are read.
     samples: Vec<f32>,
     encoder_jit: WhisperEncoderJit,
     decoder_jit: WhisperDecoderJit,
@@ -462,14 +463,13 @@ impl WhisperRecognizer {
             // ── Mel: pad-or-trim the windows, upload them to the mel JIT's
             // device-local input, run it, and copy its output across on-device.
             let t = Instant::now();
-            for (bi, row) in self.samples.chunks_mut(N_SAMPLES).enumerate() {
-                let window = windows.get(batch_start + bi).filter(|_| bi < b).copied().unwrap_or(&[]);
+            for (row, window) in self.samples.chunks_mut(N_SAMPLES).zip(&windows[batch_start..batch_start + b]) {
                 WhisperMel::pad_or_trim_into(window, row);
             }
-            let src_bytes: &[u8] = bytemuck::cast_slice(&self.samples);
+            let src_bytes: &[u8] = bytemuck::cast_slice(&self.samples[..b * N_SAMPLES]);
             let copy_started = begin_host_copy(profile, self.mel_jit.samples_mut()?)
                 .map_err(|source| TranscribeError::Model { source: Box::new(source) })?;
-            self.mel_jit.samples_mut()?.copyin(src_bytes)?;
+            self.mel_jit.samples_mut()?.copyin_at(0, src_bytes)?;
             if let Some(started) = copy_started {
                 copies.h2d("mel_input", 1, src_bytes.len(), started.elapsed());
             }

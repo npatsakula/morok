@@ -468,7 +468,9 @@ pub struct StreamFlush {
 /// Stateful streaming VAD driver: 16 kHz samples in, [`VadEvent`]s out.
 ///
 /// Samples buffer host-side until a full fbank frame (400 samples, 160 hop)
-/// is available and run through a `chunk_frames`-capacity fbank JIT; its
+/// is available and run through a `chunk_frames`-capacity fbank JIT (sized
+/// to the model chunk because a fixed-shape transform costs its capacity
+/// per execute, and live pushes are shorter than a chunk); its
 /// feature rows land in the model JIT's input by on-device copies until a
 /// full `chunk_frames` chunk is resident, which is one dispatch with the
 /// conv caches recycling on-device. Latency is bounded by `chunk_frames`

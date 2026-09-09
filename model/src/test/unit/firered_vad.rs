@@ -98,6 +98,49 @@ const KNF_GOLDEN: [f32; 240] = [
     4.47017, 5.31772, 5.50067, 4.95214, 6.44142, 6.36777, 5.63803, 4.85101,
 ];
 
+/// Sizes a caller can get wrong are errors, not panics: an empty JIT shape,
+/// more windows than the batch, and the sample count of no frames.
+#[test]
+fn fbank_rejects_bad_sizes() {
+    assert_eq!(KaldiFbank::samples(0), 0);
+    assert_eq!(KaldiFbank::samples(1), 512);
+    assert!(FireRedFbank::new(0, 3).is_err());
+    assert!(FireRedFbank::new(1, 0).is_err());
+    let mut fbank = FireRedFbank::new(1, 3).expect("prepare");
+    assert_eq!((fbank.batch(), fbank.capacity()), (1, 3));
+    let waveform = synthetic_waveform(720);
+    assert!(fbank.forward_windows(&waveform, &[0, 1]).is_err());
+    assert!(fbank.forward_windows(&waveform, &[0]).is_ok());
+}
+
+/// A batch's stale rows do not leak: the same window computed alone and
+/// beside another agrees to row-level float reassociation, and a window off
+/// either end of the waveform reads zeros there.
+#[test]
+fn fbank_partial_batches_and_edges() {
+    let waveform = synthetic_waveform(16_000);
+    let mut fbank = FireRedFbank::new(2, 16).expect("prepare");
+    let row = |buf: &svod_device::Buffer, i: usize| -> Vec<f32> {
+        let mut rows = vec![0.0f32; 2 * 16 * N_MELS];
+        buf.copyout_prefix(bytemuck::cast_slice_mut(&mut rows)).expect("copyout");
+        rows[i * 16 * N_MELS..(i + 1) * 16 * N_MELS].to_vec()
+    };
+    let paired = row(fbank.forward_windows(&waveform, &[-8, 40]).expect("fbank"), 1);
+    let alone = row(fbank.forward_windows(&waveform, &[40]).expect("fbank"), 0);
+    let delta = paired.iter().zip(&alone).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(delta < 1e-5, "a window's row depends on its neighbour: max |delta| = {delta}");
+
+    let silence = row(fbank.forward_windows(&waveform, &[-40]).expect("fbank"), 0);
+    let expected_zero = fbank.forward(&[0.0; 512]).expect("fbank")[..N_MELS].to_vec();
+    assert!(silence.chunks(N_MELS).all(|frame| frame == expected_zero), "frames before the waveform must be silence");
+    let past_end =
+        row(fbank.forward_windows(&waveform, &[fbank.num_frames(waveform.len()) as isize]).expect("fbank"), 0);
+    assert!(
+        past_end.chunks(N_MELS).skip(2).all(|frame| frame == expected_zero),
+        "frames past the waveform must be silence"
+    );
+}
+
 /// Graph fbank vs `kaldi-native-fbank` on the synthetic two-tone signal.
 /// Pins the full per-frame chain: int16 scaling, DC removal, per-frame
 /// pre-emphasis, Povey window, power spectrum, Kaldi mel banks, log floor.
@@ -245,6 +288,8 @@ fn stitched_windows_match_full_forward() {
     let want = full.as_vec::<f32>().expect("readout");
 
     let mut inf = FireRedVadInference::new(model).expect("prepare");
+    let mut small = FireRedFbank::new(1, 3).expect("prepare");
+    assert!(inf.probs_from_samples(&mut small, &feat).is_err(), "an fbank of the wrong shape must be refused");
     let got = inf.probs(&feat, n_frames).expect("probs");
 
     assert_eq!(got.len(), want.len());

@@ -69,10 +69,6 @@ impl MelSpectrogram {
         Self { config: config.clone() }
     }
 
-    pub fn config(&self) -> &MelConfig {
-        &self.config
-    }
-
     pub fn n_mels(&self) -> usize {
         self.config.n_mels
     }
@@ -84,9 +80,9 @@ impl MelSpectrogram {
     }
 
     /// Samples a host-framed row holds per window: the window plus its
-    /// reflect padding under `center`.
+    /// `n_fft / 2` reflect padding on each side under `center`.
     pub fn framed_len(&self, waveform_len: usize) -> usize {
-        if self.config.center { waveform_len + self.config.n_fft } else { waveform_len }
+        if self.config.center { waveform_len + 2 * (self.config.n_fft / 2) } else { waveform_len }
     }
 
     /// Host framing for rows of differing lengths: `waveform` reflect-padded

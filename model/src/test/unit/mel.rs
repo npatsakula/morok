@@ -6,6 +6,7 @@ use std::f64::consts::TAU;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{MelNorm, MelScale as FbScale};
+use test_case::test_case;
 
 use crate::audio::{MelConfig, MelScale, MelSpectrogram};
 use crate::whisper::{N_FRAMES, N_SAMPLES, WhisperMel};
@@ -52,14 +53,14 @@ fn synthetic(len: usize, seed: u32) -> Vec<f32> {
         .collect()
 }
 
-/// The first two seconds of `ru_clip_0.wav` from the repository root (16 kHz
-/// mono int16), if present.
+/// The first two seconds of the untracked `ru_clip_0.wav` from the repository
+/// root, if it is there and is 16 kHz mono int16.
 fn real_clip() -> Option<Vec<f32>> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ru_clip_0.wav");
     let mut reader = hound::WavReader::open(path).ok()?;
     let spec = reader.spec();
-    assert_eq!((spec.channels, spec.sample_rate), (1, 16000), "real clip must be 16 kHz mono");
-    Some(reader.samples::<i16>().take(16000 * 2).map(|s| s.unwrap() as f32 / 32768.0).collect())
+    ((spec.channels, spec.sample_rate) == (1, 16000)).then_some(())?;
+    reader.samples::<i16>().take(16000 * 2).map(|s| Some(s.ok()? as f32 / 32768.0)).collect()
 }
 
 fn max_abs_diff(a: &[f32], b: &[f64]) -> f32 {
@@ -222,6 +223,31 @@ fn num_frames_follows_torch_stft() {
     assert_eq!((snipped.num_frames(16000), snipped.num_frames(319)), (99, 0));
 }
 
+/// Host framing (`framed_len`, `frame_into`) against the graph's own `center`
+/// reflect padding, for an even and an odd `n_fft`: the frame counts agree
+/// and the framed row transformed with `center = false` yields the graph's
+/// centered log-mel.
+#[test_case(400; "even n_fft")]
+#[test_case(401; "odd n_fft")]
+fn host_framing_matches_graph_centering(n_fft: usize) {
+    let mel = MelSpectrogram::new(&MelConfig { n_fft, win_length: n_fft, ..whisper_config() });
+    let signal = synthetic(16000, 5);
+    let centered =
+        mel.forward_power_tensor(&Tensor::from_slice(signal.clone())).unwrap().mel_log(MelSpectrogram::LOG).unwrap();
+    let frames = centered.dim_const(-1).unwrap();
+    assert_eq!(mel.num_frames(signal.len()), frames);
+    assert_eq!(mel.framed_len(signal.len()), signal.len() + 2 * (n_fft / 2));
+
+    let mut framed = vec![0.0f32; mel.framed_len(signal.len())];
+    mel.frame_into(&signal, &mut framed);
+    let framed = Tensor::from_slice(framed).try_unsqueeze(0).unwrap();
+    let host = mel.forward_tensor(&framed, &Tensor::from_slice(vec![frames as i32])).unwrap();
+    assert_eq!(host.dims().unwrap(), vec![1, 80, frames]);
+    let (host, want) = (host.to_vec::<f32>().unwrap(), centered.to_vec::<f32>().unwrap());
+    let worst = host.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(worst <= 1e-4, "host framing drifted from graph centering: {worst}");
+}
+
 #[test]
 fn graph_mel_matches_naive_dft_on_synthetic_windows() {
     // Two VAD-style windows of different lengths plus a silent one share one
@@ -244,7 +270,7 @@ fn graph_whisper_mel_matches_naive_dft_on_synthetic_windows() {
 #[test]
 fn graph_mel_matches_naive_dft_on_real_clip() {
     let Some(clip) = real_clip() else {
-        eprintln!("ru_clip_0.wav not found; skipping the real-clip parity check");
+        eprintln!("ru_clip_0.wav absent or not 16 kHz mono int16; skipping the real-clip parity check");
         return;
     };
     assert_gigaam_parity(&[&clip, &clip[16000 / 2..16000 + 321]], "ru_clip_0");

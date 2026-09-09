@@ -38,10 +38,11 @@ fn cosine_sum(kind: &Window) -> (f64, f64, f64) {
     }
 }
 
-/// Cosine-sum window, periodic form (denominator `n`).
-fn host_window(kind: &Window, n: usize) -> Vec<f64> {
+/// Cosine-sum window: periodic (denominator `n`) or symmetric (`n - 1`).
+fn host_window(kind: &Window, n: usize, periodic: bool) -> Vec<f64> {
     let (a0, a1, p) = cosine_sum(kind);
-    (0..n).map(|k| (a0 - a1 * (TAU * k as f64 / n as f64).cos()).powf(p)).collect()
+    let denom = if periodic || n == 1 { n } else { n - 1 };
+    (0..n).map(|k| (a0 - a1 * (TAU * k as f64 / denom as f64).cos()).powf(p)).collect()
 }
 
 /// `torch.nn.functional.pad(mode="reflect")`: mirror without repeating edges.
@@ -104,11 +105,38 @@ fn assert_close(got: &[f32], expected: &[f64], tol: f64) {
 #[test_case(Window::Povey, 9, false; "povey symmetric (kaldi)")]
 #[test_case(Window::Rectangular, 5, true; "rectangular")]
 fn window_matches_torch(kind: Window, n: usize, periodic: bool) {
-    let (a0, a1, p) = cosine_sum(&kind);
-    let denom = if periodic || n == 1 { n } else { n - 1 };
-    let expected: Vec<f64> = (0..n).map(|k| (a0 - a1 * (TAU * k as f64 / denom as f64).cos()).powf(p)).collect();
+    let expected = host_window(&kind, n, periodic);
     let got = Tensor::window(&kind, n, periodic, DType::Float32).unwrap().to_vec::<f32>().unwrap();
     assert_close(&got, &expected, 1e-6);
+}
+
+/// Kaldi's `povey` window, `pow(0.5 - 0.5·cos(2πk/(N - 1)), 0.85)`, is the
+/// symmetric form of `Window::Povey`.
+#[test]
+fn povey_symmetric_is_kaldis_window() {
+    let n = 12;
+    let kaldi: Vec<f64> = (0..n).map(|k| (0.5 - 0.5 * (TAU * k as f64 / (n - 1) as f64).cos()).powf(0.85)).collect();
+    let got = Tensor::window(&Window::Povey, n, false, DType::Float32).unwrap().to_vec::<f32>().unwrap();
+    assert_close(&got, &kaldi, 1e-6);
+    assert_eq!(got[0], 0.0, "the first weight is exactly zero, which `preemphasis` relies on");
+}
+
+/// A `Custom` window must be exactly `[win_length]`: a `[1, n]` tensor is
+/// rejected on the host path (realized) and the graph path (lazy) alike, by
+/// the analysis and the synthesis.
+#[test_case(true; "realized")]
+#[test_case(false; "lazy")]
+fn custom_window_of_the_wrong_rank_is_rejected_before_realization(realized: bool) {
+    let (n_fft, len) = (16usize, 64usize);
+    let flat = Tensor::from_slice(vec![0.5f32; n_fft]);
+    let w = if realized { flat } else { flat.try_mul(1.0).unwrap() }.try_reshape([1, n_fft as isize]).unwrap();
+    assert_eq!(w.buffer().is_some(), realized);
+    let x = Tensor::from_slice(vec![0.1f32; len]);
+    let err = x.stft().n_fft(n_fft).window(Window::Custom(w.clone())).call().unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::NdimExact { .. }), "got {err}");
+    let spec = x.stft().n_fft(n_fft).call().unwrap();
+    let err = spec.istft().n_fft(n_fft).window(Window::Custom(w)).call().unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::NdimExact { .. }), "got {err}");
 }
 
 #[test]
@@ -143,7 +171,7 @@ fn window_rejects_zero_length() {
 fn stft_matches_naive_dft(n_fft: usize, hop: usize, kind: Window, center: bool, onesided: bool, normalized: bool) {
     let len = 96;
     let x = signal(len, 0.3);
-    let win = host_window(&kind, n_fft);
+    let win = host_window(&kind, n_fft, true);
     let expected = ref_stft(&x, n_fft, hop, &win, center, onesided, normalized);
 
     let input = Tensor::from_slice(x.iter().map(|&v| v as f32).collect::<Vec<_>>());
@@ -165,12 +193,45 @@ fn stft_matches_naive_dft(n_fft: usize, hop: usize, kind: Window, center: bool, 
     assert_close(&spec.to_vec::<f32>().unwrap(), &expected, 2e-4);
 }
 
+/// `periodic(false)` analyses with the symmetric window (denominator
+/// `n - 1`), which differs from the periodic one at every interior sample.
+#[test_case(Window::Hann, 32; "hann symmetric")]
+#[test_case(Window::Hamming, 32; "hamming symmetric")]
+#[test_case(Window::Povey, 20; "povey symmetric, short window")]
+fn stft_periodic_false_matches_the_symmetric_window(kind: Window, win_length: usize) {
+    let (n_fft, hop, len) = (32usize, 8usize, 96usize);
+    let x = signal(len, 0.3);
+    let left = (n_fft - win_length) / 2;
+    let mut win = vec![0.0; n_fft];
+    win[left..left + win_length].copy_from_slice(&host_window(&kind, win_length, false));
+    let expected = ref_stft(&x, n_fft, hop, &win, true, true, false);
+
+    let input = Tensor::from_slice(x.iter().map(|&v| v as f32).collect::<Vec<_>>());
+    let stft = |periodic: bool| {
+        input
+            .stft()
+            .n_fft(n_fft)
+            .hop(hop)
+            .win_length(win_length)
+            .window(kind.clone())
+            .periodic(periodic)
+            .call()
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap()
+    };
+    assert_close(&stft(false), &expected, 2e-4);
+    let periodic = stft(true);
+    let apart = periodic.iter().zip(&expected).filter(|(g, e)| (**g as f64 - *e).abs() > 1e-3).count();
+    assert!(apart > 0, "the periodic form must not coincide with the symmetric reference");
+}
+
 #[test]
 fn stft_win_length_is_zero_padded_symmetrically() {
     let (n_fft, win_length, hop, len) = (32usize, 20usize, 8usize, 96usize);
     let x = signal(len, 1.1);
     // torch centers a short window inside the n_fft frame.
-    let short = host_window(&Window::Hann, win_length);
+    let short = host_window(&Window::Hann, win_length, true);
     let left = (n_fft - win_length) / 2;
     let mut win = vec![0.0; n_fft];
     win[left..left + win_length].copy_from_slice(&short);
@@ -185,7 +246,7 @@ fn stft_win_length_is_zero_padded_symmetrically() {
 fn stft_defaults_match_torch_hop_and_window() {
     let (n_fft, len) = (32usize, 96usize);
     let x = signal(len, 0.9);
-    let expected = ref_stft(&x, n_fft, n_fft / 4, &host_window(&Window::Hann, n_fft), true, true, false);
+    let expected = ref_stft(&x, n_fft, n_fft / 4, &host_window(&Window::Hann, n_fft, true), true, true, false);
     let input = Tensor::from_slice(x.iter().map(|&v| v as f32).collect::<Vec<_>>());
     let spec = input.stft().n_fft(n_fft).call().unwrap();
     assert_close(&spec.to_vec::<f32>().unwrap(), &expected, 2e-4);
@@ -195,7 +256,7 @@ fn stft_defaults_match_torch_hop_and_window() {
 fn stft_custom_window_matches_gtcrn_sqrt_hann() {
     // GTCRN analyses with `hann_window(n_fft).sqrt()`.
     let (n_fft, hop, len) = (32usize, 16usize, 96usize);
-    let win: Vec<f64> = host_window(&Window::Hann, n_fft).iter().map(|w| w.sqrt()).collect();
+    let win: Vec<f64> = host_window(&Window::Hann, n_fft, true).iter().map(|w| w.sqrt()).collect();
     let x = signal(len, 2.4);
     let expected = ref_stft(&x, n_fft, hop, &win, true, true, false);
 
@@ -243,7 +304,7 @@ fn lazy_custom_window_falls_back_to_in_graph_kernels() {
 fn stft_aligned_keeps_the_tileable_extents(n_fft: usize, hop: usize, len: usize) {
     let x = Tensor::from_slice(signal(len, 0.8).iter().map(|&v| v as f32).collect::<Vec<_>>());
     let (spec, bins, frames) =
-        x.stft_aligned(n_fft, Some(hop), None, &Window::Hann, true, true, false, None, false).unwrap();
+        x.stft_aligned(n_fft, Some(hop), None, &Window::Hann, true, true, true, false, None, false).unwrap();
     let trimmed = x.stft().n_fft(n_fft).hop(hop).call().unwrap();
     assert_eq!((bins, frames), (n_fft / 2 + 1, len / hop + 1));
     let dims = spec.dims().unwrap();
@@ -272,7 +333,7 @@ fn stft_aligned_keeps_the_tileable_extents(n_fft: usize, hop: usize, len: usize)
 fn stft_batches_rows_independently() {
     let (n_fft, hop, len) = (16usize, 4usize, 48usize);
     let rows: Vec<Vec<f64>> = (0..3).map(|b| signal(len, b as f64 * 1.7)).collect();
-    let win = host_window(&Window::Hann, n_fft);
+    let win = host_window(&Window::Hann, n_fft, true);
     let expected: Vec<f64> = rows.iter().flat_map(|r| ref_stft(r, n_fft, hop, &win, true, true, false)).collect();
 
     let flat: Vec<f32> = rows.iter().flatten().map(|&v| v as f32).collect();
@@ -352,6 +413,23 @@ fn istft_round_trips_across_center_and_sidedness(center: bool, onesided: bool) {
     assert!(compare >= len / 2, "reconstruction too short: {}", got.len());
     let start = if center { 0 } else { n_fft };
     assert_close(&got[start..compare], &x[start..compare], 1e-4);
+}
+
+/// The synthesis window follows `periodic` too: a symmetric analysis round
+/// trips through a symmetric synthesis and not through a periodic one.
+#[test]
+fn istft_round_trips_a_symmetric_window() {
+    let (n_fft, hop, len) = (32usize, 8usize, 192usize);
+    let x = signal(len, 0.42);
+    let input = Tensor::from_slice(x.iter().map(|&v| v as f32).collect::<Vec<_>>());
+    let spec = input.stft().n_fft(n_fft).hop(hop).periodic(false).call().unwrap();
+    let back = |periodic: bool| {
+        spec.istft().n_fft(n_fft).hop(hop).periodic(periodic).length(len).call().unwrap().to_vec::<f32>().unwrap()
+    };
+    assert_close(&back(false), &x, 1e-4);
+    let mismatched = back(true);
+    let apart = mismatched.iter().zip(&x).filter(|(g, e)| (**g as f64 - *e).abs() > 1e-3).count();
+    assert!(apart > 0, "a periodic synthesis window must not invert a symmetric analysis");
 }
 
 #[test]
@@ -514,7 +592,7 @@ fn complex_helpers_reproduce_the_gtcrn_mask_branch() {
 fn stft_magnitude_reproduces_the_silero_front_end() {
     let (n_fft, hop, len) = (32usize, 16usize, 96usize);
     let x = signal(len, 1.9);
-    let win = host_window(&Window::Hann, n_fft);
+    let win = host_window(&Window::Hann, n_fft, true);
     let flat = ref_stft(&x, n_fft, hop, &win, true, true, false);
     let expected: Vec<f64> = flat.chunks(2).map(|c| (c[0] * c[0] + c[1] * c[1]).sqrt()).collect();
 
@@ -743,7 +821,7 @@ fn ref_mel_spectrogram(
     power: f64,
     log: Option<MelLog>,
 ) -> Vec<f64> {
-    let win = host_window(&Window::Hann, n_fft);
+    let win = host_window(&Window::Hann, n_fft, true);
     let spec = ref_stft(x, n_fft, hop, &win, true, true, false);
     let bins = n_fft / 2 + 1;
     let frames = spec.len() / (bins * 2);
@@ -876,15 +954,15 @@ fn mel_spectrogram_rejects_bad_parameters() {
 
 /// Kaldi's per-frame chain (`snip_edges`, `remove_dc_offset`, `preemph_coeff`)
 /// as `kaldi-native-fbank` writes it: the mean over the `win_length` samples
-/// under the window removed from the frame, pre-emphasis with its first
-/// sample special-cased, the windowed DFT power against a `[n_mels, F]`
+/// under the `short` window removed from the frame, pre-emphasis with its
+/// first sample special-cased, the windowed DFT power against a `[n_mels, F]`
 /// table, `ln(max(x, eps))`. Flat `[n_mels, T]`.
 #[allow(clippy::too_many_arguments)]
 fn ref_kaldi_mel(
     x: &[f64],
     n_fft: usize,
     hop: usize,
-    win_length: usize,
+    short: &[f64],
     preemph: f64,
     remove_dc: bool,
     banks: &[f64],
@@ -893,7 +971,7 @@ fn ref_kaldi_mel(
     let bins = n_fft / 2 + 1;
     let n_mels = banks.len() / bins;
     let frames = (x.len() - n_fft) / hop + 1;
-    let short = host_window(&Window::Hann, win_length);
+    let win_length = short.len();
     let left = (n_fft - win_length) / 2;
     let mut out = vec![0.0; n_mels * frames];
     for t in 0..frames {
@@ -920,16 +998,25 @@ fn ref_kaldi_mel(
 
 /// `preemphasis`, `remove_dc` and a custom `filterbank` reproduce Kaldi's
 /// per-frame chain on a signal with a DC offset — including a short window,
-/// whose mean is taken under the window rather than over the whole frame.
-#[test_case(64, Some(0.97), true; "pre-emphasis and dc removal")]
-#[test_case(48, Some(0.97), true; "short window: mean under the window")]
-#[test_case(64, None, true; "dc removal alone")]
-#[test_case(64, Some(0.97), false; "pre-emphasis alone")]
-fn mel_spectrogram_kaldi_options_match_the_per_frame_chain(win_length: usize, preemph: Option<f64>, remove_dc: bool) {
+/// whose mean is taken under the window rather than over the whole frame,
+/// and Kaldi's own symmetric Povey window.
+#[test_case(Window::Hann, true, 64, Some(0.97), true; "pre-emphasis and dc removal")]
+#[test_case(Window::Hann, true, 48, Some(0.97), true; "short window: mean under the window")]
+#[test_case(Window::Hann, true, 64, None, true; "dc removal alone")]
+#[test_case(Window::Hann, true, 64, Some(0.97), false; "pre-emphasis alone")]
+#[test_case(Window::Povey, false, 48, Some(0.97), true; "kaldi's symmetric povey window")]
+fn mel_spectrogram_kaldi_options_match_the_per_frame_chain(
+    kind: Window,
+    periodic: bool,
+    win_length: usize,
+    preemph: Option<f64>,
+    remove_dc: bool,
+) {
     let (sr, n_fft, hop, n_mels, len, eps) = (8000usize, 64usize, 16usize, 12usize, 256usize, 1e-7f64);
     let x: Vec<f64> = signal(len, 0.35).iter().map(|v| v + 0.5).collect();
     let banks = ref_mel_filterbank(sr, n_fft, n_mels, 0.0, sr as f64 / 2.0, MelScale::Htk, None);
-    let expected = ref_kaldi_mel(&x, n_fft, hop, win_length, preemph.unwrap_or(0.0), remove_dc, &banks, eps);
+    let short = host_window(&kind, win_length, periodic);
+    let expected = ref_kaldi_mel(&x, n_fft, hop, &short, preemph.unwrap_or(0.0), remove_dc, &banks, eps);
 
     let fb = Tensor::from_slice(banks.iter().map(|&w| w as f32).collect::<Vec<_>>())
         .try_reshape([n_mels as isize, (n_fft / 2 + 1) as isize])
@@ -941,6 +1028,8 @@ fn mel_spectrogram_kaldi_options_match_the_per_frame_chain(win_length: usize, pr
         .n_fft(n_fft)
         .hop(hop)
         .win_length(win_length)
+        .window(kind)
+        .periodic(periodic)
         .center(false)
         .maybe_preemphasis(preemph)
         .remove_dc(remove_dc)
@@ -950,6 +1039,32 @@ fn mel_spectrogram_kaldi_options_match_the_per_frame_chain(win_length: usize, pr
         .unwrap();
     assert_eq!(mel.dims().unwrap(), vec![n_mels, (len - n_fft) / hop + 1]);
     assert_close(&mel.to_vec::<f32>().unwrap(), &expected, 1e-3);
+}
+
+/// The signal-wide pre-emphasis equals Kaldi's per-frame one only where the
+/// window's first weight is zero, so `preemphasis` is refused for any other
+/// window — and for a lazy `Custom` one, whose first weight is unknown.
+#[test_case(Window::Hann, true; "hann")]
+#[test_case(Window::Povey, true; "povey")]
+#[test_case(Window::Hamming, false; "hamming")]
+#[test_case(Window::Rectangular, false; "rectangular")]
+fn preemphasis_needs_a_window_starting_at_zero(kind: Window, accepted: bool) {
+    let x = Tensor::from_slice(vec![0.1f32; 256]);
+    let mel = |w: Window| x.mel_spectrogram().sample_rate(8000).n_fft(64).n_mels(8).window(w).preemphasis(0.97).call();
+    match mel(kind.clone()) {
+        Ok(_) => assert!(accepted, "{kind:?} must be rejected"),
+        Err(err) => assert!(!accepted && matches!(err.kind(), ErrorKind::ParamRange { .. }), "{kind:?}: {err}"),
+    }
+    // Without pre-emphasis every window is fine.
+    x.mel_spectrogram().sample_rate(8000).n_fft(64).n_mels(8).window(kind).remove_dc(true).call().unwrap();
+
+    let sqrt_hann = || Tensor::window(&Window::Hann, 64, true, DType::Float32).unwrap().try_sqrt().unwrap();
+    let host = Tensor::from_slice(sqrt_hann().to_vec::<f32>().unwrap());
+    mel(Window::Custom(host)).expect("a realized custom window starting at zero is accepted");
+    let lazy = sqrt_hann();
+    assert!(lazy.buffer().is_none(), "the window must reach stft unrealized");
+    let err = mel(Window::Custom(lazy)).unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::ParamRange { .. }), "lazy custom: {err}");
 }
 
 /// A filterbank still in the graph is widened by a launch of its own and
