@@ -23,7 +23,6 @@ svod-tk = { path = "../tk", version = "=0.1.0-alpha.6" }
 ndarray.workspace = true
 prost = "0.14.3"
 nom = "7.1"
-realfft = "3.5.0"
 repugnant-pickle = { version = "0.0.1", features = ["torch"] }
 safetensors = "0.8"
 zip = { version = "8", default-features = false }
@@ -35,7 +34,6 @@ tracing = "0.1.44"
 bytemuck = "1.25.0"
 flate2 = "1.1.10"
 rand = "0.10"
-rayon = "1.12.0"
 rustc-hash = "2"
 tiktoken-rs = "0.12"
 wide = "1.7"

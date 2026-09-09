@@ -15,13 +15,13 @@ use svod_tensor::PrepareConfig;
 use crate::jit::InputSpec;
 
 use super::aligner::{AlignmentProfile, WhisperAligner, WhisperAlignmentInput};
-use super::config::{N_AUDIO_CTX, N_FRAMES, N_TEXT_CTX, SAMPLE_RATE};
+use super::config::{N_AUDIO_CTX, N_FRAMES, N_SAMPLES, N_TEXT_CTX, SAMPLE_RATE};
 use super::decode::{
     DecodeOptions, DecodeScheduleStats, attempt_strategies, detect_language_profile, prefill_decode_seed,
     run_fixed_slot_decode, strategy_width,
 };
 use super::jit::{WhisperCrossKvJit, WhisperDecoderJit, WhisperDecoderStepJit, WhisperEncoderJit, WhisperPrefillJit};
-use super::mel::WhisperMel;
+use super::mel::{WhisperMel, WhisperMelJit};
 use super::model::Whisper;
 use super::plan::WhisperPlan;
 use super::profile::{CopyProfile, GraphProfile, begin_host_copy};
@@ -74,7 +74,13 @@ pub enum TranscribeError {
 /// Prepared timestamp-enabled recognizer. It owns only recognition graphs;
 /// word alignment is a separate [`WhisperAligner`] stage.
 pub struct WhisperRecognizer {
-    mel: WhisperMel,
+    /// Graph front-end; its device output feeds the encoder's mel input.
+    mel_jit: WhisperMelJit,
+    /// Host staging for the mel JIT's device-local `[max_batch, N_SAMPLES]`
+    /// input: one `copyin` of the batch's rows instead of kernels reading
+    /// pinned host memory over the bus. Rows past the batch are stale; the
+    /// mel and encoder graphs are per row and only the batch's rows are read.
+    samples: Vec<f32>,
     encoder_jit: WhisperEncoderJit,
     decoder_jit: WhisperDecoderJit,
     cross_kv_jit: WhisperCrossKvJit,
@@ -84,7 +90,6 @@ pub struct WhisperRecognizer {
     batched_step_jit: WhisperDecoderStepJit,
     tokenizer: WhisperTokenizer,
     options: DecodeOptions,
-    n_mels: usize,
     n_audio_state: usize,
     n_vocab: usize,
     n_text_ctx: usize,
@@ -138,25 +143,27 @@ impl WhisperRecognizer {
         let n_vocab = model.dims.n_vocab;
         let n_text_ctx = model.dims.n_text_ctx;
         let n_text_head = model.dims.n_text_head;
-        if max_chunk_samples > super::config::N_SAMPLES {
+        if max_chunk_samples > N_SAMPLES {
             return Err(TranscribeError::Model {
                 source: Box::new(super::error::Error::Decode {
-                    msg: format!(
-                        "Whisper decode windows are limited to {} samples, got {max_chunk_samples}",
-                        super::config::N_SAMPLES
-                    ),
+                    msg: format!("Whisper decode windows are limited to {N_SAMPLES} samples, got {max_chunk_samples}"),
                 }),
             });
         }
-        let mel = WhisperMel::new(n_mels);
-
         let max_batch = plan.encoder_batch;
 
         let prepare_config = PrepareConfig::from_env();
 
-        // Encoder JIT: [max_batch, n_mels, N_FRAMES], device-local output
+        let mut mel_jit = WhisperMelJit::new(WhisperMel::new(n_mels));
+        let samples_spec = InputSpec::f32(&[max_batch, N_SAMPLES]).device_local();
+        mel_jit.prepare_with_config(samples_spec, &PrepareConfig::device_local())?;
+        let samples = vec![0.0f32; max_batch * N_SAMPLES];
+
+        // Encoder JIT: [max_batch, n_mels, N_FRAMES], device-local on both
+        // sides — the mel input is only ever written by an on-device copy
+        // from the mel JIT's output.
         let mut encoder_jit = WhisperEncoderJit::new(model.clone());
-        let mel_spec = InputSpec::f32(&[max_batch, n_mels, N_FRAMES]);
+        let mel_spec = InputSpec::f32(&[max_batch, n_mels, N_FRAMES]).device_local();
         encoder_jit.prepare_with_config(mel_spec, &PrepareConfig::device_local())?;
 
         let n_text_state = model.dims.n_text_state;
@@ -217,7 +224,8 @@ impl WhisperRecognizer {
         let pos_embedding = model.decoder.positional_embedding.cast(svod_dtype::DType::Float32).to_vec::<f32>()?;
 
         Ok(Self {
-            mel,
+            mel_jit,
+            samples,
             encoder_jit,
             decoder_jit,
             cross_kv_jit,
@@ -225,7 +233,6 @@ impl WhisperRecognizer {
             batched_step_jit,
             tokenizer,
             options,
-            n_mels,
             n_audio_state,
             n_vocab,
             n_text_ctx,
@@ -251,17 +258,6 @@ impl WhisperRecognizer {
 
     pub fn plan(&self) -> &WhisperPlan {
         &self.plan
-    }
-
-    /// Compute mel spectrogram for a window, padded/trimmed to N_FRAMES.
-    fn compute_mel(&self, window: &[f32]) -> Vec<f32> {
-        let mel = self.mel.compute(window);
-        let total = self.n_mels * N_FRAMES;
-
-        let mut padded = vec![0.0f32; total];
-        let copy_len = mel.len().min(total);
-        padded[..copy_len].copy_from_slice(&mel[..copy_len]);
-        padded
     }
 }
 
@@ -444,9 +440,7 @@ impl WhisperRecognizer {
             return Ok((Vec::new(), profile.then(RunProfile::default), CopyProfile::default()));
         }
 
-        let n_mels = self.n_mels;
         let d = self.n_audio_state;
-        let mel_stride = n_mels * N_FRAMES;
         let item_stride = N_AUDIO_CTX * d;
         let max_batch = self.max_batch;
         let n_vocab = self.n_vocab;
@@ -466,24 +460,21 @@ impl WhisperRecognizer {
         for batch_start in (0..windows.len()).step_by(max_batch) {
             let b = (windows.len() - batch_start).min(max_batch);
 
-            // ── Mel: compute + pack into [b, n_mels, N_FRAMES] ──────────────
+            // ── Mel: pad-or-trim the windows, upload them to the mel JIT's
+            // device-local input, run it, and copy its output across on-device.
             let t = Instant::now();
-            let batch_mels: Vec<Vec<f32>> = (0..b).map(|bi| self.compute_mel(windows[batch_start + bi])).collect();
-            {
-                let mel_buf = self.encoder_jit.mel_mut()?;
-                let mut packed = vec![0f32; max_batch * mel_stride];
-                for bi in 0..b {
-                    packed[bi * mel_stride..(bi + 1) * mel_stride].copy_from_slice(&batch_mels[bi][..mel_stride]);
-                }
-                let copy_started = begin_host_copy(profile, mel_buf)
-                    .map_err(|source| TranscribeError::Model { source: Box::new(source) })?;
-                let dst = mel_buf.as_host_bytes_mut()?;
-                let src_bytes: &[u8] = bytemuck::cast_slice(&packed);
-                dst[..src_bytes.len()].copy_from_slice(src_bytes);
-                if let Some(started) = copy_started {
-                    copies.h2d("mel_input", 1, src_bytes.len(), started.elapsed());
-                }
+            for (row, window) in self.samples.chunks_mut(N_SAMPLES).zip(&windows[batch_start..batch_start + b]) {
+                WhisperMel::pad_or_trim_into(window, row);
             }
+            let src_bytes: &[u8] = bytemuck::cast_slice(&self.samples[..b * N_SAMPLES]);
+            let copy_started = begin_host_copy(profile, self.mel_jit.samples_mut()?)
+                .map_err(|source| TranscribeError::Model { source: Box::new(source) })?;
+            self.mel_jit.samples_mut()?.copyin_at(0, src_bytes)?;
+            if let Some(started) = copy_started {
+                copies.h2d("mel_input", 1, src_bytes.len(), started.elapsed());
+            }
+            self.mel_jit.execute()?;
+            self.encoder_jit.mel_mut()?.copy_from(self.mel_jit.output()?)?;
             t_mel += t.elapsed();
 
             // ── Encode: one dispatch for b windows ───────────────────────────

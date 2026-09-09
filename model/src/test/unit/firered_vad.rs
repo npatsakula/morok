@@ -1,8 +1,9 @@
 //! FireRedVAD tests.
 //!
 //! Cheap default tier: forward-graph shape on random weights (no compile),
-//! fbank parity against an embedded `kaldi-native-fbank` golden, and the
-//! smoothing function against numpy reference values. The `#[ignore]` tier
+//! fbank parity against an embedded `kaldi-native-fbank` golden and against
+//! a naive per-frame Kaldi chain written here, and the smoothing function
+//! against numpy reference values. The `#[ignore]` tier
 //! compiles and executes the JIT on the local CPU device: window/halo stitch
 //! exactness on random weights, and — when the converted checkpoint is
 //! present (`scripts/convert_firered_vad.py`) — probability parity against
@@ -17,8 +18,8 @@ use svod_arch::pipelines::audio::Splitter;
 
 use crate::audio::EncoderBounds;
 use crate::firered_vad::{
-    CORE, FRAME_LENGTH, FRAME_SHIFT, FireRedFbank, FireRedVad, FireRedVadInference, FireRedVadSplitter, N_MELS,
-    smooth_trailing,
+    CORE, FRAME_LENGTH, FRAME_SHIFT, FireRedFbank, FireRedVad, FireRedVadInference, FireRedVadSplitter, KaldiFbank,
+    N_MELS, smooth_trailing,
 };
 
 // ---------------------------------------------------------------------------
@@ -97,21 +98,152 @@ const KNF_GOLDEN: [f32; 240] = [
     4.47017, 5.31772, 5.50067, 4.95214, 6.44142, 6.36777, 5.63803, 4.85101,
 ];
 
-/// Rust fbank vs `kaldi-native-fbank` on the synthetic two-tone signal.
+/// Sizes a caller can get wrong are errors, not panics: an empty JIT shape,
+/// more windows than the batch, and the sample count of no frames.
+#[test]
+fn fbank_rejects_bad_sizes() {
+    assert_eq!(KaldiFbank::samples(0), 0);
+    assert_eq!(KaldiFbank::samples(1), 512);
+    assert!(FireRedFbank::new(0, 3).is_err());
+    assert!(FireRedFbank::new(1, 0).is_err());
+    let mut fbank = FireRedFbank::new(1, 3).expect("prepare");
+    assert_eq!((fbank.batch(), fbank.capacity()), (1, 3));
+    let waveform = synthetic_waveform(720);
+    assert!(fbank.forward_windows(&waveform, &[0, 1]).is_err());
+    assert!(fbank.forward_windows(&waveform, &[0]).is_ok());
+}
+
+/// A batch's stale rows do not leak: the same window computed alone and
+/// beside another agrees to row-level float reassociation, and a window off
+/// either end of the waveform reads zeros there.
+#[test]
+fn fbank_partial_batches_and_edges() {
+    let waveform = synthetic_waveform(16_000);
+    let mut fbank = FireRedFbank::new(2, 16).expect("prepare");
+    let row = |buf: &svod_device::Buffer, i: usize| -> Vec<f32> {
+        let mut rows = vec![0.0f32; 2 * 16 * N_MELS];
+        buf.copyout_prefix(bytemuck::cast_slice_mut(&mut rows)).expect("copyout");
+        rows[i * 16 * N_MELS..(i + 1) * 16 * N_MELS].to_vec()
+    };
+    let paired = row(fbank.forward_windows(&waveform, &[-8, 40]).expect("fbank"), 1);
+    let alone = row(fbank.forward_windows(&waveform, &[40]).expect("fbank"), 0);
+    let delta = paired.iter().zip(&alone).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(delta < 1e-5, "a window's row depends on its neighbour: max |delta| = {delta}");
+
+    let silence = row(fbank.forward_windows(&waveform, &[-40]).expect("fbank"), 0);
+    let expected_zero = fbank.forward(&[0.0; 512]).expect("fbank")[..N_MELS].to_vec();
+    assert!(silence.chunks(N_MELS).all(|frame| frame == expected_zero), "frames before the waveform must be silence");
+    let past_end =
+        row(fbank.forward_windows(&waveform, &[fbank.num_frames(waveform.len()) as isize]).expect("fbank"), 0);
+    assert!(
+        past_end.chunks(N_MELS).skip(2).all(|frame| frame == expected_zero),
+        "frames past the waveform must be silence"
+    );
+}
+
+/// Graph fbank vs `kaldi-native-fbank` on the synthetic two-tone signal.
 /// Pins the full per-frame chain: int16 scaling, DC removal, per-frame
 /// pre-emphasis, Povey window, power spectrum, Kaldi mel banks, log floor.
 #[test]
 fn fbank_matches_kaldi_native_fbank() {
     let waveform = synthetic_waveform(720);
-    let fbank = FireRedFbank::new();
+    let mut fbank = FireRedFbank::new(1, 3).expect("prepare");
     assert_eq!(fbank.num_frames(waveform.len()), 3);
     assert_eq!(fbank.num_frames(FRAME_LENGTH - 1), 0);
     assert_eq!(fbank.num_frames(FRAME_LENGTH + FRAME_SHIFT), 2);
 
-    let feat = fbank.forward(&waveform);
+    let feat = fbank.forward(&waveform).expect("fbank");
     assert_eq!(feat.len(), KNF_GOLDEN.len());
+    // The two tones leave the bins between their harmonics nine orders of
+    // magnitude below the frame peak, where knf's own f32 FFT carries ~2e-3
+    // of noise in the log (its error against an f64 chain is 2.9e-3, the
+    // graph's 1.1e-3); the bins that matter agree to 1e-4.
     let max_abs = feat.iter().zip(&KNF_GOLDEN).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
-    assert!(max_abs < 1e-3, "fbank drifted from kaldi-native-fbank: max |delta| = {max_abs}");
+    assert!(max_abs < 2.5e-3, "fbank drifted from kaldi-native-fbank: max |delta| = {max_abs}");
+}
+
+/// Kaldi's chain as it is written in `kaldi-native-fbank`, one frame at a
+/// time with a naive DFT: the reference for the graph's folded formulation
+/// (signal-level pre-emphasis, the mean's `0.03·DFT(w)` correction).
+fn ref_kaldi_fbank(waveform: &[f32]) -> Vec<f32> {
+    const N_FFT: usize = 512;
+    let povey: Vec<f64> = (0..FRAME_LENGTH)
+        .map(|i| (0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / (FRAME_LENGTH - 1) as f64).cos()).powf(0.85))
+        .collect();
+    let mel = |f: f64| 1127.0 * (1.0 + f / 700.0).ln();
+    let (mel_low, mel_high) = (mel(20.0), mel(8000.0));
+    let delta = (mel_high - mel_low) / (N_MELS + 1) as f64;
+    let bin_mel: Vec<f64> = (0..N_FFT / 2).map(|i| mel(i as f64 * 16000.0 / N_FFT as f64)).collect();
+
+    let mut feat = Vec::new();
+    for t in 0..KaldiFbank::num_frames(waveform.len()) {
+        let mut frame: Vec<f64> =
+            waveform[t * FRAME_SHIFT..t * FRAME_SHIFT + FRAME_LENGTH].iter().map(|&s| f64::from(s) * 32768.0).collect();
+        let mean = frame.iter().sum::<f64>() / FRAME_LENGTH as f64;
+        frame.iter_mut().for_each(|s| *s -= mean);
+        for i in (1..FRAME_LENGTH).rev() {
+            frame[i] -= 0.97 * frame[i - 1];
+        }
+        frame[0] -= 0.97 * frame[0];
+        let power: Vec<f64> = (0..N_FFT / 2)
+            .map(|k| {
+                let (re, im) = (0..FRAME_LENGTH).fold((0.0, 0.0), |(re, im), n| {
+                    let angle = std::f64::consts::TAU * ((k * n) % N_FFT) as f64 / N_FFT as f64;
+                    let v = frame[n] * povey[n];
+                    (re + v * angle.cos(), im - v * angle.sin())
+                });
+                re * re + im * im
+            })
+            .collect();
+        for m in 0..N_MELS {
+            let (left, center, right) =
+                (mel_low + m as f64 * delta, mel_low + (m + 1) as f64 * delta, mel_low + (m + 2) as f64 * delta);
+            let energy: f64 = bin_mel
+                .iter()
+                .zip(&power)
+                .filter(|&(&f, _)| f > left && f < right)
+                .map(|(&f, &p)| if f <= center { (f - left) / delta * p } else { (right - f) / delta * p })
+                .sum();
+            feat.push(energy.max(f64::from(f32::EPSILON)).ln() as f32);
+        }
+    }
+    feat
+}
+
+/// A second of signal through a `[2, 16]` JIT — three full executes and a
+/// partial one — against the naive per-frame chain in f64: to 1e-4 within
+/// twelve nats of each frame's peak, and to 2e-3 in the bins nine orders of
+/// magnitude below it, where an f32 spectrum has no more digits to give.
+/// Then the same signal with a DC offset: Kaldi removes each frame's mean
+/// before anything else, so the output must not move.
+#[test]
+fn fbank_matches_naive_kaldi_chain_across_blocks() {
+    let waveform = synthetic_waveform(16_000 + 123);
+    let mut fbank = FireRedFbank::new(2, 16).expect("prepare");
+    let feat = fbank.forward(&waveform).expect("fbank");
+    let want = ref_kaldi_fbank(&waveform);
+    assert_fbank_close(&feat, &want, 2e-3, "the naive chain");
+
+    // The mean's `0.03·m·DFT(w)` correction cancels against the spectrum, so
+    // a 5% offset costs the quiet band one more digit.
+    let offset: Vec<f32> = waveform.iter().map(|s| s + 0.05).collect();
+    let shifted = fbank.forward(&offset).expect("fbank");
+    assert_fbank_close(&shifted, &feat, 5e-3, "the same signal without the DC offset");
+}
+
+/// Largest `|got - want|` per row, split at twelve nats below the row's
+/// peak: 1e-4 above, `quiet_tol` below.
+fn assert_fbank_close(got: &[f32], want: &[f32], quiet_tol: f32, against: &str) {
+    assert_eq!(got.len(), want.len());
+    let (mut loud, mut quiet) = (0.0f32, 0.0f32);
+    for (got, want) in got.chunks(N_MELS).zip(want.chunks(N_MELS)) {
+        let peak = want.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        for (g, w) in got.iter().zip(want) {
+            let delta = (g - w).abs();
+            if *w >= peak - 12.0 { loud = loud.max(delta) } else { quiet = quiet.max(delta) }
+        }
+    }
+    assert!(loud < 1e-4 && quiet < quiet_tol, "graph fbank drifted from {against}: loud {loud}, quiet {quiet}");
 }
 
 /// `smooth_trailing` vs numpy reference
@@ -156,6 +288,8 @@ fn stitched_windows_match_full_forward() {
     let want = full.as_vec::<f32>().expect("readout");
 
     let mut inf = FireRedVadInference::new(model).expect("prepare");
+    let mut small = FireRedFbank::new(1, 3).expect("prepare");
+    assert!(inf.probs_from_samples(&mut small, &feat).is_err(), "an fbank of the wrong shape must be refused");
     let got = inf.probs(&feat, n_frames).expect("probs");
 
     assert_eq!(got.len(), want.len());
@@ -195,8 +329,8 @@ fn real_weights_match_pytorch_golden() {
     let probs_want = load_golden_vec(&golden, "probs");
     let n_frames = probs_want.len();
 
-    let fbank = FireRedFbank::new();
-    let feat_got = fbank.forward(&samples);
+    let mut fbank = FireRedFbank::new(1, n_frames).expect("prepare");
+    let feat_got = fbank.forward(&samples).expect("fbank");
     assert_eq!(feat_got.len(), feat_want.len(), "frame count mismatch vs knf");
     let fbank_delta = feat_got.iter().zip(&feat_want).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
     assert!(fbank_delta < 1e-3, "fbank drifted from knf golden: max |delta| = {fbank_delta}");

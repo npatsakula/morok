@@ -442,6 +442,34 @@ let signal = spec.istft().n_fft(16).hop(4).window(Window::Hann).length(64).call(
 除 `magnitude` 外，末轴为 2 的表示还提供 `power`、`complex_abs`、
 `complex_mul` 以及 `Tensor::complex_from_polar(&mag, &phase)`。
 
+梅尔前端就是同一张图，只是末尾多了一次滤波器组收缩和一次取对数。
+`mel_spectrogram()` 接受 `stft` 的参数再加上梅尔参数，返回 `[B, n_mels, T]`：
+
+```rust
+use svod_tensor::nn::{MelLog, MelNorm, MelScale};
+
+let x = Tensor::from_slice(vec![0.25f32; 16000]);
+let mel = x
+    .mel_spectrogram()
+    .sample_rate(16000)
+    .n_fft(400)
+    .hop(160)
+    .n_mels(80)
+    .mel_scale(MelScale::Slaney)
+    .norm(MelNorm::Slaney)
+    .log(MelLog::Whisper)
+    .call()?;
+assert_eq!(mel.dims()?, vec![80, 101]);
+```
+
+默认值与 torchaudio 的 `MelSpectrogram` 一致（HTK 刻度、不归一化、`power = 2`、
+`f_min = 0`、`f_max = sample_rate / 2`、不取对数）；`MelScale::Slaney` 搭配
+`MelNorm::Slaney` 就是 `librosa.filters.mel`，即 Whisper 背后的滤波器组。
+`MelLog::Ln { min, max }` 是 `ln(clamp(x))`，`MelLog::Whisper` 是
+`log_mel_spectrogram` 末尾的 `log10` / 以 `max - 8` 为下限 / `(x + 4) / 4`；
+`mel_log` 可以单独应用其中任一种，`Tensor::mel_filterbank(...)` 则物化出
+`[n_mels, F]` 的表。
+
 ---
 
 ## 错误处理
@@ -476,6 +504,7 @@ let signal = spec.istft().n_fft(16).hop(4).window(Window::Hann).length(64).call(
 | 激活函数 | `t.relu()?`, `t.softmax(-1)?` |
 | 加载权重 | `model.load_state_dict(&sd, "")?` |
 | 频谱图 | `x.stft().n_fft(512).hop(160).call()?` |
+| 梅尔频谱图 | `x.mel_spectrogram().sample_rate(16000).n_fft(400).n_mels(80).call()?` |
 | 循环层 | `x.lstm().weight_ih(&w).weight_hh(&r).hidden_size(h).call()?` |
 | 执行 | `t.realize()?` |
 | 批量 realize | `Tensor::realize_batch([&a, &b])?` |

@@ -445,6 +445,35 @@ Hann window, `center`, `onesided`, कोई normalization नहीं — औ�
 करता है। `magnitude` के अलावा, आख़िरी 2-वाले axis पर `power`, `complex_abs`,
 `complex_mul` और `Tensor::complex_from_polar(&mag, &phase)` भी हैं।
 
+Mel front-end वही ग्राफ़ है, बस अंत में एक filterbank contraction और एक log जुड़
+जाता है। `mel_spectrogram()` `stft` के पैरामीटर और साथ में mel वाले पैरामीटर लेता है
+और `[B, n_mels, T]` लौटाता है:
+
+```rust
+use svod_tensor::nn::{MelLog, MelNorm, MelScale};
+
+let x = Tensor::from_slice(vec![0.25f32; 16000]);
+let mel = x
+    .mel_spectrogram()
+    .sample_rate(16000)
+    .n_fft(400)
+    .hop(160)
+    .n_mels(80)
+    .mel_scale(MelScale::Slaney)
+    .norm(MelNorm::Slaney)
+    .log(MelLog::Whisper)
+    .call()?;
+assert_eq!(mel.dims()?, vec![80, 101]);
+```
+
+डिफ़ॉल्ट torchaudio के `MelSpectrogram` वाले हैं (HTK स्केल, कोई normalization
+नहीं, `power = 2`, `f_min = 0`, `f_max = sample_rate / 2`, कोई log नहीं);
+`MelScale::Slaney` के साथ `MelNorm::Slaney` `librosa.filters.mel` है, यानी Whisper
+के पीछे का filterbank। `MelLog::Ln { min, max }` `ln(clamp(x))` है और
+`MelLog::Whisper` `log_mel_spectrogram` की `log10` / `max - 8` पर floor /
+`(x + 4) / 4` वाली पूँछ; `mel_log` इनमें से किसी को भी अकेले लगाता है, और
+`Tensor::mel_filterbank(...)` `[n_mels, F]` टेबल को materialize करता है।
+
 ---
 
 ## एरर
@@ -479,6 +508,7 @@ Hann window, `center`, `onesided`, कोई normalization नहीं — औ�
 | एक्टिवेशन | `t.relu()?`, `t.softmax(-1)?` |
 | Weights लोड करें | `model.load_state_dict(&sd, "")?` |
 | Spectrogram | `x.stft().n_fft(512).hop(160).call()?` |
+| Mel spectrogram | `x.mel_spectrogram().sample_rate(16000).n_fft(400).n_mels(80).call()?` |
 | Recurrent लेयर | `x.lstm().weight_ih(&w).weight_hh(&r).hidden_size(h).call()?` |
 | एक्ज़ीक्यूट करें | `t.realize()?` |
 | बैच realize | `Tensor::realize_batch([&a, &b])?` |

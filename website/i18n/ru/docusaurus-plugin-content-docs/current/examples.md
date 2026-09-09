@@ -448,6 +448,36 @@ let signal = spec.istft().n_fft(16).hop(4).window(Window::Hann).length(64).call(
 `magnitude`, для последней оси длины 2 есть `power`, `complex_abs`,
 `complex_mul` и `Tensor::complex_from_polar(&mag, &phase)`.
 
+Mel-фронтенд — это тот же граф со свёрткой с банком фильтров и логарифмом в
+конце. `mel_spectrogram()` принимает параметры `stft` плюс mel-параметры и
+возвращает `[B, n_mels, T]`:
+
+```rust
+use svod_tensor::nn::{MelLog, MelNorm, MelScale};
+
+let x = Tensor::from_slice(vec![0.25f32; 16000]);
+let mel = x
+    .mel_spectrogram()
+    .sample_rate(16000)
+    .n_fft(400)
+    .hop(160)
+    .n_mels(80)
+    .mel_scale(MelScale::Slaney)
+    .norm(MelNorm::Slaney)
+    .log(MelLog::Whisper)
+    .call()?;
+assert_eq!(mel.dims()?, vec![80, 101]);
+```
+
+По умолчанию это `MelSpectrogram` из torchaudio (шкала HTK, без нормализации,
+`power = 2`, `f_min = 0`, `f_max = sample_rate / 2`, без логарифма);
+`MelScale::Slaney` вместе с `MelNorm::Slaney` — это `librosa.filters.mel`, банк
+фильтров, лежащий в основе Whisper. `MelLog::Ln { min, max }` — это
+`ln(clamp(x))`, а `MelLog::Whisper` — хвост `log_mel_spectrogram`:
+`log10` / нижняя граница `max - 8` / `(x + 4) / 4`; `mel_log` применяет любой из
+них отдельно, а `Tensor::mel_filterbank(...)` материализует таблицу
+`[n_mels, F]`.
+
 ---
 
 ## Ошибки
@@ -483,6 +513,7 @@ let signal = spec.istft().n_fft(16).hop(4).window(Window::Hann).length(64).call(
 | Активация | `t.relu()?`, `t.softmax(-1)?` |
 | Загрузить веса | `model.load_state_dict(&sd, "")?` |
 | Спектрограмма | `x.stft().n_fft(512).hop(160).call()?` |
+| Mel-спектрограмма | `x.mel_spectrogram().sample_rate(16000).n_fft(400).n_mels(80).call()?` |
 | Рекуррентный слой | `x.lstm().weight_ih(&w).weight_hh(&r).hidden_size(h).call()?` |
 | Выполнить | `t.realize()?` |
 | Батч-реализация | `Tensor::realize_batch([&a, &b])?` |

@@ -446,6 +446,35 @@ and `Tensor::window(&Window::Hann, n, periodic, dtype)` materializes one.
 Alongside `magnitude`, the trailing-2 axis has `power`, `complex_abs`,
 `complex_mul` and `Tensor::complex_from_polar(&mag, &phase)`.
 
+A mel front-end is the same graph with a filterbank contraction and a log on
+the end. `mel_spectrogram()` takes the `stft` parameters plus the mel ones and
+returns `[B, n_mels, T]`:
+
+```rust
+use svod_tensor::nn::{MelLog, MelNorm, MelScale};
+
+let x = Tensor::from_slice(vec![0.25f32; 16000]);
+let mel = x
+    .mel_spectrogram()
+    .sample_rate(16000)
+    .n_fft(400)
+    .hop(160)
+    .n_mels(80)
+    .mel_scale(MelScale::Slaney)
+    .norm(MelNorm::Slaney)
+    .log(MelLog::Whisper)
+    .call()?;
+assert_eq!(mel.dims()?, vec![80, 101]);
+```
+
+The defaults are torchaudio's `MelSpectrogram` (HTK scale, no normalization,
+`power = 2`, `f_min = 0`, `f_max = sample_rate / 2`, no log); `MelScale::Slaney`
+with `MelNorm::Slaney` is `librosa.filters.mel`, the filterbank behind Whisper.
+`MelLog::Ln { min, max }` is `ln(clamp(x))` and `MelLog::Whisper` the
+`log10` / floor-at-`max - 8` / `(x + 4) / 4` tail of `log_mel_spectrogram`;
+`mel_log` applies either on its own, and `Tensor::mel_filterbank(...)`
+materializes the `[n_mels, F]` table.
+
 ---
 
 ## Errors
@@ -480,6 +509,7 @@ You've learned the core patterns for using Svod:
 | Activation | `t.relu()?`, `t.softmax(-1)?` |
 | Load weights | `model.load_state_dict(&sd, "")?` |
 | Spectrogram | `x.stft().n_fft(512).hop(160).call()?` |
+| Mel spectrogram | `x.mel_spectrogram().sample_rate(16000).n_fft(400).n_mels(80).call()?` |
 | Recurrent layer | `x.lstm().weight_ih(&w).weight_hh(&r).hidden_size(h).call()?` |
 | Execute | `t.realize()?` |
 | Batch realize | `Tensor::realize_batch([&a, &b])?` |

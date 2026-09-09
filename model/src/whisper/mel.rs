@@ -1,11 +1,17 @@
-//! Whisper mel spectrogram: uses the pre-computed Slaney filterbank from
-//! Whisper's `assets/mel_filters.npz`, then applies `log10` + clamp + normalize.
+//! Whisper mel spectrogram: the Slaney filterbank of Whisper's
+//! `assets/mel_filters.npz` over `pad_or_trim`med 30 s windows, the trailing
+//! STFT frame dropped, then `log10` + clamp + normalize — in the graph.
+
+use svod_macros::jit_wrapper;
+use svod_tensor::Tensor;
+use svod_tensor::nn::MelLog;
 
 use crate::audio::{MelConfig, MelScale, MelSpectrogram};
 
-use super::config::{HOP_LENGTH, N_FFT, SAMPLE_RATE};
+use super::config::{HOP_LENGTH, N_FFT, N_FRAMES, N_SAMPLES, SAMPLE_RATE};
 
 /// Whisper-specific mel spectrogram extractor.
+#[derive(Clone)]
 pub struct WhisperMel {
     inner: MelSpectrogram,
 }
@@ -28,49 +34,33 @@ impl WhisperMel {
         self.inner.n_mels()
     }
 
-    pub fn num_frames(&self, waveform_len: usize) -> usize {
-        self.inner.num_frames(waveform_len)
+    /// `whisper.audio.pad_or_trim` into `out` (`[N_SAMPLES]`): the window
+    /// zero-padded or cut to 30 seconds — the host's whole share of the
+    /// front-end.
+    pub fn pad_or_trim_into(waveform: &[f32], out: &mut [f32]) {
+        let copy_len = waveform.len().min(N_SAMPLES);
+        out[..copy_len].copy_from_slice(&waveform[..copy_len]);
+        out[copy_len..].fill(0.0);
     }
 
-    /// Compute log-mel spectrogram matching `whisper.audio.log_mel_spectrogram`.
-    /// Returns `[n_mels, n_frames]` row-major.
-    ///
-    /// Audio is pad-or-trimmed to 30 seconds (N_SAMPLES) before STFT, matching
-    /// `whisper.audio.pad_or_trim` + `log_mel_spectrogram`.
-    pub fn compute(&self, waveform: &[f32]) -> Vec<f32> {
-        let audio_owned: Vec<f32>;
-        let audio: &[f32] = if waveform.len() != super::config::N_SAMPLES {
-            audio_owned = {
-                let mut v = vec![0.0f32; super::config::N_SAMPLES];
-                let copy_len = waveform.len().min(super::config::N_SAMPLES);
-                v[..copy_len].copy_from_slice(&waveform[..copy_len]);
-                v
-            };
-            &audio_owned
-        } else {
-            waveform
-        };
+    /// `whisper.audio.log_mel_spectrogram` over `[B, N_SAMPLES]` rows of
+    /// [`pad_or_trim_into`](Self::pad_or_trim_into): `[B, n_mels, N_FRAMES]`.
+    /// Every row is exactly 30 s, so `center` reflects in the graph; the
+    /// trailing frame (`torch.stft(...)[..., :-1]`) goes before the log so
+    /// the per-signal maximum sees exactly the frames Whisper keeps.
+    pub fn forward_tensor(&self, samples: &Tensor) -> svod_tensor::error::Result<Tensor> {
+        self.inner.forward_power_tensor(samples)?.narrow(-1, 0_usize, N_FRAMES)?.mel_log(MelLog::Whisper)
+    }
+}
 
-        let power = self.inner.forward_power(audio);
-        if power.is_empty() {
-            return power;
+// Front-end JIT: `[B, N_SAMPLES]` pad-or-trimmed windows -> log-mel
+// `[B, n_mels, N_FRAMES]`, copied on-device into the encoder JIT's mel input.
+jit_wrapper! {
+    WhisperMelJit(WhisperMel) {
+        samples: Tensor,
+
+        build(samples) {
+            model.forward_tensor(samples)
         }
-
-        // log10(clamp(x, 1e-10))
-        let mut log_spec: Vec<f32> = power.iter().map(|&p| p.clamp(1e-10, f32::MAX).log10()).collect();
-
-        // max(x, x.max() - 8.0)
-        let max_val = log_spec.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let clamp_floor = max_val - 8.0;
-        for v in log_spec.iter_mut() {
-            *v = v.max(clamp_floor);
-        }
-
-        // (x + 4.0) / 4.0
-        for v in log_spec.iter_mut() {
-            *v = (*v + 4.0) / 4.0;
-        }
-
-        log_spec
     }
 }
